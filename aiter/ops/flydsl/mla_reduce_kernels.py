@@ -114,6 +114,7 @@ def flydsl_mla_reduce_v1(
     final_output: torch.Tensor,  # bf16/fp16 [bs, H, Dv]
     final_lse: torch.Tensor | None = None,  # fp32 [bs, H] (optional)
     num_kv_splits: int = 0,  # signature parity; grid derived from num_cu + CSR width
+    actual_max_splits: int | None = None,  # true max tile width; gates DA split-K
     *,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
@@ -136,6 +137,10 @@ def flydsl_mla_reduce_v1(
             the host tier hint (guarded by :func:`_safe_host_tier`; see
             :func:`_host_tier_dispatch_enabled`). Default (flag off): unused -- the
             split count is read per-tile from the CSR map, grid from num_cu.
+        actual_max_splits: optional true ``max_t(n_splits)`` over active tiles
+            (from :func:`derive_actual_max_splits` at planning time). When set,
+            gates device-adaptive split-K engagement instead of the loose
+            ``num_kv_splits`` budget. ``None`` preserves legacy gate behavior.
         stream: launch stream; defaults to the current stream of the device.
     """
     if reduce_indptr.numel() < 2:
@@ -174,6 +179,7 @@ def flydsl_mla_reduce_v1(
             max_seqlen_q=max_seqlen_q,
             num_kv_splits=int(num_kv_splits),
             num_cu=num_cu,
+            actual_max_splits=actual_max_splits,
         )
         if engage_sk:
             launch_partial, launch_combine = compile_mla_reduce_splitk(

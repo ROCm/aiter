@@ -1102,8 +1102,30 @@ def da_splitk_enabled() -> bool:
     return os.environ.get("AITER_MLA_REDUCE_DA_SPLITK", "1") == "1"
 
 
+def derive_actual_max_splits(reduce_indptr) -> int:
+    """Return ``max_t(reduce_indptr[t+1] - reduce_indptr[t])`` from the CSR.
+
+    MUST be called at **planning time** (outside any CUDA-graph capture region),
+    after ``get_mla_metadata_v1`` has filled ``reduce_indptr`` on device. This
+    is a one-time host read of the true per-tile split width; phase 2 replaces
+    this helper with a scalar emitted directly by the metadata kernel.
+    """
+    import torch
+
+    if reduce_indptr.numel() < 2:
+        return 0
+    diffs = reduce_indptr[1:] - reduce_indptr[:-1]
+    return int(diffs.max().item())
+
+
 def plan_splitk_capture_safe(
-    *, num_final_rows, H, max_seqlen_q, num_kv_splits, num_cu
+    *,
+    num_final_rows,
+    H,
+    max_seqlen_q,
+    num_kv_splits,
+    num_cu,
+    actual_max_splits=None,
 ):
     """Capture-safe, DEFAULT-ABLE split-K plan from HOST-ONLY values.
 
@@ -1118,24 +1140,20 @@ def plan_splitk_capture_safe(
       (tile, head) combine slots -- and the grid/scratch derived from it are fixed
       for a given CUDA-graph capture (one graph per batch-size bucket).
     * ``num_kv_splits`` is the host split budget (= ``max_split_per_batch`` on the
-      aiter decode dispatch): a true UPPER BOUND on every tile's actual
-      ``n_splits`` (the metadata caps splits at it). It is a pure PERFORMANCE
-      heuristic here (correctness is independent of it -- the per-tile K
-      allocation is decided on-device from the actual ``n_splits``), so gating on
-      it can never corrupt output, only mis-tune.
+      aiter decode dispatch): an upper bound on every tile's actual ``n_splits``.
+      On the persistent decode path it is often a fixed capacity (~304) unrelated
+      to the current context length.
+    * ``actual_max_splits`` (optional): the true ``max_t(n_splits)`` over active
+      tiles, from :func:`derive_actual_max_splits` or (phase 2) a scalar emitted
+      by ``get_mla_metadata_v1``. When set, engagement and K sizing use this
+      instead of ``num_kv_splits``, closing the over-provisioned-budget regression
+      (short-context tiny batch with a loose budget). When ``None``, behavior is
+      unchanged (gate on ``num_kv_splits`` only).
 
     Engage only when the grid is otherwise IDLE (few active tiles ->
-    ``base_slots < num_cu``) AND the split budget is high enough to amortize the
-    combine kernel (``num_kv_splits >= min_splits``, default 64). Large-batch
-    decode (grid already saturated) keeps the single-kernel path unchanged.
-
-    Because ``num_kv_splits`` upper-bounds the actual splits, ``< min_splits``
-    provably means the win is unavailable (the measured single-vs-split crossover
-    is ~32-40 actual splits) so skipping is free. The one imperfect case is an
-    OVER-PROVISIONED budget (``>= min_splits`` but the actual context is short):
-    engaging then costs ~1-2us of combine floor on an already-cheap op. In a
-    context-sized serving stack ``max_split_per_batch`` tracks the context so this
-    does not arise; raise ``MLA_SPLITK_MIN_SPLITS`` if the budget is loose.
+    ``base_slots < num_cu``) AND ``engage_splits >= min_splits`` (default 64),
+    where ``engage_splits = actual_max_splits if provided else num_kv_splits``.
+    Large-batch decode (grid already saturated) keeps the single-kernel path.
 
     CORRECTNESS is device-adaptive and independent of this plan: the partial
     kernel reads each tile's real ``n_splits`` on-device and reduces its own
@@ -1153,12 +1171,17 @@ def plan_splitk_capture_safe(
     )
     if max_seqlen_q != 1:
         return False, 1, 0  # decode-only prototype (NTG == 1)
-    if num_kv_splits < min_splits:
+    engage_splits = (
+        int(num_kv_splits)
+        if actual_max_splits is None
+        else int(actual_max_splits)
+    )
+    if engage_splits < min_splits:
         return False, 1, 0  # perf heuristic: too few splits to amortize combine
     base_slots = num_final_rows * H
     if base_slots <= 0 or base_slots >= num_cu:
         return False, 1, 0  # grid already saturated; split-K would not help
-    K = max(2, min(factor, num_kv_splits))
+    K = max(2, min(factor, engage_splits))
     # Keep the partial grid within ~2 waves of the CU count.
     while K > 2 and base_slots * K > 2 * num_cu:
         K //= 2

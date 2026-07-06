@@ -614,6 +614,142 @@ def test_da_splitk_capture_safe_varying_splits(monkeypatch):
         _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
+# ---------------------------------------------------------------------------
+# actual_max_splits gate (closes over-provisioned-budget regression edge)
+# ---------------------------------------------------------------------------
+
+
+def test_actual_max_splits_gate_loose_budget():
+    """Loose num_kv_splits budget (304) with small actual_max_splits does not
+    engage; true high actual_max_splits does."""
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
+
+    engage_loose, _, _ = plan_splitk_capture_safe(
+        num_final_rows=1,
+        H=16,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
+        actual_max_splits=8,
+    )
+    assert not engage_loose
+
+    engage_hi, K, slots = plan_splitk_capture_safe(
+        num_final_rows=1,
+        H=16,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
+        actual_max_splits=128,
+    )
+    assert engage_hi and K == 16 and slots == 16
+
+
+def test_derive_actual_max_splits():
+    """Helper matches CSR max tile width."""
+    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
+
+    indptr = torch.tensor([0, 8, 12, 12], dtype=torch.int32, device="cuda")
+    assert derive_actual_max_splits(indptr) == 8
+
+
+@pytest.mark.slow
+def test_actual_max_splits_wrapper_loose_budget_correct(monkeypatch):
+    """Loose budget (304) + small actual splits stays on single-kernel path and
+    matches the torch reference."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+    from aiter.ops.flydsl.kernels.mla_reduce import (
+        derive_actual_max_splits,
+        plan_splitk_capture_safe,
+    )
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
+        out_dtype, 8, pool=8
+    )
+    fout = fout[:1].contiguous()
+    flse = flse[:1].contiguous()
+    actual = derive_actual_max_splits(indptr)
+    assert actual == 8
+    engage, _, _ = plan_splitk_capture_safe(
+        num_final_rows=1,
+        H=_SPLITK_H,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
+        actual_max_splits=actual,
+    )
+    assert not engage
+
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po,
+            pl,
+            indptr,
+            fmap,
+            pmap,
+            1,
+            fout,
+            flse,
+            num_kv_splits=304,
+            actual_max_splits=actual,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_actual_max_splits_wrapper_cudagraph_replay(monkeypatch):
+    """Loose budget + actual_max_splits gate stays correct under graph replay."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
+        out_dtype, 128, pool=128
+    )
+    fout = fout[:1].contiguous()
+    flse = flse[:1].contiguous()
+    actual = derive_actual_max_splits(indptr)
+    assert actual == 128
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po,
+            pl,
+            indptr,
+            fmap,
+            pmap,
+            1,
+            fout,
+            flse,
+            num_kv_splits=304,
+            actual_max_splits=actual,
+        )
+
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("num_kv_splits", [32, 128])
 def test_wrapper_host_tier_dispatch_cudagraph_replay(monkeypatch, num_kv_splits):
