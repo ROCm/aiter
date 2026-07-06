@@ -13,6 +13,10 @@ from .utils import (
     round_multiple,
 )
 
+# Built once at import, not per call: a per-call alloc inherits the default
+# device and does an illegal H2D under CUDA graph capture.
+_RNG_STATE = torch.tensor([PHILOX_SEED, PHILOX_OFFSET])
+
 
 def fwd(
     q: torch.Tensor,
@@ -78,7 +82,7 @@ def fwd(
 
     # Dropout + RNG seed
     philox_seed, philox_offset = PHILOX_SEED, PHILOX_OFFSET
-    rng_state = torch.as_tensor([philox_seed, philox_offset])
+    rng_state = _RNG_STATE
 
     # argument checks
     assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
@@ -231,15 +235,6 @@ def bwd(
             "softcap is not supported in the AMD Triton FA2 interface (expected 0.0)."
         )
 
-    # Check for sliding window - backward doesn't support it yet
-    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
-    if is_sliding_window:
-        raise NotImplementedError(
-            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
-            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
-            f"Use window_size=(-1, -1) for full attention."
-        )
-
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
@@ -324,6 +319,8 @@ def bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
 
     if DEBUG:
@@ -454,7 +451,7 @@ def varlen_fwd(
         assert alibi_slopes.shape == (batch, nheads_q)
 
     philox_seed, philox_offset = PHILOX_SEED, PHILOX_OFFSET
-    rng_state = torch.as_tensor([philox_seed, philox_offset])
+    rng_state = _RNG_STATE
 
     # Inline checks (subset appropriate for varlen)
     assert q.dim() == 3 and k.dim() == 3 and v.dim() == 3
@@ -664,6 +661,8 @@ def varlen_bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
 
     if DEBUG:

@@ -386,6 +386,749 @@ def test_fused_ar_rmsnorm(
     }
 
 
+def _make_strided_lastdim_view(x: torch.Tensor, extra_cols: int = 32) -> torch.Tensor:
+    *prefix, n = x.shape
+    base = torch.empty((*prefix, n + extra_cols), dtype=x.dtype, device=x.device)
+    base[..., :n].copy_(x)
+    return base[..., :n]
+
+
+def fused_ar_rmsnorm_pad_stride(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    residual,
+    weight,
+    eps,
+    x_pad_to_multiple=0,
+    input_strided=False,
+    residual_strided=False,
+    distributed_init_method: Optional[str] = None,
+):
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+    x = x.to(device)
+    residual = residual.to(device)
+    weight = weight.to(device)
+    if input_strided:
+        x = _make_strided_lastdim_view(x)
+    if residual_strided:
+        residual = _make_strided_lastdim_view(residual)
+
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x,
+        residual,
+        weight,
+        eps,
+        x_pad_to_multiple=x_pad_to_multiple,
+    )
+
+    if dist.is_initialized():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return out, res_out
+
+
+def fused_ar_rmsnorm_padded_input(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    residual,
+    weight,
+    eps,
+    input_storage_width,
+    distributed_init_method: Optional[str] = None,
+):
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+    x = x.to(device)
+    residual = residual.to(device)
+    weight = weight.to(device)
+
+    if input_storage_width > x.shape[-1]:
+        padded_x = torch.zeros(
+            x.shape[:-1] + (input_storage_width,), dtype=x.dtype, device=x.device
+        )
+        padded_x[..., : x.shape[-1]].copy_(x)
+        x = padded_x
+
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1).cuda(), group=group)
+    torch.cuda.synchronize()
+
+    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x,
+        residual,
+        weight,
+        eps,
+    )
+
+    if dist.is_initialized():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return out, res_out
+
+
+def test_fused_ar_rmsnorm_pad_stride_case(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    *,
+    x_pad_to_multiple=0,
+    input_strided=False,
+    residual_strided=False,
+    distributed_init_method: Optional[str] = None,
+):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    pool = Pool(processes=tp_size)
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=dtype)
+    residual = torch.randn(shape, dtype=dtype)
+    weight = torch.randn((shape[-1],), dtype=dtype)
+    rets = []
+    eps = 1e-6
+    for rank in range(tp_size):
+        rets.append(
+            pool.apply_async(
+                fused_ar_rmsnorm_pad_stride,
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    x,
+                    residual,
+                    weight,
+                    eps,
+                    x_pad_to_multiple,
+                    input_strided,
+                    residual_strided,
+                    distributed_init_method,
+                ),
+            )
+        )
+    pool.close()
+    pool.join()
+
+    ref = x * tp_size
+    ref_residual = ref + residual
+    ref_out = F.rms_norm(
+        input=ref_residual,
+        normalized_shape=(shape[-1],),
+        weight=weight,
+        eps=eps,
+    )
+    if x_pad_to_multiple > 0:
+        n = shape[-1]
+        n_out = ((n + x_pad_to_multiple - 1) // x_pad_to_multiple) * x_pad_to_multiple
+        ref_out = F.pad(ref_out, (0, n_out - n), "constant", 0.0)
+    rets = [ret.get() for ret in rets]
+
+    atol = 1e-2 if dtype != torch.bfloat16 else 5e-2
+    rtol = atol
+    max_err = 0.0
+    max_res_err = 0.0
+    expected_n = ref_out.shape[-1]
+    for out, res_out in rets:
+        assert out.shape == shape[:-1] + (expected_n,)
+        assert res_out.shape == shape
+        err = checkAllclose(
+            ref_out,
+            out.to(ref_out),
+            msg=(
+                "test_fused_ar_rmsnorm_pad_stride_case: "
+                f"{shape=} {dtype=} {x_pad_to_multiple=} "
+                f"{input_strided=} {residual_strided=}"
+            ),
+            atol=atol,
+            rtol=rtol,
+        )
+        res_err = checkAllclose(
+            ref_residual,
+            res_out.to(ref_residual),
+            msg=(
+                "test_fused_ar_rmsnorm_pad_stride_case residual: "
+                f"{shape=} {dtype=} {x_pad_to_multiple=} "
+                f"{input_strided=} {residual_strided=}"
+            ),
+            atol=atol,
+            rtol=rtol,
+        )
+        max_err = max(max_err, err)
+        max_res_err = max(max_res_err, res_err)
+    return {
+        "shape": shape,
+        "dtype": str(dtype),
+        "x_pad_to_multiple": x_pad_to_multiple,
+        "input_strided": input_strided,
+        "residual_strided": residual_strided,
+        "err": max_err,
+        "res_err": max_res_err,
+    }
+
+
+def test_fused_ar_rmsnorm_padded_input_case(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    *,
+    input_storage_width,
+    distributed_init_method: Optional[str] = None,
+):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    pool = Pool(processes=tp_size)
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=dtype)
+    residual = torch.randn(shape, dtype=dtype)
+    weight = torch.randn((shape[-1],), dtype=dtype)
+    rets = []
+    eps = 1e-6
+    for rank in range(tp_size):
+        rets.append(
+            pool.apply_async(
+                fused_ar_rmsnorm_padded_input,
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    x,
+                    residual,
+                    weight,
+                    eps,
+                    input_storage_width,
+                    distributed_init_method,
+                ),
+            )
+        )
+    pool.close()
+    pool.join()
+
+    ref = x * tp_size
+    ref_residual = ref + residual
+    ref_out = F.rms_norm(
+        input=ref_residual,
+        normalized_shape=(shape[-1],),
+        weight=weight,
+        eps=eps,
+    )
+    rets = [ret.get() for ret in rets]
+
+    atol = 1e-2 if dtype != torch.bfloat16 else 5e-2
+    rtol = atol
+    max_err = 0.0
+    max_res_err = 0.0
+    for out, res_out in rets:
+        assert out.shape == shape
+        assert res_out.shape == shape
+        err = checkAllclose(
+            ref_out,
+            out.to(ref_out),
+            msg=(
+                "test_fused_ar_rmsnorm_padded_input_case: "
+                f"{shape=} {dtype=} {input_storage_width=}"
+            ),
+            atol=atol,
+            rtol=rtol,
+        )
+        res_err = checkAllclose(
+            ref_residual,
+            res_out.to(ref_residual),
+            msg=(
+                "test_fused_ar_rmsnorm_padded_input_case residual: "
+                f"{shape=} {dtype=} {input_storage_width=}"
+            ),
+            atol=atol,
+            rtol=rtol,
+        )
+        max_err = max(max_err, err)
+        max_res_err = max(max_res_err, res_err)
+    return {
+        "shape": shape,
+        "dtype": str(dtype),
+        "input_storage_width": input_storage_width,
+        "err": max_err,
+        "res_err": max_res_err,
+    }
+
+
+def fused_ar_rmsnorm_gemma(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    residual,
+    weight,
+    eps,
+    distributed_init_method: Optional[str] = None,
+):
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+    x = x.to(device)
+    residual = residual.to(device)
+    weight = weight.to(device)
+
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1, device=device), group=group)
+    torch.cuda.synchronize()
+
+    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x,
+        residual,
+        weight,
+        eps,
+        gemma_norm=True,
+    )
+
+    if dist.is_initialized():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return out, res_out
+
+
+def test_fused_ar_gemma_rmsnorm_case(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    *,
+    distributed_init_method: Optional[str] = None,
+):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    pool = Pool(processes=tp_size)
+    torch.manual_seed(123)
+    x = torch.randn(shape, dtype=dtype)
+    residual = torch.randn(shape, dtype=dtype)
+    # GemmaRMSNorm stores zero-centered weights and applies (1 + weight).
+    weight = torch.randn((shape[-1],), dtype=dtype) * 0.1
+    eps = 1e-6
+    rets = []
+    for rank in range(tp_size):
+        rets.append(
+            pool.apply_async(
+                fused_ar_rmsnorm_gemma,
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    x,
+                    residual,
+                    weight,
+                    eps,
+                    distributed_init_method,
+                ),
+            )
+        )
+    pool.close()
+    pool.join()
+
+    ref_residual = x * tp_size + residual
+    ref_out = F.rms_norm(
+        input=ref_residual,
+        normalized_shape=(shape[-1],),
+        weight=weight + 1.0,
+        eps=eps,
+    )
+    rets = [ret.get() for ret in rets]
+
+    atol = 1e-2 if dtype != torch.bfloat16 else 5e-2
+    rtol = atol
+    max_err = 0.0
+    max_res_err = 0.0
+    for out, res_out in rets:
+        assert out.shape == shape
+        assert res_out.shape == shape
+        err = checkAllclose(
+            ref_out,
+            out.to(ref_out),
+            msg=f"test_fused_ar_gemma_rmsnorm_case: {shape=} {dtype=}",
+            atol=atol,
+            rtol=rtol,
+        )
+        res_err = checkAllclose(
+            ref_residual,
+            res_out.to(ref_residual),
+            msg=f"test_fused_ar_gemma_rmsnorm_case residual: {shape=} {dtype=}",
+            atol=atol,
+            rtol=rtol,
+        )
+        max_err = max(max_err, err)
+        max_res_err = max(max_res_err, res_err)
+    return {
+        "shape": shape,
+        "dtype": str(dtype),
+        "err": max_err,
+        "res_err": max_res_err,
+    }
+
+
+def _set_ar_1stage_override(stage_override: Optional[str]):
+    if stage_override is None:
+        os.environ.pop("AITER_AR_1STAGE", None)
+    else:
+        os.environ["AITER_AR_1STAGE"] = stage_override
+
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+    CudaCommunicator._ar_1stage_override = {"1": True, "0": False}.get(
+        stage_override or ""
+    )
+
+
+def _expected_gemma_per_token_quant_dispatch(shape, dtype, stage_override):
+    m, n = shape
+    element_size = torch.empty((), dtype=dtype).element_size()
+    total_bytes = m * n * element_size
+    supported_hidden = n in [512, 1024, 2048, 4096] or (
+        n in [7168, 6144] and dtype in (torch.float16, torch.bfloat16)
+    )
+    if not supported_hidden or total_bytes > 4096 * 1024:
+        return "python_split"
+
+    pack_size = 16 // element_size
+    n_constrain = n % pack_size == 0 and n // pack_size <= 1024
+    use_1stage = {"1": True, "0": False}.get(
+        stage_override or "", total_bytes <= 128 * 1024
+    )
+    use_1stage = use_1stage and n_constrain
+    if use_1stage:
+        return "1stage"
+    if n_constrain and total_bytes <= 512 * 1024:
+        return "2stage"
+    if n_constrain:
+        return "split"
+    return "unsupported"
+
+
+def fused_ar_gemma_rmsnorm_quant(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    residual,
+    weight,
+    eps,
+    stage_override: Optional[str] = None,
+    distributed_init_method: Optional[str] = None,
+):
+    _set_ar_1stage_override(stage_override)
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+
+    try:
+        x = x.to(device)
+        residual = residual.to(device)
+        weight = weight.to(device)
+
+        group = get_tp_group().device_group
+        dist.all_reduce(torch.zeros(1, device=device), group=group)
+        torch.cuda.synchronize()
+
+        out, res_out, scale_out = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+            x,
+            residual,
+            weight,
+            eps,
+            quant_type="per_token",
+            gemma_norm=True,
+        )
+        dequant = out.float() * scale_out
+        return dequant.cpu(), res_out.cpu(), out.dtype, tuple(scale_out.shape)
+    finally:
+        if dist.is_initialized():
+            destroy_model_parallel()
+            destroy_distributed_environment()
+            torch.cuda.empty_cache()
+
+
+def _fused_ar_gemma_rmsnorm_quant_case(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    *,
+    stage_override: Optional[str],
+    distributed_init_method: Optional[str] = None,
+):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    torch.manual_seed(321)
+    x = torch.randn(shape, dtype=dtype)
+    residual = torch.randn(shape, dtype=dtype)
+    # GemmaRMSNorm stores zero-centered weights and applies (1 + weight).
+    weight = torch.randn((shape[-1],), dtype=dtype) * 0.1
+    eps = 1e-6
+
+    ref_residual = (x * tp_size).to(dtype) + residual
+    ref_out = F.rms_norm(
+        input=ref_residual,
+        normalized_shape=(shape[-1],),
+        weight=weight + 1.0,
+        eps=eps,
+    )
+    quant_function = aiter.get_hip_quant(aiter.QuantType.per_Token)
+    ref_fp8, ref_scale = quant_function(ref_out.cuda(), quant_dtype=dtypes.fp8)
+    ref_dequant = (ref_fp8.float() * ref_scale).cpu()
+
+    with Pool(processes=tp_size) as pool:
+        rets = [
+            pool.apply_async(
+                fused_ar_gemma_rmsnorm_quant,
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    x,
+                    residual,
+                    weight,
+                    eps,
+                    stage_override,
+                    distributed_init_method,
+                ),
+            )
+            for rank in range(tp_size)
+        ]
+        rets = [ret.get() for ret in rets]
+
+    expected_scale_shape = shape[:-1] + (1,)
+    atol = 5e-2
+    rtol = atol
+    max_quant_err = 0.0
+    max_res_err = 0.0
+    for rank, (dequant_out, res_out, out_dtype, scale_shape) in enumerate(rets):
+        assert out_dtype == dtypes.fp8
+        assert scale_shape == expected_scale_shape
+        msg = (
+            "test_fused_ar_gemma_rmsnorm_quant_case: "
+            f"{shape=} {dtype=} {stage_override=} rank={rank}"
+        )
+        max_quant_err = max(
+            max_quant_err,
+            checkAllclose(
+                ref_dequant,
+                dequant_out.to(ref_dequant),
+                msg=msg,
+                atol=atol,
+                rtol=rtol,
+            ),
+        )
+        max_res_err = max(
+            max_res_err,
+            checkAllclose(
+                ref_residual,
+                res_out.to(ref_residual),
+                msg=f"{msg} residual",
+                atol=atol,
+                rtol=rtol,
+            ),
+        )
+
+    return {
+        "shape": shape,
+        "dtype": str(dtype),
+        "stage_override": stage_override or "auto",
+        "expected_path": _expected_gemma_per_token_quant_dispatch(
+            shape, dtype, stage_override
+        ),
+        "quant_dequant_err": max_quant_err,
+        "res_err": max_res_err,
+    }
+
+
+try:
+    import pytest
+
+    @pytest.mark.parametrize(
+        "x_pad_to_multiple,input_strided,residual_strided",
+        [
+            (0, True, False),
+            (0, False, True),
+            (256, True, False),
+            (256, True, True),
+        ],
+    )
+    def test_pad_and_stride_tp2(
+        x_pad_to_multiple: int, input_strided: bool, residual_strided: bool
+    ):
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_rmsnorm_pad_stride_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(13, 2880),
+            dtype=dtypes.d_dtypes["bf16"],
+            x_pad_to_multiple=x_pad_to_multiple,
+            input_strided=input_strided,
+            residual_strided=residual_strided,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert ret["err"] < 5e-2, f"fused_ar_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_padded_input_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_rmsnorm_padded_input_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(13, 2880),
+            dtype=dtypes.d_dtypes["bf16"],
+            input_storage_width=3072,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert ret["err"] < 5e-2, f"fused_ar_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_large_padded_output_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_rmsnorm_pad_stride_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(13, 4096),
+            dtype=dtypes.d_dtypes["bf16"],
+            x_pad_to_multiple=16384,
+            input_strided=False,
+            residual_strided=False,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert ret["err"] < 5e-2, f"fused_ar_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_strided_nd_input_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_rmsnorm_pad_stride_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(3, 13, 2880),
+            dtype=dtypes.d_dtypes["bf16"],
+            x_pad_to_multiple=0,
+            input_strided=True,
+            residual_strided=False,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert ret["err"] < 5e-2, f"fused_ar_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_gemma_norm_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_gemma_rmsnorm_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(17, 2048),
+            dtype=dtypes.d_dtypes["bf16"],
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert (
+            ret["err"] < 5e-2
+        ), f"fused_ar_gemma_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_gemma_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    @pytest.mark.parametrize(
+        "dispatch_path,shape,stage_override",
+        [
+            ("1stage", (17, 4096), "1"),
+            ("2stage", (32, 4096), "0"),
+            ("split", (96, 4096), "0"),
+        ],
+    )
+    def test_gemma_norm_per_token_quant_dispatch_paths_tp2(
+        dispatch_path, shape, stage_override
+    ):
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        dtype = dtypes.d_dtypes["bf16"]
+        expected_path = _expected_gemma_per_token_quant_dispatch(
+            shape, dtype, stage_override
+        )
+        assert expected_path == dispatch_path
+        ret = _fused_ar_gemma_rmsnorm_quant_case(
+            tp_size=2,
+            pp_size=1,
+            shape=shape,
+            dtype=dtype,
+            stage_override=stage_override,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert (
+            ret["quant_dequant_err"] < 5e-2
+        ), f"gemma per-token quant dequant err={ret['quant_dequant_err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"gemma per-token quant residual err={ret['res_err']} config={ret}"
+
+except ImportError:
+    pass
+
+
 l_dtype = ["fp16", "bf16"]
 # (13, 2880): GPT-OSS-120B / GPT-OSS-20B hidden_size (n_bytes=5760, 4096 < 5760 < 8192)
 l_shape = [

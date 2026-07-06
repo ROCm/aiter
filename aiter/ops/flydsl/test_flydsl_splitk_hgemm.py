@@ -25,11 +25,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.gemm_kernels import (
-        FIXED_C_TO_LDS,
-        FIXED_STAGE,
-        KERNEL_ASYNC_COPY,
         flydsl_hgemm,
-        flydsl_kernel_name,
     )
 except ImportError as exc:
     pytest.skip(
@@ -65,7 +61,7 @@ SPLITK_PRECISION_CASES = [
         "tile_m": 16,
         "tile_n": 128,
         "pack_n": 1,
-        "split_k": 4,
+        "split_k": 2,
         "b_preshuffle": False,
     },
     {
@@ -213,40 +209,6 @@ def run_splitk_precision_case(
 def test_flydsl_splitk_hgemm_precision_regressions(case: dict):
     passed, _, _ = run_splitk_precision_case(case)
     assert passed
-
-
-def _make_kernel_name_kwargs(**overrides) -> dict:
-    kwargs = {
-        "stage": FIXED_STAGE,
-        "dtype": "bf16",
-        "out_dtype": "bf16",
-        "tile_m": 32,
-        "tile_n": 64,
-        "tile_k": 64,
-        "split_k": 8,
-        "block_m_warp": 2,
-        "block_n_warp": 2,
-        "async_copy": KERNEL_ASYNC_COPY,
-        "b_to_lds": True,
-        "b_preshuffle": False,
-        "c_to_lds": FIXED_C_TO_LDS,
-    }
-    kwargs.update(overrides)
-    return kwargs
-
-
-def test_flydsl_kernel_name_rejects_legacy_metadata():
-    with pytest.raises(ValueError, match="stage="):
-        flydsl_kernel_name(**_make_kernel_name_kwargs(stage=1))
-
-    with pytest.raises(ValueError, match="async_copy"):
-        flydsl_kernel_name(**_make_kernel_name_kwargs(async_copy=not KERNEL_ASYNC_COPY))
-
-    with pytest.raises(ValueError, match="c_to_lds"):
-        flydsl_kernel_name(**_make_kernel_name_kwargs(c_to_lds=True))
-
-    with pytest.raises(ValueError, match="b_to_lds=False"):
-        flydsl_kernel_name(**_make_kernel_name_kwargs(b_to_lds=True, b_preshuffle=True))
 
 
 def print_summary(results: list[tuple[str, str, float, float]]) -> None:

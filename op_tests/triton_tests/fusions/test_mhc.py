@@ -646,23 +646,43 @@ def test_triton_mhc_matches_hip(M, n, C):
         sinkhorn_iters=sinkhorn_repeat,
     )
 
-    residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    # HACK: temporarily swap the HIP reference for the torch reference to
+    # confirm Triton mhc() matches the spec (and isolate the HIP 2nd-row bug).
+    # Triton mhc() uses canonical log-domain Sinkhorn, so compare against
+    # mhc_torch with asymmetric_exp_domain=False.
+    #
+    # Original HIP reference (kept for re-enabling once the HIP
+    # mhc_pre_big_fuse 2nd-row projection bug is fixed):
+    #
+    # residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
+    #     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    # )
+    # # aiter.mhc_pre allocates outputs via torch.empty without a device kwarg,
+    # # so it needs an active torch.device context to land on the GPU.
+    # with torch.device(x.device):
+    #     post_h, comb_h, li_h = _aiter.mhc_pre(
+    #         residual,
+    #         fn_hip,
+    #         hc_scale,
+    #         hc_base,
+    #         rms_eps=rms_eps,
+    #         hc_pre_eps=hc_pre_eps,
+    #         hc_sinkhorn_eps=hc_sinkhorn_eps,
+    #         hc_post_mult_value=hc_post_mult_value,
+    #         sinkhorn_repeat=sinkhorn_repeat,
+    #     )
+    post_h, comb_h, _hpre_ref, li_h = mhc_torch(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        sinkhorn_iters=sinkhorn_repeat,
     )
-    # aiter.mhc_pre allocates outputs via torch.empty without a device kwarg,
-    # so it needs an active torch.device context to land on the GPU.
-    with torch.device(x.device):
-        post_h, comb_h, li_h = _aiter.mhc_pre(
-            residual,
-            fn_hip,
-            hc_scale,
-            hc_base,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_sinkhorn_eps=hc_sinkhorn_eps,
-            hc_post_mult_value=hc_post_mult_value,
-            sinkhorn_repeat=sinkhorn_repeat,
-        )
 
     cfg = f"(M={M}, n={n}, C={C})"
     for name, t, h, atol, rtol in (
@@ -670,7 +690,7 @@ def test_triton_mhc_matches_hip(M, n, C):
         ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
         ("layer_input", li_t, li_h, 8e-2, 2e-2),
     ):
-        msg = f"{name} Triton vs aiter.mhc_pre mismatch at {cfg}"
+        msg = f"{name} Triton vs mhc_torch mismatch at {cfg}"
         pct = checkAllclose(
             t.float(),
             h.float(),
@@ -857,19 +877,27 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
 @pytest.mark.parametrize("n", [4])
 @pytest.mark.parametrize("C", [1024, 4096, 7168])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_triton_mhc_pre_post(M, n, C, dtype):
-    """Fused ``mhc_post_pre()`` matches the unfused torch chain.
+@pytest.mark.parametrize("use_asymmetric_exp_domain", [False, True])
+def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
+    """Fused ``mhc_post_pre()`` matches the unfused reference chain.
 
     ``mhc_post_pre`` fuses one mHC sub-layer transition: it consumes the
     previous sub-layer's ``(post_mix, comb_mix)`` to update the residual
     stream via the mhc_post mix, then runs the next sub-layer's mhc_pre
     GEMM + RMS-norm + Sinkhorn on the just-updated residual.
 
-    Reference is the unfused chain on torch:
-        residual_out = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
-        (h_post, h_res, _h_pre, layer_input_out) = mhc_torch(residual_out.view(M, n*C), phi, ...)
+    Both modes compare against the **torch** chain
+    (``mhc_post_torch → mhc_torch``); the Sinkhorn variant inside ``mhc_torch``
+    is selected by ``use_asymmetric_exp_domain``:
 
-    Compared outputs: ``(residual_out, h_post, h_res, layer_input_out)``.
+    - ``False``: canonical log-domain Sinkhorn-Knopp.
+    - ``True``: HIP-compatible asymmetric exp-domain Sinkhorn
+      (``sinkhorn_knopp_asymmetric_exp_domain_torch``): first iter
+      ``softmax(row) + eps`` then ``div(col + eps)``, followed by
+      ``sinkhorn_iters - 1`` symmetric ``div(row + eps)/div(col + eps)`` iters.
+
+    Compared outputs in both modes:
+    ``(residual_out, h_post, h_res, layer_input_out)``.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required for mHC kernels")
@@ -890,9 +918,15 @@ def test_triton_mhc_pre_post(M, n, C, dtype):
     _x_unused, phi, alpha_pre, alpha_post, alpha_res, bias, _n = generate_mhc_inputs(
         M, n, C, dtype
     )
+    alphas_t = _alphas(alpha_pre, alpha_post, alpha_res, device=layer_input.device)
 
-    # Reference: torch mhc_post -> torch mhc. mhc_torch is the PyTorch ref;
-    # it still takes the three floats directly (no alphas tensor).
+    # Torch reference for both modes (fp32 throughout). The only difference is
+    # the Sinkhorn variant selected by ``asymmetric_exp_domain``:
+    #   - False: canonical log-domain Sinkhorn-Knopp.
+    #   - True : HIP-compatible asymmetric exp-domain Sinkhorn
+    #            (softmax(row) + eps first iter, then symmetric div iters).
+    # Both compare against the **torch** chain (``mhc_post_torch → mhc_torch``);
+    # no HIP kernel is involved.
     residual_out_ref = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
     h_post_ref, h_res_ref, _h_pre_ref, layer_input_out_ref = mhc_torch(
         residual_out_ref.view(M, n * C),
@@ -903,25 +937,33 @@ def test_triton_mhc_pre_post(M, n, C, dtype):
         bias,
         n,
         sinkhorn_iters=sinkhorn_iters,
+        asymmetric_exp_domain=use_asymmetric_exp_domain,
+        hc_sinkhorn_eps=1e-6,
     )
+    # Keep phi in its native K-contiguous layout (mhc_torch casts to fp32
+    # internally; the Triton kernel consumes the same values).
+    phi_triton = phi.T.contiguous().T
 
-    # Convert to K-contiguous tensor
-    phi = phi.T.contiguous().T.to(torch.float32)
-
-    # Triton fused — mhc_post_pre consumes the alphas tensor.
+    # Triton fused — mhc_post_pre selects log-domain (default) or
+    # HIP-compatible exp-domain Sinkhorn via the flag.
     h_post_t, h_res_t, layer_input_out_t, residual_out_t = mhc_post_pre(
         layer_input,
         residual_in,
         post_mix,
         comb_mix,
-        phi,
-        _alphas(alpha_pre, alpha_post, alpha_res, device=layer_input.device),
+        phi_triton,
+        alphas_t,
         bias,
         n,
         sinkhorn_iters=sinkhorn_iters,
+        asymmetric_exp_domain=use_asymmetric_exp_domain,
+        hc_sinkhorn_eps=1e-6,
     )
 
-    cfg = f"(M={M}, n={n}, C={C}, dtype={dtype})"
+    cfg = (
+        f"(M={M}, n={n}, C={C}, dtype={dtype}, "
+        f"use_asymmetric_exp_domain={use_asymmetric_exp_domain})"
+    )
     for name, t, ref, atol, rtol in (
         ("residual_out", residual_out_t, residual_out_ref, 2e-2, 2e-2),
         ("h_post", h_post_t, h_post_ref, 2e-2, 2e-2),

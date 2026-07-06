@@ -242,7 +242,7 @@ def _bwd_dkdv_inner(
         else:
             qkT = tl.dot(k, qT)
             if HAS_PE:
-                qkT += tl.dot(k_pe, qT_pe)
+                qkT = tl.dot(k_pe, qT_pe, acc=qkT)
         qkT_scaled = qkT * sm_scale
 
         if USE_ALIBI:
@@ -294,7 +294,7 @@ def _bwd_dkdv_inner(
                     * descale_do
                 )
             else:
-                dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+                dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
             if IS_FP8:
                 scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
@@ -304,7 +304,7 @@ def _bwd_dkdv_inner(
                     * descale_do
                 )
             else:
-                dv += tl.dot(pT.to(do.type.element_ty), do)
+                dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -328,9 +328,11 @@ def _bwd_dkdv_inner(
                 * descale_q
             )
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
             if HAS_PE:
-                dk_pe += tl.dot(dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe))
+                dk_pe = tl.dot(
+                    dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe), acc=dk_pe
+                )
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -465,7 +467,7 @@ def _bwd_dq_inner(
         else:
             qk = tl.dot(q, kT)
             if HAS_PE:
-                qk += tl.dot(q_pe, kT_pe)
+                qk = tl.dot(q_pe, kT_pe, acc=qk)
         qk_scaled = qk * sm_scale
 
         if USE_ALIBI:
@@ -512,9 +514,9 @@ def _bwd_dq_inner(
                 * descale_k
             )
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
             if HAS_PE:
-                dq_pe += tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe))
+                dq_pe = tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe), acc=dq_pe)
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn

@@ -28,6 +28,7 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
     if gindx is not None:
+        gindx = gindx.to(torch.int32)
         ret["name"] += "_layer1"
     else:
         ret["name"] += "_layer2"
@@ -113,7 +114,7 @@ def _moe_gemm_int8_smoothquant(
     limit,
     ACTIVATION_REDUCTION_N: tl.constexpr,
     APPLY_ACTIVATION: tl.constexpr,
-    ADD_RESIDUAL: tl.constexpr,
+    SWIGLU_ADD_RESIDUAL: tl.constexpr,
     # MoE config
     N_EXPTS_ACT: tl.constexpr,
     # optimization config
@@ -147,7 +148,7 @@ def _moe_gemm_int8_smoothquant(
 
     Activation functions:
     - alpha=0: No activation
-    - alpha==1, ADD_RESIDUAL=False: SiLU
+    - alpha==1, SWIGLU_ADD_RESIDUAL=False: SiLU
     - alpha!=0: SwiGLU
     """
     # Assume positive strides for compiler hints
@@ -293,7 +294,7 @@ def _moe_gemm_int8_smoothquant(
         acc = acc + bias[None, :]
 
     if APPLY_ACTIVATION and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
