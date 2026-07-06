@@ -3599,6 +3599,7 @@ def compile_moe_reduction(
     dtype_str: str = "f16",
     use_mask: bool = False,
     num_experts: int = 0,
+    out_dtype_str: str | None = None,
 ):
     """Compile a reduction kernel that sums over the topk dimension.
 
@@ -3620,7 +3621,15 @@ def compile_moe_reduction(
     BLOCK_SIZE = 256
     VEC_WIDTH = 8
 
-    if dtype_str == "f32":
+    is_fp8 = dtype_str == "fp8"
+    if is_fp8:
+        if use_mask:
+            raise ValueError("fp8 moe reduction does not support EP masking")
+        out_tag = out_dtype_str or "bf16"
+        if out_tag not in ("bf16", "f16"):
+            raise ValueError(f"fp8 reduce out_dtype must be bf16/f16, got {out_tag}")
+        elem_type_tag = out_tag
+    elif dtype_str == "f32":
         elem_type_tag = "f32"
     elif dtype_str == "f16":
         elem_type_tag = "f16"
@@ -3646,12 +3655,18 @@ def compile_moe_reduction(
         )
         return ty() if callable(ty) else ty
 
-    module_name = (
-        f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
-        f"_{dtype_str}_topk{topk}_md{model_dim}"
-    )
+    if is_fp8:
+        module_name = (
+            f"moe_reduction_fp8_kernel_{elem_type_tag}_topk{topk}_md{model_dim}"
+        )
+    else:
+        module_name = (
+            f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
+            f"_{dtype_str}_topk{topk}_md{model_dim}"
+        )
 
-    elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
+    elem_bytes_c = 2 if is_fp8 else ((32 if dtype_str == "f32" else 16) // 8)
+    fp8_row_bytes_in = model_dim + model_dim // 8
 
     if True:
 
@@ -3692,8 +3707,12 @@ def compile_moe_reduction(
             # fold the per-WG token byte offset into the descriptor's 48-bit
             # base address (computed in i64). The in-kernel voffsets then only
             # need to address one token's slab.
-            slab_elems_x = c_topk * c_model_dim
-            x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
+            if const_expr(is_fp8):
+                # X row = model_dim fp8 bytes + model_dim/8 e8m0 bytes.
+                x_slab_nbytes = c_topk * fx.Index(fp8_row_bytes_in)
+            else:
+                slab_elems_x = c_topk * c_model_dim
+                x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
             y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)
             x_base_off_i64 = fx.Int64(token_idx * x_slab_nbytes)
             y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
@@ -3732,6 +3751,106 @@ def compile_moe_reduction(
                 col_ok = col_base < c_model_dim
                 _if_col = scf.IfOp(col_ok)
                 with _if_then(_if_col):
+                  if const_expr(is_fp8):
+                    # ── MXFP8 route-out dequant + topk sum ──
+                    f32 = T.f32
+                    i32 = T.i32
+                    i8 = T.i8
+                    c_row_bytes_in = fx.Index(fp8_row_bytes_in)
+                    c_scale_base = fx.Index(model_dim)
+                    vec2_f32 = T.vec(2, f32)
+                    # Fast path: full 8-col group in-bounds (model_dim is a
+                    # multiple of 8, so col_base is group-aligned).
+                    end_ok = col_base + c_vecw <= c_model_dim
+                    _if_full8 = scf.IfOp(end_ok, has_else=True)
+                    with _if_then(_if_full8):
+                        acc = [arith.constant(0.0, type=f32) for _ in range(VEC_WIDTH)]
+                        scale_col = col_base // c_vecw
+                        for k in range_constexpr(topk):
+                            k_row_base = fx.Index(k) * c_row_bytes_in
+                            # 8 fp8 value bytes as vec<2 x i32> (one 8B load).
+                            val_i32_off = fx.Int32(
+                                (k_row_base + col_base) // fx.Index(4)
+                            )
+                            w_v = buffer_ops.buffer_load(
+                                x_rsrc, val_i32_off, vec_width=2, dtype=i32
+                            )
+                            w01 = vector.extract(
+                                w_v, static_position=[0], dynamic_position=[]
+                            )
+                            w23 = vector.extract(
+                                w_v, static_position=[1], dynamic_position=[]
+                            )
+                            scale_off_i32 = fx.Int32(
+                                k_row_base + c_scale_base + scale_col
+                            )
+                            e8m0_i8 = buffer_ops.buffer_load(
+                                x_rsrc, scale_off_i32, vec_width=1, dtype=i8
+                            )
+                            e8m0_i32 = arith.extui(i32, e8m0_i8)
+                            scale_f32 = (e8m0_i32 << fx.Int32(23)).bitcast(f32)
+                            pairs = [
+                                rocdl.cvt_pk_f32_fp8(vec2_f32, w01, False),
+                                rocdl.cvt_pk_f32_fp8(vec2_f32, w01, True),
+                                rocdl.cvt_pk_f32_fp8(vec2_f32, w23, False),
+                                rocdl.cvt_pk_f32_fp8(vec2_f32, w23, True),
+                            ]
+                            for pi in range_constexpr(4):
+                                v0 = vector.extract(
+                                    pairs[pi], static_position=[0], dynamic_position=[]
+                                )
+                                v1 = vector.extract(
+                                    pairs[pi], static_position=[1], dynamic_position=[]
+                                )
+                                acc[2 * pi] = acc[2 * pi] + v0 * scale_f32
+                                acc[2 * pi + 1] = acc[2 * pi + 1] + v1 * scale_f32
+                        out_vec_ty = T.vec(VEC_WIDTH, elem_type())
+                        out_elems = [
+                            acc[i].truncf(elem_type()) for i in range(VEC_WIDTH)
+                        ]
+                        out_vec = vector.from_elements(out_vec_ty, out_elems)
+                        buffer_ops.buffer_store(
+                            out_vec, y_rsrc, fx.Int32(col_base)
+                        )
+                    with _if_else(_if_full8):
+                        # Tail path: per-lane scalar for the last partial group.
+                        for lane in range_constexpr(VEC_WIDTH):
+                            col = col_base + fx.Index(lane)
+                            lane_ok = col < c_model_dim
+                            _if_lane8 = scf.IfOp(lane_ok)
+                            with _if_then(_if_lane8):
+                                a = arith.constant(0.0, type=f32)
+                                scale_col = col // c_vecw
+                                for k in range_constexpr(topk):
+                                    k_row_base = fx.Index(k) * c_row_bytes_in
+                                    b_i8 = buffer_ops.buffer_load(
+                                        x_rsrc,
+                                        fx.Int32(k_row_base + col),
+                                        vec_width=1,
+                                        dtype=i8,
+                                    )
+                                    b_i32 = arith.extui(i32, b_i8) & fx.Int32(0xFF)
+                                    e8m0_i8 = buffer_ops.buffer_load(
+                                        x_rsrc,
+                                        fx.Int32(
+                                            k_row_base + c_scale_base + scale_col
+                                        ),
+                                        vec_width=1,
+                                        dtype=i8,
+                                    )
+                                    e8m0_i32 = arith.extui(i32, e8m0_i8)
+                                    scale_f32 = (
+                                        e8m0_i32 << fx.Int32(23)
+                                    ).bitcast(f32)
+                                    p = rocdl.cvt_pk_f32_fp8(vec2_f32, b_i32, False)
+                                    v0 = vector.extract(
+                                        p, static_position=[0], dynamic_position=[]
+                                    )
+                                    a = a + v0 * scale_f32
+                                buffer_ops.buffer_store(
+                                    a.truncf(elem_type()), y_rsrc, fx.Int32(col)
+                                )
+                  else:
                     # Fast path: full vector in-bounds (Index <= → ule)
                     end_ok = col_base + c_vecw <= c_model_dim
                     _if_full = scf.IfOp(end_ok, has_else=True)

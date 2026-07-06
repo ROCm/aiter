@@ -3003,16 +3003,32 @@ def compile_mixed_moe_gemm2(
 
     out_s = str(out_dtype).strip().lower()
     if const_expr(
-        out_s not in ("f16", "fp16", "half", "bf16", "bfloat16", "f32", "fp32", "float")
+        out_s
+        not in (
+            "f16",
+            "fp16",
+            "half",
+            "bf16",
+            "bfloat16",
+            "f32",
+            "fp32",
+            "float",
+            "fp8",
+        )
     ):
         raise ValueError(
-            f"out_dtype must be 'f16', 'bf16', or 'f32', got {out_dtype!r}"
+            f"out_dtype must be 'f16', 'bf16', 'f32', or 'fp8', got {out_dtype!r}"
         )
     out_is_f32 = out_s in ("f32", "fp32", "float")
     out_is_bf16 = out_s in ("bf16", "bfloat16")
+    need_fp8_out = out_s == "fp8"
+    if const_expr(need_fp8_out and bool(accumulate)):
+        raise ValueError(
+            "compile_mixed_moe_gemm2 fp8 output requires accumulate=False (reduce path)"
+        )
     if const_expr((not bool(accumulate)) and out_is_f32):
         raise ValueError(
-            "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
+            "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16','fp8'}"
         )
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
@@ -3087,8 +3103,13 @@ def compile_mixed_moe_gemm2(
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}{cumul_tag}{xcd_tag}{acc_tag}"
     ).replace("-", "_")
+    # fp8 output keeps the CShuffle staging buffer in f32 (4B) like the quant
+    # path in gemm1; bf16/f16 stage at 2B.
+    cshuffle_elem_bytes = 4 if need_fp8_out else 2
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    lds_out_bytes = (
+        cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    )
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes + lds_tw_bytes
@@ -3232,7 +3253,11 @@ def compile_mixed_moe_gemm2(
                 SmemPtr(
                     base_ptr,
                     lds_x_ptr.byte_offset,
-                    (T.bf16 if out_is_bf16 else T.f16),
+                    (
+                        T.f32
+                        if need_fp8_out
+                        else (T.bf16 if out_is_bf16 else T.f16)
+                    ),
                     shape=(tile_m * tile_n,),
                 ).get()
                 if _use_cshuffle_epilog
@@ -3240,7 +3265,11 @@ def compile_mixed_moe_gemm2(
             )
 
             lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-            lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+            lds_out_b = (
+                cshuffle_elem_bytes * int(tile_m) * int(tile_n)
+                if _use_cshuffle_epilog
+                else 0
+            )
             lds_tid_off = max(lds_x_b, lds_out_b)
             lds_tid = SmemPtr(
                 base_ptr, lds_x_ptr.byte_offset + lds_tid_off, T.i32, shape=(tile_m,)
@@ -3270,17 +3299,29 @@ def compile_mixed_moe_gemm2(
 
             w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
 
-            out_elem_bytes = 4 if out_is_f32 else 2
-            out_nbytes_idx = (
-                tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
+            out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
+            # fp8 route-out row = [N fp8 value bytes | N/8 e8m0 scale bytes].
+            scale_bytes_per_row = (int(model_dim) // 8) if need_fp8_out else 0
+            out_row_bytes_const = int(model_dim) * int(out_elem_bytes) + int(
+                scale_bytes_per_row
             )
-            if const_expr(not bool(accumulate)):
+            if const_expr(need_fp8_out):
                 out_nbytes_idx = (
                     tokens_in
                     * arith.index(topk)
-                    * n_in
-                    * arith.constant(out_elem_bytes, index=True)
+                    * arith.constant(out_row_bytes_const, index=True)
                 )
+            else:
+                out_nbytes_idx = (
+                    tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
+                )
+                if const_expr(not bool(accumulate)):
+                    out_nbytes_idx = (
+                        tokens_in
+                        * arith.index(topk)
+                        * n_in
+                        * arith.constant(out_elem_bytes, index=True)
+                    )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
             out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
 
@@ -4546,13 +4587,19 @@ def compile_mixed_moe_gemm2(
 
                         if const_expr(doweight_stage2):
                             v = v * tw
-                        v_out = arith.trunc_f(out_elem(), v)
 
                         lds_idx = row_base_lds + col_local
-                        vec1_out = T.vec(1, out_elem())
-                        v1 = vector.from_elements(vec1_out, [v_out])
-
-                        vector.store(v1, lds_out, [lds_idx], alignment=2)
+                        if const_expr(need_fp8_out):
+                            # Stage the (weighted) f32 result; quantize to MXFP8
+                            # in store_pair after the CShuffle transpose.
+                            vec1_f32 = T.vec(1, f32)
+                            v1 = vector.from_elements(vec1_f32, [v])
+                            vector.store(v1, lds_out, [lds_idx], alignment=4)
+                        else:
+                            v_out = arith.trunc_f(out_elem(), v)
+                            vec1_out = T.vec(1, out_elem())
+                            v1 = vector.from_elements(vec1_out, [v_out])
+                            vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                 row_stride_bytes_py = int(model_dim) * int(out_elem_bytes)
                 use_buf_atomic = bool(accumulate) and (row_stride_bytes_py <= 16384)
@@ -4584,6 +4631,10 @@ def compile_mixed_moe_gemm2(
                         row_byte_base = out_base_idx + t_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
                         )
+                    elif const_expr(need_fp8_out):
+                        row_byte_base = out_base_idx + ts_idx * arith.constant(
+                            out_row_bytes_const, index=True
+                        )
                     else:
                         row_byte_base = out_base_idx + ts_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
@@ -4601,7 +4652,84 @@ def compile_mixed_moe_gemm2(
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     fused, row_byte_base, row_byte_off_i32 = row_ctx
-                    if const_expr(not bool(accumulate)):
+                    if const_expr(need_fp8_out):
+                        # frag is vector<e_vec x f32>; e_vec==8 == one opus
+                        # 8-col MXFP8 group. Quantize to e4m3 + one e8m0 byte.
+                        c0_i32_q = arith.constant(0, type=T.i32)
+                        c1_i32_q = arith.constant(1, type=T.i32)
+                        c7_i32_q = arith.constant(7, type=T.i32)
+                        c23_i32_q = arith.constant(23, type=T.i32)
+                        c254_i32_q = arith.constant(254, type=T.i32)
+                        c255_i32_q = arith.constant(0xFF, type=T.i32)
+                        c0_f32_q = arith.constant(0.0, type=T.f32)
+                        frag_vals = []
+                        for i in range_constexpr(e_vec):
+                            frag_vals.append(
+                                vector.extract(
+                                    frag, static_position=[i], dynamic_position=[]
+                                )
+                            )
+                        local_max = c0_f32_q
+                        for i in range_constexpr(e_vec):
+                            abs_v = llvm.call_intrinsic(
+                                f32, "llvm.fabs.f32", [frag_vals[i]], [], []
+                            )
+                            local_max = arith.maximumf(local_max, abs_v)
+                        # opus: E = bf16/f32 biased exp(amax) - 7, clamp E>=1,
+                        # E=0 when amax==0. scale byte = E; dequant = fp8*2^(E-127).
+                        amax_bits = local_max.bitcast(T.i32)
+                        ax_e = (amax_bits >> c23_i32_q) & c255_i32_q
+                        E = ax_e - c7_i32_q
+                        E = arith.maxsi(E, c1_i32_q)
+                        is_zero = arith.cmpi(
+                            CmpIPredicate.eq, amax_bits, c0_i32_q
+                        )
+                        E = arith.select(is_zero, c0_i32_q, E)
+                        quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(T.f32)
+                        scaled_vals = []
+                        for i in range_constexpr(e_vec):
+                            scaled_vals.append(frag_vals[i] * quant_scale)
+                        ptr_addr_idx = row_byte_base + col_g0
+                        for wg in range_constexpr(e_vec // 4):
+                            b = wg * 4
+                            packed_w = c0_i32_q
+                            packed_w = rocdl.cvt_pk_fp8_f32(
+                                T.i32, scaled_vals[b], scaled_vals[b + 1], packed_w, 0
+                            )
+                            packed_w = rocdl.cvt_pk_fp8_f32(
+                                T.i32,
+                                scaled_vals[b + 2],
+                                scaled_vals[b + 3],
+                                packed_w,
+                                1,
+                            )
+                            word_ptr = ptr_addr_idx + arith.constant(
+                                wg * 4, index=True
+                            )
+                            out_ptr_v = idx_to_llvm_ptr(word_ptr)
+                            packed_raw = (
+                                packed_w._value
+                                if hasattr(packed_w, "_value")
+                                else packed_w
+                            )
+                            llvm.StoreOp(
+                                packed_raw, out_ptr_v, alignment=4, nontemporal=True
+                            )
+                        # e8m0 scale byte at [model_dim + col_g0/8].
+                        scale_byte_idx = (
+                            row_byte_base
+                            + arith.constant(model_dim, index=True)
+                            + (col_g0 // arith.constant(8, index=True))
+                        )
+                        scale_ptr_v = idx_to_llvm_ptr(scale_byte_idx)
+                        e8m0_i8 = arith.TruncIOp(T.i8, E)
+                        e8m0_raw = (
+                            e8m0_i8._value if hasattr(e8m0_i8, "_value") else e8m0_i8
+                        )
+                        llvm.StoreOp(
+                            e8m0_raw, scale_ptr_v, alignment=1, nontemporal=True
+                        )
+                    elif const_expr(not bool(accumulate)):
                         col_idx = col_g0
                         byte_off_col = col_idx * arith.constant(
                             out_elem_bytes, index=True
@@ -4664,7 +4792,9 @@ def compile_mixed_moe_gemm2(
                     n_tile_base=n_tile_base,
                     lds_out=lds_out,
                     frag_elem_type=(
-                        ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get()
+                        ir.F32Type.get()
+                        if need_fp8_out
+                        else (ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get())
                     ),
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
