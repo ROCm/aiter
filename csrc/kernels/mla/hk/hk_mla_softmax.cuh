@@ -545,6 +545,99 @@ softmax_p1_prescaled(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t
     *p_row_sum_e = kIsFirstIter ? local_sum_e : (rescale * (*p_row_sum_e) + local_sum_e);
 }
 
+// V40 prescaled variant of softmax_p1_16 (16 VGPRs = kBlockN=64). Same as
+// softmax_p1_prescaled but over 16 dwords: Q is pre-scaled by sm_scale*log2e in
+// load_q, so scores arrive in log2 units -> NO per-tile log2e multiply here; just
+// add -new_row_max then v_exp_f32 (= 2^x). One warp_reduce + one row_sum update
+// across all 64 N-columns (both 32-row sub-tiles A[0:8] and B[8:15]).
+template <bool kIsFirstIter, uint32_t k_p_comp_begin, typename comp_t = float>
+__device__ __forceinline__ void
+softmax_p1_prescaled_16(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)
+{
+    using comp2_t = __attribute__((__ext_vector_type__(2))) comp_t;
+
+    const comp2_t neg_new_row_max_pk = {-new_row_max, -new_row_max};
+    comp2_t tmp0, tmp1, tmp2, tmp3;
+
+    asm volatile("v_pk_add_f32 v[%0:%1],   v[%0:%1],   %16\n\t"
+                 "v_pk_add_f32 v[%2:%3],   v[%2:%3],   %16\n\t"
+                 "v_pk_add_f32 v[%4:%5],   v[%4:%5],   %16\n\t"
+                 "v_pk_add_f32 v[%6:%7],   v[%6:%7],   %16\n\t"
+                 "v_pk_add_f32 v[%8:%9],   v[%8:%9],   %16\n\t"
+                 "v_pk_add_f32 v[%10:%11], v[%10:%11], %16\n\t"
+                 "v_pk_add_f32 v[%12:%13], v[%12:%13], %16\n\t"
+                 "v_pk_add_f32 v[%14:%15], v[%14:%15], %16\n\t"
+                 "v_exp_f32_e32 v[%0],  v[%0]\n\t"
+                 "v_exp_f32_e32 v[%1],  v[%1]\n\t"
+                 "v_exp_f32_e32 v[%2],  v[%2]\n\t"
+                 "v_exp_f32_e32 v[%3],  v[%3]\n\t"
+                 "v_exp_f32_e32 v[%4],  v[%4]\n\t"
+                 "v_exp_f32_e32 v[%5],  v[%5]\n\t"
+                 "v_exp_f32_e32 v[%6],  v[%6]\n\t"
+                 "v_exp_f32_e32 v[%7],  v[%7]\n\t"
+                 "v_exp_f32_e32 v[%8],  v[%8]\n\t"
+                 "v_exp_f32_e32 v[%9],  v[%9]\n\t"
+                 "v_exp_f32_e32 v[%10], v[%10]\n\t"
+                 "v_exp_f32_e32 v[%11], v[%11]\n\t"
+                 "v_exp_f32_e32 v[%12], v[%12]\n\t"
+                 "v_exp_f32_e32 v[%13], v[%13]\n\t"
+                 "v_exp_f32_e32 v[%14], v[%14]\n\t"
+                 "v_exp_f32_e32 v[%15], v[%15]"
+                 :
+                 : "n"(k_p_comp_begin),
+                   "n"(k_p_comp_begin + 1),
+                   "n"(k_p_comp_begin + 2),
+                   "n"(k_p_comp_begin + 3),
+                   "n"(k_p_comp_begin + 4),
+                   "n"(k_p_comp_begin + 5),
+                   "n"(k_p_comp_begin + 6),
+                   "n"(k_p_comp_begin + 7),
+                   "n"(k_p_comp_begin + 8),
+                   "n"(k_p_comp_begin + 9),
+                   "n"(k_p_comp_begin + 10),
+                   "n"(k_p_comp_begin + 11),
+                   "n"(k_p_comp_begin + 12),
+                   "n"(k_p_comp_begin + 13),
+                   "n"(k_p_comp_begin + 14),
+                   "n"(k_p_comp_begin + 15),
+                   "v"(neg_new_row_max_pk));
+
+    asm volatile("v_pk_add_f32 %0, v[%4:%5],   v[%6:%7]\n\t"
+                 "v_pk_add_f32 %1, v[%8:%9],   v[%10:%11]\n\t"
+                 "v_pk_add_f32 %2, v[%12:%13], v[%14:%15]\n\t"
+                 "v_pk_add_f32 %3, v[%16:%17], v[%18:%19]\n\t"
+                 "v_pk_add_f32 %0, %0, %1\n\t"
+                 "v_pk_add_f32 %2, %2, %3\n\t"
+                 "v_pk_add_f32 %0, %0, %2"
+                 : "=v"(tmp0), "=v"(tmp1), "=v"(tmp2), "=v"(tmp3)
+                 : "n"(k_p_comp_begin),
+                   "n"(k_p_comp_begin + 1),
+                   "n"(k_p_comp_begin + 2),
+                   "n"(k_p_comp_begin + 3),
+                   "n"(k_p_comp_begin + 4),
+                   "n"(k_p_comp_begin + 5),
+                   "n"(k_p_comp_begin + 6),
+                   "n"(k_p_comp_begin + 7),
+                   "n"(k_p_comp_begin + 8),
+                   "n"(k_p_comp_begin + 9),
+                   "n"(k_p_comp_begin + 10),
+                   "n"(k_p_comp_begin + 11),
+                   "n"(k_p_comp_begin + 12),
+                   "n"(k_p_comp_begin + 13),
+                   "n"(k_p_comp_begin + 14),
+                   "n"(k_p_comp_begin + 15));
+
+    float local_sum_e = tmp0[0] + tmp0[1];
+
+    constexpr int32_t reduce_range = opus::get_warp_size();
+    constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
+    local_sum_e =
+        hk_mla::warp_reduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
+            local_sum_e);
+
+    *p_row_sum_e = kIsFirstIter ? local_sum_e : (rescale * (*p_row_sum_e) + local_sum_e);
+}
+
 template <bool kIsFirstIter, uint32_t k_p_comp_begin, typename comp_t = float>
 __device__ __forceinline__ void
 softmax_p1_16(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)

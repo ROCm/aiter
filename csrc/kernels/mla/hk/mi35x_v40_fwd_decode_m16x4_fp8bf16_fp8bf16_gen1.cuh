@@ -640,39 +640,39 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // ---- own strip cvt+store (p0,p1 from Phase A; 4 loads, drain 2->0) ----
                 kv_manager.template wait_kv_loads<0u, 0u, false, /*kVmCnt=*/7>(warp_idx);
                 const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
-                kv_manager.template cvt_kv_tile_step<0>(dw, p0, scale_f0);
-                kv_manager.template cvt_kv_tile_step<1>(dw, p0, scale_f0);
+                kv_manager.template cvt_kv_tile_step<0>(dw, p0.nope_dw, scale_f0);
+                kv_manager.template cvt_kv_tile_step<1>(dw, p0.nope_dw, scale_f0);
                 kv_manager.template store_kv_tile_step<0u, 0u, 0, false>(p_lds_kv_next, warp_idx, dw);
-                kv_manager.template cvt_kv_tile_step<2>(dw, p0, scale_f0);
-                kv_manager.template cvt_kv_tile_step<3>(dw, p0, scale_f0);
+                kv_manager.template cvt_kv_tile_step<2>(dw, p0.nope_dw, scale_f0);
+                kv_manager.template cvt_kv_tile_step<3>(dw, p0.nope_dw, scale_f0);
                 kv_manager.template store_kv_tile_step<0u, 0u, 1, false>(p_lds_kv_next, warp_idx, dw);
                 kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/5>(warp_idx);
                 const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
-                kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
-                kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
+                kv_manager.template cvt_kv_tile_step<0>(dw, p1.nope_dw, scale_f1);
+                kv_manager.template cvt_kv_tile_step<1>(dw, p1.nope_dw, scale_f1);
                 kv_manager.template store_kv_tile_step<0u, kTileCols, 0, false>(p_lds_kv_next, warp_idx, dw);
-                kv_manager.template cvt_kv_tile_step<2>(dw, p1, scale_f1);
-                kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
+                kv_manager.template cvt_kv_tile_step<2>(dw, p1.nope_dw, scale_f1);
+                kv_manager.template cvt_kv_tile_step<3>(dw, p1.nope_dw, scale_f1);
                 kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, warp_idx, dw);
 
                 kv_manager.template wait_kv_loads<0u, 0u, kPlus4IsRope, /*kVmCnt=*/3>(p4_warp_idx);
                 const float scale_f0b = kv_manager.kv_tile_scale_f(p0b);
-                kv_manager.template cvt_kv_tile_step<0>(dw, p0b, scale_f0b);
-                kv_manager.template cvt_kv_tile_step<1>(dw, p0b, scale_f0b);
+                kv_manager.template cvt_kv_tile_step<0>(dw, p0b.nope_dw, scale_f0b);
+                kv_manager.template cvt_kv_tile_step<1>(dw, p0b.nope_dw, scale_f0b);
                 kv_manager.template store_kv_tile_step<0u, 0u, 0, kPlus4IsRope>(p_lds_kv_next, p4_warp_idx, dw);
-                kv_manager.template cvt_kv_tile_step<2>(dw, p0b, scale_f0b);
-                kv_manager.template cvt_kv_tile_step<3>(dw, p0b, scale_f0b);
+                kv_manager.template cvt_kv_tile_step<2>(dw, p0b.nope_dw, scale_f0b);
+                kv_manager.template cvt_kv_tile_step<3>(dw, p0b.nope_dw, scale_f0b);
                 kv_manager.template store_kv_tile_step<0u, 0u, 1, kPlus4IsRope>(p_lds_kv_next, p4_warp_idx, dw);
 
                 if constexpr(!kPlus4IsRope)
                 {
                     kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/1>(p4_warp_idx);
                     const float scale_f1b = kv_manager.kv_tile_scale_f(p1b);
-                    kv_manager.template cvt_kv_tile_step<0>(dw, p1b, scale_f1b);
-                    kv_manager.template cvt_kv_tile_step<1>(dw, p1b, scale_f1b);
+                    kv_manager.template cvt_kv_tile_step<0>(dw, p1b.nope_dw, scale_f1b);
+                    kv_manager.template cvt_kv_tile_step<1>(dw, p1b.nope_dw, scale_f1b);
                     kv_manager.template store_kv_tile_step<0u, kTileCols, 0, false>(p_lds_kv_next, p4_warp_idx, dw);
-                    kv_manager.template cvt_kv_tile_step<2>(dw, p1b, scale_f1b);
-                    kv_manager.template cvt_kv_tile_step<3>(dw, p1b, scale_f1b);
+                    kv_manager.template cvt_kv_tile_step<2>(dw, p1b.nope_dw, scale_f1b);
+                    kv_manager.template cvt_kv_tile_step<3>(dw, p1b.nope_dw, scale_f1b);
                     kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, p4_warp_idx, dw);
                 }
             }

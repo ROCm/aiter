@@ -26,11 +26,16 @@ struct HkMlaV40Regs
     using comp_t    = float;
     using mfma_ab_t = hk::bf16;
 
+    // p_comp = kBlockN N-cols x kTileM(16) rows / 64 lanes = kBlockN/4 fp32/lane;
+    // p_mfma is its bf16-packed half. kBlockN=32 -> 8/4 (m16x4, m16x8 legacy);
+    // kBlockN=64 -> 16/8 (m16x8 double-tile: sub-tile A in the low half, B high).
     static constexpr uint32_t k_o_sz      = 128;
-    static constexpr uint32_t k_p_comp_sz = 8;
-    static constexpr uint32_t k_p_mfma_sz = 4;
+    static constexpr uint32_t k_p_comp_sz = T::kBlockN / 4u;
+    static constexpr uint32_t k_p_mfma_sz = T::kBlockN / 8u;
     static constexpr uint32_t k_q_vgpr_sz = 64; // full Q block (512 cols)
     static constexpr uint32_t mfma_tile_sz = 4; // one 16x32 bf16 base tile
+    // Per-iteration count of 32-row KV sub-tiles (1 for kBlockN=32, 2 for 64).
+    static constexpr uint32_t kNumKvSub = T::kBlockN / 32u;
 
     // # of QK col-tiles whose Q comes from the contiguous q_vgpr block (the rest
     // come from LDS). Migration knob: 10 (0:320), 12 (0:384), 14 (all NoPE),
@@ -45,14 +50,25 @@ struct HkMlaV40Regs
     static constexpr uint32_t k_q_vgpr_end   = k_o_begin - 1;                    // 127
     static constexpr uint32_t k_q_vgpr_begin = k_q_vgpr_end - k_q_vgpr_sz + 1;   // 64
     static constexpr uint32_t k_p_comp_end   = k_q_vgpr_begin - 1;               // 63
-    static constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;   // 56
-    static constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0;              // 56 (overlay)
-    static constexpr uint32_t k_p_mfma_end   = k_p_mfma_begin + k_p_mfma_sz - 1; // 59
-    static constexpr uint32_t k_v0_begin     = k_p_comp_begin + 4;              // 60
+    static constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;   // 56 / 48
+    static constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0;              // overlay
+    static constexpr uint32_t k_p_mfma_end   = k_p_mfma_begin + k_p_mfma_sz - 1; // 59 / 55
+    // pv_v_0 (QK-unused, PV-only) sits at the top 4 of the p_comp region (dead
+    // during PV). 60:63 for both kBlockN (== p_comp_begin+4 at 32).
+    static constexpr uint32_t k_v0_begin     = k_p_comp_end - 3;                // 60
     static constexpr uint32_t k_v0_end       = k_v0_begin + mfma_tile_sz - 1;      // 63
-    static constexpr uint32_t k_k0_begin     = k_p_comp_begin - mfma_tile_sz;      // 52
-    static constexpr uint32_t k_k1_begin     = k_k0_begin - mfma_tile_sz;          // 48
-    static constexpr uint32_t k_k2_begin     = k_k1_begin - mfma_tile_sz;          // 44
+    // 3-slot QK K ring, 12 regs directly below p_comp: [p_comp_begin-12, -1].
+    //   kBlockN=32: k0=52,k1=48,k2=44 (original, top-down).
+    //   kBlockN=64: k0=36,k1=40,k2=44 (bottom-up) so p_comp can grow to 48:63.
+    // Only k0<->k2 swap vs the linear order; k1 is the midpoint either way, so the
+    // 32 case is byte-identical to the pre-double map.
+    static constexpr uint32_t k_k0_begin =
+        (T::kBlockN == 32) ? (k_p_comp_begin - mfma_tile_sz) : (k_p_comp_begin - 3u * mfma_tile_sz);
+    static constexpr uint32_t k_k1_begin     = k_p_comp_begin - 2u * mfma_tile_sz;
+    static constexpr uint32_t k_k2_begin =
+        (T::kBlockN == 32) ? (k_p_comp_begin - 3u * mfma_tile_sz) : (k_p_comp_begin - mfma_tile_sz);
+    // Lowest pinned VGPR -> compiler scratch budget = [0, k_scratch_budget).
+    static constexpr uint32_t k_scratch_budget = k_p_comp_begin - 3u * mfma_tile_sz; // 44 / 36
     // q_lds (Phase-B Q-from-LDS scratch) reuses the unused top of q_vgpr, right
     // after the kQkGemmTiles VGPR col-tiles: v[64 + 4*kQkGemmTiles .. +7].
     static constexpr uint32_t k_q_lds_begin   = k_q_vgpr_begin + 4u * kQkGemmTiles;
@@ -67,6 +83,12 @@ struct HkMlaV40Regs
         split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 0, k_p_comp_begin + 3>>, 4>;
     using p_comp_hi_ranges = hkdart::
         split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 4, k_p_comp_begin + 7>>, 4>;
+    // Sub-tile B N-groups (kv-rows 32:48, 48:64), only for kBlockN=64. For 32 these
+    // alias regs above p_comp (unused; m16x4 never references the b_* aliases).
+    using p_comp_b_lo_ranges = hkdart::
+        split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 8, k_p_comp_begin + 11>>, 4>;
+    using p_comp_b_hi_ranges = hkdart::
+        split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 12, k_p_comp_begin + 15>>, 4>;
     using kv_top_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
     using kv_bot_ranges =
@@ -75,6 +97,12 @@ struct HkMlaV40Regs
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k2_begin, k_k2_begin + 3>>, 4>;
     using p_mfma_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin, k_p_mfma_end>>, 4>;
+    // Per-sub-tile p_mfma halves (16x32 = 4 dwords each): A = packed p_comp N 0:32,
+    // B = N 32:64. For kBlockN=32 only A is used (== p_mfma); B aliases unused regs.
+    using p_mfma_a_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin, k_p_mfma_begin + 3>>, 4>;
+    using p_mfma_b_ranges = hkdart::
+        split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin + 4, k_p_mfma_begin + 7>>, 4>;
     using o_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_o_begin, k_o_end>>, 4>;
     using pv_v_0_ranges =
@@ -97,6 +125,10 @@ struct HkMlaV40Regs
         hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_lo_ranges>;
     using p_comp_hi_t =
         hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_hi_ranges>;
+    using p_comp_b_lo_t =
+        hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_b_lo_ranges>;
+    using p_comp_b_hi_t =
+        hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_b_hi_ranges>;
     using k_0_t = hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_top_ranges>;
     using k_1_t = hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_bot_ranges>;
     using k_2_t =
@@ -111,6 +143,11 @@ struct HkMlaV40Regs
         hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_3_ranges>;
     using p_mfma_t =
         hk::art<mfma_ab_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges>;
+    // 16x32 per-sub-tile P (bf16) for the PV GEMM; PV runs once per sub-tile.
+    using p_mfma_a_t =
+        hk::art<mfma_ab_t, T::kTileM, 32, hk::row_l, hk::rt_16x32_s, p_mfma_a_ranges>;
+    using p_mfma_b_t =
+        hk::art<mfma_ab_t, T::kTileM, 32, hk::row_l, hk::rt_16x32_s, p_mfma_b_ranges>;
     using oaccu_t = hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges>;
 };
 
@@ -122,7 +159,13 @@ struct HkMlaV40Regs
 // the V pong (curr-pong; PV runs at call end). kDoRescale folds the
 // online-softmax oaccu rescale; kIsFirstIter inits oaccu fresh (3-arg mma) and
 // never rescales.
-template <bool kIsFirstIter, bool kDoRescale, typename T>
+// PMfmaT is the 16x32 per-sub-tile P (4 dwords): p_mfma_a_t (default; also == the
+// full p_mfma for kBlockN=32) or p_mfma_b_t (kBlockN=64 sub-tile B). One PV call
+// contracts one 32-wide KV sub-tile; kBlockN=64 calls this twice (A then B).
+// kRowBase: V sub-tile row base (0 = sub-tile A, 32 = sub-tile B). Folded into the
+// V ds_read imm by load_transposed_v_to_gpr so the caller passes the pong BASE.
+template <bool kIsFirstIter, bool kDoRescale, typename T,
+          typename PMfmaT = typename HkMlaV40Regs<T>::p_mfma_a_t, uint32_t kRowBase = 0u>
 __device__ __forceinline__ void
 hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v, const float rescale)
 {
@@ -133,14 +176,17 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
     constexpr uint32_t k_k0_begin  = R::k_k0_begin;
     constexpr uint32_t k_k1_begin  = R::k_k1_begin;
     constexpr uint32_t k_k2_begin  = R::k_k2_begin;
-    typename R::p_mfma_t p_mfma;
+    PMfmaT p_mfma;
     typename R::pv_v_0_t pv_v_0;
     typename R::pv_v_1_t pv_v_1;
     typename R::pv_v_2_t pv_v_2;
     typename R::pv_v_3_t pv_v_3;
 
-    constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
-    constexpr uint32_t kNumVTiles  = 2u * num_pv_iter;          // 32 = S_0..S_31
+    // D-tiling: each iter emits 2 oaccu 16x16 sub-tiles (32 D-cols); 512/32 = 16.
+    // Bound to the oaccu geometry, NOT kBlockN (the PV contracts one 32-wide
+    // sub-tile per call regardless of the logical kBlockN).
+    constexpr uint32_t num_pv_iter = T::kVoHeadDim / (2u * T::kTileM); // 16
+    constexpr uint32_t kNumVTiles  = 2u * num_pv_iter;                 // 32 = S_0..S_31
 
     auto pk_mul_pair = [&](float r, auto base_c) {
         constexpr uint32_t base = decltype(base_c)::value;
@@ -161,8 +207,8 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
                                   : (slot == 1u) ? k_k0_begin
                                   : (slot == 2u) ? k_k1_begin
                                                  : k_k2_begin;
-        kv_manager.template load_transposed_v_to_gpr<0u, jj * 16u, base + 0>(p_lds_v);
-        kv_manager.template load_transposed_v_to_gpr<16u, jj * 16u, base + 2>(p_lds_v);
+        kv_manager.template load_transposed_v_to_gpr<kRowBase + 0u, jj * 16u, base + 0>(p_lds_v);
+        kv_manager.template load_transposed_v_to_gpr<kRowBase + 16u, jj * 16u, base + 2>(p_lds_v);
     };
     // mfma: oaccu_dst (+)= pv_v_{slot}^T @ p_mfma (3-arg init when first).
     auto do_mma = [&]<uint32_t slot, typename OA>(OA& oaccu_dst) {
@@ -241,21 +287,22 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
 
 // PV stage selector: picks the kIsFirstIter / kDoRescale instantiation from the
 // runtime do_rescale decision the softmax produced.
-template <bool kIsFirstIter, typename T>
+template <bool kIsFirstIter, typename T,
+          typename PMfmaT = typename HkMlaV40Regs<T>::p_mfma_a_t, uint32_t kRowBase = 0u>
 __device__ __forceinline__ void
 hk_mla_v40_pv_stage(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
                     const float rescale, const bool do_rescale)
 {
     if constexpr(kIsFirstIter)
     {
-        hk_mla_v40_pv_gemm<true, false, T>(kv_manager, p_lds_v, rescale);
+        hk_mla_v40_pv_gemm<true, false, T, PMfmaT, kRowBase>(kv_manager, p_lds_v, rescale);
     }
     else if(do_rescale)
     {
-        hk_mla_v40_pv_gemm<false, true, T>(kv_manager, p_lds_v, rescale);
+        hk_mla_v40_pv_gemm<false, true, T, PMfmaT, kRowBase>(kv_manager, p_lds_v, rescale);
     }
     else
     {
-        hk_mla_v40_pv_gemm<false, false, T>(kv_manager, p_lds_v, rescale);
+        hk_mla_v40_pv_gemm<false, false, T, PMfmaT, kRowBase>(kv_manager, p_lds_v, rescale);
     }
 }
