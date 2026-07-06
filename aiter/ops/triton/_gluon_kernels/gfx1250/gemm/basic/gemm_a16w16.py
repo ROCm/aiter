@@ -206,13 +206,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     # Main pipeline loop
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
-    # The interior iterations step K with update_tensor_descriptor(add_offsets=...),
-    # which moves the tile position only and leaves the descriptor's OOB bound
-    # untouched.  That is fine for every full K tile, but the final tile may be
-    # partial (K need not be a multiple of BLOCK_K).  Peel that last load out of
-    # the loop and install the true remaining extent with set_bounds so the TDM
-    # engine zero-fills past K instead of reading out of bounds.
-    for _ in range(num_k_tiles - (NUM_BUFFERS - 1) - 1):
+    for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
