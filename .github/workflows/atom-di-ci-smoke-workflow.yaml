@@ -32,7 +32,7 @@ on:
         description: "DeepSeek-V4-Pro model path visible on Slurm nodes"
         required: false
         type: string
-        default: "/mnt/models/DeepSeek-V4-Pro/"
+        default: "/data/models2/DeepSeek-V4-Pro"
       docker_image:
         description: "ATOM image used by the ATOM mesh script"
         required: false
@@ -115,9 +115,9 @@ jobs:
             echo "SPUR_ACCOUNT=${SPUR_ACCOUNT:-amd-frameworks}"
             echo "SPUR_PARTITION=${SPUR_PARTITION:-amd-frameworks}"
             echo "SPUR_NODELIST=${SPUR_NODELIST:-ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16}"
-            echo "MODEL_PATH=${MODEL_PATH:-/mnt/models/DeepSeek-V4-Pro/}"
+            echo "MODEL_PATH=${MODEL_PATH:-/data/models2/DeepSeek-V4-Pro}"
             echo "DOCKER_IMAGE=${DOCKER_IMAGE:-rocm/atom-dev:latest}"
-            echo "SHARED_ROOT=${SHARED_ROOT:-/it-share/yajizhan/spur_dsv4_logs/aiter_spur_login_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}}"
+            echo "SHARED_ROOT=${SHARED_ROOT:-/data/xinhuang/spur_dsv4_logs/aiter_spur_login_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}}"
             echo "ISL_LIST=${ISL_LIST:-8192}"
             echo "OSL=${OSL:-1}"
             echo "CONC_LIST=${CONC_LIST:-2}"
