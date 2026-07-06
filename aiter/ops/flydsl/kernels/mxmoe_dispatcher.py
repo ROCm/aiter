@@ -94,19 +94,22 @@ _AITER_PIPE_TABLE = {
         16384: (64, "reduce"),
         32768: (64, "reduce"),
     },
-    # DeepSeekV4 a8w4 (7168/512/E384/k6) — reduce-dominant cold at every token; BM32<=1024 else BM64.
+    # DeepSeekV4 a8w4 (7168/512/E384/k6) — BM32 atomic now beats reduce-TOTAL (gemm2+topk-reduce)
+    # at every token after the padding-row atomic gate fix (self-contained, no extra reduce kernel):
+    # atomic vs reduce-TOTAL same-tile BM32 M1 -37%, M8 -15%, M64 -7%, M256 -6%, M1024 -9%. The
+    # BM64 buckets (>=2048) keep reduce (BM64 atomic not re-validated post-fix). BM32<=1024 else BM64.
     (7168, 512, 384): {
-        1: (32, "reduce"),
-        2: (32, "reduce"),
-        4: (32, "reduce"),
-        8: (32, "reduce"),
-        16: (32, "reduce"),
-        32: (32, "reduce"),
-        64: (32, "reduce"),
-        128: (32, "reduce"),
-        256: (32, "reduce"),
-        512: (32, "reduce"),
-        1024: (32, "reduce"),
+        1: (32, "atomic"),
+        2: (32, "atomic"),
+        4: (32, "atomic"),
+        8: (32, "atomic"),
+        16: (32, "atomic"),
+        32: (32, "atomic"),
+        64: (32, "atomic"),
+        128: (32, "atomic"),
+        256: (32, "atomic"),
+        512: (32, "atomic"),
+        1024: (32, "atomic"),
         2048: (64, "reduce"),
         4096: (64, "reduce"),
         8192: (64, "reduce"),

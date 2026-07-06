@@ -1474,8 +1474,14 @@ def atomic_bf16_epilog(
 
     gpu.barrier()
 
-    # read back + weighted store (atomic: fadd out[token_id]; reduce: store out[token_id*topk+slot]); token_id<i32_M gates padding: default plain-if (byte-identical), else device scf.if (their OOB write faults).
-    guard_padding = BM >= 64 or SBM != BM or use_reduce
+    # read back + weighted store (atomic: fadd out[token_id]; reduce: store out[token_id*topk+slot]);
+    # token_id<i32_M gates padding via a DEVICE scf.if (a plain Python `if` on the dynamic token_id
+    # does NOT gate at runtime -> its body always ran). At small/mid M the block-sparse sort floor is
+    # ~97% padding rows (M64: 12288 pad vs 384 real); ungated, every padding row (token_id==M) issues
+    # a weighted atomic-fadd into an OOB out-row -> 77x wasted atomics + L2 RMW serialization
+    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Always gate; reduce already gated via
+    # use_reduce. (fp4-atomic families are gated too -> strictly correct OOB-skip, kernel IR changes.)
+    guard_padding = True
 
     def store_one_mr(mr):
         row_in_block = fx.Int32(mr * 8) + m_lane
