@@ -193,6 +193,7 @@ jobs:
           sed \
             -e "s|/it-share/yajizhan|/data/xinhuang|g" \
             -e "s|/data/xinhuang/code/ATOM|${atom_source}|g" \
+            -e "s|/data/xinhuang/slurm_dsv4_logs|${shared_root}|g" \
             "${script_src}" > "${script_dst}"
           chmod +x "${script_dst}"
 
