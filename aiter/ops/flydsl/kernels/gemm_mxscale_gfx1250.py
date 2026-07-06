@@ -588,15 +588,19 @@ def compile_mxscale_gemm(
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
-    # Kernel symbol carries the data format + tile shape + buffer count + the
-    # stage1 weight layout (gguu/gugu) so profiles/dumps can tell configs apart
-    # (e.g. stage1 vs stage2, different tile_m/n/k, same tile with a different
-    # num_buffers, or gguu vs gugu). This is the single canonical place for the
-    # tile shape -- callers must NOT also embed it in kernel_tag, or it shows up
-    # twice in the symbol.
+    _act_tag = stage1_act_mode if stage1_act_mode is not None else "noact"
     module_name = (
-        f"kernel_mxscale_{kernel_tag_mode}_{data_format}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_b{num_buffers}_{stage1_weight_layout_mode}"
+        f"kernel_mxscale_{data_format}"
+        f"_m{M}n{N}k{K}e{batch_count}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
+        f"_b{num_buffers}_sk{split_k}"
+        f"_{_act_tag}_{out_dtype}"
+        f"_wst{int(wave_specialized_tdm)}"
+        f"_asprol{int(tdm_as_in_prologue)}"
+        f"_bias{int(epilogue_bias_mode)}"
+        f"_masked{int(grouped_masked_m)}"
+        f"_pers{int(grouped_persistent_m)}"
+        f"_contig{int(grouped_contiguous_m)}"
     ).replace("-", "_")
 
     if use_fp4_bank_friendly_schedule:
@@ -3411,6 +3415,7 @@ def compile_mxscale_gemm(
         out_dtype,
         inst_prefetch,
         wave_specialized_tdm,
+        tdm_as_in_prologue,
         split_k,
         use_scale_opsel,
         expert_sched_mode,
