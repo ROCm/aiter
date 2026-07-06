@@ -221,7 +221,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 118  # u/g prefetch before GEMM1 (full MFMA chain hides HBM latency)
+    _K5_KERNEL_REVISION = 121  # lds_uv: cooperative u load + v_new store via LDS
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -243,15 +243,25 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # has finished reading the h_state panels -- a WAR barrier is inserted right
     # before the gated_v store to enforce that ordering across warps.
     lds_gv_offset = lds_hp_offset + LDS_HP_PANEL_ELEMS * 2  # panel 1 (byte offset)
-    # HIP-ALIGN phase 1a: [V][K] transpose buffer for the b128 h store.
+    # [V][K] transpose buffer for the b128 h store.
     lds_ht_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_ht_offset + LDS_HT_BYTES
-
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
     THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
+
+    # lds_uv: shared [BT][BV] bf16 buffer for cooperative u load + v_new store.
+    LDS_UV_ELEMS = BT * BV
+    LDS_UV_BYTES = LDS_UV_ELEMS * 2  # 8 KB for BT=64, BV=64
+    THREADS_PER_ROW_BV = BV // LOAD_VEC_WIDTH
+    ROWS_PER_BATCH_BV = BLOCK_THREADS // THREADS_PER_ROW_BV
+    NUM_LOAD_BATCHES_BV = BT // ROWS_PER_BATCH_BV
+
+    # [BT][BV] u/v_new staging buffer (cooperative coalesced HBM access).
+    lds_uv_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_uv_offset + LDS_UV_BYTES
 
     # ---- OPT-VC: precompute the GEMM1 prefetch interleaving schedule.
     # All quantities here depend ONLY on compile-time constants
@@ -397,9 +407,18 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         def _lds_read_gv_bf16x4(elem_idx):
             return vector.load_op(v4bf16_hp_type, lds_gv_memref, [fx.Index(elem_idx)])
 
+        # u/v_new staging buffer [BT][BV] (bf16)
+        lds_uv_ptr = SmemPtr(lds_base_ptr, lds_uv_offset, T.bf16, shape=(LDS_UV_ELEMS,))
+        lds_uv = STensor(lds_uv_ptr, dtype=T.bf16, shape=(LDS_UV_ELEMS,))
+        lds_uv_memref = lds_uv_ptr.get()
+
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
+
+        # Cooperative u/vn decomposition (BV-wide rows instead of 64-wide)
+        uv_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_BV)
+        uv_load_col_base = (tid % fx.Int32(THREADS_PER_ROW_BV)) * fx.Int32(LOAD_VEC_WIDTH)
 
         # -- LDS vector read helpers (generates ds_read_b128 for 8xbf16) --
         v8bf16_type = T.vec(8, T.bf16)
@@ -648,7 +667,20 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         4,
                     )
 
-            # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
+            # >>> COOPERATIVE u LOAD → lds_uv (before barrier, alongside staging).
+            # 2× buffer_load_dwordx4 (coalesced) replaces 16× buffer_load_ushort.
+            for batch in range_constexpr(NUM_LOAD_BATCHES_BV):
+                uv_row = fx.Int32(batch * ROWS_PER_BATCH_BV) + uv_load_row_in_batch
+                uv_abs_row = i_t_i32 * fx.Int32(BT) + uv_row
+                uv_safe_row = (uv_abs_row < T_local).select(uv_abs_row, fx.Int32(0))
+                uv_hbm_off = v_base + uv_safe_row * stride_v + (
+                    i_v * fx.Int32(BV) + uv_load_col_base
+                )
+                uv_vec = v_.vec_load((fx.Index(uv_hbm_off),), LOAD_VEC_WIDTH)
+                uv_lds_idx = uv_row * fx.Int32(BV) + uv_load_col_base
+                lds_uv.vec_store((fx.Index(uv_lds_idx),), uv_vec, LOAD_VEC_WIDTH)
+
+            # Barrier: ensures h_state panels + lds_uv + prev w/k panels all visible.
             gpu.barrier()
 
             # last_idx for the current chunk (gating).
@@ -656,27 +688,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             last_idx_raw = (next_chunk_end < T_local).select(
                 next_chunk_end, T_local
             ) - fx.Int32(1)
-
-            # >>> PREFETCH u + g BEFORE GEMM1: issue all HBM loads for u
-            # (N_REPEAT × 4 ushort) and g (4 rows + 1 g_last = 5 dword) now,
-            # so the full 64-MFMA GEMM1 chain hides their HBM latency.
-            # Without this, LLVM hoists the loads into the GEMM1 middle where
-            # only ~2 MFMA can hide them → 4.2M cycle vmcnt stall (39% of stalls).
-            u_prefetch = []  # N_REPEAT × 4 bf16 scalars
-            for idx in range_constexpr(N_REPEAT):
-                u_col_pf = i_v * fx.Int32(BV) + fx.Int32(idx * 16) + lane_n
-                for elem_i in range_constexpr(4):
-                    u_bt_row_raw = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    safe_u_row = (u_bt_row_raw < T_local).select(
-                        u_bt_row_raw, fx.Int32(0)
-                    )
-                    u_off = v_base + safe_u_row * stride_v + u_col_pf
-                    u_prefetch.append(v_[fx.Index(u_off)])
 
             if const_expr(USE_G):
                 g_last = g_[fx.Index(i_h * T_flat + (bos + last_idx_raw))]
@@ -778,37 +789,38 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = vector.from_elements(T.f32x4, gate_elems)
 
-            if const_expr(SAVE_NEW_VALUE):
-                def _emit_vn_store(off, value):
-                    vn_[fx.Index(off)] = value
-
             for idx in range_constexpr(N_REPEAT):
                 bv_val = bv_accs[idx]
-                u_col = i_v * fx.Int32(BV) + fx.Int32(idx * 16) + lane_n
+                # Read u from lds_uv (ds_read, no vmcnt).
+                u_lds_col = fx.Int32(idx * 16) + lane_n
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    u_raw = u_prefetch[idx * 4 + elem_i]
+                    u_lds_row = (
+                        wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    u_lds_off = u_lds_row * fx.Int32(BV) + u_lds_col
+                    u_raw = lds_uv[fx.Index(u_lds_off)]
                     u_bf16 = fx.BFloat16(u_raw)
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
                 vn_val = u_f32 - bv_val
 
+                # Write v_new (pre-gating) to lds_uv (overwrites consumed u).
+                # Cooperative store to HBM happens after the loop.
                 if const_expr(SAVE_NEW_VALUE):
                     vn_bf16 = fx.Vector(
                         _f32x4_to_bf16x4_rne(vn_val), (4,), fx.BFloat16
                     )
-                    bt_tile_base = wid * fx.Int32(16)
                     for elem_i in range_constexpr(4):
-                        vn_bt_row = (
-                            i_t_i32 * fx.Int32(BT)
-                            + bt_tile_base
+                        vn_lds_row = (
+                            wid * fx.Int32(16)
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
-                        if (vn_bt_row < T_local).ir_value():
-                            bf16_v = vn_bf16[elem_i]
-                            vn_off = vn_base + vn_bt_row * fx.Int32(V) + u_col
-                            _emit_vn_store(vn_off, bf16_v)
+                        vn_lds_off = vn_lds_row * fx.Int32(BV) + u_lds_col
+                        lds_uv[fx.Index(vn_lds_off)] = vn_bf16[elem_i]
 
                 if const_expr(USE_G):
                     gated_val = vn_val * gate_vec
@@ -822,6 +834,23 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     _f32x4_to_bf16x4_rne(gated_val),
                     4,
                 )
+
+            # Cooperative v_new store: lds_uv → HBM (coalesced b128).
+            # Replaces 16× buffer_store_short with 2× buffer_store_dwordx4.
+            if const_expr(SAVE_NEW_VALUE):
+                def _emit_vn_vec_store(off, val):
+                    vn_.vec_store((fx.Index(off),), val, LOAD_VEC_WIDTH)
+
+                gpu.barrier()
+                for batch in range_constexpr(NUM_LOAD_BATCHES_BV):
+                    vn_row = fx.Int32(batch * ROWS_PER_BATCH_BV) + uv_load_row_in_batch
+                    vn_abs_row = i_t_i32 * fx.Int32(BT) + vn_row
+                    vn_lds_base = vn_row * fx.Int32(BV) + uv_load_col_base
+                    vn_vec = lds_uv.vec_load((fx.Index(vn_lds_base),), LOAD_VEC_WIDTH)
+                    vn_hbm_col = i_v * fx.Int32(BV) + uv_load_col_base
+                    vn_hbm_off = vn_base + vn_abs_row * fx.Int32(V) + vn_hbm_col
+                    if (vn_abs_row < T_local).ir_value():
+                        _emit_vn_vec_store(vn_hbm_off, vn_vec)
 
             # >>> PREFETCH k_next: HBM loads for next chunk (HIP .cu:727-731).
             # Overlaps with the barrier + h store below.
