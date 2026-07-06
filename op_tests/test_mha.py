@@ -1159,14 +1159,12 @@ def test_flash_attn_func_opus(
             return_attn_probs=False,
         )
 
-    # fp32-upcast ref + non-upcast run to size the bf16 tolerance (file convention).
     out_ref, _ = run_torch(q, k, v, causal=causal)
     out_pt, _ = run_torch(q, k, v, causal=causal, upcast=False, reorder_ops=True)
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     print(f"[opus] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
     assert (out - out_ref).abs().max().item() <= out_tol
 
-    # Confirm opus was actually taken: bit-identical to a direct opus wrapper call.
     with torch.no_grad():
         out_opus = fmha_fwd_hd128_bf16_opus_fwd(
             q, k, v, softmax_scale=d**-0.5, causal=causal
