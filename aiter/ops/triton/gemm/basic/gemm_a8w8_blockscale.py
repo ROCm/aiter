@@ -292,7 +292,7 @@ def gemm_a8w8_blockscale_preshuffle(
     # Resolve backend up-front so the config is loaded from the backend's
     # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
     if backend is None:
-        backend = "gluon" if _is_gluon_available(preshuffle=True) else "triton"
+        backend = "gluon" if _is_gluon_available() else "triton"
     backend = backend.lower()
 
     if config is None:
