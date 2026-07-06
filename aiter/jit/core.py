@@ -876,6 +876,8 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
+        if get_gfx() == "gfx1250" and hip_version >= Version("7.0.0"):
+            flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
             import torch
@@ -1323,8 +1325,11 @@ def _ctypes_call(func, fc_name, md_name):
                 argtypes.append(ctypes.c_float)
             else:
                 argtypes.append(ctypes.c_void_p)
-        if has_tensor:
-            argtypes.append(ctypes.c_void_p)  # hipStream_t
+        # hipStream_t: the caller always appends the current stream to the args, so the
+        # argtypes must always declare it -- otherwise ctypes takes the variadic path
+        # (ffi_prep_cif_var) for torch-free modules whose params are all non-tensor, which
+        # fails on stricter libffi builds.
+        argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
 
         _cache["lib"] = lib

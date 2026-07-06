@@ -21,6 +21,7 @@ __global__ void add_rmsnorm_quant_kernel(
     DTYPE_I* residual_in,
     DTYPE_I* weight,
     double epsilon,
+    bool gemma_norm,
     int m,
     int n,
     int input_stride,
@@ -157,11 +158,12 @@ __global__ void add_rmsnorm_quant_kernel(
             }
             
             float* thread_data_weight2 = reinterpret_cast<float*>(&thread_data_weight);
+            const float weight_offset = gemma_norm ? 1.0f : 0.0f;
             for(int i = 0; i < thread_data_size / 2; i++)
             {
                 vec2_f& thread_data_weight_float2 = rcp;
-                thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]);
-                thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]);
+                thread_data_weight_float2[0] = static_cast<float>(thread_data_weight[2 * i]) + weight_offset;
+                thread_data_weight_float2[1] = static_cast<float>(thread_data_weight[2 * i + 1]) + weight_offset;
                 // if constexpr(std::is_same_v<DTYPE_I, opus::bf16_t>)
                 // {
                 //     asm volatile(
@@ -310,7 +312,7 @@ __global__ void add_rmsnorm_quant_kernel(
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
-                                                                                                     epsilon, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale); \
+                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale); \
                                                                                                      });
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
@@ -362,7 +364,8 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& weight,
         double epsilon,
         int group_size = 0,
-        bool shuffle_scale = false
+        bool shuffle_scale = false,
+        bool gemma_norm = false
     )
     {
         int n = input.size(1);
@@ -421,7 +424,8 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& weight,
         double epsilon,
         int group_size = 0,
-        bool shuffle_scale = false
+        bool shuffle_scale = false,
+        bool gemma_norm = false
     )
     {
         torch::Tensor residual_in = torch::empty({0}, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
@@ -483,7 +487,8 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& residual_in,
         torch::Tensor& residual_out,
         torch::Tensor& weight,
-        double epsilon
+        double epsilon,
+        bool gemma_norm = false
     )
     {
         torch::Tensor scale = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));
@@ -536,7 +541,8 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& out,
         torch::Tensor& input,
         torch::Tensor& weight,
-        double epsilon
+        double epsilon,
+        bool gemma_norm = false
     )
     {
         torch::Tensor scale = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(input.device()));

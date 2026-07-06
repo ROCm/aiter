@@ -4,6 +4,15 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
+        reduce_grouped_gluon as _reduce_grouped_gluon,
+        reduce_grouped_gluon_num_warps as _reduce_grouped_gluon_num_warps,
+    )
+except (ImportError, ModuleNotFoundError):
+    _reduce_grouped_gluon = None
+    _reduce_grouped_gluon_num_warps = None
+
 
 def reduce_grouped(
     x: torch.Tensor,
@@ -52,6 +61,48 @@ def reduce_grouped(
     K = 1 if indx is None else indx.shape[1]
     out_dtype = x.dtype if out_dtype is None else out_dtype
     assert x.shape[-1] % reduction_n == 0
+
+    # Gluon path on gfx1250 for the plain grouped combine; swiglu-fused (MoE1 split-k) reductions, reduction_n != 1, and non-contiguous inputs stay on the Triton _reduce_grouped.
+    use_gluon = (
+        is_tdm_avail()
+        and indx is not None
+        and not apply_swiglu
+        and reduction_n == 1
+        and x.ndim == 3
+        and x.is_contiguous()
+        and indx.is_contiguous()
+    )
+    if use_gluon:
+        B, M, N = x.shape[0], x.shape[1], x.shape[2]
+        npad = triton.next_power_of_2(N)
+        has_ext_residual = residual is not None
+        if has_ext_residual:
+            assert residual.shape == out.shape, (
+                f"residual.shape {tuple(residual.shape)} must match "
+                f"out.shape {tuple(out.shape)}"
+            )
+        gluon_num_warps = _reduce_grouped_gluon_num_warps(npad)
+        _reduce_grouped_gluon[(num_groups,)](
+            X=x,
+            Out=out,
+            InIndx=indx,
+            Residual=residual if has_ext_residual else out,
+            stride_xm=x.stride(1),
+            stride_om=out.stride(0),
+            stride_on=out.stride(1),
+            stride_res_m=residual.stride(0) if has_ext_residual else 0,
+            stride_res_n=residual.stride(1) if has_ext_residual else 0,
+            M=M,
+            N=N,
+            NPAD=npad,
+            B=B,
+            K=K,
+            NUM_WARPS=gluon_num_warps,
+            HAS_EXT_RESIDUAL=has_ext_residual,
+            num_warps=gluon_num_warps,
+        )
+        return out
+
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
 
