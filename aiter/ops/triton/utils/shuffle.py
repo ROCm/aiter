@@ -153,6 +153,41 @@ def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tens
     return scales
 
 
+def shuffle_scale_gemm_e8m0(scales: torch.Tensor) -> torch.Tensor:
+    """MXFP4 e8m0 block-scale preshuffle, built on the ``shuffle_scale_gemm``
+    reshape/permute structure. Drop-in for ``aiter.ops.shuffle.shuffle_scale``
+    (non-``guinterleave``) / ``fp4_utils.e8m0_shuffle``.
+
+    ``e8m0_shuffle`` pads the ``(M, K_groups)`` scale to ``M`` a multiple of 256
+    and ``K_groups`` a multiple of 8, then applies a fixed row-``(2, 16)`` /
+    K-``(2, 4)`` tile permute. That permute is *byte-identical* to the gfx950
+    GEMM scale tile ``shuffle_scale_gemm(..., preshuffle_factor=32,
+    scale_kwidth=8)`` -- both map source ``(m, n)`` to flat offset
+    ``e1 + e4*2 + e2*4 + e5*64 + (n//8)*256 + (m//32)*(N_pad*32)`` with
+    ``e1=(m%32)//16, e2=(m%32)%16, e4=(n%8)//4, e5=(n%8)%4`` -- so we reuse it.
+
+    The e8m0 layout is arch-independent (it is *not* the gfx1250 GEMM tile),
+    so ``arch`` is pinned to ``"gfx950"`` rather than queried. Returns the
+    padded ``(M_pad, K_groups_pad)`` view, matching ``e8m0_shuffle``.
+    """
+    if scales is None:
+        return scales
+    if scales.dtype == torch.float32:
+        return scales
+    assert scales.ndim == 2, "scale must be a 2D tensor"
+
+    m, n = scales.shape
+    m_pad = (m + 255) // 256 * 256
+    n_pad = (n + 7) // 8 * 8
+    padded = torch.empty((m_pad, n_pad), dtype=scales.dtype, device=scales.device)
+    padded[:m, :n] = scales
+
+    tiled = shuffle_scale_gemm(
+        padded, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+    )
+    return tiled.reshape(m_pad, n_pad)
+
+
 # --- MoE MX scales (a8w4 / a8w8 / a16w4 / a4w4) ---
 def shuffle_scale_moe(
     data: torch.Tensor,
