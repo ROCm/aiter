@@ -22,14 +22,20 @@ from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 FP8_DTYPE = dtypes.fp8
+FP8_MAX_GFX942 = 240.0
+
+pytestmark = pytest.mark.skipif(
+    aiter.get_gfx() != "gfx942",
+    reason="Z-Image 1way per-head FP8 tests are validated only on MI308/gfx942 (fp8_max=240)",
+)
 
 
 def _torch_per_head_fp8_quant(x: Tensor) -> tuple[Tensor, Tensor]:
-    """Reference per-(batch, head) fp8 quant (amax/240 descale)."""
+    """Reference per-(batch, head) fp8 quant for gfx942 fp8_e4m3fnuz."""
     batch_size, _, _, _ = x.shape
     x32 = x.float()
     amax = x32.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-8)
-    descale = amax / 240.0
+    descale = amax / FP8_MAX_GFX942
     q = (x32 / descale).to(FP8_DTYPE)
     scale = descale.view(batch_size, 1, -1, 1).squeeze(-1).squeeze(1)
     return q, scale
@@ -585,6 +591,13 @@ if __name__ == "__main__":
         help="Collect perf via @benchmark (slower).",
     )
     args = parser.parse_args()
+
+    if aiter.get_gfx() != "gfx942":
+        print(
+            "Skipping: Z-Image 1way per-head FP8 tests require MI308/gfx942 (fp8_max=240)",
+            flush=True,
+        )
+        raise SystemExit(0)
 
     qk_cases = [
         # Z-Image style

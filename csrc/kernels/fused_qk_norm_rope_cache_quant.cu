@@ -3630,6 +3630,9 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
     AITER_CHECK(q.dtype() == q_unquantized.dtype() && k.dtype() == k_unquantized.dtype());
     AITER_CHECK(q_fp8.dtype() == AITER_DTYPE_fp8 && k_fp8.dtype() == AITER_DTYPE_fp8);
     AITER_CHECK(q_descale.dtype() == AITER_DTYPE_fp32 && k_descale.dtype() == AITER_DTYPE_fp32);
+    AITER_CHECK(get_gpu_arch() == "gfx942",
+                "fused_qk_norm_rope_1way_fp8_perhead_quant is validated only on gfx942/MI308 "
+                "because this path uses fp8_e4m3fnuz with fp8_max=240");
 
     HipDeviceGuard device_guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -4215,6 +4218,9 @@ void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
     AITER_CHECK(head_size == 128, "v_1way_per_head_fp8_quant currently only supports head_size=128");
     AITER_CHECK(v_fp8.dtype() == AITER_DTYPE_fp8, "v_fp8 must be fp8");
     AITER_CHECK(v_descale.dtype() == AITER_DTYPE_fp32, "v_descale must be fp32");
+    AITER_CHECK(get_gpu_arch() == "gfx942",
+                "v_1way_per_head_fp8_quant is validated only on gfx942/MI308 because this path "
+                "uses fp8_e4m3fnuz with fp8_max=240");
 
     HipDeviceGuard device_guard(v.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
