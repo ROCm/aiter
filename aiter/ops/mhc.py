@@ -20,6 +20,7 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
+    is_fn_pack_bf16: int = 0,  # 1: bf16 (hi/lo) MFMA compute; 0: fp32 MFMA (gfx950 only)
 ) -> None: ...
 
 
@@ -320,6 +321,7 @@ def mhc_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
+    is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -339,7 +341,7 @@ def mhc_pre(
     )
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
-    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k)
+    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k, is_fn_pack_bf16)
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)
 
@@ -415,6 +417,7 @@ def mhc_fused_post_pre_gemm_sqrsum(
     tile_m: int = 16,  # 16, 32 or 64
     tile_n: int = 32,  # 16 or 32
     tile_k: int = 32,  # 32 or 64
+    is_fn_pack_bf16: int = 0,  # 1: bf16 (hi/lo) MFMA compute; 0: fp32 MFMA (gfx950 only)
 ) -> None: ...
 
 
@@ -462,6 +465,7 @@ def mhc_fused_post_pre_large_m(
     sinkhorn_repeat: int = 20,
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
     m = residual_in.size(0)
@@ -504,6 +508,7 @@ def mhc_fused_post_pre_large_m(
         norm_weight,
         norm_eps,
         large_m_splitk=True,
+        is_fn_pack_bf16=is_fn_pack_bf16,
     )
     return post_mix, comb_mix, layer_input_out, next_residual
 
@@ -525,6 +530,7 @@ def mhc_fused_post_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
+    is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + next mhc_pre (HIP), mirroring ``mhc_pre`` with post-step inputs.
 
@@ -571,6 +577,7 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
+            is_fn_pack_bf16=is_fn_pack_bf16,
         )
         return post_mix, comb_mix, layer_input_out, next_residual
 
@@ -590,6 +597,7 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
+            is_fn_pack_bf16=is_fn_pack_bf16,
         )
 
     assert layer_input.shape == (
@@ -643,6 +651,7 @@ def mhc_fused_post_pre(
         selected_tile_m,
         selected_tile_n,
         selected_tile_k,
+        is_fn_pack_bf16,
     )
 
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
