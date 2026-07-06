@@ -22,6 +22,31 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+# Route moe_sorting to the FlyDSL atomicAdd (lazy-index) implementation.
+# Falls back to CK automatically for cases it does not support (expert_mask /
+# num_local_tokens / flydsl unavailable).
+_USE_FLYDSL_MOE_SORTING = (
+    os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+    and is_flydsl_available()
+)
+
+# Route the per_Tensor fp8 STAGE2 activation quant (the stage1 intermediate
+# [token*topk, inter_dim]) through the fused Triton kernel
+# (dynamic_per_tensor_quant_fp8_i8_*) for the non-direct 2-stage path too,
+# instead of the slow 3-launch HIP dynamic_per_tensor_quant (initScale +
+# data_to_scale global-atomicMax + scaled_quant). The HIP data_to_scale maps
+# one block per row and is pathologically slow on the narrow stage2 cols
+# (inter_dim=192: ~12 of 256 lanes active + single global atomicMax). The
+# direct path already uses this fused helper; this extends it to the CK-gemm1
+# + flydsl-gemm2 path. Stage1 hidden (cols=model_dim, wide) is left on the HIP
+# path since the fused Triton path regresses there at large M. Default on;
+# set =0 to fall back.
+_FAST_PT_QUANT = os.environ.get("AITER_FUSED_MOE_FAST_PT_QUANT", "1") == "1"
+
+
+def _flydsl_moe_sorting_supported(expert_mask, num_local_tokens):
+    """The FlyDSL atomic sort only covers the plain (no-EP) sorting path."""
+    return expert_mask is None and num_local_tokens is None
 
 
 def _moe_sorting_impl(
@@ -35,6 +60,8 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
+    use_flydsl=False,
+    skip_moe_buf_zero=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -48,6 +75,29 @@ def _moe_sorting_impl(
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+
+    if use_flydsl and _flydsl_moe_sorting_supported(expert_mask, num_local_tokens):
+        from aiter.ops.flydsl.moe_sorting_api import moe_sorting_atomic_fwd
+
+        ti = topk_ids if topk_ids.dtype == dtypes.i32 else topk_ids.to(dtypes.i32)
+        tw = (
+            topk_weights
+            if topk_weights.dtype == dtypes.fp32
+            else topk_weights.to(dtypes.fp32)
+        )
+        moe_sorting_atomic_fwd(
+            ti,
+            tw,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            skip_moe_buf_zero=skip_moe_buf_zero,
+        )
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -77,7 +127,19 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    skip_moe_buf_zero=False,
+    use_flydsl=None,
 ):
+    # use_flydsl: None -> honor the global env default; True/False -> per-call
+    # override. The FlyDSL atomic sort is neutral-to-faster than CK across the
+    # whole hy3 2-stage sweep (e.g. token=32 e2e 179->165us), and auto-falls
+    # back to CK for unsupported cases (expert_mask / num_local_tokens / no
+    # flydsl), so the 2-stage path forces it on while the 1-stage/asm path is
+    # left on the env default to keep that baseline unchanged.
+    _use_flydsl = (
+        (_USE_FLYDSL_MOE_SORTING if use_flydsl is None else bool(use_flydsl))
+        and is_flydsl_available()
+    )
     try:
         return _moe_sorting_impl(
             topk_ids,
@@ -90,6 +152,8 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
+            use_flydsl=_use_flydsl,
+            skip_moe_buf_zero=skip_moe_buf_zero,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -438,6 +502,10 @@ def fused_moe_(
                 expert_mask,
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
+                skip_moe_buf_zero=metadata.skip_moe_buf_zero,
+                # 2-stage: force FlyDSL sort (faster, auto CK fallback);
+                # 1-stage/asm: leave on env default to keep that baseline.
+                use_flydsl=None if metadata.run_1stage else True,
             )
         )
         sorted_ids2 = sorted_ids1
@@ -455,6 +523,8 @@ def fused_moe_(
             expert_mask,
             num_local_tokens,
             moe_sorting_dispatch_policy,
+            skip_moe_buf_zero=metadata.skip_moe_buf_zero,
+            use_flydsl=True,
         )
         sorted_ids2, sorted_weights2, sorted_expert_ids2, num_valid_ids2, moe_buf = (
             moe_sorting(
@@ -467,6 +537,8 @@ def fused_moe_(
                 expert_mask,
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
+                skip_moe_buf_zero=metadata.skip_moe_buf_zero,
+                use_flydsl=True,
             )
         )
         # Different block_m can legitimately produce different padded valid-id
@@ -926,7 +998,10 @@ def _direct_per_tensor_quant_cached(
         dynamic_per_tensor_quant_fp8_i8_fused_small,
     )
     if dynamic_per_tensor_quant_fp8_i8_fused_small(qbuf, quant_input, sbuf) is not None:
-        _guard_zero_input(qbuf, sbuf)
+        # The fused-small kernel now clamps `scale` to a tiny epsilon internally,
+        # so an all-zero tile produces a clean fp8 zero (not NaN 0x80). This makes
+        # the external _guard_zero_input (clamp_ + eq + masked_fill_, 3 extra
+        # elementwise launches per quant) unnecessary on this hot small-M path.
         return qbuf, sbuf, amax, sbuf.view(1)
     n_blocks = (quant_input.numel() + 1023) // 1024
     if (
@@ -1145,6 +1220,9 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_fp4_quant: bool = False
     stage0: Callable = None
+    # stage2 writes its final result (reduce/split-reduce) instead of
+    # atomic-accumulating into moe_buf -> the moe_buf pre-zero can be skipped.
+    skip_moe_buf_zero: bool = False
 
     def __post_init__(self):
         if self.block_m2 is None:
@@ -1304,6 +1382,7 @@ def _flydsl_stage2_wrapper(
         # Keep stage2 persist behavior aligned with kernel naming.
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
+        persist_n=parsed.get("persist_n", 0),
         n_per_wave=parsed.get("n_per_wave", 32),
         k_batch=parsed.get("k_batch", 1),
     )
@@ -1645,11 +1724,19 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
+        # A FlyDSL reduce/split-reduce stage2 writes its final result instead of
+        # atomic-accumulating into moe_buf, so the moe_buf pre-zero is unnecessary.
+        _s2_reduce = False
         if is_flydsl2:
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
             )
+            _p2 = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName2)
+            if _p2:
+                _s2_reduce = _p2.get("mode") == "reduce" or bool(
+                    _p2.get("split_reduce", False)
+                )
         else:
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
@@ -1667,6 +1754,7 @@ def get_2stage_cfgs(
             block_m2=block_m2,
             run_1stage=run_1stage,
             fuse_fp4_quant=_s1_fq and q_type2 == QuantType.per_1x32,
+            skip_moe_buf_zero=_s2_reduce,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -2149,8 +2237,16 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     elif (
-        _is_direct_params(stage2_params)
-        and q_type2 == QuantType.per_Tensor
+        q_type2 == QuantType.per_Tensor
+        and (
+            _is_direct_params(stage2_params)
+            or (
+                _FAST_PT_QUANT
+                and q_dtype_a2 == dtypes.fp8
+                and a2_scale is None
+                and num_local_tokens is None
+            )
+        )
     ):
         a2, a2_scale = _direct_stage2_per_tensor_quant(a2, a2_scale, q_dtype_a2)
         a2 = a2.view(token_num, topk, inter_dim)

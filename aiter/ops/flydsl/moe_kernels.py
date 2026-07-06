@@ -319,6 +319,10 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["fuse_fp4_quant"] = True
         elif stage == 2 and token == "persist":
             params["persist"] = True
+        elif stage == 2 and token.startswith("pn") and token[2:].isdigit():
+            # persist_n: number of N-tiles each workgroup covers (per-WG N-loop
+            # length). Only meaningful with `persist`. See compile_moe_gemm2.
+            params["persist_n"] = int(token[2:])
         elif token.startswith("sbm") and token[3:].isdigit():
             params["sort_block_m"] = int(token[3:])
         elif token == "fq":
@@ -1029,6 +1033,7 @@ def compile_flydsl_moe_stage2(
     n_per_wave: int = 32,
     k_batch: int = 1,
     persist: bool = False,
+    persist_n: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if direct:
@@ -1109,6 +1114,7 @@ def compile_flydsl_moe_stage2(
             n_per_wave=n_per_wave,
             k_batch=k_batch,
             persist=persist,
+            persist_n=persist_n,
         )
 
 
@@ -1891,6 +1897,7 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    persist_n: int = 0,
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
@@ -2070,6 +2077,7 @@ def flydsl_moe_stage2(
         n_per_wave=n_per_wave,
         k_batch=k_batch,
         persist=bool(persist),
+        persist_n=persist_n,
     )
     _run_compiled(exe, args)
 
@@ -2537,28 +2545,46 @@ def flydsl_moe_stage1_direct(
             # [HY3_FIX_V14] splitk: same per_Tensor + zero-guard as v12/v13 non-splitk path.
             # Bypass _fused_kb_silu_quant/_fused_silu_quant (those assert per-token scale shape).
             from aiter.ops.activation import silu_and_mul
-            from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
+            from aiter.ops.triton.quant import (
+                dynamic_per_tensor_quant_fp8_i8,
+                dynamic_per_tensor_quant_fp8_i8_fused_small,
+            )
 
-            out_scale = torch.zeros((1,), dtype=torch.float32, device=a.device)
-            reduced = tmp_out.sum(dim=0) if _splitk_reduce else tmp_out
+            # empty (not zeros): the quant kernel below writes scale_out
+            # unconditionally, so the zero-fill launch is dead work.
+            out_scale = torch.empty((1,), dtype=torch.float32, device=a.device)
             tmp_bf16 = torch.empty(
                 (token_num, topk, inter_dim),
                 dtype=torch.bfloat16,
                 device=a.device,
             )
-            silu_and_mul(
-                tmp_bf16.view(-1, inter_dim),
-                reduced.view(-1, 2 * inter_dim),
-            )
-            dynamic_per_tensor_quant_fp8_i8(
-                out.view(-1, inter_dim),
-                tmp_bf16.view(-1, inter_dim),
-                out_scale,
-            )
-            # [HY3_FIX_V14] zero-input guard (graph-safe).
-            out_scale.clamp_(min=1e-12)
-            _out_u8 = out.view(torch.uint8)
-            _out_u8.masked_fill_(_out_u8.eq(0x80), 0)
+            if _splitk_reduce and not _fused_post_disabled():
+                # Fuse kb-axis sum + silu_and_mul into one Triton launch,
+                # skipping the separate torch.sum reduce (~6us at small M) and
+                # the f32 `reduced` HBM round-trip. Per-tensor quant follows.
+                _fused_kb_silu(
+                    tmp_bf16.view(-1, inter_dim),
+                    tmp_out.view(int(k_batch), -1, 2 * inter_dim),
+                    inter_dim=inter_dim,
+                )
+            else:
+                reduced = tmp_out.sum(dim=0) if _splitk_reduce else tmp_out
+                silu_and_mul(
+                    tmp_bf16.view(-1, inter_dim),
+                    reduced.view(-1, 2 * inter_dim),
+                )
+            _q_out = out.view(-1, inter_dim)
+            _q_in = tmp_bf16.view(-1, inter_dim)
+            # Single-launch fused quant clamps scale to eps internally, so an
+            # all-zero tile yields a clean fp8 0 (not NaN 0x80). This folds the
+            # [HY3_FIX_V14] clamp_/eq/masked_fill_ zero-guard into one kernel and
+            # replaces the 2-launch dynamic quant -> 5 kernels collapse to 1 on
+            # the small-M a2q path. Falls back when the tile is too big for 1 WG.
+            if dynamic_per_tensor_quant_fp8_i8_fused_small(_q_out, _q_in, out_scale) is None:
+                dynamic_per_tensor_quant_fp8_i8(_q_out, _q_in, out_scale)
+                out_scale.clamp_(min=1e-12)
+                _out_u8 = out.view(torch.uint8)
+                _out_u8.masked_fill_(_out_u8.eq(0x80), 0)
             return out, out_scale
 
         if _splitk_reduce and not _fused_post_disabled():
@@ -2600,22 +2626,27 @@ def flydsl_moe_stage1_direct(
     _run_compiled(exe, args)
     if fuse_a2_quant:
         # [HY3_FIX_V12] per_Tensor scale (was per_Token shape (T*topk,) which caller treats as per_Tensor scalar -> bug)
-        out_scale = torch.zeros(
+        # empty (not zeros): the quant kernel below writes scale_out
+        # unconditionally, so the zero-fill launch is dead work.
+        out_scale = torch.empty(
             (1,), dtype=torch.float32, device=a.device
         )
-        from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
-
-        dynamic_per_tensor_quant_fp8_i8(
-            out.view(-1, inter_dim),
-            _kernel_out.view(-1, inter_dim),
-            out_scale,
+        from aiter.ops.triton.quant import (
+            dynamic_per_tensor_quant_fp8_i8,
+            dynamic_per_tensor_quant_fp8_i8_fused_small,
         )
-        # [HY3_FIX_V13] zero-input guard (graph-safe): when amax=0 -> scale=0 -> static quant div/0 -> fp8 NaN.
-        # 1) clamp scale to small eps so downstream dequant won't div/0.
-        # 2) replace any fp8_e4m3fnuz NaN (encoding 0x80) with fp8 zero (0x00) via uint8 view.
-        out_scale.clamp_(min=1e-12)
-        _out_u8 = out.view(torch.uint8)
-        _out_u8.masked_fill_(_out_u8.eq(0x80), 0)
+
+        _q_out = out.view(-1, inter_dim)
+        _q_in = _kernel_out.view(-1, inter_dim)
+        # Single-launch fused quant clamps scale to eps internally so a zero tile
+        # yields a clean fp8 0 (not NaN 0x80); folds the [HY3_FIX_V13] zero-guard
+        # (clamp_/eq/masked_fill_) and the 2-launch dynamic quant into 1 kernel.
+        # Falls back to the guarded 2-launch path when too big for one workgroup.
+        if dynamic_per_tensor_quant_fp8_i8_fused_small(_q_out, _q_in, out_scale) is None:
+            dynamic_per_tensor_quant_fp8_i8(_q_out, _q_in, out_scale)
+            out_scale.clamp_(min=1e-12)
+            _out_u8 = out.view(torch.uint8)
+            _out_u8.masked_fill_(_out_u8.eq(0x80), 0)
         return out, out_scale
     return out
 

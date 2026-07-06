@@ -113,7 +113,11 @@ def _per_tensor_quant_fused_small_kernel(
     mask = offsets < n_elements
     x = tl.load(x_in_ptr + offsets, mask=mask, other=0.0, cache_modifier=".cg")
     amax = tl.max(tl.abs(x))
-    scale = amax / DTYPE_MAX
+    # Clamp scale to a tiny epsilon so an all-zero tile yields scale>0 and
+    # qx = 0/scale = 0 (a clean fp8 zero) instead of 0/0 = NaN(0x80). This folds
+    # the [HY3_FIX_V14/V15] zero/NaN guard (clamp_ + eq + masked_fill_, 3 extra
+    # elementwise launches) into this single kernel for the direct small-M path.
+    scale = tl.maximum(amax / DTYPE_MAX, 1e-12)
     scale_recip = 1.0 / scale
     qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
     tl.store(qx_ptr + offsets, qx, mask=mask)
