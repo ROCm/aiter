@@ -1,9 +1,22 @@
-pandas
-pytest
-psutil
-matplotlib
-pyyaml
-einops
-pybind11>=3.0.1
-ninja
+# Runtime / CI Python dependencies, version-pinned for reproducible builds and
+# to reduce PyPI supply-chain risk (typosquat / upstream compromise pulling an
+# unexpected version).
+#
+# Baseline: rocm/atom-dev:latest, the canonical aiter build/test image
+#   digest sha256:7826a9a904a905b3b14418b267e8c40d17ca5606d72d620ff407df2129c2e5e7
+# Versions below match what that image ships, so `pip install -r requirements.txt`
+# is a no-op there and reproducible elsewhere.
+#
+# Note: torch and triton are provided by the base image as ROCm-specific builds
+# (e.g. torch 2.10.0+rocm..., triton 3.7.0+amd.rocm...) that are not published on
+# PyPI, so they are intentionally NOT pinned here — their provenance is governed
+# by the base image, not this file.
+pandas==3.0.3
+pytest==9.0.3
+psutil==7.2.2
+matplotlib==3.10.9
+pyyaml==6.0.3
+einops==0.8.2
+pybind11==3.0.4
+ninja==1.13.0
 flydsl==0.2.2
