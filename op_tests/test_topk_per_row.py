@@ -312,6 +312,49 @@ def test_top_k_per_row_decode(
     return ret
 
 
+def test_mb_workspace_reuse():
+    """Regression for the persistent multi-block workspace + kernel self-reset.
+
+    The mb path now runs on a cached, zeroed-once buffer (no per-call memset);
+    the kernel must reset its counters/histograms to zero on exit so the *next*
+    call on the same buffer is correct. This drives 3 calls with DIFFERENT data
+    on the same cached buffer -- if self-reset were broken, a later call would be
+    corrupted by an earlier call's leftover atomic counters / histograms.
+    """
+    num_rows, num_prefix, top_k = 4, 131072, 2048
+    row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
+    probe = create_random_logits(row_starts, row_ends, torch.float32, 0)
+    stride0 = probe.stride(0)
+    if not aiter.topk_use_mulblocks(num_rows, stride0):
+        print(
+            f"[mb_workspace_reuse] mb path not selected on this HW "
+            f"(num_rows={num_rows}, seq={stride0}); skipping"
+        )
+        return
+    max_end = int(max(row_ends))
+    for call_idx, seed in enumerate((11, 22, 33)):
+        logits = create_random_logits(row_starts, row_ends, torch.float32, seed)
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+        aiter.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            None,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=top_k,
+        )
+        ref = logits.topk(min(top_k, max_end), dim=-1)[1]
+        mask = (ref >= 0) & ((ref - (row_ends - row_starts)[:, None]) < 0)
+        ref = ref.masked_fill(~mask, -1)
+        assert compare_topk_results(
+            logits, indices, ref, row_starts, row_ends, top_k
+        ), f"mb workspace reuse mismatch on call #{call_idx} (seed={seed})"
+    print("[mb_workspace_reuse] PASS: 3 reused-buffer mb calls matched torch.topk")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -379,6 +422,9 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+# Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
+test_mb_workspace_reuse()
 
 
 df = []

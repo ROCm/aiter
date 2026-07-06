@@ -75,6 +75,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
+    timeout-minutes: 60
     needs: [split_triton_tests, prepare_triton_wheel, check-signal]
     strategy:
       fail-fast: false
@@ -210,6 +211,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: aiter-1gpu-runner
+    timeout-minutes: 60
     needs: [split_triton_tests, prepare_triton_wheel, check-signal]
     strategy:
       fail-fast: false

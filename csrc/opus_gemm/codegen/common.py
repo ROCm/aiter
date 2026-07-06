@@ -16,6 +16,7 @@ W3_KERNEL_PAIRS = {
     "a16w16_kbuf2v": "a16w16_kbuf2v_sk",
     "a16w16_kbuf2v_bk128": "a16w16_kbuf2v_bk128_sk",
     "a16w16_kbuf1": "a16w16_kbuf1_sk",
+    "a16w16_quad_mfma32_kbuf1": "a16w16_quad_mfma32_kbuf1_sk",
 }
 _NOSPLIT = tuple(W3_KERNEL_PAIRS.keys())
 _SPLITK = tuple(W3_KERNEL_PAIRS.values())
@@ -25,6 +26,7 @@ _GFX942_A16W16_TAGS = (
         "a16w16_em3en4_lds1_pgr2_sk",
         "a16w16_kbuf1_large_tile",
         "a16w16_wave_k_coop",
+        "a16w16_wave_k_coop_accum",
     )
     + _NOSPLIT
 )
@@ -34,6 +36,10 @@ _A16W16_TAGS = (
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
     "a16w16_mono_tile",
+    # gfx1250 cluster/TDM split-K (fp32 workspace + reduce kernel).
+    "a16w16_cluster_tdm_splitk_ws",
+    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (fp32 workspace + reduce).
+    "a16w16_clusterlaunch_tdm_splitk_ws",
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}
