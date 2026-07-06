@@ -1,0 +1,195 @@
+name: ATOMesh Spur Login Smoke
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - ".github/workflows/atomesh-spur-login-smoke.yaml"
+  workflow_dispatch:
+    inputs:
+      atom_ref:
+        description: "ROCm/ATOM ref containing the mesh Slurm script"
+        required: false
+        default: "main"
+      slurm_account:
+        description: "Slurm account"
+        required: false
+        default: "amd-frameworks"
+      slurm_partition:
+        description: "Slurm partition"
+        required: false
+        default: "amd-frameworks"
+      slurm_nodelist:
+        description: "Optional Slurm nodelist override for the 2P1D run"
+        required: false
+        default: "mia1-p02-g42,mia1-p02-g44,mia1-p02-g47"
+      model_path:
+        description: "DeepSeek-V4-Pro model path visible on Slurm nodes"
+        required: false
+        default: "/mnt/models/DeepSeek-V4-Pro/"
+      docker_image:
+        description: "ATOM image used by the ATOM mesh script"
+        required: false
+        default: "rocm/atom-dev:latest"
+      shared_root:
+        description: "Shared root mounted by the ATOM script containers, for example /it-share/..."
+        required: false
+        default: ""
+      isl_list:
+        description: "Input lengths for the smoke benchmark"
+        required: false
+        default: "8192"
+      osl:
+        description: "Output length for the smoke benchmark"
+        required: false
+        default: "1"
+      conc_list:
+        description: "Concurrency list for the smoke benchmark"
+        required: false
+        default: "2"
+      run_gsm8k:
+        description: "Run GSM8K after the mesh smoke check"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  atomesh-spur-login-smoke:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    runs-on: aiter-di-ci-spur-login
+    timeout-minutes: 180
+    env:
+      ATOM_REF: ${{ github.event.inputs.atom_ref || 'main' }}
+      SLURM_ACCOUNT: ${{ github.event.inputs.slurm_account || 'amd-frameworks' }}
+      SLURM_PARTITION: ${{ github.event.inputs.slurm_partition || 'amd-frameworks' }}
+      SLURM_NODELIST: ${{ github.event.inputs.slurm_nodelist || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47' }}
+      MODEL_PATH: ${{ github.event.inputs.model_path || '/mnt/models/DeepSeek-V4-Pro/' }}
+      DOCKER_IMAGE: ${{ github.event.inputs.docker_image || 'rocm/atom-dev:latest' }}
+      SHARED_ROOT: ${{ github.event.inputs.shared_root || format('/it-share/yajizhan/slurm_dsv4_logs/aiter_spur_login_{0}_{1}', github.run_id, github.run_attempt) }}
+      ISL_LIST: ${{ github.event.inputs.isl_list || '8192' }}
+      OSL: ${{ github.event.inputs.osl || '1' }}
+      CONC_LIST: ${{ github.event.inputs.conc_list || '2' }}
+      RUN_GSM8K: ${{ github.event.inputs.run_gsm8k == 'true' && '1' || '0' }}
+      RANDOM_RANGE_RATIO: "0.8"
+      SCRIPT_PATH: atom/mesh/scripts/ds_v4_2p_tp8_1d_tp8_atom_mtp_dpa_slurm.sh
+    steps:
+      - name: Show runner and Slurm state
+        run: |
+          set -euo pipefail
+          hostname
+          whoami
+          pwd
+          command -v sbatch
+          sbatch --version
+          squeue --me || true
+
+      - name: Checkout ATOM mesh scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/ATOM
+          ref: ${{ env.ATOM_REF }}
+          path: ATOM
+
+      - name: Prepare shared ATOM source and patched Slurm script
+        run: |
+          set -euo pipefail
+
+          shared_root="${SHARED_ROOT}"
+          case "${shared_root}" in
+            /it-share/*|/mnt/*|/data/*) ;;
+            *)
+              echo "shared_root must be under /it-share, /mnt, or /data so Slurm node containers can see the copied ATOM source."
+              exit 2
+              ;;
+          esac
+
+          atom_source="${shared_root}/ATOM"
+          log_root="${shared_root}/job"
+          script_src="ATOM/${SCRIPT_PATH}"
+          script_dst="${shared_root}/$(basename "${SCRIPT_PATH}")"
+
+          test -f "${script_src}"
+          mkdir -p "${shared_root}" "${log_root}"
+          rm -rf "${atom_source}"
+          cp -a ATOM "${atom_source}"
+
+          sed "s|/it-share/yajizhan/code/ATOM|${atom_source}|g" "${script_src}" > "${script_dst}"
+          chmod +x "${script_dst}"
+
+          {
+            echo "ATOM_SOURCE_FOR_SLURM=${atom_source}"
+            echo "LOG_ROOT=${log_root}"
+            echo "PATCHED_SCRIPT=${script_dst}"
+          } >> "${GITHUB_ENV}"
+
+          echo "Prepared ATOM source: ${atom_source}"
+          echo "Prepared patched script: ${script_dst}"
+          sed -n '1,80p' "${script_dst}"
+
+      - name: Submit DeepSeek-V4-Pro 2P1D ATOM mesh smoke job
+        run: |
+          set -euo pipefail
+
+          sbatch_args=(
+            --parsable
+            --wait
+            --export=ALL
+            --job-name=aiter-dsv4-2p1d-smoke
+            --output="${SHARED_ROOT}/slurm-%j.out"
+            --error="${SHARED_ROOT}/slurm-%j.err"
+            --time=02:00:00
+          )
+
+          if [[ -n "${SLURM_ACCOUNT}" ]]; then
+            sbatch_args+=(--account="${SLURM_ACCOUNT}")
+          fi
+          if [[ -n "${SLURM_PARTITION}" ]]; then
+            sbatch_args+=(--partition="${SLURM_PARTITION}")
+          fi
+          if [[ -n "${SLURM_NODELIST}" ]]; then
+            sbatch_args+=(--nodelist="${SLURM_NODELIST}")
+          fi
+
+          echo "Submitting ${PATCHED_SCRIPT}"
+          echo "Shared root: ${SHARED_ROOT}"
+          echo "Model path: ${MODEL_PATH}"
+          echo "Docker image: ${DOCKER_IMAGE}"
+          echo "ISL/OSL/CONC: ${ISL_LIST}/${OSL}/${CONC_LIST}"
+          echo "RUN_GSM8K=${RUN_GSM8K}"
+
+          set +e
+          sbatch_output="$(sbatch "${sbatch_args[@]}" "${PATCHED_SCRIPT}" 2>&1)"
+          sbatch_status=$?
+          set -e
+
+          echo "${sbatch_output}"
+          echo "SBATCH_STATUS=${sbatch_status}" >> "${GITHUB_ENV}"
+
+          echo "=== Slurm logs ==="
+          find "${SHARED_ROOT}" -maxdepth 2 -type f \( -name "slurm-*.out" -o -name "slurm-*.err" \) -print -exec tail -n 240 {} \; || true
+
+          echo "=== ATOM mesh result files ==="
+          find "${LOG_ROOT}" -maxdepth 4 -type f \( -name "*.json" -o -name "*.log" -o -name "*.out" -o -name "*.err" \) -print | sort || true
+
+          exit "${sbatch_status}"
+
+      - name: Upload ATOMesh smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomesh-spur-login-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ env.SHARED_ROOT }}/slurm-*.out
+            ${{ env.SHARED_ROOT }}/slurm-*.err
+            ${{ env.LOG_ROOT }}/**/*.json
+            ${{ env.LOG_ROOT }}/**/*.log
