@@ -442,10 +442,6 @@ def moe_gemm_a8w4(
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
-    if use_gluon:
-        clamp_bounds = (K % config["block_k"] != 0) or (
-            triton.cdiv(K, config["block_k"]) < config["num_buffers"]
-        )
     # launch kernel
     if use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
@@ -494,7 +490,6 @@ def moe_gemm_a8w4(
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
-            CLAMP_BOUNDS=clamp_bounds,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
@@ -548,7 +543,6 @@ def moe_gemm_a8w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
             X_SCALE_TDM=X_SCALE_TDM,
-            CLAMP_BOUNDS=clamp_bounds,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
