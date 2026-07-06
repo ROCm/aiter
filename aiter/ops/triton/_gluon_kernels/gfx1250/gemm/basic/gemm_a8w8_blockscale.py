@@ -156,12 +156,14 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
         gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
     )
 
-    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
+    offs_am = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout))
+    ) % M
+    offs_bn = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout))
+    ) % N
 
     offs_a_scale = offs_am * stride_ascale_m
 
@@ -219,12 +221,9 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     # ------------ Prologue ---------------
 
     # load scales
-    a_scale_mask = offs_am < M
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
-        mask=a_scale_mask,
-        other=0,
         cache=cache_modifier,
     )
     if SCALAR_B_SCALE:
@@ -317,8 +316,6 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
         if SCALAR_B_SCALE:
@@ -352,8 +349,6 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
         if SCALAR_B_SCALE:
@@ -532,12 +527,14 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
     )
 
-    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
+    offs_am = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout))
+    ) % M
+    offs_bn = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout))
+    ) % N
 
     offs_a_scale = offs_am * stride_ascale_m
     offs_b_scale_n = offs_bn // GROUP_N
@@ -588,12 +585,9 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
 
     # ------------ Prologue ---------------
 
-    a_scale_mask = offs_am < M
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
-        mask=a_scale_mask,
-        other=0,
         cache=cache_modifier,
     )
     if SCALAR_B_SCALE:
@@ -678,8 +672,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
         if SCALAR_B_SCALE:
@@ -712,8 +704,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
         if SCALAR_B_SCALE:
@@ -974,12 +964,14 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
             gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
         )
 
-    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
+    offs_am = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout))
+    ) % M
+    offs_bn = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout))
+    ) % N
 
     offs_a_scale = offs_am * stride_ascale_m
     offs_b_scale_n = offs_bn // GROUP_N
@@ -1059,12 +1051,9 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
         )
-    a_scale_mask = offs_am < M
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
-        mask=a_scale_mask,
-        other=0,
         cache=cache_modifier,
     )
 
@@ -1162,8 +1151,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
 
@@ -1262,8 +1249,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
 
@@ -1480,12 +1465,14 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
         )
 
-    offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    )
-    offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    )
+    offs_am = (
+        pid_m * BLOCK_SIZE_M
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout))
+    ) % M
+    offs_bn = (
+        pid_n * BLOCK_SIZE_N
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout))
+    ) % N
 
     offs_a_scale = offs_am * stride_ascale_m
     offs_b_scale_n = offs_bn // GROUP_N
@@ -1565,12 +1552,9 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
         )
-    a_scale_mask = offs_am < M
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
-        mask=a_scale_mask,
-        other=0,
         cache=cache_modifier,
     )
 
@@ -1668,8 +1652,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
 
@@ -1768,8 +1750,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            mask=a_scale_mask,
-            other=0,
             cache=cache_modifier,
         )
 
