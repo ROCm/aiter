@@ -375,7 +375,7 @@ def moe_gemm_a8w4(
     X_SCALE_TDM = False
     if use_gluon and x_has_mx:
         mx_scale_block_k = config["block_k"] // 32
-        ASYNC_COPY_MIN_SCALE_WIDTH = 4
+        ASYNC_COPY_MIN_SCALE_WIDTH = 16
         X_SCALE_TDM = (
             mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH
             or K % config["block_k"] != 0
