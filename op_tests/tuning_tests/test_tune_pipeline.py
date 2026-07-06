@@ -135,9 +135,12 @@ class TestTunePipeline(unittest.TestCase):
             "a8w8_blockscale": {
                 "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
                 "header": ["M", "N", "K"],
-                "shapes": [(1, 1024, 512)],
-                "shapes_mp1": [(1, 1024, 512)],
+                # Use the B-preshuffle ASM path to avoid expensive CK JIT builds
+                # in the smoke pipeline.
+                "shapes": [(16, 1536, 7168)],
+                "shapes_mp1": [(16, 1536, 7168)],
                 "keys": ["cu_num", "M", "N", "K"],
+                "extra_args": ["--libtype", "asm", "--preshuffle", "--batch", "1"],
             },
             "a8w8_bpreshuffle": {
                 "script": "csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py",
@@ -280,6 +283,56 @@ class TestTunePipeline(unittest.TestCase):
                 "timeout": 1800,
                 "timeout_mp1": 2400,
             },
+            "csrc_bf16": {
+                "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
+                "header": [
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ],
+                "shapes": [
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                    (
+                        512,
+                        5120,
+                        1280,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "False",
+                        "False",
+                    ),
+                ],
+                "shapes_mp1": [
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                ],
+                "keys": ["M", "N", "K"],
+                "timeout": 900,
+                "timeout_mp1": 1800,
+            },
             "gradlib_bf16": {
                 "script": "gradlib/gradlib/gemm_tuner.py",
                 "header": [
@@ -293,7 +346,6 @@ class TestTunePipeline(unittest.TestCase):
                     "bpreshuffle",
                 ],
                 "shapes": [
-                    # decode (M=1): hipBLASLt/ASM typically wins
                     (
                         1,
                         1024,
@@ -304,20 +356,8 @@ class TestTunePipeline(unittest.TestCase):
                         "False",
                         "False",
                     ),
-                    # prefill (large M): FlyDSL has a chance to win
-                    (
-                        512,
-                        5120,
-                        1280,
-                        "False",
-                        "torch.bfloat16",
-                        "torch.bfloat16",
-                        "False",
-                        "False",
-                    ),
                 ],
                 "shapes_mp1": [
-                    # single small decode shape for mp=1
                     (
                         1,
                         1024,
@@ -349,7 +389,14 @@ class TestTunePipeline(unittest.TestCase):
             tuned = os.path.join(tmp, "tuned.csv")
             _write_csv(untuned, cfg["header"], shapes)
 
-            result = _run_tuner(cfg["script"], untuned, tuned, timeout=timeout, mp=mp)
+            result = _run_tuner(
+                cfg["script"],
+                untuned,
+                tuned,
+                extra_args=cfg.get("extra_args"),
+                timeout=timeout,
+                mp=mp,
+            )
             if result.returncode != 0:
                 print(f"\n=== {name} ({mp_label}) STDOUT ===\n{result.stdout[-2000:]}")
                 print(f"\n=== {name} ({mp_label}) STDERR ===\n{result.stderr[-2000:]}")
@@ -391,6 +438,45 @@ class TestTunePipeline(unittest.TestCase):
     def test_a8w8_blockscale_mp_default(self):
         self._run_one("a8w8_blockscale", mp=None)
 
+    def test_a8w8_blockscale_bpreshuffle_asm_mp1(self):
+        """Smoke-test the a8w8 blockscale B-preshuffle ASM tuner path."""
+        cfg = self.TUNERS["a8w8_blockscale"]
+        with tempfile.TemporaryDirectory() as tmp:
+            untuned = os.path.join(tmp, "untuned.csv")
+            tuned = os.path.join(tmp, "tuned.csv")
+            _write_csv(untuned, cfg["header"], [(16, 1536, 7168)])
+
+            result = _run_tuner(
+                cfg["script"],
+                untuned,
+                tuned,
+                extra_args=["--libtype", "asm", "--preshuffle", "--batch", "1"],
+                timeout=900,
+                mp=1,
+            )
+            if result.returncode != 0:
+                print(
+                    f"\n=== a8w8_blockscale bpreshuffle asm STDOUT ===\n{result.stdout[-2000:]}"
+                )
+                print(
+                    f"\n=== a8w8_blockscale bpreshuffle asm STDERR ===\n{result.stderr[-2000:]}"
+                )
+            self.assertEqual(
+                result.returncode,
+                0,
+                "a8w8_blockscale bpreshuffle asm tuner failed",
+            )
+            self.assertTrue(
+                os.path.exists(tuned),
+                "a8w8_blockscale bpreshuffle asm: tuned CSV not created",
+            )
+
+            df = pd.read_csv(tuned)
+            df.columns = df.columns.str.strip()
+            self.assertGreaterEqual(len(df), 1)
+            self.assertTrue((df["libtype"] == "asm").any())
+            self.assertTrue((df["errRatio"].astype(float) <= 0.05).all())
+
     def test_a8w8_bpreshuffle_mp1(self):
         self._run_one("a8w8_bpreshuffle", mp=1)
 
@@ -414,6 +500,12 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_fmoe_mp_default(self):
         self._run_one("fmoe", mp=None)
+
+    def test_csrc_bf16_mp1(self):
+        self._run_one("csrc_bf16", mp=1)
+
+    def test_csrc_bf16_mp_default(self):
+        self._run_one("csrc_bf16", mp=None)
 
     def _run_gradlib(self, mp):
         """gradlib spawns an internal subprocess; use /tmp paths that persist."""
@@ -462,8 +554,9 @@ class TestShapeGrouped(unittest.TestCase):
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
-            "shapes": [(16, 1536, 7168), (16, 576, 7168), (16, 7168, 256)],
+            "shapes": [(16, 1536, 7168), (32, 1536, 7168), (64, 1536, 7168)],
             "keys": ["cu_num", "M", "N", "K"],
+            "extra_args": ["--libtype", "asm", "--preshuffle"],
             "timeout": 600,
         },
         "batched_bf16": {
@@ -490,7 +583,7 @@ class TestShapeGrouped(unittest.TestCase):
                 cfg["script"],
                 untuned,
                 tuned_ref,
-                extra_args=["-o2", profile_ref],
+                extra_args=cfg.get("extra_args", []) + ["-o2", profile_ref],
                 timeout=timeout,
             )
             self.assertEqual(
@@ -501,7 +594,8 @@ class TestShapeGrouped(unittest.TestCase):
                 cfg["script"],
                 untuned,
                 tuned,
-                extra_args=["--shape_grouped", "-o2", profile],
+                extra_args=cfg.get("extra_args", [])
+                + ["--shape_grouped", "-o2", profile],
                 timeout=timeout,
             )
             if r.returncode != 0:
@@ -540,7 +634,7 @@ class TestComparePipeline(unittest.TestCase):
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
-            "shapes": [(1, 1024, 512)],
+            "shapes": [(16, 1536, 7168)],
             "keys": ["cu_num", "M", "N", "K"],
             "timeout": 3600,
         },
@@ -564,7 +658,8 @@ class TestComparePipeline(unittest.TestCase):
                     "--compare",
                     "--update_improved",
                     "--libtype",
-                    "ck",
+                    "asm",
+                    "--preshuffle",
                     "--batch",
                     "1",
                 ],
@@ -643,6 +738,10 @@ class TestOnlineTuneE2E(unittest.TestCase):
         env = os.environ.copy()
         env["AITER_ONLINE_TUNE"] = "1"
         env["AITER_CONFIG_FMOE"] = tuned_csv
+        # Force subprocess to import aiter from this checkout, not any editable
+        # install on PYTHONPATH (e.g. an older /app/aiter-test with the stale
+        # fmoe_2stages/tune.py online-tune path).
+        env["PYTHONPATH"] = AITER_ROOT + os.pathsep + env.get("PYTHONPATH", "")
 
         try:
             result = subprocess.run(

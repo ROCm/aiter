@@ -408,7 +408,7 @@ template <typename T, std::enable_if_t<is_tuple_v<T> && !(is_tuple_v<tuple_eleme
 OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }  // already flat
 template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true>
 OPUS_H_D constexpr auto flatten_tuple(const T& t) { return flatten_tuple_general(t, make_index_seq<size<T>()>{}); }  // non-tuple (e.g. seq)
-namespace impl { // direct flatten for 1-level nested tuples — bypasses concat_tuple + explode_tuple
+namespace impl { // direct flatten for 1-level nested tuples -- bypasses concat_tuple + explode_tuple
 template<typename T, index_t... Gs> constexpr auto group_sizes(seq<Gs...>) { return seq<size<tuple_element_t<Gs, T>>()...>{}; }
 template<typename T, index_t... Gs> constexpr index_t group_total(seq<Gs...>) { return (size<tuple_element_t<Gs, T>>() + ...); }
 template<index_t J, index_t... Gs, index_t... Ns> constexpr index_t flat_group(seq<Gs...>, seq<Ns...>) { index_t acc = 0, r = 0; ((void)(acc += Ns, (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r; }
@@ -499,7 +499,7 @@ template <std::size_t I, typename... Ts> struct tuple_element<I, const opus::tup
 } // namespace std
 
 namespace opus {
-// fwd-decl mma adaptors — needed so make_tiled_mma() parses on archs (gfx12) where full defs are gated out.
+// fwd-decl mma adaptors -- needed so make_tiled_mma() parses on archs (gfx12) where full defs are gated out.
 struct mfma_adaptor; struct mfma_adaptor_swap_ab; struct wmma_adaptor; struct wmma_adaptor_swap_ab;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -643,6 +643,8 @@ struct layout_cached : public remove_cvref_t<Layout> {
     array<index_t, num_issues> offsets;
 };
 
+// Wraps a layout with a *compile-time* offset N. Keeping N in the type lets smem::tr_load lower it into the `offset:` immediate of ds_read_b64_tr_*,
+// Construct it as `layout/layout_linear/layout_cached + number<N>{}`
 template<typename Layout, index_t N>
 struct layout_shifted : public remove_cvref_t<Layout> {
     using base = remove_cvref_t<Layout>;
@@ -651,6 +653,9 @@ struct layout_shifted : public remove_cvref_t<Layout> {
     OPUS_H_D constexpr layout_shifted(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord) {}
     template <typename... Cs>
     OPUS_H_D constexpr auto operator()(Cs&&... cs) const { return base::operator()(std::forward<Cs>(cs)...) + N; }
+
+    OPUS_H_D constexpr layout_shifted& operator+=(index_t offset) { static_cast<base&>(*this) += offset; return *this; }
+    OPUS_H_D constexpr layout_shifted operator+(index_t offset) const { layout_shifted result(*this); static_cast<base&>(result) += offset; return result; }
 };
 
 template<typename T> struct is_layout : false_type {};
@@ -700,11 +705,11 @@ template<typename Layout, index_t vec = 1> struct layout_load_traits {
     static constexpr auto issue_space = layout_to_issue_space<Layout>();
     static constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{}); static constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
 };
-// Runtime flat index → multi-index tuple (all index_t) — avoids per-iteration template instantiation
+// Runtime flat index -> multi-index tuple (all index_t) -- avoids per-iteration template instantiation
 template<index_t... Is, index_t... Ns> OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
     constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...}, dims[] = {Ns...};
     return opus::make_tuple(static_cast<index_t>((flat / strides[Is]) % dims[Is])...); }
-// Pre-compute offsets via runtime loop — 1 coord_to_linear instantiation per layout instead of N
+// Pre-compute offsets via runtime loop -- 1 coord_to_linear instantiation per layout instead of N
 template<index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
     using LT = layout_load_traits<Layout, vec>; constexpr auto issue_space_vec = LT::issue_space_vec;
     constexpr index_t num_issues = LT::r_elem.value, ndim = size<remove_cvref_t<decltype(issue_space_vec)>>();
@@ -921,6 +926,8 @@ REGISTER_DTYPE(u16 , unsigned short)
 #endif
 REGISTER_DTYPE(i8  , signed char)
 REGISTER_DTYPE(u8  , unsigned char)
+REGISTER_DTYPE(i64 , long long)
+REGISTER_DTYPE(u64 , unsigned long long)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 // numeric_limits -- returns min/max/lowest/quiet_nan/infinity in the *original* dtype
@@ -1125,12 +1132,22 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    // RDNA3/3.5 (gfx1100/gfx115x) lack fp8-conversion-insts; compile-only
+    // stub so headers build. BF16 code paths never invoke fp8 conversion.
+    (void)x; return __builtin_bit_cast(fp8_t, static_cast<signed char>(0));
+#else
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
     return __builtin_bit_cast(fp8_t, static_cast<signed char>(w));
+#endif
 }
 OPUS_D auto fp8_to_fp32(const fp8_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    (void)x; return fp32_t(0.0f);
+#else
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
+#endif
 }
 OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
 OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
@@ -1532,7 +1549,7 @@ OPUS_H_D constexpr index_t get_smem_size()
 
 // ---- Device intrinsic wrappers ----
 // Replace HIP runtime macros (threadIdx.x, __syncthreads, __all, etc.) so kernels compile
-// with just #include <opus/opus.hpp> — no <hip/hip_runtime.h> needed.
+// with just #include <opus/opus.hpp> -- no <hip/hip_runtime.h> needed.
 OPUS_D index_t thread_id_x() { return __builtin_amdgcn_workitem_id_x(); }
 OPUS_D index_t thread_id_y() { return __builtin_amdgcn_workitem_id_y(); }
 OPUS_D index_t thread_id_z() { return __builtin_amdgcn_workitem_id_z(); }
@@ -1542,6 +1559,16 @@ OPUS_D index_t block_id_z()  { return __builtin_amdgcn_workgroup_id_z(); }
 OPUS_D index_t block_size_x() { return __builtin_amdgcn_workgroup_size_x(); }
 OPUS_D index_t block_size_y() { return __builtin_amdgcn_workgroup_size_y(); }
 OPUS_D index_t block_size_z() { return __builtin_amdgcn_workgroup_size_z(); }
+#if defined(__gfx1250__)
+OPUS_D index_t cluster_workgroup_id_x() {return __builtin_amdgcn_cluster_workgroup_id_x();}
+OPUS_D index_t cluster_workgroup_id_y() {return __builtin_amdgcn_cluster_workgroup_id_y();}
+OPUS_D index_t cluster_workgroup_id_z() {return __builtin_amdgcn_cluster_workgroup_id_z();}
+OPUS_D index_t cluster_workgroup_flat_id() {return __builtin_amdgcn_cluster_workgroup_flat_id();}
+OPUS_D index_t cluster_id_x() {return __builtin_amdgcn_cluster_id_x();}
+OPUS_D index_t cluster_id_y() {return __builtin_amdgcn_cluster_id_y();}
+OPUS_D index_t cluster_id_z() {return __builtin_amdgcn_cluster_id_z();}
+#endif
+// grid x-z switch to cluster_id when cluster enable in gfx1250
 OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); }
 OPUS_D index_t grid_size_y()  { return __builtin_amdgcn_grid_size_y(); }
 OPUS_D index_t grid_size_z()  { return __builtin_amdgcn_grid_size_z(); }
@@ -1605,6 +1632,34 @@ OPUS_D unsigned int lane_id() {
     else return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
 
+//gfx1250 only feature. Named-barrier / cluster-sync builtins + __amdgpu_named_workgroup_barrier_t only exist on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse them.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id; }
+
+//Named Barrier define
+#define DECLARE_NAMED_BARRIERS() \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_1; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_2; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_3; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_4; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_5; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_6; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_7; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_8; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_9; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_10; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_11; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_12; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_13; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
+
+OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, u32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
+OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
+OPUS_D void sync_cluster()   { __builtin_amdgcn_s_barrier_signal(-3); __builtin_amdgcn_s_barrier_wait(-3); }
+OPUS_D void sync_workgroup() { __builtin_amdgcn_s_barrier_signal(-1); __builtin_amdgcn_s_barrier_wait(-1); }
+#endif
+
 // cross-lane shuffle via ds_bpermute (no hip_runtime.h dependency)
 template<typename T>
 OPUS_D T shfl(T var, int src_lane, int width = get_warp_size()) {
@@ -1627,7 +1682,7 @@ OPUS_D constexpr auto buffer_default_config() {
     return 0x00020000;
 #elif defined(__gfx103__)
     return 0x31014000;
-// gfx1200/gfx1201 (Navi 44/48) listed explicitly — __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
+// gfx1200/gfx1201 (Navi 44/48) listed explicitly -- __gfx11__/__gfx12__ are typos (clang predefines only uppercase __GFX11__/__GFX12__), so without this gfx1200/gfx1201 fall into the 0xffffffff sentinel and make_gmem<> stores silently drop.
 #elif defined(__gfx11__) || defined(__gfx12__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)
     return 0x31004000;
 #else
@@ -1643,6 +1698,75 @@ OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, unsigned int siz
 OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned int* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 #pragma clang diagnostic pop
 #endif
+
+// ── buffer atomic feature guards ───────────────────────────────────────────────
+// per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
+//   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
+//   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
+//   fadd.v2bf16  : raw_buffer_atomic_fadd<v2bf16>        (gfx90a/gfx942/gfx950/gfx12+; gated to gfx950/gfx1250 per request)
+//   fmin/fmax.f32: atomic-fmin-fmax-global-f32           (gfx950/gfx1250)
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1200__) || defined(__gfx1201__)
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 0
+#endif
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
+#endif
+
+// __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_{f32,v2f16} (opaque rsrc) only exist on clang>=22 / ROCm>=7.2; __has_builtin picks the builtin where present, else the __asm LLVM-intrinsic fallback (i32x4 rsrc, below) -- no -D flag or version literal needed.
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 0
+#endif
+#endif
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 0
+#endif
+#endif
+
+// No clang builtin for these (only global/flat/ds, never raw_(ptr_)buffer), so each binds the LLVM IR int_amdgcn_raw_buffer_atomic_* via __asm under one -Wundefined-inline silence; rsrc is the i32x4 form (memcpy'd, non-copyable): fadd.v2bf16=packed bf16 add, cmpswap.i32=32-bit CAS (emulates pk fadd where unsupported), add.i32=i32 add (aux drives returning-bit+scope).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+OPUS_D bf16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(bf16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2bf16");
+#endif
+// fadd.f32 / fadd.v2f16 __asm fallbacks for toolchains without the raw_ptr builtins (clang < 22).
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+OPUS_D fp32_t llvm_amdgcn_raw_buffer_atomic_fadd_f32(fp32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.f32");
+#endif
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+OPUS_D fp16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(fp16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2f16");
+#endif
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.cmpswap.i32");
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
+#pragma clang diagnostic pop
+
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+enum class atomic_scope : u8_t { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
+// RMW-atomic cpol (NOT make_cpol's load hints): TH[0]=returning (1=>returns pre-op value, tracked by LOADcnt; 0=>non-ret, STOREcnt), TH[1]=NT, TH[2]=cascade (defer scope of non-ret atomics; keep 0 for gates), scope[4:3]=cu/se/dev/sys (cross-cluster needs >=dev).
+OPUS_H_D constexpr int make_atomic_cpol(atomic_scope sc = atomic_scope::dev, bool returning = true, bool nt = false, bool cascade = false) { return (returning ? 1 : 0) | (nt ? (1 << 1) : 0) | (cascade ? (1 << 2) : 0) | ((int(sc) & 0x3) << 3); }
+static_assert(make_atomic_cpol(atomic_scope::dev, true, true, false) == 19, "atomic cpol layout drift");
+static_assert(make_atomic_cpol(atomic_scope::sys, false, false, false) == 24, "atomic cpol layout drift");
+#endif
+
 template<typename T_>
 struct gmem {
     using T = remove_cvref_t<T_>;
@@ -1667,42 +1791,51 @@ struct gmem {
         else if constexpr (sizeof(type) == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_raw_buffer_load_b128(cached_rsrc, v_os, s_os, aux)); }
     }
 
-    template<index_t vec = 1, index_t aux = 0>   // os in unit of byte
-    OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<aux> = {}) {
+    // Async copy global -> LDS. Offsets are in bytes.
+    // IMPORTANT - i_os shifts BOTH ends of the copy, not just the source.
+    template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>
+    OPUS_D void _async_load(OPUS_LDS_ADDR void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using type = vector_type<vec>;
 #if defined(__gfx1250__)
-        // gfx1250: global_load_async_to_lds (global addressing, not buffer rsrc)
+        static_assert(i_os >= 0 && i_os <= (1 << 23) - 1, "_async_load: i_os exceeds gfx1250 VGLOBAL IOFFSET range [0, 2^23 - 1]");
         #define GPTR_(T, p) ((__attribute__((address_space(1))) T*)(p))
         #define LPTR_(T, p) ((OPUS_LDS_ADDR T*)(p))
         {
             auto* src = raw_ptr + v_os + s_os;
-            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), 0, 0);
-                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), 0, 0); }
-            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), 0, 0); }
-            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), 0, 0); }
+            if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src), LPTR_(char, dst), i_os, 0);
+                                                     __builtin_amdgcn_global_load_async_to_lds_b8  (GPTR_(char, src + 1), LPTR_(char, (char*)dst + 1), i_os, 0); }
+            else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_global_load_async_to_lds_b32 (GPTR_(int, src), LPTR_(int, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 8)  { __builtin_amdgcn_global_load_async_to_lds_b64 (GPTR_(i32x2_t, src), LPTR_(i32x2_t, dst), i_os, 0); }
+            else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_global_load_async_to_lds_b128(GPTR_(i32x4_t, src), LPTR_(i32x4_t, dst), i_os, 0); }
         }
         #undef GPTR_
         #undef LPTR_
-#elif __clang_major__ >= 20   // start from rocm 7.0,introduced by https://github.com/llvm/llvm-project/pull/132048, 133055, 132957
-        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, 0, aux); }
+#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)   // CDNA: buffer-load lands directly in LDS (vmem-to-lds-load-insts).
+        static_assert(i_os >= 0 && i_os <= (1 << 12) - 1, "_async_load: i_os exceeds CDNA MUBUF OFFSET range [0, 2^12 - 1]");
+#if __clang_major__ >= 20    // clang 20+ raw_ptr builtin (rocm 7.0+)
+        if      constexpr (sizeof(type) == 1)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  1, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 2)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  2, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 4)  { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst,  4, v_os, s_os, i_os, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 12, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 16) { __builtin_amdgcn_raw_ptr_buffer_load_lds(cached_rsrc, dst, 16, v_os, s_os, i_os, aux); }
 #endif
 #else
         i32x4_t cached_rsrc_;
         __builtin_memcpy(&cached_rsrc_, &cached_rsrc, sizeof(i32x4_t));   // builtin memcpy, __builtin_bit_cast() can not use here due to __amdgpu_buffer_rsrc_t is non copyable
-        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, 0, aux); }
+        if      constexpr (sizeof(type) == 1)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  1, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 2)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  2, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 4)  {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst),  4, v_os, s_os, i_os, aux); }
 #if  defined(__gfx950__)
-        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, 0, aux); }
-        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, 0, aux); }
+        else if constexpr (sizeof(type) == 12) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 12, v_os, s_os, i_os, aux); }
+        else if constexpr (sizeof(type) == 16) {llvm_amdgcn_raw_buffer_load_lds(cached_rsrc_, reinterpret_cast<OPUS_LDS_ADDR u32_t*>(dst), 16, v_os, s_os, i_os, aux); }
 #endif
+#endif
+#else
+        auto val = _load<vec, aux>(v_os + i_os, s_os, number<aux>{});
+        dst = reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst) + i_os);
+        *reinterpret_cast<OPUS_LDS_ADDR type*>(dst) = val;
 #endif
     }
 
@@ -1713,14 +1846,94 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(vector_type<vec>) == 16) {
+#if defined(__gfx1250__) && (__clang_major__ <= 22)
+            // clang<=22 (HIP<=7.2) miscompiles bounded b128 store under high C-store reg expansion (large gfx1250 clusterlaunch tiles, e.g. 128x128): sinks the uniform voffset part into the buffer BASE via readfirstlane, corrupting high address bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier keeps voffset opaque so the full offset stays in the bounds-checked VGPR. Fixed in clang-23/HIP 7.14, where this branch compiles out.
+            int vo_ = v_os;
+            asm volatile("" : "+v"(vo_));
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, vo_, s_os, aux);
+#else
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux);
+#endif
+        }
+    }
+
+    // CAS-loop fallback: emulate a packed fp16/bf16 atomic-add on the 32-bit word at (vo,s_os) when the arch lacks native pk_add -- read the word, add in fp32, write back via cmpswap, retry until the compare succeeds. add_pk is the increment as an fp32x2 (lo,hi lanes).
+    template<typename Pk>
+    OPUS_D Pk _atomic_pk_add_cas(const Pk& add_pk, int vo, int s_os, index_t aux) {
+        i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));
+        i32_t old = __builtin_bit_cast(i32_t, _load<1>(vo, s_os, number<0>{}));   // seed with a normal read of the word
+        i32_t assumed;
+        do {
+            assumed = old;
+            Pk cur = __builtin_bit_cast(Pk, assumed);
+            Pk nxt;
+            if constexpr (std::is_same_v<scalar_type, bf16_t>) {
+                nxt[0] = fp32_to_bf16(bf16_to_fp32(cur[0]) + bf16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_bf16(bf16_to_fp32(cur[1]) + bf16_to_fp32(add_pk[1]));
+            } else { // fp16
+                nxt[0] = fp32_to_fp16(fp16_to_fp32(cur[0]) + fp16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_fp16(fp16_to_fp32(cur[1]) + fp16_to_fp32(add_pk[1]));
+            }
+            old = llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(__builtin_bit_cast(i32_t, nxt), assumed, rsrc_, vo, s_os, aux);
+        } while (old != assumed);
+        return __builtin_bit_cast(Pk, old);
+    }
+
+    // buffer atomic add. v_os/ioffset in BYTES (ioffset compile-time -> folded into the immediate offset: field, v_os stays in a VGPR). Returns the old value. Dispatch on (scalar_type,total): f32x1/f16x2/bf16x2/i32x1/u32x1; packed types fall back to a cmpswap loop on archs lacking native pk_add.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0>   // os in unit of byte
+    OPUS_D auto _atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        using type = vector_type<vec>;
+        constexpr index_t total = vec * vector_size;
+        const int vo = v_os + ioffset;
+        static_assert((std::is_same_v<scalar_type, fp32_t> && total == 1) ||
+                      (std::is_same_v<scalar_type, fp16_t> && total == 2) ||
+                      (std::is_same_v<scalar_type, bf16_t> && total == 2) ||
+                      ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && total == 1),
+                      "unsupported atomic_add (scalar_type, vec) combination");
+#if defined(__HIP_DEVICE_COMPILE__)
+        if constexpr (std::is_same_v<scalar_type, fp32_t> && total == 1) {
+            static_assert(OPUS_HAS_BUFFER_ATOMIC_FADD_F32, "buffer_atomic_add f32 not supported on this arch");
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), rsrc_, vo, s_os, aux));
+#endif
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, fp16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), rsrc_, vo, s_os, aux));
+#endif
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(fp16x2_t, x), vo, s_os, aux));
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, bf16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(__builtin_bit_cast(bf16x2_t, x), rsrc_, vo, s_os, aux));
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(bf16x2_t, x), vo, s_os, aux));
+#endif
+        } else /* i32/u32 */ {
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_add_i32(__builtin_bit_cast(i32_t, x), rsrc_, vo, s_os, aux));
+        }
+#else
+        (void)vo; (void)s_os; return type{};   // host: never codegen'd, body present only to satisfy parsing
+#endif
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
     OPUS_D auto load(int v_os, int s_os = 0, number<aux> = {}) { return _load<vec>(v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
 
-    template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
-    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<aux>{}); }
+    template<index_t vec = 1, index_t i_os = 0, index_t aux = 0>   // os in unit of T and cast to vector with vec; i_os = compile-time immediate byte offset (see _async_load notes; applies to both src and dst)
+    OPUS_D void async_load(void* dst, int v_os, int s_os = 0, number<i_os> = {}, number<aux> = {}) { _async_load<vec>(reinterpret_cast<OPUS_LDS_ADDR void*>(reinterpret_cast<__UINTPTR_TYPE__>(dst)), v_os * sizeof(T), s_os * sizeof(T), number<i_os>{}, number<aux>{}); }
 
     template<index_t vec = 1, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>   // os in unit of T and cast to vector with vec
     OPUS_D void store(const V& x, int v_os, int s_os = 0, number<aux> = {}) {
@@ -1730,6 +1943,34 @@ struct gmem {
         } else {
             static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
             _store<vec>(x, v_os * sizeof(T), s_os * sizeof(T), number<aux>{});
+        }
+    }
+
+    // atomic add. v_os / s_os in unit of T; ioffset is a compile-time element offset folded into the instruction immediate offset: field (also in unit of T). Returns the old value. x must match vec*vector_size.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
+    OPUS_D auto atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must match for atomic_add");
+        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
+        return _atomic_add<vec, ioffset * static_cast<index_t>(sizeof(T))>(x, v_os * sizeof(T), s_os * sizeof(T), number<ioffset * static_cast<index_t>(sizeof(T))>{}, number<aux>{});
+    }
+
+    // bulk atomic add over a tile layout. value is array/vector of partials, one vec per issue.
+    template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void atomic_add(const V& x, const Layout& u, int s_os = 0, number<aux> = {})
+    {
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_vector_v<V>) return x; }();
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            atomic_add<vec>(v_, offsets[i], s_os, number<0>{}, number<aux>{});   // offsets are in element units
         }
     }
 
@@ -1776,15 +2017,15 @@ struct gmem {
         }
     }
 
-    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+    template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t i_os = 0, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using LT = layout_load_traits<LayoutG, vec>;
         constexpr auto r_elem = LT::r_elem;
         auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
         auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
         for (index_t i = 0; i < r_elem.value; i++) {
-            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i])), gmem_offsets[i], s_os, number<aux>{});
+            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i])), gmem_offsets[i], s_os, number<i_os>{}, number<aux>{});
         }
     }
 
@@ -1838,8 +2079,8 @@ struct gmem {
         });
     }
 
-    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
-    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
+    template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t i_os = 0, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
+    OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<i_os> = {}, number<aux> = {}) {
         using LT = layout_load_traits<LayoutG, vec>;
         constexpr auto issue_space_vec = LT::issue_space_vec;
         auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
@@ -1850,7 +2091,7 @@ struct gmem {
         static_ford(issue_space_vec, [&](auto... ids) {
             constexpr index_t idx = u_r(ids...);
             if (pred(ids...)) {
-                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[idx])), gmem_offsets[idx], s_os, number<aux>{});
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[idx])), gmem_offsets[idx], s_os, number<i_os>{}, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
@@ -2091,6 +2332,211 @@ struct smem {
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm (gfx1250): tdm_desc = stateless D# (sg0..sg3 raw dwords); tdm_window = stateful tile window with make() + move(d0..d4, lds) + load_to_lds<cpol>(); cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
+// __builtin_amdgcn_tensor_load_to_lds only exists on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse it.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+
+enum class tdm_load_th : u8_t { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
+enum class tdm_scope   : u8_t { cu=0, se=1, dev=2, sys=3 };
+
+OPUS_H_D constexpr int make_cpol(tdm_load_th th = tdm_load_th::rt, tdm_scope sc = tdm_scope::dev, bool nv = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (nv ? (1 << 5) : 0); }
+inline constexpr int default_cpol = make_cpol(tdm_load_th::rt, tdm_scope::dev);                     // = 16
+static_assert(default_cpol == 16, "cpol layout drift");
+
+namespace impl {
+template<typename T> struct is_static_zero : false_type {};
+template<index_t I>  struct is_static_zero<number<I>> : bool_constant<I == 0> {};
+template<typename T> static constexpr bool is_static_zero_v = is_static_zero<remove_cvref_t<T>>::value;
+
+template<bool En> struct tdm_dim_state {};
+template<>        struct tdm_dim_state<true> { u32_t extent=0; u64_t stride=0; u32_t origin=0; };
+
+// saturating_sub via pure SALU (s_sub_co_u32 + s_cselect_b32); clamps underflow to 0.
+OPUS_H_D u32_t tdm_saturating_sub(u32_t e, u32_t o) {
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__AMDGCN__)
+    u32_t es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), r;
+    asm("s_sub_co_u32 %0, %1, %2\n\ts_cselect_b32 %0, 0, %0" : "=s"(r) : "s"(es), "s"(os) : "scc"); return r;
+#else
+    return (o < e) ? (e - o) : 0u;
+#endif
+}
+
+// wg_mask: seq<i0, i1, ...> index i → bit i. WgCount=0 → mask=0 (no multicast).
+template<index_t WgCount, typename Wgs> struct tdm_wg_mask;
+template<index_t WgCount, index_t... Is> struct tdm_wg_mask<WgCount, seq<Is...>> {
+    static_assert(WgCount >= 0 && (WgCount == 0 || index_t(sizeof...(Is)) == WgCount) && (WgCount == 0 || (((Is >= 0) && ...) && ((Is < 16) && ...))), "tdm_desc: bad selected workgroups");
+    static constexpr u16_t value = [] { if constexpr (WgCount == 0) return u16_t(0); else return (u16_t(0) | ... | u16_t(u16_t(1) << Is)); }();
+};
+template<index_t WgCount, typename Wgs> static constexpr u16_t tdm_wg_mask_v = tdm_wg_mask<WgCount, Wgs>::value;
+
+// __builtin_amdgcn_tensor_load_to_lds operand types (6th arg sg_extra MUST be present & all-zero).
+using tdm_sg0_vec      = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sg1_vec      = i32_t __attribute__((ext_vector_type(8)));
+using tdm_sg2_vec      = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sg3_vec      = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sg_extra_vec = i32_t __attribute__((ext_vector_type(8)));
+} // namespace impl
+
+template<typename T> struct tdm_data_size { static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4||sizeof(T)==8, "tdm_data_size: bad element size"); static constexpr u64_t value = (sizeof(T)==1)?0:(sizeof(T)==2)?1:(sizeof(T)==4)?2:3; };
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm_desc<T, TileDim0..4, flags, pad, SelectedWgs>: stateless D# (sg0..sg3 raw u32_t arrays); compile-time defaults baked into the storage initializer, runtime setters are hand-coded mask+or.
+template<typename DataType,
+         u64_t TileDim0=0, u64_t TileDim1=0, u64_t TileDim2=0, u64_t TileDim3=0, u64_t TileDim4=0,
+         u64_t Count=1, u64_t GatherIndexSize=0, u64_t GatherMode=0, u64_t TypeLo=0, u64_t TypeHi=1,
+         u64_t AtomicBarrierEn=0, u64_t IterateEn=0, u64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         u64_t LdsPadEn=0, u64_t PadInterval=0, u64_t PadAmount=0, typename SelectedWorkgroups = seq<>>
+struct tdm_desc {
+    static constexpr u64_t data_size = tdm_data_size<DataType>::value;
+    static constexpr u64_t wg_mask   = impl::tdm_wg_mask_v<SelectedWorkgroupCount, SelectedWorkgroups>;
+    static constexpr u32_t ndim      = (TileDim4!=0)?5:(TileDim3!=0)?4:(TileDim2!=0)?3:2;
+
+    // Compile-time dword inits (only slots holding ≥1 compile-time field):
+    static constexpr u32_t sg0_init0 = u32_t(Count & 0x1) | (u32_t(GatherIndexSize & 0x1) << 30) | (u32_t(GatherMode & 0x1) << 31);                                            // count | gather flags
+    static constexpr u32_t sg0_init3 = (u32_t(TypeLo & 0x1) << 30) | (u32_t(TypeHi & 0x1) << 31);                                                                                  // global_addr_hi(rt) | type
+    static constexpr u32_t sg1_init0 = u32_t(wg_mask & 0xFFFF) | (u32_t(data_size & 0x3) << 16) | (u32_t(AtomicBarrierEn & 0x1) << 18) | (u32_t(IterateEn & 0x1) << 19) | (u32_t(LdsPadEn & 0x1) << 20) | (u32_t(McEarlyTimeout & 0x1) << 21) | (u32_t(PadInterval & 0x7) << 22) | (u32_t(PadAmount & 0x7F) << 25);   // wg_mask | data_size | flags | pad
+    static constexpr u32_t sg1_init3 = u32_t(TileDim0 & 0xFFFF) << 16;                                                                                                                // tensor_dim1_lo(rt) | tile_dim0
+    static constexpr u32_t sg1_init4 = u32_t(TileDim1 & 0xFFFF) | (u32_t(TileDim2 & 0xFFFF) << 16);                                                                                // tile_dim1 | tile_dim2
+    static constexpr u32_t sg2_init3 = u32_t(TileDim3 & 0xFFFF) << 16;                                                                                                                // tdim2_stride_hi(rt) | tile_dim3
+    static constexpr u32_t sg3_init2 = u32_t(TileDim4 & 0xFFFF) << 16;                                                                                                                // tensor_dim4_hi(rt) | tile_dim4
+
+    u32_t sg0[4]{ sg0_init0, 0, 0, sg0_init3 };
+    u32_t sg1[8]{ sg1_init0, 0, 0, sg1_init3, sg1_init4, 0, 0, 0 };
+    u32_t sg2[4]{ 0, 0, 0, sg2_init3 };
+    u32_t sg3[4]{ 0, 0, sg3_init2, 0 };
+
+    // Runtime setters (bit positions as comments):
+    OPUS_H_D void set_lds_addr          (u32_t v) { sg0[1] = v; }                                                                                                              // [32:32] (LDS addr is 32-bit on gfx1250)
+    OPUS_H_D void set_global_addr       (u64_t v) { sg0[2] = u32_t(v); sg0[3] = (sg0[3] & 0xFE000000u) | u32_t((v >> 32) & 0x01FFFFFFu); }                                  // [64:57]
+    OPUS_H_D void set_tensor_dim0       (u32_t  v) { sg1[1] = (sg1[1] & 0x0000FFFFu) | (v << 16); sg1[2] = (sg1[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    OPUS_H_D void set_tensor_dim1       (u32_t  v) { sg1[2] = (sg1[2] & 0x0000FFFFu) | (v << 16); sg1[3] = (sg1[3] & 0xFFFF0000u) | (v >> 16); }                        // [80:32]
+    OPUS_H_D void set_lds_barrier_addr  (u16_t  v) { sg1[1] = (sg1[1] & 0xFFFF0000u) | u32_t(v); }                                                                   // [32:16]
+    OPUS_H_D void set_tensor_dim0_stride(u64_t  v) { sg1[5] = u32_t(v); sg1[6] = (sg1[6] & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu); }                           // [160:48]
+    OPUS_H_D void set_tensor_dim1_stride(u64_t  v) { sg1[6] = (sg1[6] & 0x0000FFFFu) | u32_t((v & 0xFFFFu) << 16); sg1[7] = u32_t(v >> 16); }                     // [208:48]
+    OPUS_H_D void set_tensor_dim2       (u32_t  v) { sg2[0] = v; }                                                                                                      // [0:32]
+    OPUS_H_D void set_tensor_dim3       (u32_t  v) { sg2[1] = v; }                                                                                                      // [32:32]
+    OPUS_H_D void set_tensor_dim2_stride(u64_t  v) { sg2[2] = u32_t(v); sg2[3] = (sg2[3] & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu); }                           // [64:48]
+    OPUS_H_D void set_tensor_dim3_stride(u64_t  v) { sg3[0] = u32_t(v); sg3[1] = (sg3[1] & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu); }                           // [0:48]
+    OPUS_H_D void set_tensor_dim4       (u32_t  v) { sg3[1] = (sg3[1] & 0x0000FFFFu) | (v << 16); sg3[2] = (sg3[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    // CLUSTER_LOAD_ASYNC peer bitmask (sg1[0] [15:0]); a <=1-WG mask has no fan-out so store 0 (multicast off).   // [0:16]
+    OPUS_H_D void set_workgroup_mask    (u16_t  v) { u16_t m = (__builtin_popcount((unsigned)v) > 1) ? v : u16_t(0); sg1[0] = (sg1[0] & 0xFFFF0000u) | u32_t(m); }
+
+    OPUS_H_D void make(u32_t lds_addr, const void* global_addr, u32_t td0, u32_t td1, u64_t s0,
+                       u64_t s1=0, u16_t lds_bar=0, u32_t td2=0, u32_t td3=0, u64_t s2=0, u64_t s3=0, u32_t td4=0) {
+        set_lds_addr(lds_addr); set_global_addr(reinterpret_cast<u64_t>(global_addr));
+        set_tensor_dim0(td0); set_tensor_dim1(td1); set_tensor_dim0_stride(s0);
+        if (lds_bar) set_lds_barrier_addr(lds_bar);
+        if (s1)  set_tensor_dim1_stride(s1);
+        if (td2) set_tensor_dim2(td2); if (td3) set_tensor_dim3(td3); if (s2) set_tensor_dim2_stride(s2);
+        if (s3)  set_tensor_dim3_stride(s3); if (td4) set_tensor_dim4(td4);
+    }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm_window<T, ...>: stateful tile window over tdm_desc; caches global/lds_offset_bytes (layout_linear), move(d0..d4, lds) does cache += delta and rewrites only affected fields, opus::number<0>{} (0_I) elides that slot at compile time.
+template<typename DataType,
+         u64_t TileDim0=0, u64_t TileDim1=0, u64_t TileDim2=0, u64_t TileDim3=0, u64_t TileDim4=0,
+         u64_t Count=1, u64_t GatherIndexSize=0, u64_t GatherMode=0, u64_t TypeLo=0, u64_t TypeHi=1,
+         u64_t AtomicBarrierEn=0, u64_t IterateEn=0, u64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         u64_t LdsPadEn=0, u64_t PadInterval=0, u64_t PadAmount=0, typename SelectedWorkgroups = seq<>,
+         int CachePol = default_cpol>
+struct tdm_window {
+    using desc_t = tdm_desc<DataType, TileDim0, TileDim1, TileDim2, TileDim3, TileDim4, Count, GatherIndexSize, GatherMode, TypeLo, TypeHi, AtomicBarrierEn, IterateEn, McEarlyTimeout, SelectedWorkgroupCount, LdsPadEn, PadInterval, PadAmount, SelectedWorkgroups>;
+
+    static constexpr int      cache_pol = CachePol;
+    static constexpr u32_t ndim      = desc_t::ndim;
+    static constexpr bool     has_dim2  = (ndim >= 3), has_dim3 = (ndim >= 4), has_dim4 = (ndim >= 5);
+    static_assert((CachePol & ~0x3F) == 0, "tdm_window: cache_pol must fit in 6 bits");
+
+    desc_t    desc{};
+    u32_t            lds_base_addr=0, lds_offset_bytes=0;                                            // LDS addr/offset are 32-bit on gfx1250
+    u64_t            global_base_addr=0, global_offset_bytes=0;
+    u32_t  extent0=0, extent1=0, origin0=0, origin1=0;
+    u64_t  stride0=0;                                                                                // = tdm tensor_dim0_stride (elements)
+    [[no_unique_address]] impl::tdm_dim_state<has_dim2> dim2{};
+    [[no_unique_address]] impl::tdm_dim_state<has_dim3> dim3{};
+    [[no_unique_address]] impl::tdm_dim_state<has_dim4> dim4{};
+
+    // 2D make; 3D/4D/5D SFINAE overloads omitted (uncommon).
+    OPUS_H_D void make(u32_t lds_base, const void* global_base, u32_t lds_off, u32_t td0, u32_t td1, u64_t s0, u32_t o0=0, u32_t o1=0) {
+        lds_base_addr=lds_base; global_base_addr=reinterpret_cast<u64_t>(global_base);
+        lds_offset_bytes=lds_off; stride0=s0; origin0=o0; origin1=o1;
+        extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
+    }
+
+    // 6-operand tensor_load_to_lds (clang>=23 / ROCm>=7.14) vs 5-operand (older); auto-detected from clang version, predefine OPUS_TDM_BUILTIN_HAS_SG_EXTRA=0/1 to override.
+#ifndef OPUS_TDM_BUILTIN_HAS_SG_EXTRA
+#  if defined(__clang_major__) && (__clang_major__ >= 23)
+#    define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 1
+#  else
+#    define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 0
+#  endif
+#endif
+#if OPUS_TDM_BUILTIN_HAS_SG_EXTRA
+#define OPUS_TDM_SG_EXTRA_ARG , impl::tdm_sg_extra_vec{0, 0, 0, 0, 0, 0, 0, 0}
+#else
+#define OPUS_TDM_SG_EXTRA_ARG
+#endif
+
+    template<int cpol = cache_pol>
+    OPUS_D void load_to_lds() const {
+        if constexpr (ndim == 2)
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tdm_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tdm_sg1_vec, desc.sg1), impl::tdm_sg2_vec{0,0,0,0}, impl::tdm_sg3_vec{0,0,0,0} OPUS_TDM_SG_EXTRA_ARG, cpol);
+        else
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tdm_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tdm_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tdm_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tdm_sg3_vec, desc.sg3) OPUS_TDM_SG_EXTRA_ARG, cpol);
+    }
+
+    // move(d0..d4, lds): per-dim signed deltas + lds byte delta. 0_I args are compile-time elided.
+    template<typename D0=number<0>, typename D1=number<0>, typename D2=number<0>, typename D3=number<0>, typename D4=number<0>, typename Lds=number<0>>
+    OPUS_H_D void move(D0 d0={}, D1 d1={}, D2 d2={}, D3 d3={}, D4 d4={}, Lds lds={}) {
+        static_assert(has_dim2 || impl::is_static_zero_v<D2>, "tdm_window::move(): d2 requires has_dim2");
+        static_assert(has_dim3 || impl::is_static_zero_v<D3>, "tdm_window::move(): d3 requires has_dim3");
+        static_assert(has_dim4 || impl::is_static_zero_v<D4>, "tdm_window::move(): d4 requires has_dim4");
+        constexpr bool z0=impl::is_static_zero_v<D0>, z1=impl::is_static_zero_v<D1>, z2=impl::is_static_zero_v<D2>, z3=impl::is_static_zero_v<D3>, z4=impl::is_static_zero_v<D4>, zL=impl::is_static_zero_v<Lds>;
+        if constexpr (!z0)             origin0     = u32_t(i64_t(origin0)     + i64_t(d0));
+        if constexpr (!z1)             origin1     = u32_t(i64_t(origin1)     + i64_t(d1));
+        if constexpr (has_dim2 && !z2) dim2.origin = u32_t(i64_t(dim2.origin) + i64_t(d2));
+        if constexpr (has_dim3 && !z3) dim3.origin = u32_t(i64_t(dim3.origin) + i64_t(d3));
+        if constexpr (has_dim4 && !z4) dim4.origin = u32_t(i64_t(dim4.origin) + i64_t(d4));
+        constexpr bool any_moved = !z0 || !z1 || (has_dim2 && !z2) || (has_dim3 && !z3) || (has_dim4 && !z4);
+        if constexpr (any_moved) { global_offset_bytes = u64_t(i64_t(global_offset_bytes) + coord_delta_to_global_offset_bytes(d0, d1, d2, d3, d4)); desc.set_global_addr(global_base_addr + global_offset_bytes); }
+        if constexpr (!zL)       { lds_offset_bytes    = u32_t(i32_t(lds_offset_bytes) + i32_t(lds)); desc.sg0[1] = lds_base_addr + lds_offset_bytes; }   // lds_addr direct dword write
+        if constexpr (!z0)             desc.set_tensor_dim0(impl::tdm_saturating_sub(extent0,     origin0));
+        if constexpr (!z1)             desc.set_tensor_dim1(impl::tdm_saturating_sub(extent1,     origin1));
+        if constexpr (has_dim2 && !z2) desc.set_tensor_dim2(impl::tdm_saturating_sub(dim2.extent, dim2.origin));
+        if constexpr (has_dim3 && !z3) desc.set_tensor_dim3(impl::tdm_saturating_sub(dim3.extent, dim3.origin));
+        if constexpr (has_dim4 && !z4) desc.set_tensor_dim4(impl::tdm_saturating_sub(dim4.extent, dim4.origin));
+    }
+private:
+    template<typename D0, typename D1, typename D2, typename D3, typename D4>
+    OPUS_H_D constexpr i64_t coord_delta_to_global_offset_bytes(D0 d0, D1 d1, D2 d2, D3 d3, D4 d4) const {
+        i64_t dg = 0;
+        if constexpr (!impl::is_static_zero_v<D0>)             dg += i64_t(d0) * i64_t(sizeof(DataType));
+        if constexpr (!impl::is_static_zero_v<D1>)             dg += i64_t(d1) * i64_t(stride0)     * i64_t(sizeof(DataType));
+        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) dg += i64_t(d2) * i64_t(dim2.stride) * i64_t(sizeof(DataType));
+        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) dg += i64_t(d3) * i64_t(dim3.stride) * i64_t(sizeof(DataType));
+        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) dg += i64_t(d4) * i64_t(dim4.stride) * i64_t(sizeof(DataType));
+        return dg;
+    }
+    OPUS_H_D void materialize_desc_initial() {
+        u64_t s1=0, s2=0, s3=0; u32_t td2=0, td3=0, td4=0;
+        if constexpr (has_dim2) { s1 = dim2.stride; td2 = dim2.extent; }
+        if constexpr (has_dim3) { s2 = dim3.stride; td3 = dim3.extent; }
+        if constexpr (has_dim4) { s3 = dim4.stride; td4 = dim4.extent; }
+        u64_t off = u64_t(origin0) + u64_t(origin1) * stride0;
+        if constexpr (has_dim2) off += u64_t(dim2.origin) * dim2.stride;
+        if constexpr (has_dim3) off += u64_t(dim3.origin) * dim3.stride;
+        if constexpr (has_dim4) off += u64_t(dim4.origin) * dim4.stride;
+        global_offset_bytes = off * sizeof(DataType);
+        desc.make(lds_base_addr + lds_offset_bytes, reinterpret_cast<const void*>(global_base_addr + global_offset_bytes),
+                  impl::tdm_saturating_sub(extent0, origin0), impl::tdm_saturating_sub(extent1, origin1),
+                  stride0, s1, 0, td2, td3, s2, s3, td4);
+    }
+};
+
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mem type traits & free function wrappers (eliminate .template syntax in dependent context)
 template<typename>   struct is_gmem : false_type {};
 template<typename T> struct is_gmem<gmem<T>> : true_type {};
@@ -2192,10 +2638,10 @@ template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
     return inst_(__builtin_bit_cast(long, a), __builtin_bit_cast(long, b), c, cbsz, abid, blgp); }
 
-// scaled MFMA (f8f6f4): input always bitcast to i32x8_t (256 bits); uses format codes and runtime scale
+// scaled MFMA (f8f6f4): input bitcast to i32x8_t (256 bits); uses format codes, runtime scale, and 2-bit byte-selectors (scale_op_sel_a/b) into the packed-int32 scale word.
 #define DISPATCH_MFMA_SCALE_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, 0, scale_a, 0, scale_b); }
+    return inst_(__builtin_bit_cast(i32x8_t, a), __builtin_bit_cast(i32x8_t, b), c, fmt_a, fmt_b, scale_op_sel_a, scale_a, scale_op_sel_b, scale_b); }
 
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 //
@@ -2264,22 +2710,25 @@ struct mfma {
 
     // Scaled MFMA dispatch (gfx950: f8f6f4 with E8M0 block exponent scaling)
     // scale_a, scale_b are runtime E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) -> vtype_c {
-        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;
-        if constexpr (false) {}
+    // scale_op_sel_a/b: compile-time 2-bit byte-selectors picking which byte of the packed-int32 scale word feeds this MFMA; 0 = low byte = legacy scalar behavior.
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) -> vtype_c {
+        (void)a; (void)b; (void)c; (void)scale_a; (void)scale_b;  // used by DISPATCH_MFMA_SCALE_; suppress -Wunused-parameter on host
+        if      constexpr (false) {}
 #if defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
 #endif
         __builtin_unreachable();
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 };
 #undef DISPATCH_MFMA_
@@ -2317,7 +2766,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 #endif // __GFX9__ (mfma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// wmma (RDNA4 / wave32) — gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ — gfx12 set is DISPATCH_WMMA_GFX12_*.
+// wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
 #if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
@@ -2341,7 +2790,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
                  static_cast<short>(0), c, false, false); }
 
-// gfx12 builtins: 3-arg (A, B, C) — no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
+// gfx12 builtins: 3-arg (A, B, C) -- no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
 #define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
     (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && wave_m == wm_ && wave_n == wn_ && wave_k == wk_ && warp_size == ws_)
 #define DISPATCH_WMMA_GFX12_F32_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_) \
@@ -2351,7 +2800,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     constexpr index_t i32_a = elem_a * static_cast<index_t>(sizeof(dtype_a)) / static_cast<index_t>(sizeof(i32_t)); \
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), __builtin_bit_cast(vector_t<i32_t, i32_b>, b), c); }
-#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain N×inst for wider K */ \
+#define DISPATCH_WMMA_GFX12_F32_STEP_K_(ta_, tb_, tc_, wm_, wn_, wk_, ws_, inst_k_, inst_) /* chain Nxinst for wider K */ \
     DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) { \
     constexpr index_t steps = wk_ / inst_k_, e_a = elem_a / steps, e_b = elem_b / steps; \
     auto tmp = inst_(slice(a, number<0>{}, number<e_a>{}), slice(b, number<0>{}, number<e_b>{}), c); \
@@ -2424,7 +2873,7 @@ struct wmma {
 #if defined(__gfx1201__) || defined(__gfx1200__)
         // _w32/_w64 builtins gated by wavefrontsize target feature; OPUS_GFX120X_IS_WAVE32 selects the active wave mode.
 #  if OPUS_GFX120X_IS_WAVE32
-        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 → f32 + same-type acc. iu8/iu4 deferred.
+        // gfx12 wave32 16x16x16: f16/bf16/fp8/bf8 -> f32 + same-type acc. iu8/iu4 deferred.
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
@@ -2433,7 +2882,7 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(fp8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , fp8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_8BIT_(bf8_t , bf8_t , fp32_t , 16, 16, 16, 32, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
-        // gfx12 wave32 16x16x32 synthetic: 2× stacked 16x16x16 along K.
+        // gfx12 wave32 16x16x32 synthetic: 2x stacked 16x16x16 along K.
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 32, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
@@ -2445,7 +2894,7 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, fp32_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (fp16_t, fp16_t, fp16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_ (bf16_t, bf16_t, bf16_t , 16, 16, 16, 64, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w64_gfx12)
-        // gfx12 wave64 16x16x32 synthetic: 2× stacked _w64 16x16x16 (8 elem/lane = 1 b128 load).
+        // gfx12 wave64 16x16x32 synthetic: 2x stacked _w64 16x16x16 (8 elem/lane = 1 b128 load).
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(bf16_t, bf16_t, fp32_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12)
         else if constexpr DISPATCH_WMMA_GFX12_F32_STEP_K_(fp16_t, fp16_t, fp16_t , 16, 16, 32, 64, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w64_gfx12)
@@ -2560,7 +3009,7 @@ using wmma_f32_16x16x16_fp8_fp8 = wmma<fp8_t , fp8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_fp8_bf8 = wmma<fp8_t , bf8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf8_fp8 = wmma<bf8_t , fp8_t , fp32_t, 16, 16, 16>;
 using wmma_f32_16x16x16_bf8_bf8 = wmma<bf8_t , bf8_t , fp32_t, 16, 16, 16>;
-// gfx12 wave32 16x16x32 synthetic (2× 16x16x16).
+// gfx12 wave32 16x16x32 synthetic (2x 16x16x16).
 using wmma_f32_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 32>;
 using wmma_f32_16x16x32_bf16_w32  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 32>;
 using wmma_f16_16x16x32_f16_w32   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 32>;
@@ -2570,7 +3019,7 @@ using wmma_f32_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16, 64>
 using wmma_f32_16x16x16_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16, 64>;
 using wmma_f16_16x16x16_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16, 64>;
 using wmma_bf16_16x16x16_bf16_w64 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16, 64>;
-// gfx12 wave64 16x16x32 synthetic (2× 16x16x16_w64).
+// gfx12 wave64 16x16x32 synthetic (2x 16x16x16_w64).
 using wmma_f32_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32, 64>;
 using wmma_f32_16x16x32_bf16_w64  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32, 64>;
 using wmma_f16_16x16x32_f16_w64   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32, 64>;
@@ -2784,14 +3233,14 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
         typename MFMA::vtype_c c{0}; return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        return base::operator()(b, a, c, scale_b, scale_a);
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<scale_op_sel_b>{}, number<scale_op_sel_a>{});
     }
 
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
-        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
+        typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 };
 }
@@ -2940,10 +3389,12 @@ struct tiled_mma_adaptor : public MMA_ {
     static constexpr index_t tile_c_len = EXPAND_M * EXPAND_N * mma_c_len;
 
     // input a/b/c is array of ext type e.g. "fp16x2_t a[2];", pass "a" to this function
+    // #pragma unroll required: constexpr trip counts but clang's heuristic gives up on large tiles -> runtime indices into vtype_a/b/c -> N-way s_cselect_b64 chain on GFX9 -> SGPR-spill-to-VGPR-lane blow-up.
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
@@ -2961,13 +3412,21 @@ struct tiled_mma_adaptor : public MMA_ {
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             index_t i_a = (i_m * EXPAND_K + i_k) * a_len, i_b = (i_n * EXPAND_K + i_k) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
-            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
-            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
-            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
+            #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;
@@ -2979,22 +3438,23 @@ struct tiled_mma_adaptor : public MMA_ {
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA
-    template<typename VA, typename VB, typename VC,
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b and per-call scale_op_sel to underlying MMA; all sub-MFMAs in this call share the same scale_op_sel (same K position in the packed-int32 scale word).
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b); c_[i_m * EXPAND_N + i_n] = s_c;
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{}); c_[i_m * EXPAND_N + i_n] = s_c;
         }
         return c_;
     }
 
-    template<typename VA, typename VB, typename VC,
+    template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(size<VA>() == tile_a_len);
         static_assert(size<VB>() == tile_b_len);
         static_assert(size<VC>() == tile_c_len);
@@ -3009,15 +3469,16 @@ struct tiled_mma_adaptor : public MMA_ {
             auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
             auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
             auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
             set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
         });
         return c_;
     }
-    template<typename VA, typename VB>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
+
+    template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         vtype_c c{0};
-        return operator()(a, b, c, scale_a, scale_b);
+        return operator()(a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 
     template<index_t STEP_K, typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
@@ -3044,13 +3505,21 @@ struct tiled_mma_adaptor : public MMA_ {
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
-            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
-            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
-            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
+            #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;
@@ -3062,22 +3531,23 @@ struct tiled_mma_adaptor : public MMA_ {
         return step_k(step, a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    template<index_t STEP_K, typename VA, typename VB, typename VC,
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(STEP_K < EXPAND_K);
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b); c_[i_m * EXPAND_N + i_n] = s_c;
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{}); c_[i_m * EXPAND_N + i_n] = s_c;
         }
         return c_;
     }
 
-    template<index_t STEP_K, typename VA, typename VB, typename VC,
+    template<index_t STEP_K, typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
-    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
+    OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(STEP_K < EXPAND_K);
         static_assert(size<VA>() == tile_a_len);
         static_assert(size<VB>() == tile_b_len);
@@ -3086,22 +3556,30 @@ struct tiled_mma_adaptor : public MMA_ {
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
-            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
-            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
-            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
+            #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;
     }
 
-    template<index_t STEP_K, typename VA, typename VB>
-    OPUS_D constexpr auto step_k(number<STEP_K> step, const VA& a, const VB& b, int scale_a, int scale_b) {
+    template<index_t STEP_K, typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>
+    OPUS_D constexpr auto step_k(number<STEP_K> step, const VA& a, const VB& b, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         vtype_c c{0};
-        return step_k(step, a, b, c, scale_a, scale_b);
+        return step_k(step, a, b, c, scale_a, scale_b, number<scale_op_sel_a>{}, number<scale_op_sel_b>{});
     }
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE

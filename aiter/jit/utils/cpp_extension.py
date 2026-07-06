@@ -8,6 +8,7 @@
 import copy
 import importlib
 import importlib.abc
+import importlib.util
 import os
 import re
 import shlex
@@ -91,7 +92,51 @@ def get_hip_version():
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
     except Exception:
-        raise RuntimeError("ROCm version file not found")
+        pass
+    # The fallbacks below previously hard-coded /opt/rocm, so they never
+    # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
+    # same way the rest of this module does (ROCM_HOME / ROCM_PATH env, then
+    # `which hipcc`, then /opt/rocm).  NOTE: the module-level ROCM_HOME global
+    # is assigned *after* this function is first called (see bottom of file),
+    # so we must call _find_rocm_home() directly here rather than referencing
+    # the global.  /opt/rocm is kept as a last-resort candidate so behavior on
+    # default installs is unchanged.
+    rocm_roots = []
+    discovered = _find_rocm_home()
+    if discovered:
+        rocm_roots.append(discovered)
+    if "/opt/rocm" not in rocm_roots:
+        rocm_roots.append("/opt/rocm")
+
+    # Fallback: try <rocm_root>/bin/hipconfig for each candidate root.
+    for root in rocm_roots:
+        rocm_hipconfig = os.path.join(root, "bin", "hipconfig")
+        if os.path.isfile(rocm_hipconfig):
+            try:
+                output = subprocess.check_output(
+                    [rocm_hipconfig, "--version"], text=True
+                )
+                return output
+            except Exception:
+                pass
+    # Fallback: read HIP version from a header / info file under each root.
+    for root in rocm_roots:
+        for ver_rel in ["include/hip/hip_version.h", ".info/version"]:
+            ver_path = os.path.join(root, ver_rel)
+            if os.path.isfile(ver_path):
+                with open(ver_path) as f:
+                    content = f.read()
+                if "HIP_VERSION_MAJOR" in content:
+                    import re
+
+                    major = re.search(r"HIP_VERSION_MAJOR\s+(\d+)", content)
+                    minor = re.search(r"HIP_VERSION_MINOR\s+(\d+)", content)
+                    patch = re.search(r"HIP_VERSION_PATCH\s+(\d+)", content)
+                    if major and minor and patch:
+                        return f"{major.group(1)}.{minor.group(1)}.{patch.group(1)}"
+                else:
+                    return content.strip()
+    raise RuntimeError("ROCm version file not found")
 
 
 def _find_rocm_home() -> Optional[str]:
@@ -99,7 +144,21 @@ def _find_rocm_home() -> Optional[str]:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2
+        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
+        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
+        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
+        # wrapper, not a real binary — realpath() can't recover the SDK
+        # root from it.
+        try:
+            spec = importlib.util.find_spec("_rocm_sdk_devel")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            candidate = spec.submodule_search_locations[0]
+            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+                rocm_home = candidate
+    if rocm_home is None:
+        # Guess #3
         hipcc_path = shutil.which("hipcc")
         if hipcc_path is not None:
             rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
@@ -107,7 +166,7 @@ def _find_rocm_home() -> Optional[str]:
             if os.path.basename(rocm_home) == "hip":
                 rocm_home = os.path.dirname(rocm_home)
         else:
-            # Guess #3
+            # Guess #4
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
@@ -1145,6 +1204,7 @@ def _jit_compile(
     keep_intermediates=True,
     torch_exclude=False,
     hipify=True,
+    extra_cuda_cflags_per_source=None,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1162,6 +1222,9 @@ def _jit_compile(
             extra_cuda_cflags,
             extra_ldflags,
             extra_include_paths,
+            # Include per-source extras in the cache key so toggling them
+            # invalidates the cached .so on the next call.
+            extra_cuda_cflags_per_source,
         ],
         build_directory=build_directory,
         with_cuda=with_cuda,
@@ -1236,6 +1299,7 @@ def _jit_compile(
                         is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
+                        extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                     )
             elif verbose:
                 print(
@@ -1318,6 +1382,7 @@ def _write_ninja_file_and_build_library(
     is_python_module: bool,
     is_standalone: bool = False,
     torch_exclude: bool = False,
+    extra_cuda_cflags_per_source=None,
 ) -> None:
     verify_ninja_availability()
 
@@ -1345,6 +1410,7 @@ def _write_ninja_file_and_build_library(
         is_python_module=is_python_module,
         is_standalone=is_standalone,
         torch_exclude=torch_exclude,
+        extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
     )
 
     if verbose:
@@ -1528,6 +1594,7 @@ def _write_ninja_file_to_build_library(
     is_python_module,
     is_standalone,
     torch_exclude,
+    extra_cuda_cflags_per_source=None,
 ) -> None:
     extra_cflags = [flag.strip() for flag in extra_cflags]
     extra_cuda_cflags = [flag.strip() for flag in extra_cuda_cflags]
@@ -1618,6 +1685,7 @@ def _write_ninja_file_to_build_library(
         ldflags=ldflags,
         library_target=library_target,
         with_cuda=with_cuda,
+        extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
     )
 
 
@@ -1633,6 +1701,7 @@ def _write_ninja_file(
     ldflags,
     library_target,
     with_cuda,
+    extra_cuda_cflags_per_source=None,
 ) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
@@ -1647,6 +1716,13 @@ def _write_ninja_file(
     `library_target`: Name of the output library. Can be None; in that case,
                       we do no linking.
     `with_cuda`: If we should be compiling with CUDA.
+    `extra_cuda_cflags_per_source`: Optional mapping {source_path_or_glob:
+        list_of_flags}. When a source file matches one of the keys, the
+        flags are appended to that file's $cuda_post_cflags via a
+        per-build ninja variable override (so they only affect that one
+        translation unit, not the rest). Useful for opus_gemm where one
+        kernel TU benefits from -D__HIPCC_RTC__ but the dispatcher TUs
+        in the same module would break with it.
     """
 
     def sanitize_flags(flags):
@@ -1704,14 +1780,50 @@ def _write_ninja_file(
         )
 
     # Emit one build rule per source to enable incremental build.
+    # Optional per-source override: ninja allows variable bindings under a
+    # build statement (indented `var = value` on the next line). For
+    # cuda_compile this re-binds $cuda_post_cflags for that single
+    # translation unit, which is exactly the granularity we need to apply
+    # something like -D__HIPCC_RTC__ to a kernel TU without breaking
+    # neighbouring host TUs. See `extra_cuda_cflags_per_source` docstring.
+    import fnmatch as _fnmatch
+
+    per_source_map = extra_cuda_cflags_per_source or {}
+
+    def _resolve_per_source_flags(src_abs):
+        # Match by absolute path glob, basename glob, or exact path. First
+        # match wins so callers get deterministic behaviour when multiple
+        # patterns overlap.
+        src_base = os.path.basename(src_abs)
+        for pattern, extra_flags in per_source_map.items():
+            if (
+                pattern == src_abs
+                or _fnmatch.fnmatch(src_abs, pattern)
+                or _fnmatch.fnmatch(src_base, pattern)
+            ):
+                return extra_flags
+        return None
+
     build = []
     for source_file, object_file in zip(sources, objects):
         is_cuda_source = _is_cuda_file(source_file) and with_cuda
         rule = "cuda_compile" if is_cuda_source else "compile"
 
-        source_file = source_file.replace(" ", "$ ")
-        object_file = object_file.replace(" ", "$ ")
-        build.append(f"build {object_file}: {rule} {source_file}")
+        per_source_flags = (
+            _resolve_per_source_flags(source_file) if is_cuda_source else None
+        )
+
+        source_file_q = source_file.replace(" ", "$ ")
+        object_file_q = object_file.replace(" ", "$ ")
+        build.append(f"build {object_file_q}: {rule} {source_file_q}")
+        if per_source_flags:
+            # Append to the rule-level $cuda_post_cflags rather than
+            # replacing it, so the global flags (e.g. --offload-arch) stay
+            # in effect for this TU too.
+            build.append(
+                "  cuda_post_cflags = "
+                f"{' '.join(cuda_post_cflags + list(per_source_flags))}"
+            )
 
     flags.append(f'ldflags = {" ".join(ldflags)}')
     if cuda_dlink_post_cflags:

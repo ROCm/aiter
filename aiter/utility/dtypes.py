@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx_runtime
 from ..ops.enum import QuantType, ActivationType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
@@ -9,6 +9,8 @@ import argparse
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},
     "gfx950": {"fp8": torch.float8_e4m3fn},
+    "gfx1200": {"fp8": torch.float8_e4m3fn},
+    "gfx1201": {"fp8": torch.float8_e4m3fn},
     "gfx1250": {"fp8": torch.float8_e4m3fn},
 }
 
@@ -16,7 +18,7 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx(), {"fp8": _8bit_fallback})["fp8"]
+    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
 
 
 i4x2 = getattr(torch, "int4", _8bit_fallback)

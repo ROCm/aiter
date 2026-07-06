@@ -127,8 +127,8 @@ def _gemm_a16_w16_gated_kernel(
                 cache_modifier=cache_modifier,
             )
 
-        acc0 += tl.dot(a, b0)
-        acc1 += tl.dot(a, b1)
+        acc0 = tl.dot(a, b0, acc=acc0)
+        acc1 = tl.dot(a, b1, acc=acc1)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak

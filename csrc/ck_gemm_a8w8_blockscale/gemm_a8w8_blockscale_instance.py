@@ -116,3 +116,10 @@ default_kernels_dict = {
     (-1):KernelInstance(256,     1,   128,   128,    16,   128,   256,  16,  16,  16,   16,    1,    2,     [16, 16, 1],     [16, 16, 1],           1,           2,                   [1, 16, 1, 16],             [8],     "Intrawave",                  1,),
 }
 # fmt: on
+
+
+# Name-keyed reverse lookup so codegen can filter the tuned CSV by kernelName,
+# matching what the C++ runtime dispatcher uses.  This guards against a
+# (kernelId, kernelName) desync in the CSV silently producing a .so that
+# TORCH_CHECK(false, ...) at runtime for the offending shape.
+candidate_kernels_by_name = {v.name: v for v in candidate_kernels_dict.values()}

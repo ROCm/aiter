@@ -33,13 +33,14 @@ echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
-pip install -r .github/requirements/triton-test.txt
+retry_cmd 3 pip install -r .github/requirements/triton-test.txt
+.github/scripts/install_triton.sh
 pip uninstall -y aiter || true
 retry_cmd 3 pip install --no-build-isolation -e .
 
 echo
-echo "==== Verify pinned triton ===="
-python .github/scripts/verify_triton_pin.py .github/requirements/triton-test.txt
+echo "==== Verify triton installed by install_triton.sh ===="
+python .github/scripts/verify_triton_pin.py
 
 # Read BUILD_TRITON env var, default to 0. If 1, override the pinned triton wheel with a source build; if 0, use the pinned wheel from triton-test.txt.
 BUILD_TRITON=${BUILD_TRITON:-0}

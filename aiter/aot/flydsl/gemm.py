@@ -44,6 +44,7 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
@@ -197,6 +198,12 @@ def _compile_executable_to_cache(exe, *args) -> None:
         exe(*args)
 
 
+def _ptr_view_safe(t):
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+    return ptr_arg(t)
+
+
 def _compile_hgemm_to_cache(
     *,
     m: int,
@@ -207,9 +214,11 @@ def _compile_hgemm_to_cache(
     tile_m: int,
     tile_n: int,
     tile_k: int,
+    stages: int,
     split_k: int,
     block_m_warps: int,
     block_n_warps: int,
+    block_k_warps: int,
     n_tile_repeat: int = 1,
     persistent_n_tiles: int = 1,
     waves_per_eu: int = 0,
@@ -254,9 +263,11 @@ def _compile_hgemm_to_cache(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
+        stages=stages,
         split_k=split_k,
         block_m_warps=block_m_warps,
         block_n_warps=block_n_warps,
+        block_k_warps=block_k_warps,
         n_tile_repeat=n_tile_repeat,
         persistent_n_tiles=persistent_n_tiles,
         waves_per_eu=waves_per_eu,
@@ -271,7 +282,15 @@ def _compile_hgemm_to_cache(
     # optional bias and split-K sync tensors.
     launch_bias = bias if has_bias else b
     _compile_executable_to_cache(
-        exe, out, a, b, launch_bias, m, semaphore, signal, stream
+        exe,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        _ptr_view_safe(launch_bias),
+        m,
+        _ptr_view_safe(semaphore),
+        _ptr_view_safe(signal),
+        stream,
     )
 
 
@@ -322,7 +341,18 @@ def _compile_preshuffle_to_cache(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         xcd_swizzle=xcd_swizzle,
     )
-    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, bias, m, n, stream)
+    _compile_executable_to_cache(
+        exe,
+        _ptr_view_safe(out),
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        _ptr_view_safe(scale_a),
+        _ptr_view_safe(scale_b),
+        _ptr_view_safe(bias),
+        m,
+        n,
+        stream,
+    )
 
 
 def compile_one_config(
@@ -343,9 +373,10 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
@@ -408,19 +439,11 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
 
-    if hgemm_jobs:
-        print(f"\n--- HGEMM ({len(hgemm_jobs)} kernels) ---")
-        for i, job in enumerate(hgemm_jobs, 1):
-            print(f"\n[{i}/{len(hgemm_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
-
-    if preshuffle_jobs:
-        print(f"\n--- Preshuffle GEMM ({len(preshuffle_jobs)} kernels) ---")
-        for i, job in enumerate(preshuffle_jobs, 1):
-            print(f"\n[{i}/{len(preshuffle_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
+    # HGEMM and preshuffle kernels are independent compiles, so they share
+    # one pool for maximum fan-out instead of two serial passes.
+    print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle) ---")
+    results = run_jobs_parallel(compile_one_config, hgemm_jobs + preshuffle_jobs)
 
     total_elapsed = time.time() - total_t0
 

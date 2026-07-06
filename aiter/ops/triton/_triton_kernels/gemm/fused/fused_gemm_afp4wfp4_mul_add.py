@@ -449,7 +449,9 @@ def _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel(
                 .trans(1, 0)
             )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(
+                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
+            )
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak

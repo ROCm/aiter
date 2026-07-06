@@ -708,6 +708,16 @@ parser.add_argument(
     e.g.: -i true   # for interleaved MRoPE
           or -i false # for non-interleaved MRoPE""",
 )
+parser.add_argument(
+    "-k",
+    "--kv_cache_dtypes",
+    type=dtypes.str2Dtype,
+    nargs="*",
+    default="bf16,fp8",
+    help="""KV cache dtypes.
+    e.g.: --kv_cache_dtypes bf16
+          or --kv_cache_dtypes fp8""",
+)
 
 mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
@@ -719,14 +729,13 @@ mrope_partial_sections_dict = {
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    kv_cache_dtypes = [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz]
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
     page_sizes = [16]  # Test two page sizes for shuffle layout
     partial_rotary_configs = [(256, 64), (128, 32)]
     partial_rotary_heads = [(32, 4), (8, 2)]
 
-    for kv_cache_dtype in kv_cache_dtypes:
+    for kv_cache_dtype in args.kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
             for use_shuffle_layout in use_shuffle_layouts:
                 # For shuffle layout, test both page sizes; for normal layout, skip page_size
@@ -756,7 +765,7 @@ if __name__ == "__main__":
                                             max_positions=args.max_positions,
                                         )
 
-    for kv_cache_dtype in kv_cache_dtypes:
+    for kv_cache_dtype in args.kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:
             for use_shuffle_layout in use_shuffle_layouts:
                 # For shuffle layout, test both page sizes; for normal layout, skip page_size
@@ -787,7 +796,7 @@ if __name__ == "__main__":
 
     # Partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     print("\n=== Partial Rotary RoPE Tests (non-mrope) ===", flush=True)
-    for kv_cache_dtype in kv_cache_dtypes:
+    for kv_cache_dtype in args.kv_cache_dtypes:
         for use_shuffle_layout in use_shuffle_layouts:
             page_size_list = page_sizes if use_shuffle_layout else [0]
             for page_size in page_size_list:
@@ -817,7 +826,7 @@ if __name__ == "__main__":
 
     # MRoPE + Partial rotary tests (Qwen3.5 multimodal: head_size=256, rotary_dim=64)
     print("\n=== Partial Rotary MRoPE Tests ===", flush=True)
-    for kv_cache_dtype in kv_cache_dtypes:
+    for kv_cache_dtype in args.kv_cache_dtypes:
         for use_shuffle_layout in use_shuffle_layouts:
             page_size_list = page_sizes if use_shuffle_layout else [0]
             for page_size in page_size_list:

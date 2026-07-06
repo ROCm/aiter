@@ -232,7 +232,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                         cache_modifier=cache_modifier,
                     )
 
-                accumulator_bf16 += tl.dot(a, b)
+                accumulator_bf16 = tl.dot(a, b, acc=accumulator_bf16)
 
                 a_ptrs += BLOCK_SIZE_K * stride_a_bf16_k
                 b_ptrs += BLOCK_SIZE_K * stride_b_bf16_k

@@ -17,6 +17,7 @@ import triton.language as tl
 from ..gated_delta_rule_utils import (
     input_guard,
     autotune_cache_kwargs,
+    gated_delta_rule_autotune_configs,
     IS_TMA_SUPPORTED,
 )
 from .index import prepare_chunk_indices
@@ -39,13 +40,16 @@ DOT_PRECISION_AUTOTUNE_LIST = (
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"DOT_PRECISION": "ieee"}, num_warps=num_warps, num_stages=num_stages
-        )
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-    ],
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config(
+                {"DOT_PRECISION": "ieee"}, num_warps=num_warps, num_stages=num_stages
+            )
+            for num_warps in [1, 2, 4, 8]
+            for num_stages in [2, 3, 4, 5]
+        ],
+        triton.Config({"DOT_PRECISION": "ieee"}, num_warps=4, num_stages=3),
+    ),
     key=["BT"],
     **autotune_cache_kwargs,
 )
@@ -97,9 +101,10 @@ def solve_tril_16x16_kernel(
     b_A = -b_A
 
     for i in range(2, min(16, T - i_t * 16)):
-        # [16]
+        # [16]; A is strictly lower triangular (enforced by the fused
+        # cumsum+KKT kernel) so the
+        # upper-tri elements are already zero, no defensive mask needed.
         b_a = -tl.load(A + (i_t * 16 + i) * H * BT + o_i + offset)
-        b_a = tl.where(o_i < i, b_a, 0.0)
         b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
         b_A = tl.where((o_i == i)[:, None], b_a, b_A)
     b_A += m_I
@@ -122,14 +127,19 @@ def solve_tril_16x16_kernel(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"DOT_PRECISION": DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages
-        )
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
-    ],
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config(
+                {"DOT_PRECISION": DOT_PRECISION},
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            for num_warps in [1, 2, 4, 8]
+            for num_stages in [2, 3, 4, 5]
+            for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
+        ],
+        triton.Config({"DOT_PRECISION": "ieee"}, num_warps=4, num_stages=3),
+    ),
     key=["H", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -210,6 +220,12 @@ def merge_16x16_to_32x32_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
+    # Ai has strict-lower + identity structure. The strict-upper 16x16 block
+    # Ai_12 is implicitly zero -- write it explicitly so the caller can
+    # allocate Ai via `torch.empty_like` instead of `torch.zeros_like` and
+    # skip the memset on the critical path.
+    z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
+
     if not USE_TMA:
         p_Ai_11 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
@@ -219,6 +235,9 @@ def merge_16x16_to_32x32_inverse_kernel(
         )
         p_Ai_22 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
+        )
+        p_Ai_12 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
         )
         tl.store(
             p_Ai_11,
@@ -235,6 +254,11 @@ def merge_16x16_to_32x32_inverse_kernel(
             b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
             boundary_check=(0, 1),
         )
+        tl.store(
+            p_Ai_12,
+            z16.to(p_Ai_12.dtype.element_ty),
+            boundary_check=(0, 1),
+        )
     else:
         desc_o.store(
             [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
@@ -245,6 +269,7 @@ def merge_16x16_to_32x32_inverse_kernel(
         desc_o.store(
             [i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
+        desc_o.store([i_t * BT + 0, 16], z16.to(desc_o.dtype))
 
 
 @triton.heuristics(
@@ -253,14 +278,19 @@ def merge_16x16_to_32x32_inverse_kernel(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"DOT_PRECISION": DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages
-        )
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-        for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
-    ],
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config(
+                {"DOT_PRECISION": DOT_PRECISION},
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
+            for num_warps in [1, 2, 4, 8]
+            for num_stages in [2, 3, 4, 5]
+            for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
+        ],
+        triton.Config({"DOT_PRECISION": "ieee"}, num_warps=4, num_stages=3),
+    ),
     key=["H", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -327,24 +357,24 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
     b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
 
+    # A is strict-lower-tri (the fused cumsum+KKT kernel enforces it), so
+    # defensive `o_i < i` masks
+    # inside the loops are redundant; dropping them saves a `tl.where`
+    # per iteration in the serial triangular solve.
     for i in range(2, min(16, T - i_t * BT)):
         b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
-        b_a_11 = tl.where(o_i < i, b_a_11, 0.0)
         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
         b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
     for i in range(16 + 2, min(32, T - i_t * BT)):
         b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
-        b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.0)
         b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
         b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
     for i in range(32 + 2, min(48, T - i_t * BT)):
         b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
-        b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.0)
         b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
         b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
     for i in range(48 + 2, min(64, T - i_t * BT)):
         b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
-        b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.0)
         b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
         b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
     b_Ai_11 += m_I
@@ -421,6 +451,12 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
+    # Ai has strict-lower + identity structure. The 6 strict-upper sub-blocks
+    # Ai_12, Ai_13, Ai_14, Ai_23, Ai_24, Ai_34 are implicitly zero -- write
+    # them explicitly so the caller can allocate Ai via `torch.empty_like`
+    # instead of `torch.zeros_like` (skips the memset on the critical path).
+    z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
+
     if not USE_TMA:
         p_Ai_11 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
@@ -451,6 +487,25 @@ def merge_16x16_to_64x64_inverse_kernel(
         )
         p_Ai_43 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
+        )
+        # 6 strict-upper sub-block zero ptrs
+        p_Ai_12 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
+        )
+        p_Ai_13 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 32), (16, 16), (1, 0)
+        )
+        p_Ai_14 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 48), (16, 16), (1, 0)
+        )
+        p_Ai_23 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 32), (16, 16), (1, 0)
+        )
+        p_Ai_24 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 48), (16, 16), (1, 0)
+        )
+        p_Ai_34 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 48), (16, 16), (1, 0)
         )
         tl.store(
             p_Ai_11,
@@ -502,6 +557,12 @@ def merge_16x16_to_64x64_inverse_kernel(
             b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"),
             boundary_check=(0, 1),
         )
+        tl.store(p_Ai_12, z16.to(p_Ai_12.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_13, z16.to(p_Ai_13.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_14, z16.to(p_Ai_14.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_23, z16.to(p_Ai_23.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_24, z16.to(p_Ai_24.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_34, z16.to(p_Ai_34.dtype.element_ty), boundary_check=(0, 1))
     else:
         desc_o.store(
             [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
@@ -533,6 +594,12 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store(
             [i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
+        desc_o.store([i_t * BT + 0, 16], z16.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 0, 32], z16.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 0, 48], z16.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 16, 32], z16.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 16, 48], z16.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 32, 48], z16.to(desc_o.dtype))
 
 
 @input_guard
@@ -568,7 +635,12 @@ def solve_tril(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    Ai = torch.zeros_like(A, dtype=output_dtype)
+    # `empty_like` is safe because the kernels below explicitly write every
+    # in-bounds element of Ai's chunked layout (strict-lower + diagonal + the
+    # strict-upper blocks zeroed by tl.store). Out-of-bounds tail rows past
+    # T-1 are never read by the downstream recompute_w_u kernel since it also
+    # uses boundary_check.
+    Ai = torch.empty_like(A, dtype=output_dtype)
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:

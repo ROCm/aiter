@@ -88,7 +88,13 @@ def generate_data(
         weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=q_dtype_w)
 
     out = torch.empty(m, n, dtype=dtype, device=device)
-    return x, weight, x_scale, w_scale, out
+    return {
+        "x": x,
+        "weight": weight,
+        "x_scale": x_scale,
+        "w_scale": w_scale,
+        "out": out,
+    }
 
 
 def gemm_a8w8_ref(x, weight, x_scale, w_scale, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8):
@@ -137,14 +143,23 @@ class GemmA8W8Tuner(GemmCommonTuner):
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
-            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
+            row = untunedf.iloc[i]
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
+            q_dtype_w = row["q_dtype_w"]
             shape_str = f"({M}, {N}, {K}, {q_dtype_w})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                x, weight, x_scale, w_scale, out = generate_data(
-                    M, N, K, 0, dtypes.bf16, eval(q_dtype_w)
+                gd = generate_data(M, N, K, 0, dtypes.bf16, eval(q_dtype_w))
+                x, weight, x_scale, w_scale, out = (
+                    gd["x"],
+                    gd["weight"],
+                    gd["x_scale"],
+                    gd["w_scale"],
+                    gd["out"],
                 )
                 out, us = run_perftest(
                     gemm_a8w8,
@@ -168,8 +183,8 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 )
                 status = (
                     "ok"
-                    if err_ratio <= args.errRatio
-                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
@@ -195,8 +210,8 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
         task = []
         tasks_data = []
-        gemm_a8w8_data_idx = [0, 1, 2, 3, 4]  # input index in generate_data
-        ref_data_idx = [0, 1, 2, 3]
+        gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
         seed = 0
 
         for i in range(len(untunedf)):
@@ -204,7 +219,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
-            seed = seed + 1
 
             kernels_num = len(kernels_list)
             total_kernel_nums = 0
@@ -232,17 +246,20 @@ class GemmA8W8Tuner(GemmCommonTuner):
                             generate_data,
                             (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                             run_gemm_a8w8,
-                            (gemm_a8w8_data_idx, j, splitK),
+                            (gemm_keys, j, splitK),
                             {
                                 "num_warmup": args.warmup,
                                 "num_iters": args.iters,
                             },
                             gemm_a8w8_ref,
-                            (ref_data_idx, dtypes.bf16, eval(q_dtype_w)),
+                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
                             {},
                             None,
                             1e-2,
                             1e-2,
+                            None,
+                            None,
+                            ("out",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
