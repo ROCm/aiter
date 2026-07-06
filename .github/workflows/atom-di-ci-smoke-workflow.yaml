@@ -11,42 +11,52 @@ on:
       atom_ref:
         description: "ROCm/ATOM ref containing the mesh Slurm script"
         required: false
+        type: string
         default: "main"
       spur_account:
         description: "Spur account"
         required: false
+        type: string
         default: "amd-frameworks"
       spur_partition:
         description: "Spur partition or queue"
         required: false
+        type: string
         default: "amd-frameworks"
       spur_nodelist:
         description: "Candidate Spur nodes; the 2P1D ATOM script uses the first 3"
         required: false
+        type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       model_path:
         description: "DeepSeek-V4-Pro model path visible on Slurm nodes"
         required: false
+        type: string
         default: "/mnt/models/DeepSeek-V4-Pro/"
       docker_image:
         description: "ATOM image used by the ATOM mesh script"
         required: false
+        type: string
         default: "rocm/atom-dev:latest"
       shared_root:
         description: "Shared root mounted by the ATOM script containers, for example /it-share/..."
         required: false
+        type: string
         default: ""
       isl_list:
         description: "Input lengths for the smoke benchmark"
         required: false
+        type: string
         default: "8192"
       osl:
         description: "Output length for the smoke benchmark"
         required: false
+        type: string
         default: "1"
       conc_list:
         description: "Concurrency list for the smoke benchmark"
         required: false
+        type: string
         default: "2"
       run_gsm8k:
         description: "Run GSM8K after the mesh smoke check"
@@ -66,17 +76,17 @@ jobs:
     runs-on: aiter-di-ci-spur-login
     timeout-minutes: 180
     env:
-      ATOM_REF: ${{ inputs.atom_ref || 'main' }}
-      SPUR_ACCOUNT: ${{ inputs.spur_account || 'amd-frameworks' }}
-      SPUR_PARTITION: ${{ inputs.spur_partition || 'amd-frameworks' }}
-      SPUR_NODELIST: ${{ inputs.spur_nodelist || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
-      MODEL_PATH: ${{ inputs.model_path || '/mnt/models/DeepSeek-V4-Pro/' }}
-      DOCKER_IMAGE: ${{ inputs.docker_image || 'rocm/atom-dev:latest' }}
-      SHARED_ROOT: ${{ inputs.shared_root || format('/it-share/yajizhan/spur_dsv4_logs/aiter_spur_login_{0}_{1}', github.run_id, github.run_attempt) }}
-      ISL_LIST: ${{ inputs.isl_list || '8192' }}
-      OSL: ${{ inputs.osl || '1' }}
-      CONC_LIST: ${{ inputs.conc_list || '2' }}
-      RUN_GSM8K: ${{ inputs.run_gsm8k && '1' || '0' }}
+      ATOM_REF: ${{ inputs.atom_ref }}
+      SPUR_ACCOUNT: ${{ inputs.spur_account }}
+      SPUR_PARTITION: ${{ inputs.spur_partition }}
+      SPUR_NODELIST: ${{ inputs.spur_nodelist }}
+      MODEL_PATH: ${{ inputs.model_path }}
+      DOCKER_IMAGE: ${{ inputs.docker_image }}
+      SHARED_ROOT: ${{ inputs.shared_root }}
+      ISL_LIST: ${{ inputs.isl_list }}
+      OSL: ${{ inputs.osl }}
+      CONC_LIST: ${{ inputs.conc_list }}
+      RUN_GSM8K_INPUT: ${{ format('{0}', inputs.run_gsm8k) }}
       RANDOM_RANGE_RATIO: "0.8"
       SCRIPT_PATH: atom/mesh/scripts/ds_v4_2p_tp8_1d_tp8_atom_mtp_dpa_slurm.sh
     steps:
@@ -95,8 +105,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ROCm/ATOM
-          ref: ${{ env.ATOM_REF }}
+          ref: ${{ env.ATOM_REF || 'main' }}
           path: ATOM
+
+      - name: Set ATOM DI smoke defaults
+        run: |
+          set -euo pipefail
+          {
+            echo "SPUR_ACCOUNT=${SPUR_ACCOUNT:-amd-frameworks}"
+            echo "SPUR_PARTITION=${SPUR_PARTITION:-amd-frameworks}"
+            echo "SPUR_NODELIST=${SPUR_NODELIST:-ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16}"
+            echo "MODEL_PATH=${MODEL_PATH:-/mnt/models/DeepSeek-V4-Pro/}"
+            echo "DOCKER_IMAGE=${DOCKER_IMAGE:-rocm/atom-dev:latest}"
+            echo "SHARED_ROOT=${SHARED_ROOT:-/it-share/yajizhan/spur_dsv4_logs/aiter_spur_login_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}}"
+            echo "ISL_LIST=${ISL_LIST:-8192}"
+            echo "OSL=${OSL:-1}"
+            echo "CONC_LIST=${CONC_LIST:-2}"
+            if [[ "${RUN_GSM8K_INPUT:-false}" == "true" ]]; then
+              echo "RUN_GSM8K=1"
+            else
+              echo "RUN_GSM8K=0"
+            fi
+          } >> "${GITHUB_ENV}"
 
       - name: Prepare shared ATOM source and patched Spur script
         run: |
@@ -234,6 +264,23 @@ jobs:
 
           exit "${spur_status}"
 
+      - name: Collect ATOMesh smoke logs
+        if: always()
+        run: |
+          set -euo pipefail
+          artifact_dir="atom-di-ci-smoke-artifacts"
+          rm -rf "${artifact_dir}"
+          mkdir -p "${artifact_dir}"
+
+          if [[ -n "${SHARED_ROOT:-}" && -d "${SHARED_ROOT}" ]]; then
+            tar -C "${SHARED_ROOT}" -cf "${artifact_dir}/atom-di-ci-smoke-logs.tar" .
+          else
+            {
+              echo "No shared log root was available."
+              echo "SHARED_ROOT=${SHARED_ROOT:-}"
+            } > "${artifact_dir}/README.txt"
+          fi
+
       - name: Upload ATOMesh smoke logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -241,8 +288,4 @@ jobs:
           name: atomesh-spur-login-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 7
-          path: |
-            ${{ env.SHARED_ROOT }}/**/*.out
-            ${{ env.SHARED_ROOT }}/**/*.err
-            ${{ env.SHARED_ROOT }}/job/**/*.json
-            ${{ env.SHARED_ROOT }}/job/**/*.log
+          path: atom-di-ci-smoke-artifacts/
