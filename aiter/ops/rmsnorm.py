@@ -225,6 +225,7 @@ def _rms_norm_quant_opus_raw(
     input: int,
     weight: int,
     residual: int,
+    residual_out: int,
     xscale: int,
     epsilon: float,
     rows: int,
@@ -248,8 +249,19 @@ def _qmax_outcode(out_dtype):
 
 
 def _quant(
-    out, input, weight, yscale, xscale, residual, unquant, epsilon, model_sensitive
+    out,
+    input,
+    weight,
+    yscale,
+    xscale,
+    residual,
+    unquant,
+    epsilon,
+    model_sensitive,
+    residual_out=None,
 ):
+    # residual = residual_in (read); residual_out (write) enables out-of-place add
+    # in the kernel -- no host staging copy. In-place when residual_out is None.
     _check(input, weight)
     qmax, out_code = _qmax_outcode(out.dtype)
     hidden = input.shape[-1]
@@ -261,6 +273,7 @@ def _quant(
         input.data_ptr(),
         weight.data_ptr(),
         residual.data_ptr() if residual is not None else 0,
+        residual_out.data_ptr() if residual_out is not None else 0,
         xscale.data_ptr() if xscale is not None else 0,
         float(epsilon),
         rows,
@@ -315,17 +328,18 @@ def rmsnorm2d_fwd_with_add_dynamicquant_opus(
     epsilon,
     use_model_sensitive_rmsnorm=0,
 ) -> None:
-    residual_out.copy_(residual_in)  # opus adds in place on the residual buffer
+    # out-of-place fused add inside the kernel (read residual_in, write residual_out) -- no copy.
     _quant(
         out,
         input,
         weight,
         yscale,
         None,
-        residual_out,
+        residual_in,
         None,
         epsilon,
         use_model_sensitive_rmsnorm,
+        residual_out=residual_out,
     )
 
 
@@ -341,17 +355,18 @@ def rmsnorm2d_fwd_with_add_smoothquant_opus(
     out_before_quant=None,
     use_model_sensitive_rmsnorm=0,
 ) -> None:
-    residual_out.copy_(residual_in)
+    # out-of-place fused add inside the kernel (read residual_in, write residual_out) -- no copy.
     _quant(
         out,
         input,
         weight,
         yscale,
         xscale,
-        residual_out,
+        residual_in,
         out_before_quant,
         epsilon,
         use_model_sensitive_rmsnorm,
+        residual_out=residual_out,
     )
 
 

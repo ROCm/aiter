@@ -91,6 +91,7 @@ inline void launch_quant_t(void* out,
                            const void* in,
                            const void* weight,
                            void* residual,
+                           void* residual_out,
                            const void* xscale,
                            float epsilon,
                            int rows,
@@ -101,43 +102,22 @@ inline void launch_quant_t(void* out,
 {
     constexpr int VW = 16 / (int)sizeof(in_t); // 8 for bf16/fp16, 4 for fp32
     const bool vec = (hidden % VW == 0);
+    // oop: out-of-place add (residual_out != residual). In-place / no-add use OOP=false.
+    const bool oop = (residual != nullptr) && (residual_out != residual);
     const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
+#define OPUS_LAUNCH_QUANT(WIDTH, OOP)                                                       \
+    hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, WIDTH>, OOP>), \
+                       grid, block, 0, stream, out, yscale, unquant, in, weight, residual, \
+                       residual_out, xscale, epsilon, rows, hidden, qmax, model_sensitive)
     if(vec)
-        hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, VW>>),
-                           grid,
-                           block,
-                           0,
-                           stream,
-                           out,
-                           yscale,
-                           unquant,
-                           in,
-                           weight,
-                           residual,
-                           xscale,
-                           epsilon,
-                           rows,
-                           hidden,
-                           qmax,
-                           model_sensitive);
+    {
+        if(oop) OPUS_LAUNCH_QUANT(VW, true); else OPUS_LAUNCH_QUANT(VW, false);
+    }
     else
-        hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, 1>>),
-                           grid,
-                           block,
-                           0,
-                           stream,
-                           out,
-                           yscale,
-                           unquant,
-                           in,
-                           weight,
-                           residual,
-                           xscale,
-                           epsilon,
-                           rows,
-                           hidden,
-                           qmax,
-                           model_sensitive);
+    {
+        if(oop) OPUS_LAUNCH_QUANT(1, true); else OPUS_LAUNCH_QUANT(1, false);
+    }
+#undef OPUS_LAUNCH_QUANT
 }
 
 // in_code: 0=fp16, 1=bf16, 2=fp32 ; out_code: 0=int8, 1=fp8
@@ -147,6 +127,7 @@ inline void launch_quant(void* out,
                          const void* in,
                          const void* weight,
                          void* residual,
+                         void* residual_out,
                          const void* xscale,
                          float epsilon,
                          int rows,
@@ -158,8 +139,8 @@ inline void launch_quant(void* out,
                          hipStream_t stream)
 {
 #define OPUS_QUANT(IN_T, OUT_T)                                                                     \
-    launch_quant_t<IN_T, OUT_T>(out, yscale, unquant, in, weight, residual, xscale, epsilon, rows, \
-                                hidden, qmax, model_sensitive, stream)
+    launch_quant_t<IN_T, OUT_T>(out, yscale, unquant, in, weight, residual, residual_out, xscale,   \
+                                epsilon, rows, hidden, qmax, model_sensitive, stream)
     if(in_code == 2)
     {
         if(out_code)
