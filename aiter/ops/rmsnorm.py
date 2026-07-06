@@ -398,6 +398,20 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
     )
 
 
+def _rms_norm_fwd_dispatch(
+    input, weight, epsilon, use_model_sensitive_rmsnorm
+) -> Tensor:
+    # Flat one-guard dispatch: common (bf16/fp16, hidden<=8192, non-T5, 2-D) -> fast HIP
+    # module_rmsnorm_quant; opus generic otherwise. rms_norm and rmsnorm2d_fwd both call this
+    # directly (not each other) so the vLLM no-add path pays a single torch_compile_guard.
+    out = torch.empty_like(input)
+    if _use_hip_common(input, use_model_sensitive_rmsnorm):
+        rmsnorm(out, input, weight, epsilon)
+    else:
+        rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
+    return out
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
 def rms_norm(
     input: Tensor,
@@ -405,8 +419,8 @@ def rms_norm(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    """rmsnorm (opus; fp16/bf16/fp32)."""
-    return rmsnorm2d_fwd(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    """rmsnorm (fast HIP for the common case; opus for fp32/T5/hidden>8192)."""
+    return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
@@ -416,11 +430,7 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    if _use_hip_common(input, use_model_sensitive_rmsnorm):
-        out = torch.empty_like(input)
-        rmsnorm(out, input, weight, epsilon)  # fast HIP module_rmsnorm_quant
-        return out
-    return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 @torch_compile_guard(
