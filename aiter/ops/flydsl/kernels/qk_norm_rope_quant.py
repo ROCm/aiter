@@ -284,7 +284,7 @@ def _build_kernel(
     # The HW FP8 element dtype follows the arch (matches ``_fp8_const``):
     # gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448).
     # ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
-    _is_fnuz = get_hip_arch() == "gfx942"
+    _is_fnuz = _fp8_const()["dtype"] == torch.float8_e4m3fnuz
     _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if _is_fnuz else _D.FP8_E4M3
 
     # Kernel name: only include flags that affect the compiled binary.
