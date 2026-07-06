@@ -63,7 +63,6 @@ permissions:
 
 jobs:
   atomesh-spur-login-smoke:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: aiter-di-ci-spur-login
     timeout-minutes: 180
     env:
