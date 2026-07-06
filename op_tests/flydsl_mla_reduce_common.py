@@ -6,9 +6,13 @@ import aiter
 from aiter.ops.flydsl.kernels.mla_reduce import (
     Tier,
     compile_mla_reduce,
+    compile_mla_reduce_splitk,
+    plan_splitk,
     select_tier,
     should_use_persistent_launch,
+    splitk_enabled,
     waves_per_eu_from_env,
+    _get_splitk_scratch,
 )
 
 
@@ -599,6 +603,45 @@ def make_runner(
         num_partial_rows = int(po.size(0))
     if num_final_rows is None:
         num_final_rows = int(fout.size(0))
+    # Split-K (opt-in): cooperative multi-block reduction for the low-tile /
+    # high-split decode case. Metadata is inspected at setup (outside any
+    # CUDA-graph capture); the scratch is pre-allocated + reused, so the
+    # captured run() only launches the two kernels (capture-safe).
+    if splitk_enabled() and tier is None and not disable_guards:
+        diffs = indptr[1:] - indptr[:-1]
+        active_tiles = int((diffs > 1).sum().item())
+        max_splits_val = int(diffs.max().item()) if diffs.numel() else 0
+        engage, K, num_slots = plan_splitk(
+            active_tiles=active_tiles,
+            H=H,
+            max_seqlen_q=M,
+            max_splits=max_splits_val,
+            num_cu=max_splits,
+        )
+        if engage:
+            lp, lc = compile_mla_reduce_splitk(
+                H=H,
+                Dv=Dv,
+                out_dtype=out_dtype_str,
+                K=K,
+                output_lse=output_lse,
+                waves_per_eu=waves_per_eu_from_env(),
+            )
+            sk_acc, sk_ml = _get_splitk_scratch(num_slots, K, Dv, fout.device.index)
+            _npr = int(num_partial_rows)
+            _nfr = int(num_final_rows)
+            _ss = int(fout.stride(0))
+            _sh = int(fout.stride(1))
+            _grid_p = int(num_slots * K)
+            _grid_c = int(num_slots)
+
+            def run():
+                st = torch.cuda.current_stream()
+                lp(po, pl, indptr, pmap, sk_acc, sk_ml, _npr, _grid_p, st)
+                lc(fmap, sk_acc, sk_ml, fout, flse, _ss, _sh, _nfr, _grid_c, st)
+
+            return run
+
     use_persistent = should_use_persistent_launch(
         H=H,
         max_seqlen_q=M,

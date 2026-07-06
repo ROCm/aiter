@@ -373,6 +373,123 @@ def test_serving_sparse_grid_cudagraph_replay():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
+# ---------------------------------------------------------------------------
+# Split-K cooperative reduction (opt-in): low-tile / high-split decode case.
+# b1_s128 = 1 active tile x H=16 heads = 16 active blocks / 304 CUs, each
+# serially reducing 128 splits. Split-K fans each head's 128 splits across K
+# blocks (partial online-softmax) + a cheap combine. These cases prove the
+# path stays numerically correct (vs torch ref AND HIP) and capture-safe.
+# ---------------------------------------------------------------------------
+_SPLITK_H, _SPLITK_DV = 16, 512
+_SPLITK_GRID = 16384
+
+
+def _build_splitk_b1_s128(out_dtype):
+    """1 active tile x 128 splits in a 16384-tile serving grid (b1_s128)."""
+    spt = [128] + [0] * (_SPLITK_GRID - 1)
+    return build_irregular_inputs(
+        spt, _SPLITK_H, _SPLITK_DV, out_dtype, M=1, gap_stride=1, pool_slack=0
+    )
+
+
+def _assert_splitk_engages(indptr, monkeypatch):
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk
+
+    diffs = indptr[1:] - indptr[:-1]
+    engage, K, num_slots = plan_splitk(
+        active_tiles=int((diffs > 1).sum().item()),
+        H=_SPLITK_H,
+        max_seqlen_q=1,
+        max_splits=int(diffs.max().item()),
+        num_cu=304,
+    )
+    assert engage, "split-K did not engage for b1_s128 (test is meaningless)"
+    return K, num_slots
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("K", [4, 8, 16])
+def test_splitk_b1_s128_vs_torch_ref(monkeypatch, K):
+    """Split-K partial+combine matches the gather-based torch reference for the
+    low-tile/high-split decode case, across split factors K."""
+    _require_cuda()
+    monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
+    monkeypatch.setenv("MLA_SPLITK_FACTOR", str(K))
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(indptr, monkeypatch)
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(
+        po, pl, indptr, pmap, fmap, fout, flse, _SPLITK_H, _SPLITK_DV, dt, True,
+        tier=None,
+    )
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_splitk_b1_s128_vs_hip(monkeypatch):
+    """Split-K matches the production HIP kn_mla_reduce_v1 (Dv=512 template)."""
+    _require_cuda()
+    monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(indptr, monkeypatch)
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(
+        po, pl, indptr, pmap, fmap, fout, flse, _SPLITK_H, _SPLITK_DV, dt, True,
+        tier=None,
+    )
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_splitk_b1_s128_cudagraph_replay(monkeypatch):
+    """Split-K (2-kernel) stays correct under CUDA-graph capture + replay, with
+    a pre-allocated scratch buffer — the capture-safety proof."""
+    _require_cuda()
+    monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(indptr, monkeypatch)
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(
+        po, pl, indptr, pmap, fmap, fout, flse, _SPLITK_H, _SPLITK_DV, dt, True,
+        tier=None,
+    )
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_splitk_disabled_by_default(monkeypatch):
+    """Without the env flag, plan_splitk never engages (default path untouched)."""
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk, splitk_enabled
+
+    monkeypatch.delenv("AITER_MLA_REDUCE_SPLITK", raising=False)
+    assert not splitk_enabled()
+    engage, _, _ = plan_splitk(
+        active_tiles=1, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
+    )
+    assert not engage
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("num_kv_splits", [32, 128])
 def test_wrapper_host_tier_dispatch_cudagraph_replay(monkeypatch, num_kv_splits):

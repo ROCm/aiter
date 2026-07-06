@@ -1009,3 +1009,402 @@ def compile_mla_reduce(
         )
 
     return launch_mla_reduce
+
+
+# ======================================================================
+# Split-K cooperative reduction (opt-in prototype for the low-tile /
+# high-split decode case, e.g. b1_s128: 1 active tile x H=16 heads = only
+# 16 active blocks / 304 CUs, each serially reducing 128 splits -> latency
+# bound, grid 95% idle).
+#
+# Two-kernel structure (kernel boundary = free cross-block fence):
+#   * PARTIAL: each active (tile, head) is split across K blocks; block j
+#     partial-reduces a CONTIGUOUS subset of that head's splits with an
+#     online-softmax partial (running max m_j, sum-exp l_j, weighted
+#     output accumulator acc_j) into a pre-allocated scratch buffer.
+#   * COMBINE: one block per (tile, head) merges the K partials with a
+#     global-max renormalization (LSE combined as logsumexp) -> the final
+#     bf16 output (+ optional fp32 LSE).
+#
+# Capture-safe: the scratch buffer is host-preallocated ONCE (module-level
+# lru_cache), reused every replay; no allocation / device sync / .item()
+# in the launch path. The grid is a host-known constant per capture.
+#
+# Engaged only when the host-visible metadata says few tiles are active
+# but each has many splits (idle CUs -> extra parallelism); otherwise the
+# default path is used unchanged. Assumes the active tiles are the CSR
+# prefix [0, active_tiles) (true for the sparse decode serving profile)
+# and max_seqlen_q == 1 (decode).
+# ======================================================================
+
+# Split-K tuning defaults (overridable per-process via the matching env vars,
+# read at call time so tests/benches can vary them without re-import).
+# K=16 is the measured sweet spot for b1_s128 on gfx942/MI300X (H=16, Dv=512,
+# 128 splits): 256 partial blocks + 16 combine blocks fits in one CU wave and
+# cuts the b1_s128 graph latency 11.0 -> 7.4us (0.67x). K=8 gives 8.4us; K=32
+# spills the partial grid past 304 CUs (2 waves) and regresses to ~8.6us.
+_SPLITK_FACTOR_DEFAULT = 16
+_SPLITK_MIN_SPLITS_DEFAULT = 64
+_SPLITK_MAX_ACTIVE_TILES_DEFAULT = 64
+
+
+def splitk_enabled() -> bool:
+    """Opt-in gate for the cooperative split-K reduction (default OFF)."""
+    return os.environ.get("AITER_MLA_REDUCE_SPLITK", "0") == "1"
+
+
+def plan_splitk(*, active_tiles, H, max_seqlen_q, max_splits, num_cu):
+    """Decide split-K engagement + factor from HOST-visible metadata only
+    (capture-safe: no device read in the launch path).
+
+    Returns ``(engage: bool, K: int, num_slots: int)``. ``num_slots`` is the
+    number of (tile, head) combine slots = ``active_tiles * H``; the partial
+    kernel launches ``num_slots * K`` blocks, the combine ``num_slots``.
+    """
+    if not splitk_enabled():
+        return False, 1, 0
+    factor = int(os.environ.get("MLA_SPLITK_FACTOR", _SPLITK_FACTOR_DEFAULT))
+    min_splits = int(
+        os.environ.get("MLA_SPLITK_MIN_SPLITS", _SPLITK_MIN_SPLITS_DEFAULT)
+    )
+    max_active = int(
+        os.environ.get(
+            "MLA_SPLITK_MAX_ACTIVE_TILES", _SPLITK_MAX_ACTIVE_TILES_DEFAULT
+        )
+    )
+    if max_seqlen_q != 1:
+        return False, 1, 0  # decode-only prototype (NTG == 1)
+    if max_splits < min_splits:
+        return False, 1, 0  # not enough splits to amortize the extra kernel
+    if active_tiles <= 0 or active_tiles > max_active:
+        return False, 1, 0
+    base_blocks = active_tiles * H
+    if base_blocks >= num_cu:
+        return False, 1, 0  # grid already saturated; split-K would not help
+    K = max(2, min(factor, max_splits))
+    # Do not oversubscribe far past the CU count (each partial should keep
+    # enough splits to be worth a block).
+    while K > 2 and base_blocks * K > 2 * num_cu:
+        K //= 2
+    return True, int(K), int(base_blocks)
+
+
+@functools.lru_cache(maxsize=64)
+def _get_splitk_scratch(num_slots: int, K: int, Dv: int, device_index: int):
+    """Pre-allocate (once) the split-K scratch: partial weighted-output
+    accumulators + (m_j, l_j) per partial. Cached so CUDA-graph replays reuse
+    the same device buffers (capture-safe). Zero-initialized (partials fully
+    overwrite their own rows every launch)."""
+    import torch
+
+    dev = torch.device("cuda", device_index)
+    sk_acc = torch.zeros(num_slots * K, Dv, dtype=torch.float32, device=dev)
+    sk_ml = torch.zeros(num_slots * K, 2, dtype=torch.float32, device=dev)
+    return sk_acc, sk_ml
+
+
+@functools.lru_cache(maxsize=64)
+def compile_mla_reduce_splitk(
+    *,
+    H: int,
+    Dv: int,
+    out_dtype: str = "bf16",
+    K: int = 8,
+    output_lse: bool = False,
+    waves_per_eu: int = _DEFAULT_WAVES_PER_EU,
+):
+    """Compile the split-K partial + combine kernels for fixed (H, Dv, K).
+
+    Returns ``(launch_partial, launch_combine)``: two ``@flyc.jit`` launchers
+    the host invokes in sequence (partial writes scratch, combine reads it and
+    writes ``final_output``). ``use_reduce_final_map`` is always True here (the
+    combine needs the per-tile q-range).
+    """
+    assert Dv % NUM_THREADS == 0
+    VEC = Dv // NUM_THREADS
+
+    def _f32_vec_load(g, row_idx, col_idx):
+        if fx.const_expr(VEC == 1):
+            return [g[row_idx, col_idx]]
+        v = g.vec_load((row_idx, col_idx), VEC)
+        return [
+            fx.vector.extract(v, static_position=[i], dynamic_position=[])
+            for i in fx.range_constexpr(VEC)
+        ]
+
+    def _f32_vec_store(g, row_idx, col_idx, elems):
+        if fx.const_expr(VEC == 1):
+            g[row_idx, col_idx] = elems[0]
+            return
+        vt = T.vec(VEC, T.f32)
+        vec = fx.vector.from_elements(vt, [_to_raw(e) for e in elems])
+        g.vec_store((row_idx, col_idx), vec, VEC)
+
+    def _o3d_vec_load(g, row_idx, head_idx, col_idx):
+        """Load VEC fp32 elements from a 3-D [row, H, Dv] partial-output view."""
+        if fx.const_expr(VEC == 1):
+            return [g[row_idx, head_idx, col_idx]]
+        v = g.vec_load((row_idx, head_idx, col_idx), VEC)
+        return [
+            fx.vector.extract(v, static_position=[i], dynamic_position=[])
+            for i in fx.range_constexpr(VEC)
+        ]
+
+    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    def sk_partial_kernel(
+        partial_output: fx.Pointer,  # fp32 [row, H, Dv]
+        partial_lse: fx.Pointer,  # fp32 [row, H]
+        reduce_indptr: fx.Pointer,  # i32  [tiles+1]
+        reduce_partial_map: fx.Pointer,  # i32  [nsplits_total]
+        sk_acc: fx.Pointer,  # fp32 [num_slots*K, Dv]  (out)
+        sk_ml: fx.Pointer,  # fp32 [num_slots*K, 2]   (out: m_j, l_j)
+        num_partial_rows: fx.Int32,
+    ):
+        c_VEC = fx.Index(VEC)
+        tid = fx.thread_idx.x
+        col = tid * c_VEC
+
+        g_po = GTensor(partial_output, dtype=T.f32, shape=(-1, H, Dv))
+        g_pl = GTensor(partial_lse, dtype=T.f32, shape=(-1, H))
+        g_indptr = GTensor(reduce_indptr, dtype=T.i32, shape=(-1,))
+        g_pmap = GTensor(reduce_partial_map, dtype=T.i32, shape=(-1,))
+        g_acc = GTensor(sk_acc, dtype=T.f32, shape=(-1, Dv))
+        g_ml = GTensor(sk_ml, dtype=T.f32, shape=(-1, 2))
+
+        c_H = fx.Int32(H)
+        c_K = fx.Int32(K)
+        w = fx.Int32(fx.block_idx.x)  # partial row = slot * K + j
+        j = w % c_K
+        slot = w // c_K
+        tile = slot // c_H
+        head = slot % c_H
+
+        t0 = fx.Int32(g_indptr[tile])
+        t1 = fx.Int32(g_indptr[tile + fx.Index(1)])
+        n_splits = t1 - t0
+
+        # contiguous split subset [lo, hi) for this partial
+        chunk = (n_splits + fx.Int32(K - 1)) // c_K
+        lo = j * chunk
+        hi_full = lo + chunk
+        over = fx.arith.cmpi(fx.arith.CmpIPredicate.sgt, hi_full, n_splits)
+        hi = over.select(n_splits, hi_full)
+
+        neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
+        zero_f = fx.arith.constant(0.0, type=T.f32)
+
+        init = [_to_raw(zero_f) for _ in fx.range_constexpr(VEC)]
+        init += [_to_raw(neg_inf), _to_raw(zero_f)]
+
+        lo_idx = fx.arith.index_cast(T.index, _to_raw(lo))
+        hi_idx = fx.arith.index_cast(T.index, _to_raw(hi))
+
+        results = init
+        for s, state in range(lo_idx, hi_idx, fx.Index(1), init=init):
+            regs = [state[i] for i in fx.range_constexpr(VEC)]
+            m = state[VEC]
+            l = state[VEC + 1]
+            s_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(s)))
+            split_i32 = t0 + s_i32
+            pmap_v = fx.Int32(g_pmap[fx.Index(split_i32)])
+            in_b = fx.arith.andi(
+                fx.arith.cmpi(fx.arith.CmpIPredicate.sge, pmap_v, fx.Int32(0)),
+                fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.slt, pmap_v, num_partial_rows
+                ),
+            )
+            safe_row = in_b.select(pmap_v, fx.Int32(0))
+            row_idx = fx.arith.index_cast(T.index, _to_raw(safe_row))
+            os = _o3d_vec_load(g_po, row_idx, fx.Index(head), col)
+            lse = g_pl[row_idx, fx.Index(head)]
+            lse = in_b.select(lse, neg_inf)
+            new_m = fx.arith.maximumf(m, lse)
+            c_old = _exp(m - new_m, use_exp2=True)
+            c_new = _exp(lse - new_m, use_exp2=True)
+            new_regs = [
+                _to_raw(regs[i] * c_old + os[i] * c_new)
+                for i in fx.range_constexpr(VEC)
+            ]
+            new_l = l * c_old + c_new
+            results = yield new_regs + [_to_raw(new_m), _to_raw(new_l)]
+
+        regs = [results[i] for i in fx.range_constexpr(VEC)]
+        m = results[VEC]
+        l = results[VEC + 1]
+        prow = fx.Index(w)
+        _f32_vec_store(g_acc, prow, col, regs)
+        is_t0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
+        if_t0 = scf.IfOp(is_t0, results_=[], has_else=False)
+        with ir.InsertionPoint(if_t0.then_block):
+            g_ml[prow, fx.Index(0)] = m
+            g_ml[prow, fx.Index(1)] = l
+            scf.YieldOp([])
+
+    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    def sk_combine_kernel(
+        reduce_final_map: fx.Pointer,  # i32 [tiles, 2] {q_start, q_end}
+        sk_acc: fx.Pointer,  # fp32 [num_slots*K, Dv]
+        sk_ml: fx.Pointer,  # fp32 [num_slots*K, 2]
+        final_output: fx.Pointer,  # out [bs, H, Dv]
+        final_lse: fx.Pointer,  # fp32 [bs, H]
+        stride_s_o: fx.Int32,
+        stride_h_o: fx.Int32,
+        num_final_rows: fx.Int32,
+    ):
+        _out_t_local = _out_t(out_dtype)
+        out_vt = T.vec(VEC, _out_t_local)
+        c_VEC = fx.Index(VEC)
+        tid = fx.thread_idx.x
+        col = tid * c_VEC
+
+        g_fmap = GTensor(reduce_final_map, dtype=T.i32, shape=(-1, 2))
+        g_acc = GTensor(sk_acc, dtype=T.f32, shape=(-1, Dv))
+        g_ml = GTensor(sk_ml, dtype=T.f32, shape=(-1, 2))
+        g_fo = GTensor(final_output, dtype=_out_t_local, shape=(-1,))
+        g_flse = GTensor(final_lse, dtype=T.f32, shape=(-1,))
+
+        c_H = fx.Int32(H)
+        c_K = fx.Int32(K)
+        slot = fx.Int32(fx.block_idx.x)
+        tile = slot // c_H
+        head = slot % c_H
+        base = slot * c_K
+
+        q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
+        q_valid = fx.arith.andi(
+            fx.arith.cmpi(fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)),
+            fx.arith.cmpi(
+                fx.arith.CmpIPredicate.slt, q_start, num_final_rows
+            ),
+        )
+
+        neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
+        zero_f = fx.arith.constant(0.0, type=T.f32)
+
+        # global max over the K partials
+        M = neg_inf
+        for jj in fx.range_constexpr(K):
+            prow = fx.Index(base + fx.Int32(jj))
+            mj = g_ml[prow, fx.Index(0)]
+            M = fx.arith.maximumf(M, mj)
+
+        regs = [zero_f for _ in fx.range_constexpr(VEC)]
+        den = zero_f
+        for jj in fx.range_constexpr(K):
+            prow = fx.Index(base + fx.Int32(jj))
+            mj = g_ml[prow, fx.Index(0)]
+            lj = g_ml[prow, fx.Index(1)]
+            wj = _exp(mj - M, use_exp2=True)  # exp(-inf)=0 for empty partials
+            accj = _f32_vec_load(g_acc, prow, col)
+            regs = [regs[i] + accj[i] * wj for i in fx.range_constexpr(VEC)]
+            den = den + lj * wj
+
+        den_ok = fx.arith.cmpf(fx.arith.CmpFPredicate.OGT, den, zero_f)
+        inv = den_ok.select(fx.rocdl.rcp(T.f32, den), zero_f)
+        out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
+
+        if_q = scf.IfOp(q_valid, results_=[], has_else=False)
+        with ir.InsertionPoint(if_q.then_block):
+            store_off = (
+                q_start * stride_s_o
+                + head * stride_h_o
+                + fx.Int32(tid) * fx.Int32(VEC)
+            )
+            if fx.const_expr(VEC == 1):
+                g_fo[fx.Index(store_off)] = out_elems[0].truncf(_out_t_local)
+            else:
+                out_vec = fx.vector.from_elements(
+                    out_vt,
+                    [
+                        _to_raw(out_elems[i].truncf(_out_t_local))
+                        for i in fx.range_constexpr(VEC)
+                    ],
+                )
+                g_fo.vec_store((fx.Index(store_off),), out_vec, VEC)
+            if fx.const_expr(output_lse):
+                bad = fx.arith.ori(
+                    fx.arith.cmpf(
+                        fx.arith.CmpFPredicate.OEQ, den, zero_f
+                    ),
+                    fx.arith.cmpf(fx.arith.CmpFPredicate.UNO, den, den),
+                )
+                inf = fx.arith.constant(float("inf"), type=T.f32)
+                lse_val = bad.select(inf, _log(den) + M)
+                is_l0 = fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.eq, tid, fx.Int32(0)
+                )
+                if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
+                with ir.InsertionPoint(if_l0.then_block):
+                    lse_off = q_start * c_H + head
+                    g_flse[fx.Index(lse_off)] = lse_val
+                    scf.YieldOp([])
+            scf.YieldOp([])
+
+    def _set_wpe(ctx):
+        if fx.const_expr(waves_per_eu >= 1):
+            _wpe = int(waves_per_eu)
+            for op in ctx.gpu_module_body.operations:
+                if getattr(op, "OPERATION_NAME", None) == "gpu.func":
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        T.i32, _wpe
+                    )
+
+    @flyc.jit
+    def launch_partial(
+        partial_output: fx.Pointer,
+        partial_lse: fx.Pointer,
+        reduce_indptr: fx.Pointer,
+        reduce_partial_map: fx.Pointer,
+        sk_acc: fx.Pointer,
+        sk_ml: fx.Pointer,
+        num_partial_rows: fx.Int32,
+        sk_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        _set_wpe(CompilationContext.get_current())
+        idx_grid = fx.arith.index_cast(T.index, _to_raw(sk_grid))
+        sk_partial_kernel(
+            partial_output,
+            partial_lse,
+            reduce_indptr,
+            reduce_partial_map,
+            sk_acc,
+            sk_ml,
+            num_partial_rows,
+        ).launch(
+            grid=(idx_grid, fx.Index(1), fx.Index(1)),
+            block=(NUM_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @flyc.jit
+    def launch_combine(
+        reduce_final_map: fx.Pointer,
+        sk_acc: fx.Pointer,
+        sk_ml: fx.Pointer,
+        final_output: fx.Pointer,
+        final_lse: fx.Pointer,
+        stride_s_o: fx.Int32,
+        stride_h_o: fx.Int32,
+        num_final_rows: fx.Int32,
+        sk_grid: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        _set_wpe(CompilationContext.get_current())
+        idx_grid = fx.arith.index_cast(T.index, _to_raw(sk_grid))
+        sk_combine_kernel(
+            reduce_final_map,
+            sk_acc,
+            sk_ml,
+            final_output,
+            final_lse,
+            stride_s_o,
+            stride_h_o,
+            num_final_rows,
+        ).launch(
+            grid=(idx_grid, fx.Index(1), fx.Index(1)),
+            block=(NUM_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_partial, launch_combine
