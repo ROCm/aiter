@@ -248,7 +248,11 @@ def test_op(
         # if act_dtype_str == "mxfloat8_e4m3fn":
         #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
         # temporary
-        if do_gather and m > 1024 and act_dtype_str == "mxfloat8_e4m3fn":
+        if (
+            do_gather
+            and (m * n_expts_act) > 1024
+            and act_dtype_str == "mxfloat8_e4m3fn"
+        ):
             pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
