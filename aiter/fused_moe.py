@@ -1741,6 +1741,7 @@ def fused_moe_2stages(
     elif (
         quant_type == QuantType.per_1x32
         and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.SEPARATED
     ):
         # fp4_bf16 SEPARATED: MXFP4 weights, bf16 activations; no activation quantization needed
@@ -1876,6 +1877,7 @@ def fused_moe_2stages(
     elif (
         quant_type == QuantType.per_1x32
         and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.SEPARATED
     ):
         # fp4_bf16 SEPARATED: stage1 output is bf16, no inter-stage quantization
