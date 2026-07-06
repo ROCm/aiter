@@ -4220,7 +4220,7 @@ void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     AiterTensor v_amax =
-        AiterTensor::empty({batch_size, num_heads}, AITER_DTYPE_fp32, v.device_id, stream);
+        AiterTensor::zeros({batch_size, num_heads}, AITER_DTYPE_fp32, v.device_id, stream);
 
     constexpr int TILE_T    = 128;
     constexpr int HEAD_SIZE = 128;
