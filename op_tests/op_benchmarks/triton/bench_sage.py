@@ -42,7 +42,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
     sage_quant_mxfp4,
-    rotation_smooth_qk,
+    sage_quant_mxfp6,
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
@@ -76,6 +76,7 @@ KernelName = Literal[
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_mxfp6",
+    "aiter_f6f4",
     "aiter_bf16",
 ]
 
@@ -97,6 +98,7 @@ QUANT_KERNELS = {
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_mxfp6",
+    "aiter_f6f4",
 }
 
 
@@ -736,6 +738,46 @@ _MXFP6_PACK_PATH = os.environ.get("AITER_MXFP6_PACK")
 _host_fp6_pack_mod = None
 
 
+# Per-channel fp4 V operand packer for aiter_f6f4. Lives in the research asm module
+# (host_fp6_pack.py) alongside the proven .co byte layout; loaded by path (cached).
+# Override the path with AITER_F6F4_PACK_MOD.
+_F6F4_V_PACK_PATH = os.environ.get(
+    "AITER_F6F4_PACK_MOD",
+    "/app/external/diffusion-models-inference-private/asm/fmha_sage_fwd/gfx950/fp6/host_fp6_pack.py",
+)
+_fp4_v_pack_mod = None
+
+
+def _load_fp4_v_pack_mod():
+    global _fp4_v_pack_mod
+    if _fp4_v_pack_mod is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("f6f4_host_pack", _F6F4_V_PACK_PATH)
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError(f"fp4-V host packer not found at {_F6F4_V_PACK_PATH}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _fp4_v_pack_mod = mod
+    return _fp4_v_pack_mod
+
+
+# ===========================================================================
+# MXFP6 / F6F4 operand packers used by the bench runner
+#   _build_fp6_qk_packer / _build_fp6_k_coalesced_packer: Q/K fp6 packers, resolved via
+#     the host module (hp) so AITER_MXFP6_PACK can swap the packer and AITER_MXFP6_QK_TRITON
+#     can force the numpy path. Passed into sage_quant_mxfp6(q_packer=, k_packer=).
+#   _build_fp4_v_packer: per-channel fp4 V for aiter_f6f4 (host col-major LDS packer).
+# ===========================================================================
+
+
+# By default the fp6 FMHA encoding lives IN-TREE (aiter.ops.triton.quant.
+# mxfp6_fmha_pack). Set AITER_MXFP6_PACK=/path/to/packer.py to override with an
+# external packer module by path.
+_MXFP6_PACK_PATH = os.environ.get("AITER_MXFP6_PACK")
+_host_fp6_pack_mod = None
+
+
 def _load_host_fp6_pack():
     """Return the MXFP6-E2M3 host packer module (cached).
 
@@ -762,92 +804,6 @@ def _load_host_fp6_pack():
     return _host_fp6_pack_mod
 
 
-def _sage_quant_mxfp6(
-    q,
-    k,
-    v,
-    FP8_TYPE,
-    FP8_MAX,
-    BLKQ,
-    BLKK,
-    q_packer,
-    k_packer,
-    sm_scale=None,
-    q_smoothing=False,
-    layout="bshd",
-    R=None,
-    BLOCK_R=32,
-):
-    """MXFP6-E2M3 QK quantize for the aiter_mxfp6 bench path.
-
-    Local copy of sage_quant_mxfp4's body so the shared production wrapper
-    (sage_attention_quant_wrappers.sage_quant_mxfp4) stays untouched. Q and K are
-    packed to MXFP6-E2M3 (both QK MFMA operands in fp6): Q via q_packer (base
-    pack), K via k_packer -- the coalesced LDS-order pack that is the shipped
-    default. V quant (sage_quant_v_kernel) and delta_s match the mxfp4 path."""
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-    assert layout == "bshd", f"aiter_mxfp6 bench path expects bshd, got {layout}"
-    b, qo_len, h_qo, head_dim = q.shape
-    _, kv_len, h_kv, _ = v.shape
-    stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-        v.stride(0),
-        v.stride(2),
-        v.stride(1),
-        v.stride(3),
-    )
-    K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
-
-    v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
-    grid = (b * h_kv * K_NUM_BLKS,)
-
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-
-    q, k, delta_s = rotation_smooth_qk(
-        q,
-        k,
-        BLKQ,
-        R=R,
-        BLOCK_R=BLOCK_R,
-        q_smoothing=q_smoothing,
-        layout=layout,
-        sm_scale=(sm_scale * 1.4426950408889634),
-    )
-
-    sage_quant_v_kernel[grid](
-        v,
-        v_fp8,
-        v_scale,
-        stride_bz_v,
-        stride_h_v,
-        stride_seq_v,
-        stride_d_v,
-        v_scale.stride(0),
-        v_scale.stride(1),
-        b,
-        h_kv,
-        K_NUM_BLKS,
-        kv_len,
-        D=head_dim,
-        BLK_K=BLKK,
-        num_stages=3,
-        num_warps=8,
-    )
-
-    # Q uses the base fp6 pack; K uses the coalesced LDS-order pack -- the shipped
-    # default (the kernel's cooperative K load is a contiguous coalesced copy). The
-    # K scale rides the existing separate gather.
-    q_fp4, q_scale = q_packer(q)
-    k_fp4, k_scale = k_packer(k)
-
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
-
-
-# ===========================================================================
-# MXFP6 operand packers (the SHIPPED default path)
-#   _build_fp6_qk_packer        : base fp6 pack, used for Q (and as the K base)
-#   _build_fp6_k_coalesced_packer: K in LDS-order so the cooperative load coalesces
-# ===========================================================================
 def _build_fp6_qk_packer(device):
     """Return a packer: rotated/smoothed float Q|K [...,128] -> (uint8 [...,96]
     interleaved MXFP6-E2M3 data, uint8 [...,4] E8M0 scale) on `device`.
@@ -907,6 +863,30 @@ def _build_fp6_k_coalesced_packer(device):
             hit = hp.quantize_fp6_k_lds_order_triton(k_thd, tile=128)
             _cache[key] = hit
         return hit
+
+    return _packer
+
+
+def _build_fp4_v_packer(device):
+    """Per-channel fp4 (E2M1) V packer for aiter_f6f4 -- the analogue of the Q/K fp6
+    packers. Wraps the host module's fused Triton packer (quantize_fp4_v_colmajor_lds_triton,
+    which reads a permuted view through strides -- no copy) and returns the kernel-ready
+    strided col-major LDS view + per-channel descale. V [b, sk, h_kv, 128] float ->
+    (uint8 view [b, sk, h_kv, 128] over a [b,h_kv,sk*64] buffer with seq stride 64, descale
+    f32 [b, h_kv, 128])."""
+    hp = _load_fp4_v_pack_mod()
+
+    def _packer(v: torch.Tensor):
+        b_, sk_, h_kv_, d_ = v.shape
+        assert d_ == 128 and sk_ % 128 == 0, (d_, sk_)
+        v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, 128], non-contiguous (read via strides)
+        packed, descale = hp.quantize_fp4_v_colmajor_lds_triton(v_tok)
+        # +64B slack so the last-token strided window (stride 64 < 128) stays in storage bounds.
+        packed = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
+        v_view = torch.as_strided(
+            packed, (b_, sk_, h_kv_, 128), (h_kv_ * sk_ * 64, 64, sk_ * 64, 1)
+        )
+        return v_view, descale
 
     return _packer
 
@@ -1258,9 +1238,13 @@ def make_kernel_runner(
         *packed, _delta_s = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel == "aiter_mxfp6":
-        # fp6 QK path (the f6f8 kernel): Q,K are packed fp6 [.,.,.,96] -> fwd_hd128_mxfp6.co; V is raw
-        # fp8 (E4M3, per-channel descale). Coexists with aiter_mxfp4 (own symbol/config/.co slot).
+    if args.kernel in ("aiter_mxfp6", "aiter_f6f4"):
+        # fp6 QK path. aiter_mxfp6 = f6f8 (fp6 QK, fp8 V, tail K-scale) -> the mainline upstream
+        # kernel. aiter_f6f4 = the ISOLATED v_fp4 kernel (fp6 QK, per-channel fp4 V via
+        # ds_read_b64_tr_b4), based on the pre-tail mxfp6: it uses the NO-TAIL K packer (separate
+        # K-scale stream) and forces the fp4-V feed. Both share the fwd_hd128_mxfp6.co slot/symbol
+        # (deploy the matching .co); the wrappers differ only in the K packer + V dtype.
+        _is_f6f4 = args.kernel == "aiter_f6f4"
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
@@ -1274,18 +1258,19 @@ def make_kernel_runner(
             block_r, device=q_bshd.device, dtype=q_bshd.dtype
         ) / (block_r**0.5)
 
-        # Build the fp6 packers ONCE (they memoize per input tensor); rebuilding
-        # them inside _quantize_mxfp6 would discard the cache every do_bench
-        # iteration. Q uses the base fp6 pack; K uses the coalesced LDS-order pack
-        # -- the shipped default (the cooperative K load is a contiguous coalesced
-        # copy; fixes the vL1D address-gen serialization).
+        # Q/K fp6 packers, resolved via the host module (hp) so AITER_MXFP6_PACK can swap the
+        # packer and AITER_MXFP6_QK_TRITON can force the numpy path. Built ONCE (they memoize
+        # per input tensor) and passed into sage_quant_mxfp6 as q_packer/k_packer. Q uses the
+        # base fp6 pack; K uses the coalesced LDS-order (tail-K-scale) pack.
         _mxfp6_q_packer = _build_fp6_qk_packer(q_bshd.device)
         _mxfp6_k_packer = _build_fp6_k_coalesced_packer(q_bshd.device)
-        # V is raw fp8 (E4M3, per-channel fp32 descale) -> fwd_hd128_mxfp6.co (the C++ keys on V's
-        # dtype: in_bpe=1, reads V stride from the tensor).
+        # V operand: aiter_f6f4 feeds per-channel fp4 (E2M1) col-major (read via ds_read_b64_tr_b4);
+        # aiter_mxfp6 keeps raw fp8 (E4M3). The fp4 packer (built only for f6f4) is passed in;
+        # sage_quant_mxfp6 computes ONLY the selected V operand.
+        _v_fp4_packer = _build_fp4_v_packer(q_bshd.device) if _is_f6f4 else None
 
         def _quantize_mxfp6():
-            return _sage_quant_mxfp6(
+            return sage_quant_mxfp6(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1293,20 +1278,22 @@ def make_kernel_runner(
                 fp8_max,
                 BLKQ=cfg["BLOCK_M"],
                 BLKK=64,
-                q_packer=_mxfp6_q_packer,
-                k_packer=_mxfp6_k_packer,
                 layout="bshd",
                 R=r,
                 BLOCK_R=block_r,
                 sm_scale=softmax_scale,
                 q_smoothing=args.qsmooth,
+                f6f4=_is_f6f4,
+                v_fp4_packer=_v_fp4_packer,
+                q_packer=_mxfp6_q_packer,
+                k_packer=_mxfp6_k_packer,
             )
 
-        def _kernel_mxfp6(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
+        def _kernel_mxfp6(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
             return flash_attn_mxfp4_func(
                 q_fp4,
                 k_fp4,
-                v_fp8,
+                v_quantized,
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
@@ -1406,6 +1393,23 @@ def make_reference_output(
     )
     ref = args.ref
 
+    # The torch reference (attention_ref) materializes a full [b, hq, sq, sk] fp32 scores tensor and
+    # softmaxes it; past ~32 GiB that path becomes numerically UNRELIABLE -- the cosine collapses
+    # even for a correct kernel (measured ~0.45 at sq=sk=75520, while sq=sk=32768 ~21 GiB is fine).
+    # Warn and point the user at --ref aiter_bf16, which streams the scores and stays accurate.
+    if ref == "torch":
+        b_, sq_, hq_, _ = q_bshd.shape
+        sk_ = k_bshd.shape[1]
+        scores_gib = b_ * hq_ * sq_ * sk_ * 4 / (1024**3)
+        if scores_gib > 32.0:
+            logger.warning(
+                "torch reference builds a %.0f GiB fp32 [b=%d, hq=%d, sq=%d, sk=%d] scores tensor "
+                "at this shape and is numerically UNRELIABLE at long sequence (its cosine collapses "
+                "even for a bit-correct kernel -- e.g. ~0.45 at sq=sk=75520). Use "
+                "--ref aiter_bf16 for correctness checks at this size.",
+                scores_gib, b_, hq_, sq_, sk_,
+            )
+
     if block_attn_mask is not None:
         if ref != "torch":
             raise ValueError(
@@ -1501,6 +1505,7 @@ def benchmark_single_case(
         "aiter_i8fp8",
         "aiter_mxfp4",
         "aiter_mxfp6",
+        "aiter_f6f4",
         "sage_fp8",
         "sage_mxfp4",
     ):
@@ -1513,7 +1518,7 @@ def benchmark_single_case(
     v_elem_size = (
         1
         if args.kernel
-        in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4", "aiter_mxfp6")
+        in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4", "aiter_mxfp6", "aiter_f6f4")
         else v.element_size()
     )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
@@ -1710,12 +1715,13 @@ def validate_args(args: argparse.Namespace) -> None:
         "aiter_i8fp8",
         "aiter_mxfp4",
         "aiter_mxfp6",
+        "aiter_f6f4",
     )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    if args.kernel not in ("sage_mxfp4", "aiter_mxfp4", "aiter_mxfp6", "all") and (
+    if args.kernel not in ("sage_mxfp4", "aiter_mxfp4", "aiter_mxfp6", "aiter_f6f4", "all") and (
         args.qsmooth or args.hadamard_rotate is False
     ):
         logger.warning(
@@ -2040,6 +2046,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_i8fp8",
             "aiter_mxfp4",
             "aiter_mxfp6",
+            "aiter_f6f4",
             "aiter_bf16",
             "all",
         ],

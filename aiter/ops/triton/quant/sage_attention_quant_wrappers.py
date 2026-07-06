@@ -196,6 +196,101 @@ def sage_quant_mxfp4(
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
 
+def sage_quant_mxfp6(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    R=None,
+    BLOCK_R=32,
+    f6f4=False,
+    v_fp4_packer=None,
+    q_packer=None,
+    k_packer=None,
+):
+    """MXFP6-E2M3 QK quantize (+ V) for the aiter mxfp6 (f6f8) / f6f4 fmha kernels.
+
+    Rotates/smooths Q,K (Hadamard R, folding sm_scale*log2e into Q) then packs both to
+    MXFP6-E2M3: Q -> [...,96] data + E8M0 scale; K -> kernel-ready LDS-order view with the
+    E8M0 K-scale in the per-tile tail. By default Q/K are packed with the in-tree Triton
+    packers (quantize_fp6_lastdim_triton / quantize_fp6_k_lds_order_triton); pass q_packer /
+    k_packer callables to override (e.g. a bench that swaps the packer via AITER_MXFP6_PACK
+    or forces the numpy path). The V operand is selected by f6f4:
+      * f6f4=False (f6f8): raw fp8 V via sage_quant_v_kernel (per-channel descale).
+      * f6f4=True:         per-channel fp4 (E2M1) V via v_fp4_packer(v). The caller
+                           supplies the packer (it is co-located with the .co byte
+                           layout in the research asm module), keeping aiter free of
+                           that dependency.
+    Only the selected V operand is computed (no wasted fp8 quant on the f6f4 path).
+    Returns (q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s). bshd only.
+    """
+    if q_packer is None or k_packer is None:
+        from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+            quantize_fp6_lastdim_triton,
+            quantize_fp6_k_lds_order_triton,
+        )
+
+    assert layout == "bshd", f"sage_quant_mxfp6 expects bshd, got {layout}"
+    b, qo_len, h_qo, head_dim = q.shape
+    _, kv_len, h_kv, _ = v.shape
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+
+    # V operand: per-channel fp4 (f6f4) or raw fp8 (f6f8) -- only the selected one.
+    if f6f4:
+        assert v_fp4_packer is not None, "sage_quant_mxfp6(f6f4=True) requires v_fp4_packer"
+        v_quantized, v_scale = v_fp4_packer(v)
+    else:
+        v_quantized = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
+        K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
+        v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
+        grid = (b * h_kv * K_NUM_BLKS,)
+        sage_quant_v_kernel[grid](
+            v,
+            v_quantized,
+            v_scale,
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            v.stride(3),
+            v_scale.stride(0),
+            v_scale.stride(1),
+            b,
+            h_kv,
+            K_NUM_BLKS,
+            kv_len,
+            D=head_dim,
+            BLK_K=BLKK,
+            num_stages=3,
+            num_warps=8,
+        )
+
+    # Q -> base fp6 pack; K -> coalesced LDS-order pack (E8M0 K-scale in the tile tail).
+    # Use caller-supplied packers when given (overridable), else the in-tree Triton packers.
+    q_fp6, q_scale = q_packer(q) if q_packer is not None else quantize_fp6_lastdim_triton(q)
+    k_view, k_scale = (
+        k_packer(k) if k_packer is not None else quantize_fp6_k_lds_order_triton(k, tile=128)
+    )
+    return q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s
+
+
 def sage_quant(
     q,
     k,

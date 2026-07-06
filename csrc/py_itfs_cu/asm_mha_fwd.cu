@@ -93,7 +93,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
     void *v_descale_ptr = nullptr;
 
     // mxfp4 (fp4) and mxfp6 (E2M3) are uint8-packed MX formats carrying per-block scales.
-    const bool is_mxfp_packed = (data_type == "mxfp4bf16" || data_type == "mxfp6bf16");
+    const bool is_mxfp_packed = (data_type == "mxfp4bf16" || data_type == "mxfp6bf16" || data_type == "f6f4bf16");
 
     if (bias_.has_value()) {
         auto bias = bias_.value();
@@ -269,8 +269,9 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     if (is_mxfp_packed) {
         TORCH_CHECK(!out_.has_value() || out_.value().dtype() == torch::kBFloat16,
                     "For mxfp4/mxfp6 input, output must have dtype BF16");
-        // fp6 Q/K (is_mxfp6) -> "mxfp6bf16" (the f6f8 kernel, fp6-QK / fp8-PV); else mxfp4.
-        dtype_str = is_mxfp6 ? "mxfp6bf16" : "mxfp4bf16";
+        // fp6 Q/K (is_mxfp6): fp8 V -> "mxfp6bf16" (the f6f8 kernel, fp6-QK / fp8-PV);
+        // packed fp4 V -> "f6f4bf16" (the f6f4 kernel, its own .co slot). else mxfp4.
+        dtype_str = is_mxfp6 ? (is_v_fp8 ? "mxfp6bf16" : "f6f4bf16") : "mxfp4bf16";
     } else if (q_dtype == torch::kFloat16) {
         dtype_str = "fp16";
     } else if (q_dtype == torch::kBFloat16) {
@@ -372,7 +373,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
-    auto out_type = (dtype_str == "fp8bf16" || dtype_str == "i8fp8bf16" || dtype_str == "mxfp4bf16" || dtype_str == "mxfp6bf16") ? torch::kBFloat16 : q.scalar_type();
+    auto out_type = (dtype_str == "fp8bf16" || dtype_str == "i8fp8bf16" || dtype_str == "mxfp4bf16" || dtype_str == "mxfp6bf16" || dtype_str == "f6f4bf16") ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
