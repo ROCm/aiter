@@ -803,6 +803,7 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
             exe = _get_compiled_swiglu(inter_dim)
             x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
             out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
+            # trailing 0 = stream: null/default (compile-only, never launched)
             _run_compiled(exe, (x, out, rows, 0))
             return
 
@@ -828,8 +829,8 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
                 _ptr_view_safe(empty_f32),
                 rows,
                 sorted_token_ids.shape[0],
-                float("inf"),
-                0,
+                float("inf"),  # swiglu_limit (unused for silu)
+                0,  # stream: null/default (compile-only, kernel is never launched)
             ),
         )
 
