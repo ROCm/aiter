@@ -370,15 +370,15 @@ def moe_gemm_a8w4(
     # StridedLayout callers keep their tuned BK<256.
     if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
         config["block_k"] = 256
-    # Fallback to TDM if the scale width is less than 16 or the shape is uneven.
+    # Fall back to TDM if the scale width is below the gfx1250 direct-to-LDS
+    # floor (32 bits = 4 uint8 scales) or K is uneven
     X_SCALE_TDM = False
     if use_gluon and x_has_mx:
         mx_scale_block_k = config["block_k"] // 32
-        padded_ks = triton.cdiv(K, config["block_k"]) * mx_scale_block_k
-        ASYNC_COPY_MIN_SCALE_WIDTH = 16
+        ASYNC_COPY_MIN_SCALE_WIDTH = 4
         X_SCALE_TDM = (
             mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH
-            or padded_ks > x_scales.shape[-1]
+            or K % config["block_k"] != 0
         )
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
@@ -493,7 +493,6 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=clamp_bounds,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
