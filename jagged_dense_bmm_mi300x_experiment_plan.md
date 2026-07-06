@@ -168,6 +168,51 @@ gfx942.
 
 ---
 
+## 5b. Research directions from the MFMA-issue-latency diagnosis (open, untried)
+
+The knob-level levers (§5 #2–#10) are exhausted: the loop's final PMC
+(dev journal batch 5–6) shows the kernel is **MFMA-issue / dependency-latency
+bound**, NOT occupancy- or memory-bound — MfmaUtil pinned at ~28–44% of peak,
+~54% of cycles unable to issue, `MemUnitStalled ≈ 0.1%`, and doubling occupancy
+(threads=512 on D512) left MfmaUtil flat. The stall is the in-warp
+`LDS s2r read → MFMA → next MFMA` dependency chain plus the interleaved VALU. The
+directions below target *that* stall and are all **genuinely untried**; each is a
+gfx942 hypothesis, not a known win. (Skew tail-waste reduction is tracked
+separately and intentionally excluded here.)
+
+| # | Direction | What it does | Test on gfx942 |
+|---|---|---|---|
+| R1 | **Larger MFMA atom `32×32×8` bf16** | gfx942 lacks the 16×16×32 (K=32) atom (the hard 2× blocker), but **does** have `v_mfma_f32_32x32x8_bf16`. A bigger atom issues **fewer MFMA instructions** for the same output tile → directly attacks the MFMA-issue-count ceiling. | Does the 32×32×8 fragment layout compile + stay correct (cos≥0.999), and does the lower issue count raise MfmaUtil above ~28–44%? New fragment/register footprint — real work, but the closest software proxy for the missing 32-K atom. **Highest-leverage untried idea.** |
+| R2 | **Dual-accumulator MFMA interleave (ILP)** | Keep **two independent C-accumulator tiles** and interleave their MFMA issue so one chain's MFMA issues while the other waits on its s2r read — hides issue latency **without more waves** (which PMC proved inert). | Does interleaving two dependency chains lift MfmaUtil / drop `SQ_WAIT_INST_ANY` (54%)? Watch AGPR/VGPR pressure (two accumulators). This is the latency-hiding lever the profile points to; not in the current §5 menu. |
+| R3 | **A-fragment register prefetch (mirror the B win to A)** | The B-prefetch breakthrough (+5–12%) staged B in registers 2-ahead. A still goes LDS with a 1-ahead s2r read sitting **directly in the MFMA critical path**. Prefetch A's s2r fragments further ahead into registers to move LDS-read latency off the chain. | What **hybrid** LDS/register A-staging depth hides the read without blowing VGPR? (Full global→reg already refuted — VGPR wall.) So the question is depth, not all-or-nothing. |
+| R4 | **Joint / ML-driven multi-knob autotuning** | The loop tunes one lever at a time (greedy). A joint search over `(atom × BLOCK_K × threads × B_STAGES × warp-split)` could find a co-optimum the greedy path misses — especially once the atom (R1) becomes a real knob. | Does a joint sweep beat the greedy per-shape winners? Build on the existing tier-A/tier-B tuner scaffolds. |
+
+R1–R3 are justified directly by the measured MFMA-issue stall; R1 is the highest
+leverage. R4 is a search-strategy upgrade. Do NOT re-open fp8 / split-K /
+bigger-tiles / fusion — all already refuted by PMC.
+
+**Result (2026-07-03 frontier loop, all cos=1.0, GPU 5):** R1/R2/R3 all TESTED and
+DISCARDED — do not re-run on gfx942. Each confirms the hardware-latency ceiling from a
+different angle:
+- **R1 (32x32x8 atom): +9–15% ALL cells.** Compiled (worked around a missing FlyDSL
+  bf16-32x32x8 Fly→ROCDL lowering by emitting `mfma_f32_32x32x8bf16_1k` directly). ISA
+  confirms MFMA count HALVED 512→256, but the gfx942 32x32x8 bf16 atom has ~2× per-instr
+  latency → total MFMA cycles flat + less ILP → slower. Count was never the constraint.
+- **R2 (dual-accumulator ILP): +20–23% D256, flat else.** PMC: SQ_WAIT_INST_ANY −2.4%
+  (flat), MfmaUtil flat — the KNM gemm already exposes atom-level MFMA ILP; 2nd accum
+  spills AGPR(128)→VGPR and kills D256 occupancy.
+- **R3 (A-frag reg prefetch): +18–48% D256, flat else.** Premise fails — the per-tile
+  barrier + k%2 double-buffer pins A's s2r read; no cross-tile depth without triple-buffer
+  LDS (kills D256 occupancy). No spill (Scratch=0); an adverse VGPR↔AGPR alloc flip.
+- **R4 (joint search): NOT RUN** — unblocked by R1's atom knob but low-yield (atom is a
+  proven loss; other axes greedily tuned to ceiling). Re-open on gfx950 or if the FlyDSL
+  bf16-32x32x8 latency changes.
+
+The 2× blocker is confirmed hardware: gfx942 lacks `v_mfma_f32_16x16x32_bf16` (the K=32
+atom that halves issue count WITHOUT the 32x32x8 atom's latency penalty).
+
+---
+
 ## 6. The two design decisions that MUST be re-derived per regime on gfx942
 
 The dispatch (`jagged_dense_bmm_dispatch_v2.py`) makes two regime-dependent choices.

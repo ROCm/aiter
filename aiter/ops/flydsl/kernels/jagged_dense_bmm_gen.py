@@ -143,7 +143,7 @@ def make_bounded_buffer_tensor(tensor, num_records_bytes):
 
 
 @functools.lru_cache(maxsize=None)
-def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32, WAVES_PER_EU=0, B_STAGES=3):
+def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES, N_GROUPS, XCD_C, XCD_W, USE_MFMA_K32, WAVES_PER_EU=0, B_STAGES=3, COMPACT=False):
     """Build (and memoize) a launch wrapper specialized to this (N, K, tiling).
     N (output) and K (reduction) are baked in as closure constants. BM_TILES
     (= ceil(max_seq_len/BLOCK_M)) and N_GROUPS are also baked in so the chiplet
@@ -165,6 +165,7 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         B: fx.Tensor,  # dense  (B_groups * N, K) bf16 (pre-transposed, tall)
         BIAS: fx.Tensor,  # bias   (B_groups * N,)   bf16
         SEQ_OFFSETS: fx.Tensor,  # (B_groups + 1,) int32
+        TILE_MAP: fx.Tensor,  # compact mode: (total_occ_tiles, 2) int32 [off_b, m_idx]; else dummy
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s_A: fx.TiledCopy,
         tiled_copy_s2g_C: fx.TiledCopy,
@@ -172,21 +173,35 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         tid = fx.thread_idx.x
         pid_mn, _, raw_b = fx.block_idx
 
-        # --- Chiplet (XCD) block-ID remap (HipKittens Algorithm 1) ---
-        # The raw hardware linear block id for grid (gx,1,gz) is
-        #   xy = raw_b * gx + pid_mn,  gx = BM_TILES * N_BLOCKS,
-        # which is exactly the id the hardware uses to pick XCD = xy % 8. Remap
-        # it to a (row, col) so a group's M-tiles co-locate on the same XCD.
-        raw_xy = fx.Int32(raw_b) * fx.Int32(BM_TILES * N_BLOCKS) + fx.Int32(pid_mn)
-        row, col = _xcd_remap(raw_xy, XCD_NUM_ROWS, XCD_NUM_COLS, XCD_C, XCD_W)
-        # Keep the remapped indices uniform across the wave so all derived
-        # offsets / buffer descriptors stay in SGPRs (no store waterfall).
-        row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), row))
-        col = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), col))
+        if fx.const_expr(COMPACT):
+            # --- Compacted static grid ---
+            # Grid = (total_occ_tiles, 1, N_BLOCKS). Each x-block handles exactly
+            # one OCCUPIED (group, m-tile); its (off_b, block_m_idx) come from the
+            # precomputed compact TILE_MAP, so no empty blocks are launched at all
+            # (skew tail-waste elimination). N-block index is the z-dim (raw_b).
+            tile_rsrc = fx.buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
+            base = fx.Int32(pid_mn) * fx.Int32(2)
+            off_b = fx.buffer_ops.buffer_load(tile_rsrc, base, vec_width=1, dtype=fx.T.i32())
+            block_m_idx = fx.buffer_ops.buffer_load(tile_rsrc, base + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
+            off_b = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), off_b))
+            block_m_idx = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), block_m_idx))
+            block_n_idx = fx.Int32(raw_b)
+        else:
+            # --- Chiplet (XCD) block-ID remap (HipKittens Algorithm 1) ---
+            # The raw hardware linear block id for grid (gx,1,gz) is
+            #   xy = raw_b * gx + pid_mn,  gx = BM_TILES * N_BLOCKS,
+            # which is exactly the id the hardware uses to pick XCD = xy % 8. Remap
+            # it to a (row, col) so a group's M-tiles co-locate on the same XCD.
+            raw_xy = fx.Int32(raw_b) * fx.Int32(BM_TILES * N_BLOCKS) + fx.Int32(pid_mn)
+            row, col = _xcd_remap(raw_xy, XCD_NUM_ROWS, XCD_NUM_COLS, XCD_C, XCD_W)
+            # Keep the remapped indices uniform across the wave so all derived
+            # offsets / buffer descriptors stay in SGPRs (no store waterfall).
+            row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), row))
+            col = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), col))
 
-        off_b = row // fx.Int32(BM_TILES)
-        block_m_idx = row % fx.Int32(BM_TILES)
-        block_n_idx = col
+            off_b = row // fx.Int32(BM_TILES)
+            block_m_idx = row % fx.Int32(BM_TILES)
+            block_n_idx = col
 
         # --- Device group resolution (read seq_offsets[b], seq_offsets[b+1]) ---
         seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
@@ -412,6 +427,8 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         B: fx.Tensor,
         BIAS: fx.Tensor,
         SEQ_OFFSETS: fx.Tensor,
+        TILE_MAP: fx.Tensor,
+        total_occ_tiles: int,
         n_groups: int,
         max_seq_len: int,
         stream: fx.Stream = fx.Stream(None),
@@ -458,14 +475,21 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
         epi_smem_bytes = max(smem_bytes, BLOCK_M * BLOCK_N * 2)
 
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
+        # Compact grid: x = one occupied (group, m-tile), z = N-block. Static grid,
+        # so each block does exactly one tile (no grid-stride loop, full block
+        # parallelism -- unlike the persistent kernel). Else: envelope grid.
+        if fx.const_expr(COMPACT):
+            grid = (total_occ_tiles, 1, N_BLOCKS)
+        else:
+            grid = (bm * N_BLOCKS, 1, n_groups)
         if WAVES_PER_EU:
             with CompilationContext.compile_hints({"waves_per_eu": WAVES_PER_EU}):
-                jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
-                    grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
+                jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, TILE_MAP, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
+                    grid=grid, block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
                 )
         else:
-            jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
-                grid=(bm * N_BLOCKS, 1, n_groups), block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
+            jdbba_kernel(C, A, B, BIAS, SEQ_OFFSETS, TILE_MAP, tiled_mma, tiled_copy_g2s_A, tiled_copy_s2g_C).launch(
+                grid=grid, block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
             )
 
     return _launch
@@ -488,6 +512,8 @@ def jagged_dense_bmm(
     block_n: int | None = None,
     waves_per_eu: int = 0,
     threads: int | None = None,
+    tile_map=None,
+    total_occ_tiles: int | None = None,
 ):
     """Public entry. Derives N (output) and K (reduction) from the tall dense B
     matrix shape (B_groups * N, K), then dispatches to the per-shape kernel.
@@ -553,7 +579,12 @@ def jagged_dense_bmm(
     # the 2-slot, 1-ahead B pipeline.
     b_stages = 2 if _use_mfma_k32() else 3
     nthreads = THREADS if threads is None else threads
+    compact = tile_map is not None
     launch = _build_launcher(
-        N, K, bmn, bnn, block_k, STAGES_A, nthreads, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu, b_stages
+        N, K, bmn, bnn, block_k, STAGES_A, nthreads, bm, n_groups, xcd_c, xcd_w, use_mfma_k32, waves_per_eu, b_stages, compact
     )
-    return launch(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
+    # Non-compact: TILE_MAP is bound but never read -> pass SEQ_OFFSETS as a
+    # harmless dummy so the kernel signature is uniform.
+    tmap = SEQ_OFFSETS if tile_map is None else tile_map
+    tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
+    return launch(C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream=stream)

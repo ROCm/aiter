@@ -381,3 +381,94 @@ specialized (CUTLASS ping-pong) rewrite could capture, before sinking multi-day 
   issue count).** Recommendation: do NOT invest in the warp-specialized rewrite for these shapes — the
   ceiling is hardware, not the kernel surface. The committed config stands as gfx942-optimal: uniform
   D256 ~1.30-1.34×, D512 ~1.41-1.43× vs Triton; skew up to ~1.31×.
+
+## 2026-07-03 — Next research directions (untried; flow from the batch-6 MFMA-issue-latency diagnosis)
+
+Documented for the autoresearch loop to pick up. The knob-level lever menu is exhausted; the batch 5–6 PMC
+verdict is **MFMA-issue / dependency-latency bound** (MfmaUtil ~28–44% of peak, SQ_WAIT_INST_ANY ~54%,
+MemUnitStalled ≈ 0.1%, occupancy doubling inert). These target *that* stall specifically. Recorded as
+levers **R1–R5** in `jagged_dense_bmm_mi300x_experiment_plan.md` §5b (full mechanism + gfx942 test each):
+
+- **R1 — larger MFMA atom `32×32×8` bf16 (highest leverage).** gfx942 lacks the 16×16×32 atom (the hard
+  blocker) but *has* `v_mfma_f32_32x32x8_bf16` → fewer MFMA issues per tile. Closest software proxy for the
+  missing 32-K atom; only ever the 16×16×16 / missing-32-K framing was tried, never 32×32×8.
+- **R2 — dual-accumulator MFMA interleave (ILP).** Two independent C tiles, interleaved MFMA issue → hide
+  issue latency without more waves (which PMC proved inert). The latency-hiding lever the profile implies.
+- **R3 — A-fragment register prefetch.** Mirror the B-prefetch win (+5–12%) to A, whose s2r LDS read still
+  sits on the MFMA critical path. Open question is the *hybrid* LDS/register depth (full global→reg refuted).
+- **R4 — joint / ML-driven multi-knob autotuning.** Replace greedy one-lever tuning with a joint sweep over
+  `(atom × BLOCK_K × threads × B_STAGES × warp-split)`, especially once R1 makes the atom a real knob.
+
+Excluded on purpose: skew tail-waste reduction (tracked separately). Do NOT re-open fp8 / split-K /
+bigger-tiles / fusion — all already refuted by PMC.
+
+## 2026-07-03 (frontier loop, batch 1 -- R1/R2/R3 kernel-surface levers, all DEAD-ENDS)
+
+Ran the ratcheted frontier loop (`/jdbba-frontier-search`) as a 3-way fan-out (one isolated git
+worktree + subagent per lever, GPU 5, flock-serialized do_bench). Re-established the rung on HEAD
+`9150ff450` (both regimes, cos=1.0). **Net: no rung climbed; 3 well-characterized dead-ends. The
+frontier levers confirm the batch-6b hardware-ceiling verdict from three independent angles.** All
+three edits are correct (cos=1.0 all 8 cells) and left in their worktrees behind default-OFF flags.
+
+- **R1 -- 32x32x8 bf16 atom (highest leverage) -- DISCARD (+9-15% ALL cells).** Overcame a real
+  FlyDSL compiler gap (no Fly->ROCDL legalization for bf16 32x32x8 `mma_atom_call_ssa`; only f16 is
+  registered) by emitting `fx.rocdl.mfma_f32_32x32x8bf16_1k` directly (operands bitcast to
+  vector<4xi16>), warp layout generalized to `(m_warps,n_warps,1)`, `n_warps=min(THREADS//64,
+  BLOCK_N//32)`. ISA confirms the mechanism moved -- MFMA issue count HALVED 512->256 on B1024_D512
+  -- yet runtime went UP. gfx942's 32x32x8 bf16 atom carries ~2x per-instruction latency, so halving
+  the count leaves total MFMA cycles flat while giving the scheduler LESS ILP to hide the
+  dependency-latency stall (SQ_WAIT_INST_ANY ~54%) the lever targeted. No VGPR cliff (164 vs 182 on
+  D512, 0 spill). **Instruction COUNT was never the binding constraint; total MFMA latency is.** This
+  is the closest software proxy for the missing K=32 atom and it is a proven net loss -- the honest 2x
+  blocker is genuinely the hardware (gfx942 lacks `v_mfma_f32_16x16x32_bf16`, which would halve issue
+  count WITHOUT the 32x32x8 atom's latency penalty). Preserved in `.wt/r1`, opt-in `USE_MFMA_32x32`.
+- **R2 -- dual-accumulator MFMA interleave (ILP) -- DISCARD (+20-23% D256, flat elsewhere).** Two
+  independent even/odd K-substep C accumulators, summed in the epilogue. PMC (B120_D512) proves the
+  mechanism did NOT move: SQ_WAIT_INST_ANY -2.4% (flat), MfmaUtil 45.0->45.7 (flat). The single KNM
+  `fx.gemm` already issues all N*M output atoms per K-step -> atom-level MFMA ILP is abundant; adding
+  accumulate chains helps a level that was never the bottleneck, while the 2nd accumulator spills the
+  already-saturated AGPR(128) into VGPR (56->128) and collapses D256 occupancy. `.wt/r2`, opt-in
+  `JDBBA_DUAL_ACCUM`.
+- **R3 -- hybrid A-fragment register prefetch -- DISCARD (+18-48% D256, flat elsewhere).** The
+  premise (A's s2r read has prefetch depth) fails: A is LDS double-buffered (slot k%2) with a
+  per-tile `gpu.barrier()`, which architecturally PINS A's s2r read to [after barrier, before this
+  tile's MFMAs]. Cross-tile depth needs a triple-buffer LDS (STAGES_A>=3 -> 32->48KB, kills the D256
+  occupancy BLOCK_K=64 protects). At BLOCK_K=64 there are only 2 within-tile sub-steps (both same
+  slot), so the one realizable move (batch the 2 s2r reads) gives zero D512 gain and regresses D256
+  via an adverse VGPR<->AGPR alloc flip -- NOT a VGPR spill (rocprofv3 Scratch=0 everywhere). The B
+  win could not mirror to A precisely because B is global->register (barrier-free, freely 2-ahead)
+  whereas A is barrier-gated. `.wt/r3`, opt-in `A_REG_STAGES` (default 1).
+- **R4 -- joint co-optimization search -- NOT RUN.** Unblocked (R1 landed a correct 32x32x8 atom
+  knob) but low-yield: the atom is a proven -9-15% loss with FLAT total MFMA cycles, and the other
+  joint axes were already greedily tuned to the gfx942 ceiling. Deferred; re-open on gfx950 or if the
+  FlyDSL bf16-32x32x8 latency changes.
+
+**Standing unchanged:** the committed `9150ff450` config remains gfx942-optimal (uniform ~0.72-0.77x,
+skew ~0.76-0.81x vs Triton). Frontier detail + dead-end table in `jdbba-autoresearch-results.md`.
+
+## 2026-07-03 (skew tail-waste pivot -- compact static grid: CONDITIONAL WIN on B120, persistent DEAD)
+
+After R1-R3 confirmed the dense-math MFMA ceiling, pivoted to the one orthogonal axis: the skew
+regime's launched-but-empty blocks. Measured tail-waste (bench skew dist): **~84% of launched M-tiles
+are empty early-exit blocks**, ~28% empty groups, partial-tile waste only ~4.3%.
+
+- **Compact static grid (launch only occupied (group,m-tile) blocks via a TILE_MAP lookup) -- CONDITIONAL
+  KEEP on B120.** Built behind a `COMPACT` flag + `TILE_MAP` arg in the `.wt/skew` kernel clone; grid
+  `(occ_tiles,1,N_BLOCKS)`. Oracle proxy (host map) then a real on-device prep (single FlyDSL kernel:
+  per-block on-device prefix scan + scatter, torch sentinel prefill, grid_x = host-known
+  `ceil(L/BM)+n_groups`, NO device->host readback). cos=1.0 all 4 skew shapes + edge cases, byte-exact
+  vs oracle. **prep-amortized (deployment truth -- seq_offsets shared across a forward, map built once):
+  B120_D256 +25.7%, B120_D512 +7.9%**; B1024_D256 ~0% (noise), B1024_D512 -12.9% (gated out, L2 thrash
+  from many concurrent 512KB weights). **prep-per-call loses everywhere** -- not compute (~1 us GPU) but
+  the prep's host kernel-launch-latency floor (~75-200 us) dwarfing the ~20 us kernel win. Group-major
+  tile order is required (preserves Dense[b] L2 reuse; interleave was -22.5% on B1024_D512). **Ratchet:
+  committed default UNCHANGED** (per-call would regress it); this is a documented deployable conditional
+  win on B120 (inference) needing a seq_offsets-keyed tile-map cache API to land in production dispatch.
+- **Persistent-launch on B120 -- DEAD-END (re-tested on gfx942, never done before).** Persistent fuses
+  the traversal (no separate prep launch), so it was the natural fallback for the per-call case. Re-test
+  (cos=1.0, persist_blocks sweep {304,512,608,912,1216}): **LOSES at every count** -- B120_D256 best
+  -45.1%, B120_D512 best -9.9%. Loses on B120 just as on B1024 (batch 2): the grid-stride loop +
+  per-tile in-kernel CUM search + registers/LDS held across the loop (and BLOCK_K=128 on D256, an
+  occupancy disadvantage) cost more than the baseline's cheap empty-block early-exits on these tiny
+  0.1-0.3 ms kernels. **The compact STATIC grid wins precisely because it removes empties WITHOUT the
+  persistent loop overhead** (hardware block scheduler load-balances for free). Persistent stays gfx95x-only.

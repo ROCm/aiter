@@ -80,15 +80,25 @@ from typing import Optional
 
 from .kernels.jagged_dense_bmm_gen import jagged_dense_bmm
 from .kernels.jagged_dense_bmm_persist_dev import jagged_dense_bmm as jagged_dense_bmm_persist
+from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
 
 __all__ = [
     "jagged_dense_bmm_dispatched",
     "resolve_config",
     "shape_id",
+    "clear_skew_tile_map_cache",
 ]
 
 _DISPATCH_TABLE: Optional[dict] = None
 _DISPATCH_CACHE: dict[tuple, dict] = {}
+
+# Skew compacted-static-grid: launch only occupied (group, m-tile) blocks via a
+# device-built TILE_MAP. Wins on small-B inference skew (B120: +8-26% amortized
+# vs envelope grid on gfx942); loses on B1024_D512 (L2 thrash) -> gated here.
+# The map is cached keyed on seq_offsets.data_ptr() so a forward pass that
+# reuses the same offsets tensor amortizes the ~1us GPU prep (deployment truth).
+SKEW_COMPACT_MAX_GROUPS = 120
+_TILE_MAP_CACHE: dict[int, tuple] = {}
 
 # Inert defaults for the full forward-compatible config schema. The keys the
 # apply path forwards TODAY are xcd_c / xcd_w / use_mfma_k32 / block_k; the rest
@@ -189,6 +199,37 @@ def _coerce(v, kind):
 def _opt_int(v):
     """None-preserving int cast for optional skew-path knobs."""
     return None if v is None else int(v)
+
+
+def clear_skew_tile_map_cache() -> None:
+    """Drop cached skew TILE_MAP tensors (for tests or when reusing the buffer)."""
+    _TILE_MAP_CACHE.clear()
+
+
+def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int, arch: Optional[str]) -> bool:
+    if uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS:
+        return False
+    # Measured on gfx942; disable on gfx95x until re-validated there.
+    if arch and arch.lower().startswith("gfx95"):
+        return False
+    return True
+
+
+def _get_skew_tile_map(seq_offsets, n_groups: int, max_seq_len: int, block_m: int):
+    """Return (tile_map, upper_bound) for the compact skew kernel, with caching.
+
+    L = seq_offsets[-1] is read from the device only on a cache miss (once per
+  buffer); repeating .item() every call would sync the GPU each do_bench rep."""
+    key = seq_offsets.data_ptr()
+    hit = _TILE_MAP_CACHE.get(key)
+    if hit is not None:
+        return hit
+    L = int(seq_offsets[-1].item())
+    tile_map, ub = build_tile_map_device_fused(
+        seq_offsets, n_groups, L, max_seq_len, block_m=block_m
+    )
+    _TILE_MAP_CACHE[key] = (tile_map, ub)
+    return tile_map, ub
 
 
 def _normalize_cfg(cfg: dict) -> dict:
@@ -377,6 +418,27 @@ def jagged_dense_bmm_dispatched(
     )
     if use_persist:
         return jagged_dense_bmm_persist(C, A, B, BIAS, SEQ_OFFSETS, n_groups, max_seq_len, stream=stream)
+
+    # Skew + small-B (inference): compacted static grid skips ~84% empty blocks.
+    # TILE_MAP is built on-device once per seq_offsets buffer (cached); L is
+    # host-known (needed to size the packed output) so grid_x needs no readback.
+    if _skew_compact_enabled(uniform_seqlen=uniform_seqlen, n_groups=n_groups, arch=arch):
+        block_m = int(cfg.get("tile_m") or 128)
+        tile_map, ub = _get_skew_tile_map(SEQ_OFFSETS, n_groups, max_seq_len, block_m)
+        return jagged_dense_bmm(
+            C,
+            A,
+            B,
+            BIAS,
+            SEQ_OFFSETS,
+            n_groups,
+            max_seq_len,
+            stream=stream,
+            use_mfma_k32=cfg["use_mfma_k32"],
+            uniform_seqlen=False,
+            tile_map=tile_map,
+            total_occ_tiles=ub,
+        )
 
     # Skew + gfx942: the small-weight/large-B cell (B1024_D256) prefers the XCD
     # remap ON even under skew (0.857 vs 0.904 remap-off, 1.05x), because with many

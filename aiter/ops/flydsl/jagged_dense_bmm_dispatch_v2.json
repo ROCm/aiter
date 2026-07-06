@@ -3,7 +3,7 @@
   "by_arch": {
     "gfx942": {
       "gfx": "gfx942",
-      "source": "tier-A XCD-remap autotune (gfx942 MI300X, 2026-06-10): tune_jdbba_xcd.py, triton.testing.do_bench cold-L2 ms, Mi=7680, UNIFORM regime only (skew forces remap off in the dispatch); swept xcd_c in [1,8,16,32,60,120,240] x xcd_w in [4,8,16], use_mfma_k32=false (gfx942 has no 16x16x32 bf16 atom -- forcing it core-dumps); correctness cos>0.999 vs torch eager (all =1.0000); 3x-repeat confirmed each winner beats the kernel auto-default by 0.9-2.6%. Fallback stays empty-winners -> D-bucketed heuristic with use_mfma_k32=false, xcd_c/xcd_w null (kernel shape-derived defaults). Bench: op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test.",
+      "source": "tier-A XCD-remap autotune (gfx942 MI300X, 2026-06-10) + skew compact static grid for B120 (2026-07-06): tune_jdbba_xcd.py cold-L2 do_bench; skew B120 uses compact TILE_MAP (device prep cached per seq_offsets ptr, amortized across forward); B1024 skew stays envelope grid. Bench: op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test.",
       "winners": {
         "B120D256K256N7680": {
           "use_mfma_k32": false,
