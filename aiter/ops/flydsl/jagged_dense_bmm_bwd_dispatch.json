@@ -1,0 +1,51 @@
+{
+  "schema": "arch-keyed-v1",
+  "_comment": [
+    "Per-shape schedule for the FlyDSL jagged_dense_bmm BACKWARD (grad_jagged +",
+    "fused grad_dense_bias), consumed by jagged_dense_bmm_bwd_dispatch.py.",
+    "Tunables: split (None -> D-derived 2 if D<=256 else 1), coarsen_m (None ->",
+    "module default 2), gj_stages_a (None -> heuristic). shape id is",
+    "B{n_groups}D{reduction_k}K{output_n}N{max_seq_len}; for the backward",
+    "reduction_k == output_n == D (square dense). Resolution: explicit kwarg >",
+    "winners exact match > fallback.by_d_bucket (D<=256 -> d_le_256, else",
+    "d_gt_256). The only shape-varying win today is gj_stages_a: =1 at D=256",
+    "(grad_jagged -2.6% direct / -3.4% autograd) and =2 at D=512 (=1 is",
+    "noise/marginally slower there) -- see docs/2026-07-03_mvonstra-amd_bench.md.",
+    "Same JSON on both archs: the backward has no arch-specific atom (the fp16",
+    "32x32x8 path was removed), so gfx942 and gfx950 share the schedule."
+  ],
+  "by_arch": {
+    "gfx942": {
+      "gfx": "gfx942",
+      "source": "2026-07-03_mvonstra-amd_bench.md (GJ_STAGES_A A/B), 2026-07-01 optimization log",
+      "winners": {
+        "B120D256K256N7680": {"gj_stages_a": 1},
+        "B120D512K512N7680": {"gj_stages_a": 2},
+        "B1024D256K256N7680": {"gj_stages_a": 1},
+        "B1024D512K512N7680": {"gj_stages_a": 2}
+      },
+      "fallback": {
+        "by_d_bucket": {
+          "d_le_256": {"config": {"gj_stages_a": 1}},
+          "d_gt_256": {"config": {"gj_stages_a": 2}}
+        }
+      }
+    },
+    "gfx950": {
+      "gfx": "gfx950",
+      "source": "mirrors gfx942 (no arch-specific backward atom)",
+      "winners": {
+        "B120D256K256N7680": {"gj_stages_a": 1},
+        "B120D512K512N7680": {"gj_stages_a": 2},
+        "B1024D256K256N7680": {"gj_stages_a": 1},
+        "B1024D512K512N7680": {"gj_stages_a": 2}
+      },
+      "fallback": {
+        "by_d_bucket": {
+          "d_le_256": {"config": {"gj_stages_a": 1}},
+          "d_gt_256": {"config": {"gj_stages_a": 2}}
+        }
+      }
+    }
+  }
+}

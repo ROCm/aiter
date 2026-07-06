@@ -81,10 +81,14 @@ NRED_TILES = N // BLOCK_K   # contraction tiles over N (compile-time)
 COARSEN_M = 2
 
 # grad_jagged A-staging depth (B2). The double-buffered sA is BLOCK_M*BLOCK_K*GJ_STAGES_A
-# bf16 = 32 KB at the default 2 stages, which caps grad_jagged at <=2 WG/CU (LDS-bound,
-# 25% occupancy ceiling). GJ_STAGES_A=1 single-buffers it -> 16 KB -> up to 4 WG/CU, at
-# the cost of one extra barrier/iter (the write can no longer overlap the next read).
-# Defaults to the forward's STAGES_A (2) so the baseline is byte-identical.
+# bf16 = 32 KB at 2 stages, which caps grad_jagged at <=2 WG/CU (LDS-bound, 25% occupancy
+# ceiling). GJ_STAGES_A=1 single-buffers it -> 16 KB -> up to 4 WG/CU, at the cost of one
+# extra barrier/iter (the write can no longer overlap the next read). This module default
+# (1) is the D<=256 winner and only applies when the kernel is launched WITHOUT the
+# dispatcher; the production path (jagged_dense_bmm_bwd_dispatch.py) resolves it per-D
+# from the JSON table (1 @ D<=256, 2 @ D>256 -- see 2026-07-03_mvonstra-amd_bench.md) and
+# pins it before the first launch. The forward's STAGES_A (2) is unrelated (it stages the
+# forward's own sA); GJ_STAGES_A is an independent backward knob.
 GJ_STAGES_A = 1
 
 # dDense partials tiling. The contraction dDense[k,n] = sum_m J[m,k]*dOut[m,n] is
