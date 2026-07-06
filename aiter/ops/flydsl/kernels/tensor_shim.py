@@ -39,11 +39,20 @@ def _run_compiled(exe, *args):
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
     """
     cf = getattr(exe, "_cf", None)
-    if cf is None:
+    if cf is not None:
+        cf(*args)
+        return
+    try:
         cf = flyc.compile(exe, *args)
         exe._cf = cf
-    else:
-        cf(*args)
+    except Exception:
+        # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
+        try:
+            while ir.Context.current is not None:
+                ir.Context.current.__exit__(None, None, None)
+        except Exception:
+            pass
+        raise
 
 
 def _to_raw(v):

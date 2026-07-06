@@ -1,0 +1,76 @@
+--- mxmoe_dispatcher.py	2026-07-06 09:50:48.503785962 +0000
++++ mxmoe_dispatcher.py	2026-07-06 09:51:12.438294425 +0000
+@@ -624,6 +624,7 @@
+     g2_bhoist=None,
+     g2_ascale_pf=None,
+     g2_spart=None,
++    use_strip=None,
+ ):
+     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
+     SBM = _norm_sbm(SBM, BM)
+@@ -653,6 +654,12 @@
+     g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
+     if g2_spart > 0 and (g2_group_num < 1 or g2_m01 < 1):
+         raise AssertionError(f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)")
++    # use_strip (opt-in, default False = byte-identical): reuse a [BM,64] f32 LDS strip per N-band in
++    # the atomic epilog instead of the full [BM,BN] slab -> resident LDS BM*64*4 vs BM*BN*4, freeing
++    # occupancy. Ported from FlyDSL rlcr/g2-align.
++    if use_strip is None:
++        use_strip = os.environ.get("MXFP4_G2_STRIP", "0") == "1"
++    use_strip = bool(use_strip)
+     if a_dtype not in ("fp4", "fp8"):
+         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
+@@ -660,7 +667,9 @@
+     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
+     slot_bytes = BM * KH_TILE_A
+     aStages = 3  # runtime K-loop: triple-buffered A LDS (handles both K_TILES==2 and larger)
+-    lds_bytes = max(BM * BN * 4, aStages * slot_bytes)
++    # Strip epilog resident cshuffle slab is [BM,64] (8KB) vs the full [BM,BN] (32KB).
++    acc_slab_cols = 64 if use_strip else BN
++    lds_bytes = max(BM * acc_slab_cols * 4, aStages * slot_bytes)
+     # N_OUT = model_dim/hidden is a runtime arg (i32_hidden); num_n_blocks = N_OUT//256 is computed runtime in the body/launch (HIDDEN_MAX only caps host checks).
+     assert HIDDEN_MAX % BK == 0, f"HIDDEN_MAX must be a multiple of {BK}, got {HIDDEN_MAX}"
+ 
+@@ -682,7 +691,8 @@
+     bh_tag = "_bhoist" if g2_bhoist else ""
+     apf_tag = "_apf" if g2_ascale_pf else ""
+     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
+-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}_v2"
++    strip_tag = "_strip" if use_strip else ""
++    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{strip_tag}_v2"
+     name = f"gemm2_a4w4_port_{tag}"
+ 
+     @fx.struct
+@@ -770,6 +780,7 @@
+                 g2_kstages=g2_kstages,
+                 g2_bhoist=g2_bhoist,
+                 g2_ascale_pf=g2_ascale_pf,
++                use_strip=use_strip,
+             )
+ 
+         if const_expr(not persist and g2_spart <= 0):
+@@ -1049,6 +1060,7 @@
+     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
+     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
+     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
++    use_strip = os.environ.get("MXFP4_G2_STRIP", "0") == "1"
+     key = (
+         BM,
+         use_nt,
+@@ -1065,6 +1077,7 @@
+         g2_bhoist,
+         g2_ascale_pf,
+         g2_spart,
++        use_strip,
+     )
+     launch = G2_CACHE.get(key)
+     if launch is None:
+@@ -1084,6 +1097,7 @@
+             g2_bhoist=g2_bhoist,
+             g2_ascale_pf=g2_ascale_pf,
+             g2_spart=g2_spart,
++            use_strip=use_strip,
+         )
+         G2_CACHE[key] = launch
+     return launch
