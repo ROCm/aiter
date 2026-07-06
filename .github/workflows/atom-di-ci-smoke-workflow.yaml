@@ -5,7 +5,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
-      - ".github/workflows/atomesh-spur-login-smoke.yaml"
+      - ".github/workflows/atom-di-ci-smoke-workflow.yaml"
   workflow_dispatch:
     inputs:
       atom_ref:
