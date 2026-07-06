@@ -739,6 +739,7 @@ def _run_moe_reduction(
     expert_mask=None,
     topk_ids=None,
     stream=None,
+    is_fp8=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -746,42 +747,53 @@ def _run_moe_reduction(
         raise ValueError(
             "topk_ids is required when expert_mask is provided for reduce mode"
         )
-    # Map torch dtype -> compile_moe_reduction dtype_str
-    if out.dtype == torch.float16:
-        _reduce_dtype_str = "f16"
-    elif out.dtype == torch.bfloat16:
-        _reduce_dtype_str = "bf16"
-    elif out.dtype == torch.float32:
-        _reduce_dtype_str = "f32"
-    else:
-        _reduce_dtype_str = None
-
-    if _reduce_dtype_str is None:
-        # Unsupported dtype for the masked kernel — fall back to torch.sum.
-        # This drops the EP mask, so only valid for non-EP runs.
-        if use_mask:
-            raise NotImplementedError(
-                f"Masked moe reduction not supported for dtype {out.dtype}"
-            )
-        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
-        return
+    if is_fp8 and use_mask:
+        raise NotImplementedError(
+            "MXFP8 route-out reduce does not support EP expert_mask yet"
+        )
 
     from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+    if is_fp8:
+        _dtype_str = "fp8"
+        _out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+        # fp8 route-out is a flat uint8 [rows, model_dim + model_dim/8] buffer,
+        # consumed as-is (not reshaped to [token, topk, model_dim]).
+        X = target
+    else:
+        # Map torch dtype -> compile_moe_reduction dtype_str
+        if out.dtype == torch.float16:
+            _dtype_str = "f16"
+        elif out.dtype == torch.bfloat16:
+            _dtype_str = "bf16"
+        elif out.dtype == torch.float32:
+            _dtype_str = "f32"
+        else:
+            # Unsupported dtype for the masked kernel — fall back to torch.sum.
+            # This drops the EP mask, so only valid for non-EP runs.
+            if use_mask:
+                raise NotImplementedError(
+                    f"Masked moe reduction not supported for dtype {out.dtype}"
+                )
+            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+            return
+        _out_dtype_str = None
+        X = target.view(token_num, topk, model_dim)
 
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
-        dtype_str=_reduce_dtype_str,
+        dtype_str=_dtype_str,
         use_mask=use_mask,
         # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
         num_experts=int(expert_mask.numel()) if use_mask else 0,
+        out_dtype_str=_out_dtype_str,
     )
-    X = target.view(token_num, topk, model_dim)
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
         tk = topk_ids.to(torch.int32).contiguous()
     else:
-        # Placeholders; kernel ignores them when use_mask=False.
+        # Placeholders; kernel ignores them when use_mask=False (and for fp8).
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
     if stream is None:
@@ -1602,9 +1614,25 @@ def flydsl_moe_stage2(
     _k_in = inter_dim
 
     target = out
+    _s2_fp8_inter = (
+        (not accumulate)
+        and (not return_per_slot)
+        and use_mx_gemm
+        and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
+    _s2_gemm_out_dtype = "fp8" if _s2_fp8_inter else out_dtype
+
     if not accumulate:
         if return_per_slot:
             target = out.view(-1)
+        elif _s2_fp8_inter:
+            # uint8 [rows, N value bytes + N/8 e8m0 scale bytes]
+            _rows = token_num * topk
+            target = torch.empty(
+                (_rows, model_dim + model_dim // 8),
+                device=out.device,
+                dtype=torch.uint8,
+            )
         else:
             target = torch.empty(
                 (token_num * topk * model_dim,),
@@ -1658,7 +1686,7 @@ def flydsl_moe_stage2(
         doweight_stage2=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        out_dtype=out_dtype,
+        out_dtype=_s2_gemm_out_dtype,
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
@@ -1681,7 +1709,14 @@ def flydsl_moe_stage2(
             )
     if not accumulate and not return_per_slot:
         _run_moe_reduction(
-            target, out, token_num, topk, model_dim, expert_mask, topk_ids
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim,
+            expert_mask,
+            topk_ids,
+            is_fp8=_s2_fp8_inter,
         )
     return out
 
