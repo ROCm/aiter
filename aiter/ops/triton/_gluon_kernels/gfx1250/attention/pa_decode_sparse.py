@@ -141,19 +141,9 @@ def _pa_decode_sparse(
         order=[0],
     )
     slot_reg_layout: gl.constexpr = SLOT_BLOCKED_LAYOUT
-    # SLOT_BLOCKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
-    #     size_per_thread=[1, 8],
-    #     threads_per_warp=[32, 1],
-    #     warps_per_cta=[1, num_warps],
-    #     order=[0, 1],
-    # )
-    # slot_reg_layout: gl.constexpr = gl.SliceLayout(0, SLOT_BLOCKED_LAYOUT)
-
     kv_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 8]], [BLOCK_K, BLOCK_D], [1, 0]
     )
-    # Slot tiles are staged through LDS via TDM async_load (1 row x BLOCK_K
-    # contiguous int32), then read back to registers to feed async_gather.
     slot_shared: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
@@ -162,12 +152,27 @@ def _pa_decode_sparse(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
     valid_col_mma: gl.constexpr = gl.SliceLayout(0, QK_WMMA_LAYOUT)
+    NUM_BUFFERS: gl.constexpr = 2
+    kv_bufs = gl.allocate_shared_memory(
+        unified_kv_ptr.dtype.element_ty,
+        [NUM_BUFFERS, BLOCK_K, BLOCK_D],
+        kv_shared,
+    )
+    slot_bufs = gl.allocate_shared_memory(
+        kv_indices_ptr.dtype.element_ty,
+        [NUM_BUFFERS, 1, BLOCK_K],
+        slot_shared,
+    )
 
     t = gl.program_id(0)
     pid_h = gl.program_id(1)
     pid_k = gl.program_id(2)
 
+    kv_start = gl.load(kv_indptr_ptr + t)
+    kv_end = gl.load(kv_indptr_ptr + t + 1)
+
     h_off_base = pid_h * BLOCK_H
+    qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
 
     # ---- Q load (once per program) ----
     h_offs_q = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
@@ -182,16 +187,7 @@ def _pa_decode_sparse(
         mask=h_mask_q[:, None],
         other=0.0,
     )
-    # When USE_EXP2, fold log2(e) into q so QK scores land in the base-2
-    # domain and per-element softmax uses the bare exp2 HW instruction.
-    # Otherwise stay in the natural-exp domain (softmax_scale only).
-    qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
-    mfma_q = gl.convert_layout(q, dot_q_layout)
-    mfma_q = mfma_q.to(gl.float32) * qk_scale
-    mfma_q = mfma_q.to(q_ptr.dtype.element_ty)
 
-    kv_start = gl.load(kv_indptr_ptr + t)
-    kv_end = gl.load(kv_indptr_ptr + t + 1)
     kv_len = kv_end - kv_start
 
     tiles_per_segment = gl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
@@ -202,10 +198,24 @@ def _pa_decode_sparse(
     tile_end = gl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
     num_iters = tile_end - tile_start
 
+    slot_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=kv_indices_ptr + kv_start,
+        shape=[1, kv_len],
+        strides=[kv_len, 1],
+        block_shape=[1, BLOCK_K],
+        layout=slot_shared,
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        slot_desc, [0, tile_start * BLOCK_K], slot_bufs.index(0)
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        slot_desc, [0, (tile_start + 1) * BLOCK_K], slot_bufs.index(1)
+    )
+
+    # initialize m_i, l_i, mma
     h_offs_mma_row = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, PV_WMMA_LAYOUT))
     h_offs_mma_row_eff = h_off_base + h_offs_mma_row
     h_mask_mma_row = h_offs_mma_row_eff < H
-
     if KV_SPLITS == 1:
         sink = gl.amd.cdna4.buffer_load(
             ptr=attn_sink_ptr,
@@ -240,21 +250,6 @@ def _pa_decode_sparse(
     acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=PV_WMMA_LAYOUT)
 
     # ---- 2-stage pipeline ----
-    # Slot tensor: loaded synchronously (analogous to physical_block_idx
-    # in gluon/mla.py). KV cache: async_gather into a 2-deep ring buffer so
-    # the next tile's gather runs in parallel with the current tile's math.
-    NUM_BUFFERS: gl.constexpr = 2
-    kv_bufs = gl.allocate_shared_memory(
-        unified_kv_ptr.dtype.element_ty,
-        [NUM_BUFFERS, BLOCK_K, BLOCK_D],
-        kv_shared,
-    )
-    NUM_SLOT_BUFFERS: gl.constexpr = 2
-    slot_bufs = gl.allocate_shared_memory(
-        kv_indices_ptr.dtype.element_ty,
-        [NUM_SLOT_BUFFERS, 1, BLOCK_K],
-        slot_shared,
-    )
     if QUANT_KV:
         scales_smem = gl.allocate_shared_memory(
             gl.float32,
@@ -275,28 +270,12 @@ def _pa_decode_sparse(
         layout=kv_shared,
     )
 
-    # TDM descriptor over the per-token slot list kv_indices[kv_start : +kv_len],
-    # viewed as a [1, kv_len] row so each BLOCK_K tile is a contiguous block.
-    slot_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=kv_indices_ptr + kv_start,
-        shape=[1, kv_len],
-        strides=[kv_len, 1],
-        block_shape=[1, BLOCK_K],
-        layout=slot_shared,
-    )
-
     k_offs_slot = gl.arange(0, BLOCK_K, layout=slot_reg_layout)
 
     # ---- Prologue ----
     # TDM async_load slot[tile_start] -> slot_bufs[0] and slot[tile_start+1] ->
     # slot_bufs[1] (slots run one tile ahead of the KV gather). Wait for the
     # first, read it back to registers, and kick off the KV gather for tile 0.
-    gl.amd.gfx1250.tdm.async_load(
-        slot_desc, [0, tile_start * BLOCK_K], slot_bufs.index(0)
-    )
-    gl.amd.gfx1250.tdm.async_load(
-        slot_desc, [0, (tile_start + 1) * BLOCK_K], slot_bufs.index(1)
-    )
     gl.amd.gfx1250.tdm.async_wait(1)  # slot[tile_start] ready (slot[+1] in flight)
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
 
@@ -310,6 +289,11 @@ def _pa_decode_sparse(
     else:
         safe_slot_cur = slot_reg
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, 0, kv_bufs.index(0))
+
+    mfma_q = gl.convert_layout(q, dot_q_layout)
+    mfma_q = mfma_q.to(gl.float32) * qk_scale
+    mfma_q = mfma_q.to(q_ptr.dtype.element_ty)
+
     if QUANT_KV:
         cur_safe_slot = safe_slot_cur
         _safe_sl = gl.convert_layout(cur_safe_slot, gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
@@ -330,13 +314,13 @@ def _pa_decode_sparse(
         gl.amd.gfx1250.tdm.async_load(
             slot_desc,
             [0, (tile_start + i + 2) * BLOCK_K],
-            slot_bufs.index(i % NUM_SLOT_BUFFERS),
+            slot_bufs.index(i % NUM_BUFFERS),
         )
         # Wait for slot[i+1] (issued last iter): leaves KV[i] and slot[i+2] in
         # flight (2 outstanding TDM ops). Read slot[i+1] back to registers.
         gl.amd.gfx1250.tdm.async_wait(2)
         slot_reg = (
-            slot_bufs.index((i + 1) % NUM_SLOT_BUFFERS)
+            slot_bufs.index((i + 1) % NUM_BUFFERS)
             .reshape([BLOCK_K])
             .load(layout=slot_reg_layout)
         )
