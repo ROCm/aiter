@@ -12,9 +12,8 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
-    swizzle_scales_gfx950,
-    swizzle_scales_gfx1250,
 )
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -288,11 +287,15 @@ def test_op(
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+            )
         else:
             assert get_arch() == "gfx950"
             swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
     else:
         swizzle_mx_scale = None
 

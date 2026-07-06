@@ -1355,6 +1355,8 @@ OPUS_H bool moe_sorting_is_oneshot(int tokens_, int num_experts_)
 #endif
     auto sub_token_          = moe_sorting_get_sub_token(tokens_, num_experts_);
     bool is_sub_token_onshot = tokens_ <= sub_token_;
+    if(num_experts_ >= 512 && is_sub_token_onshot)
+        return false;
     return is_sub_token_onshot;
 }
 
