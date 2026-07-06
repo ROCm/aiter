@@ -59,8 +59,7 @@ def _varctx_cta_info_kernel(
     BLOCK_B: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
-    """Single-kernel build of the varctx persistent-grid schedule (cta_info).
-    """
+    """Single-kernel build of the varctx persistent-grid schedule (cta_info)."""
     pid = tl.program_id(0)
     b = tl.arange(0, BLOCK_B)
     bmask = b < B
@@ -182,25 +181,25 @@ def build_pa_mqa_logits_fp4_module(
     head_dim_packed = head_dim // 2
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
-    assert head_dim % 128 == 0, (
-        f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
-    )
+    assert (
+        head_dim % 128 == 0
+    ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
     global allocator
 
     N_TILES = block_k // MFMA_N
-    assert N_TILES % num_warps == 0, (
-        f"block_k={block_k} → N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
-    )
+    assert (
+        N_TILES % num_warps == 0
+    ), f"block_k={block_k} → N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
     N_TILES_PER_WARP = N_TILES // num_warps
 
     assert kv_block_size % MFMA_N == 0, (
         f"kv_block_size={kv_block_size} must be a multiple of MFMA_N={MFMA_N}; "
         f"sub-tile pages would require splitting one MFMA over multiple page lookups"
     )
-    assert block_k % kv_block_size == 0, (
-        f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
-    )
+    assert (
+        block_k % kv_block_size == 0
+    ), f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
     TILES_PER_BLOCK = kv_block_size // MFMA_N
     N_PHYS = (N_TILES_PER_WARP + TILES_PER_BLOCK - 1) // TILES_PER_BLOCK
 
@@ -504,9 +503,9 @@ def build_pa_mqa_logits_fp4_module(
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             """Process chunk c using prefetched (kv, kvs_packed)."""
-            assert N_TILES_PER_WARP == 4, (
-                "pipelined-nt structure currently hardcoded for NTPW=4"
-            )
+            assert (
+                N_TILES_PER_WARP == 4
+            ), "pipelined-nt structure currently hardcoded for NTPW=4"
 
             # Pre-extract all NTPW nt scales (frees packed register early).
             kvs_scales = _extract_kvs_scales(kvs_packed_list_in)
