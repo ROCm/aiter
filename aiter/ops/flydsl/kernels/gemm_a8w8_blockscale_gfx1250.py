@@ -85,9 +85,7 @@ def lds_load_b32_f32(memref, elem_off):
     read the right number of element units to cover 32 bits and bitcast."""
     vec_ty = _lds_vec_type(memref, 32)
     loaded = vector.load_op(vec_ty, memref, [elem_off])
-    as_f32_vec = vector.bitcast(
-        ir.VectorType.get([1], ir.F32Type.get()), loaded
-    )
+    as_f32_vec = vector.bitcast(ir.VectorType.get([1], ir.F32Type.get()), loaded)
     return vector.extract(as_f32_vec, static_position=[0], dynamic_position=[])
 
 
@@ -114,8 +112,7 @@ def _disable_unroll_on_enclosing_loop():
     if op.name != "scf.for":
         return
     anno = ir.Attribute.parse(
-        "#llvm.loop_annotation<unroll = <disable = true>, "
-        "disableNonforced = true>"
+        "#llvm.loop_annotation<unroll = <disable = true>, " "disableNonforced = true>"
     )
     op.attributes["loop_annotation"] = anno
 
@@ -196,9 +193,7 @@ def compile_gemm_a8w8_blockscale(
     kernarg_preload: bool = False,
 ):
     if variant not in ("reg_preload", "manual"):
-        raise ValueError(
-            f"variant must be 'reg_preload' or 'manual', got {variant!r}"
-        )
+        raise ValueError(f"variant must be 'reg_preload' or 'manual', got {variant!r}")
     if const_expr(variant == "reg_preload"):
         _w_is_wave_uniform = (tile_n // n_warp) <= scale_block_n
         if not _w_is_wave_uniform:
@@ -206,8 +201,7 @@ def compile_gemm_a8w8_blockscale(
                 f"variant='reg_preload' requires warp_tile_n ({tile_n // n_warp}) "
                 f"<= scale_block_n ({scale_block_n}) (W-scale must be wave-uniform)"
             )
-        # scale_k > 32 → multi-chunk prefetch chain (issued at entry chunks 0+1,
-        # advanced per iteration in the main loop). No upper bound.
+        # scale_k > 32 -> multi-chunk prefetch chain (chunks 0+1 at entry, advanced per iter).
     if const_expr(variant == "manual"):
         # B-resident streaming-A requires wmma_n_rep ≥ 2 and even.
         _warp_tile_m = tile_m // m_warp
@@ -290,7 +284,6 @@ def compile_gemm_a8w8_blockscale(
     k_wmma_steps = tile_k // WMMA_K  # WMMAs per K-tile along K
     scales_per_tile = tile_k // scale_block_k  # scale blocks per K-tile
     wmma_steps_per_scale = scale_block_k // WMMA_K
-    wmma_pipeline_depth = min(n_accs, 2)
     acc_coords = [
         (wm, wn, wm * wmma_n_rep + wn)
         for wm in range(wmma_m_rep)
@@ -300,8 +293,7 @@ def compile_gemm_a8w8_blockscale(
     num_k_tiles = K // tile_k
     scale_k = K // scale_block_k
 
-    # W-scale chunking: 1 buffer_load_b32 covers 32 K-blocks; lazy chain when scale_k > 32.
-    # Both surviving variants use the bulk-load W-scale path.
+    # W-scale chunking: 1 buffer_load_b32 covers 32 K-blocks; lazy chain when scale_k > 32 (both variants bulk-load).
     _USES_REG_W = True
     NUM_W_CHUNKS = (scale_k + 31) // 32
     USES_W_CHUNK_PREFETCH = NUM_W_CHUNKS > 1
@@ -319,8 +311,7 @@ def compile_gemm_a8w8_blockscale(
     effective_waves_per_eu = waves_per_eu
 
     lds_a_stride_bytes = tile_k + LDS_PAD_A_BYTES
-    # B is now preshuffled (cycle-major). Each stripe (= 16 N values) holds
-    # tile_k cycles of 16 bytes = tile_k * 16 contiguous bytes, no padding.
+    # B preshuffled (cycle-major): each stripe (16 N) = tile_k cycles x 16 bytes = tile_k*16 contiguous, no padding.
     lds_b_stride_bytes = tile_k * 16  # per-stripe size in LDS bytes
     lds_a_data_bytes = tile_m * lds_a_stride_bytes
     lds_b_data_bytes = (tile_n // 16) * lds_b_stride_bytes
@@ -330,29 +321,19 @@ def compile_gemm_a8w8_blockscale(
     lds_x_scale_row_bytes = scales_per_tile * 4
     lds_x_scale_data_bytes = tile_m * lds_x_scale_row_bytes
 
-    # Unified LDS allocator: lays out [A0|A1|...|A_nb-1 | B0|...|B_nb-1 |
-    # X0|...|X_nb-1] in a single contiguous global LDS region. This lets
-    # us address slot i with `region_base + i * slot_stride_bytes`, so
-    # helpers can take an SSA `buf_idx_i32` instead of a Python int and the
-    # main loop can be a single-tile-per-iter scf.for (Gluon style).
-    unified_alloc = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="a8w8bs_unified"
-    )
+    # Unified LDS allocator: contiguous [A0..A_nb-1 | B0..B_nb-1 | X0..X_nb-1]; slot i = region_base + i*slot_stride_bytes (SSA buf_idx).
+    unified_alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="a8w8bs_unified")
     unified_a_off = unified_alloc._align(unified_alloc.ptr, 16)
     unified_alloc.ptr = unified_a_off + num_buffers * lds_a_data_bytes
     unified_b_off = unified_alloc._align(unified_alloc.ptr, 16)
     unified_alloc.ptr = unified_b_off + num_buffers * lds_b_data_bytes
     if USES_X_SCALE_TDM:
         unified_x_scale_off = unified_alloc._align(unified_alloc.ptr, 16)
-        unified_alloc.ptr = (
-            unified_x_scale_off + num_buffers * lds_x_scale_data_bytes
-        )
+        unified_alloc.ptr = unified_x_scale_off + num_buffers * lds_x_scale_data_bytes
     else:
         unified_x_scale_off = 0
 
-    # Per-region per-slot byte offsets within the unified allocator. Used
-    # only by the prologue/drain (compile-time buf_idx); the main loop uses
-    # SSA buf_idx and computes addresses arithmetically.
+    # Per-region per-slot byte offsets (unified allocator); used only by prologue/drain (compile-time buf_idx).
     stage_a_data_off = [
         unified_a_off + i * lds_a_data_bytes for i in range(num_buffers)
     ]
@@ -361,13 +342,11 @@ def compile_gemm_a8w8_blockscale(
     ]
     if USES_X_SCALE_TDM:
         stage_x_scale_off = [
-            unified_x_scale_off + i * lds_x_scale_data_bytes
-            for i in range(num_buffers)
+            unified_x_scale_off + i * lds_x_scale_data_bytes for i in range(num_buffers)
         ]
     else:
         stage_x_scale_off = []
-    # Compatibility shim: every site that wants `stage_allocators[i]` is
-    # really asking for the unified base.
+    # Compatibility shim: stage_allocators[i] really means the unified base.
     stage_allocators = [unified_alloc] * num_buffers
 
     if use_tdm_store:
@@ -384,13 +363,12 @@ def compile_gemm_a8w8_blockscale(
         d_lds_allocator.ptr = total_d_bytes
 
     prologue_tiles = num_buffers - 1
-    main_loop_iters = (num_k_tiles - prologue_tiles) // num_buffers
-    extra_tiles = num_k_tiles - main_loop_iters * num_buffers - prologue_tiles
-    drain_iters = num_buffers - 2
 
     # 3 TDMs per tile (X + W + X-scale) for both surviving variants.
     _TDMS_PER_TILE_EXP = 3
     MAIN_TDM_OUTSTANDING_EXPERIMENTAL = (num_buffers - 2) * _TDMS_PER_TILE_EXP
+    # fills-NB (WAR-safe): prologue fills all NB buffers (wait leaves NB-1); main loop issues TDM after the barrier so refill is read-safe. reg_preload-only.
+    REG_PROLOGUE_WAIT = (num_buffers - 1) * _TDMS_PER_TILE_EXP
 
     @flyc.kernel
     def kernel_gemm_a8w8_blockscale(
@@ -444,9 +422,7 @@ def compile_gemm_a8w8_blockscale(
 
         scale_zero = arith.constant(0.0, type=T.f32)
 
-        # One memref per region spanning all `num_buffers` slots. ds_loads
-        # for slot i use `lane_base + i * lds_<region>_data_bytes` (offset is
-        # SSA in the main loop, Python int in prologue/drain).
+        # One memref per region over all num_buffers slots; ds_loads for slot i use lane_base + i*lds_<region>_data_bytes.
         big_a = SmemPtr(
             unified_alloc.get_base(),
             unified_a_off,
@@ -461,10 +437,7 @@ def compile_gemm_a8w8_blockscale(
         )
         big_a_mem = big_a.get()
         big_b_mem = big_b.get()
-        # Per-stage memref aliases (slot 0 sub-views) used only for building
-        # the TDM descriptors — they need a per-slot memref to compute
-        # alignments. The actual TDM lds_addr i32 we use for slot i is
-        # derived from slot-0's i32 + i * slot_size below.
+        # Per-stage memref aliases (slot-0 sub-views) only for building TDM descriptors; actual slot-i lds_addr = slot0 i32 + i*slot_size.
         stages_a = [
             SmemPtr(
                 stage_allocators[i].get_base(),
@@ -502,12 +475,7 @@ def compile_gemm_a8w8_blockscale(
             )
 
         def _make_desc_w(lds_mem, k_base):
-            # W is preshuffled to (N // 16, K * 16) cycle-major layout.
-            # Each row in HBM = one 16-N stripe; byte offset within row =
-            # k_element_index * 16 (since each (n_inner, K_inner) cycle cell
-            # is 16 bytes). Per K-tile per workgroup, read (tile_n//16)
-            # stripes of (tile_k * 16) bytes each = tile_n * tile_k bytes
-            # total, no padding.
+            # W preshuffled (N//16, K*16) cycle-major: each HBM row = one 16-N stripe; per K-tile read (tile_n//16) stripes of tile_k*16 bytes.
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_w,
                 lds_memref=lds_mem,
@@ -539,9 +507,7 @@ def compile_gemm_a8w8_blockscale(
             _desc_w_init.dgroup0, static_position=[2], dynamic_position=[]
         )
 
-        # Slot-0 LDS i32 base addresses (pre-extracted from descriptor).
-        # Slot i LDS address = slot_0_base + i * slot_stride_bytes (computed
-        # arithmetically at runtime when buf_idx is SSA).
+        # Slot-0 LDS i32 base addresses; slot i = slot_0_base + i*slot_stride_bytes (computed at runtime for SSA buf_idx).
         a_lds_base_i32 = vector.extract(
             _make_desc_x(stages_a_mem[0], arith.index(0)).dgroup0,
             static_position=[1],
@@ -572,12 +538,8 @@ def compile_gemm_a8w8_blockscale(
             `buf_idx` may be a Python int (prologue/drain) or an i32 SSA
             value (main loop). Returns advanced (lo_x, lo_w)."""
             buf_i32 = _buf_idx_to_i32(buf_idx)
-            a_addr = arith.addi(
-                a_lds_base_i32, arith.muli(buf_i32, slot_stride_a_i32)
-            )
-            b_addr = arith.addi(
-                b_lds_base_i32, arith.muli(buf_i32, slot_stride_b_i32)
-            )
+            a_addr = arith.addi(a_lds_base_i32, arith.muli(buf_i32, slot_stride_a_i32))
+            b_addr = arith.addi(b_lds_base_i32, arith.muli(buf_i32, slot_stride_b_i32))
             dg0_x = vector.from_elements(
                 T.vec(4, T.i32), [pred_const, a_addr, lo_x, addr_hi_x]
             )
@@ -640,9 +602,7 @@ def compile_gemm_a8w8_blockscale(
                 static_position=[1],
                 dynamic_position=[],
             )
-            slot_stride_x_scale_i32 = arith.constant(
-                lds_x_scale_data_bytes, type=T.i32
-            )
+            slot_stride_x_scale_i32 = arith.constant(lds_x_scale_data_bytes, type=T.i32)
 
             # K-axis advance per K-tile: scales_per_tile K-blocks × 4 B/elem.
             adv_x_scale_i32 = arith.constant(scales_per_tile * 4, type=T.i32)
@@ -660,9 +620,7 @@ def compile_gemm_a8w8_blockscale(
                     T.vec(4, T.i32),
                     [pred_const, xs_addr, lo_x_scale, addr_hi_x_scale],
                 )
-                tdm_ops.tensor_load_2d(
-                    tdm_ops.TDMDescriptor2D(dg0, dgroup1_x_scale)
-                )
+                tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, dgroup1_x_scale))
                 return arith.addi(lo_x_scale, adv_x_scale_i32)
 
             def ds_read_x_scales(buf_idx):
@@ -692,8 +650,7 @@ def compile_gemm_a8w8_blockscale(
                 return out
 
         w_is_wave_uniform = warp_tile_n <= scale_block_n
-        # Hoisted out of `if const_expr(w_is_wave_uniform):` so closures wrapped by the
-        # AST rewriter for downstream branches can resolve it.
+        # Hoisted out of the w_is_wave_uniform const_expr so AST-rewriter closures downstream can resolve it.
         wave_n_block = (blk_n + warp_n_base) / arith.index(scale_block_n)
 
         # Bulk W-scale load: 1 buffer_load_b32 covers 32 K-blocks; chunk-prefetch chain when scale_k > 32.
@@ -716,9 +673,7 @@ def compile_gemm_a8w8_blockscale(
                     chunk_idx_i32,
                     arith.constant(NUM_W_CHUNKS - 1, type=T.i32),
                 )
-                offset_i32 = arith.muli(
-                    clamped_i32, arith.constant(32, type=T.i32)
-                )
+                offset_i32 = arith.muli(clamped_i32, arith.constant(32, type=T.i32))
                 offset = arith.index_cast(T.index, offset_i32)
                 idx = wave_n_block * arith.index(scale_k) + lane_id_full + offset
                 return buffer_ops.buffer_load(
@@ -737,15 +692,9 @@ def compile_gemm_a8w8_blockscale(
             (vs. the loop-carried cur_chunk_idx_i32), then readlanes."""
             if const_expr(NUM_W_CHUNKS == 1):
                 return rocdl.readlane(T.f32, bulk_w_cur, kb_i32)
-            kb_chunk_i32 = arith.shrui(
-                kb_i32, arith.constant(5, type=T.i32)
-            )
-            lane_in_chunk_i32 = arith.andi(
-                kb_i32, arith.constant(31, type=T.i32)
-            )
-            is_cur = arith.cmpi(
-                arith.CmpIPredicate.eq, kb_chunk_i32, cur_chunk_idx_i32
-            )
+            kb_chunk_i32 = arith.shrui(kb_i32, arith.constant(5, type=T.i32))
+            lane_in_chunk_i32 = arith.andi(kb_i32, arith.constant(31, type=T.i32))
+            is_cur = arith.cmpi(arith.CmpIPredicate.eq, kb_chunk_i32, cur_chunk_idx_i32)
             chosen = arith.select(is_cur, bulk_w_cur, bulk_w_prefetch)
             return rocdl.readlane(T.f32, chosen, lane_in_chunk_i32)
 
@@ -754,10 +703,8 @@ def compile_gemm_a8w8_blockscale(
         # lane_kgrp selects K-half: kgrp=0 → bytes [0..63], kgrp=1 → [64..127].
         k_half_byte_offset = lane_kgrp * arith.index(64)
 
-        # For preshuffled B (cycle-major), lane group selects which cycle
-        # within each WMMA's 8-cycle window: kgrp=0 reads cycles 0,2,4,6;
-        # kgrp=1 reads cycles 1,3,5,7. One cycle = 256 LDS bytes.
-        b_k_half_byte_offset = lane_kgrp * arith.index(256)
+        # Preshuffled B (cycle-major, natural K per shuffle_weight_gfx1250): kgrp selects a contiguous 4-cycle K-half (kgrp0=cycles 0-3, kgrp1=4-7); cycle=256B, K-half=1024B.
+        b_k_half_byte_offset = lane_kgrp * arith.index(1024)
 
         def _compute_lane_bases(warp_base, stride_bytes, num_reps, rep_stride_elems):
             """Compute per-lane LDS byte offsets for loading `num_reps` WMMA
@@ -787,23 +734,24 @@ def compile_gemm_a8w8_blockscale(
             for rep in range_constexpr(num_reps):
                 # warp_base is the starting N-element index; each rep advances by WMMA_N=16
                 stripe_offset = (
-                    warp_base + arith.index(rep * WMMA_N)
-                ) / arith.index(WMMA_N) * arith.index(lds_b_stride_bytes)
-                base = (
-                    stripe_offset
-                    + b_k_half_byte_offset
-                    + lane16 * arith.index(16)
+                    (warp_base + arith.index(rep * WMMA_N))
+                    / arith.index(WMMA_N)
+                    * arith.index(lds_b_stride_bytes)
                 )
+                base = stripe_offset + b_k_half_byte_offset + lane16 * arith.index(16)
                 bases.append(base)
             return bases
 
-        def _load_frag(lds_memref, lane_base, ks, cycle_stride_bytes=16, ks_stride_bytes=WMMA_K):
+        def _load_frag(
+            lds_memref, lane_base, ks, cycle_stride_bytes=16, ks_stride_bytes=WMMA_K
+        ):
             """Load one WMMA frag (16 × b128) from LDS into a vector<16xi32>
             per lane, starting at byte offset (lane_base + ks * ks_stride_bytes).
 
             cycle_stride_bytes:
               - 16  for M-major A (default; consecutive b128s are adjacent)
-              - 512 for cycle-major preshuffled B (b128s are one cycle pair apart)
+              - 256 for cycle-major preshuffled B (consecutive b128s are one
+                    cycle apart; natural-K shuffle_weight_gfx1250 layout)
             ks_stride_bytes:
               - WMMA_K (=128) for M-major A
               - 2048 for cycle-major preshuffled B (one WMMA = 8 cycles = 2048 B)
@@ -821,22 +769,13 @@ def compile_gemm_a8w8_blockscale(
         a_lane_bases = _compute_lane_bases(
             warp_m_base, lds_a_stride_bytes, wmma_m_rep, WMMA_M
         )
-        b_lane_bases = _compute_b_lane_bases_preshuffled(
-            warp_n_base, wmma_n_rep
-        )
+        b_lane_bases = _compute_b_lane_bases_preshuffled(warp_n_base, wmma_n_rep)
 
-        # ═══════════════════════════════════════════════════════════════════
         # HELPERS: WMMA compute + scale FMA
-        # ═══════════════════════════════════════════════════════════════════
 
         acc_zero = arith.constant_vector(0.0, T.vec(8, T.f32))
 
-        # ─────────────────────────────────────────────────────────────────
-        # Split-out primitive helpers (used by compute_wmma_with_frags_experimental
-        # below — and intended to be called directly from the main loop when
-        # hand-orchestrating WMMA/scale/FMA ordering, e.g. to force WMMAs in
-        # K-step source order so each one's `s_wait_dscnt` is minimal).
-        # ─────────────────────────────────────────────────────────────────
+        # Split-out primitive helpers (also callable directly from the main loop to hand-order WMMA/scale/FMA for minimal s_wait_dscnt).
 
         def issue_wmma_step(sc, wm, wn, a_frags, b_frags):
             """Issue WMMA(s) for scale-block `sc`, M-rep `wm`, N-rep `wn`.
@@ -881,22 +820,14 @@ def compile_gemm_a8w8_blockscale(
             scale_vec = vector.broadcast(T.vec(8, T.f32), scale)
             return math_dialect.fma(temp, scale_vec, acc)
 
-        # N_ACCS         — global accumulators (always carried)
-        # N_A_FRAGS      — cur_a operand frags (reg_preload only)
-        # N_B_FRAGS      — cur_b operand frags (reg_preload only)
-        # N_CUR_X_RAW    — current tile raw x_scales
-        # N_CUR_W_RAW    — current tile raw w_scales
-        # N_PREFETCH_X   — next tile raw x_scales (prefetched)
-        # N_PREFETCH_W   — next tile raw w_scales (prefetched)
+        # State layout: N_ACCS accs | N_A_FRAGS cur_a | N_B_FRAGS cur_b | N_CUR_X_RAW | N_CUR_W_RAW | N_PREFETCH_X | N_PREFETCH_W (frags reg_preload only).
         N_ACCS = n_accs
         N_A_FRAGS = wmma_m_rep * k_wmma_steps
         N_B_FRAGS = wmma_n_rep * k_wmma_steps
         # x_raw carry: wmma_m_rep entries per sc (lane16-strided layout).
         N_CUR_X_RAW = scales_per_tile * wmma_m_rep
         N_CUR_W_RAW = scales_per_tile * wmma_n_rep
-        N_PREFETCH_X = N_CUR_X_RAW
         N_PREFETCH_W = N_CUR_W_RAW
-        zero_x_raw = [scale_zero] * N_CUR_X_RAW
         zero_w_raw = [scale_zero] * N_CUR_W_RAW
 
         # Prologue + accs init live inside each variant branch.
@@ -1009,13 +940,17 @@ def compile_gemm_a8w8_blockscale(
                         )
                     for wn in range_constexpr(wmma_n_rep):
                         b_frags.append(
-                            _load_frag(big_b_mem, b_lane_bases[wn] + slot_off_b, ks, cycle_stride_bytes=512, ks_stride_bytes=2048)
+                            _load_frag(
+                                big_b_mem,
+                                b_lane_bases[wn] + slot_off_b,
+                                ks,
+                                cycle_stride_bytes=256,
+                                ks_stride_bytes=2048,
+                            )
                         )
-                    # Pin X-scale ds_read right after K-step 0's frag loads.
+                    # X-scale ds_read after K-step 0's frag loads (unpinned).
                     if const_expr(ks == 0):
-                        rocdl.sched_barrier(0)
                         x_raw = ds_read_x_scales(buffer_idx)
-                        rocdl.sched_barrier(0)
                 return a_frags, b_frags, x_raw
 
             def load_operand_frags(buffer_idx):
@@ -1045,14 +980,58 @@ def compile_gemm_a8w8_blockscale(
                         )
                     for wn in range_constexpr(wmma_n_rep):
                         b_frags.append(
-                            _load_frag(big_b_mem, b_lane_bases[wn] + slot_off_b, ks, cycle_stride_bytes=512, ks_stride_bytes=2048)
+                            _load_frag(
+                                big_b_mem,
+                                b_lane_bases[wn] + slot_off_b,
+                                ks,
+                                cycle_stride_bytes=256,
+                                ks_stride_bytes=2048,
+                            )
                         )
                 return a_frags, b_frags
+
+            def load_a_frags(buffer_idx):
+                # A-only load — exact split of load_operand_frags's A half.
+                if const_expr(isinstance(buffer_idx, int)):
+                    slot_off_a = arith.index(buffer_idx * lds_a_data_bytes)
+                else:
+                    slot_off_a = arith.index_cast(
+                        T.index, arith.muli(buffer_idx, slot_stride_a_i32)
+                    )
+                a_frags = []
+                for ks in range_constexpr(k_wmma_steps):
+                    for wm in range_constexpr(wmma_m_rep):
+                        a_frags.append(
+                            _load_frag(big_a_mem, a_lane_bases[wm] + slot_off_a, ks)
+                        )
+                return a_frags
+
+            def load_b_frags(buffer_idx):
+                # B-only load, split out so the main loop can prefetch B into its own vgprs (double-buffered) at the n+1 tensor_wait.
+                if const_expr(isinstance(buffer_idx, int)):
+                    slot_off_b = arith.index(buffer_idx * lds_b_data_bytes)
+                else:
+                    slot_off_b = arith.index_cast(
+                        T.index, arith.muli(buffer_idx, slot_stride_b_i32)
+                    )
+                b_frags = []
+                for ks in range_constexpr(k_wmma_steps):
+                    for wn in range_constexpr(wmma_n_rep):
+                        b_frags.append(
+                            _load_frag(
+                                big_b_mem,
+                                b_lane_bases[wn] + slot_off_b,
+                                ks,
+                                cycle_stride_bytes=256,
+                                ks_stride_bytes=2048,
+                            )
+                        )
+                return b_frags
 
             def compute_wmma_with_frags_experimental(
                 global_accs, a_frags, b_frags, x_raw, w_raw
             ):
-                """2-deep rolling WMMA/FMA pipeline (experimental variant).
+                """Flat WMMA/FMA (fold-lag removed): issue each WMMA then fold immediately.
 
                 Non-transposed WMMA: ISA operand order (B, A, C). Same WMMA
                 output layout as reg_preload — each lane's vec<8> shares one row,
@@ -1072,9 +1051,7 @@ def compile_gemm_a8w8_blockscale(
                     return issue_wmma_step(sc, wm, wn, a_frags, b_frags)
 
                 def compute_scale(wm, wn, sc_x_base, sc_w_base):
-                    # Local shim for backward-compat with the rolling-pipeline
-                    # body below — note: takes pre-computed sc_x_base / sc_w_base,
-                    # whereas compute_scale_step takes `sc` and computes those.
+                    # Local shim for the rolling-pipeline body below: takes pre-computed sc_x_base/sc_w_base (compute_scale_step takes sc).
                     return arith.mulf(x_raw[sc_x_base + wm], w_raw[sc_w_base + wn])
 
                 def wmma_with_scale(temp, wm, wn, idx, sc_x_base, sc_w_base):
@@ -1085,25 +1062,10 @@ def compile_gemm_a8w8_blockscale(
                     sc_x_base = sc * wmma_m_rep
                     sc_w_base = sc * wmma_n_rep
 
-                    wm0, wn0, idx0 = acc_coords[0]
-                    # rocdl.s_setprio(2)
-                    temp0 = issue_wmma_temp(sc, wm0, wn0)
-                    if const_expr(n_accs > 1):
-                        wm1, wn1, idx1 = acc_coords[1]
-                        temp1 = issue_wmma_temp(sc, wm1, wn1)
-                    # rocdl.s_setprio(0)
-
-                    if const_expr(n_accs == 1):
-                        wmma_with_scale(temp0, wm0, wn0, idx0, sc_x_base, sc_w_base)
-                    else:
-                        for i in range_constexpr(n_accs - wmma_pipeline_depth):
-                            wmma_with_scale(temp0, wm0, wn0, idx0, sc_x_base, sc_w_base)
-                            wm0, wn0, idx0 = wm1, wn1, idx1
-                            temp0 = temp1
-                            wm1, wn1, idx1 = acc_coords[i + wmma_pipeline_depth]
-                            temp1 = issue_wmma_temp(sc, wm1, wn1)
-                        wmma_with_scale(temp0, wm0, wn0, idx0, sc_x_base, sc_w_base)
-                        wmma_with_scale(temp1, wm1, wn1, idx1, sc_x_base, sc_w_base)
+                    # FOLD-LAG REMOVED: issue+fold each WMMA immediately in acc_coords order (no 2-deep pipeline); independent chains let coexec overlap; bit-identical to pipelined.
+                    for wm, wn, idx in acc_coords:
+                        temp = issue_wmma_temp(sc, wm, wn)
+                        wmma_with_scale(temp, wm, wn, idx, sc_x_base, sc_w_base)
 
                 return global_accs
 
@@ -1112,12 +1074,9 @@ def compile_gemm_a8w8_blockscale(
             lo_w = addr_lo_w_init
             lo_x_scale = addr_lo_x_scale_init
 
-            # Boost wave priority for the TDM issue burst to compress wave-dispatch skew.
-            rocdl.s_setprio(2)
-            for i in range_constexpr(prologue_tiles):
+            for i in range_constexpr(num_buffers):
                 lo_x, lo_w = issue_tdm_loads(i, lo_x, lo_w)
                 lo_x_scale = issue_x_scale_tdm(i, lo_x_scale)
-            rocdl.s_setprio(0)
 
             # Bulk W-scale buffer_load deferred to here (after prologue TDM issues).
             bulk_w_cur = _issue_w_chunk_const(0)
@@ -1126,35 +1085,27 @@ def compile_gemm_a8w8_blockscale(
             else:
                 bulk_w_prefetch = bulk_w_cur
 
-            # Single wait: retires tile-0 X+W+S; leaves just-issued tiles pending.
-            tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING_EXPERIMENTAL)
+            # Single wait: retires tile-0; leaves NB-1 tiles pending (NB filled).
+            tdm_ops.tensor_wait(REG_PROLOGUE_WAIT)
             gpu.barrier()
 
-            # Issue ds_loads with X-scale interleaved after K-step 0's frags,
-            # so X-scale is in registers by the time WMMA #1 completes and the
-            # first FMA can fire without a long dscnt drain.
+            # ds_loads with X-scale interleaved after K-step 0's frags, so X-scale is ready when WMMA #1 completes (no long dscnt drain).
             cur_a, cur_b, cur_x_raw = load_operand_frags_with_xscale_interleave(0)
 
-            # sched_barrier pins readlane after wait so vmcnt is near zero.
-            rocdl.sched_barrier(0)
             cur_w_raw = issue_w_raw_scales_for_tile_experimental(0)
             if const_expr(num_k_tiles > 1):
                 prefetch_w_raw = issue_w_raw_scales_for_tile_experimental(1)
             else:
                 prefetch_w_raw = zero_w_raw
 
-            # Accumulator init lives here (just before main-loop entry) so
-            # source order matches execution order. Note: emits no IR by
-            # itself; v_mov_b32 zero-inits are placed lazily by LLVM near
-            # first use (the first FMA in main-loop iter 0).
+            # Accumulator init here (before main-loop entry) for source/execution order; emits no IR (LLVM places v_mov zero-inits lazily near first use).
             accs = [acc_zero] * n_accs
 
             # MAIN LOOP — one K-tile per iter: wmma(cur) → tdm(T+2) → wait(T+1) → ds_read next.
-            main_loop_iters_g = num_k_tiles - (num_buffers - 1)
+            main_loop_iters_g = num_k_tiles - num_buffers
 
-            # Loop-carried indices: load_idx starts at NB-1 (next tile to issue),
-            # compute_idx starts at 0 (next tile to consume from VGPRs).
-            load_idx_init = arith.constant(num_buffers - 1, type=T.i32)
+            # Loop-carried indices: load_idx = next tile to issue, compute_idx = 0 (next tile to consume).
+            load_idx_init = arith.constant(num_buffers, type=T.i32)
             compute_idx_init = arith.constant(0, type=T.i32)
 
             if const_expr(main_loop_iters_g > 0):
@@ -1168,17 +1119,18 @@ def compile_gemm_a8w8_blockscale(
                         cur_chunk_idx_i32,
                     ]
                 init_state = init_state + [
-                    lo_x, lo_w, lo_x_scale,
-                    load_idx_init, compute_idx_init,
+                    lo_x,
+                    lo_w,
+                    lo_x_scale,
+                    load_idx_init,
+                    compute_idx_init,
                 ]
 
                 nb_const_i32 = arith.constant(num_buffers, type=T.i32)
                 one_i32 = arith.constant(1, type=T.i32)
                 two_i32 = arith.constant(2, type=T.i32)
 
-                for tile_step, state in range(
-                    0, main_loop_iters_g, 1, init=init_state
-                ):
+                for tile_step, state in range(0, main_loop_iters_g, 1, init=init_state):
                     _disable_unroll_on_enclosing_loop()
                     cur_compute_idx = state[-1]
                     cur_load_idx = state[-2]
@@ -1193,8 +1145,12 @@ def compile_gemm_a8w8_blockscale(
                     else:
                         _reg_state = state[:-5]
                     (
-                        cur_accs, cur_a, cur_b,
-                        cur_x_raw, cur_w_raw, prefetch_w_raw,
+                        cur_accs,
+                        cur_a,
+                        cur_b,
+                        cur_x_raw,
+                        cur_w_raw,
+                        prefetch_w_raw,
                     ) = _unpack_state_experimental(_reg_state)
 
                     # SSA buf indices for this iteration.
@@ -1207,39 +1163,34 @@ def compile_gemm_a8w8_blockscale(
                         cur_accs, cur_a, cur_b, cur_x_raw, cur_w_raw
                     )
 
-                    # Issue TDMs for tile load_idx.
-                    cur_lo_x, cur_lo_w = issue_tdm_loads(
-                        load_buf_i32, cur_lo_x, cur_lo_w
-                    )
-                    cur_lo_x_scale = issue_x_scale_tdm(
-                        load_buf_i32, cur_lo_x_scale
-                    )
-
                     # Wait for tile compute_idx+1 to land in LDS.
                     tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING_EXPERIMENTAL)
                     gpu.barrier()
 
-                    # Pre-load tile compute_idx+1 into VGPRs.
+                    # Issue TDMs for tile load_idx AFTER the barrier: guarantees all waves finished reading buffer (load_idx % NB) before refill -> WAR-safe at NB-deep fill.
+                    cur_lo_x, cur_lo_w = issue_tdm_loads(
+                        load_buf_i32, cur_lo_x, cur_lo_w
+                    )
+                    cur_lo_x_scale = issue_x_scale_tdm(load_buf_i32, cur_lo_x_scale)
+
+                    # Pre-load tile compute_idx+1 into VGPRs; double-buffer B first (own vgprs) so ds_reads overlap this tile's WMMAs, then A.
+                    next_b = load_b_frags(next_buf_i32)
                     next_x_raw = ds_read_x_scales(next_buf_i32)
-                    next_a, next_b = load_operand_frags(next_buf_i32)
+                    next_a = load_a_frags(next_buf_i32)
 
                     cur_a = next_a
                     cur_b = next_b
                     cur_x_raw = next_x_raw
                     cur_w_raw = prefetch_w_raw
 
-                    # Prefetch W-scale for compute_idx+2 (zero-masked if past
-                    # num_k_tiles).
+                    # Prefetch W-scale for compute_idx+2 (zero-masked if past num_k_tiles).
                     future_tile_i32 = arith.addi(cur_compute_idx, two_i32)
                     future_tile_idx = arith.index_cast(T.index, future_tile_i32)
-                    prefetch_w_raw = (
-                        issue_w_raw_scales_for_future_tile_rt_experimental(
-                            future_tile_idx
-                        )
+                    prefetch_w_raw = issue_w_raw_scales_for_future_tile_rt_experimental(
+                        future_tile_idx
                     )
 
-                    # W-chunk advance: trigger when next_compute_idx crosses
-                    # a 32-K-block boundary.
+                    # W-chunk advance: trigger when next_compute_idx crosses a 32-K-block boundary.
                     if const_expr(USES_W_CHUNK_PREFETCH):
                         next_kb_i32 = arith.muli(
                             next_compute_idx,
@@ -1257,17 +1208,19 @@ def compile_gemm_a8w8_blockscale(
                             need_advance, bulk_w_prefetch, bulk_w_cur
                         )
                         target_chunk_i32 = arith.addi(next_chunk_i32, one_i32)
-                        new_bulk_w_prefetch = _issue_w_chunk_runtime(
-                            target_chunk_i32
-                        )
+                        new_bulk_w_prefetch = _issue_w_chunk_runtime(target_chunk_i32)
                         bulk_w_cur = new_bulk_w_cur
                         bulk_w_prefetch = new_bulk_w_prefetch
                         cur_chunk_idx_i32 = next_chunk_i32
 
                     new_load_idx = arith.addi(cur_load_idx, one_i32)
                     new_state = _pack_state_experimental(
-                        cur_accs, cur_a, cur_b,
-                        cur_x_raw, cur_w_raw, prefetch_w_raw,
+                        cur_accs,
+                        cur_a,
+                        cur_b,
+                        cur_x_raw,
+                        cur_w_raw,
+                        prefetch_w_raw,
                     )
                     if const_expr(USES_W_CHUNK_PREFETCH):
                         new_state = new_state + [
@@ -1276,8 +1229,11 @@ def compile_gemm_a8w8_blockscale(
                             cur_chunk_idx_i32,
                         ]
                     new_state = new_state + [
-                        cur_lo_x, cur_lo_w, cur_lo_x_scale,
-                        new_load_idx, next_compute_idx,
+                        cur_lo_x,
+                        cur_lo_w,
+                        cur_lo_x_scale,
+                        new_load_idx,
+                        next_compute_idx,
                     ]
                     results = yield new_state
 
@@ -1293,51 +1249,55 @@ def compile_gemm_a8w8_blockscale(
                 else:
                     _reg_results = results[:-5]
                 (
-                    accs, cur_a, cur_b,
-                    cur_x_raw, cur_w_raw, prefetch_w_raw,
+                    accs,
+                    cur_a,
+                    cur_b,
+                    cur_x_raw,
+                    cur_w_raw,
+                    prefetch_w_raw,
                 ) = _unpack_state_experimental(_reg_results)
             else:
                 accs = list(accs)
                 # No main loop ran — drain starts at compute_idx = 0.
                 final_compute_idx = arith.constant(0, type=T.i32)
 
-            # EPILOGUE — drain NB-2 iters + final WMMA; Y-store is shared after the manual branch.
+            # EPILOGUE - scf.for drain, small carry (accs + tile idx, frags reloaded fresh); descending tensorcnt via range_constexpr if-ladder; drain_count_d tiles, no new TDMs.
             drain_compute_idx = final_compute_idx
             nb_const_i32_d = arith.constant(num_buffers, type=T.i32)
             one_i32_d = arith.constant(1, type=T.i32)
-            two_i32_d = arith.constant(2, type=T.i32)
-            for drain_i in range_constexpr(drain_iters):
-                outstanding = (num_buffers - 3 - drain_i) * _TDMS_PER_TILE_EXP
+            drain_count_d = (
+                num_buffers if main_loop_iters_g > 0 else min(num_buffers, num_k_tiles)
+            )
+            drain_init = list(accs) + [drain_compute_idx]
+            for _drain_i, dstate in range(0, drain_count_d, 1, init=drain_init):
+                _disable_unroll_on_enclosing_loop()
+                accs_d = list(dstate[:N_ACCS])
+                cur_dci_d = dstate[-1]
+                drain_buf_i32 = arith.remui(cur_dci_d, nb_const_i32_d)
 
-                accs = compute_wmma_with_frags_experimental(
-                    accs, cur_a, cur_b, cur_x_raw, cur_w_raw
-                )
-
-                tdm_ops.tensor_wait(outstanding)
+                # cur tile == num_k_tiles-1-_k  ->  _k later tiles still in flight.
+                for _k in range_constexpr(drain_count_d):
+                    _is_k = arith.cmpi(
+                        arith.CmpIPredicate.eq,
+                        cur_dci_d,
+                        arith.constant(num_k_tiles - 1 - _k, type=T.i32),
+                    )
+                    if _is_k:
+                        tdm_ops.tensor_wait(_k * _TDMS_PER_TILE_EXP)
                 gpu.barrier()
 
-                next_compute_idx = arith.addi(drain_compute_idx, one_i32_d)
-                next_buf_i32 = arith.remui(next_compute_idx, nb_const_i32_d)
-
-                next_x_raw = ds_read_x_scales(next_buf_i32)
-                cur_a, cur_b = load_operand_frags(next_buf_i32)
-                cur_x_raw = next_x_raw
-
-                cur_w_raw = prefetch_w_raw
-                future_tile_i32 = arith.addi(drain_compute_idx, two_i32_d)
-                future_tile_idx = arith.index_cast(T.index, future_tile_i32)
-                prefetch_w_raw = (
-                    issue_w_raw_scales_for_future_tile_rt_experimental(
-                        future_tile_idx
-                    )
+                # Reload this tile's operands FRESH (not carried across the loop).
+                cur_a_d, cur_b_d, cur_x_d = load_operand_frags_with_xscale_interleave(
+                    drain_buf_i32
                 )
-
-                drain_compute_idx = next_compute_idx
-
-            # Final WMMA on the last rotated tile.
-            accs = compute_wmma_with_frags_experimental(
-                accs, cur_a, cur_b, cur_x_raw, cur_w_raw
-            )
+                cur_w_d = issue_w_raw_scales_for_future_tile_rt_experimental(
+                    arith.index_cast(T.index, cur_dci_d)
+                )
+                accs_d = compute_wmma_with_frags_experimental(
+                    accs_d, cur_a_d, cur_b_d, cur_x_d, cur_w_d
+                )
+                dresults = yield list(accs_d) + [arith.addi(cur_dci_d, one_i32_d)]
+            accs = list(dresults[:N_ACCS])
 
         elif const_expr(variant == "manual"):
             # ───── manual-only helpers ─────
@@ -1448,7 +1408,13 @@ def compile_gemm_a8w8_blockscale(
                         )
                     for wn in range_constexpr(wmma_n_rep):
                         b_frags.append(
-                            _load_frag(big_b_mem, b_lane_bases[wn] + slot_off_b, ks, cycle_stride_bytes=512, ks_stride_bytes=2048)
+                            _load_frag(
+                                big_b_mem,
+                                b_lane_bases[wn] + slot_off_b,
+                                ks,
+                                cycle_stride_bytes=256,
+                                ks_stride_bytes=2048,
+                            )
                         )
                     # Pin X-scale ds_read right after K-step 0's frag loads.
                     if const_expr(ks == 0):
@@ -1471,7 +1437,9 @@ def compile_gemm_a8w8_blockscale(
                     # Block 2: all FMAs (scale apply) for this scale block.
                     for i, (wm, wn, idx) in enumerate(acc_coords):
                         scale = compute_scale_step(sc, wm, wn, x_raw, w_raw)
-                        global_accs[idx] = apply_scale(temps[i], scale, global_accs[idx])
+                        global_accs[idx] = apply_scale(
+                            temps[i], scale, global_accs[idx]
+                        )
 
                     rocdl.sched_barrier(0)
 
@@ -1499,7 +1467,13 @@ def compile_gemm_a8w8_blockscale(
                 for ks in range_constexpr(k_wmma_steps):
                     for wn in range_constexpr(wmma_n_rep):
                         b_frags.append(
-                            _load_frag(big_b_mem, b_lane_bases[wn] + slot_off_b, ks, cycle_stride_bytes=512, ks_stride_bytes=2048)
+                            _load_frag(
+                                big_b_mem,
+                                b_lane_bases[wn] + slot_off_b,
+                                ks,
+                                cycle_stride_bytes=256,
+                                ks_stride_bytes=2048,
+                            )
                         )
                 return a_frags, b_frags
 
@@ -1519,13 +1493,16 @@ def compile_gemm_a8w8_blockscale(
                 prefetch_xs_at = max(0, wmma_n_rep - 2)
 
                 slot_off_a = arith.index_cast(
-                    T.index, arith.muli(cur_buf_i32_, slot_stride_a_i32),
+                    T.index,
+                    arith.muli(cur_buf_i32_, slot_stride_a_i32),
                 )
                 slot_off_b = arith.index_cast(
-                    T.index, arith.muli(cur_buf_i32_, slot_stride_b_i32),
+                    T.index,
+                    arith.muli(cur_buf_i32_, slot_stride_b_i32),
                 )
                 slot_off_xs = arith.index_cast(
-                    T.index, arith.muli(cur_buf_i32_, slot_stride_x_scale_i32),
+                    T.index,
+                    arith.muli(cur_buf_i32_, slot_stride_x_scale_i32),
                 )
 
                 def _load_a(wm, sc):
@@ -1533,8 +1510,11 @@ def compile_gemm_a8w8_blockscale(
 
                 def _load_b(wn, sc):
                     return _load_frag(
-                        big_b_mem, b_lane_bases[wn] + slot_off_b, ks=sc,
-                        cycle_stride_bytes=512, ks_stride_bytes=2048,
+                        big_b_mem,
+                        b_lane_bases[wn] + slot_off_b,
+                        ks=sc,
+                        cycle_stride_bytes=256,
+                        ks_stride_bytes=2048,
                     )
 
                 def _load_xs(wm, sc):
@@ -1567,7 +1547,9 @@ def compile_gemm_a8w8_blockscale(
                     temps = [None] * wmma_n_rep
                     for n in range_constexpr(wmma_n_rep):
                         if const_expr(n < second_half):
-                            b_frags[bootstrap_half + n] = _load_b(bootstrap_half + n, sc)
+                            b_frags[bootstrap_half + n] = _load_b(
+                                bootstrap_half + n, sc
+                            )
                         temps[n] = rocdl.wmma_f32_16x16x128_fp8_fp8(
                             T.vec(8, T.f32), b_frags[n], a_cur, acc_zero
                         ).result
@@ -1582,7 +1564,9 @@ def compile_gemm_a8w8_blockscale(
                             if const_expr(n == prefetch_xs_at):
                                 xs_next = _load_xs(1, sc)
                         idx = 0 * wmma_n_rep + n
-                        cur_accs_[idx] = math_dialect.fma(temps[n], s_cur, cur_accs_[idx])
+                        cur_accs_[idx] = math_dialect.fma(
+                            temps[n], s_cur, cur_accs_[idx]
+                        )
 
                     rocdl.sched_barrier(0)
 
@@ -1610,7 +1594,9 @@ def compile_gemm_a8w8_blockscale(
                                 if const_expr(n == prefetch_xs_at):
                                     xs_next = _load_xs(m + 1, sc)
                             idx = m * wmma_n_rep + n
-                            cur_accs_[idx] = math_dialect.fma(temps[n], s_cur, cur_accs_[idx])
+                            cur_accs_[idx] = math_dialect.fma(
+                                temps[n], s_cur, cur_accs_[idx]
+                            )
 
                         rocdl.sched_barrier(0)
 
@@ -1631,21 +1617,31 @@ def compile_gemm_a8w8_blockscale(
                 lo_x_scale = issue_x_scale_tdm(i, lo_x_scale)
             rocdl.s_setprio(0)
 
-            #W scales
+            # W scales
             bulk_w_cur = _issue_w_chunk_const(0)
             if const_expr(USES_W_CHUNK_PREFETCH):
                 bulk_w_prefetch = _issue_w_chunk_const(1)
             else:
                 bulk_w_prefetch = bulk_w_cur
 
-            nb_const_i32     = arith.constant(num_buffers, type=T.i32)         # ring-buffer modulus for buf_idx = idx % NB
-            one_i32          = arith.constant(1, type=T.i32)                   # increment for compute_idx each iter
-            two_i32          = arith.constant(2, type=T.i32)                   # offset for "future tile" W-scale prefetch (compute_idx + 2)
-            load_idx_init    = arith.constant(num_buffers - 1, type=T.i32)     # first tile to TDM-issue in main loop (= prologue's last + 1)
-            compute_idx_init = arith.constant(0, type=T.i32)                   # first tile to compute (= the one tensor_wait just retired)
-            accs = [acc_zero] * n_accs                                         # n_accs vec<8xf32> output accumulators, one per (wm, wn) cell
-
-
+            nb_const_i32 = arith.constant(
+                num_buffers, type=T.i32
+            )  # ring-buffer modulus for buf_idx = idx % NB
+            one_i32 = arith.constant(
+                1, type=T.i32
+            )  # increment for compute_idx each iter
+            two_i32 = arith.constant(
+                2, type=T.i32
+            )  # offset for "future tile" W-scale prefetch (compute_idx + 2)
+            load_idx_init = arith.constant(
+                num_buffers - 1, type=T.i32
+            )  # first tile to TDM-issue in main loop (= prologue's last + 1)
+            compute_idx_init = arith.constant(
+                0, type=T.i32
+            )  # first tile to compute (= the one tensor_wait just retired)
+            accs = [
+                acc_zero
+            ] * n_accs  # n_accs vec<8xf32> output accumulators, one per (wm, wn) cell
 
             # MAIN LOOP — 1 K-tile per iter, wave-by-wave compute.
             main_loop_iters_g = num_k_tiles - (num_buffers - 1)
@@ -1655,56 +1651,54 @@ def compile_gemm_a8w8_blockscale(
                 init_state = list(accs)
                 if const_expr(USES_W_CHUNK_PREFETCH):
                     init_state = init_state + [
-                        bulk_w_cur, bulk_w_prefetch, cur_chunk_idx_i32,
+                        bulk_w_cur,
+                        bulk_w_prefetch,
+                        cur_chunk_idx_i32,
                     ]
                 init_state = init_state + [
-                    lo_x, lo_w, lo_x_scale,
-                    load_idx_init, compute_idx_init,
+                    lo_x,
+                    lo_w,
+                    lo_x_scale,
+                    load_idx_init,
+                    compute_idx_init,
                 ]
 
-                for tile_step, state in range(
-                    0, main_loop_iters_g, 1, init=init_state
-                ):
+                for tile_step, state in range(0, main_loop_iters_g, 1, init=init_state):
                     _disable_unroll_on_enclosing_loop()
 
                     # Unpack loop-carried state.
-                    cur_compute_idx  = state[-1]
-                    cur_load_idx     = state[-2]
-                    cur_lo_x_scale   = state[-3]
-                    cur_lo_w         = state[-4]
-                    cur_lo_x         = state[-5]
+                    cur_compute_idx = state[-1]
+                    cur_load_idx = state[-2]
+                    cur_lo_x_scale = state[-3]
+                    cur_lo_w = state[-4]
+                    cur_lo_x = state[-5]
                     if const_expr(USES_W_CHUNK_PREFETCH):
                         cur_chunk_idx_i32 = state[-6]
-                        bulk_w_prefetch   = state[-7]
-                        bulk_w_cur        = state[-8]
-                        cur_accs          = list(state[:-8])
+                        bulk_w_prefetch = state[-7]
+                        bulk_w_cur = state[-8]
+                        cur_accs = list(state[:-8])
                     else:
-                        cur_accs          = list(state[:-5])
+                        cur_accs = list(state[:-5])
 
                     # Ring-buffer SSA indices for this iter.
-                    load_buf_i32      = arith.remui(cur_load_idx, nb_const_i32)
-                    next_compute_idx  = arith.addi(cur_compute_idx, one_i32)
-                    next_buf_i32      = arith.remui(next_compute_idx, nb_const_i32)
+                    load_buf_i32 = arith.remui(cur_load_idx, nb_const_i32)
+                    next_compute_idx = arith.addi(cur_compute_idx, one_i32)
+                    next_buf_i32 = arith.remui(next_compute_idx, nb_const_i32)
 
-                    # Wait drains tile T (this iter's compute target) into LDS.
-                    # Before wait: NB-1 tiles in flight. After: NB-2 tiles in flight.
+                    # Wait drains tile T into LDS (before: NB-1 tiles in flight, after: NB-2).
                     tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING_EXPERIMENTAL)
                     gpu.barrier()
 
-                    # Issue TDMs for tile T+2 AFTER the wait (so they don't
-                    # interfere with the wait's per-tile retirement).
+                    # Issue TDMs for tile T+2 AFTER the wait (avoid interfering with per-tile retirement).
                     cur_lo_x, cur_lo_w = issue_tdm_loads(
                         load_buf_i32, cur_lo_x, cur_lo_w
                     )
-                    cur_lo_x_scale = issue_x_scale_tdm(
-                        load_buf_i32, cur_lo_x_scale
-                    )
+                    cur_lo_x_scale = issue_x_scale_tdm(load_buf_i32, cur_lo_x_scale)
 
                     # Current tile's LDS slot (retired by the wait above).
                     cur_buf_i32 = arith.remui(cur_compute_idx, nb_const_i32)
 
-                    # Extract this tile's wave-uniform W-scales via readlane
-                    # (one per scale-block within the K-tile).
+                    # Extract this tile's wave-uniform W-scales via readlane (one per scale-block in the K-tile).
                     kb_T_i32 = arith.muli(
                         cur_compute_idx,
                         arith.constant(scales_per_tile, type=T.i32),
@@ -1737,9 +1731,7 @@ def compile_gemm_a8w8_blockscale(
                             need_advance, bulk_w_prefetch, bulk_w_cur
                         )
                         target_chunk_i32 = arith.addi(next_chunk_i32, one_i32)
-                        new_bulk_w_prefetch = _issue_w_chunk_runtime(
-                            target_chunk_i32
-                        )
+                        new_bulk_w_prefetch = _issue_w_chunk_runtime(target_chunk_i32)
                         bulk_w_cur = new_bulk_w_cur
                         bulk_w_prefetch = new_bulk_w_prefetch
                         cur_chunk_idx_i32 = next_chunk_i32
@@ -1749,11 +1741,16 @@ def compile_gemm_a8w8_blockscale(
                     new_state = list(cur_accs)
                     if const_expr(USES_W_CHUNK_PREFETCH):
                         new_state = new_state + [
-                            bulk_w_cur, bulk_w_prefetch, cur_chunk_idx_i32,
+                            bulk_w_cur,
+                            bulk_w_prefetch,
+                            cur_chunk_idx_i32,
                         ]
                     new_state = new_state + [
-                        cur_lo_x, cur_lo_w, cur_lo_x_scale,
-                        new_load_idx, next_compute_idx,
+                        cur_lo_x,
+                        cur_lo_w,
+                        cur_lo_x_scale,
+                        new_load_idx,
+                        next_compute_idx,
                     ]
                     results = yield new_state
 
@@ -1818,11 +1815,8 @@ def compile_gemm_a8w8_blockscale(
                         need_advance_d, bulk_w_prefetch, bulk_w_cur
                     )
                     target_chunk_i32_d = arith.addi(next_chunk_i32_d, one_i32_d)
-                    # Issue next chunk prefetch only if not on last drain iter
-                    # (no further compute will consume it, but harmless cache load).
-                    new_bulk_w_prefetch_d = _issue_w_chunk_runtime(
-                        target_chunk_i32_d
-                    )
+                    # Issue next-chunk prefetch only if not the last drain iter (harmless cache load otherwise).
+                    new_bulk_w_prefetch_d = _issue_w_chunk_runtime(target_chunk_i32_d)
                     bulk_w_cur = new_bulk_w_cur_d
                     bulk_w_prefetch = new_bulk_w_prefetch_d
                     cur_chunk_idx_i32 = next_chunk_i32_d
@@ -2052,12 +2046,9 @@ def gemm_a8w8_blockscale(
     """
     assert x.ndim == 2 and w.ndim == 2, "X and W must be 2D"
     M, K = x.shape
-    if getattr(w, "is_shuffled", False):
-        # Preshuffled W: shape is (N // 16, K * 16). Recover logical (N, K).
-        N = w.shape[0] * 16
-        K_w = w.shape[1] // 16
-    else:
-        N, K_w = w.shape
+    # W is always preshuffled to (N//16, K*16) for the gfx1250 fragment path; recover logical (N, K) from that shape.
+    N = w.shape[0] * 16
+    K_w = w.shape[1] // 16
     assert K == K_w, f"K mismatch: X has {K}, W has {K_w}"
 
     assert x_scale.ndim == 2 and w_scale.ndim == 2, "scales must be 2D"
@@ -2088,22 +2079,13 @@ def gemm_a8w8_blockscale(
 
     K_padded = ((K + tile_k - 1) // tile_k) * tile_k
     if K_padded != K:
-        assert not getattr(w, "is_shuffled", False), (
+        # W is always preshuffled; a preshuffled buffer can't be K-padded here (pad before the shuffle).
+        raise ValueError(
             "K padding is not supported for preshuffled W; pass K that is a "
             "multiple of tile_k or shuffle the padded W."
         )
-        pad_size = K_padded - K
-        x = torch.nn.functional.pad(x, (0, pad_size))
-        w = torch.nn.functional.pad(w, (0, pad_size))
-        new_scale_k = K_padded // scale_block_k_derived
-        scale_pad = new_scale_k - scale_k
-        if scale_pad > 0:
-            x_scale = torch.nn.functional.pad(x_scale, (0, scale_pad))
-            w_scale = torch.nn.functional.pad(w_scale, (0, scale_pad))
-        K = K_padded
 
-    # Pad N up to tile_n so the kernel's WMMAs and stores land inside
-    # the allocated output
+    # Pad N up to tile_n so the kernel's WMMAs and stores land inside the allocated output.
     N_stride = ((N + tile_n - 1) // tile_n) * tile_n
 
     if y is not None:

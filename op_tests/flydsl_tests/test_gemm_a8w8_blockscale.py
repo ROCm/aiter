@@ -9,7 +9,7 @@ import os
 import pytest
 import torch
 
-from aiter.ops.shuffle import preshuffle_fp8_weights_gfx1250
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 SCALE_BLOCK_N = 128
 SCALE_BLOCK_K = 128
@@ -58,7 +58,14 @@ def _load_kernel():
     return mod.gemm_a8w8_blockscale
 
 
-gemm_a8w8_blockscale = _load_kernel()
+_raw_gemm_a8w8_blockscale = _load_kernel()
+
+
+def gemm_a8w8_blockscale(*args, **kwargs):
+    # Unit-test default: 3 buffers (manual variant requires >=3). An explicit
+    # num_buffers in a test (e.g. the num_buffers sweep) still overrides this.
+    kwargs.setdefault("num_buffers", 3)
+    return _raw_gemm_a8w8_blockscale(*args, **kwargs)
 
 
 def _check_gfx1250():
@@ -67,7 +74,7 @@ def _check_gfx1250():
         pytest.skip(f"gemm_a8w8_blockscale requires gfx1250, got {arch}")
 
 
-def _check_shape_compat(M, N, K, tile_k=128, num_buffers=2):
+def _check_shape_compat(M, N, K, tile_k=128, num_buffers=3):
     """Kernel requires num_k_tiles >= num_buffers - 1."""
     _ = M
     _ = N
@@ -183,7 +190,7 @@ def test_gemm_a8w8_blockscale_basic(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=dtype)
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
@@ -197,7 +204,7 @@ def test_gemm_a8w8_blockscale_num_buffers(M, N, K, num_buffers):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -218,7 +225,7 @@ def test_gemm_a8w8_blockscale_dtype(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=dtype)
 
     rtol = 1e-3 if dtype == torch.float32 else 1e-2
@@ -235,7 +242,7 @@ def test_gemm_a8w8_blockscale_preallocated_output(M, N, K):
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
 
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16, y=y)
     assert out.data_ptr() == y.data_ptr(), "Output should reuse pre-allocated y"
@@ -259,7 +266,7 @@ def test_gemm_a8w8_blockscale_scales_per_tile(M, N, K):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -279,7 +286,7 @@ def test_gemm_a8w8_blockscale_large(M, N, K):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16)
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
@@ -293,7 +300,7 @@ def test_gemm_a8w8_blockscale_tdm_store_basic(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -314,7 +321,7 @@ def test_gemm_a8w8_blockscale_tdm_store_dtype(M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -338,7 +345,7 @@ def test_gemm_a8w8_blockscale_tdm_store_num_buffers(M, N, K, num_buffers):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -360,7 +367,7 @@ def test_gemm_a8w8_blockscale_tdm_store_preallocated_output(M, N, K):
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
 
     out = gemm_a8w8_blockscale(
         x,
@@ -407,7 +414,7 @@ def test_gemm_a8w8_blockscale_experimental_basic(variant, M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -429,7 +436,7 @@ def test_gemm_a8w8_blockscale_experimental_num_buffers(variant, M, N, K, num_buf
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -452,7 +459,7 @@ def test_gemm_a8w8_blockscale_experimental_tdm_store(variant, M, N, K, dtype):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -481,7 +488,7 @@ def test_gemm_a8w8_blockscale_experimental_scales_per_tile(variant, M, N, K):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -510,7 +517,7 @@ def test_gemm_a8w8_blockscale_experimental_multi_chunk(variant, M, N, K):
 
     x, w, x_scale, w_scale = _generate_inputs(M, N, K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
@@ -559,7 +566,7 @@ if __name__ == "__main__":
 
     x, w, x_scale, w_scale = _generate_inputs(args.M, args.N, args.K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = preshuffle_fp8_weights_gfx1250(w)
+    w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(
         x,
         w,
