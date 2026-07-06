@@ -221,7 +221,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 117  # HIP-aligned pipeline: prologue w/k load + GEMM1-interleaved prefetch + GEMM2-end LDS write
+    _K5_KERNEL_REVISION = 118  # u/g prefetch before GEMM1 (full MFMA chain hides HBM latency)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -657,7 +657,45 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 next_chunk_end, T_local
             ) - fx.Int32(1)
 
+            # >>> PREFETCH u + g BEFORE GEMM1: issue all HBM loads for u
+            # (N_REPEAT × 4 ushort) and g (4 rows + 1 g_last = 5 dword) now,
+            # so the full 64-MFMA GEMM1 chain hides their HBM latency.
+            # Without this, LLVM hoists the loads into the GEMM1 middle where
+            # only ~2 MFMA can hide them → 4.2M cycle vmcnt stall (39% of stalls).
+            u_prefetch = []  # N_REPEAT × 4 bf16 scalars
+            for idx in range_constexpr(N_REPEAT):
+                u_col_pf = i_v * fx.Int32(BV) + fx.Int32(idx * 16) + lane_n
+                for elem_i in range_constexpr(4):
+                    u_bt_row_raw = (
+                        i_t_i32 * fx.Int32(BT)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    safe_u_row = (u_bt_row_raw < T_local).select(
+                        u_bt_row_raw, fx.Int32(0)
+                    )
+                    u_off = v_base + safe_u_row * stride_v + u_col_pf
+                    u_prefetch.append(v_[fx.Index(u_off)])
+
+            if const_expr(USE_G):
+                g_last = g_[fx.Index(i_h * T_flat + (bos + last_idx_raw))]
+                g_row_pf = []
+                for elem_i in range_constexpr(4):
+                    abs_row = (
+                        i_t_i32 * fx.Int32(BT)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    in_bounds = abs_row < T_local
+                    safe_row = in_bounds.select(abs_row, fx.Int32(0))
+                    g_row_pf.append(
+                        (g_[fx.Index(i_h * T_flat + (bos + safe_row))], in_bounds)
+                    )
+
             # -- GEMM1: b_v = w @ h_state, with w_next prefetch interleaved.
+            # u/g/w_next loads are all in flight; 64 MFMA hide HBM latency.
             bv_accs = []
             for _i in range_constexpr(N_REPEAT):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
@@ -688,7 +726,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_hi, b_frag_hi, bv_accs[nr])
 
             # >>> PREFETCH w_next: HBM loads for next chunk (HIP .cu:670-672).
-            # Always issued with safe addresses; LDS write is conditional at GEMM2 end.
             next_i_t = i_t_i32 + fx.Int32(1)
             w_next_vecs = []
             w_next_swz = []
@@ -702,7 +739,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     w_next_vecs.append(w_.vec_load((fx.Index(w_g_off_next),), LOAD_VEC_WIDTH))
                     w_next_swz.append(wp_pb_next + _w_panel_swz_elems(row, load_col_base))
 
-            # GEMM1 remaining K-blocks -- MFMA hides w prefetch HBM latency.
+            # GEMM1 remaining K-blocks -- MFMA hides u/g/w_next HBM latency.
             for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
                     wp_pbase = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
@@ -727,67 +764,35 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_lo, b_frag_lo, bv_accs[nr])
                         bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_hi, b_frag_hi, bv_accs[nr])
 
-            # WAR barrier: gated_v aliases h_state_panel1, so all warps must
-            # finish reading the h_state panels in GEMM1 above before any warp
-            # overwrites panel1 with gated_v here (mirrors HIP's __syncthreads
-            # between run_gemm1 accum and the gated_v store, .cu:692).
+            # WAR barrier (.cu:692).
             gpu.barrier()
 
-            # -- 4. FUSED v_new + gating + gated_v store (HIP-aligned).
-            # HIP fuses g_scale computation, u load, v_new = u - bv, v_new
-            # scalar store, gated_v = v_new * g_scale, and gated_v LDS store
-            # into a single pass over bv tiles (run_gemm1_fulltile_bvp:694-724).
-            # This avoids keeping vn_frags alive across multiple phases, which
-            # reduces register pressure vs the previous 4-phase separation.
-
-            # Pre-compute g_last and per-row gate vector (before the bv loop).
+            # -- FUSED v_new + gating + gated_v store --
+            # Consume prefetched u/g (already in VGPRs from before GEMM1).
             if const_expr(USE_G):
-                g_last = g_[fx.Index(i_h * T_flat + (bos + last_idx_raw))]
                 exp_g_last = _fast_exp(g_last)
-
                 gate_elems = []
                 for elem_i in range_constexpr(4):
-                    abs_row = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    in_bounds = abs_row < T_local
-                    safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                    g_row = g_[fx.Index(i_h * T_flat + (bos + safe_row))]
-                    gate = _fast_exp(g_last - g_row)
+                    g_row_val, in_bounds = g_row_pf[elem_i]
+                    gate = _fast_exp(g_last - g_row_val)
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = vector.from_elements(T.f32x4, gate_elems)
 
-            # Closure wrapper to hide ``vn_`` from FlyDSL ast rewriter.
             if const_expr(SAVE_NEW_VALUE):
                 def _emit_vn_store(off, value):
                     vn_[fx.Index(off)] = value
 
-            # Fused per-bv-tile loop: u load -> vn -> v_new store -> gate -> gated_v store.
             for idx in range_constexpr(N_REPEAT):
                 bv_val = bv_accs[idx]
                 u_col = i_v * fx.Int32(BV) + fx.Int32(idx * 16) + lane_n
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    u_bt_row_raw = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    safe_u_row = (u_bt_row_raw < T_local).select(
-                        u_bt_row_raw, fx.Int32(0)
-                    )
-                    u_off = v_base + safe_u_row * stride_v + u_col
-                    u_raw = v_[fx.Index(u_off)]
+                    u_raw = u_prefetch[idx * 4 + elem_i]
                     u_bf16 = fx.BFloat16(u_raw)
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
                 vn_val = u_f32 - bv_val
 
-                # Store v_new (pre-gating) for output.
                 if const_expr(SAVE_NEW_VALUE):
                     vn_bf16 = fx.Vector(
                         _f32x4_to_bf16x4_rne(vn_val), (4,), fx.BFloat16
@@ -805,7 +810,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             vn_off = vn_base + vn_bt_row * fx.Int32(V) + u_col
                             _emit_vn_store(vn_off, bf16_v)
 
-                # Apply gating + store gated_v to shared2 panel (fused).
                 if const_expr(USE_G):
                     gated_val = vn_val * gate_vec
                 else:
