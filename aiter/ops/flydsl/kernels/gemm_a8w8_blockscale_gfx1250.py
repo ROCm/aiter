@@ -366,8 +366,11 @@ def compile_gemm_a8w8_blockscale(
 
     # 3 TDMs per tile (X + W + X-scale) for both surviving variants.
     _TDMS_PER_TILE_EXP = 3
-    MAIN_TDM_OUTSTANDING_EXPERIMENTAL = (num_buffers - 2) * _TDMS_PER_TILE_EXP
-    # fills-NB (WAR-safe): prologue fills all NB buffers (wait leaves NB-1); main loop issues TDM after the barrier so refill is read-safe. reg_preload-only.
+    # EXPERIMENT: main loop issues the TDM BEFORE the wait (fuller memory pipe: keeps
+    # NB-1 tiles in flight across the barrier instead of dipping to NB-2). The wait now
+    # sees the just-issued tile -> target is (NB-1)*3, matching the prologue. This
+    # re-exposes the WAR (the TDM refill precedes the barrier) -- see the main-loop note.
+    MAIN_TDM_OUTSTANDING_EXPERIMENTAL = (num_buffers - 1) * _TDMS_PER_TILE_EXP
     REG_PROLOGUE_WAIT = (num_buffers - 1) * _TDMS_PER_TILE_EXP
 
     @flyc.kernel
@@ -1163,15 +1166,22 @@ def compile_gemm_a8w8_blockscale(
                         cur_accs, cur_a, cur_b, cur_x_raw, cur_w_raw
                     )
 
-                    # Wait for tile compute_idx+1 to land in LDS.
-                    tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING_EXPERIMENTAL)
+                    # WAR wall: barrier BEFORE the TDMs, so every wave finished reading
+                    # buffer (load_idx % NB) (its previous-iter ds_read) before this refill.
                     gpu.barrier()
 
-                    # Issue TDMs for tile load_idx AFTER the barrier: guarantees all waves finished reading buffer (load_idx % NB) before refill -> WAR-safe at NB-deep fill.
+                    # Issue TDMs for tile load_idx BEFORE the wait: keeps NB-1 tiles in
+                    # flight across the SECOND barrier (vs dipping to NB-2) -> fuller
+                    # memory pipe for the mb case. WAR-safe now via the barrier above
+                    # (two barriers/iter: one guards the refill, one guards the ds_read).
                     cur_lo_x, cur_lo_w = issue_tdm_loads(
                         load_buf_i32, cur_lo_x, cur_lo_w
                     )
                     cur_lo_x_scale = issue_x_scale_tdm(load_buf_i32, cur_lo_x_scale)
+
+                    # Wait for tile compute_idx+1 to land in LDS.
+                    tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING_EXPERIMENTAL)
+                    gpu.barrier()
 
                     # Pre-load tile compute_idx+1 into VGPRs; double-buffer B first (own vgprs) so ds_reads overlap this tile's WMMAs, then A.
                     next_b = load_b_frags(next_buf_i32)
