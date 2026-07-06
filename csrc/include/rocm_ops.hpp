@@ -1653,67 +1653,6 @@ namespace py = pybind11;
           py::arg("handles"));                                                             \
     m.def("qr_max_size", &aiter::qr_max_size);
 
-#define RMSNORM_PYBIND                                                                             \
-    m.def("rms_norm_cu",                                                                           \
-          &rms_norm,                                                                               \
-          "Apply Root Mean Square (RMS) Normalization to the input tensor.");                      \
-    m.def(                                                                                         \
-        "fused_add_rms_norm_cu", &fused_add_rms_norm, "In-place fused Add and RMS Normalization"); \
-    m.def("rmsnorm2d_fwd",                                                                         \
-          &rmsnorm2d,                                                                              \
-          py::arg("input"),                                                                        \
-          py::arg("weight"),                                                                       \
-          py::arg("epsilon"),                                                                      \
-          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_add",                                                                \
-          &rmsnorm2d_with_add,                                                                     \
-          py::arg("out"),                                                                          \
-          py::arg("input"),                                                                        \
-          py::arg("residual_in"),                                                                  \
-          py::arg("residual_out"),                                                                 \
-          py::arg("weight"),                                                                       \
-          py::arg("epsilon"),                                                                      \
-          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_smoothquant",                                                        \
-          &rmsnorm2d_with_smoothquant,                                                             \
-          py::arg("out"),                                                                          \
-          py::arg("input"),                                                                        \
-          py::arg("xscale"),                                                                       \
-          py::arg("yscale"),                                                                       \
-          py::arg("weight"),                                                                       \
-          py::arg("epsilon"),                                                                      \
-          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_add_smoothquant",                                                    \
-          &rmsnorm2d_with_add_smoothquant,                                                         \
-          py::arg("out"),                                                                          \
-          py::arg("input"),                                                                        \
-          py::arg("residual_in"),                                                                  \
-          py::arg("residual_out"),                                                                 \
-          py::arg("xscale"),                                                                       \
-          py::arg("yscale"),                                                                       \
-          py::arg("weight"),                                                                       \
-          py::arg("epsilon"),                                                                      \
-          py::arg("out_before_quant")            = std::nullopt,                                   \
-          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_dynamicquant",                                                       \
-          &rmsnorm2d_with_dynamicquant,                                                            \
-          py::arg("out"),                                                                          \
-          py::arg("input"),                                                                        \
-          py::arg("yscale"),                                                                       \
-          py::arg("weight"),                                                                       \
-          py::arg("epsilon"),                                                                      \
-          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_add_dynamicquant",                                                   \
-          &rmsnorm2d_with_add_dynamicquant,                                                        \
-          py::arg("out"),                                                                          \
-          py::arg("input"),                                                                        \
-          py::arg("residual_in"),                                                                  \
-          py::arg("residual_out"),                                                                 \
-          py::arg("yscale"),                                                                       \
-          py::arg("weight"),                                                                       \
-          py::arg("epsilon"),                                                                      \
-          py::arg("use_model_sensitive_rmsnorm") = 0);
-
 #define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
 #define ROPE_2C_UNCACHED_FWD_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
 #define ROPE_1C_CACHED_FWD_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
