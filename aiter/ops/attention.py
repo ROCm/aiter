@@ -1236,6 +1236,7 @@ def get_mla_metadata_v1(
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
     is_cp_round_robin: bool = False,
+    reduce_max_split: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Inputs:
@@ -1279,6 +1280,13 @@ def get_mla_metadata_v1(
                                                     The final output location of each group of tiles.
         [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
                                                     reduced.
+    Optional in-place output:
+        reduce_max_split: (1,) int32, optional. When provided (fast_mode only), receives
+            max over active tiles of the per-tile split count, i.e.
+            max_t(reduce_indptr[t+1]-reduce_indptr[t]). Pre-zeroed and filled via atomicMax
+            inside the metadata kernel, so callers can size/gate the split-K reduce on the
+            true per-tile split count without a separate device reduction. Left untouched
+            (stays 0 if passed as zeros) on non-fast_mode paths.
     """
     ...
 

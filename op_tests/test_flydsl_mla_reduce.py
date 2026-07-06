@@ -1016,3 +1016,142 @@ def test_flydsl_mla_reduce_degenerate_empty_tile(num_tiles):
     torch.cuda.synchronize()
     assert torch.equal(fout, expected_out)
     assert torch.equal(flse, expected_lse)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: get_mla_metadata_v1 emits reduce_max_split; it must equal the CSR
+# max tile width and drive the split-K gate end to end (no host CSR reduction).
+# ---------------------------------------------------------------------------
+
+_META_NHEAD = 16  # MLA min heads
+_META_NHEAD_KV = 1
+_META_PAGE_SIZE = 1
+_META_KV_GRAN = 16
+_META_MAX_SPLIT_PER_BATCH = 16
+_META_FIELDS = (
+    "work_meta_data",
+    "work_indptr",
+    "work_info_set",
+    "reduce_indptr",
+    "reduce_final_map",
+    "reduce_partial_map",
+)
+
+
+def _metadata_emit(batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_PER_BATCH):
+    """Run get_mla_metadata_v1 for a uniform decode shape, returning the emitted
+    reduce_max_split scalar (int) alongside its reduce_indptr CSR."""
+    import os
+
+    import aiter
+
+    os.environ["AITER_MLA_META_USE_PARALLEL"] = "1" if parallel else "0"
+    qo = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    kv = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+    kv[1:] = torch.full((batch,), ctx, dtype=torch.int32, device="cuda").cumsum(0)
+    klp = torch.ones(batch, dtype=torch.int32, device="cuda")
+    sizes = aiter.get_mla_metadata_info_v1(
+        batch, 1, _META_NHEAD, torch.bfloat16, torch.bfloat16,
+        is_sparse=False, fast_mode=True,
+    )
+    outs = {
+        name: torch.empty(sz, dtype=t, device="cuda")
+        for name, (sz, t) in zip(_META_FIELDS, sizes)
+    }
+    rms = torch.zeros(1, dtype=torch.int32, device="cuda")
+    aiter.get_mla_metadata_v1(
+        qo, kv, klp,
+        _META_NHEAD // _META_NHEAD_KV, _META_NHEAD_KV, True,
+        outs["work_meta_data"], outs["work_info_set"], outs["work_indptr"],
+        outs["reduce_indptr"], outs["reduce_final_map"], outs["reduce_partial_map"],
+        page_size=_META_PAGE_SIZE, kv_granularity=_META_KV_GRAN,
+        max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        dtype_q=torch.bfloat16, dtype_kv=torch.bfloat16,
+        reduce_max_split=rms,
+    )
+    torch.cuda.synchronize()
+    return int(rms.item()), outs["reduce_indptr"]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+@pytest.mark.parametrize(
+    "batch,ctx",
+    [(128, 2048), (64, 512), (8, 8192), (1, 32768), (1, 1)],
+    ids=["b128c2k", "b64c512", "b8c8k", "b1c32k", "b1c1"],
+)
+def test_metadata_emits_reduce_max_split_matches_csr(parallel, batch, ctx):
+    """The emitted scalar equals max_t(reduce_indptr[t+1]-reduce_indptr[t]) for
+    both planner variants -- i.e. what derive_actual_max_splits would compute."""
+    _require_cuda()
+    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
+
+    emitted, reduce_indptr = _metadata_emit(batch, ctx, parallel=parallel)
+    assert emitted == derive_actual_max_splits(reduce_indptr)
+
+
+def test_metadata_emitted_scalar_drives_gate():
+    """End-to-end crossover from metadata: an idle-grid short-context decode
+    emits a small reduce_max_split that declines DA split-K, while a long-context
+    decode emits a large one that engages it -- both sourced purely from the
+    metadata scalar (no host CSR reduction). Uses unbounded per-batch splits so a
+    single sequence can straddle the min_splits threshold."""
+    _require_cuda()
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
+
+    low, _ = _metadata_emit(1, 512, parallel=True, max_split_per_batch=-1)
+    hi, _ = _metadata_emit(1, 32768, parallel=True, max_split_per_batch=-1)
+    assert low < 64 <= hi  # straddle the default min_splits threshold
+
+    engage_low, _, _ = plan_splitk_capture_safe(
+        num_final_rows=1, H=16, max_seqlen_q=1,
+        num_kv_splits=304, num_cu=304, actual_max_splits=low,
+    )
+    engage_hi, K, slots = plan_splitk_capture_safe(
+        num_final_rows=1, H=16, max_seqlen_q=1,
+        num_kv_splits=304, num_cu=304, actual_max_splits=hi,
+    )
+    assert not engage_low and engage_hi
+
+
+def test_metadata_gate_closes_over_provisioned_budget_edge():
+    """The regression this whole change targets: on an idle-grid short-context
+    decode the loose num_kv_splits budget (304) makes the legacy gate over-engage
+    DA split-K, but the metadata-emitted true split count declines it."""
+    _require_cuda()
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
+
+    emitted, _ = _metadata_emit(1, 512, parallel=True)  # bounded cap -> small
+    assert emitted < 64
+
+    engage_legacy, _, _ = plan_splitk_capture_safe(
+        num_final_rows=1, H=16, max_seqlen_q=1, num_kv_splits=304, num_cu=304,
+    )
+    engage_gated, _, _ = plan_splitk_capture_safe(
+        num_final_rows=1, H=16, max_seqlen_q=1, num_kv_splits=304, num_cu=304,
+        actual_max_splits=emitted,
+    )
+    assert engage_legacy and not engage_gated
+
+
+def test_dispatch_forwards_actual_max_splits(monkeypatch):
+    """The mla.py reduce dispatch seam forwards actual_max_splits to the FlyDSL
+    kernel wrapper (the new plumbing added for phase 2)."""
+    import aiter.mla as mla
+    import aiter.ops.flydsl as flydsl
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_FLYDSL", "1")
+    mla._flydsl_mla_reduce_enabled.cache_clear()
+    captured = {}
+
+    def _capture(*args, **kwargs):
+        captured["actual_max_splits"] = kwargs.get("actual_max_splits")
+
+    monkeypatch.setattr(flydsl, "flydsl_mla_reduce_v1", _capture)
+    try:
+        mla._mla_reduce_v1_dispatch(
+            None, None, None, None, None, 1, 0, None, None, actual_max_splits=77
+        )
+    finally:
+        mla._flydsl_mla_reduce_enabled.cache_clear()
+    assert captured["actual_max_splits"] == 77

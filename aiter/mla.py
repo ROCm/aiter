@@ -48,14 +48,22 @@ def _mla_reduce_v1_dispatch(
     num_kv_splits,
     final_output,
     final_lse,
+    actual_max_splits=None,
 ):
     """Dispatch the MLA decode reduce to HIP (default) or FlyDSL (opt-in).
 
-    Signature mirrors ``aiter.mla_reduce_v1`` exactly (num_kv_splits at slot 7,
-    between max_seqlen_q and final_output) so it is a drop-in swap. The HIP
-    kernel uses max(SM_count, num_kv_splits); 0 means "auto" (SM_count). The
-    FlyDSL port derives its grid from num_cu + CSR width, so it takes the arg
-    for parity but does not need it.
+    Signature mirrors ``aiter.mla_reduce_v1`` (num_kv_splits at slot 7, between
+    max_seqlen_q and final_output) so it is a drop-in swap. The HIP kernel uses
+    max(SM_count, num_kv_splits); 0 means "auto" (SM_count). The FlyDSL port
+    derives its grid from num_cu + CSR width, so it takes the arg for parity but
+    does not need it.
+
+    ``actual_max_splits`` (optional) is the true ``max_t(n_splits)`` over active
+    tiles -- emitted by ``get_mla_metadata_v1`` (``reduce_max_split``) and read
+    once at planning time. When provided it gates the FlyDSL device-adaptive
+    split-K on the real per-tile split count instead of the (often
+    over-provisioned) ``num_kv_splits`` budget. ``None`` keeps legacy behavior
+    and the HIP path ignores it entirely.
     """
     if _flydsl_mla_reduce_enabled():
         from aiter.ops.flydsl import flydsl_mla_reduce_v1
@@ -70,6 +78,7 @@ def _mla_reduce_v1_dispatch(
             final_output,
             final_lse,
             num_kv_splits=num_kv_splits,
+            actual_max_splits=actual_max_splits,
         )
         return
     aiter.mla_reduce_v1(
@@ -270,6 +279,7 @@ def mla_decode_fwd(
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
+    actual_max_splits=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -608,6 +618,7 @@ def mla_decode_fwd(
             num_kv_splits,
             o,
             final_lse,
+            actual_max_splits=actual_max_splits,
         )
 
     if io_transformed:
@@ -764,6 +775,7 @@ def mla_prefill_ps_fwd(
         0,
         output,
         final_lse,
+        actual_max_splits=actual_max_splits,
     )
 
     return output.view(total_s, nhead, v_head_dim), attn_lse

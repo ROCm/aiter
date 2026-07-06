@@ -60,7 +60,8 @@ void get_mla_metadata_v1(
     const bool                          intra_batch_mode,
     const std::optional<at::ScalarType> dtype_q,
     const std::optional<at::ScalarType> dtype_kv,
-    const bool                          is_cp_round_robin)
+    const bool                          is_cp_round_robin,
+    const std::optional<torch::Tensor>  reduce_max_split)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
@@ -107,7 +108,8 @@ void get_mla_metadata_v1(
             work_indptr,
             reduce_indptr,
             reduce_final_map,
-            reduce_partial_map);
+            reduce_partial_map,
+            reduce_max_split);
     }
     else if (intra_batch_mode)
     {

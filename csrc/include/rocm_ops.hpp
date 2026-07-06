@@ -2066,7 +2066,8 @@ namespace py = pybind11;
           py::arg("intra_batch_mode")    = false,        \
           py::arg("dtype_q")             = std::nullopt, \
           py::arg("dtype_kv")            = std::nullopt, \
-          py::arg("is_cp_round_robin")   = false);         \
+          py::arg("is_cp_round_robin")   = false,        \
+          py::arg("reduce_max_split")    = std::nullopt);  \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define PA_METADATA_PYBIND                       \
