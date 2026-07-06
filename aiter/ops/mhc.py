@@ -296,6 +296,7 @@ def mhc_pre_fake(
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -437,6 +438,7 @@ def mhc_fused_post_pre_fake(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
+    is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
