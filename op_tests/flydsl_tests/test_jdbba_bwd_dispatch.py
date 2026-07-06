@@ -14,10 +14,11 @@ shapes (B in {120, 1024}, D in {256, 512}) across regimes (genrec + skew), plus:
      faulted before 2026-07-06 (B=32, D=512, Mi=2048, genrec, seed=1234) -- this
      shape must simply run to completion (a fault aborts the process).
 
-Because D (= K = N) and the grad_jagged schedule knobs are compile-time constants
-snapshotted on the first launch -- AND the FlyDSL cache key ignores COARSEN_M /
-GJ_STAGES_A -- this test runs ONE D PER SUBPROCESS with ~/.flydsl/cache cleared
-between them. Invoked with no args it orchestrates the per-D worker subprocesses.
+Phase 4: the backward bakes D and the schedule knobs into a memoized per-shape
+build (jagged_dense_bmm_bwd.build_backward), so multiple D coexist in ONE process.
+This test therefore runs BOTH D in a single process (D=256 then D=512) — which is
+itself the multi-D regression — with no per-D subprocess isolation and no cache
+clearing. ``--worker-d D`` still runs a single D in-process for manual debugging.
 
 Run (inside the venv):
     HIP_VISIBLE_DEVICES=6 python op_tests/flydsl_tests/test_jdbba_bwd_dispatch.py
@@ -26,9 +27,6 @@ Run (inside the venv):
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -108,6 +106,7 @@ def _run_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95, label=""):
     import torch
 
     from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched
+    from aiter.ops.flydsl.jagged_dense_bmm_bwd_dispatch import resolve_config
     from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd
 
     # Reuse the bench's input builder + eager reference (single source of truth).
@@ -123,7 +122,11 @@ def _run_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95, label=""):
     rj, rd, rb = _torch_reference(jagged, dense, d_out, seq_offsets, N, K)
     c_dj, c_dd, c_db = _cos(dj, rj), _cos(dd, rd), _cos(db, rb)
     ok = min(c_dj, c_dd, c_db) > _COS_THRESH
-    tag = f"{label}B={B} D={D} Mi={Mi} {regime:6s} L={L} gj={_bwd.GJ_STAGES_A} split={_bwd.SPLIT}"
+    # Report the ACTUAL per-shape build config (not module globals, which no longer
+    # track it — the build bakes D + knobs as closure constants).
+    cfg = resolve_config(n_groups=B, reduction_k=D, output_n=D, max_seq_len=Mi)
+    bw = _bwd.build_backward(D, split=cfg["split"], gj_stages_a=cfg["gj_stages_a"], coarsen_m=cfg["coarsen_m"])
+    tag = f"{label}B={B} D={D} Mi={Mi} {regime:6s} L={L} gj={cfg['gj_stages_a']} split={bw.split}"
     return ok, f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})"
 
 
@@ -142,16 +145,18 @@ def _worker(D: int) -> int:
     print(f"[{'PASS' if res_ok else 'FAIL'}] resolve winner D={D}: gj_stages_a={cfg['gj_stages_a']} "
           f"(expected {expected_gj})")
 
+    # The memoized build resolves the D-derived SPLIT (2 @ D<=256, 1 @ D>256).
+    expected_split = 2 if D <= 256 else 1
+    bw = _bwd.build_backward(D, split=None, gj_stages_a=expected_gj, coarsen_m=None)
+    split_ok = bw.split == expected_split
+    ok &= split_ok
+    print(f"[{'PASS' if split_ok else 'FAIL'}] build_backward(D={D}).split={bw.split} (expected {expected_split})")
+
     # (2) headline correctness (all three grads).
     for (B, Mi, regime) in _HEADLINE:
         case_ok, msg = _run_case(D, B, Mi, regime)
         ok &= case_ok
         print(msg)
-
-    # After the first launch the resolved gj must be pinned into the kernel module.
-    pin_ok = _bwd.GJ_STAGES_A == expected_gj
-    ok &= pin_ok
-    print(f"[{'PASS' if pin_ok else 'FAIL'}] pinned GJ_STAGES_A={_bwd.GJ_STAGES_A} (expected {expected_gj})")
 
     # (3) regression guard (D=512 only): must run to completion without faulting.
     if D == 512:
@@ -176,18 +181,14 @@ def _worker(D: int) -> int:
 
 
 def _orchestrate() -> int:
-    """Spawn one worker subprocess per D, clearing the FlyDSL cache between them."""
-    cache = Path.home() / ".flydsl" / "cache"
+    """Phase 4: run BOTH D in ONE process. The backward now bakes D + knobs into a
+    memoized per-shape build (jagged_dense_bmm_bwd.build_backward), so multiple D
+    coexist — no single-D-per-process constraint, no per-D subprocess isolation,
+    no cache clearing. Running D=256 then D=512 here IS the multi-D regression."""
     overall = True
     for D in (256, 512):
-        if cache.exists():
-            shutil.rmtree(cache, ignore_errors=True)
-        print(f"\n===== D={D} (fresh process, cache cleared) =====")
-        rc = subprocess.run(
-            [sys.executable, os.path.abspath(__file__), "--worker-d", str(D)],
-            env=os.environ.copy(),
-        ).returncode
-        overall &= (rc == 0)
+        print(f"\n===== D={D} (same process, multi-D) =====")
+        overall &= (_worker(D) == 0)
     print("\n==================== OVERALL:", "PASS" if overall else "FAIL", "====================")
     return 0 if overall else 1
 

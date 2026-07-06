@@ -7,14 +7,11 @@ Companion to the forward's ``jagged_dense_bmm_dispatch_v2.py``. It folds all the
 host-side glue the backward needs (previously inlined in every bench / example /
 recsys-harness driver) into one place:
 
-    - ``configure_dim(D)`` + a **single-D-per-process guard** (the backward
-      snapshots the square dense dim D = K = N as a compile-time constant on the
-      first launch and rejects later drift);
-    - the ``GJ_STAGES_A`` / ``COARSEN_M`` **schedule-knob snapshot guard** (both
-      are compile-time module globals snapshotted on the first grad_jagged
-      launch, and the FlyDSL artifact cache key does NOT include them, so a
-      second, different value in the same process would silently reuse a stale
-      compiled kernel — we reject it loudly instead);
+    - building (memoized) the per-shape backward launchers via
+      ``jagged_dense_bmm_bwd.build_backward(D, split, gj_stages_a, coarsen_m)``,
+      which bakes D and the schedule knobs in as closure constants — so MULTIPLE
+      D coexist in one process (Phase 4; no single-D-per-process constraint, no
+      module-global snapshot, and no cache-collision hazard on the knobs);
     - fp32 split-reduction scratch allocation (cached per (n_groups, D, device));
     - the ``BLOCK_M``-padded ``dJagged`` output (so a partial tail-tile store
       stays in-bounds) and the ``[:L]`` view returned to the caller;
@@ -25,7 +22,8 @@ recsys-harness driver) into one place:
     - stream defaulting;
     - calling ``grad_jagged`` then the fused ``grad_dense_bias``.
 
-Backward-only, D fixed per process. Per-shape scheduling is resolved from a JSON
+Backward-only. Multiple D can be served per process (each memoizes its own
+compiled kernels). Per-shape scheduling is resolved from a JSON
 dispatch table (``jagged_dense_bmm_bwd_dispatch.json``, arch-keyed-v1, same loader
 shape as the forward's ``jagged_dense_bmm_dispatch_v2``): the tunables are
 ``split`` (None → the kernel's ``2 if D<=256 else 1`` rule), ``coarsen_m`` (None →
@@ -191,67 +189,10 @@ def resolve_config(
             cfg[k] = int(v)
     return cfg
 
-# Process-wide first-launch snapshot state. D and the schedule knobs (SPLIT,
-# GJ_STAGES_A, COARSEN_M) are compile-time constants the kernels snapshot on their
-# first launch, so the whole process is pinned to the first values seen here.
-_CONFIGURED_D: Optional[int] = None
-_CONFIGURED_KNOBS: Optional[tuple[int, int, int]] = None  # (SPLIT, GJ_STAGES_A, COARSEN_M)
-
 # fp32 split-reduction scratch, cached per (n_groups, D, device). The partials
 # passes fully overwrite every slot they later reduce (empty groups included), so
 # reuse across calls is safe without re-zeroing.
 _SCRATCH_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
-
-
-def _configure_once(D: int, cfg: dict) -> None:
-    """Set D + the resolved schedule knobs before the first launch and guard drift.
-
-    ``cfg`` carries split / coarsen_m / gj_stages_a (each int or None → keep the
-    kernel/module default). On the first call this rebinds the compile-time
-    constants; on every later call it only *validates* that D and the knobs match
-    the pinned values, raising loudly (never silently mutating) otherwise.
-    """
-    global _CONFIGURED_D, _CONFIGURED_KNOBS
-    D = int(D)
-
-    if _CONFIGURED_D is None:
-        # configure_dim first (it sets the D-derived SPLIT), then apply overrides.
-        _bwd.configure_dim(D)
-        if cfg.get("split") is not None:
-            _bwd.SPLIT = int(cfg["split"])
-        if cfg.get("gj_stages_a") is not None:
-            _bwd.GJ_STAGES_A = int(cfg["gj_stages_a"])
-        if cfg.get("coarsen_m") is not None:
-            _bwd.COARSEN_M = int(cfg["coarsen_m"])
-        _CONFIGURED_D = D
-        _CONFIGURED_KNOBS = (_bwd.SPLIT, _bwd.GJ_STAGES_A, _bwd.COARSEN_M)
-        return
-
-    # Validate-only: intended knob values default to the pinned ones when a cfg
-    # entry is None, so an unspecified knob always matches.
-    want = (
-        int(cfg["split"]) if cfg.get("split") is not None else _bwd.SPLIT,
-        int(cfg["gj_stages_a"]) if cfg.get("gj_stages_a") is not None else _bwd.GJ_STAGES_A,
-        int(cfg["coarsen_m"]) if cfg.get("coarsen_m") is not None else _bwd.COARSEN_M,
-    )
-    if _CONFIGURED_D != D:
-        raise RuntimeError(
-            f"jagged_dense_bmm_bwd_dispatched: this process is pinned to D={_CONFIGURED_D} "
-            f"(K = N = the square dense dim), but was called with D={D}. The backward "
-            "snapshots D as a compile-time constant on its first launch and cannot serve a "
-            "second D in the same process. Run one D per process (e.g. a fresh subprocess "
-            "per D). Removing this constraint is Phase 4 of the aiter integration plan "
-            "(runtime-derived D, like the forward gen kernel)."
-        )
-    if _CONFIGURED_KNOBS != want:
-        raise RuntimeError(
-            f"jagged_dense_bmm_bwd_dispatched: schedule knobs are pinned to "
-            f"(SPLIT, GJ_STAGES_A, COARSEN_M)={_CONFIGURED_KNOBS} for this process but were "
-            f"changed to {want}. These are compile-time globals snapshotted on the first launch "
-            "AND the FlyDSL artifact cache key ignores GJ_STAGES_A/COARSEN_M, so changing them "
-            "in-process would silently reuse the stale compiled kernel. Pick one config per "
-            "process (clear ~/.flydsl/cache and use a fresh process to switch)."
-        )
 
 
 def _get_scratch(n_groups: int, K: int, N: int, split: int, device: torch.device):
@@ -299,10 +240,11 @@ def jagged_dense_bmm_bwd_dispatched(
         d_dense[b]    = Jagged[s:e].T @ d_out[s:e] (n_groups, K, N)
         d_bias[b]     = sum_m d_out[s:e]           (n_groups, N)
 
-    The square dense dim ``D = K = N`` is a compile-time constant pinned per
-    process (see the single-D guard). ``max_seq_len`` sizes the grad_jagged M
-    grid envelope; if omitted it is derived from ``seq_offsets`` (costs one
-    device→host sync — pass it to avoid that). The schedule knobs
+    The square dense dim ``D = K = N`` is baked into a memoized per-shape build,
+    so different D in the same process just build different kernels (no single-D
+    constraint). ``max_seq_len`` sizes the grad_jagged M grid envelope; if omitted
+    it is derived from ``seq_offsets`` (costs one device→host sync — pass it to
+    avoid that). The schedule knobs
     ``split`` / ``gj_stages_a`` / ``coarsen_m`` are normally resolved per-shape
     from the JSON dispatch table; passing any of them here forces that value
     (must be constant per process).
@@ -334,16 +276,18 @@ def jagged_dense_bmm_bwd_dispatched(
     max_seq_len = int(max_seq_len)
 
     # Resolve per-shape schedule (explicit kwarg > JSON winner > D-bucketed
-    # heuristic), then pin it for the process. For the backward K == N == D.
+    # heuristic), then build (memoized) the launchers specialized to this shape.
+    # For the backward K == N == D.
     cfg = resolve_config(
         n_groups=n_groups, reduction_k=D, output_n=D, max_seq_len=max_seq_len,
         split=split, gj_stages_a=gj_stages_a, coarsen_m=coarsen_m,
     )
-    _configure_once(D, cfg)
+    bw = _bwd.build_backward(
+        D, split=cfg["split"], gj_stages_a=cfg["gj_stages_a"], coarsen_m=cfg["coarsen_m"]
+    )
 
-    # Read the (now-pinned) tiling constants back from the kernel module.
-    BLOCK_M = _bwd.BLOCK_M
-    SPLIT = _bwd.SPLIT
+    BLOCK_M = _bwd.BLOCK_M  # D-independent module constant
+    SPLIT = bw.split
 
     import flydsl.compiler as flyc
 
@@ -368,14 +312,14 @@ def jagged_dense_bmm_bwd_dispatched(
     dense_kn = dense.reshape(n_groups * K, N).contiguous()
     d_jagged = torch.empty(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
     tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
-    _bwd.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
+    bw.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
 
     # --- dDense (+ fused dBias): split-reduction over the sequence axis m. ---
     d_dense = torch.empty(n_groups, K, N, dtype=torch.bfloat16, device=device)
     d_bias = torch.empty(n_groups, N, dtype=torch.bfloat16, device=device)
     dense_partials, bias_partials = _get_scratch(n_groups, K, N, SPLIT, device)
     tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
-    _bwd.grad_dense_bias(
+    bw.grad_dense_bias(
         d_dense.view(n_groups * K, N), d_bias, tJagged, tDOut, seq_offsets,
         dense_partials, bias_partials, n_groups, max_seq_len, stream=stream,
     )
