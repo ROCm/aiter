@@ -12,18 +12,18 @@ on:
         description: "ROCm/ATOM ref containing the mesh Slurm script"
         required: false
         default: "main"
-      slurm_account:
-        description: "Slurm account"
+      spur_account:
+        description: "Spur account"
         required: false
         default: "amd-frameworks"
-      slurm_partition:
-        description: "Slurm partition"
+      spur_partition:
+        description: "Spur partition or queue"
         required: false
         default: "amd-frameworks"
-      slurm_nodelist:
-        description: "Optional Slurm nodelist override for the 2P1D run"
+      spur_nodelist:
+        description: "Candidate Spur nodes; the 2P1D ATOM script uses the first 3"
         required: false
-        default: "mia1-p02-g42,mia1-p02-g44,mia1-p02-g47"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       model_path:
         description: "DeepSeek-V4-Pro model path visible on Slurm nodes"
         required: false
@@ -67,12 +67,12 @@ jobs:
     timeout-minutes: 180
     env:
       ATOM_REF: ${{ github.event.inputs.atom_ref || 'main' }}
-      SLURM_ACCOUNT: ${{ github.event.inputs.slurm_account || 'amd-frameworks' }}
-      SLURM_PARTITION: ${{ github.event.inputs.slurm_partition || 'amd-frameworks' }}
-      SLURM_NODELIST: ${{ github.event.inputs.slurm_nodelist || 'mia1-p02-g42,mia1-p02-g44,mia1-p02-g47' }}
+      SPUR_ACCOUNT: ${{ github.event.inputs.spur_account || 'amd-frameworks' }}
+      SPUR_PARTITION: ${{ github.event.inputs.spur_partition || 'amd-frameworks' }}
+      SPUR_NODELIST: ${{ github.event.inputs.spur_nodelist || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
       MODEL_PATH: ${{ github.event.inputs.model_path || '/mnt/models/DeepSeek-V4-Pro/' }}
       DOCKER_IMAGE: ${{ github.event.inputs.docker_image || 'rocm/atom-dev:latest' }}
-      SHARED_ROOT: ${{ github.event.inputs.shared_root || format('/it-share/yajizhan/slurm_dsv4_logs/aiter_spur_login_{0}_{1}', github.run_id, github.run_attempt) }}
+      SHARED_ROOT: ${{ github.event.inputs.shared_root || format('/it-share/yajizhan/spur_dsv4_logs/aiter_spur_login_{0}_{1}', github.run_id, github.run_attempt) }}
       ISL_LIST: ${{ github.event.inputs.isl_list || '8192' }}
       OSL: ${{ github.event.inputs.osl || '1' }}
       CONC_LIST: ${{ github.event.inputs.conc_list || '2' }}
@@ -80,15 +80,16 @@ jobs:
       RANDOM_RANGE_RATIO: "0.8"
       SCRIPT_PATH: atom/mesh/scripts/ds_v4_2p_tp8_1d_tp8_atom_mtp_dpa_slurm.sh
     steps:
-      - name: Show runner and Slurm state
+      - name: Show runner and Spur state
         run: |
           set -euo pipefail
           hostname
           whoami
           pwd
-          command -v sbatch
-          sbatch --version
-          squeue --me || true
+          command -v spur
+          spur --version || true
+          spur --help || true
+          spur queue || true
 
       - name: Checkout ATOM mesh scripts
         uses: actions/checkout@v4
@@ -97,7 +98,7 @@ jobs:
           ref: ${{ env.ATOM_REF }}
           path: ATOM
 
-      - name: Prepare shared ATOM source and patched Slurm script
+      - name: Prepare shared ATOM source and patched Spur script
         run: |
           set -euo pipefail
 
@@ -114,71 +115,124 @@ jobs:
           log_root="${shared_root}/job"
           script_src="ATOM/${SCRIPT_PATH}"
           script_dst="${shared_root}/$(basename "${SCRIPT_PATH}")"
+          shim_dir="${shared_root}/spur-shims"
 
           test -f "${script_src}"
-          mkdir -p "${shared_root}" "${log_root}"
+          mkdir -p "${shared_root}" "${log_root}" "${shim_dir}"
           rm -rf "${atom_source}"
           cp -a ATOM "${atom_source}"
 
           sed "s|/it-share/yajizhan/code/ATOM|${atom_source}|g" "${script_src}" > "${script_dst}"
           chmod +x "${script_dst}"
 
+          cat > "${shim_dir}/scontrol" <<'SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [[ "${1:-}" == "show" && "${2:-}" == "hostnames" ]]; then
+            IFS=',' read -ra nodes <<< "${3:-}"
+            printf '%s\n' "${nodes[@]}"
+            exit 0
+          fi
+          echo "Unsupported scontrol invocation: $*" >&2
+          exit 2
+          SHIM
+          chmod +x "${shim_dir}/scontrol"
+
+          cat > "${shim_dir}/srun" <<'SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          node=""
+          time_limit=""
+          args=()
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --nodelist=*) node="${1#--nodelist=}" ; shift ;;
+              --nodelist) node="${2:-}" ; shift 2 ;;
+              --time=*) time_limit="${1#--time=}" ; shift ;;
+              --time) time_limit="${2:-}" ; shift 2 ;;
+              --nodes=*|--ntasks=*) shift ;;
+              --nodes|--ntasks) shift 2 ;;
+              *) args+=("$1") ; shift ;;
+            esac
+          done
+
+          if [[ -z "${node}" ]]; then
+            echo "srun shim requires --nodelist" >&2
+            exit 2
+          fi
+          if [[ "${#args[@]}" -eq 0 ]]; then
+            echo "srun shim requires a command" >&2
+            exit 2
+          fi
+
+          spur_args=(run --nodes "${node}")
+          if [[ -n "${SPUR_ACCOUNT:-}" ]]; then
+            spur_args+=(--account "${SPUR_ACCOUNT}")
+          fi
+          if [[ -n "${SPUR_PARTITION:-}" ]]; then
+            spur_args+=(--partition "${SPUR_PARTITION}")
+          fi
+          if [[ -n "${time_limit}" ]]; then
+            spur_args+=(--time "${time_limit}")
+          fi
+
+          exec spur "${spur_args[@]}" -- "${args[@]}"
+          SHIM
+          chmod +x "${shim_dir}/srun"
+
           {
             echo "ATOM_SOURCE_FOR_SLURM=${atom_source}"
             echo "LOG_ROOT=${log_root}"
             echo "PATCHED_SCRIPT=${script_dst}"
+            echo "SPUR_SHIM_DIR=${shim_dir}"
           } >> "${GITHUB_ENV}"
 
           echo "Prepared ATOM source: ${atom_source}"
           echo "Prepared patched script: ${script_dst}"
+          echo "Prepared Spur shim dir: ${shim_dir}"
           sed -n '1,80p' "${script_dst}"
 
-      - name: Submit DeepSeek-V4-Pro 2P1D ATOM mesh smoke job
+      - name: Run DeepSeek-V4-Pro 2P1D ATOM mesh smoke job with Spur
         run: |
           set -euo pipefail
 
-          sbatch_args=(
-            --parsable
-            --wait
-            --export=ALL
-            --job-name=aiter-dsv4-2p1d-smoke
-            --output="${SHARED_ROOT}/slurm-%j.out"
-            --error="${SHARED_ROOT}/slurm-%j.err"
-            --time=02:00:00
-          )
-
-          if [[ -n "${SLURM_ACCOUNT}" ]]; then
-            sbatch_args+=(--account="${SLURM_ACCOUNT}")
-          fi
-          if [[ -n "${SLURM_PARTITION}" ]]; then
-            sbatch_args+=(--partition="${SLURM_PARTITION}")
-          fi
-          if [[ -n "${SLURM_NODELIST}" ]]; then
-            sbatch_args+=(--nodelist="${SLURM_NODELIST}")
-          fi
-
-          echo "Submitting ${PATCHED_SCRIPT}"
+          echo "Running ${PATCHED_SCRIPT}"
           echo "Shared root: ${SHARED_ROOT}"
+          IFS=',' read -ra candidate_nodes <<< "${SPUR_NODELIST}"
+          if [[ "${#candidate_nodes[@]}" -lt 3 ]]; then
+            echo "Need at least 3 Spur nodes for the ATOM 2P1D script; got: ${SPUR_NODELIST}"
+            exit 2
+          fi
+          atom_mesh_nodelist="${candidate_nodes[0]},${candidate_nodes[1]},${candidate_nodes[2]}"
+
+          echo "Spur candidate nodes: ${SPUR_NODELIST}"
+          echo "ATOM 2P1D nodes: ${atom_mesh_nodelist}"
           echo "Model path: ${MODEL_PATH}"
           echo "Docker image: ${DOCKER_IMAGE}"
           echo "ISL/OSL/CONC: ${ISL_LIST}/${OSL}/${CONC_LIST}"
           echo "RUN_GSM8K=${RUN_GSM8K}"
 
           set +e
-          sbatch_output="$(sbatch "${sbatch_args[@]}" "${PATCHED_SCRIPT}" 2>&1)"
-          sbatch_status=$?
+          spur_output="$(
+            SLURM_JOB_ID="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" \
+            SLURM_JOB_NODELIST="${atom_mesh_nodelist}" \
+            PATH="${SPUR_SHIM_DIR}:${PATH}" \
+            bash "${PATCHED_SCRIPT}" 2>&1
+          )"
+          spur_status=$?
           set -e
 
-          echo "${sbatch_output}"
-          echo "SBATCH_STATUS=${sbatch_status}" >> "${GITHUB_ENV}"
+          echo "${spur_output}"
+          echo "SPUR_STATUS=${spur_status}" >> "${GITHUB_ENV}"
 
-          echo "=== Slurm logs ==="
-          find "${SHARED_ROOT}" -maxdepth 2 -type f \( -name "slurm-*.out" -o -name "slurm-*.err" \) -print -exec tail -n 240 {} \; || true
+          echo "=== Spur logs ==="
+          find "${SHARED_ROOT}" -maxdepth 3 -type f \( -name "*.out" -o -name "*.err" -o -name "*.log" \) -print -exec tail -n 240 {} \; || true
 
           echo "=== ATOM mesh result files ==="
           find "${LOG_ROOT}" -maxdepth 4 -type f \( -name "*.json" -o -name "*.log" -o -name "*.out" -o -name "*.err" \) -print | sort || true
 
-          exit "${sbatch_status}"
+          exit "${spur_status}"
 
       - name: Upload ATOMesh smoke logs
         if: always()
@@ -188,7 +242,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
           path: |
-            ${{ env.SHARED_ROOT }}/slurm-*.out
-            ${{ env.SHARED_ROOT }}/slurm-*.err
+            ${{ env.SHARED_ROOT }}/**/*.out
+            ${{ env.SHARED_ROOT }}/**/*.err
             ${{ env.LOG_ROOT }}/**/*.json
             ${{ env.LOG_ROOT }}/**/*.log
