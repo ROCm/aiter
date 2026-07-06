@@ -340,6 +340,7 @@ def fused_moe_(
     if (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.INTERLEAVE
         and is_flydsl_available()
     ):
@@ -1642,6 +1643,7 @@ def fused_moe_2stages(
     if (
         quant_type == QuantType.per_1x32
         and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.INTERLEAVE
         and is_flydsl_available()
     ):
@@ -1742,9 +1744,9 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and w1.dtype == dtypes.fp4x2
         and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
-        and gate_mode == GateMode.SEPARATED
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
     ):
-        # fp4_bf16 SEPARATED: MXFP4 weights, bf16 activations; no activation quantization needed
+        # fp4_bf16 SEPARATED/INTERLEAVE: MXFP4 weights, bf16 activations; no activation quant
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
@@ -1878,9 +1880,9 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and w1.dtype == dtypes.fp4x2
         and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
-        and gate_mode == GateMode.SEPARATED
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
     ):
-        # fp4_bf16 SEPARATED: stage1 output is bf16, no inter-stage quantization
+        # fp4_bf16 SEPARATED/INTERLEAVE: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
