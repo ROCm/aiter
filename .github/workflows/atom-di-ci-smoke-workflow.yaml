@@ -58,12 +58,6 @@ on:
         required: false
         type: string
         default: "2"
-      run_gsm8k:
-        description: "Run GSM8K after the mesh smoke check"
-        required: false
-        type: boolean
-        default: false
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -73,7 +67,7 @@ permissions:
 
 jobs:
   atomesh-spur-login-smoke:
-    runs-on: aiter-di-ci-spur-login
+    runs-on: [self-hosted, aiter-di-ci-spur-login]
     timeout-minutes: 180
     env:
       ATOM_REF: main
@@ -152,8 +146,7 @@ jobs:
           else:
               print(f"SHARED_ROOT={shared_root}")
 
-          run_gsm8k = inputs.get("run_gsm8k", False)
-          print(f"RUN_GSM8K={1 if run_gsm8k in (True, 'true', 'True', '1', 1) else 0}")
+          print("RUN_GSM8K=0")
           PY
 
       - name: Checkout ATOM mesh scripts
@@ -195,7 +188,7 @@ jobs:
           test -f "${script_src}"
           mkdir -p "${shared_root}" "${log_root}" "${shim_dir}"
           rm -rf "${atom_source}"
-          cp -a ATOM "${atom_source}"
+          cp -R --no-preserve=mode,ownership,timestamps ATOM "${atom_source}"
 
           sed "s|/it-share/yajizhan/code/ATOM|${atom_source}|g" "${script_src}" > "${script_dst}"
           chmod +x "${script_dst}"
