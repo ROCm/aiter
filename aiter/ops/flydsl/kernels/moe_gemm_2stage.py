@@ -67,24 +67,6 @@ from .mfma_preshuffle_pipeline import (
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 
 
-def _vmcnt(n: int):
-    """Emit standalone s_waitcnt vmcnt(n) via inline asm.
-
-    Used in the prologue to drain only A-tile loads before the LDS store,
-    leaving B-tile loads in-flight. LLVM SIInsertWaitcnts treats the inline
-    asm as an opaque fence and skips inserting its own vmcnt(0) before the
-    subsequent ds_write.
-    """
-    llvm.InlineAsmOp(
-        res=None,
-        operands_=[],
-        asm_string=f"s_waitcnt vmcnt({n})",
-        constraints="",
-        has_side_effects=True,
-        is_align_stack=False,
-    )
-
-
 def _barrier(vmcnt=63, lgkmcnt=63):
     """Emit s_waitcnt + s_barrier via inline asm.
 
@@ -1650,13 +1632,11 @@ def compile_moe_gemm1(
                             rocdl.sched_dswr(1)
                     rocdl.sched_barrier(0)
 
-                # Prologue: A-load → B-loads → partial vmcnt → A→LDS store → barrier.
-                # _vmcnt(_b_vmem_total) drains A without touching B: LLVM's SIInsertWaitcnts
-                # sees the inline-asm fence and skips its own vmcnt(0) before ds_write,
-                # so B stays in-flight through the LDS store and arrives before the barrier.
+                # Prologue: B-loads first → A-load → A→LDS store → barrier.
+                # Issuing B before A gives B ~300 extra cycles of latency cover.
+                # By the time A finishes and the LDS store drains vmcnt(0), B has
+                # already arrived — the s_waitcnt stall covers only A's latency.
                 k0 = k_base_idx
-                x_regs0 = load_x_tile(k0)                     # A in-flight
-                rocdl.sched_barrier(0)
                 b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate)
                 # INTERLEAVE: gate and up alternate in n_blk_gate; no separate up tile needed.
                 b_up_cur = (
@@ -1665,11 +1645,10 @@ def compile_moe_gemm1(
                     else load_b_tile(k0, n_blk_up, n_intra_up)
                 )
                 rocdl.sched_barrier(0)
-                # Wait for A only (num_x_loads ops done); _b_vmem_total B ops still running.
-                _vmcnt(_b_vmem_total)
-                store_x_tile_to_lds(x_regs0, lds_base_cur)
+                x_regs0 = load_x_tile(k0)                     # A in-flight after B
                 rocdl.sched_barrier(0)
-                # B arrives during LDS write + barrier; vmcnt(0) drains it cleanly.
+                store_x_tile_to_lds(x_regs0, lds_base_cur)    # vmcnt(0) drains A; B already done
+                rocdl.sched_barrier(0)
                 _barrier(vmcnt=0, lgkmcnt=0)
 
                 # Loop-carried ping/pong state.
@@ -3890,19 +3869,13 @@ def compile_moe_gemm2(
 
                     rocdl.sched_barrier(0)
 
-                # Prologue: A-load → B-load → partial vmcnt → A→LDS store → barrier.
+                # Prologue: B-load first → A-load → A→LDS store → barrier.
                 k0 = fx.Index(0)
-                x_regs0 = load_x_tile(k0)                     # A in-flight
-                rocdl.sched_barrier(0)
                 b_cur = load_b_tile(k0)
                 rocdl.sched_barrier(0)
-                _s2_b_vmem = (
-                    num_acc_n + num_acc_n if is_fp4_bf16
-                    else k_unroll * num_acc_n * 2 if is_int4_bf16_groupwise
-                    else k_unroll * num_acc_n
-                )
-                _vmcnt(_s2_b_vmem)
-                store_x_tile_to_lds(x_regs0, lds_base_cur)
+                x_regs0 = load_x_tile(k0)                     # A in-flight after B
+                rocdl.sched_barrier(0)
+                store_x_tile_to_lds(x_regs0, lds_base_cur)    # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
                 _barrier(vmcnt=0, lgkmcnt=0)
 
