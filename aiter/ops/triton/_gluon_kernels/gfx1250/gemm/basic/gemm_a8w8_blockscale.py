@@ -891,7 +891,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     # SPLITK_BLOCK_SIZE (like the Triton kernel), so per-iter counters/offsets
     # become compile-time -- removing the rolled-loop overhead and the runtime
     # descriptor address math (v_readfirstlane) that dominate low-K shapes.
-    NUM_K_ITER: gl.constexpr = (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
@@ -910,6 +909,16 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     K_local = K - k_split_offset
     if NUM_KSPLIT > 1:
         K_local = SPLITK_BLOCK_SIZE
+
+    LOOP_UNROLL: gl.constexpr = (
+        (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    ) < 32
+    if LOOP_UNROLL:
+        NUM_K_ITER: gl.constexpr = (
+            SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1
+        ) // BLOCK_SIZE_K
+    else:
+        NUM_K_ITER = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -1072,7 +1081,9 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
 
     # ----- Main Loop --------
 
-    for k in gl.static_range(NUM_K_ITER - (NUM_BUFFERS - 1)):
+    for k in (gl.static_range if LOOP_UNROLL else range)(
+        NUM_K_ITER - (NUM_BUFFERS - 1)
+    ):
         # Advance scales
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
