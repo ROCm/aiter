@@ -354,23 +354,33 @@ def moe_gemm_a8w4(
     if preshuffled:
         # preshuffle layout is (E, K_packed*16, N//16); w.shape[-1] = N//16
         N = w.shape[-1] * 16
+    logical_N = N
+    logical_K = K
     # Output buffer must be sized to the PADDED N: the kernel writes full
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
     # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
     padded_N = N
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
-        N = unpadded_N
+        logical_N = unpadded_N
     if unpadded_K and block_m == 16:
-        K = unpadded_K
+        logical_K = unpadded_K
+    # CDNA4 scale swizzle is laid out over the padded tensor dimensions. Keep
+    # physical N/K for swizzled scale addressing while still using logical dims
+    # for dispatch lookup below.
+    if swizzle_mx_scale != "CDNA4_SCALE":
+        N = logical_N
+        K = logical_K
     if use_gluon:
         w = w.transpose(1, 2)
         w_scales = w_scales.transpose(1, 2)
     # compute optimization flags
     if use_gluon:
-        config = get_kernel_config_gluon(M, N, K, routing_data)
+        config = get_kernel_config_gluon(M, logical_N, logical_K, routing_data)
     else:
-        config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
+        config = get_kernel_config_triton(
+            M, logical_N, logical_K, routing_data, swizzle_mx_scale
+        )
     # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
     # pick BK<256 for utilization. Clamp only when swizzle is requested so
     # StridedLayout callers keep their tuned BK<256.
