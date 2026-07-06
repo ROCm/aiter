@@ -408,7 +408,7 @@ def compile_gemm_a8w8_blockscale(
         )
 
         x_scale_total_bytes = m_idx * arith.index(scale_k) * arith.index(4)
-        x_scale_buf = buffer_ops.create_buffer_resource(
+        buffer_ops.create_buffer_resource(
             arg_x_scale, num_records_bytes=x_scale_total_bytes
         )
 
