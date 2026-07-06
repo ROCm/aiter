@@ -127,24 +127,23 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse tile config from flydsl kernelName.
-    Returns ``(tile_m, tile_n, tile_k, async_copy, waves_per_eu, xcd_swizzle, enable_scheduler)``
-    or None on parse failure. The optional xcd token (``...x{acp}x{wpe}x{xcd}_...``)
-    defaults to 0 for legacy names without it. The trailing scheduler token maps to
-    ``enable_scheduler`` ("off" -> False, anything else -> True).
+    Returns ``(tile_m, tile_n, tile_k, async_copy, waves_per_eu, xcd_swizzle, lds_stage)``
+    or None on parse failure. The numeric suffix is ``...x{acp}x{wpe}[x{xcd}[x{lds}]]``;
+    the xcd token defaults to 0 and the lds_stage token defaults to 2 for legacy
+    names without them. 
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?_"
-        r"([A-Za-z][A-Za-z0-9]*)",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?=_|$)",
         kernel_name,
     )
     if m is None:
         return None
     tm, tn, tk, acp, wpe = (int(m.group(i)) for i in range(1, 6))
     xcd_swizzle = int(m.group(6)) if m.group(6) else 0
-    enable_scheduler = m.group(7).lower() != "off"
-    return (tm, tn, tk, acp, wpe, xcd_swizzle, enable_scheduler)
+    lds_stage = int(m.group(7)) if m.group(7) else 2
+    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage)
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -169,7 +168,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, acp, wpe, xcd_swizzle, enable_scheduler = parsed
+    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage = parsed
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -183,7 +182,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         acp,
         wpe,
         xcd_swizzle,
-        enable_scheduler,
+        lds_stage=lds_stage,
     )
     return Out
 

@@ -13,7 +13,6 @@ from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl, vector
 from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k); ported from v1.
@@ -21,7 +20,7 @@ _TILE_PRELOAD_TABLE = {
     # (tile_m, tile_n, tile_k): (dsrd_preload, dvmem_preload)
     # ── tile_m = 16 ──
     (16, 64, 256): (2, 2),
-    (16, 64, 512): (8, 8),
+    (16, 64, 512): (4, 4),
     (16, 128, 256): (2, 2),
     (16, 128, 512): (2, 2),
     (16, 192, 256): (2, 2),
@@ -122,6 +121,7 @@ def compile_preshuffle_gemm(
     enable_scheduler: bool = True,
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,
+    lds_stage: int = 2,
 ):
     """Compile preshuffle GEMM (layout API, fp8/int8/fp16/bf16).
 
@@ -134,6 +134,8 @@ def compile_preshuffle_gemm(
         raise ValueError(f"tile_k must be a positive divisor of K; got tile_k={tile_k}, K={K}")
     if epilogue not in ("none", "bias", "bias_relu", "bias_silu", "bias_gelu"):
         raise ValueError(f"epilogue must be none/bias/bias_relu/bias_silu/bias_gelu, got {epilogue!r}")
+    if lds_stage not in (1, 2):
+        raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
     _has_epilogue = epilogue != "none"
     _has_bias = epilogue in ("bias", "bias_relu", "bias_silu", "bias_gelu")
     _has_relu = epilogue == "bias_relu"
@@ -190,10 +192,21 @@ def compile_preshuffle_gemm(
 
     a_lds_elems = tile_m * tile_k
 
-    @fx.struct
-    class SharedStorage:
-        a0: fx.Array[layout_elem, a_lds_elems, 16]
-        a1: fx.Array[layout_elem, a_lds_elems, 16]
+    # lds_stage == 1 keeps a single A buffer (half the LDS): each tile reads it,
+    # then a barrier + overwrite stages the next tile into the same buffer. lds_stage
+    # == 2 is the classic ping-pong (a0/a1) that needs only one barrier per tile.
+    if lds_stage == 1:
+
+        @fx.struct
+        class SharedStorage:
+            a0: fx.Array[layout_elem, a_lds_elems, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            a0: fx.Array[layout_elem, a_lds_elems, 16]
+            a1: fx.Array[layout_elem, a_lds_elems, 16]
 
     # ── Kernel ────────────────────────────────────────────────────────
     @flyc.kernel
@@ -261,11 +274,13 @@ def compile_preshuffle_gemm(
         thr_g2r_B = fx.make_tiled_copy_B(buf_copy, tiled_mma).get_slice(tid)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # A-LDS swizzle. For 8-bit, match the async DMA's swizzle_xor16
-        # (k ^ ((m % (tile_k//16)) * 16)) so use_async_copy reads back what it wrote:
-        # get(b, 4, b) with b = log2(tile_k//16).
         if const_expr(is_8bit):
             k_blocks16 = (tile_k * elem_bytes) // 16
+            if k_blocks16 <= 0 or (k_blocks16 & (k_blocks16 - 1)) != 0:
+                raise ValueError(
+                    f"Unsupported tile_k for 8-bit LDS swizzle: tile_k={tile_k}, elem_bytes={elem_bytes} (k_blocks16={k_blocks16}); "
+                    "expected tile_k*elem_bytes to be a positive multiple of 16 with (tile_k*elem_bytes/16) a power of two."
+                )
             swz_bits = k_blocks16.bit_length() - 1  # log2
             swz = fx.SwizzleType.get(swz_bits, 4, swz_bits)
         else:
@@ -280,7 +295,10 @@ def compile_preshuffle_gemm(
                 ),
             )
 
-        sA_stages = [_make_sA(lds.a0), _make_sA(lds.a1)]
+        if const_expr(lds_stage == 1):
+            sA_stages = [_make_sA(lds.a0)]
+        else:
+            sA_stages = [_make_sA(lds.a0), _make_sA(lds.a1)]
 
         # Partitions
         pA_g = thr_g2s.partition_S(tA)
@@ -313,7 +331,9 @@ def compile_preshuffle_gemm(
                 num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
             )
             gA_div = fx.logical_divide(gA_flat, fx.make_layout(1, 1))
-            sA_i8_ptr = [fx.recast_iter(Int8, lds.a0.ptr), fx.recast_iter(Int8, lds.a1.ptr)]
+            sA_i8_ptr = [fx.recast_iter(Int8, lds.a0.ptr)]
+            if const_expr(lds_stage == 2):
+                sA_i8_ptr.append(fx.recast_iter(Int8, lds.a1.ptr))
             bx_m = bid_x * tile_m
             wave_id = tid // 64
             step_bytes = total_threads * a_load_bytes
@@ -452,23 +472,28 @@ def compile_preshuffle_gemm(
             rocdl.sched_barrier(0)
 
         # ── Pipeline stage (double-buffered B via split fragments) ─
-        def mma_kloop(read_stage, cur_frag_B):
+        def mma_kloop(a_stage, cur_frag_B):
             # s2r the A tile then issue the MMAs. K=128/K=32 (1 atom): flat k_iters → ki;
-            # K=16 gfx942 (2 atoms): (None, ki).
+            # K=16 gfx942 (2 atoms): (None, ki). a_stage is the LDS A buffer index
+            # (always 0 for lds_stage == 1, ping-pong read_stage for lds_stage == 2).
             for ki in range_constexpr(k_iters):
-                fx.copy(uni_copy, pA_s2r_stages[read_stage][None, None, ki], frag_A_retile[None, None, ki])
+                fx.copy(uni_copy, pA_s2r_stages[a_stage][None, None, ki], frag_A_retile[None, None, ki])
                 k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
                 fx.gemm(tiled_mma, frag_C, frag_A[None, None, k_coord], cur_frag_B[None, None, k_coord], frag_C)
 
-        def pipeline_stage(read_stage, next_k_val=None, read_next=True):
+        def pipeline_2stage(read_stage, next_k_val=None, read_next=True):
+            # lds_stage == 2 only: read_stage ping-pongs both the A LDS buffer and the B
+            # register double-buffer.
             write_stage = read_stage ^ 1
+            a_read = read_stage
+            a_write = write_stage
             cur_frag_B = frag_B_stages[read_stage]
             do_next = read_next and next_k_val is not None
             if const_expr(use_async_copy):
                 if const_expr(do_next):
-                    dma_a_to_lds(next_k_val, write_stage)
+                    dma_a_to_lds(next_k_val, a_write)
                     fx.copy(buf_copy, pB_g[None, None, None, next_k_val], frag_B_retile_stages[write_stage])
-                mma_kloop(read_stage, cur_frag_B)
+                mma_kloop(a_read, cur_frag_B)
                 if const_expr(enable_scheduler):
                     hot_loop_scheduler()
                 if const_expr(do_next):
@@ -478,11 +503,13 @@ def compile_preshuffle_gemm(
             if const_expr(do_next):
                 fx.copy(buf_copy, pA_g[None, None, None, next_k_val], frag_copy_A)
                 fx.copy(buf_copy, pB_g[None, None, None, next_k_val], frag_B_retile_stages[write_stage])
-            mma_kloop(read_stage, cur_frag_B)
-            fx.copy(uni_copy, frag_copy_A, pA_s_stages[write_stage][None, None, None])
+            mma_kloop(a_read, cur_frag_B)
+            if const_expr(do_next):
+                fx.copy(uni_copy, frag_copy_A, pA_s_stages[a_write][None, None, None])
             if const_expr(enable_scheduler):
                 hot_loop_scheduler()
-            gpu.barrier()
+            if const_expr(do_next):
+                gpu.barrier()
 
         # ── Prologue ──────────────────────────────────────────────
         acc_zero = Vec.filled(acc_size, 0, Int32) if const_expr(is_int8) else Vec.filled(acc_size, 0.0, Float32)
@@ -500,83 +527,124 @@ def compile_preshuffle_gemm(
             gpu.barrier()
         rocdl.sched_barrier(0)
 
-        # ── Main tile loop (scf.for with ping-pong) ──────────────
-        if const_expr(num_tiles == 1):
-            pipeline_stage(read_stage=0, read_next=False)
-        elif const_expr(num_tiles == 2):
-            pipeline_stage(read_stage=0, next_k_val=fx.Int32(1))
-            pipeline_stage(read_stage=1, read_next=False)
-        else:
-            # Ping-pong loop, 2 tiles/iter, acc-only carry; odd num_tiles → 1-stage tail
-            is_odd_tiles = (num_tiles % 2) == 1
-            loop_end = fx.Index((num_tiles - 1) // 2 if is_odd_tiles else (num_tiles - 2) // 2)
-            for iv, state in range(fx.Index(0), loop_end, fx.Index(1), init=[frag_C.load()]):
+        # ── Main tile loop ────────────────────────────────────────────
+        if const_expr(lds_stage == 1 and num_tiles > 1):
+            # 1-tile/iter, single A + single B buffer (register relief): mma consumes
+            # B[iv], then B[iv+1] is prefetched into the SAME fragment. No B loop-carry
+            # -> no backedge copies of the B tile -> A LDS-read addresses don't spill.
+            # Tiles 0..num_tiles-2; the last tile is the shared final MMA below.
+            frag_Bc = frag_B_stages[0]
+            frag_Bc_retile = frag_B_retile_stages[0]
+            for iv, state in range(0, num_tiles - 1, 1, init=[frag_C.load()]):
                 frag_C.store(state[0])
-                k_base = fx.Int32(iv * 2)
-                pipeline_stage(read_stage=0, next_k_val=k_base + fx.Int32(1))
-                pipeline_stage(read_stage=1, next_k_val=k_base + fx.Int32(2))
+                k_next = fx.Int32(iv + 1)
+                mma_kloop(0, frag_Bc)
+                if const_expr(not use_async_copy):
+                    fx.copy(buf_copy, pA_g[None, None, None, k_next], frag_copy_A)
+                fx.copy(buf_copy, pB_g[None, None, None, k_next], frag_Bc_retile)
+                gpu.barrier()  # single buffer: all reads done before overwrite
+                if const_expr(use_async_copy):
+                    dma_a_to_lds(k_next, 0)
+                else:
+                    fx.copy(uni_copy, frag_copy_A, pA_s_stages[0][None, None, None])
+                if const_expr(enable_scheduler):
+                    hot_loop_scheduler()
+                if const_expr(use_async_copy):
+                    rocdl.s_waitcnt(num_b_loads)
+                gpu.barrier()
                 results = yield [frag_C.load()]
             frag_C.store(results)
-            if const_expr(is_odd_tiles):
-                pipeline_stage(read_stage=0, read_next=False)
-            else:
-                pipeline_stage(read_stage=0, next_k_val=fx.Int32(num_tiles - 1))
-                pipeline_stage(read_stage=1, read_next=False)
+        elif const_expr(lds_stage == 2):
+            # 2-tile/iter ping-pong (lds_stage == 2): middle loop runs 2 tiles/iter
+            is_odd_tiles = (num_tiles % 2) == 1
+            tail = 1 if is_odd_tiles else 2
+            loop_end = (num_tiles - tail) // 2
+
+            def two_tiles(k_base):
+                pipeline_2stage(read_stage=0, next_k_val=k_base + fx.Int32(1))
+                pipeline_2stage(read_stage=1, next_k_val=k_base + fx.Int32(2))
+
+            if const_expr(loop_end > 0 and use_async_copy):
+                for iv in range_constexpr(loop_end):
+                    two_tiles(fx.Int32(iv * 2))
+            elif const_expr(loop_end > 0):
+                for iv, state in range(0, loop_end, 1, init=[frag_C.load()]):
+                    frag_C.store(state[0])
+                    two_tiles(fx.Int32(iv * 2))
+                    results = yield [frag_C.load()]
+                frag_C.store(results)
+            k_tail0 = num_tiles - tail  # first tile handled by the peeled tail
+            for j in range_constexpr(tail - 1):
+                pipeline_2stage(read_stage=(k_tail0 + j) % 2, next_k_val=fx.Int32(k_tail0 + j + 1))
+
+        # ── Epilogue-operand preloads (scale_a / scale_b / bias) ─────────
+        bx_m = bid_x * tile_m
+        by_n = bid_y * tile_n
+        wave_id = gpu.thread_id("x") // 64
+        lane_id = gpu.thread_id("x") % 64
+        lane_div_16 = lane_id // 16
+        lane_mod_16 = lane_id % 16
+
+        def load_epi_operands():
+            s_a = s_b = bias = None
+            if const_expr(is_8bit):
+                # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
+                scale_b_rsrc = fx.buffer_ops.create_buffer_resource(arg_scale_b, max_size=True)
+                s_b = [
+                    fx.buffer_ops.buffer_load(
+                        scale_b_rsrc,
+                        fx.Int32(by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16),
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                    for ni in range_constexpr(num_acc_n)
+                ]
+                # 4 contiguous per-row scales per mi loaded as one 128b buffer_load (#791).
+                scale_a_rsrc = fx.buffer_ops.create_buffer_resource(arg_scale_a, max_size=True)
+                s_a = [
+                    Vec(
+                        fx.buffer_ops.buffer_load(
+                            scale_a_rsrc, fx.Int32(bx_m + mi * 16 + lane_div_16 * 4), vec_width=4, dtype=T.f32
+                        )
+                    ).bitcast(fx.Float32)
+                    for mi in range_constexpr(m_repeat)
+                ]
+            if const_expr(_has_bias):
+                # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
+                bias_rsrc = fx.buffer_ops.create_buffer_resource(arg_bias, max_size=True)
+                bias_elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
+                bias = [
+                    fx.Float32(
+                        fx.buffer_ops.buffer_load(
+                            bias_rsrc,
+                            fx.Int32(by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16),
+                            vec_width=1,
+                            dtype=bias_elem_ty,
+                        )
+                    )
+                    for ni in range_constexpr(num_acc_n)
+                ]
+            return s_a, s_b, bias
+
+        overlap_epi_load = acc_size <= 64  # small enough accumulator to keep operands live over the MMA
+        s_a_vals = s_b_vals = bias_vals = None
+        if const_expr(overlap_epi_load):
+            s_a_vals, s_b_vals, bias_vals = load_epi_operands()
+
+        # Final MMA stage — overlaps the epilogue-operand loads when issued above.
+        if const_expr(lds_stage == 1):
+            # lds=1: last tile's A is resident in buf 0 and its B in frag_B_stages[0].
+            mma_kloop(0, frag_B_stages[0])
+        else:
+            pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
 
         # ── Epilogue ─────────────────────────────────────────────
-        # Fast path: f16/bf16 with no fused epilogue → vectorized truncate + copy.
-        # Otherwise (8-bit scaling and/or fused bias+activation) build the output
-        # element-wise so per-column bias and the activation can be applied.
         if const_expr(not is_8bit and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
         else:
-            bx_m = bid_x * tile_m
-            by_n = bid_y * tile_n
-            wave_id = gpu.thread_id("x") // 64
-            lane_id = gpu.thread_id("x") % 64
-            lane_div_16 = lane_id // 16
-            lane_mod_16 = lane_id % 16
-
-            if const_expr(is_8bit):
-                # FP8/INT8: per-row(scale_a) × per-col(scale_b) scaling applied inline.
-                scale_a_buf = fx.rocdl.make_buffer_tensor(arg_scale_a, max_size=True)
-                scale_b_buf = fx.rocdl.make_buffer_tensor(arg_scale_b, max_size=True)
-                scale_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 32)
-                scale_reg_lay = fx.make_layout(1, 1)
-                scale_a_div = fx.logical_divide(scale_a_buf, fx.make_layout(1, 1))
-                scale_b_div = fx.logical_divide(scale_b_buf, fx.make_layout(1, 1))
-
-                def load_scale(div_tensor, index):
-                    r = fx.make_rmem_tensor(scale_reg_lay, fx.Float32)
-                    fx.copy_atom_call(scale_copy, fx.slice(div_tensor, (None, fx.Int32(index))), r)
-                    return Vec(fx.memref_load_vec(r))[0]
-
-                # Per-column scales (1/N-block) and per-row scales (1/row/thread).
-                # The 4 waves tile N interleaved at 16-col granularity (wave layout
-                # (1,4,1) over the 16-wide MMA N atom), so N-block ni of this wave
-                # lives at column (ni*num_waves + wave_id)*16, NOT wave_id*n_per_wave+ni*16.
-                s_b_vals = [
-                    load_scale(scale_b_div, by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16)
-                    for ni in range_constexpr(num_acc_n)
-                ]
-                s_a_vals = [
-                    [load_scale(scale_a_div, bx_m + mi * 16 + lane_div_16 * 4 + ii) for ii in range_constexpr(4)]
-                    for mi in range_constexpr(m_repeat)
-                ]
-
-            # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
-            if const_expr(_has_bias):
-                bias_buf = fx.rocdl.make_buffer_tensor(arg_bias, max_size=True)
-                bias_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_elem_cls)
-                bias_div = fx.logical_divide(bias_buf, fx.make_layout(1, 1))
-
-                def load_bias(index):
-                    r = fx.make_rmem_tensor(fx.make_layout(1, 1), out_elem_cls)
-                    fx.copy_atom_call(bias_copy, fx.slice(bias_div, (None, fx.Int32(index))), r)
-                    return fx.Float32(Vec(fx.memref_load_vec(r))[0])
-
-                bias_vals = [load_bias(by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16) for ni in range_constexpr(num_acc_n)]
+            if const_expr(not overlap_epi_load):
+                s_a_vals, s_b_vals, bias_vals = load_epi_operands()
 
             def apply_activation(val_s):
                 # ReLU/SiLU/GeLU ported from v1: maximumf for relu; exp+rcp for silu;
@@ -602,7 +670,6 @@ def compile_preshuffle_gemm(
 
             acc_vec = Vec(frag_C.load())
             out_elems = []
-
             for p in range_constexpr(acc_size):
                 ni = p // (m_repeat * 4)
                 mi = (p // 4) % m_repeat

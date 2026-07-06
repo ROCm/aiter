@@ -43,6 +43,7 @@ class kernelInstance:
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     xcd_swizzle: int  # 0=off, >0=group size for XCD remap
     sScheduler: str  # "Default" (scheduler hints on) | "Off" (compiler default)
+    lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
 
     @property
     def enable_scheduler(self) -> bool:
@@ -69,6 +70,7 @@ class kernelInstance:
                             self.use_async_copy,
                             self.waves_per_eu,
                             self.xcd_swizzle,
+                            self.lds_stage,
                         ],
                     )
                 ),
@@ -88,6 +90,7 @@ def _ki(
     q_dtype_a="fp8",
     q_dtype_w="fp8",
     dtype="bf16",
+    lds_stage=2,
 ):
     return kernelInstance(
         tile_m,
@@ -100,6 +103,7 @@ def _ki(
         waves_per_eu,
         xcd_swizzle,
         scheduler,
+        lds_stage,
     )
 
 
@@ -124,18 +128,20 @@ def preshuffle_gemm_estimated_lds_bytes(
     *,
     in_dtype: str = "fp8",
     out_dtype: str = "bf16",
+    lds_stage: int = 2,
 ) -> int:
-    """Estimated total LDS (bytes) for preshuffle_gemm: sum of two smem globals.
+    """Estimated total LDS (bytes) for preshuffle_gemm: sum of smem globals.
 
-    Mirrors ``preshuffle_gemm.py`` ping/pong A-tile allocation (``SharedStorage``
-    holds two ``tile_m x tile_k`` buffers); used to skip tune instances that
-    exceed AMDGPU per-kernel LDS limits (e.g. 64 KiB on gfx942).
+    Mirrors ``preshuffle_gemm.py`` A-tile allocation (``SharedStorage`` holds
+    ``lds_stage`` × ``tile_m x tile_k`` buffers: 2 for ping-pong, 1 for the
+    single-buffer path); used to skip tune instances that exceed AMDGPU
+    per-kernel LDS limits (e.g. 64 KiB on gfx942).
     """
     elem_bytes = 1 if in_dtype in ("fp8", "int8") else 2
     a_tile_bytes = int(tile_m) * int(tile_k) * elem_bytes
 
-    # Two ping/pong A-tile buffers, each finalized to a 128B-aligned smem global.
-    return _smem_finalize_size(_smem_align(a_tile_bytes)) * 2
+    # lds_stage A-tile buffers, each finalized to a 128B-aligned smem global.
+    return _smem_finalize_size(_smem_align(a_tile_bytes)) * (2 if int(lds_stage) == 2 else 1)
 
 
 def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
@@ -146,6 +152,7 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
         ki.tile_k,
         in_dtype=ki.q_dtype_a,
         out_dtype=ki.dtype,
+        lds_stage=ki.lds_stage,
     )
 
 
@@ -208,12 +215,12 @@ _base_tiles_950_extra = [
 ]
 
 # ---------------------------------------------------------------------------
-# Combo sweep: async_copy x waves_per_eu x scheduler
+# Combo sweep: lds_stage x waves_per_eu x async_copy x xcd_swizzle
 # ---------------------------------------------------------------------------
 _ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0, 1, 2, 3, 4)
 _XCD_SWIZZLE_VALS = (0, 4)  # 0=off, >0=XCD remap group size
-_SCHEDULER_VALS  = ("Default", "Off")  # in-loop sched hints on / compiler default
+_LDS_STAGES      = (2, 1)  # 2=double-buffer ping-pong, 1=single A-LDS buffer
 
 _WAVES_PER_WG = 4  # typical wavefronts per workgroup in FlyDSL preshuffle GEMM
 
@@ -249,14 +256,15 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
 def _build_kernels_list(tiles, total_vgpr=512):
     kl = {}
     idx = 0
-    for sched in _SCHEDULER_VALS:
+
+    for lds in _LDS_STAGES:
         for wpe in _WAVES_PER_EU:
             for acp in _ASYNC_COPY_VALS:
                 for xcd in _XCD_SWIZZLE_VALS:
                     for tm, tn, tk in tiles:
                         if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
                             continue
-                        kl[idx] = _ki(tm, tn, tk, acp, wpe, xcd, sched)
+                        kl[idx] = _ki(tm, tn, tk, acp, wpe, xcd, lds_stage=lds)
                         idx += 1
     return kl
 

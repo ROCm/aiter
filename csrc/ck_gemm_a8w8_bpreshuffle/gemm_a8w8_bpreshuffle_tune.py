@@ -149,6 +149,7 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
         ki.waves_per_eu,
         getattr(ki, "xcd_swizzle", 0),
         ki.enable_scheduler,
+        getattr(ki, "lds_stage", 2),
     )
     return out
 
