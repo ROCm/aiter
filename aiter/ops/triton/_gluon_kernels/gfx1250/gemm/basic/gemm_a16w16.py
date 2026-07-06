@@ -172,25 +172,30 @@ def _gemm_a16w16_bandwidth_bound_kernel(
 
     # Fill the pipeline
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        a_k_off = load_idx * BLOCK_K
-        b_k_off = load_idx * BLOCK_K
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        )
 
+        # Walk the descriptors forward one K tile.
         if LAYOUT[0] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, a_k_off], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [a_k_off, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if LAYOUT[1] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [b_k_off, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, b_k_off], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         load_idx += 1
@@ -199,28 +204,33 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-        a_k_off = load_idx * BLOCK_K
-        b_k_off = load_idx * BLOCK_K
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        )
 
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+
+        # Walk the descriptors forward one K tile.
         if LAYOUT[0] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, a_k_off], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [a_k_off, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if LAYOUT[1] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [b_k_off, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, b_k_off], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
-
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
         load_idx += 1
 
@@ -420,27 +430,32 @@ def _gemm_a16w16_compute_bound_kernel(
 
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    # TDM prologue: fill the pipeline with NUM_BUFFERS tiles
+    # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
     for _ in gl.static_range(NUM_BUFFERS):
-        a_k_off = load_idx * BLOCK_K
-        b_k_off = load_idx * BLOCK_K
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        )
 
+        # Walk the descriptors forward one K tile.
         if LAYOUT[0] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, a_k_off], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [a_k_off, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if LAYOUT[1] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [b_k_off, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, b_k_off], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         load_idx += 1
@@ -481,25 +496,30 @@ def _gemm_a16w16_compute_bound_kernel(
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
     # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
-    a_k_off = load_idx * BLOCK_K
-    b_k_off = load_idx * BLOCK_K
+    gl.amd.gfx1250.tdm.async_load(
+        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+    )
 
+    # Walk the descriptors forward one K tile.
     if LAYOUT[0] == "T":
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, a_k_off], a_buffer.index(load_idx % NUM_BUFFERS)
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, BLOCK_K]
         )
     else:
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [a_k_off, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[BLOCK_K, 0]
         )
 
     if LAYOUT[1] == "T":
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [b_k_off, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[BLOCK_K, 0]
         )
     else:
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, b_k_off], b_buffer.index(load_idx % NUM_BUFFERS)
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, BLOCK_K]
         )
 
     # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
@@ -544,25 +564,30 @@ def _gemm_a16w16_compute_bound_kernel(
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
         # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
-        a_k_off = load_idx * BLOCK_K
-        b_k_off = load_idx * BLOCK_K
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+        )
 
+        # Walk the descriptors forward one K tile.
         if LAYOUT[0] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, a_k_off], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [a_k_off, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[BLOCK_K, 0]
             )
 
         if LAYOUT[1] == "T":
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [b_k_off, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[BLOCK_K, 0]
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, b_k_off], b_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
             )
 
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
