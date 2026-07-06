@@ -1,4 +1,4 @@
-name: ATOMesh Spur Login Smoke
+name: ATOM DI CI smoke workflow
 
 on:
   pull_request:
