@@ -96,7 +96,9 @@ def _buffer_load_vec(
 class PreshuffleScaleLayout:
     """Container returned by `make_preshuffle_scale_layout`.
 
-    The scale layout is ``(c_mn1, c_k1, 4, 16) : (stride_n0, stride_k0, stride_klane, 1)``.
+    Default layout: ``(c_mn1, c_k1, 4, 16) : (stride_n0, stride_k0, stride_klane, 1)``.
+    klane_inner layout: ``(c_mn1, c_k1, 16, 4) : (stride_n0, stride_k0, stride_nlane, 1)``.
+
     Callers compute flat index directly with plain arith::
 
         idx = mni * stride_n0 + ku * stride_k0 + k_lane * stride_klane + n_lane
@@ -106,6 +108,7 @@ class PreshuffleScaleLayout:
     stride_n0: object
     stride_k0: object
     stride_klane: object
+    stride_nlane: object
 
 
 def make_preshuffle_scale_layout(
@@ -117,11 +120,12 @@ def make_preshuffle_scale_layout(
     k_pack: int = 2,
     elem_bytes: int = 4,
     scale_block_size: int = 32,
+    klane_inner: bool = False,
 ) -> PreshuffleScaleLayout:
     """Build scale layout matching aiter/CK preshuffle for FP4/FP8 microscale.
 
-    Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
-    ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
+    Default shape: ``(c_mn1, c_k1, 4, 16)`` — KLane outermost.
+    klane_inner shape: ``(c_mn1, c_k1, 16, 4)`` — KLane innermost for dwordx4.
     """
     c16 = fx.Index(16)
     c4 = fx.Index(4)
@@ -134,26 +138,41 @@ def make_preshuffle_scale_layout(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
         )
 
-    stride_klane = c16
-    stride_k0 = c4 * stride_klane
-    stride_n0 = c_k1 * stride_k0
+    if klane_inner:
+        stride_nlane = c4
+        stride_klane = fx.Index(1)
+        stride_k0 = c16 * stride_nlane
+        stride_n0 = c_k1 * stride_k0
+    else:
+        stride_nlane = fx.Index(1)
+        stride_klane = c16
+        stride_k0 = c4 * stride_klane
+        stride_n0 = c_k1 * stride_k0
 
     c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
     c_k1_i32 = arith.index_cast(T.i32, c_k1)
     stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
     stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
-    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
 
-    layout_scale = fx.make_layout(
-        (c_mn1_i32, c_k1_i32, 4, 16),
-        stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
-    )
+    if klane_inner:
+        stride_nlane_i32 = arith.index_cast(T.i32, stride_nlane)
+        layout_scale = fx.make_layout(
+            (c_mn1_i32, c_k1_i32, 16, 4),
+            stride=(stride_n0_i32, stride_k0_i32, stride_nlane_i32, 1),
+        )
+    else:
+        stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+        layout_scale = fx.make_layout(
+            (c_mn1_i32, c_k1_i32, 4, 16),
+            stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
+        )
 
     return PreshuffleScaleLayout(
         layout_scale=layout_scale,
         stride_n0=stride_n0,
         stride_k0=stride_k0,
         stride_klane=stride_klane,
+        stride_nlane=stride_nlane,
     )
 
 
@@ -173,12 +192,18 @@ def make_preshuffle_b_layout(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     k_major: bool = False,
+    klane_inner: bool = False,
 ) -> PreshuffleBLayout:
     """Build B layout matching aiter/CK preshuffle for A8 MFMA kernels.
 
     When *k_major* is True the block-level order is K-major (``k_blk`` outermost),
     matching the ``(0,3,1,4,2,5)`` shuffle permutation.  The default N-major
     order (``k_major=False``) matches the legacy ``(0,1,3,4,2,5)`` permutation.
+
+    When *klane_inner* is True (MXFP4 SEPARATED only), KLane is the innermost
+    dimension with stride=4 bytes, enabling buffer_load_dwordx4 for all 4 KLane
+    dwords. Requires weights shuffled by shuffle_weight_a16w4_sep_fp4.
+    Layout: (N0, K0, NLane=16, L_sub=4, KLane=4) — coord (n_blk,k0,n_intra,L,ku%4).
     """
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
@@ -207,6 +232,18 @@ def make_preshuffle_b_layout(
         stride_klane = c16 * stride_nlane
         stride_n0 = c2 * stride_klane
         stride_k0 = n0 * stride_n0
+    elif klane_inner:
+        # MXFP4 SEPARATED: KLane innermost (stride=4B), enabling buffer_load_dwordx4.
+        # Layout (N0, K0, NLane=16, L_sub=4, KLane=4) — coord (n_blk,k0,n_intra,L,ku%4).
+        # Produced by shuffle_weight_a16w4_sep_fp4 permute (0,1,3,2,5,4,6).
+        c4 = fx.Index(4)
+        c64 = fx.Index(64)
+        c_k0 = c_k_bytes // c64
+        klane_dim = 4
+        stride_klane = c4              # KLane stride = 4 bytes (innermost)
+        stride_nlane = c64             # NLane stride = 64 bytes (L_sub=4 * KLane=4 * 4B)
+        stride_k0 = c16 * stride_nlane # 16 NLane entries × 64 = 1024 bytes
+        stride_n0 = c_k0 * stride_k0
     else:
         c64 = fx.Index(64)
         c4 = fx.Index(4)
@@ -224,10 +261,17 @@ def make_preshuffle_b_layout(
     stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
     stride_nlane_i32 = arith.index_cast(T.i32, stride_nlane)
 
-    stride_b = (stride_n0_i32, stride_k0_i32, stride_klane_i32, stride_nlane_i32, 1)
-    layout_b = fx.make_layout(
-        (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
-    )
+    if klane_inner:
+        # Dims: (N0, K0, NLane=16, L_sub=4, KLane=4)
+        # stride_b slots map to: (stride_n0, stride_k0, stride_NLane=64, stride_L_sub=16, stride_KLane=4)
+        stride_lsub_i32 = arith.index_cast(T.i32, fx.Index(16))
+        stride_b = (stride_n0_i32, stride_k0_i32, stride_nlane_i32, stride_lsub_i32, 4)
+        layout_b = fx.make_layout((n0_i32, c_k0_i32, 16, 4, klane_dim), stride_b)
+    else:
+        stride_b = (stride_n0_i32, stride_k0_i32, stride_klane_i32, stride_nlane_i32, 1)
+        layout_b = fx.make_layout(
+            (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
+        )
     return PreshuffleBLayout(layout_b=layout_b, kpack_bytes=kpack_bytes)
 
 
@@ -781,6 +825,10 @@ __all__ = [
     "swizzle_xor16",
     "tile_chunk_coord_i32",
     "xcd_remap_bx_by",
+    "load_b_raw_mxfp4",
+    "load_b_raw_mxfp4_dwordx4",
+    "load_b_raw_mxfp4_klane4",
+    "unpack_b_mxfp4_bf16",
 ]
 
 
@@ -1135,6 +1183,51 @@ def load_b_raw_mxfp4_dwordx4(
         elem_bytes=1,
         offset_in_bytes=True,
         cache_modifier=cache_modifier,
+    )
+    return vector.bitcast(T.vec(4, T.i32), b16)
+
+
+def load_b_raw_mxfp4_klane4(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    arg_b,
+    b_rsrc,
+    layout_b,
+    base_k,
+    n_blk,
+    n_intra,
+    lane_div_16,
+    elem_type,
+    kpack_bytes: int = 16,
+):
+    """Load 4 KLane dwords via buffer_load_dwordx4 from klane_inner layout.
+
+    Requires the layout produced by make_preshuffle_b_layout(klane_inner=True)
+    and weights shuffled by shuffle_weight_a16w4_sep_fp4.
+
+    Layout (N0, K0, NLane=16, L_sub=4, KLane=4): coord (n_blk, k0, n_intra, lane_div_16, 0).
+    Returns vec<4xi32> where element [j] = the dword for KLane=j at this thread's L_sub.
+    """
+    if kpack_bytes != 16:
+        raise ValueError(f"MXFP4 requires kpack_bytes=16, got {kpack_bytes!r}")
+
+    c128 = fx.Index(128)
+    k0 = base_k // c128
+
+    coord = (n_blk, k0, n_intra, lane_div_16, fx.Index(0))
+    idx = crd2idx(coord, layout_b)
+
+    b16 = _buffer_load_vec(
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx,
+        elem_type=elem_type,
+        vec_elems=16,
+        elem_bytes=1,
+        offset_in_bytes=True,
     )
     return vector.bitcast(T.vec(4, T.i32), b16)
 

@@ -59,6 +59,47 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     )
 
 
+def shuffle_weight_a16w4_sep_fp4(src: torch.Tensor) -> torch.Tensor:
+    """Preshuffle fp4 weights for FlyDSL SEPARATED mode (klane-contiguous layout).
+
+    Rearranges data so the 4 KLane dwords for each thread are contiguous in memory,
+    enabling buffer_load_dwordx4 instead of 4 separate buffer_load_dword calls.
+
+    New in-memory layout: (E, N0, K0, NLane=16, L_sub=4, KLane=4, 4_bytes)
+    where KLane is innermost (stride=4 bytes) and L_sub selects the kpack position.
+    Thread (L, I) loads dwordx4 at byte offset I*64 + L*16 to get KLane=0,1,2,3.
+    """
+    x_type = src.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        src = src.view(torch.uint8)
+    E, N, K_pk = src.shape
+    NLane = 16
+    KLane = 4
+    L_sub = 4  # KPack(16) // KLane(4)
+    N0 = N // NLane
+    K0 = K_pk // (KLane * L_sub * 4)  # KLane*L_sub*4 = 64 bytes per tile
+    # view as (E, N0, NLane, K0, KLane, L_sub, 4_bytes) then reorder
+    x_ = src.view(E, N0, NLane, K0, KLane, L_sub, 4)
+    x_ = x_.permute(0, 1, 3, 2, 5, 4, 6).contiguous()
+    return x_.view(E, N, K_pk).view(x_type)
+
+
+def shuffle_scale_a16w4_sep_fp4(src: torch.Tensor, experts_cnt: int) -> torch.Tensor:
+    """Preshuffle E8M0 scale for FlyDSL SEPARATED mode (KLane-contiguous layout).
+
+    Result: (c_mn1, c_k1, NLane=16, KLane=4) — enables buffer_load_dwordx4 for
+    all 4 KLane scale i32s in one VMEM instruction.
+    """
+    n_experts, k_ = src.shape
+    n_ = n_experts // experts_cnt
+    K_Pack, N_Pack, N_Lane, K_Lane = 2, 2, 16, 4
+    K1 = k_ // K_Pack // K_Lane
+    N1 = n_ // N_Lane // N_Pack
+    shfl = src.view(experts_cnt, N1, N_Pack, N_Lane, K1, K_Pack, K_Lane)
+    shfl = shfl.permute(0, 1, 4, 3, 6, 5, 2).contiguous()
+    return shfl.view(*src.shape).contiguous()
+
+
 def shuffle_weight_NK(
     x: torch.Tensor, inst_N: int, inst_K: int, use_int4=False
 ) -> torch.Tensor:
