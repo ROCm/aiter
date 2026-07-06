@@ -75,6 +75,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import weakref
 from pathlib import Path
 from typing import Optional
 
@@ -93,11 +94,21 @@ _DISPATCH_TABLE: Optional[dict] = None
 _DISPATCH_CACHE: dict[tuple, dict] = {}
 
 # Skew compacted-static-grid: launch only occupied (group, m-tile) blocks via a
-# device-built TILE_MAP. Wins on small-B inference skew (B120: +8-26% amortized
-# vs envelope grid on gfx942); loses on B1024_D512 (L2 thrash) -> gated here.
-# The map is cached keyed on seq_offsets.data_ptr() so a forward pass that
-# reuses the same offsets tensor amortizes the ~1us GPU prep (deployment truth).
-SKEW_COMPACT_MAX_GROUPS = 120
+# device-built TILE_MAP. Enabled for skew on gfx942 across batch sizes; the map
+# is cached keyed on seq_offsets.data_ptr() so a forward pass that reuses the
+# same offsets tensor amortizes the ~1us GPU prep (deployment truth).
+#   - B120 small-weight (D256): naive group-major order (few small Dense[b] fit
+#     L2, +8-26% amortized vs envelope grid).
+#   - large-B (B1024) OR large-weight (D>=512): F3 XCD-aware order (see
+#     _skew_compact_xcd) -- the naive group-major order hands each XCD a
+#     stride-nXCD sample of the group-major tiles so every XCD's 4MB private L2
+#     is asked to hold ~all groups' Dense[b] and THRASHES (the old B1024_D512
+#     -13% loss that gated compact off for large B). Clustering C consecutive
+#     group-major tiles onto one XCD restores L2 reuse: B1024_D512 skew L2 hit
+#     36->75%, HBM read 6.6->1.8 GB/launch, -20% cold-L2 time.
+SKEW_COMPACT_MAX_GROUPS = 4096  # upper guard on TILE_MAP size (headline B in {120,1024})
+SKEW_COMPACT_XCD_C = 32  # F3 chunk C (HipKittens Algorithm 1) for the compact grid
+SKEW_COMPACT_XCD_W = 8  # F3 window W
 _TILE_MAP_CACHE: dict[int, tuple] = {}
 
 # Inert defaults for the full forward-compatible config schema. The keys the
@@ -215,20 +226,41 @@ def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int, arch: Optional
     return True
 
 
+def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[Optional[int], Optional[int]]:
+    """F3 XCD-aware compact tile order (xcd_c, xcd_w), or (None, None) = naive
+    group-major (xcd_c defaults to 1 in the kernel). The reorder wins wherever
+    the concurrent Dense[b] weight working set thrashes each XCD's 4MB private
+    L2 -- large-B (B1024) OR large-weight (reduction_K >= 512). It was measured a
+    -9% LOSS on the tiny small-weight small-B B120_D256 cell (few 64KB weight
+    slices already fit L2, so the remap is pure overhead), which stays naive."""
+    if n_groups > 120 or reduction_k >= 512:
+        return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
+    return None, None
+
+
 def _get_skew_tile_map(seq_offsets, n_groups: int, max_seq_len: int, block_m: int):
     """Return (tile_map, upper_bound) for the compact skew kernel, with caching.
 
     L = seq_offsets[-1] is read from the device only on a cache miss (once per
-  buffer); repeating .item() every call would sync the GPU each do_bench rep."""
+    buffer); repeating .item() every call would sync the GPU each do_bench rep.
+
+    Keyed on data_ptr but VALIDATED by tensor OBJECT IDENTITY (a weakref to the
+    exact seq_offsets that built the map). data_ptr alone is unsafe: the torch
+    caching allocator recycles freed addresses, so a later tensor with DIFFERENT
+    content can land on a cached address and receive a stale map sized for the
+    wrong problem (silent cos=0 wrong output -- observed when B1024 skew offsets
+    reused a freed B120 address). The `is` check forces a rebuild whenever the
+    tensor identity (or block_m) changes, while a genuine within-forward reuse of
+    the SAME offsets tensor still hits and amortizes the ~1us device prep."""
     key = seq_offsets.data_ptr()
     hit = _TILE_MAP_CACHE.get(key)
-    if hit is not None:
-        return hit
+    if hit is not None and hit[0]() is seq_offsets and hit[1] == block_m:
+        return hit[2], hit[3]
     L = int(seq_offsets[-1].item())
     tile_map, ub = build_tile_map_device_fused(
         seq_offsets, n_groups, L, max_seq_len, block_m=block_m
     )
-    _TILE_MAP_CACHE[key] = (tile_map, ub)
+    _TILE_MAP_CACHE[key] = (weakref.ref(seq_offsets), block_m, tile_map, ub)
     return tile_map, ub
 
 
@@ -425,6 +457,7 @@ def jagged_dense_bmm_dispatched(
     if _skew_compact_enabled(uniform_seqlen=uniform_seqlen, n_groups=n_groups, arch=arch):
         block_m = int(cfg.get("tile_m") or 128)
         tile_map, ub = _get_skew_tile_map(SEQ_OFFSETS, n_groups, max_seq_len, block_m)
+        sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
         return jagged_dense_bmm(
             C,
             A,
@@ -434,6 +467,8 @@ def jagged_dense_bmm_dispatched(
             n_groups,
             max_seq_len,
             stream=stream,
+            xcd_c=sc_xcd_c,
+            xcd_w=sc_xcd_w,
             use_mfma_k32=cfg["use_mfma_k32"],
             uniform_seqlen=False,
             tile_map=tile_map,

@@ -116,6 +116,53 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     return row, col
 
 
+def _xcd_remap_compact(xy, num_rows_rt, num_cols, C, W, nXCD=NXCD):
+    """Runtime-``num_rows`` variant of :func:`_xcd_remap` for the COMPACT skew
+    grid. Same HipKittens Algorithm 1 (Phase 1 C-chunk + Phase 2 W-window), but
+    ``num_rows`` (= total_occ_tiles, the compact grid's x-extent) is DATA-
+    dependent (varies per seq_offsets), so it arrives as a runtime uniform
+    ``fx.Int32`` instead of a Python int -- this keeps the kernel from
+    recompiling per unique occupied-tile count. ``num_cols`` (= N_BLOCKS), ``C``,
+    ``W`` stay compile-time Python ints.
+
+    Logical 2D grid: row = occupied-tile index into the group-major TILE_MAP,
+    col = block_n_idx. Phase 1 clusters C consecutive TILE_MAP rows (= C
+    consecutive group-major occupied M-tiles, i.e. one-or-a-few whole groups)
+    onto ONE XCD so that group's Dense[b] weight stays resident in that XCD's
+    private L2. Bijection over [0, num_rows*num_cols) for ANY C/W (the tail is
+    identity-mapped and the last window is clamped), so no occupied tile is
+    dropped or duplicated (cos must stay 1.0)."""
+    xy = fx.Int32(xy)
+    nrows = fx.Int32(num_rows_rt)
+    c_num_cols = fx.Int32(num_cols)
+    cnXCD = fx.Int32(nXCD)
+    cC = fx.Int32(C)
+    total = nrows * c_num_cols          # runtime: total launched blocks
+    period = fx.Int32(nXCD * C)         # compile-time product
+    prefix = total - (total % period)   # runtime largest multiple of period <= total
+
+    # Phase 1: XCD grouping on the divisible prefix; identity-map the (< period)
+    # tail so the whole map stays a bijection for ANY runtime total.
+    xcd = xy % cnXCD
+    local = xy // cnXCD
+    chunk_idx = local // cC
+    pos = local % cC
+    xy_g_remap = chunk_idx * (cnXCD * cC) + xcd * cC + pos
+    xy_g = (xy < prefix).select(xy_g_remap, xy)
+
+    # Phase 2: windowed 2D traversal (W rows tall) within the chunk.
+    cW = fx.Int32(W)
+    tids_per_grp = cW * c_num_cols
+    group_id = xy_g // tids_per_grp
+    first_row = group_id * cW
+    remaining = nrows - first_row
+    win_h = (remaining < cW).select(remaining, cW)  # last window may be short
+    l = xy_g % tids_per_grp
+    row = first_row + (l % win_h)
+    col = l // win_h
+    return row, col
+
+
 def make_bounded_buffer_tensor(tensor, num_records_bytes):
     """Like fx.rocdl.make_buffer_tensor but with a runtime byte bound, so the
     hardware OOB-drops stores past num_records_bytes."""
@@ -180,12 +227,30 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             # precomputed compact TILE_MAP, so no empty blocks are launched at all
             # (skew tail-waste elimination). N-block index is the z-dim (raw_b).
             tile_rsrc = fx.buffer_ops.create_buffer_resource(TILE_MAP, max_size=True)
-            base = fx.Int32(pid_mn) * fx.Int32(2)
+            if fx.const_expr(XCD_C > 1):
+                # --- F3: L2-residency-aware compact tile ordering ---
+                # The naive order (tile_row = pid_mn, n_block = z) hands each XCD a
+                # stride-nXCD sample of the group-major TILE_MAP -> every XCD touches
+                # nearly every group's Dense[b] -> each 4MB private L2 is asked to
+                # hold ~all groups' weights and THRASHES (the B1024_D512 -13% loss).
+                # Apply HipKittens Algorithm 1 to the compact grid so C consecutive
+                # group-major tiles co-locate on ONE XCD: the hardware routes raw
+                # linear id xy = z*gridDim.x + x to XCD (xy % nXCD), so remap xy to
+                # (tile_row, n_block). total_occ_tiles = gridDim.x is host-known but
+                # data-dependent, so read it at runtime (no per-count recompile).
+                total_occ = fx.Int32(fx.grid_dim.x)
+                raw_xy = fx.Int32(raw_b) * total_occ + fx.Int32(pid_mn)
+                tile_row, n_col = _xcd_remap_compact(raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W)
+                tile_row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), tile_row))
+                block_n_idx = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), n_col))
+            else:
+                tile_row = fx.Int32(pid_mn)
+                block_n_idx = fx.Int32(raw_b)
+            base = tile_row * fx.Int32(2)
             off_b = fx.buffer_ops.buffer_load(tile_rsrc, base, vec_width=1, dtype=fx.T.i32())
             block_m_idx = fx.buffer_ops.buffer_load(tile_rsrc, base + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
             off_b = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), off_b))
             block_m_idx = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), block_m_idx))
-            block_n_idx = fx.Int32(raw_b)
         else:
             # --- Chiplet (XCD) block-ID remap (HipKittens Algorithm 1) ---
             # The raw hardware linear block id for grid (gx,1,gz) is

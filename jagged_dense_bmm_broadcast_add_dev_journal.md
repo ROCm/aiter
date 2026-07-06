@@ -472,3 +472,37 @@ are empty early-exit blocks**, ~28% empty groups, partial-tile waste only ~4.3%.
   occupancy disadvantage) cost more than the baseline's cheap empty-block early-exits on these tiny
   0.1-0.3 ms kernels. **The compact STATIC grid wins precisely because it removes empties WITHOUT the
   persistent loop overhead** (hardware block scheduler load-balances for free). Persistent stays gfx95x-only.
+
+## 2026-07-06 (frontier batch 2 -- off-the-MFMA-cadence levers F1/F2/F3; F3 RUNG CLIMBED)
+
+Batch 1 (R1-R3) fixed that the DENSE math is at the gfx942 MFMA-issue-latency ceiling. Batch 2 attacked
+the axes the campaign proved are NOT capped (latency/overhead-bound, HBM 25-32% peak): epilogue fixed
+cost, the A-read critical path via a new mechanism, and the skew launch schedule's L2 residency. 3-way
+fan-out (worktree + subagent per lever, GPU 5, flock-serialized), HEAD `fbeb51990`. Net: **1 rung climb
+(F3), 1 flat, 1 hardware-blocked -- the recoverable frontier is structural (HBM-traffic), not compute.**
+
+- **F3 -- L2-residency-aware compact tile order -- RUNG CLIMBED (folded).** The skew compact grid was
+  launching occupied tiles in naive group-major order; the hardware XCD routing (`xy % 8`) then hands
+  each XCD a stride-8 sample of the group-major map, so every 4MB private L2 is asked to hold ~all
+  groups' `Dense[b]` and thrashes (the old B1024_D512 -13% that gated compact off for large B). Applying
+  HipKittens Algorithm 1 (C=32,W=8) to the compact grid clusters C consecutive group-major tiles on one
+  XCD -> **B1024_D512 skew L2 hit 36.3->75.2%, HBM read 6.6->1.8 GB/launch, -19% cold-L2 (2.471->1.992
+  ms); B1024_D256 -17% (0.828->0.686); B120_D512 -11% (0.308->0.273 bonus).** All skew now ~1.5-1.6x
+  Triton (large-B was 1.24-1.33x). `num_rows` is data-dependent so `_xcd_remap_compact` reads it at
+  runtime (`fx.grid_dim.x`, no per-count recompile); bijection preserved -> cos=1.0 (4 skew + 12 edges).
+  Gate widened (`SKEW_COMPACT_MAX_GROUPS` 120->4096); XCD order iff `n_groups>120 OR reduction_k>=512`,
+  else naive (B120_D256 stays naive: reorder was -9% there). Uniform untouched (verified unchanged).
+  Also fixed a latent cache-collision correctness bug: the `seq_offsets.data_ptr()` key could return a
+  stale map after the torch allocator recycled an address (silent cos=0); now validated by tensor object
+  identity (`weakref.ref` + `is`), which also hardens the already-shipped B120 path.
+- **F1 -- epilogue latency -- FLAT (frontier narrowed).** gfx942 runs 2 workgroups/CU (~3.83 waves),
+  which ALREADY hides the epilogue's barriers + LDS round-trip via inter-workgroup overlap. Proven two
+  ways: (a) a dedicated C-shuffle LDS buffer (to drop more barriers) adds 32KB atop the 32KB A-staging,
+  crosses the 64KB/CU ceiling and halves occupancy (MeanOccupancyPerActiveCU 3.83->1.98) -> +17-31%
+  REGRESS; (b) dropping the provably-dead pre-shuffle barrier at constant occupancy moves s_barrier 7->6
+  yet costs 0 time. The occupancy-neutral register-permute transpose is BLOCKED in FlyDSL (tiled-copy
+  atoms don't cross lanes; no ds_bpermute/permlane lowering) and has ~0 EV by (b). Region closed.
+- **F2 -- ds_read_tr swizzle-free A staging -- BLOCKED (hardware).** The `ds_read_tr` transpose-LDS-read
+  family is CDNA4/gfx950-only: `llc -mcpu=gfx942` gives "Cannot select intrinsic llvm.amdgcn.ds.read.
+  tr16.b64" and `llvm-mc` rejects the asm "not supported on this GPU" (gfx950 control passes). Same class
+  of hardware absence as the missing K=32 MFMA atom. Region permanently closed on gfx942.

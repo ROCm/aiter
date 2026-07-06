@@ -3,7 +3,7 @@
   "by_arch": {
     "gfx942": {
       "gfx": "gfx942",
-      "source": "tier-A XCD-remap autotune (gfx942 MI300X, 2026-06-10) + skew compact static grid for B120 (2026-07-06): tune_jdbba_xcd.py cold-L2 do_bench; skew B120 uses compact TILE_MAP (device prep cached per seq_offsets ptr, amortized across forward); B1024 skew stays envelope grid. Bench: op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test.",
+      "source": "tier-A XCD-remap autotune (gfx942 MI300X, 2026-06-10) + skew compact static grid (2026-07-06) + F3 L2-residency compact tile ordering (2026-07-06): tune_jdbba_xcd.py cold-L2 do_bench; ALL skew now uses the compact TILE_MAP (device prep cached per seq_offsets object, amortized across forward). B120_D256 skew uses naive group-major order; large-B (B1024) OR large-weight (D>=512) skew uses the F3 XCD-aware order (xcd_c=32, xcd_w=8) which clusters a group's M-tiles on one XCD's L2 (B1024_D512 skew L2 hit 36->75%, -20% time; B1024_D256 -15%, B120_D512 -12%). Skew routing is code-gated in jagged_dense_bmm_dispatch_v2.py (_skew_compact_xcd), NOT in this JSON. Bench: op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py --regime both --metric time -test.",
       "winners": {
         "B120D256K256N7680": {
           "use_mfma_k32": false,

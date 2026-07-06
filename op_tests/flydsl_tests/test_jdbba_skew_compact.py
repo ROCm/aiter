@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Skew compacted-static-grid: dispatch correctness on B120 skew shapes.
+"""Skew compacted-static-grid: dispatch correctness on skew shapes.
 
-Verifies jagged_dense_bmm_dispatched(..., uniform_seqlen=False) routes B120 skew
-through the compact TILE_MAP path (cos>0.999 vs torch eager). B1024 skew stays
-on the envelope grid (no compact gate).
+Verifies jagged_dense_bmm_dispatched(..., uniform_seqlen=False) routes skew through
+the compact TILE_MAP path (cos>0.999 vs torch eager). B120_D256 uses the naive
+group-major tile order; large-B (B1024) or large-weight (D>=512) skew uses the F3
+XCD-aware order (Dense[b] L2 residency). Both must stay a bijection over occupied
+tiles -> cos=1.0.
 
 Run (inside container):
     HIP_VISIBLE_DEVICES=5 FLYDSL_RUNTIME_ENABLE_CACHE=0 \\
