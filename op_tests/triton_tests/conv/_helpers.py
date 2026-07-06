@@ -99,9 +99,12 @@ def apply_activation(y: torch.Tensor, activation: str):
 
 
 # -- Architecture gating ------------------------------------------------------
+# NOTE: CDNA configs are not tuned at all - these are included only so
+# correctness tests can run on CDNA hardware without being skipped.
+# AITER Triton CI relies on CDNA runners.
 SUPPORTED_ARCHS = {
     "RDNA": {"gfx1200", "gfx1201"},
-    "CDNA": set(),
+    "CDNA": {"gfx942", "gfx950"},
 }
 
 # Flat union for arch-check use sites.
