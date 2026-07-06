@@ -649,6 +649,9 @@ def moe_gemm_a4w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             GatherIndx=gather_indx,
         )
+        clamp_bounds = (K % config["block_k"] != 0) or (
+            triton.cdiv(K, config["block_k"]) < config["num_buffers"]
+        )
         # launch gluon kernel
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
@@ -700,6 +703,7 @@ def moe_gemm_a4w4(
             L2_PREFETCH_DISTANCE=config["l2_prefetch_distance"],
             X_SCALES_TDM=config.get("x_scales_tdm", False),
             EVEN_K=K % config["block_k"] == 0,
+            CLAMP_BOUNDS=clamp_bounds,
             **layouts,
             num_ctas=1 if gather_indx is not None else config["num_ctas"],
             num_warps=config["num_warps"],
