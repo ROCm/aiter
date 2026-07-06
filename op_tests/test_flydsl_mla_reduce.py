@@ -490,6 +490,130 @@ def test_splitk_disabled_by_default(monkeypatch):
     assert not engage
 
 
+# ---------------------------------------------------------------------------
+# Device-adaptive, capture-safe, default-able split-K (through the production
+# wrapper flydsl_mla_reduce_v1). Unlike the opt-in plan_splitk above, the plan is
+# taken from HOST-only values (final_output.size(0), num_kv_splits, num_cu) with
+# no device read, so it can engage under CUDA-graph capture and is on by default.
+# ---------------------------------------------------------------------------
+
+
+def _build_da_single_tile(out_dtype, splits, pool=304):
+    """One active tile (bs=1: final_output has a single row) with `splits`
+    splits, partial pool sized to `pool` so the split count can be MUTATED up to
+    `pool` across CUDA-graph replays (the device-adaptive stress)."""
+    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+        [splits], _SPLITK_H, _SPLITK_DV, out_dtype, M=1, gap_stride=1,
+        pool_slack=pool - splits,
+    )
+    pmap = torch.arange(pool, dtype=torch.int32, device=pmap.device)
+    return po, pl, indptr, fmap, pmap, fout, flse
+
+
+def test_da_splitk_no_engage_large_batch():
+    """Default-safe: a saturated grid (base_slots >= num_cu) never engages, so
+    large-batch decode keeps the unchanged single-kernel path."""
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
+
+    engage, _, _ = plan_splitk_capture_safe(
+        num_final_rows=32, H=16, max_seqlen_q=1, num_kv_splits=128, num_cu=304
+    )
+    assert not engage
+
+
+def test_da_splitk_no_engage_low_splits():
+    """Default-safe: too few splits (num_kv_splits < min) never engages, so the
+    combine kernel is not paid on short-context / low-split decode."""
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
+
+    engage, _, _ = plan_splitk_capture_safe(
+        num_final_rows=1, H=16, max_seqlen_q=1, num_kv_splits=32, num_cu=304
+    )
+    assert not engage
+
+
+@pytest.mark.slow
+def test_da_splitk_wrapper_vs_hip(monkeypatch):
+    """The default-able wrapper path (DA split-K on) matches HIP for b1_s128."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
+        out_dtype, 128, pool=128
+    )
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=128
+        )
+
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_da_splitk_capture_safe_varying_splits(monkeypatch):
+    """THE capture-safety proof: ONE CUDA-graph capture (bs=1, grid/K/scratch
+    baked from host num_kv_splits) stays correct across replays whose per-tile
+    split count changes ON-DEVICE. The opt-in plan_splitk cannot do this (its
+    grid/K come from a .item() read of the CSR at capture time)."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    pool = 304
+    nkv = 128
+    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
+        out_dtype, pool, pool=pool
+    )
+    engage, K, slots = plan_splitk_capture_safe(
+        num_final_rows=1, H=_SPLITK_H, max_seqlen_q=1, num_kv_splits=nkv,
+        num_cu=304,
+    )
+    assert engage and slots == _SPLITK_H, "DA split-K must engage for bs=1"
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=nkv
+        )
+
+    # Warm up, then capture ONCE (grid/K/scratch fixed for this bs=1 bucket).
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        run()
+        side.synchronize()
+        with torch.cuda.graph(graph, stream=side):
+            run()
+    torch.cuda.current_stream().wait_stream(side)
+
+    # Replay the SAME graph with DIFFERENT per-tile split counts (bs fixed): the
+    # device reads the mutated CSR each replay and adapts its K allocation.
+    for s_k in [128, 304, 64, 200, 8, 96]:
+        indptr[1] = s_k  # mutate the captured CSR in place (host->device copy)
+        fout.zero_()
+        flse.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_out, ref_lse = torch_ref_gather(
+            po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+        )
+        _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("num_kv_splits", [32, 128])
 def test_wrapper_host_tier_dispatch_cudagraph_replay(monkeypatch, num_kv_splits):

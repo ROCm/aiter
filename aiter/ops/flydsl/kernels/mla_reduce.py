@@ -1089,6 +1089,82 @@ def plan_splitk(*, active_tiles, H, max_seqlen_q, max_splits, num_cu):
     return True, int(K), int(base_blocks)
 
 
+def da_splitk_enabled() -> bool:
+    """Gate for the DEVICE-ADAPTIVE, capture-safe split-K (default ON).
+
+    Unlike :func:`splitk_enabled` (opt-in; its host plan reads the device CSR via
+    ``.item()`` so it only works outside graph capture), this path takes ALL its
+    launch-time decisions from host-visible values already on the wrapper stack
+    (``final_output.size(0)``, ``num_kv_splits``, ``num_cu``) -- no device read,
+    no sync -- so it is safe to enable by default. Set
+    ``AITER_MLA_REDUCE_DA_SPLITK=0`` to force it off.
+    """
+    return os.environ.get("AITER_MLA_REDUCE_DA_SPLITK", "1") == "1"
+
+
+def plan_splitk_capture_safe(
+    *, num_final_rows, H, max_seqlen_q, num_kv_splits, num_cu
+):
+    """Capture-safe, DEFAULT-ABLE split-K plan from HOST-ONLY values.
+
+    Returns ``(engage, K, num_slots)`` deciding split-K purely from values known
+    on the host at launch, with NO device read (unlike :func:`plan_splitk`, which
+    reads ``active_tiles``/``max_splits`` off the CSR via ``.item()`` and thus
+    cannot run under CUDA-graph capture):
+
+    * ``num_final_rows`` = ``final_output.size(0)`` = the decode batch size = the
+      number of active reduce tiles (active tiles are the CSR prefix ``[0, bs)``),
+      so ``base_slots = num_final_rows * H`` is a capture-safe count of active
+      (tile, head) combine slots -- and the grid/scratch derived from it are fixed
+      for a given CUDA-graph capture (one graph per batch-size bucket).
+    * ``num_kv_splits`` is the host split budget (= ``max_split_per_batch`` on the
+      aiter decode dispatch): a true UPPER BOUND on every tile's actual
+      ``n_splits`` (the metadata caps splits at it). It is a pure PERFORMANCE
+      heuristic here (correctness is independent of it -- the per-tile K
+      allocation is decided on-device from the actual ``n_splits``), so gating on
+      it can never corrupt output, only mis-tune.
+
+    Engage only when the grid is otherwise IDLE (few active tiles ->
+    ``base_slots < num_cu``) AND the split budget is high enough to amortize the
+    combine kernel (``num_kv_splits >= min_splits``, default 64). Large-batch
+    decode (grid already saturated) keeps the single-kernel path unchanged.
+
+    Because ``num_kv_splits`` upper-bounds the actual splits, ``< min_splits``
+    provably means the win is unavailable (the measured single-vs-split crossover
+    is ~32-40 actual splits) so skipping is free. The one imperfect case is an
+    OVER-PROVISIONED budget (``>= min_splits`` but the actual context is short):
+    engaging then costs ~1-2us of combine floor on an already-cheap op. In a
+    context-sized serving stack ``max_split_per_batch`` tracks the context so this
+    does not arise; raise ``MLA_SPLITK_MIN_SPLITS`` if the budget is loose.
+
+    CORRECTNESS is device-adaptive and independent of this plan: the partial
+    kernel reads each tile's real ``n_splits`` on-device and reduces its own
+    contiguous chunk ``[j*ceil(n/K), ...)``; chunks past the end are empty and the
+    combine weights them by ``exp(-inf)=0``. So the SAME captured (grid, K,
+    scratch) stays correct across replays whose per-tile split counts differ
+    (fixed batch bucket, varying context) -- the capture-safety property the
+    opt-in ``plan_splitk`` cannot provide.
+    """
+    if not da_splitk_enabled():
+        return False, 1, 0
+    factor = int(os.environ.get("MLA_SPLITK_FACTOR", _SPLITK_FACTOR_DEFAULT))
+    min_splits = int(
+        os.environ.get("MLA_SPLITK_MIN_SPLITS", _SPLITK_MIN_SPLITS_DEFAULT)
+    )
+    if max_seqlen_q != 1:
+        return False, 1, 0  # decode-only prototype (NTG == 1)
+    if num_kv_splits < min_splits:
+        return False, 1, 0  # perf heuristic: too few splits to amortize combine
+    base_slots = num_final_rows * H
+    if base_slots <= 0 or base_slots >= num_cu:
+        return False, 1, 0  # grid already saturated; split-K would not help
+    K = max(2, min(factor, num_kv_splits))
+    # Keep the partial grid within ~2 waves of the CU count.
+    while K > 2 and base_slots * K > 2 * num_cu:
+        K //= 2
+    return True, int(K), int(base_slots)
+
+
 @functools.lru_cache(maxsize=64)
 def _get_splitk_scratch(num_slots: int, K: int, Dv: int, device_index: int):
     """Pre-allocate (once) the split-K scratch: partial weighted-output

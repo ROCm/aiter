@@ -24,7 +24,10 @@ import torch
 from .kernels.mla_reduce import (
     LDS_MAX_SPLITS,
     Tier,
+    _get_splitk_scratch,
     compile_mla_reduce,
+    compile_mla_reduce_splitk,
+    plan_splitk_capture_safe,
     select_tier,
     should_use_persistent_launch,
     waves_per_eu_from_env,
@@ -155,6 +158,65 @@ def flydsl_mla_reduce_v1(
         num_reduce_tile=num_reduce_tile,
         num_cu=num_cu,
     )
+
+    # -------- Device-adaptive, capture-safe split-K (default-able) ----------
+    # For low-active-tile / high-split decode the persistent grid is mostly idle
+    # (few (tile,head) slots vs num_cu); split each active tile's reduction across
+    # K cooperating partial blocks, then combine. The plan is HOST-only (no device
+    # read/sync) so it is safe under CUDA-graph capture and on by default; the
+    # per-tile K allocation is device-adaptive so a single capture stays correct
+    # as the per-tile split counts vary across replays. Needs reduce_final_map
+    # (the combine reads each tile's q-range).
+    if use_reduce_final_map:
+        engage_sk, sk_K, sk_slots = plan_splitk_capture_safe(
+            num_final_rows=int(final_output.size(0)),
+            H=H,
+            max_seqlen_q=max_seqlen_q,
+            num_kv_splits=int(num_kv_splits),
+            num_cu=num_cu,
+        )
+        if engage_sk:
+            launch_partial, launch_combine = compile_mla_reduce_splitk(
+                H=H,
+                Dv=Dv,
+                out_dtype=out_dtype_str,
+                K=sk_K,
+                output_lse=output_lse,
+                waves_per_eu=waves_per_eu_from_env(),
+            )
+            sk_acc, sk_ml = _get_splitk_scratch(
+                sk_slots, sk_K, Dv, final_output.device.index
+            )
+            if final_lse is None:
+                final_lse = torch.empty(
+                    1, dtype=torch.float32, device=final_output.device
+                )
+            if stream is None:
+                stream = torch.cuda.current_stream(final_output.device)
+            launch_partial(
+                partial_output,
+                partial_lse,
+                reduce_indptr,
+                reduce_partial_map,
+                sk_acc,
+                sk_ml,
+                int(partial_output.size(0)),
+                sk_slots * sk_K,
+                stream,
+            )
+            launch_combine(
+                reduce_final_map,
+                sk_acc,
+                sk_ml,
+                final_output,
+                final_lse,
+                int(final_output.stride(-3)),
+                int(final_output.stride(-2)),
+                int(final_output.size(0)),
+                sk_slots,
+                stream,
+            )
+            return
 
     # Capture-safe tier selection. Default: Tier.ALL (device-side per-tile
     # branch), correct for any data. Opt-in: host per-tier dispatch, but GUARDED
