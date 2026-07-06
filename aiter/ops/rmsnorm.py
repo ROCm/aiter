@@ -385,6 +385,19 @@ def _rms_norm_fwd_fake(
     return torch.empty_like(input)
 
 
+def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
+    # main routed the bf16/fp16, hidden<=8192, non-T5, 2-D case to the hand-tuned HIP
+    # module_rmsnorm_quant (add_rmsnorm_quant_kernel); opus handles the rest (fp32, T5,
+    # hidden>8192, non-2-D) that the CK module_rmsnorm used to cover. Keeping the hot path
+    # on the HIP kernel avoids a perf regression vs main (opus generic is slower here).
+    return (
+        use_model_sensitive_rmsnorm == 0
+        and input.dim() == 2
+        and input.element_size() == 2
+        and input.shape[-1] <= 8192
+    )
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
 def rms_norm(
     input: Tensor,
@@ -393,7 +406,7 @@ def rms_norm(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
     """rmsnorm (opus; fp16/bf16/fp32)."""
-    return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    return rmsnorm2d_fwd(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
@@ -403,6 +416,10 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
+    if _use_hip_common(input, use_model_sensitive_rmsnorm):
+        out = torch.empty_like(input)
+        rmsnorm(out, input, weight, epsilon)  # fast HIP module_rmsnorm_quant
+        return out
     return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
@@ -419,6 +436,11 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    if _use_hip_common(input, use_model_sensitive_rmsnorm):
+        add_rmsnorm(  # fast HIP module_rmsnorm_quant
+            out, input, residual_in, residual_out, weight, epsilon, gemma_norm
+        )
+        return
     rmsnorm2d_fwd_with_add_opus(
         out,
         input,
@@ -482,9 +504,12 @@ def rmsnorm2d_fwd_with_dynamicquant(
     shuffle_scale: bool = False,
 ) -> None:
     if group_size == 0 and not shuffle_scale:
-        rmsnorm2d_fwd_with_dynamicquant_opus(
-            out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
-        )
+        if _use_hip_common(input, use_model_sensitive_rmsnorm):
+            rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast HIP
+        else:
+            rmsnorm2d_fwd_with_dynamicquant_opus(
+                out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
+            )
     else:
         # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
         assert (
@@ -506,16 +531,21 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     shuffle_scale: bool = False,
 ) -> None:
     if group_size == 0 and not shuffle_scale:
-        rmsnorm2d_fwd_with_add_dynamicquant_opus(
-            out,
-            input,
-            residual_in,
-            residual_out,
-            yscale,
-            weight,
-            epsilon,
-            use_model_sensitive_rmsnorm,
-        )
+        if _use_hip_common(input, use_model_sensitive_rmsnorm):
+            add_rmsnorm_quant(  # fast HIP
+                out, input, residual_in, residual_out, yscale, weight, epsilon
+            )
+        else:
+            rmsnorm2d_fwd_with_add_dynamicquant_opus(
+                out,
+                input,
+                residual_in,
+                residual_out,
+                yscale,
+                weight,
+                epsilon,
+                use_model_sensitive_rmsnorm,
+            )
     else:
         # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
         assert (
