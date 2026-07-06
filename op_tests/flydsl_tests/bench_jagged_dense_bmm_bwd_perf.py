@@ -3,10 +3,11 @@
 #
 # triton.testing.perf_report-style benchmark for the BACKWARD pass of
 # jagged_dense_bmm_broadcast_add (jdbba), the companion to
-# bench_jagged_dense_bmm_perf.py. Reports time / throughput / bandwidth for the
-# upstream Meta/HSTU Triton backward kernels. The corresponding FlyDSL backward
-# kernels are wired up in a follow-up step (the provider plumbing is already in
-# place; only "triton" is enabled today).
+# bench_jagged_dense_bmm_perf.py. Reports time / throughput / bandwidth for both
+# the upstream Meta/HSTU Triton backward kernels and the FlyDSL backward. The
+# FlyDSL path is reached through its packaged aiter entrypoint
+# (aiter.ops.flydsl.jagged_dense_bmm_bwd_dispatched) for the full backward, plus
+# the raw per-component launchers for component-level (jagged / dense_bias) timing.
 #
 # Given the forward
 #     Out[s:e, :] = Jagged[s:e, :] @ Dense[b] + Bias[b][None, :]   per group b
@@ -41,34 +42,28 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+from pathlib import Path
 
 import torch
 import triton
 
-# The FlyDSL backward kernels (jagged_dense_bmm_bwd.py) use *bare* sibling imports
-# (`from jagged_dense_bmm import ...`), so the kernels dir must be on sys.path and
-# the modules imported by their bare names -- exactly how the example/profile
-# drivers next to them do it. Importing as aiter.ops.flydsl.kernels.* would break
-# those sibling imports.
-_KERNELS_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "..", "aiter", "ops", "flydsl", "kernels"
-)
-_KERNELS_DIR = os.path.abspath(_KERNELS_DIR)
-if _KERNELS_DIR not in sys.path:
-    sys.path.insert(0, _KERNELS_DIR)
+# Make `aiter` importable when this file is run directly as a script (sys.path[0]
+# is then this dir, not the repo root). Repo root = .../meta/aiter (the dir that
+# contains the `aiter` package), two levels up from op_tests/flydsl_tests/.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
+# The FlyDSL backward is imported the aiter way now (no sys.path hack): the
+# packaged wrapper for the full backward, plus the kernel module for the raw
+# per-component launchers + tiling constants. The kernel module resolves its
+# forward constants dual-path, so importing it as an aiter package submodule
+# works (the old bare-sibling shim is gone).
 try:
     import flydsl.compiler as flyc  # noqa: E402
-    from jagged_dense_bmm import BLOCK_M as _FLY_BLOCK_M  # noqa: E402
-    from jagged_dense_bmm import K as _FLY_K  # noqa: E402
-    from jagged_dense_bmm import N as _FLY_N  # noqa: E402
-    from jagged_dense_bmm_bwd import (  # noqa: E402
-        SPLIT as _FLY_SPLIT,
-        grad_dense_bias as _fly_grad_dense_bias,
-        grad_jagged as _fly_grad_jagged,
-    )
+    from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched as _fly_bwd_dispatched  # noqa: E402
+    from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd  # noqa: E402
 
     _HAS_FLYDSL = True
 except Exception as _fexc:  # pragma: no cover - environment dependent
@@ -181,57 +176,67 @@ def _triton_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
 def _flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
     """Build the do_bench closure for the FlyDSL backward component(s).
 
-    Mirrors the host wiring in example_jagged_dense_bmm_bwd.py. The FlyDSL kernels
-    take N/K as *compile-time* constants (jagged_dense_bmm.py), so the requested
-    D (=K) and Kout (=N) must match the compiled values -- assert loudly otherwise.
+    D (= K = N) is a compile-time constant the kernels snapshot on the first
+    launch, so it is pinned here via configure_dim(K). The bench therefore runs
+    ONE D per process (custom -b/-d/-kout); a default multi-D sweep would trip the
+    single-D snapshot on the second shape.
+
+    Timing methodology:
+      * component == "all" -> the packaged wrapper (jagged_dense_bmm_bwd_dispatched),
+        i.e. the production path. It allocates its grad outputs per call, so this
+        measures the real end-to-end op cost (alloc + all three launches), NOT the
+        steady-state kernel-only time of the per-component closures.
+      * component in {"jagged","dense_bias"} -> raw launchers over PRE-ALLOCATED
+        buffers reused across iters, for steady-state kernel-only timing that is
+        apples-to-apples with the split Triton kernels.
     """
-    if (K, N) != (_FLY_K, _FLY_N):
-        raise ValueError(
-            f"FlyDSL kernels are compiled for K={_FLY_K}, N={_FLY_N} but the bench "
-            f"shape needs K={K}, N={N}. Set K/N in "
-            f"aiter/ops/flydsl/kernels/jagged_dense_bmm.py to match this shape."
-        )
+    # Pin the square dim for this process (K == N == D here).
+    _bwd.configure_dim(K)
+    BLOCK_M = _bwd.BLOCK_M
+    SPLIT = _bwd.SPLIT
 
     device = jagged.device
     total_rows = jagged.shape[0]
     stream = torch.cuda.current_stream()
+
+    if component == "all":
+        def run_all():
+            return _fly_bwd_dispatched(
+                jagged, dense, d_out, seq_offsets, n_groups=B, max_seq_len=Mi, stream=stream
+            )
+
+        return run_all
+
     tDOut = flyc.from_dlpack(d_out).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
-    # dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall.
-    dense_kn = dense.reshape(B * K, N).contiguous()
-    d_jagged = torch.zeros(total_rows + _FLY_BLOCK_M, K, dtype=torch.bfloat16, device=device)
-    tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+    if component == "jagged":
+        # dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall.
+        dense_kn = dense.reshape(B * K, N).contiguous()
+        d_jagged = torch.zeros(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
+        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
-    def run_jagged():
-        _fly_grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, B, Mi, stream=stream)
-        return d_jagged[:total_rows]
+        def run_jagged():
+            _bwd.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, B, Mi, stream=stream)
+            return d_jagged[:total_rows]
 
-    # dDense (+ dBias) split-reduction scratch + outputs.
+        return run_jagged
+
+    # component == "dense_bias": dDense (+ fused dBias) split-reduction.
     d_dense = torch.zeros(B, K, N, dtype=torch.bfloat16, device=device)
     d_dense_v = d_dense.view(B * K, N)
-    dense_partials = torch.zeros(B * _FLY_SPLIT * K, N, dtype=torch.float32, device=device)
+    dense_partials = torch.zeros(B * SPLIT * K, N, dtype=torch.float32, device=device)
     d_bias = torch.zeros(B, N, dtype=torch.bfloat16, device=device)
-    bias_partials = torch.zeros(B * _FLY_SPLIT, N, dtype=torch.float32, device=device)
+    bias_partials = torch.zeros(B * SPLIT, N, dtype=torch.float32, device=device)
     tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
     def run_dense_bias():
-        _fly_grad_dense_bias(
+        _bwd.grad_dense_bias(
             d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
             bias_partials, B, Mi, stream=stream
         )
         return d_dense, d_bias
 
-    if component == "jagged":
-        return run_jagged
-    if component == "dense_bias":
-        return run_dense_bias
-
-    def run_all():
-        dj = run_jagged()
-        dd, db = run_dense_bias()
-        return dj, dd, db
-
-    return run_all
+    return run_dense_bias
 
 
 def _torch_reference(jagged, dense, d_out, seq_offsets, N, K):

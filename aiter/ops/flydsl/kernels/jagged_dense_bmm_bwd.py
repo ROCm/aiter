@@ -23,19 +23,25 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.vector import full
 
-# Sibling import (script dir is on sys.path[0]); shares the forward tile/shape
-# constants and the runtime-bounded buffer helper so forward and backward stay
-# in lockstep.
-from jagged_dense_bmm import (  # noqa: F401
-    BLOCK_K,
-    BLOCK_M,
-    BLOCK_N,
-    K,
-    N,
-    N_BLOCKS,
-    STAGES_A,
-    make_bounded_buffer_tensor,
-)
+# Forward tile/shape constants + the runtime-bounded buffer helper, shared so
+# forward and backward stay in lockstep. Imported dual-path so this module works
+# both as an aiter package submodule (production: ``aiter.ops.flydsl.kernels``)
+# and as a bare sibling (bench/example/profile drivers put the kernels dir on
+# sys.path[0]). Both paths must resolve to the *same* forward module object,
+# because configure_dim() rebinds K/N on it — see the note there.
+try:
+    from . import jagged_dense_bmm as _fwd  # package-relative (aiter import path)
+except ImportError:  # bare sibling import (kernels dir on sys.path[0])
+    import jagged_dense_bmm as _fwd
+
+BLOCK_K = _fwd.BLOCK_K
+BLOCK_M = _fwd.BLOCK_M
+BLOCK_N = _fwd.BLOCK_N
+K = _fwd.K
+N = _fwd.N
+N_BLOCKS = _fwd.N_BLOCKS
+STAGES_A = _fwd.STAGES_A  # noqa: F401  (reference value for GJ_STAGES_A below)
+make_bounded_buffer_tensor = _fwd.make_bounded_buffer_tensor
 
 # Split factor over the jagged (m) axis for the dDense / dBias reductions. Each
 # (group, split) block owns one fp32 scratch slot; the reduce pass sums them. SPLIT
@@ -125,7 +131,9 @@ def configure_dim(D):
     module globals on its *first* launch and rejects any later drift. So this MUST
     be called before the first grad_* launch (e.g. right after arg parsing, before
     warmup). It rebinds the constants on both this module and the forward module it
-    borrows K/N from, and returns D for convenience.
+    borrows K/N from (the same ``_fwd`` object this module imported its constants
+    from, so there is exactly one forward module whose globals stay in sync), and
+    returns D for convenience.
     """
     global K, N, SPLIT, NRED_BLK, NRED_COL_TILES, KOUT_BLOCKS, NRED_TILES
     global NK_TILES, NN_TILES
@@ -134,8 +142,6 @@ def configure_dim(D):
             f"D={D} must be divisible by the tile sizes "
             f"(DDENSE_BK={DDENSE_BK}, DDENSE_BN={DDENSE_BN}, BLOCK_N={BLOCK_N}, BLOCK_K={BLOCK_K})"
         )
-    import jagged_dense_bmm as _fwd
-
     K = N = int(D)
     _fwd.K = _fwd.N = int(D)
     _fwd.N_BLOCKS = N // BLOCK_N
@@ -219,7 +225,14 @@ def grad_jagged_kernel(
             b_row_off = fx.Int32(off_b) * fx.Int32(K) * fx.Int32(N)
             B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
 
-            A_buf = fx.rocdl.make_buffer_tensor(A_g, max_size=True)
+            # Bound A (dOut) reads to exactly M_b rows: a partial last row-tile spans
+            # rows [M_b, ceil(M_b/BLOCK_M)*BLOCK_M), which for the LAST group runs past
+            # the dOut allocation. An unbounded (max_size) descriptor lets that over-read
+            # touch unmapped memory -> a data/size-dependent GPU fault. Bounding makes the
+            # HW return 0 for the tail rows instead (they are masked out on the C store
+            # anyway, so the result is unchanged). num_records is int32-safe (per-group
+            # M_b*N*2 <= Mi*N*2). Mirrors grad_dense_partials_kernel's bounded reads.
+            A_buf = make_bounded_buffer_tensor(A_g, fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)))
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
             # Bound C to exactly M_b rows (K cols, bf16=2B) so partial tail-tile
             # stores are HW-dropped instead of corrupting the next group's rows.

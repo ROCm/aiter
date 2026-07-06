@@ -12,32 +12,45 @@
 #
 # This harness is built test-first: it provides torch references for all three
 # gradients, cross-checks those references against torch.autograd on the forward
-# (so the references are themselves trusted), and wires up the FlyDSL launchers.
-# Until the kernels exist, the FlyDSL path reports SKIPPED (NotImplementedError)
-# while the reference-vs-autograd check still runs and must pass.
+# (so the references are themselves trusted), and validates the FlyDSL backward
+# through its packaged aiter entrypoint (jagged_dense_bmm_bwd_dispatched).
 #
-# Run inside the project venv:
+# Run inside the project venv, from the aiter repo root so `aiter` is importable:
 #     source flydsl_venv/bin/activate
-#     python aiter/aiter/ops/flydsl/kernels/example_jagged_dense_bmm_bwd.py
+#     python aiter/ops/flydsl/kernels/example_jagged_dense_bmm_bwd.py -d 256
 #
-# Lives next to jagged_dense_bmm.py / jagged_dense_bmm_bwd.py and imports them as
-# sibling modules so it does not pull in the full aiter package.
+# The FlyDSL correctness path now goes through the packaged wrapper (which owns
+# configure_dim, the single-D guard, scratch, padding, and layout), so this pulls
+# in the aiter package. The optional --bench timing path calls the raw launchers
+# directly (pre-allocated buffers, reused across iters) for steady-state timing.
 
 from __future__ import annotations
 
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import torch
 
 import flydsl.compiler as flyc
 
-# Sibling imports (script dir is on sys.path[0]); avoids importing the aiter pkg.
-import jagged_dense_bmm_bwd as _bwd
-from example_jagged_dense_bmm import make_seq_offsets
-from jagged_dense_bmm import BLOCK_M, K, N
-from jagged_dense_bmm_bwd import SPLIT, grad_dense_bias, grad_jagged
+# Make `aiter` importable when this file is run directly as a script. Repo root =
+# .../meta/aiter (the dir that contains the `aiter` package), four levels up from
+# aiter/ops/flydsl/kernels/.
+_REPO_ROOT = str(Path(__file__).resolve().parents[4])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched  # noqa: E402
+from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd  # noqa: E402
+from aiter.ops.flydsl.kernels.example_jagged_dense_bmm import make_seq_offsets  # noqa: E402
+
+# Shared tiling constants (updated by configure_dim in main via _bwd).
+BLOCK_M = _bwd.BLOCK_M
+K = _bwd.K
+N = _bwd.N
+SPLIT = _bwd.SPLIT
 
 GRADS = ("djagged", "ddense", "dbias")
 
@@ -130,60 +143,23 @@ def report(name, ref, got, cos_thresh=0.999):
     return ok
 
 
-# --- FlyDSL host wiring (calls launchers; SKIPPED until kernels exist) ---------
+# --- FlyDSL validation (through the packaged wrapper) --------------------------
 
 
 def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max_seq_len):
-    """Prepare device buffers and invoke the FlyDSL backward launchers.
+    """Validate the FlyDSL backward via the packaged wrapper.
 
-    Returns a dict {grad_name: tensor or None}. A None entry means the kernel is
-    not implemented yet (NotImplementedError) and the FlyDSL path is skipped.
+    The wrapper does the full backward in one call (owning configure_dim, guards,
+    scratch, padding, and the dense layout), so all three grads are computed
+    regardless of `which`; we just return the requested subset. `bias` is unused
+    (backward needs only dOut).
     """
-    device = jagged.device
-    total_rows = jagged.shape[0]
-    stream = torch.cuda.current_stream()
-    results = {g: None for g in GRADS}
-
-    tDOut = flyc.from_dlpack(d_out).mark_layout_dynamic(leading_dim=1, divisibility=8)
-
-    if "djagged" in which:
-        # RHS is Dense[b] in its (K, N) orientation: pass the plain dense as a
-        # tall (n_groups * K, N) matrix (K-major per group).
-        dense_kn = dense.reshape(n_groups * K, N).contiguous()
-        # Pad output rows by BLOCK_M so a partial tail-tile store stays in-bounds.
-        d_jagged = torch.zeros(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
-        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
-        try:
-            grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
-            torch.cuda.synchronize()
-            results["djagged"] = d_jagged[:total_rows]
-        except NotImplementedError as ex:
-            print(f"  [skip] grad_jagged: {ex}")
-
-    # dDense and dBias are produced by a single fused launcher: the dBias column-sums
-    # piggyback on the dDense partials pass (both reduce over m). Run it once if either
-    # gradient is requested, then hand back whichever pieces were asked for.
-    if ("ddense" in which) or ("dbias" in which):
-        d_dense = torch.zeros(n_groups, K, N, dtype=torch.bfloat16, device=device)
-        d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
-        # fp32 split-reduction scratch: dDense (n_groups*SPLIT*K, N), dBias (n_groups*SPLIT, N).
-        dense_partials = torch.zeros(n_groups * SPLIT * K, N, dtype=torch.float32, device=device)
-        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
-        tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
-        try:
-            grad_dense_bias(
-                d_dense.view(n_groups * K, N), d_bias, tJagged, tDOut, seq_offsets,
-                dense_partials, bias_partials, n_groups, max_seq_len, stream=stream,
-            )
-            torch.cuda.synchronize()
-            if "ddense" in which:
-                results["ddense"] = d_dense
-            if "dbias" in which:
-                results["dbias"] = d_bias
-        except NotImplementedError as ex:
-            print(f"  [skip] grad_dense_bias: {ex}")
-
-    return results
+    d_jagged, d_dense, d_bias = jagged_dense_bmm_bwd_dispatched(
+        jagged, dense, d_out, seq_offsets, n_groups=n_groups, max_seq_len=max_seq_len,
+    )
+    torch.cuda.synchronize()
+    full = {"djagged": d_jagged, "ddense": d_dense, "dbias": d_bias}
+    return {g: (full[g] if g in which else None) for g in GRADS}
 
 
 def _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len):
@@ -204,7 +180,7 @@ def _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq
         tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
         def run_djagged():
-            grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
+            _bwd.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
 
         launchers["djagged"] = run_djagged
 
@@ -217,8 +193,8 @@ def _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq
         d_dense_v = d_dense.view(n_groups * K, N)
 
         def run_dense_bias():
-            grad_dense_bias(d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
-                            bias_partials, n_groups, max_seq_len, stream=stream)
+            _bwd.grad_dense_bias(d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
+                                 bias_partials, n_groups, max_seq_len, stream=stream)
 
         launchers["dense_bias"] = run_dense_bias
 
