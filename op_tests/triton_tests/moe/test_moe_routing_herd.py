@@ -422,7 +422,8 @@ def test_routing_herd_sqrtsoftplus(
 
     _enable_herd(monkeypatch)
     rd, gather, scatter = routing(
-        logits, n_expts_act,
+        logits,
+        n_expts_act,
         score_mode="sqrtsoftplus",
         bias=bias,
         renorm=renorm,
@@ -449,13 +450,21 @@ def test_herd_sqrtsoftplus_shrinks_expert_union(monkeypatch, n_tokens):
 
     _disable_herd(monkeypatch)
     rd_off, _, _ = routing(
-        logits, k, score_mode="sqrtsoftplus", bias=bias, renorm=True,
+        logits,
+        k,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=True,
         routed_scaling_factor=2.5,
     )
 
     _enable_herd(monkeypatch)
     rd_on, _, _ = routing(
-        logits, k, score_mode="sqrtsoftplus", bias=bias, renorm=True,
+        logits,
+        k,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=True,
         routed_scaling_factor=2.5,
     )
 
@@ -482,7 +491,11 @@ def test_herd_sqrtsoftplus_gating_window(monkeypatch, n_tokens, engaged):
 
     _enable_herd(monkeypatch, min_m=16, max_m=128)
     tri_rd, tri_g, tri_s = routing(
-        logits, k, score_mode="sqrtsoftplus", bias=bias, renorm=True,
+        logits,
+        k,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=True,
         routed_scaling_factor=2.5,
     )
     assert int(tri_rd.expt_hist.sum()) == n_tokens * k
@@ -491,13 +504,15 @@ def test_herd_sqrtsoftplus_gating_window(monkeypatch, n_tokens, engaged):
         ref_w, ref_ids = _minunique_select_sqrtsoftplus_torch(
             logits.clone(), k, bias, True, 2.5
         )
-        _check_minunique(
-            ref_w, ref_ids, tri_rd, tri_g, tri_s, n_expts_tot, k, block_m
-        )
+        _check_minunique(ref_w, ref_ids, tri_rd, tri_g, tri_s, n_expts_tot, k, block_m)
     else:
         _disable_herd(monkeypatch)
         st_rd, st_g, st_s = routing(
-            logits, k, score_mode="sqrtsoftplus", bias=bias, renorm=True,
+            logits,
+            k,
+            score_mode="sqrtsoftplus",
+            bias=bias,
+            renorm=True,
             routed_scaling_factor=2.5,
         )
         _routing_fields_equal(tri_rd, tri_g, tri_s, st_rd, st_g, st_s)
@@ -516,8 +531,14 @@ def test_topk_pop_out_sqrtsoftplus(n_tokens, n_expts_tot, n_expts_act):
 
     pop = torch.zeros(n_expts_tot, dtype=torch.int32, device=logits.device)
     expt_scal, expt_indx, _ = topk(
-        logits, kp1, apply_softmax=False, score_mode="sqrtsoftplus",
-        bias=bias, renorm=False, HIST_BLOCK_M=32, pop_out=pop,
+        logits,
+        kp1,
+        apply_softmax=False,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=False,
+        HIST_BLOCK_M=32,
+        pop_out=pop,
     )
     assert expt_indx.shape == (n_tokens, kp1)
 

@@ -352,11 +352,7 @@ def routing(
 
     # HERD: env-gated fused min-unique routing for decode-sized batches.
     # Only for non-grouped-topk (DSv4 flat topk with sqrtsoftplus).
-    if (
-        _USE_HERD
-        and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M
-        and not use_grouped_topk
-    ):
+    if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M and not use_grouped_topk:
         from .minunique import routing_minunique_fused
 
         return routing_minunique_fused(

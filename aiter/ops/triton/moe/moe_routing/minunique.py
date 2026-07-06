@@ -13,8 +13,17 @@ from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
 def keepk_sort0(
-    expt_scal, expt_indx, pop, hist, part, n_expts_tot, k, apply_softmax, HIST_BLOCK_M,
-    apply_renorm=False, routed_scaling_factor=1.0,
+    expt_scal,
+    expt_indx,
+    pop,
+    hist,
+    part,
+    n_expts_tot,
+    k,
+    apply_softmax,
+    HIST_BLOCK_M,
+    apply_renorm=False,
+    routed_scaling_factor=1.0,
 ):
     """Fusion-2 driver: (k+1) candidates + popularity -> kept-k (Vout/Iout) +
     post-drop histogram + cross-block prefix offsets. `hist`/`part` are PRE-ZEROED."""
@@ -52,14 +61,31 @@ def keepk_sort0(
 
 
 def _minunique_common(
-    num_tokens, n_expts_tot, k, block_m, logits_device, logits_dtype,
-    expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M,
-    apply_softmax, apply_renorm, routed_scaling_factor,
+    num_tokens,
+    n_expts_tot,
+    k,
+    block_m,
+    logits_device,
+    logits_dtype,
+    expt_scal,
+    expt_indx,
+    pop,
+    hist,
+    partials,
+    HIST_BLOCK_M,
+    apply_softmax,
+    apply_renorm,
+    routed_scaling_factor,
 ):
     """Shared Fusion-2 + Fusion-3 for both flat-topk and fused-scoring HERD."""
     expt_scal2, expt_indx2 = keepk_sort0(
-        expt_scal, expt_indx, pop, hist, partials,
-        n_expts_tot, k,
+        expt_scal,
+        expt_indx,
+        pop,
+        hist,
+        partials,
+        n_expts_tot,
+        k,
         apply_softmax=apply_softmax,
         HIST_BLOCK_M=HIST_BLOCK_M,
         apply_renorm=apply_renorm,
@@ -82,14 +108,26 @@ def _minunique_common(
     )
     blocks1b = triton.cdiv(num_tokens, HIST_BLOCK_M)
     _combined_routing[(blocks1a + blocks1b,)](
-        topk_indx, gate_indx, gate_scal,
-        expt_scal2, expt_indx2,
-        partials, partials.stride(0), partials.stride(1),
-        n_gates, HIST_BLOCK_M, num_tokens % HIST_BLOCK_M == 0,
-        k, n_expts_act_pad,
-        hist, n_expts_tot,
-        token_offs_raw, token_offs_pad,
-        blocks1a, block_pid_map, block_pid_map.shape[0],
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        expt_scal2,
+        expt_indx2,
+        partials,
+        partials.stride(0),
+        partials.stride(1),
+        n_gates,
+        HIST_BLOCK_M,
+        num_tokens % HIST_BLOCK_M == 0,
+        k,
+        n_expts_act_pad,
+        hist,
+        n_expts_tot,
+        token_offs_raw,
+        token_offs_pad,
+        blocks1a,
+        block_pid_map,
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),
@@ -127,14 +165,28 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
     )
 
     return _minunique_common(
-        num_tokens, n_expts_tot, k, block_m, logits.device, logits.dtype,
-        expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M,
-        apply_softmax=(not sm_first), apply_renorm=False, routed_scaling_factor=1.0,
+        num_tokens,
+        n_expts_tot,
+        k,
+        block_m,
+        logits.device,
+        logits.dtype,
+        expt_scal,
+        expt_indx,
+        pop,
+        hist,
+        partials,
+        HIST_BLOCK_M,
+        apply_softmax=(not sm_first),
+        apply_renorm=False,
+        routed_scaling_factor=1.0,
     )
 
 
 def routing_minunique_fused(
-    logits, n_expts_act, *,
+    logits,
+    n_expts_act,
+    *,
     score_mode="sqrtsoftplus",
     bias=None,
     renorm=True,
@@ -159,7 +211,8 @@ def routing_minunique_fused(
     partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
 
     expt_scal, expt_indx, _bitmatrix = topk(
-        logits, k + 1,
+        logits,
+        k + 1,
         apply_softmax=False,
         score_mode=score_mode,
         bias=bias,
@@ -170,8 +223,19 @@ def routing_minunique_fused(
     )
 
     return _minunique_common(
-        num_tokens, n_expts_tot, k, block_m, logits.device, logits.dtype,
-        expt_scal, expt_indx, pop, hist, partials, HIST_BLOCK_M,
-        apply_softmax=False, apply_renorm=renorm,
+        num_tokens,
+        n_expts_tot,
+        k,
+        block_m,
+        logits.device,
+        logits.dtype,
+        expt_scal,
+        expt_indx,
+        pop,
+        hist,
+        partials,
+        HIST_BLOCK_M,
+        apply_softmax=False,
+        apply_renorm=renorm,
         routed_scaling_factor=routed_scaling_factor,
     )
