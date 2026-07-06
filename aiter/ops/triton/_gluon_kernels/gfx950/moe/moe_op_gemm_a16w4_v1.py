@@ -172,10 +172,10 @@ def _moe_gemm_a16w4(
 
     MX_PACK_DIVISOR: gl.constexpr = 32
     w_type: gl.constexpr = W.dtype.element_ty
-    #gl.static_assert(w_type == gl.uint8), "mx_weight_ptr must be uint8"
-    #gl.static_assert(
-    #    WMxScale.dtype.element_ty == gl.uint8, "mx_scale_ptr must be uint8"
-    #)
+    gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8")
+    gl.static_assert(
+        WMxScale.dtype.element_ty == gl.uint8, "mx_scale_ptr must be uint8"
+    )
     gl.static_assert(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
@@ -391,14 +391,14 @@ def _moe_gemm_a16w4(
     # Trailing partial K-block (only when BLOCK_K does not divide K, which never
     # happens on the swizzled-scale path). Masked, so it uses plain global loads.
     if MASK_K_LIMIT != 0:
-        mask_x = (offs_x_k_g < MASK_K_LIMIT)[None, :]
-        mask_w = (offs_w_k_g < MASK_K_LIMIT // W_K_DIVISOR)[None, :]
-        mask_ws = (offs_w_k_scale_g * MX_PACK_DIVISOR < MASK_K_LIMIT)[None, :]
-        x = gl.load(X_base + x_offsets_g, mask=mask_x, other=0.0)
+        mask_x = (offs_x_k_l < MASK_K_LIMIT)[None, :]
+        mask_w = (offs_w_k < MASK_K_LIMIT // W_K_DIVISOR)[None, :]
+        mask_ws = (offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT)[None, :]
+        x = gl.load(X_base + x_offsets, mask=mask_x, other=0.0)
         w = gl.load(
-            W_base + w_offsets_g, mask=mask_w, other=0.0, cache_modifier=W_CACHE_MODIFIER
+            W_base + w_offsets, mask=mask_w, other=0.0, cache_modifier=W_CACHE_MODIFIER
         )
-        w_scales = gl.load(WMxScale_base + w_scale_offsets_g, mask=mask_ws, other=0.0)
+        w_scales = gl.load(WMxScale_base + w_scale_offsets, mask=mask_ws, other=0.0)
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
         w_scales = (
@@ -407,6 +407,7 @@ def _moe_gemm_a16w4(
             .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR))
         )
         w_scales = gl.convert_layout(w_scales, GLOBAL_WS_LAYOUT)
+        w = gl.convert_layout(w,GLOBAL_W_LAYOUT)
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1)
         x = gl.convert_layout(x, DOT_LAYOUT_X)
         # (N, K) -> (K, N) for the MFMA B operand.
