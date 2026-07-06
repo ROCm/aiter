@@ -254,6 +254,15 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """
     i32 = c.i32
     f32 = c.f32
+    # Robustness clamp for the per-block amax (shared by both quant paths):
+    #  - the amax reduction uses maxnumf (not maximumf) so a NaN activation is
+    #    dropped instead of propagated -- a lone NaN no longer poisons the whole
+    #    32-elem MX block's e8m0 scale.
+    #  - minnumf(amax, FLT_MAX) turns an +/-Inf amax (abs makes it +Inf) into a
+    #    finite value, so emit_mx_e8m0_scale never clamps the exponent up to the
+    #    e8m0 NaN encoding 0xFF; the Inf element itself still saturates to the
+    #    fp8/fp4 max in the HW convert. No-op for all finite inputs.
+    c_flt_max = arith.constant(3.4028234663852886e38, type=f32)
     mx_group_base = getattr(c, "mx_group_base", None)
     if mx_group_base is None:
         mx_group_base = arith.constant(0, type=i32)
@@ -292,12 +301,13 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 for j in range_constexpr(8):
                     xj = vector.extract(f32x8, static_position=[j], dynamic_position=[])
                     absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
-                    block_amax = arith.maximumf(block_amax, absj)
+                    block_amax = arith.maxnumf(block_amax, absj)
                 for dist in c.amax_shuffle_dists:
                     peer_amax = block_amax.shuffle_xor(
                         arith.constant(dist, type=i32), c.c_wave
                     )
-                    block_amax = arith.maximumf(block_amax, peer_amax)
+                    block_amax = arith.maxnumf(block_amax, peer_amax)
+                block_amax = arith.minnumf(block_amax, c_flt_max)
 
                 e8m0_scale = emit_mx_e8m0_scale(
                     block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
@@ -338,12 +348,13 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 # shuffle_xor across the block's 16 lanes.
                 abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
                 abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
-                block_amax = arith.maximumf(c.c0_f32, arith.maximumf(abs0, abs1))
+                block_amax = arith.maxnumf(c.c0_f32, arith.maxnumf(abs0, abs1))
                 for dist in c.amax_shuffle_dists:
                     peer_amax = block_amax.shuffle_xor(
                         arith.constant(dist, type=i32), c.c_wave
                     )
-                    block_amax = arith.maximumf(block_amax, peer_amax)
+                    block_amax = arith.maxnumf(block_amax, peer_amax)
+                block_amax = arith.minnumf(block_amax, c_flt_max)
 
                 e8m0_scale = emit_mx_e8m0_scale(
                     block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype

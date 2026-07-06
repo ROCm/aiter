@@ -169,7 +169,7 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        if SLIDING_WINDOW is not None:
+        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
             num_segments = 1
         else:
             occ = waves_per_eu * 4 // attn_warps
@@ -799,6 +799,12 @@ def _gfx1250_unified_attention_2d(
         waves_per_eu = 2
         TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
         num_buffers = 2
+
+        if max_seqlen_k < 2048:
+            BLOCK_M = 64
+            num_warps = 2 if (Q_FP8 and KV_FP8) else 1
+            sel_loop_variant = 0
+            num_buffers = 2
 
     loop_variant = sel_loop_variant if loop_variant is None else loop_variant
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page

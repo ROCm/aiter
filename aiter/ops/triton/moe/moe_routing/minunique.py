@@ -113,6 +113,8 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
     HIST_BLOCK_M = 32
     num_blocks = triton.cdiv(num_tokens, HIST_BLOCK_M)
 
+    # One combined zero-buffer: pop[E] | hist[E] | partials[num_blocks, E].
+    # pop is filled by topk's atomics; hist/partials by _keepk_sort0's atomics.
     z = torch.zeros(
         2 * n_expts_tot + num_blocks * n_expts_tot,
         dtype=torch.int32,
@@ -122,6 +124,7 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
     hist = z[n_expts_tot : 2 * n_expts_tot]
     partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
 
+    # Fusion-1: top-(k+1) + atomic popularity (no separate sum).
     expt_scal, expt_indx, _bitmatrix = topk(
         logits, k + 1, apply_softmax=False, HIST_BLOCK_M=HIST_BLOCK_M, pop_out=pop
     )

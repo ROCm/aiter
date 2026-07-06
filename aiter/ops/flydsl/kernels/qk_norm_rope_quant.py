@@ -944,9 +944,9 @@ def flydsl_qk_norm_rope_quant(
             ``swa_kv[slot, pos % cache_size, :] = kv_out[t]`` in the same
             launch (``slot = state_slot_mapping[batch_id_per_token[t]]``),
             fusing the standalone ``swa_write``.
-        state_slot_mapping: ``[bs]`` int32 — per-seq SWA ring slot. Required
+        state_slot_mapping: ``[bs]`` int32 -- per-seq SWA ring slot. Required
             when ``swa_kv`` is set.
-        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
+        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens -- token->seq
             map for the fused SWA scatter (store gated off on ``-1``). Required
             when ``swa_kv`` is set.
 
