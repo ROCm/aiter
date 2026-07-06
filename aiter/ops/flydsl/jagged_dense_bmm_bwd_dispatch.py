@@ -189,9 +189,14 @@ def resolve_config(
             cfg[k] = int(v)
     return cfg
 
-# fp32 split-reduction scratch, cached per (n_groups, D, device). The partials
-# passes fully overwrite every slot they later reduce (empty groups included), so
-# reuse across calls is safe without re-zeroing.
+# fp32 split-reduction scratch, cached per (n_groups, D, split, device). The
+# partials passes fully overwrite every slot they later reduce (empty groups
+# included), so reuse across calls is safe without re-zeroing. The cache is
+# unbounded but intentionally so: the key space is the small set of shapes a run
+# actually uses (a training run is typically one (n_groups, D)), and each entry is
+# the working buffer we want resident. A given entry can be large (~0.5 GB fp32 at
+# n_groups=1024, D=256, split=2); if a future consumer sweeps many shapes and this
+# grows unacceptably, add an LRU bound or an explicit clear -- not needed today.
 _SCRATCH_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 

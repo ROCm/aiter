@@ -288,7 +288,7 @@ def main(argv=None):
         print("references do NOT match autograd; aborting before kernel validation.")
         return 1
 
-    # --- FlyDSL kernels vs references (SKIPPED until kernels are implemented) ---
+    # --- FlyDSL kernels vs references (via the packaged wrapper) ---
     print("flydsl vs reference:")
     got = run_flydsl_bwd(
         which, jagged, dense, bias, d_out, seq_offsets, args.n_groups, args.max_seq_len
@@ -302,7 +302,7 @@ def main(argv=None):
         any_run = True
         kernel_ok &= report(name_map[g], refs[g], got[g])
     if not any_run:
-        print("  (no kernels implemented yet)")
+        print(f"  (no grads selected by --only={args.only})")
 
     # --- Optional timing/TFLOPs summary -------------------------------------------
     if args.bench and any_run:

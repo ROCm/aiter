@@ -137,6 +137,10 @@ def _store_scalar(copy_atom, store_dtype, divided_tensor, index, val):
 Backward = collections.namedtuple("Backward", ["grad_jagged", "grad_dense_bias", "split", "D"])
 
 
+# maxsize=None (unbounded) is intentional: the key space is the handful of
+# distinct (D, split, gj_stages_a, coarsen_m) tuples a process actually launches
+# (typically 1-2 D x a couple of knob sets), and each entry is a set of compiled
+# kernels we WANT to keep resident for the process lifetime. No eviction needed.
 @functools.lru_cache(maxsize=None)
 def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
     """Build (and memoize) the backward launchers specialized to this (D, knobs).
@@ -162,6 +166,10 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
     K = N = D
     SPLIT = _split_for(D) if split is None else int(split)
     NRED_BLK = N if N <= 256 else 256
+    # NRED_COL_TILES > 1 when N > NRED_BLK; the last tile may be partial (N not a
+    # multiple of NRED_BLK, e.g. a forced split=2 at D=384). The reduce kernels
+    # guard col < N, so a partial last tile is correct -- no divisibility gate is
+    # imposed here (rejecting it would forbid an otherwise-valid forced split).
     NRED_COL_TILES = (N + NRED_BLK - 1) // NRED_BLK
     KOUT_BLOCKS = K // BLOCK_N   # column-tiles of the (M, K) dJagged output
     NRED_TILES = N // BLOCK_K    # contraction tiles over N
@@ -220,6 +228,12 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 c_row_off = fx.Int64(seq_start) * fx.Int64(K)
                 A_g = fx.make_view(fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)), fx.get_layout(A))
                 C_g = fx.make_view(fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)), fx.get_layout(C))
+                # int32 (NOT int64 like a_row_off/c_row_off above): the dense base
+                # offset is bounded by off_b*K*N <= n_groups*D^2, not by L. At the
+                # North-Star (n_groups=1024, D=512) that is 1024*512*512 ≈ 2.7e8 <<
+                # 2^31, so it cannot overflow -- unlike the L-scaled jagged/dOut
+                # offsets, which do reach ~4G. (Would only trip at n_groups*D^2 >= 2^31,
+                # e.g. n_groups >= 8192 at D=512.)
                 b_row_off = fx.Int32(off_b) * fx.Int32(K) * fx.Int32(N)
                 B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
 
@@ -396,14 +410,21 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
 
-        acc = fx.Float32(0.0)
-        for s in fx.range_constexpr(SPLIT):
-            part_row = off_b * fx.Int32(SPLIT) + fx.Int32(s)
-            row_div = fx.logical_divide(fx.slice(PART_buf, (part_row, None)), fx.make_layout(1, 1))
-            acc = acc + _load_scalar(copy_f32, fx.Float32, row_div, col)
+        # Guard col < N: when N is not a multiple of NRED_BLK the last column-tile
+        # carries lanes with col >= N. DBIAS_buf is a WHOLE-TENSOR descriptor, so an
+        # unguarded store from those lanes is NOT an OOB drop -- it spills into the
+        # next row (dBias[b+1]). The D-derived split policy never trips this (SPLIT>=2
+        # only at D<=256, where NRED_BLK == N), but a forced split kwarg at N%NRED_BLK
+        # != 0 (e.g. split=2 at D=384) would; the guard makes any N correct.
+        if col < fx.Int32(N):
+            acc = fx.Float32(0.0)
+            for s in fx.range_constexpr(SPLIT):
+                part_row = off_b * fx.Int32(SPLIT) + fx.Int32(s)
+                row_div = fx.logical_divide(fx.slice(PART_buf, (part_row, None)), fx.make_layout(1, 1))
+                acc = acc + _load_scalar(copy_f32, fx.Float32, row_div, col)
 
-        out_div = fx.logical_divide(fx.slice(DBIAS_buf, (off_b, None)), fx.make_layout(1, 1))
-        _store_scalar(copy_bf16, fx.BFloat16, out_div, col, acc.to(fx.BFloat16))
+            out_div = fx.logical_divide(fx.slice(DBIAS_buf, (off_b, None)), fx.make_layout(1, 1))
+            _store_scalar(copy_bf16, fx.BFloat16, out_div, col, acc.to(fx.BFloat16))
 
     @flyc.kernel
     def grad_dense_partials_kernel(
@@ -480,6 +501,10 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         thr_sD_s2r = thr_copy_s2r_B.partition_S(sD)  # (VB, VN, VK)
 
         # Output (K, N) sub-tile of this workgroup, viewed in the fp32 partials scratch.
+        # int32 is safe here (unlike the L-scaled JAGGED/DOUT base offsets, which use
+        # int64): part_off is bounded by n_groups*SPLIT*K*N, i.e. the partials-tensor
+        # element count, not by L. At n_groups=1024, SPLIT=2, D=256 that is ~1.3e8 <<
+        # 2^31; it scales with n_groups*D^2, not with the ~4G packed-row count.
         part_off = ((off_b * fx.Int32(SPLIT) + off_s) * fx.Int32(K) + k_off) * fx.Int32(N) + n_off
         PART_g = fx.make_view(fx.add_offset(fx.get_iter(PARTIALS), fx.make_int_tuple(part_off)), fx.get_layout(PARTIALS))
         PART_buf = fx.rocdl.make_buffer_tensor(PART_g, max_size=True)
@@ -612,15 +637,19 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
         copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
 
-        acc = fx.Float32(0.0)
-        for s in fx.range_constexpr(SPLIT):
-            part_row = (off_b * fx.Int32(SPLIT) + fx.Int32(s)) * fx.Int32(K) + off_k
-            row_div = fx.logical_divide(fx.slice(PART_buf, (part_row, None)), fx.make_layout(1, 1))
-            acc = acc + _load_scalar(copy_f32, fx.Float32, row_div, col)
+        # Guard col < N (see grad_bias_reduce_kernel): DD_buf is a whole-tensor
+        # descriptor, so the last column-tile's col >= N lanes must not store, or
+        # they spill into the next (K, N) row instead of being OOB-dropped.
+        if col < fx.Int32(N):
+            acc = fx.Float32(0.0)
+            for s in fx.range_constexpr(SPLIT):
+                part_row = (off_b * fx.Int32(SPLIT) + fx.Int32(s)) * fx.Int32(K) + off_k
+                row_div = fx.logical_divide(fx.slice(PART_buf, (part_row, None)), fx.make_layout(1, 1))
+                acc = acc + _load_scalar(copy_f32, fx.Float32, row_div, col)
 
-        out_row = off_b * fx.Int32(K) + off_k
-        out_div = fx.logical_divide(fx.slice(DD_buf, (out_row, None)), fx.make_layout(1, 1))
-        _store_scalar(copy_bf16, fx.BFloat16, out_div, col, acc.to(fx.BFloat16))
+            out_row = off_b * fx.Int32(K) + off_k
+            out_div = fx.logical_divide(fx.slice(DD_buf, (out_row, None)), fx.make_layout(1, 1))
+            _store_scalar(copy_bf16, fx.BFloat16, out_div, col, acc.to(fx.BFloat16))
 
     @flyc.jit
     def grad_dense_bias(
