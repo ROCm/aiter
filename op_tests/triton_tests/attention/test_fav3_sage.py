@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import os
 import torch
 import pytest
 import logging
@@ -53,6 +54,35 @@ def compare_accuracy(current, reference):
         ref_flat.unsqueeze(0), test_flat.unsqueeze(0)
     )
     print(f"  Cosine Similarity: {cos_sim.item():.8f}")
+    if os.environ.get("ILP_DBG_ROWS", "0") != "0":
+        # per-row cosine; map bad rows to seq position and seq%64 (A rows 0..31 / B rows 32..63)
+        c = current_f.reshape(-1, current_f.shape[-1])
+        r = reference_f.reshape(-1, reference_f.shape[-1])
+        rc = torch.nn.functional.cosine_similarity(c, r, dim=1)
+        bad = (rc < 0.9)
+        lead = current_f.shape[:-1]
+        seq_axis = int(torch.tensor(lead).argmax().item())  # largest lead dim ~ sequence
+        badidx = torch.nonzero(bad).flatten().cpu().numpy()
+        print(f"[DBG-ROWS] shape={tuple(current_f.shape)} bad_rows={int(bad.sum())}/{rc.numel()}")
+        if badidx.size:
+            import numpy as _np
+            multi = _np.array([_np.unravel_index(i, lead) for i in badidx])
+            seqvals = multi[:, seq_axis]
+            m64 = _np.bincount(seqvals % 64, minlength=64)
+            a_bad = int(m64[:32].sum()); b_bad = int(m64[32:].sum())
+            print(f"[DBG-ROWS]   pipeA(seq%64<32)={a_bad}  pipeB(seq%64>=32)={b_bad}")
+            tiles = _np.unique(seqvals // 64)
+            print(f"[DBG-ROWS]   bad tiles(seq//64) n={tiles.size} sample={tiles[:24].tolist()}")
+        d = current_f.shape[-1]
+        h = d // 2
+        clo = torch.nn.functional.cosine_similarity(c[:, :h], r[:, :h], dim=1).mean().item()
+        chi = torch.nn.functional.cosine_similarity(c[:, h:], r[:, h:], dim=1).mean().item()
+        # ratio current/ref per half (median over rows), to detect a wrong scale on one half
+        eps = 1e-6
+        rlo = (c[:, :h].abs().sum(1) / (r[:, :h].abs().sum(1) + eps)).median().item()
+        rhi = (c[:, h:].abs().sum(1) / (r[:, h:].abs().sum(1) + eps)).median().item()
+        print(f"[DBG-ROWS]   half-cos: ch[0:{h}]={clo:.4f}  ch[{h}:{d}]={chi:.4f}   "
+              f"mag-ratio cur/ref: lo={rlo:.4f} hi={rhi:.4f}")
 
 
 def pad_rearrange_dropout_mask(
@@ -145,6 +175,33 @@ def check_attention_outputs(
 ):
     current_tensor = _tensor_from_result(current)
     reference_tensor = _tensor_from_result(reference).to(current_tensor.dtype)
+
+    import os as _os
+    if _os.environ.get("DBG_DUMP_FAMAX", "0") != "0":
+        c = current.float().reshape(-1, current.shape[-1])
+        bits = c[:, :4].contiguous().view(torch.float32)
+        # columns: [FA_max_a, L_a, FA_max_b, L_b] per query row (lane)
+        fa_a = bits[:, 0]; l_a = bits[:, 1]; fa_b = bits[:, 2]; l_b = bits[:, 3]
+        def _st(t):
+            return f"min={t.min().item():.4g} max={t.max().item():.4g} mean={t.mean().item():.4g}"
+        print(f"[FAMAX] FA_max_a {_st(fa_a)}")
+        print(f"[FAMAX] L_a     {_st(l_a)}")
+        print(f"[FAMAX] FA_max_b {_st(fa_b)}")
+        print(f"[FAMAX] L_b     {_st(l_b)}")
+        print(f"[FAMAX] sample FA_a[:8]={[f'{x:.4g}' for x in fa_a[:8].tolist()]}")
+        print(f"[FAMAX] sample L_a[:8]={[f'{x:.4g}' for x in l_a[:8].tolist()]}")
+
+    if _os.environ.get("DUMP_ROWS", "0") != "0":
+        c = current_tensor.float(); r = reference_tensor.float()
+        sq = c.shape[1]
+        cf = c.reshape(c.shape[0], sq, -1); rf = r.reshape(r.shape[0], sq, -1)
+        print(f"[DUMP_ROWS] shape={tuple(c.shape)} sq={sq}")
+        for blk in range(0, min(sq, 128), 32):
+            cb = cf[:, blk:blk+32].reshape(-1); rb = rf[:, blk:blk+32].reshape(-1)
+            cos = torch.nn.functional.cosine_similarity(cb, rb, dim=0).item()
+            mx = (cb - rb).abs().max().item()
+            print(f"  rows[{blk}:{blk+32}] cos={cos:.5f} max_abs={mx:.4g} "
+                  f"|cur|={cb.norm().item():.4g} |ref|={rb.norm().item():.4g}")
 
     if fp8:
         fp8_assert_close(

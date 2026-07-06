@@ -293,6 +293,72 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         gdz          = 1;
     }
 
+    // ---- SOLO single-wave override (opt-in via AITER_FMHA_SOLO=1) ----------
+    // Launches the single-wave (bdx=64) persistent kernel built with SOLO_MODE=1: one WG owns ONE
+    // 32-row Q block (vs 256 for the 8-wave kernel), self-loads its full K+V tile, and grid-strides
+    // the ceil(seqlen_q/32)*nhead*batch blocks via the same atomic-counter scheme. The deployed .co
+    // MUST be the SOLO_MODE=1 build (host params + compiled kernel are a matched pair). Batch /
+    // non-causal / mxfp6 / gfx950 only (mirrors the persistent guard).
+    static const int solo_on = []() {
+        const char* e = getenv("AITER_FMHA_SOLO");
+        return e ? atoi(e) : 0;
+    }();
+    if(solo_on && !a.is_group_mode && a.mask_type == 0 &&
+       a.data_type == "mxfp6bf16" && arch_id == "gfx950")
+    {
+        // Per-WG Q-row span. MUST match kTileQ_eff in the deployed .co (host params + kernel are a
+        // matched pair). Stock solo = 32 (one 32-row block/WG). ILP dual-pipeline .co = 64 (two
+        // 32-row Q tiles/WG); set AITER_FMHA_SOLO_TS=64 when deploying a SOLO_ILP=1 build.
+        static const int ts_solo = []() {
+            const char* e = getenv("AITER_FMHA_SOLO_TS");
+            return e ? atoi(e) : 32;
+        }();
+        long long total   = (long long)((a.seqlen_q + ts_solo - 1) / ts_solo) * a.nhead_q * a.batch;
+        // 2 waves/SIMD => 8 single-wave WGs per CU.
+        static int cu_count = []() {
+            int dev = 0, n = 0;
+            (void)hipGetDevice(&dev);
+            (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
+            return n > 0 ? n : 256;
+        }();
+        const long long want = (long long)cu_count * 8;
+        const int launch_wgs = static_cast<int>((want < total) ? want : total);
+        static uint32_t* g_counter_solo = nullptr;
+        if(g_counter_solo == nullptr)
+            (void)hipMalloc(reinterpret_cast<void**>(&g_counter_solo), sizeof(uint32_t));
+        (void)hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(g_counter_solo),
+                                static_cast<unsigned int>(launch_wgs), 1, s.stream_id_);
+        args.ptr_lse = g_counter_solo;
+        args.s_lse   = static_cast<unsigned int>(total);
+        gdx          = launch_wgs;
+        gdy          = 1;
+        gdz          = 1;
+        bdx          = 64;
+    }
+
+    // ---- INTRA-WAVE single-wave override (opt-in via AITER_FMHA_INTRA_WAVE=1) ----------------
+    // Launches the single-wave (bdx=64) intra-wave fp8 kernel: one WG owns a ts_iw-row Q block and
+    // self-loads its full K+V tile. IW1 is ONE-SHOT (one tile per WG, no in-kernel grid-stride) and
+    // single-pipeline (ts_iw=32); IW3 will make it two 32-row pipelines (bump ts_iw to 64 here). The
+    // deployed .co MUST be the intra-wave build (mi350_fmha_hd128_fp8_intra_wave.py, INTRA_WAVE_MODE=1);
+    // enabling this against the stock 8-wave fp8 .co WILL break (that kernel needs 512 threads).
+    // Batch / non-causal / fp8 / gfx950 only. See FP8_INTRA_WAVE_PLAN.md.
+    static const int intra_wave_on = []() {
+        const char* e = getenv("AITER_FMHA_INTRA_WAVE");
+        return e ? atoi(e) : 0;
+    }();
+    if(intra_wave_on && !a.is_group_mode && a.mask_type == 0 &&
+       a.data_type == "fp8bf16" && arch_id == "gfx950")
+    {
+        const int ts_iw = 32;  // IW1: 32-row Q block per WG (single pipeline; matches kTileQ_eff)
+        // One-shot grid: (q_tiles, heads, batch) — matches the kernel's tgid_x/y/z mapping and
+        // get_grid_dim's non-causal layout. No atomic counter (the IW1 kernel does one tile + exit).
+        gdx = (a.seqlen_q + ts_iw - 1) / ts_iw;
+        gdy = a.nhead_q;
+        gdz = a.batch;
+        bdx = 64;
+    }
+
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
         // Explicit assignment forces evaluation order and prevents compiler from
         // reordering operations that could lead to accessing uninitialized args

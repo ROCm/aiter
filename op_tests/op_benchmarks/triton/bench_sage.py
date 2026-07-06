@@ -1391,6 +1391,32 @@ def compute_accuracy_metrics(
     cosine = torch.nn.functional.cosine_similarity(
         current_f.flatten(), reference_f.flatten(), dim=0
     ).item()
+    if os.environ.get("ILP_DBG_ROWS", "0") != "0":
+        import numpy as _np
+        c = current_f.reshape(-1, current_f.shape[-1])
+        r = reference_f.reshape(-1, reference_f.shape[-1])
+        rc = torch.nn.functional.cosine_similarity(c, r, dim=1)  # per-row cosine
+        bad = (rc < 0.9)
+        nrow = rc.numel()
+        # map flat row index back to (b,h,s) assuming shape [...,d]
+        lead = current_f.shape[:-1]
+        badidx = torch.nonzero(bad).flatten().cpu().numpy()
+        print(f"[DBG-ROWS] shape={tuple(current_f.shape)} lead={tuple(lead)} "
+              f"bad_rows={int(bad.sum())}/{nrow} ({100.0*float(bad.float().mean()):.1f}%)")
+        if badidx.size:
+            multi = _np.array([_np.unravel_index(i, lead) for i in badidx])
+            # last lead dim is the sequence (query) position for bshd->[b,s,h] or bhsd->[b,h,s]
+            for axis in range(multi.shape[1]):
+                vals = multi[:, axis]
+                uniq = _np.unique(vals)
+                print(f"[DBG-ROWS]   axis{axis}: n_unique_bad={uniq.size} "
+                      f"sample={uniq[:16].tolist()}")
+            # sequence-position modulo 64 (tile) pattern -- last-but-... find seq axis by size
+            seq_axis = int(_np.argmax(lead))  # largest lead dim ~ sequence
+            seqvals = multi[:, seq_axis]
+            mod64 = _np.bincount(seqvals % 64, minlength=64)
+            print(f"[DBG-ROWS]   seq%64 hist(nonzero): "
+                  f"{[(int(i),int(v)) for i,v in enumerate(mod64) if v]}")
     return AccuracyMetrics(
         mae=abs_diff.mean().item(),
         maxe=abs_diff.max().item(),
