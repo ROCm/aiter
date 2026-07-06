@@ -788,7 +788,6 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
     from aiter.ops.flydsl.moe_kernels import (
         _get_compiled_silu_fused,
         _get_compiled_swiglu,
-        _ptr_view_safe,
         _run_compiled,
     )
 
