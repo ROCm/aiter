@@ -9,6 +9,28 @@ from typing import Optional
 MD_NAME = "module_rmsnorm"
 
 
+def _prepare_rmsnorm2d_input(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Size | None]:
+    """Return a safe 2D contiguous tensor for RMSNorm kernels.
+
+    The low-level RMSNorm kernels operate on 2D contiguous inputs. Keep the
+    common already-safe layout as a zero-copy fast path, and only normalize
+    higher-rank or strided views.
+    """
+    if input.dim() == 2 and input.is_contiguous():
+        return input, None
+
+    original_shape = input.shape
+    return input.contiguous().reshape(-1, original_shape[-1]), original_shape
+
+
+def _restore_shape(output: torch.Tensor, original_shape: torch.Size | None) -> torch.Tensor:
+    if original_shape is None:
+        return output
+    return output.reshape(original_shape)
+
+
 @compile_ops("module_rmsnorm")
 def rms_norm_cu(
     out: Tensor,
@@ -65,12 +87,13 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
-        out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    input_2d, original_shape = _prepare_rmsnorm2d_input(input)
+    if use_model_sensitive_rmsnorm > 0 or input_2d.shape[-1] > 8192:
+        out = rmsnorm2d_fwd_ck(input_2d, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
-        out = torch.empty_like(input, dtype=input.dtype, device=input.device)
-        rmsnorm(out, input, weight, epsilon)
-    return out
+        out = torch.empty_like(input_2d, dtype=input_2d.dtype, device=input_2d.device)
+        rmsnorm(out, input_2d, weight, epsilon)
+    return _restore_shape(out, original_shape)
 
 
 def rmsnorm2d_fwd_with_add(
