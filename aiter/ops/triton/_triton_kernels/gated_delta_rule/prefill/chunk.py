@@ -264,12 +264,24 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             prepare_rebased_cu_seqlens) key on the original cu_seqlens identity,
             so chunk-index / offset builds stay cache-warm across forwards
             (no per-forward .tolist() D2H).
+        initial_state_indices: optional [N] int slot indices into the
+            ``initial_state`` recurrent-state pool. When given, the hidden state
+            is read from, and the final state written back to, ``initial_state``
+            in place at these slots (paged / radix cache) via an in-kernel
+            scatter, instead of treating ``initial_state`` as a dense
+            per-sequence [N, H, V, K] buffer. Only supported on the Triton
+            hidden-state path (raises with use_chunk_hip / use_chunk_flydsl).
+        return_h: if True, also return the per-chunk hidden-state snapshots
+            ``h`` [B, NT, H, V, K] (V-major), for chunk-boundary SSM-state
+            tracking (radix / prefix cache).
 
     Returns:
-        tuple: (g_cumsum, o, final_state) where:
+        tuple: (g_cumsum, o, final_state) — or (g_cumsum, o, final_state, h)
+        when return_h=True — where:
             - g_cumsum: [B, H, T]
             - o: [B, T, H, V]
             - final_state: [N, H, V, K] if output_final_state=True, else None
+            - h: [B, NT, H, V, K] per-chunk snapshots, only if return_h=True
     """
     if use_chunk_hip and use_chunk_flydsl:
         raise ValueError(

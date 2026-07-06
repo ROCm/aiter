@@ -502,11 +502,23 @@ def chunk_gated_delta_rule_opt_vk(
             calls (no per-forward `.tolist()` D2H).
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
+        initial_state_indices (torch.Tensor, optional): [N] int slot indices into
+            the ``initial_state`` recurrent-state pool. When given, the hidden
+            state is read from, and the final state written back to,
+            ``initial_state`` in place at these slots (paged / radix cache),
+            instead of treating ``initial_state`` as a dense per-sequence
+            [N, H, V, K] buffer. Only supported on the Triton hidden-state path
+            (raises with use_chunk_hip / use_chunk_flydsl).
+        return_h (bool): if True, also return the per-chunk hidden-state
+            snapshots ``h`` [B, NT, H, V, K] (V-major), for chunk-boundary
+            SSM-state tracking (radix / prefix cache). Default: False.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
             - o: Outputs of shape `[B, T, H, V]`.
             - final_state: `[N, H, V, K]` if `output_final_state=True` else `None`.
+        When ``return_h=True``, returns (o, final_state, h) with
+            - h: per-chunk hidden-state snapshots `[B, NT, H, V, K]`.
     """
     if cu_seqlens is not None:
         if q.shape[0] != 1:

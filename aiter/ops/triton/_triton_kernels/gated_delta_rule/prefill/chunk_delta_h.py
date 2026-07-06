@@ -1322,6 +1322,10 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     ORIGINAL cu_seqlens (data tensors are expected pre-sliced); offsets are
     rebased internally via the cached prologue helpers so the chunk-index /
     offset build stays cache-warm across forward calls.
+    initial_state_indices: optional [N] int slot indices. When given, the initial
+    state is read from and the final state written back to ``initial_state`` in
+    place at these pool slots (in-kernel scatter), instead of treating
+    ``initial_state`` as a dense per-sequence [N, H, V, K] buffer.
     """
     B, T, Hg, K = k.shape
     BT = chunk_size
