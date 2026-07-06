@@ -23,7 +23,13 @@ def _keepk_sort0(
     K: tl.constexpr,
     KP1_PAD: tl.constexpr,
     APPLY_SOFTMAX: tl.constexpr,
+    APPLY_RENORM: tl.constexpr = False,
+    ROUTED_SCALING: tl.constexpr = 1.0,
 ):
+    tl.static_assert(
+        not (APPLY_SOFTMAX and APPLY_RENORM),
+        "APPLY_SOFTMAX and APPLY_RENORM are mutually exclusive",
+    )
     pid = tl.program_id(0)
     if pid >= n_rows:
         return
@@ -58,6 +64,12 @@ def _keepk_sort0(
         vmax = tl.max(neg, axis=0)
         ex = tl.where(keep, tl.exp(val - vmax), 0.0)
         w = ex / tl.sum(ex, axis=0)
+    elif APPLY_RENORM:
+        w_f = tl.where(keep, val, 0.0)
+        s = tl.sum(w_f, axis=0)
+        w = w_f / (s + 1e-20) * ROUTED_SCALING
+    elif ROUTED_SCALING != 1.0:
+        w = val * ROUTED_SCALING
     else:
         w = val
     tl.store(Iout + pid * stride_out + outpos, idx.to(tl.int16), mask=keep)

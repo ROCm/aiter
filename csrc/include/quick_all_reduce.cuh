@@ -214,6 +214,170 @@ struct CodecQ4 : public CodecBase
     }
 };
 
+// Int3 symmetric quantization codec.
+// We quantize the FP16 data to block-scaled Int3 in blocks of 4 *
+// kThreadGroupSize. Uniform symmetric quantization (round-to-int + clip),
+// matching the structure of CodecQ4. Signed range is [-4, +3].
+template <typename T, int world_size>
+struct CodecQ3 : public CodecBase
+{
+    static constexpr int kWorldSize = world_size;
+
+    // Layout per quantization block (32 values = 8 threads * 4 fp16x2 lanes):
+    //  - each thread owns 8 values and writes:
+    //      * q2 payload : 8 * 2 bits -> uint16 (2 bytes)
+    //      * q1 payload : 8 * 1 bit  -> uint8  (1 byte)
+    //  - one scale is shared per 32 values and written by group leader.
+    //
+    // kRankTileStride is split as:
+    //   [0   .. 511] : q2 payload region (256 threads * 2 bytes)
+    //   [512 .. 767] : q1 payload region (256 threads * 1 byte)
+    //   [768 .. 895] : scale region (32 groups * 4 bytes)
+    static constexpr int kRankAtoms               = kAtoms / kWorldSize;
+    static constexpr int kRankTileStride          = 896;
+    static constexpr int kRankTileQ1Offset        = 512;
+    static constexpr int kRankTileScaleOffset     = 768;
+    static constexpr int kRankTransmittedTileSize = kRankTileStride * kRankAtoms;
+    static_assert(kRankTransmittedTileSize % 16 == 0,
+                  "kRankTransmittedTileSize must be 16B aligned.");
+
+    static constexpr int kRankBufferTileStride = kRankTileStride / sizeof(int32x4_t);
+
+    // Total tile size for the collective communication.
+    static constexpr int kTransmittedTileSize = kRankTransmittedTileSize * kWorldSize;
+
+    // {-1/4.0h, -1/4.0h}, f16x2_t / bf16x2_t. Sign-flipped so absmax maps
+    // to -4; the sign cancels with decoding_scale on the recv side.
+    static constexpr int kScaleFactor = std::is_same<T, half>::value ? 0xB400B400 : 0xBE80BE80;
+
+    // {1e-7, 1e-7}, f16x2_t
+    static constexpr int kScaleEpsilon = std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;
+
+    // {-4, -4}, f16x2_t / bf16x2_t
+    static constexpr int kRangeMin = std::is_same<T, half>::value ? 0xC400C400 : 0xC080C080;
+
+    // {+3, +3}, f16x2_t / bf16x2_t
+    static constexpr int kRangeMax = std::is_same<T, half>::value ? 0x42004200 : 0x40404040;
+
+    // {+4, +4}, int16x2_t -- shifts signed [-4, +3] to unsigned [0, 7].
+    static constexpr int kRangeBias = 0x00040004;
+
+    __quickreduce_device_inline__ CodecQ3(int thread, int rank) : CodecBase(thread, rank) {}
+
+    __quickreduce_device_inline__ void send(int32x4_t* __restrict__ send_buffer,
+                                            const int32x4_t* __restrict__ data)
+    {
+        for(int k = 0; k < kRankAtoms; k++)
+        {
+            int32x4_t const atom = data[k];
+
+            // 1) Per-group dynamic scale (shared across 32 values).
+            int wblockmax      = group_abs_max<T>(atom);
+            int decoding_scale = packed_mul<T>(wblockmax, kScaleFactor);
+            int encoding_scale = packed_add<T>(decoding_scale, kScaleEpsilon);
+            encoding_scale     = packed_rcp<T>(encoding_scale);
+
+            // 2) Scale + clip to signed int3 range [-4, +3].
+            int32x4_t w;
+            for(int i = 0; i < 4; i++)
+            {
+                w[i] = packed_mul<T>(atom[i], encoding_scale);
+                w[i] = packed_max<T>(w[i], kRangeMin);
+                w[i] = packed_min<T>(w[i], kRangeMax);
+            }
+
+            // 3) Round to integer and bias to unsigned domain [0, 7].
+            int32x4_t q;
+            {
+                int16_t* qi = reinterpret_cast<int16_t*>(&q);
+                T* wh       = reinterpret_cast<T*>(&w);
+                for(int i = 0; i < 8; i++)
+                    qi[i] = (int16_t)rintf(T2float_cast(wh[i]));
+
+                for(int i = 0; i < 4; i++)
+                {
+                    q[i] = packed_add<int16_t>(q[i], kRangeBias);
+                }
+            }
+
+            // 4) Split each 3-bit unsigned value into low-2-bit and high-1-bit
+            // halves, packed into one uint16 (low 2 bits per value) plus one
+            // uint8 (high 1 bit per value).
+            uint16_t q2w = 0;
+            uint8_t q1w  = 0;
+            {
+                int16_t* tw = reinterpret_cast<int16_t*>(&q);
+#pragma unroll
+                for(int i = 0; i < 8; i++)
+                {
+                    uint32_t v = static_cast<uint32_t>(tw[i]) & 0x7u;
+                    q2w |= static_cast<uint16_t>((v & 0x3u) << (i * 2));
+                    q1w |= static_cast<uint8_t>(((v >> 2) & 0x1u) << i);
+                }
+            }
+
+            uint8_t* atom_ptr = reinterpret_cast<uint8_t*>(send_buffer + k * kRankBufferTileStride);
+            uint16_t* q2w_ptr = reinterpret_cast<uint16_t*>(atom_ptr) + thread;
+            uint8_t* q1w_ptr  = reinterpret_cast<uint8_t*>(atom_ptr + kRankTileQ1Offset) + thread;
+            int* qs_ptr = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) + (thread / 8);
+
+            __builtin_nontemporal_store(q2w, q2w_ptr);
+            *q1w_ptr = q1w;
+            if(threadIdx.x == group_leader)
+            {
+                __builtin_nontemporal_store(decoding_scale, qs_ptr);
+            }
+        }
+    }
+
+    __quickreduce_device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
+                                            int32x4_t* __restrict__ data)
+    {
+        for(int k = 0; k < kRankAtoms; k++)
+        {
+            uint8_t* atom_ptr = reinterpret_cast<uint8_t*>(*recv_buffer);
+            uint16_t* q2w_ptr = reinterpret_cast<uint16_t*>(atom_ptr) + thread;
+            uint8_t* q1w_ptr  = reinterpret_cast<uint8_t*>(atom_ptr + kRankTileQ1Offset) + thread;
+            int* qs_ptr = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) + (thread / 8);
+
+            uint16_t q2w = __builtin_nontemporal_load(q2w_ptr);
+            uint8_t q1w  = *q1w_ptr;
+            int qs       = __builtin_nontemporal_load(qs_ptr);
+
+            *recv_buffer += kRankBufferTileStride;
+
+            // Unpack unsigned values [0, 7] then shift back to signed domain
+            // [-4, +3] by adding kRangeMin.
+            int32x4_t w;
+            {
+                int16_t qv[8];
+#pragma unroll
+                for(int i = 0; i < 8; i++)
+                {
+                    uint32_t low2  = (q2w >> (2 * i)) & 0x3u;
+                    uint32_t high1 = (q1w >> i) & 0x1u;
+                    qv[i]          = static_cast<int16_t>(low2 | (high1 << 2));
+                }
+
+#pragma unroll
+                for(int i = 0; i < 4; i++)
+                {
+                    int qpack = packed_from_int16_pair<T>(qv[2 * i], qv[2 * i + 1]);
+                    w[i]      = packed_add<T>(qpack, kRangeMin);
+                }
+            }
+
+            // Apply decode scale to reconstruct fp16/bf16 lanes.
+            for(int i = 0; i < 4; i++)
+            {
+                w[i] = packed_mul<T>(w[i], qs);
+            }
+
+            data[k] = w;
+        }
+    }
+};
+
 // Int6 symmetric quantization codec.
 // We quantize the FP16 data to block-scaled Int6 in blocks of 4 *
 // kThreadGroupSize.
@@ -855,12 +1019,42 @@ allreduce_prototype_twoshot(T const* A,
                            this->kMaxProblemSize);                            \
     }
 
+// INT3 only retains good performance on TP2 (world_size == 2). On TP4/TP8 the
+// 3-bit codec's pack/unpack overhead outweighs the reduced communication
+// volume, so INT3 is restricted to a TP2-only dispatch here.
+#define TWOSHOT_DISPATCH_TP2_ONLY(__codec)                                                  \
+    if(world_size == 2)                                                                     \
+    {                                                                                       \
+        using LineCodec       = __codec<T, 2>;                                              \
+        using AllReduceKernel = AllReduceTwoshot<T, LineCodec, cast_bf2half>;               \
+        hipLaunchKernelGGL((allreduce_prototype_twoshot<AllReduceKernel, T>),               \
+                           dim3(grid),                                                      \
+                           dim3(kBlockTwoShot),                                             \
+                           0,                                                               \
+                           stream,                                                          \
+                           A,                                                               \
+                           B,                                                               \
+                           N,                                                               \
+                           num_blocks,                                                      \
+                           rank,                                                            \
+                           dbuffer_list,                                                    \
+                           data_offset,                                                     \
+                           d_flag_color,                                                    \
+                           this->kMaxProblemSize);                                          \
+    }                                                                                       \
+    else                                                                                    \
+    {                                                                                       \
+        throw std::runtime_error("INT3 quick all-reduce is only supported for world_size "  \
+                                 "== 2 (TP2); use INT4/NONE for larger world sizes.");      \
+    }
+
 enum QuickReduceQuantLevel
 {
     F16  = 0,
     FP8  = 1,
     INT6 = 2,
     INT4 = 3,
+    INT3 = 4,
 };
 
 struct DeviceComms
@@ -1008,6 +1202,7 @@ struct DeviceComms
         case QuickReduceQuantLevel::FP8: TWOSHOT_DISPATCH(CodecFP8) break;
         case QuickReduceQuantLevel::INT6: TWOSHOT_DISPATCH(CodecQ6) break;
         case QuickReduceQuantLevel::INT4: TWOSHOT_DISPATCH(CodecQ4) break;
+        case QuickReduceQuantLevel::INT3: TWOSHOT_DISPATCH_TP2_ONLY(CodecQ3) break;
         default: TWOSHOT_DISPATCH(CodecFP) break;
         }
         HIP_CHECK(hipGetLastError());
