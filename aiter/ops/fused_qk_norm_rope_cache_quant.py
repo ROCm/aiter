@@ -407,7 +407,7 @@ def fused_qk_norm_rope_group_quant(
     ``k_nope_scale_buff`` -- per (token, kv_head), 512 bytes (head_dim=512):
         [0   : 448)  K-nope fp8                                            (448 B)
         [448 : 462)  e8m0 scale, 2*(nope_dim/64)=14 B, each tile-scale x2  (s0,s0,..,s6,s6)
-        [462 : 512)  pad (zero-initialised)                                (50 B)
+        [462 : 512)  pad (uninitialised -- never read by the asm reader)    (50 B)
       The asm reader reads each tile scale TWICE consecutively, hence the x2 duplication.
 
     ``k_rope_buff`` -- per (token, kv_head), rotated K-PE bf16 [rot_dim]    (128 B).
@@ -447,15 +447,12 @@ def fused_qk_norm_rope_group_quant(
             "NoPE size (head_dim - rot_dim) must be divisible by quant_group_size"
         )
     if q_nope_scale_buff is None:
-        # fp8: nope+scale (zeros for the pad); bf16: plain [.,H,512] rotated Q.
-        q_nope_scale_buff = (
-            torch.zeros(
-                (num_tokens, num_heads, head_dim), dtype=dtypes.fp8, device=q.device
-            )
-            if q_is_fp8
-            else torch.empty(
-                (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
-            )
+        # dtype = q_out_dtype covers both cases: when q_is_fp8 the buffer is None
+        # so q_is_fp8 == (q_out_dtype == fp8), i.e. q_out_dtype is already fp8
+        # (nope+scale, pad left uninitialised -- asm reader ignores it); otherwise
+        # it is the plain [.,H,512] rotated bf16 Q.
+        q_nope_scale_buff = torch.empty(
+            (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
         )
     if q_is_fp8 and q_rope_buff is None:
         q_rope_buff = torch.empty(
@@ -466,9 +463,9 @@ def fused_qk_norm_rope_group_quant(
             None  # bf16 Q: PE stays in q_nope_scale_buff, no separate rope buffer
         )
     if k_nope_scale_buff is None:
-        # zeros: the kernel writes nope[0:nope) + 14 scale bytes; the trailing pad must
-        # read back as zero for the asm reader, so zero-initialise it here.
-        k_nope_scale_buff = torch.zeros(
+        # The kernel writes nope[0:nope) + 14 scale bytes; the trailing pad is
+        # never read by the asm reader, so no zero-init is needed.
+        k_nope_scale_buff = torch.empty(
             (num_tokens, num_kv_heads, k_entry_bytes), dtype=dtypes.fp8, device=q.device
         )
     if k_rope_buff is None:

@@ -44,6 +44,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+
 BLOCK_THREADS = 256
 
 
@@ -81,9 +83,9 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
 
     @flyc.kernel(name=module_name)
     def scatter_copy_kernel(
-        src: fx.Tensor,  # (num_src, row_bytes) uint8
-        dst: fx.Tensor,  # (num_dst, row_bytes) uint8
-        dst_src: fx.Tensor,  # (num_dst,) int32  -- src row per dst row, -1=skip
+        src: fx.Pointer,  # (num_src, row_bytes) uint8
+        dst: fx.Pointer,  # (num_dst, row_bytes) uint8
+        dst_src: fx.Pointer,  # (num_dst,) int32  -- src row per dst row, -1=skip
         num_dst: Int32,
     ):
         i32 = T.i32
@@ -99,15 +101,15 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         dst_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_dst_i32)
         _if_dst = scf.IfOp(dst_valid)
         with ir.InsertionPoint(_if_dst.then_block):
-            map_rsrc = buffer_ops.create_buffer_resource(dst_src, max_size=True)
+            map_rsrc = ptr_rsrc(dst_src)
             srow = ArithValue(
                 buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
             )
             row_ok = arith.cmpi(CmpIPredicate.sge, srow, arith.constant(0, type=i32))
             _if_row = scf.IfOp(row_ok)
             with ir.InsertionPoint(_if_row.then_block):
-                src_rsrc = buffer_ops.create_buffer_resource(src, max_size=True)
-                dst_rsrc = buffer_ops.create_buffer_resource(dst, max_size=True)
+                src_rsrc = ptr_rsrc(src)
+                dst_rsrc = ptr_rsrc(dst)
                 tid_i32 = ArithValue(tid)
                 # Element base of each row, in copy-dtype elements (i32 if dword*, i8 otherwise).
                 src_base = srow * row_stride_i32
@@ -142,9 +144,9 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
 
     @flyc.jit
     def launch_scatter_copy(
-        src: fx.Tensor,
-        dst: fx.Tensor,
-        dst_src: fx.Tensor,
+        src: fx.Pointer,
+        dst: fx.Pointer,
+        dst_src: fx.Pointer,
         num_dst: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -159,5 +161,12 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
+
+    launch_scatter_copy.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
 
     return launch_scatter_copy

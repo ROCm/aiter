@@ -146,10 +146,17 @@ def _batched_gemm_bf16_kernel(
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
     if split_k_start < K:
         # Create pointers for first block of A and B input matrices
+        # Cast M/N offsets to int64 to avoid int32 overflow in offs*stride
+        # products (offs_am*stride_am, offs_cm*stride_cm). Large per-batch
+        # matrices (M*K or M*N > 2^31) overflow otherwise.
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = split_k_start + offs_k
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_am = tl.cast(
+            (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M, tl.int64
+        )
+        offs_bn = tl.cast(
+            (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N, tl.int64
+        )
         a_ptrs = a_ptr + (
             batch_id * stride_ab
             + offs_am[:, None] * stride_am
@@ -203,8 +210,9 @@ def _batched_gemm_bf16_kernel(
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        # int64 to avoid int32 overflow in offs_cm*stride_cm for large M*N.
+        offs_cm = tl.cast(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), tl.int64)
+        offs_cn = tl.cast(pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64)
         c_ptrs = (
             c_ptr
             + pid_k * stride_ck

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the mi350 v4 'nm' MLA pipeline (mla_decode_fwd_v4_nm).
+"""Tests for the v4 MLA pipeline (mla_decode_fwd_v4_nm).
 Usage:
   pytest -xvs op_tests/test_mla_v4_nm.py
 """
@@ -25,7 +25,9 @@ PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
 DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = 576  # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
+DIM_QK_PACKED = (
+    576  # = args.dim(512) + args.k_rotary(64); matches the kernel stride_Page
+)
 V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 
@@ -38,13 +40,13 @@ def _on_gfx950():
 
 needs_gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or not _on_gfx950(),
-    reason="v4 nm shader is shipped only for gfx950 (mi350); requires GPU",
+    reason="v4 nm shader is shipped only for gfx950; requires GPU",
 )
 
 
 # ---------------------------------------------------------------------------
 # Synthetic input builders. We do NOT replicate the host-side FP8+e8m0 dequant
-# packing here (that's poc_kl/mla_v4.h v4_detail::init_host_buffers). For
+# packing here (that lives in the host-side kernel init). For
 # smoke testing the dispatcher we just need byte-level buffers of the right
 # shape and dtype; numerical correctness is deferred (see file docstring).
 # ---------------------------------------------------------------------------
@@ -53,7 +55,7 @@ def _build_inputs(
 ):
     """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
 
-    Sizes mirror what poc_kl/mi350/mla_asm/mla.cpp computes for the same cmd
+    Sizes mirror what the reference host harness computes for the same cmd
     (only with kv_seq_lens shrunk small for fast pytest):
       total_q = batch * num_heads * q_seq_logical
       num_page = batch * (kv_seq_lens / page_size)
@@ -488,7 +490,7 @@ def _asm_attn_decode_bf16(
 
     Stride note: KV.size(3) is the per-token kernel stride in bytes. The
     kernel reads exactly 448 (nope) + 8 (scale) + slack = our 512-byte
-    layout. Padding to 576 (poc_kl's stride_Page) made the kernel read
+    layout. Padding to 576 (the kernel's stride_Page) made the kernel read
     garbage bytes as scale and produced all-NaN — DON'T pad.
     """
     total_q = q_bf16.size(0)
@@ -694,18 +696,34 @@ def _run_one_point(
     # The shipped qh64 .co has a 64 q-row tile; the dispatcher
     # (csrc/py_itfs_cu/asm_mla_v4.cu) selects sub_Q based on (gqa_ratio,
     # max_seqlen_q) and computes gdx = ceil(gqa*max_seqlen_q / sub_Q), so a
-    # single .co covers three (gqa, q_seq_logical) entry points:
-    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → gdx=1
-    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → gdx=1
-    #   (128,1) — 128 heads × 1 logical-Q row = 128 → gdx=2 (two WGs along head)
-    # The CSV alias in asm_mla_v4.cu remaps gqa∈{64,128} to the (16,4) lookup
-    # row so all three find the same kernel symbol.
-    _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
+    # single .co covers these (gqa, q_seq_logical) entry points:
+    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → sub_Q=64, gdx=1
+    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → sub_Q=64, gdx=1
+    #   (128,1) — 128 heads × 1 logical-Q row = 128 → sub_Q=64, gdx=2 (2 WGs)
+    #   (16, 1) — 16 heads × 1 logical-Q row  = 16 → sub_Q=16, gdx=1; the
+    #             kernel writes a compact 16-row partial (no 64-row tile
+    #             slack — verified: logits come back [num_seqs,1,16,512]).
+    #   (16, 2) — 16 heads × 2 logical-Q rows = 32 → sub_Q=32, gdx=1; the
+    #             kernel writes a compact 32-row partial (2 q_tokens × 16
+    #             heads; logits [num_seqs,1,2,16,512] -> [total_q,16,512]).
+    #   (32, 1) — 32 heads × 1 logical-Q row  = 32 → sub_Q=32, gdx=1; compact
+    #             32-row partial (row == head; logits [num_seqs,1,32,512]).
+    # The CSV alias in asm_mla_v4.cu remaps all of these to the single
+    # (Gqa=64, qSeqLen=1) lookup row so they share one kernel symbol.
+    _SHIPPED_TILE_VARIANTS = {
+        (16, 4),
+        (64, 1),
+        (128, 1),
+        (16, 1),
+        (16, 2),
+        (32, 1),
+    }
     assert (gqa_ratio, q_seq_logical) in _SHIPPED_TILE_VARIANTS, (
         f"(gqa_ratio={gqa_ratio}, q_seq_logical={q_seq_logical}) not in shipped "
         f"variants {_SHIPPED_TILE_VARIANTS} for the qh64 .co. The dispatcher "
-        f"picks sub_Q=64 and launches gdx=ceil(gqa*max_seqlen_q/64) WGs along "
-        f"the head dim; only these three pairs are exercised by CSV+dispatcher."
+        f"picks sub_Q from (gqa, max_seqlen_q) and launches "
+        f"gdx=ceil(gqa*max_seqlen_q/sub_Q) WGs along the head dim; only these "
+        f"pairs are exercised by CSV+dispatcher."
     )
 
     # Auto-pick the split count when the caller passes None — mirrors the
@@ -971,6 +989,155 @@ def test_v4_nm_accuracy_and_perf():
     Perf is informational (CI variance too high to assert).
     """
     _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
+
+
+def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
+    """Accuracy at a RAGGED (per-seq variable kv_len) decode shape with
+    auto-split (num_kv_splits=None).
+
+    Mirrors the production OP5 path (ATOM sparse_attn_v4_paged_decode ->
+    mla_decode_fwd_v4_nm): N seqs, gqa heads, qlen=1, per-seq kv_len from
+    `kv_lens`. get_meta_param picks the split count from the AVERAGE kv_len,
+    so short seqs in a ragged batch get per-split < SUB_KV (32) — this is the
+    case the kernel's illegal-KV-length guard must handle. Compares the merged
+    asm output against the fp8-dequant torch reference (the kernel-math gate;
+    quant-independent). Reads the result from the correct buffer per the
+    single/multi-split contract (logits[:,0] when resolved==1, else output).
+    """
+    device = "cuda"
+    gqa = gqa_ratio
+    batch = len(kv_lens)
+    total_kv = sum(kv_lens)
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    q_bf16 = torch.randn(batch, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+    kv_bf16 = torch.randn(
+        total_kv,
+        PAGE_SIZE,
+        NUM_KV_HEADS,
+        _QUANT_D,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor(
+        [0] + torch.tensor(kv_lens).cumsum(0).tolist(),
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_page_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+    if attn_sink:
+        sink = torch.randn(gqa, dtype=torch.float32, device=device) * 10.0
+    else:
+        sink = torch.full((gqa,), float("-inf"), dtype=torch.float32, device=device)
+
+    qp, qr = _native_to_2buff_for_asm(q_bf16)
+    kp, kr = _native_to_2buff_for_asm(kv_bf16)
+
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        qp,
+        qr,
+        kp,
+        kr,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        sm_scale,
+        attn_sink=(sink if attn_sink else None),
+    )
+
+    output = torch.empty((batch, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        q=qp,
+        qrope=qr.contiguous(),
+        kv_buffer=kp,
+        kvrope=kr.contiguous(),
+        output=output,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        split_indptr=None,
+        max_seqlen_q=1,
+        sink=sink,
+        sm_scale=sm_scale,
+        out_16_nosplit=0,
+        num_kv_splits=None,
+    )
+    # Single/multi-split output contract (see ATOM paged_decode.py:986): the
+    # merged result lands in `output` for resolved splits > 1; the single-pass
+    # fp32 path leaves it in logits[:, 0].
+    resolved = logits.shape[1]
+    out_asm = (output if resolved > 1 else logits[:, 0]).float()
+
+    print(
+        f"\n[v4 nm varlen] gqa={gqa} kv_lens={kv_lens} total_kv={total_kv} "
+        f"resolved_splits={resolved}"
+    )
+    checkAllclose(
+        out_ref.float(),
+        out_asm,
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg=f"mla_v4_nm varlen [fp8_dequant_ref vs asm] kv_lens={kv_lens}",
+    )
+
+
+@needs_gfx950
+def test_v4_nm_varlen_ragged_kv_tail_split_guard():
+    """Ragged (variable per-seq kv_len) decode at the production OP5 shape
+    (gqa=128, qlen=1, N=4, auto-split), where short seqs in the batch get
+    per-split < SUB_KV=32.
+
+    get_meta_param picks the split count from the AVERAGE kv_len, so in a
+    ragged batch the shortest seq's per-split token count drops well below
+    SUB_KV (e.g. kv_lens=[516,300,130,64] -> 8 splits -> the 64-token seq
+    gets 8 tokens/split). This is exactly the tail-split-< SUB_KV case the
+    kernel's illegal-KV-length guard must survive without over-reading the
+    page table; a pre-guard kernel faulted (illegal K address) here. Locks
+    in both no-crash and bit-accuracy across a spread of ragged shapes.
+    """
+    _run_varlen_point([516, 300, 130, 64])  # long..tiny ragged (prod OP5)
+    _run_varlen_point([516, 516, 516, 516])  # uniform max (split=16, ~32/split)
+    _run_varlen_point([500, 250, 100, 40])  # more extreme ragged
+    _run_varlen_point([66, 50, 40, 33])  # all-short
+
+
+@needs_gfx950
+def test_v4_nm_gqa16_qseqlen1_accuracy_and_perf():
+    """Accuracy for the (gqa_ratio=16, q_seq_logical=1) entry point.
+
+    This pair is served by the same single qh64 .co via the
+    `gqa_ratio == 16 && config_max_seqlen_q == 1` normalization branch in
+    asm_mla_v4.cu. Unlike the other three shipped variants it does NOT
+    satisfy gqa*q_seq=64 (here 16*1=16); the dispatcher picks sub_Q=16 and
+    the kernel writes a compact 16-row partial (logits [num_seqs,1,16,512],
+    no 64-row tile slack). _run_one_point's buffers are already sized to
+    num_heads=gqa_ratio so the existing reshape/compare path handles it
+    directly. Run with sink off and on so the sink path is covered too.
+    """
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=False,
+    )
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=True,
+    )
 
 
 @needs_gfx950
@@ -1330,14 +1497,10 @@ if __name__ == "__main__":
     import itertools
     import sys
 
-    # The v4 nm kernel ships only for gfx950 (mi350). CI runs every op_tests
-    # file via `python3 <file>` (not pytest), which bypasses the per-test
-    # @needs_gfx950 skipif marker and would execute this driver — loading the
-    # gfx950-only .co — on a gfx942 (mi300) runner and fail. Guard the driver
-    # so it cleanly no-ops (exit 0) anywhere that isn't gfx950.
+    # The v4 nm kernel ships only for gfx950.
     if not torch.cuda.is_available() or not _on_gfx950():
         print(
-            "[v4 nm] skip: shipped only for gfx950 (mi350); "
+            "[v4 nm] skip: shipped only for gfx950; "
             "current device is not gfx950. Exiting 0."
         )
         sys.exit(0)
