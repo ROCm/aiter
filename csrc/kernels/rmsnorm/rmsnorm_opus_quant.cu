@@ -8,13 +8,15 @@
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
 
-// Fused rmsnorm + quant. residual/xscale/unquant = 0 to disable. out_code: 0=int8,1=fp8.
+// Fused rmsnorm + quant. residual/residual_out/xscale/unquant = 0 to disable.
+// residual_out != residual => out-of-place fused add (no host staging copy). out_code: 0=int8,1=fp8.
 OPUS_EXPORT void rms_norm_quant_opus(size_t out,
                                      size_t yscale,
                                      size_t unquant,
                                      size_t in,
                                      size_t weight,
                                      size_t residual,
+                                     size_t residual_out,
                                      size_t xscale,
                                      float epsilon,
                                      int rows,
@@ -34,6 +36,7 @@ OPUS_EXPORT void rms_norm_quant_opus(size_t out,
                  reinterpret_cast<const void*>(in),
                  reinterpret_cast<const void*>(weight),
                  reinterpret_cast<void*>(residual),
+                 reinterpret_cast<void*>(residual_out),
                  reinterpret_cast<const void*>(xscale),
                  epsilon,
                  rows,

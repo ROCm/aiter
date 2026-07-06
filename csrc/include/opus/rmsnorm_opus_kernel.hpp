@@ -45,13 +45,15 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out,
 
 // rmsnorm + dynamic/smooth quant (out int8/fp8, yscale [rows]). Pointer flags:
 // residual != 0 fused-add, xscale != 0 smooth, unquant != 0 store pre-quant y.
-template <typename Traits>
+// OOP=false: in-place add (write residual). OOP=true: out-of-place (read residual, write residual_out).
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_quant_opus(void* __restrict__ out,
                                        void* __restrict__ yscale,
                                        void* __restrict__ unquant,
                                        const void* __restrict__ in,
                                        const void* __restrict__ weight,
                                        void* __restrict__ residual,
+                                       void* __restrict__ residual_out,
                                        const void* __restrict__ xscale,
                                        float epsilon,
                                        int rows,
@@ -66,9 +68,9 @@ template <typename Traits, bool OOP>
 __global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, void*, float, int, int, int, int)
 {
 }
-template <typename Traits>
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_quant_opus(
-    void*, void*, void*, const void*, const void*, void*, const void*, float, int, int, float, int)
+    void*, void*, void*, const void*, const void*, void*, void*, const void*, float, int, int, float, int)
 {
 }
 #else
@@ -238,13 +240,14 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
         store(reload_ni(idx), idx);
 }
 
-template <typename Traits>
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
                                        void* __restrict__ yscale_,
                                        void* __restrict__ unquant_,
                                        const void* __restrict__ in_,
                                        const void* __restrict__ weight_,
                                        void* __restrict__ residual_,
+                                       void* __restrict__ residual_out_,
                                        const void* __restrict__ xscale_,
                                        float epsilon,
                                        int rows,
@@ -273,6 +276,9 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
     const auto* w_v    = reinterpret_cast<const Vi*>(reinterpret_cast<const in_t*>(weight_));
     auto* out_v        = reinterpret_cast<Vo*>(reinterpret_cast<out_t*>(out_) + roff);
     auto* res_v        = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(residual_) + roff);
+    // res_out_v is dead (nullptr) for OOP=false, so it costs the in-place/no-add path nothing.
+    auto* res_out_v    = OOP ? reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(residual_out_) + roff)
+                             : static_cast<Vi*>(nullptr);
     auto* uq_v         = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(unquant_) + roff);
     const auto* xscale = reinterpret_cast<const float*>(xscale_);
 
@@ -293,7 +299,10 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
                 s[j]    = opus::cast<in_t>(f);
                 ni[j]   = t5 ? opus::cast<float>(s[j]) : f;
             }
-            res_v[idx] = s;
+            if constexpr(OOP)
+                res_out_v[idx] = s;
+            else
+                res_v[idx] = s;
         }
         else
         {
@@ -304,7 +313,7 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
         return ni;
     };
     auto reload_ni = [&](int idx) -> Vf {
-        Vi s = add ? res_v[idx] : in_v[idx];
+        Vi s = add ? (OOP ? res_out_v[idx] : res_v[idx]) : in_v[idx];
         Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
