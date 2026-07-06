@@ -218,7 +218,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     const int64_t* __restrict__ index_slot_mapping,
     cache_t* __restrict__ kv_cache_k,
     cache_t* __restrict__ kv_cache_v,
-    scalar_t* __restrict__ index_cache,
+    cache_t* __restrict__ index_cache,
     // Per-token dynamic-quant OUTPUT dequant scales (fp8 path only). Layout mirrors
     // reshape_and_cache_with_pertoken_quant:
     //   asm_layout : [num_blocks, num_kv_heads, block_size]
@@ -414,7 +414,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         {
             if(is_ik)
             {
-                storeElems(index_cache + mapped_slot * kHeadDim + dim_base, elems);
+                storeCacheElems<scalar_t, cache_t, kv_dt>(
+                    index_cache + mapped_slot * kHeadDim + dim_base, elems, 1.0f);
             }
             else if(is_k)
             {
@@ -494,7 +495,7 @@ void launchFusedQKNormIdxrQKNorm(
     const int64_t* index_slot_mapping,
     cache_t* kv_cache_k,
     cache_t* kv_cache_v,
-    scalar_t* index_cache,
+    cache_t* index_cache,
     float* k_scale,
     float* v_scale,
     float eps,
@@ -721,9 +722,19 @@ static void fused_qknorm_idxrqknorm_impl(
                             index_slot_mapping->size(0) >= num_tokens,
                         "index_slot_mapping must be 1D with at least num_tokens elements");
             AITER_CHECK(index_cache.has_value() && index_cache->is_gpu() &&
-                            index_cache->is_contiguous() &&
-                            index_cache->dtype() == qkv.dtype(),
-                        "sparse insert mode requires contiguous matching index_cache");
+                            index_cache->is_contiguous(),
+                        "sparse insert mode requires contiguous CUDA index_cache");
+            if(fp8_kv_cache)
+            {
+                AITER_CHECK(index_cache->dtype() == AITER_DTYPE_fp8 ||
+                                index_cache->dtype() == AITER_DTYPE_u8,
+                            "fp8 sparse insert mode requires fp8 or uint8 index_cache");
+            }
+            else
+            {
+                AITER_CHECK(index_cache->dtype() == qkv.dtype(),
+                            "non-fp8 sparse insert mode requires matching index_cache");
+            }
         }
 
         // K/V cache dtype + scale checks (common to both layouts). kv_cache_k is the
@@ -894,7 +905,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 (insert_kv && has_index) ? reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr()) : nullptr,
                 insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_k->data_ptr()) : nullptr,
                 insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_v->data_ptr()) : nullptr,
-                (insert_kv && has_index) ? reinterpret_cast<T*>(index_cache->data_ptr())
+                (insert_kv && has_index) ? reinterpret_cast<opus::fp8_t*>(index_cache->data_ptr())
                                          : nullptr,
                 insert_kv ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,
                 insert_kv ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,

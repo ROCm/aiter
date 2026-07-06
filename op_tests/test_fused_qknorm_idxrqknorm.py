@@ -205,7 +205,12 @@ def split_qkv(case: dict, qkv: torch.Tensor):
     return qkv.split(split_sizes, dim=-1)
 
 
-def make_insert_outputs(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = None):
+def make_insert_outputs(
+    case: dict,
+    *,
+    kv_cache_dtype: Optional[torch.dtype] = None,
+    index_cache_dtype: Optional[torch.dtype] = None,
+):
     q_size, _, _, iq_size, _ = case["sizes"]
     q_out = torch.empty(case["qkv"].size(0), q_size, dtype=case["dtype"], device="cuda")
     index_q_out = torch.empty(
@@ -224,7 +229,7 @@ def make_insert_outputs(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = N
         case["num_blocks"],
         case["block_size"],
         HEAD_DIM,
-        dtype=case["dtype"],
+        dtype=index_cache_dtype or case["dtype"],
         device="cuda",
     )
     return q_out, index_q_out, kv_cache, index_cache
@@ -470,7 +475,7 @@ def gather_index_cache(
     rows = []
     flat = index_cache.view(-1, HEAD_DIM)
     for token in range(case["qkv"].size(0)):
-        rows.append(flat[index_slots[token].item()])
+        rows.append(maybe_view_fp8(flat[index_slots[token].item()]).float())
     return torch.stack(rows)
 
 
@@ -498,6 +503,12 @@ def fp8_cache_ref(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     fp8_dtype = fp8_cache_dtype()
     assert fp8_dtype is not None
     return (x.float() / scale).to(fp8_dtype).float() * scale
+
+
+def fp8_unit_scale_ref(x: torch.Tensor) -> torch.Tensor:
+    fp8_dtype = fp8_cache_dtype()
+    assert fp8_dtype is not None
+    return x.float().to(fp8_dtype).float()
 
 
 @perftest(num_iters=10, num_warmup=1, num_rotate_args=1)
@@ -533,6 +544,7 @@ def run_fused_qknorm_idxrqknorm(
     q_out, index_q_out, kv_cache, index_cache = make_insert_outputs(
         case,
         kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype=kv_cache_dtype if use_fp8_kv_cache else None,
     )
     if use_asm_layout:
         # SHUFFLE caches (separate K/V) for the page-16 asm layout.
@@ -727,7 +739,7 @@ def test_fused_qknorm_idxrqknorm(
                     )
                 check_close(
                     index_k_out,
-                    refs["index_k"],
+                    fp8_unit_scale_ref(refs["index_k"]),
                     msg=f"{msg}(index_cache)",
                     rtol=rtol,
                     atol=atol,
