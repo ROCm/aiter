@@ -1,4 +1,4 @@
-"""hstu_attention_fwd — FlyDSL kernel
+"""hstu_attention_fwd - FlyDSL kernel
 
 out_i = (1/N) * sum_j valid(i,j) * silu(alpha * q_i * k_j^T) * v_j
 
@@ -60,40 +60,56 @@ MFMA_K = 16
 MFMA_LANE_K = 4
 MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE  # 4 f32 per lane
 
-# K LDS swizzle: col ^= (row & (K_SWZ_ROWS-1)) << K_SWZ_SHIFT, on the multiple-of-4 MFMA pack.
-K_SWZ_ROWS = 16
-K_SWZ_SHIFT = 2
+# K LDS swizzle and DMA granule are arch-conditional: bank conflict period
+# differs between CDNA3 (128 B) and CDNA4 (256 B). Mask must stay < 64 elements so col ^ mask never
+# leaves the row for any supported HEAD_DIM_K (including non-power-of-2 192).
 
-DMA_BYTES = 4
-DMA_ELEMS = DMA_BYTES // 2  # 2 elements per lane per DMA pass
+
+def _arch_dma_params(arch: str | None = None):
+    """Arch-conditional (DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT).
+
+    gfx942 (CDNA3): dword DMA (4 B/lane), 128-byte bank period -> (16, 2) covers a 64-element block.
+    gfx950 (CDNA4): dwordx4 DMA (16 B/lane), 256-byte bank period -> (8, 3) covers a 64-element block.
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    if (arch or "").startswith("gfx942"):
+        dma_bytes = 4  # CDNA3 dword
+        k_swz_rows, k_swz_shift = 16, 2
+    else:
+        dma_bytes = 16  # CDNA4 dwordx4
+        k_swz_rows, k_swz_shift = 8, 3
+    return dma_bytes, dma_bytes // 2, k_swz_rows, k_swz_shift
+
 
 # V LDS is fully contiguous row-major [BLOCK_N, hidden_dim]: the dword buffer_load_lds scatters
 # lanes contiguously from a wave-uniform base, so the LDS layout must match the global row-major
 # fetch order.
-_DEFAULT_LDS_CAP_BYTES = 65536
 
 
 @functools.lru_cache(maxsize=16384)
 def lds_cap_bytes(arch: str | None = None) -> int:
+    default_lds_cap_bytes = 65536
+
     if arch is None:
         arch = get_rocm_arch()
-    return SMEM_CAPACITY_MAP.get(arch, _DEFAULT_LDS_CAP_BYTES)
+    return SMEM_CAPACITY_MAP.get(arch, default_lds_cap_bytes)
 
 
-_LOG2E = host_math.log2(host_math.e)  # 1.4426950408889634
-
-# s_waitcnt vmcnt is split lo[3:0] @ bit 0, hi[5:4] @ bit 14.
-# lgkmcnt(63) + expcnt(7) stay maximal so only vmcnt is constrained; V register loads remain
-# outstanding while K DMA is drained.
-_VMCNT_LO_MASK = 0xF
-_LGKMCNT_EXPCNT_BASE = 0x3F70
-_VMCNT_HI_SHIFT = 14
-_VMCNT_HI_MASK = 0x3
+_LOG2E = host_math.log2(host_math.e)
 
 
 def _waitcnt_vm_n(n: int):
     """Emit s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7)."""
-    val = (n & _VMCNT_LO_MASK) | _LGKMCNT_EXPCNT_BASE | (((n >> 4) & _VMCNT_HI_MASK) << _VMCNT_HI_SHIFT)
+
+    # s_waitcnt vmcnt is split lo[3:0] @ bit 0, hi[5:4] @ bit 14.
+    # lgkmcnt(63) + expcnt(7) stay maximal so only vmcnt is constrained; V register loads remain
+    # outstanding while K DMA is drained.
+    vmcnt_lo_mask = 0xF
+    lgkmcnt_expcnt_base = 0x3F70
+    vmcnt_hi_shift = 14
+    vmcnt_hi_mask = 0x3
+    val = (n & vmcnt_lo_mask) | lgkmcnt_expcnt_base | (((n >> 4) & vmcnt_hi_mask) << vmcnt_hi_shift)
     rocdl.s_waitcnt(val)
 
 
@@ -114,7 +130,13 @@ def validate_hstu_attention_fwd(
     block_n: int,
     num_waves: int,
     waves_per_eu: int,
+    arch: str | None = None,
 ) -> None:
+    if arch is None:
+        arch = get_rocm_arch()
+    if not arch.startswith("gfx942") and not arch.startswith("gfx950"):
+        raise ValueError(f"hstu attention fwdunsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')")
+
     if dtype_str not in {"f16", "bf16"}:
         raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
     if not causal:
@@ -151,15 +173,16 @@ def validate_hstu_attention_fwd(
     if block_n % MFMA_M != 0:
         raise ValueError(f"block_n {block_n} must be a multiple of MFMA_M={MFMA_M}")
 
+    _, dma_elems, _, _ = _arch_dma_params()
     block_threads = num_waves * WARP_SIZE
-    elems_per_dma_pass = block_threads * DMA_ELEMS
+    elems_per_dma_pass = block_threads * dma_elems
     head_dim_k = ((head_dim + 63) // 64) * 64
     if (block_n * head_dim_k) % elems_per_dma_pass != 0:
         raise ValueError("K DMA tile does not divide the dword DMA pass evenly")
     if (block_n * hidden_dim) % elems_per_dma_pass != 0:
         raise ValueError("V DMA tile does not divide the dword DMA pass evenly")
 
-    vec_v = 8 if (hidden_dim % 8 == 0 and (block_n * hidden_dim) % (block_threads * 8) == 0) else DMA_ELEMS
+    vec_v = 8 if (hidden_dim % 8 == 0 and (block_n * hidden_dim) % (block_threads * 8) == 0) else dma_elems
     threads_per_row_v = hidden_dim // vec_v
     if block_threads % threads_per_row_v != 0:
         raise ValueError(f"block_threads={block_threads} must be divisible by threads_per_row_v={threads_per_row_v}")
@@ -225,18 +248,22 @@ def build_hstu_attention_fwd(
     assert hidden_dim % MFMA_M == 0
     assert (batch * num_heads) % NUM_GRID_GROUPS == 0
 
+    # Arch-conditional DMA + K LDS swizzle period
+    DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT = _arch_dma_params()
+
     elem_dtype = _dtype_to_elem_type(dtype_str)
     is_bf16 = dtype_str == "bf16"
     has_window = max_attn_len > 0
     has_contextual = contextual_seq_len > 0
 
     K_STEPS = head_dim // MFMA_K  # real 16-wide contraction steps (Q side)
-    # The SSA-lowered K-MFMA accumulation chain corrupts the GEMM2 operand when its length is not a
-    # multiple of 4 (head_dim % 64 != 0): GEMM1 scores are correct, but the C fragment reused as the
-    # GEMM2 operand is corrupted. Round K up to a multiple of 64 so K DMA, LDS layout, XOR swizzle,
-    # and MFMA chain stay 64-aligned. Extra K columns may over-fetch adjacent/out-of-range data
-    # (buffer bounds -> 0), but their MFMA steps pair with a zero Q operand and contribute nothing.
-    # The aligned case leaves HEAD_DIM_K == head_dim.
+    # The XOR swizzle formula (k_swz_col) has period 64 elements. When K_STRIDE < 64
+    # (head_dim % 64 != 0) the swizzled column lands outside [0, K_STRIDE), producing wrong LDS
+    # addresses on both the DMA write and the LDS read. GEMM1 is unaffected (Q is register-resident),
+    # but GEMM2's A-operand (P packs read back through the swizzled K LDS) gets corrupted data.
+    # Round head_dim up to a 64-aligned stride so the swizzle stays in-row by construction.
+    # Extra K columns over-fetch out-of-range data (buffer bounds -> 0) and pair with a zero Q
+    # operand, contributing nothing. The aligned case leaves HEAD_DIM_K == head_dim.
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
     K_STEPS_K = HEAD_DIM_K // MFMA_K  # padded steps (K side); always a multiple of 4
     D_CHUNKS = hidden_dim // MFMA_M  # O accumulator / GEMM2 chunks
@@ -246,7 +273,7 @@ def build_hstu_attention_fwd(
 
     stride_qk_n = num_heads * head_dim
 
-    K_STRIDE = HEAD_DIM_K  # no PAD_K — XOR swizzle replaces it; 64-aligned so the swizzle stays in-row
+    K_STRIDE = HEAD_DIM_K  # no PAD_K - XOR swizzle replaces it; 64-aligned so the swizzle stays in-row
     k_lds_bytes = BLOCK_N * K_STRIDE * 2
 
     # V LDS: row-major V[kv, d], no row pad. The contiguous lane scatter matches the
@@ -306,7 +333,7 @@ def build_hstu_attention_fwd(
         _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, MFMA_K, elem_dtype))
 
         def mfma_acc(a_pack, b_pack, c):
-            """16x16x16 MFMA accumulate through the layout MMA atom."""
+            """MFMA accumulate through the layout MMA atom."""
             return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
 
         # ---- Thread / lane indices ----

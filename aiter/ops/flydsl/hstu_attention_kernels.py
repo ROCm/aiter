@@ -32,9 +32,28 @@ _GPU_ARCH = get_rocm_arch()
 
 
 # Tuned kernel configs
+# list of column names in the tuned csv file
+_CSV_COLUMNS: list[str] = [
+    "arch",
+    "dtype",
+    "num_heads",
+    "head_dim",
+    "hidden_dim",
+    "batch",
+    "max_seq_len",
+    "has_window",
+    "has_contextual",
+    "has_targets",
+    "block_m",
+    "block_n",
+    "num_waves",
+    "waves_per_eu",
+    "duration",
+]
+
 def _problem_key(
     arch: str,
-    dtype_str: str,
+    dtype: str,
     num_heads: int,
     head_dim: int,
     hidden_dim: int,
@@ -46,7 +65,7 @@ def _problem_key(
 ) -> tuple:
     return (
         arch.strip().lower(),
-        dtype_str.strip().lower(),
+        dtype.strip().lower(),
         int(num_heads),
         int(head_dim),
         int(hidden_dim),
@@ -61,6 +80,11 @@ def _problem_key(
 @functools.lru_cache()
 def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
     def _parse_row(row: dict) -> tuple[tuple, float, dict]:
+        if set(row.keys()) != set(_CSV_COLUMNS):
+            raise KeyError(
+                f"unexpected columns: {set(row.keys()) ^ set(_CSV_COLUMNS)}"
+            )
+
         duration = float(row["duration"])
 
         problem_key = _problem_key(

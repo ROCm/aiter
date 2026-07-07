@@ -3,11 +3,34 @@ from dataclasses import dataclass
 import argparse
 import triton
 import torch
-from op_tests.triton_tests.attention.test_hstu_attn import (
-    generate_sparse_seq_len,
-    get_flops,
-    get_bytes,
+from op_tests.flydsl_tests.test_flydsl_hstu_attention import (
+    generate_hstu_attn_inputs,
 )
+
+
+# lower triangular mask, so no need to multiply by 2 for flops
+def get_flops(seq_offsets: torch.Tensor, heads: int, attn_dim: int, hidden_dim: int):
+    total_flops = 0.0
+    seq_num = seq_offsets.shape[0] - 1
+    for i in range(seq_num):
+        length = seq_offsets[i + 1] - seq_offsets[i]
+        total_flops += length * length * (attn_dim + hidden_dim) * heads
+    return total_flops
+
+
+def get_bytes(
+    seq_offsets: torch.Tensor,
+    heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+    elem_size: int,
+):
+    seq_num = seq_offsets.shape[0] - 1
+    total_bytes = 0
+    for i in range(seq_num):
+        length = seq_offsets[i + 1] - seq_offsets[i]
+        total_bytes += length * (attn_dim + length + hidden_dim) * heads * elem_size
+    return total_bytes
 
 
 @dataclass
@@ -48,44 +71,23 @@ def run_benchmark(
     seed: int = 1001,
 ):
     torch.cuda.empty_cache()
-    torch.manual_seed(seed)
     dtype = _DTYPES[shape.dtype]
 
     alpha = 1.0 / shape.head_dim * 10000
     causal = True
 
-    # generate inputs
-    lengths = generate_sparse_seq_len(
-        size=shape.batch_size,
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=shape.batch_size,
         max_seq_len=shape.max_seq_len,
         sparsity=shape.sparsity,
-        device=device,
-    )
-
-    num_targets = None
-    if shape.target_size > 0:
-        num_targets = torch.randint(
-            1,
-            shape.target_size + 1,
-            (shape.batch_size,),
-            device=lengths.device,
-            dtype=lengths.dtype,
-        )
-        num_targets = torch.where(num_targets > lengths, lengths, num_targets)
-
-    seq_offsets = torch.zeros((shape.batch_size + 1,), dtype=torch.int64, device=device)
-    seq_offsets[1:] = torch.cumsum(lengths, dim=0)
-    L = int(seq_offsets[-1].item())
-    x = torch.empty(
-        (L, shape.num_heads, shape.head_dim * 2 + shape.hidden_dim),
+        heads=shape.num_heads,
+        attn_dim=shape.head_dim,
+        hidden_dim=shape.hidden_dim,
+        target_size=shape.target_size,
         dtype=dtype,
         device=device,
-    ).uniform_(-0.01, 0.01)
-    q, k, v = torch.split(x, [shape.head_dim, shape.head_dim, shape.hidden_dim], dim=-1)
-
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+        seed=seed,
+    )
 
     def flydsl_attn():
         return flydsl_hstu_attention_fwd(
