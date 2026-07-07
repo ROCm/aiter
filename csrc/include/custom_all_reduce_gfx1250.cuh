@@ -225,7 +225,72 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 }
 
 // ---------------------------------------------------------------------------
-// gfx1250 allgather kernel
+// gfx1250 allgather kernel — scalar fallback (size not pack-aligned)
+// ---------------------------------------------------------------------------
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) ag_gfx1250_scalar(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size)
+{
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    const T* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        ptrs[i] = (const T*)_input_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int idx = tid; idx < size; idx += stride)
+    {
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            int gpu_idx = (rank + i) % ngpus;
+            result[gpu_idx * size + idx] = ptrs[gpu_idx][idx];
+        }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 2) ag_gfx1250_naive_vec(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    int index    = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride  = blockDim.x * gridDim.x;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = index; idx < size; idx += stride)
+    {
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+      {
+        int rank_idx = (rank + i) % ngpus;
+        *(reinterpret_cast<P*>(result) + size * rank_idx + idx) = ptrs[rank_idx][idx];
+      }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
+// gfx1250 allgather kernel — vectorized unroll4
 // ---------------------------------------------------------------------------
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 2) ag_gfx1250_naive_unroll4(
@@ -263,6 +328,53 @@ __global__ void __launch_bounds__(256, 2) ag_gfx1250_naive_unroll4(
     }
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) ag_gfx1250_lastdim(RankData* _dp,
+                                                            RankSignals sg,
+                                                            Signal* self_sg,
+                                                            T* __restrict__ result,
+                                                            int rank,
+                                                            int size,
+                                                            int last_dim_size)
+{
+    constexpr int unroll    = 4;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    int tid                 = blockIdx.x * blockDim.x * unroll + threadIdx.x;
+    int stride              = gridDim.x * blockDim.x * unroll;
+
+    last_dim_size /= pack_size;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int idx = tid; idx < size; idx += stride)
+    {
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+      {
+        int rank_idx = (rank + i) % ngpus;
+#pragma unroll
+        for (int j = 0; j < unroll; ++j)
+        {
+          int read_idx = idx + j * blockDim.x;
+          if (read_idx >= size) break;
+          int y = read_idx / last_dim_size;
+          int x = read_idx % last_dim_size;
+          int write_idx = (ngpus * y + rank_idx) * last_dim_size + x;
+          *(reinterpret_cast<P*>(result) + write_idx) = ptrs[rank_idx][read_idx];
+        }
+      }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 2) ag_gfx1250_warpsplit_unroll4(
@@ -526,6 +638,50 @@ public:
     }
 
     template <typename T>
+    void allgather_scalar(hipStream_t stream,
+                          T* input,
+                          T* output,
+                          int size)
+    {
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+
+        constexpr int threads = 512;
+        int blocks = std::min(kMaxBlocks,
+                              (size + threads - 1) / threads);
+        if(world_size_ == 2)
+            ag_gfx1250_scalar<T, 2><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+        else
+            ag_gfx1250_scalar<T, 4><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+    }
+
+    template <typename T>
+    void allgather_vec(hipStream_t stream,
+                       T* input,
+                       T* output,
+                       int size)
+    {
+        auto d = 16 / sizeof(T);
+        if(size % d != 0)
+            throw std::runtime_error(
+                "allgather_vec requires input length to be multiple of " + std::to_string(d));
+
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        size /= d;
+
+        constexpr int threads = 256;
+        int blocks = std::min(kMaxBlocks,
+                              (size + threads - 1) / threads);
+        if(world_size_ == 2)
+            ag_gfx1250_naive_vec<T, 2><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+        else
+            ag_gfx1250_naive_vec<T, 4><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+    }
+
+    template <typename T>
     void allgather_naive(hipStream_t stream,
                          T* input,
                          T* output,
@@ -573,6 +729,34 @@ public:
         else
             ag_gfx1250_warpsplit_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
                 input_ptrs, sg_, self_sg_, output, rank_, size);
+    }
+
+    template <typename T>
+    void allgather_lastdim(hipStream_t stream,
+                           T* input,
+                           T* output,
+                           int size,
+                           int last_dim_size)
+    {
+        auto d = 16 / sizeof(T);
+        if(size % d != 0 || last_dim_size % d != 0)
+            throw std::runtime_error(
+                "allgather_lastdim requires input length and last_dim_size "
+                "to be multiples of " + std::to_string(d));
+
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        size /= d;
+
+        constexpr int threads = 512;
+        constexpr int unroll  = 4;
+        int blocks = std::min(kMaxBlocks,
+                              (size + threads * unroll - 1) / (threads * unroll));
+        if(world_size_ == 2)
+            ag_gfx1250_lastdim<T, 2><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
+        else
+            ag_gfx1250_lastdim<T, 4><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
     }
 
     template <typename T, int unroll>

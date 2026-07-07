@@ -42,7 +42,7 @@ void all_reduce(fptr_t _fa,
 void all_gather(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,
-                int64_t kernel_type,
+                int64_t dim,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
 void p2p_bw_test(fptr_t _fa,

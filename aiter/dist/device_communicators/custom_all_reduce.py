@@ -472,6 +472,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_all_gather = ops.all_gather_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
             self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
             self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
@@ -482,6 +483,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
+            self._ops_all_gather = None
             self._ops_dispose = ops.dispose
             self._ops_register_input_buffer = ops.register_input_buffer
             self._ops_register_output_buffer = ops.register_output_buffer
@@ -1000,12 +1002,22 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        ops.all_gather_reg(
-            self._ptr,
-            inp,
-            out,
-            dim,
-        )
+        if self._ops_all_gather is not None:
+            self._ops_all_gather(
+                self._ptr,
+                inp,
+                out,
+                dim,
+                0,  # reg_inp_ptr: 0 = already registered
+                0,  # reg_inp_bytes
+            )
+        else:
+            ops.all_gather_reg(
+                self._ptr,
+                inp,
+                out,
+                dim,
+            )
         return out
 
     def all_gather_unreg(
@@ -1018,14 +1030,24 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        ops.all_gather_unreg(
-            self._ptr,
-            inp,
-            self._pool["input"].data_ptr,
-            out,
-            self._pool["input"].max_size,
-            dim,
-        )
+        if self._ops_all_gather is not None:
+            self._ops_all_gather(
+                self._ptr,
+                inp,
+                out,
+                dim,
+                self._pool["input"].data_ptr,
+                self._pool["input"].max_size,
+            )
+        else:
+            ops.all_gather_unreg(
+                self._ptr,
+                inp,
+                self._pool["input"].data_ptr,
+                out,
+                self._pool["input"].max_size,
+                dim,
+            )
         return out
 
     # Int dtypes have no fp counterpart in the C++ dispatch enum, but the

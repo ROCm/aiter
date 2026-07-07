@@ -144,32 +144,53 @@ void register_graph_buffers(fptr_t _fa,
 // ---- Allgather dispatch helpers ----
 
 static void _all_gather(fptr_t _fa, void* inp, void* out,
-                        int64_t numel, AiterDtype dtype, int kernel_type)
+                        int64_t numel, AiterDtype dtype,
+                        int64_t last_dim_size, int64_t gather_dim)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
 
-#define AG_DISPATCH(T, method)                             \
-    fa->method<T>(stream,                                  \
+#define AG_DISPATCH_DIM0(T)                                         \
+    do {                                                            \
+        auto d = 16 / sizeof(T);                                    \
+        if(numel % d != 0)                                          \
+            fa->allgather_scalar<T>(stream,                         \
+                  reinterpret_cast<T*>(inp),                        \
+                  reinterpret_cast<T*>(out), numel);                \
+        else if(numel % (d * 256 * 4) != 0)                         \
+            fa->allgather_vec<T>(stream,                            \
+                  reinterpret_cast<T*>(inp),                        \
+                  reinterpret_cast<T*>(out), numel);                \
+        else                                                        \
+            fa->allgather_naive<T>(stream,                          \
+                  reinterpret_cast<T*>(inp),                        \
+                  reinterpret_cast<T*>(out), numel);                \
+    } while(0);                                                     \
+    break
+
+#define AG_DISPATCH_LASTDIM(T)                             \
+    fa->allgather_lastdim<T>(stream,                       \
                   reinterpret_cast<T*>(inp),                \
-                  reinterpret_cast<T*>(out), numel);        \
+                  reinterpret_cast<T*>(out),                \
+                  numel, last_dim_size);                    \
     break
 
     switch(dtype)
     {
     case AITER_DTYPE_fp16:
-        if(kernel_type == 0) { AG_DISPATCH(opus::fp16_t, allgather_naive); }
-        else                 { AG_DISPATCH(opus::fp16_t, allgather_warpsplit); }
+        if(gather_dim != 0) { AG_DISPATCH_LASTDIM(opus::fp16_t); }
+        else                { AG_DISPATCH_DIM0(opus::fp16_t); }
     case AITER_DTYPE_bf16:
-        if(kernel_type == 0) { AG_DISPATCH(opus::bf16_t, allgather_naive); }
-        else                 { AG_DISPATCH(opus::bf16_t, allgather_warpsplit); }
+        if(gather_dim != 0) { AG_DISPATCH_LASTDIM(opus::bf16_t); }
+        else                { AG_DISPATCH_DIM0(opus::bf16_t); }
     case AITER_DTYPE_fp32:
-        if(kernel_type == 0) { AG_DISPATCH(opus::fp32_t, allgather_naive); }
-        else                 { AG_DISPATCH(opus::fp32_t, allgather_warpsplit); }
+        if(gather_dim != 0) { AG_DISPATCH_LASTDIM(opus::fp32_t); }
+        else                { AG_DISPATCH_DIM0(opus::fp32_t); }
     default:
         throw std::runtime_error("gfx1250 allgather only supports fp32, fp16 and bf16");
     }
-#undef AG_DISPATCH
+#undef AG_DISPATCH_DIM0
+#undef AG_DISPATCH_LASTDIM
 }
 
 // ---- P2P bandwidth test dispatch ----
@@ -244,7 +265,7 @@ void p2p_bw_test(fptr_t _fa,
 void all_gather(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,
-                int64_t kernel_type,
+                int64_t dim,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes)
 {
@@ -253,6 +274,7 @@ void all_gather(fptr_t _fa,
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
+    int64_t last_dim_size = inp.size(-1);
 
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
@@ -266,7 +288,7 @@ void all_gather(fptr_t _fa,
         actual_inp = (void*)reg_inp_ptr;
     }
 
-    _all_gather(_fa, actual_inp, actual_out, numel, dtype, kernel_type);
+    _all_gather(_fa, actual_inp, actual_out, numel, dtype, last_dim_size, dim);
 }
 
 void all_reduce(fptr_t _fa,

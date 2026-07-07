@@ -23,7 +23,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
     m.def("all_gather", &aiter::all_gather,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
-          py::arg("kernel_type"), py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+          py::arg("dim"), py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
     m.def("p2p_bw_test", &aiter::p2p_bw_test,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("unroll"), py::arg("threads"), py::arg("blocks"),

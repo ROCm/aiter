@@ -264,7 +264,7 @@ def all_gather_gfx1250(
     _fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
-    kernel_type: int,
+    dim: int,
     reg_inp_ptr: int,
     reg_inp_bytes: int,
 ) -> None: ...
