@@ -18,26 +18,6 @@
 #include <hip/hip_runtime.h>
 
 namespace {
-OpusMoeStage2Bf16Kernel opus_moe_stage2_bf16_tune_dispatch(int id)
-{
-    switch(opus_get_gfx_arch())
-    {
-    case OpusGfxArch::Gfx950:
-        return opus_moe_stage2_bf16_tune_dispatch_gfx950(id);
-    default:
-    {
-        const auto& info = opus_get_arch_info();
-        AITER_CHECK(false,
-                    "opus_moe: BF16 stage2 dispatch is only implemented for gfx950; "
-                    "current device ",
-                    info.dev,
-                    " has gcnArchName='",
-                    info.name,
-                    "'.");
-    }
-    }
-}
-
 void check_contiguous_last_dim(const aiter_tensor_t& t, const char* name)
 {
     AITER_CHECK(t.dim() > 0, name, " must have at least one dimension");
@@ -101,22 +81,6 @@ void check_sorted_weights(const std::optional<aiter_tensor_t>& sorted_weights)
     AITER_CHECK(sorted_weights->is_contiguous(), "sorted_weights must be contiguous");
 }
 
-int select_bf16_kernel_id(int requested_kernel_id)
-{
-    const int selected_kernel_id =
-        requested_kernel_id == opus_moe::kStage2KidAuto
-            ? opus_moe::kStage2KidBf16GemmStyle256x256x64TokenSlotRouteOutNoOobNFast
-            : requested_kernel_id;
-
-    AITER_CHECK(opus_moe::stage2_bf16_kid_is_valid(selected_kernel_id),
-                "opus_moe_stage2_route_reduce_fwd got unsupported kernel_id=",
-                selected_kernel_id,
-                " (",
-                opus_moe::stage2_bf16_kid_name(selected_kernel_id),
-                ")");
-    return selected_kernel_id;
-}
-
 int select_a8w4_kernel_id(int requested_kernel_id,
                           int block_m,
                           int logical_inter_dim,
@@ -125,9 +89,7 @@ int select_a8w4_kernel_id(int requested_kernel_id,
     int selected_kernel_id = requested_kernel_id;
     if(selected_kernel_id == opus_moe::kStage2KidAuto)
     {
-        // Auto selects a direct-atomic kernel by sort block_m. Route-out kernels
-        // must be requested explicitly because they require a different output
-        // layout and follow-up reduce.
+        // Auto selects direct-atomic; route-out kernels must be requested explicitly.
         selected_kernel_id = opus_moe::stage2_a8w4_auto_direct_atomic_kid(
             logical_inter_dim, inter_dim_pad, block_m);
     }
@@ -217,104 +179,6 @@ void check_a8w4_output_layout(const aiter_tensor_t& out,
 }
 
 } // namespace
-
-void opus_moe_stage2_route_reduce_fwd(aiter_tensor_t& inter_states,
-                                      aiter_tensor_t& w2,
-                                      aiter_tensor_t& sorted_token_ids,
-                                      std::optional<aiter_tensor_t> sorted_weights,
-                                      aiter_tensor_t& sorted_expert_ids,
-                                      aiter_tensor_t& num_valid_ids,
-                                      aiter_tensor_t& route_out,
-                                      aiter_tensor_t& out,
-                                      int block_m,
-                                      int kernel_id)
-{
-    check_tensor(
-        inter_states, "inter_states", 3, "[token, topk, inter_dim]", AITER_DTYPE_bf16, "bf16");
-    check_tensor(w2, "w2", 3, "[expert, model_dim, inter_dim]", AITER_DTYPE_bf16, "bf16");
-    check_tensor(out, "out", 2, "[output_rows, model_dim]", AITER_DTYPE_bf16, "bf16");
-    check_tensor(route_out, "route_out", 2, "[route, model_dim]", AITER_DTYPE_bf16, "bf16");
-    check_i32_metadata(sorted_token_ids, "sorted_token_ids", false);
-    check_i32_metadata(sorted_expert_ids, "sorted_expert_ids", true);
-    check_i32_metadata(num_valid_ids, "num_valid_ids", true);
-    check_sorted_weights(sorted_weights);
-    check_same_device(inter_states, "inter_states", w2, "w2");
-    check_same_device(inter_states, "inter_states", sorted_token_ids, "sorted_token_ids");
-    check_same_device(inter_states, "inter_states", sorted_expert_ids, "sorted_expert_ids");
-    check_same_device(inter_states, "inter_states", num_valid_ids, "num_valid_ids");
-    check_same_device(inter_states, "inter_states", route_out, "route_out");
-    check_same_device(inter_states, "inter_states", out, "out");
-    if(sorted_weights.has_value())
-        check_same_device(inter_states, "inter_states", *sorted_weights, "sorted_weights");
-
-    const int token_num = static_cast<int>(inter_states.size(0));
-    const int actual_topk = static_cast<int>(inter_states.size(1));
-    const int inter_dim = static_cast<int>(inter_states.size(2));
-    const int num_experts = static_cast<int>(w2.size(0));
-    const int model_dim = static_cast<int>(w2.size(1));
-    const int route_rows = token_num * actual_topk;
-
-    AITER_CHECK(w2.size(2) == inter_dim,
-                "w2 inter_dim mismatch, got w2.size(2)=",
-                w2.size(2),
-                " inter_states.size(2)=",
-                inter_dim);
-    AITER_CHECK(out.size(0) == token_num && out.size(1) == model_dim,
-                "out shape must be [token_num, model_dim]");
-    AITER_CHECK(route_out.size(0) >= route_rows && route_out.size(1) == model_dim,
-                "route_out shape must be at least [token_num * topk, model_dim]");
-    AITER_CHECK(block_m > 0, "block_m must be positive");
-
-    const int selected_kernel_id = select_bf16_kernel_id(kernel_id);
-    if(token_num == 0 || model_dim == 0 || inter_dim == 0)
-        return;
-
-    opus_moe_stage2_bf16_kargs decode_kargs{};
-    decode_kargs.inter_states = reinterpret_cast<const hip_bfloat16*>(inter_states.data_ptr());
-    decode_kargs.w2 = reinterpret_cast<const hip_bfloat16*>(w2.data_ptr());
-    decode_kargs.sorted_token_ids = reinterpret_cast<const int32_t*>(sorted_token_ids.data_ptr());
-    decode_kargs.sorted_weights = sorted_weights.has_value()
-                                      ? reinterpret_cast<const float*>(sorted_weights->data_ptr())
-                                      : nullptr;
-    decode_kargs.sorted_expert_ids =
-        reinterpret_cast<const int32_t*>(sorted_expert_ids.data_ptr());
-    decode_kargs.num_valid_ids = reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
-    decode_kargs.route_out_bf16 = reinterpret_cast<hip_bfloat16*>(route_out.data_ptr());
-    decode_kargs.token_num = token_num;
-    decode_kargs.topk = actual_topk;
-    decode_kargs.num_experts = num_experts;
-    decode_kargs.model_dim = model_dim;
-    decode_kargs.inter_dim = inter_dim;
-    decode_kargs.block_m = block_m;
-    decode_kargs.stride_a_t = inter_states.stride(0);
-    decode_kargs.stride_a_k = inter_states.stride(1);
-    decode_kargs.stride_w_e = w2.stride(0);
-    decode_kargs.stride_w_h = w2.stride(1);
-    decode_kargs.stride_route_out_t = route_out.stride(0);
-
-    opus_moe_stage2_route_reduce_kargs reduce_kargs{};
-    reduce_kargs.route_out = reinterpret_cast<const uint8_t*>(route_out.data_ptr());
-    reduce_kargs.out_bf16 = reinterpret_cast<hip_bfloat16*>(out.data_ptr());
-    reduce_kargs.token_num = token_num;
-    reduce_kargs.topk = actual_topk;
-    reduce_kargs.model_dim = model_dim;
-    reduce_kargs.stride_o_t = out.stride(0);
-    reduce_kargs.stride_route_out_t = route_out.stride(0);
-    reduce_kargs.route_out_fp8 = 0;
-    reduce_kargs.route_out_row_bytes = 0;
-
-    HipDeviceGuard guard(inter_states.device_id);
-    const hipStream_t stream = aiter::getCurrentHIPStream();
-
-    const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
-    auto launcher = opus_moe_stage2_bf16_tune_dispatch(selected_kernel_id);
-    launcher(decode_kargs, sorted_blocks, stream);
-    HIP_CALL_LAUNCH(hipGetLastError());
-
-    opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
-        reduce_kargs, stream, kOpusMoeStage2RouteOutputReduceBf16BlockN);
-    HIP_CALL_LAUNCH(hipGetLastError());
-}
 
 void opus_moe_stage2_a8w4_decode_fwd(
     aiter_tensor_t& inter_states,
@@ -470,8 +334,7 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.num_experts = num_experts;
     kargs.model_dim = model_dim;
     kargs.sorted_blocks = sorted_blocks;
-    // Keep a runtime route-out guard: the MXFP8 path codegen is measurably more
-    // stable than making route-out a pure compile-time else branch.
+    // Keep runtime route-out guard for more stable MXFP8 codegen.
     kargs.route_out_fp8 = route_out_fp8 ? 1 : 0;
     kargs.route_out_row_bytes = route_out_fp8 ? out.stride(0) : 0;
 
@@ -487,8 +350,7 @@ void opus_moe_stage2_reduce_token_slot_route_output_fwd(aiter_tensor_t& route_ou
                                                         int topk,
                                                         int block_n)
 {
-    // fp8 route_out is uint8-packed; bf16 route_out is bf16. Derive mode from dtype
-    // (no OPUS_ROUTE_FP8 env): keeps reduce in sync with the decode kid that produced it.
+    // Derive fp8/bf16 route_out mode from dtype to stay in sync with the decode kid.
     const int route_out_fp8 = (route_out.dtype() == AITER_DTYPE_u8) ? 1 : 0;
     check_tensor(out, "out", 2, "[token, model_dim]", AITER_DTYPE_bf16, "bf16");
     check_same_device(route_out, "route_out", out, "out");

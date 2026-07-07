@@ -4,116 +4,128 @@
 // gfx950-specific Opus MoE dispatch implementations.
 #pragma once
 
-#include "../opus_moe_arch.cuh"
 #include "../opus_moe_common.cuh"
-#include "opus_moe_stage2_route_output_reduce_gfx950.cuh"
-#include "a16w16/opus_moe_pipeline_stage2_gemmstyle_gfx950.cuh"
-#include "a8w4/opus_moe_pipeline_stage2_a8w4_decode_main_gfx950.cuh"
-#include "opus_moe_stage2_manifest.h"
-
 #include "aiter_hip_common.h"
 
-#include <algorithm>
-#include <cstddef>
-#include <hip/hip_runtime.h>
+constexpr int kOpusMoeStage2RouteOutputReduceBf16BlockN =
+    opus_moe::kStage2RouteOutputReduceBf16BlockN;
+constexpr int kOpusMoeStage2RouteOutputReduceDefaultBlockN =
+    opus_moe::kStage2RouteOutputReduceDefaultBlockN;
+constexpr int kOpusMoeStage2RouteOutputReduceDefaultThreads =
+    opus_moe::kStage2RouteOutputReduceDefaultThreads;
 
-using OpusMoeStage2Bf16Kernel = void (*)(const opus_moe_stage2_bf16_kargs&,
-                                         int,
-                                         hipStream_t);
+template<int BLOCK_N, int BLOCK_THREADS, int TOPK = 0, bool ROUTE_FP8 = false>
+__global__ __launch_bounds__(BLOCK_THREADS, 4) void
+opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(
+    opus_moe_stage2_route_reduce_kargs kargs);
 
-template<typename Traits>
-inline void opus_moe_stage2_gemmstyle_launch_gfx950(const opus_moe_stage2_bf16_kargs& kargs,
-                                                    int sorted_blocks,
-                                                    hipStream_t stream)
+inline int opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
+    int model_dim,
+    int requested_block_n)
 {
-    AITER_CHECK(kargs.block_m % Traits::B_M == 0,
-                "opus_moe stage2 gemmstyle kernel requires block_m to be a multiple of ",
-                Traits::B_M,
-                ", got ",
-                kargs.block_m);
-    AITER_CHECK(kargs.model_dim % Traits::B_N == 0,
-                "opus_moe stage2 gemmstyle kernel requires model_dim to be a multiple of ",
-                Traits::B_N,
-                ", got ",
-                kargs.model_dim);
-    AITER_CHECK(kargs.inter_dim % Traits::B_K == 0,
-                "opus_moe stage2 gemmstyle kernel requires inter_dim to be a multiple of ",
-                Traits::B_K,
-                ", got ",
-                kargs.inter_dim);
-    const int metadata_tiles = sorted_blocks * (kargs.block_m / Traits::B_M);
-    const int route_tiles =
-        (kargs.token_num * kargs.topk + Traits::B_M - 1) / Traits::B_M;
-    const int m_tiles = std::min(metadata_tiles, route_tiles);
-    const int n_tiles = (kargs.model_dim + Traits::B_N - 1) / Traits::B_N;
-    dim3 grid(n_tiles, m_tiles, 1);
-    dim3 block(Traits::BLOCK_SIZE);
-    opus_moe_stage2_gemmstyle_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(kargs);
+    if(requested_block_n > 0)
+        return requested_block_n;
+    const int auto_block_n = opus_moe::stage2_a8w4_route_reduce_auto_block_n(model_dim);
+    return auto_block_n > 0 ? auto_block_n : kOpusMoeStage2RouteOutputReduceDefaultBlockN;
 }
 
-template<typename Traits>
-inline void opus_moe_stage2_a8w4_decode_launch_gfx950(
-    const opus_moe_stage2_a8w4_kargs& kargs,
+template<int BLOCK_N, int BLOCK_THREADS, int TOPK, bool ROUTE_FP8>
+inline void opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950(
+    const opus_moe_stage2_route_reduce_kargs& kargs,
+    dim3 grid,
     hipStream_t stream)
 {
-    int route_blocks =
-        (kargs.sorted_blocks * Traits::SORT_BLOCK_M + Traits::B_M - 1) /
-        Traits::B_M;
-    opus_moe_stage2_a8w4_kargs launch_kargs = kargs;
-    launch_kargs.sorted_blocks = route_blocks;
-    if constexpr(Traits::DECODE_PACE_ROUTE_BLOCKS_TO_POW2)
-    {
-        int paced_route_blocks = 1;
-        while(paced_route_blocks < route_blocks)
-            paced_route_blocks <<= 1;
-        route_blocks = paced_route_blocks;
-        launch_kargs.sorted_blocks = route_blocks;
-    }
-    AITER_CHECK(kargs.model_dim % Traits::B_N == 0,
-                "Opus A8W4 stage2 requires model_dim to be a multiple of block_n=",
-                Traits::B_N,
-                ", got ",
-                kargs.model_dim);
-    const int n_tiles = kargs.model_dim / Traits::B_N;
-    dim3 grid(n_tiles, route_blocks, 1);
-    dim3 block(Traits::BLOCK_SIZE);
-    opus_moe_stage2_a8w4_decode_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(
-        launch_kargs);
+    opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950<
+        BLOCK_N,
+        BLOCK_THREADS,
+        TOPK,
+        ROUTE_FP8><<<grid, dim3(BLOCK_THREADS), 0, stream>>>(kargs);
 }
 
-namespace opus_moe_gfx950_detail
+template<int BLOCK_N, int BLOCK_THREADS, int TOPK>
+inline void opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950(
+    const opus_moe_stage2_route_reduce_kargs& kargs,
+    dim3 grid,
+    hipStream_t stream)
 {
-struct OpusMoeStage2TuneEntry
-{
-    int kid;
-    OpusMoeStage2Bf16Kernel func;
-};
-
-struct TuneEntryLess
-{
-    template<typename Entry>
-    constexpr bool operator()(const Entry& a, const Entry& b) const noexcept
+    if(kargs.route_out_fp8)
     {
-        return a.kid < b.kid;
+        opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950<
+            BLOCK_N,
+            BLOCK_THREADS,
+            TOPK,
+            true>(kargs, grid, stream);
     }
-};
-} // namespace opus_moe_gfx950_detail
+    else
+    {
+        opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950<
+            BLOCK_N,
+            BLOCK_THREADS,
+            TOPK,
+            false>(kargs, grid, stream);
+    }
+}
 
-inline OpusMoeStage2Bf16Kernel opus_moe_stage2_bf16_tune_dispatch_gfx950(int id)
+#include "opus_moe_stage2_a8w4_manifest.h"
+
+// Dispatch on block_n with the topk known at compile time (TOPK).
+template<int TOPK>
+inline void opus_moe_stage2_reduce_token_slot_route_output_dispatch_block_n_gfx950(
+    const opus_moe_stage2_route_reduce_kargs& kargs,
+    dim3 grid,
+    hipStream_t stream,
+    int block_n)
 {
-    using namespace opus_moe_gfx950_detail;
-    static constexpr OpusMoeStage2TuneEntry kTune[] = {
-        GENERATE_OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP
-    };
-    constexpr size_t kSize = OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP_SIZE;
-    static_assert(kSize == sizeof(kTune) / sizeof(kTune[0]));
-    const OpusMoeStage2TuneEntry needle{id, nullptr};
-    const auto it = std::lower_bound(kTune, kTune + kSize, needle, TuneEntryLess{});
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ",
-                id,
-                " (",
-                opus_moe::stage2_bf16_kid_name(id),
-                ") not found in gfx950 Opus MoE stage2 BF16 tune table");
-    return it->func;
+    switch(block_n)
+    {
+    case kOpusMoeStage2RouteOutputReduceBf16BlockN:
+        opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950<
+            kOpusMoeStage2RouteOutputReduceBf16BlockN,
+            kOpusMoeStage2RouteOutputReduceDefaultThreads,
+            TOPK>(kargs, grid, stream);
+        break;
+    case kOpusMoeStage2RouteOutputReduceDefaultBlockN:
+        opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950<
+            kOpusMoeStage2RouteOutputReduceDefaultBlockN,
+            kOpusMoeStage2RouteOutputReduceDefaultThreads,
+            TOPK>(kargs, grid, stream);
+        break;
+    default:
+        if(opus_moe_stage2_a8w4_route_reduce_dispatch_generated_gfx950<TOPK>(
+               kargs, grid, stream, block_n))
+            break;
+        AITER_CHECK(false,
+                    "unsupported Opus MoE route-output reduce block_n=",
+                    block_n);
+    }
+}
+
+inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
+    const opus_moe_stage2_route_reduce_kargs& kargs,
+    hipStream_t stream,
+    int requested_block_n)
+{
+    const int block_n = opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
+        kargs.model_dim, requested_block_n);
+    dim3 grid(kargs.token_num, (kargs.model_dim + block_n - 1) / block_n, 1);
+    // Specialize common topk values; TOPK=0 remains the runtime fallback.
+    switch(kargs.topk)
+    {
+    case 4:
+        opus_moe_stage2_reduce_token_slot_route_output_dispatch_block_n_gfx950<4>(
+            kargs, grid, stream, block_n);
+        break;
+    case 6:
+        opus_moe_stage2_reduce_token_slot_route_output_dispatch_block_n_gfx950<6>(
+            kargs, grid, stream, block_n);
+        break;
+    case 8:
+        opus_moe_stage2_reduce_token_slot_route_output_dispatch_block_n_gfx950<8>(
+            kargs, grid, stream, block_n);
+        break;
+    default:
+        opus_moe_stage2_reduce_token_slot_route_output_dispatch_block_n_gfx950<0>(
+            kargs, grid, stream, block_n);
+        break;
+    }
 }

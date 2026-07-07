@@ -3,6 +3,7 @@
 #pragma once
 
 #include "../../opus_moe_common.cuh"
+#include "../opus_moe_stage2_utils_gfx950.cuh"
 #include "opus_moe_traits_stage2_gfx950.cuh"
 
 #include "opus/opus.hpp"
@@ -721,10 +722,10 @@ opus_moe_stage2_gemmstyle_kernel_gfx950(opus_moe_stage2_bf16_kargs kargs)
             const hip_bfloat16 v2(static_cast<float>(values[2]) * weight);
             const hip_bfloat16 v3(static_cast<float>(values[3]) * weight);
             const uint64_t packed =
-                static_cast<uint64_t>(static_cast<uint16_t>(v0.data)) |
-                (static_cast<uint64_t>(static_cast<uint16_t>(v1.data)) << 16) |
-                (static_cast<uint64_t>(static_cast<uint16_t>(v2.data)) << 32) |
-                (static_cast<uint64_t>(static_cast<uint16_t>(v3.data)) << 48);
+                static_cast<uint64_t>(opus_moe_gfx950_bf16_to_bits(v0)) |
+                (static_cast<uint64_t>(opus_moe_gfx950_bf16_to_bits(v1)) << 16) |
+                (static_cast<uint64_t>(opus_moe_gfx950_bf16_to_bits(v2)) << 32) |
+                (static_cast<uint64_t>(opus_moe_gfx950_bf16_to_bits(v3)) << 48);
             *reinterpret_cast<uint64_t*>(
                 kargs.route_out_bf16 +
                 static_cast<int64_t>(route_row) * kargs.stride_route_out_t + col) =
