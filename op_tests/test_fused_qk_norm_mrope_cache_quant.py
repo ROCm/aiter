@@ -21,6 +21,14 @@ def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
     return weight * x
 
 
+def gemma_rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
+    input_dtype = x.dtype
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x.to(input_dtype)
+    return (1.0 + weight) * x
+
+
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Apply interleaved MRoPE to 3D rotary embeddings.
     Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
@@ -192,6 +200,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     use_shuffle_layout: bool = False,  # Whether to use shuffle layout
     page_size: int = 0,  # Page size (block_size) for shuffle layout
     rotary_dim: int = 0,  # Partial rotary dim (0 = full rotary = head_size)
+    gemma_norm: bool = False,
 ):
     rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
     q_size = num_heads_q * head_size
@@ -201,11 +210,12 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
 
     q_by_head = q.view(num_tokens, num_heads_q, head_size)
-    q_by_head = rms_norm_forward(q_by_head, qw, eps)
+    norm_fn = gemma_rms_norm_forward if gemma_norm else rms_norm_forward
+    q_by_head = norm_fn(q_by_head, qw, eps)
     q = q_by_head.view(q.shape)
 
     k_by_head = k.view(num_tokens, num_heads_k, head_size)
-    k_by_head = rms_norm_forward(k_by_head, kw, eps)
+    k_by_head = norm_fn(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
 
     # Infer max_positions from cos_sin shape
@@ -336,6 +346,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     use_shuffle_layout: bool = False,  # Whether to use shuffle layout
     page_size: int = 0,  # Page size (block_size) for shuffle layout
     rotary_dim: int = 0,  # Partial rotary dim (0 = full rotary = head_size)
+    gemma_norm: bool = False,
 ):
     # qkv = qkv.clone()  # inplace op
     # Calculate x for shuffle layout: x = 16 // k_cache.element_size()
@@ -373,6 +384,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             block_size,
             x,
             rotary_dim,
+            gemma_norm,
         )
     else:
         aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
@@ -424,6 +436,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
     page_size=0,  # Page size (block_size) for shuffle layout
     max_positions=10000,
     rotary_dim=0,  # Partial rotary dim (0 = full rotary = head_size)
+    gemma_norm: bool = False,
 ):
     rotary_dim_ = rotary_dim if rotary_dim > 0 else head_size
     cos_sin_dim = rotary_dim_
@@ -543,6 +556,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         use_shuffle_layout,
         page_size,
         rotary_dim,
+        gemma_norm,
     )
     _, avg_cu = run_fused_mrope_3d_rms_set_kv_shuffle(
         qkv,
@@ -572,6 +586,7 @@ def test_mrope_3d_rms_set_kv_shuffle(
         use_shuffle_layout,
         page_size,
         rotary_dim,
+        gemma_norm,
     )
 
     info = f"dtype:{dtype}, kv_cache_dtype:{kv_cache_dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}, num_heads_v:{num_heads_v}, head_size:{head_size}, is_neox_style:{is_neox_style}"
@@ -857,3 +872,47 @@ if __name__ == "__main__":
                                         max_positions=args.max_positions,
                                         rotary_dim=rotary_dim,
                                     )
+
+    # GemmaRMSNorm q_norm/k_norm tests (gemma_norm=True path).
+    # Exercises the (1 + gamma) weight in the fused kernel launch path, which is
+    # NOT covered by the loops above (they all default gemma_norm=False).
+    # Includes the exact Qwen3.6-35B-A3B full-attention layer config:
+    #   num_heads_q=16, num_kv=2, head_size=256, rotary_dim=64,
+    #   mrope_section=[11, 11, 10] (sum=32=rotary_dim/2), neox=True, interleaved=True.
+    print("\n=== GemmaRMSNorm (gemma_norm=True) MRoPE Tests ===", flush=True)
+    # (head_size, rotary_dim): mrope_section
+    gemma_mrope_sections = {
+        (256, 64): [11, 11, 10],  # Qwen3.6 full-attention layer
+        (128, 32): [4, 6, 6],
+    }
+    gemma_head_configs = [(16, 2), (8, 2)]  # (num_heads_q, num_kv_heads)
+    for kv_cache_dtype in args.kv_cache_dtypes:
+        for use_shuffle_layout in use_shuffle_layouts:
+            page_size_list = page_sizes if use_shuffle_layout else [0]
+            for page_size in page_size_list:
+                for num_token in args.token:
+                    for num_head_q, num_head_kv in gemma_head_configs:
+                        for (
+                            head_size,
+                            rotary_dim,
+                        ), mrope_sec in gemma_mrope_sections.items():
+                            test_mrope_3d_rms_set_kv_shuffle(
+                                args.dtype,
+                                num_token,
+                                num_head_q,
+                                num_head_kv,
+                                num_head_kv,
+                                head_size,
+                                True,  # is_neox_style (Qwen3.6 convention)
+                                mrope_sec,
+                                True,  # is_interleaved (Qwen3.6 convention)
+                                eps=1e-6,
+                                is_mrope=True,
+                                kv_cache_dtype=kv_cache_dtype,
+                                test_return_kv=True,
+                                use_shuffle_layout=use_shuffle_layout,
+                                page_size=page_size,
+                                max_positions=args.max_positions,
+                                rotary_dim=rotary_dim,
+                                gemma_norm=True,
+                            )
