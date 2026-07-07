@@ -397,9 +397,7 @@ def test_cdna4_swizzled_scales_with_padded_physical_dims(device="cuda"):
     )
 
     w_tri, w_scale = downcast_to_mxfp(w_physical, torch.uint8, axis=1)
-    w_ref = upcast_from_mxfp(w_tri, w_scale, torch.bfloat16, axis=1)[
-        :, :, :logical_n
-    ]
+    w_ref = upcast_from_mxfp(w_tri, w_scale, torch.bfloat16, axis=1)[:, :, :logical_n]
     w_scale_tri = shuffle_scale_moe(
         w_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
     )
