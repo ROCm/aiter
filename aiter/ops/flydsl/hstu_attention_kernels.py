@@ -8,6 +8,10 @@ from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
     validate_hstu_attention_fwd,
     build_hstu_attention_fwd,
 )
+from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
+    validate_hstu_attention_bwd,
+    build_hstu_attention_bwd,
+)
 import csv
 import functools
 import torch
@@ -441,3 +445,127 @@ def flydsl_hstu_attention_fwd(
             fx.Stream(launch_stream),
         )
     return out
+
+
+def _validate_bwd_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+) -> tuple[int, int, int, int, str]:
+    """Validate backward inputs, reusing the forward's q/k/v checks.
+
+    dout is the upstream gradient of the forward output O, so it must match v's
+    (total_tokens, num_heads, hidden_dim) shape and dtype exactly.
+    """
+    batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_inputs(
+        q=q,
+        k=k,
+        v=v,
+        seq_offsets=seq_offsets,
+        num_targets=num_targets,
+    )
+
+    if not dout.is_cuda:
+        raise ValueError("flydsl_hstu_attention_bwd requires device tensors")
+    if dout.device != q.device:
+        raise ValueError("dout must reside on q's device")
+    if dout.dim() != 3:
+        raise ValueError(f"dout must be rank 3, got {tuple(dout.shape)}")
+    if dout.shape != v.shape:
+        raise ValueError(
+            "dout must share v's shape (it is dO), got "
+            f"dout={tuple(dout.shape)} v={tuple(v.shape)}"
+        )
+    if dout.dtype != v.dtype:
+        raise ValueError(
+            f"dout must share v's dtype, got dout={dout.dtype} v={v.dtype}"
+        )
+
+    return batch, num_heads, head_dim, hidden_dim, dtype_str
+
+
+def flydsl_hstu_attention_bwd(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    causal: bool,
+    num_targets: Optional[torch.Tensor],
+    max_attn_len: int,
+    contextual_seq_len: int,
+    *,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
+    num_waves: Optional[int] = None,
+    waves_per_eu: Optional[int] = None,
+    sequence_parallel: Optional[bool] = None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """HSTU attention backward: returns (dq, dk, dv).
+
+    Recomputes S = alpha*Q*K^T and sigma from Q,K (nothing is stashed by the
+    forward), then dV = A^T dO, dS = M .* (1/N) sigma(1+S(1-sigma)) .* (dO V^T),
+    dQ = alpha dS K, dK = alpha dS^T Q. Mirrors the forward's conventions
+    (causal-only, {f16,bf16}, alpha-in-score, 1/N on dS, fast-math SiLU).
+    """
+    batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
+        q=q,
+        k=k,
+        v=v,
+        dout=dout,
+        seq_offsets=seq_offsets,
+        num_targets=num_targets,
+    )
+
+    # Phase 1 default tile config (correctness-first; tuning lands in Phase 5).
+    cfg = dict(
+        block_m=block_m if block_m is not None else 64,
+        block_n=block_n if block_n is not None else 32,
+        num_waves=num_waves if num_waves is not None else 4,
+        waves_per_eu=waves_per_eu if waves_per_eu is not None else 0,
+    )
+
+    launcher = build_hstu_attention_bwd(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        causal=causal,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=num_targets is not None,
+        alpha=alpha,
+        dtype_str=dtype_str,
+        max_seq_len=N,
+        **cfg,
+    )
+
+    # Phase 1 computes dV only; dQ/dK are returned as zeros until Phase 2/3.
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.empty_like(v)
+
+    nt = num_targets
+    if nt is None:
+        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
+
+    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
+    with torch.cuda.device(q.device.index):
+        _run_compiled(
+            launcher,
+            q.contiguous(),
+            k.contiguous(),
+            dout.contiguous(),
+            seq_offsets.contiguous(),
+            nt.contiguous(),
+            dv,
+            fx.Stream(launch_stream),
+        )
+    return dq, dk, dv
+
