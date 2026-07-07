@@ -108,6 +108,8 @@ def build_hstu_attention_bwd_dq(
 
     elem_dtype = _dtype_to_elem_type(dtype_str)
     is_bf16 = dtype_str == "bf16"
+    has_window = max_attn_len > 0
+    has_contextual = contextual_seq_len > 0
 
     K_STEPS = head_dim // MFMA_K  # real contraction steps (Q side)
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
@@ -187,6 +189,25 @@ def build_hstu_attention_bwd_dq(
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
+
+        # ---- Masked-id clamps (contextual shift then target-tail clamp; oracle order) ----
+        num_target = fx.Int32(0)
+        if has_targets:
+            num_target = fx.Int32(num_targets[batch_idx])
+        max_id = seq_len
+        if has_contextual:
+            max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
+        if has_targets:
+            max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
+
+        def to_id(x):
+            xid = x
+            if has_contextual:
+                xid = xid - fx.Int32(contextual_seq_len - 1)
+                xid = (xid < fx.Int32(0)).select(fx.Int32(0), xid)
+            if has_targets:
+                xid = (xid > max_id).select(max_id, xid)
+            return xid
 
         def grouped_loader(t, dim, g):
             in_row = fx.make_layout((dim // g, g), (g, 1))
@@ -287,15 +308,33 @@ def build_hstu_attention_bwd_dq(
             elems = [fx.Float32(v).to(elem_dtype) for v in vals]
             return Vec.from_elements(elems, elem_dtype).ir_value()
 
-        q_row_ids = q_rows  # causal-only: id == raw position
+        q_row_ids = [to_id(q_rows[qg]) for qg in range_constexpr(Q_SUBTILES)]
 
-        # ---- Streamed KV range: causal upper bound (kv <= q) ----
+        # ---- Streamed KV range: causal upper bound + optional window lower / contextual opener ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
         q_end = q_start + fx.Int32(BLOCK_M)
         active = q_start < seq_len
         clamped = (q_end < seq_len).select(q_end, seq_len)
-        kv_upper = active.select(clamped, fx.Int32(0))
+        # The prefix block (holds logical row id 0) attends the whole contextual prefix above its
+        # diagonal, so its KV range opens to seq_len.
+        base_upper = clamped
+        if has_contextual:
+            ctx_block = q_start < fx.Int32(contextual_seq_len)
+            base_upper = ctx_block.select(seq_len, clamped)
+        kv_upper = active.select(base_upper, fx.Int32(0))
         n_tiles = (kv_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
+
+        # Sliding-window lower bound: skip fully-masked low KV tiles.
+        kv_tile_start = fx.Int32(0)
+        if has_window:
+            eff_q_low = (q_start < max_id).select(q_start, max_id)
+            kv_lower = eff_q_low - fx.Int32(max_attn_len)
+            kv_lower = (kv_lower > fx.Int32(0)).select(kv_lower, fx.Int32(0))
+            win_tile_start = kv_lower // fx.Int32(BLOCK_N)
+            kv_tile_start = win_tile_start
+            if has_contextual:
+                ctx_prefix_block = q_start < fx.Int32(contextual_seq_len)
+                kv_tile_start = ctx_prefix_block.select(fx.Int32(0), win_tile_start)
 
         N_ACC = HC_CHUNKS * Q_SUBTILES
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
@@ -378,6 +417,7 @@ def build_hstu_attention_bwd_dq(
                 kv_base = kv_start + fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 kv_raw = [kv_base + fx.Int32(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                 kv_in_seq = [kv_raw[i] < seq_len for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                kv_ids = [to_id(kv_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                 for qg in range_constexpr(Q_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(K_STEPS_K):
@@ -386,9 +426,15 @@ def build_hstu_attention_bwd_dq(
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
                     def keep_col(i):
-                        """causal mask for (owned q = q_row_ids[qg], streamed kv = kv_raw[i])."""
-                        dist = q_row_ids[qg] - kv_raw[i]
+                        """mask for (owned query q_rows[qg], streamed key kv_raw[i]); same
+                        predicate as the forward: causal/diagonal, window, contextual opener."""
+                        dist = q_row_ids[qg] - kv_ids[i]
                         keep = (q_rows[qg] == kv_raw[i]) | (dist > fx.Int32(0))
+                        if has_window:
+                            keep = keep & (dist <= fx.Int32(max_attn_len))
+                        if has_contextual:
+                            ctx = (q_row_ids[qg] == fx.Int32(0)) & (kv_ids[i] < max_id)
+                            keep = keep | ctx
                         keep = keep & kv_in_seq[i] & q_in_bounds[qg]
                         return keep
 
@@ -466,7 +512,7 @@ def build_hstu_attention_bwd_dq(
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
-            for kv_tile, it in range(fx.Index(0), fx.Index(n_tiles), fx.Index(1), init=acc_init):  # ty: ignore
+            for kv_tile, it in range(fx.Index(kv_tile_start), fx.Index(n_tiles), fx.Index(1), init=acc_init):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
                 dq_acc = [it_list[i] for i in range(N_ACC)]
                 kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)

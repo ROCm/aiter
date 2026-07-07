@@ -74,6 +74,71 @@ def hstu_bwd_reference(
     return dq, dk, dv
 
 
+def hstu_bwd_reference_causal_dense(N, alpha, q, k, v, seq_offsets, dout):
+    """Causal-only dense oracle that supports attn_dim != hidden_dim.
+
+    The vendored torch_hstu_attention reshapes v with q's head_dim, so it only works
+    when attn_dim == hidden_dim. This hand-rolled per-sequence reference avoids that
+    and is used for the asymmetric-dim tests.
+    """
+    import torch.nn.functional as F
+
+    qf = q.detach().float().requires_grad_(True)
+    kf = k.detach().float().requires_grad_(True)
+    vf = v.detach().float().requires_grad_(True)
+
+    offs = seq_offsets.tolist()
+    outs = []
+    for b in range(len(offs) - 1):
+        s, e = offs[b], offs[b + 1]
+        n = e - s
+        if n == 0:
+            continue
+        Q, K, V = qf[s:e], kf[s:e], vf[s:e]  # (n, H, d)
+        scores = torch.einsum("xha,yha->hxy", Q, K) * alpha
+        attn = F.silu(scores) / N
+        mask = torch.tril(torch.ones(n, n, device=q.device))  # i >= j (causal + diagonal)
+        attn = attn * mask.unsqueeze(0)
+        outs.append(torch.einsum("hxy,yhv->xhv", attn, V))  # (n, H, dv)
+
+    out = torch.cat(outs, dim=0)
+    return torch.autograd.grad(out, (qf, kf, vf), grad_outputs=dout.float())
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "attn_dim,hidden_dim",
+    [(128, 64), (64, 128), (128, 256)],
+)
+def test_flydsl_bwd_asymmetric_dims(attn_dim, hidden_dim, dtype):
+    batch, heads, max_seq_len = 16, 2, 512
+    alpha = 1.0 / attn_dim * 10000
+
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=batch,
+        max_seq_len=max_seq_len,
+        sparsity=0.5,
+        heads=heads,
+        attn_dim=attn_dim,
+        hidden_dim=hidden_dim,
+        target_size=0,
+        dtype=dtype,
+        device=torch.device("cuda"),
+    )
+    dout = torch.randn_like(v)
+
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference_causal_dense(
+        max_seq_len, alpha, q, k, v, seq_offsets, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0
+    )
+    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
+
+
 @requires_cuda
 def test_reference_oracle_runs():
     """The oracle itself runs and returns correctly-shaped grads (no FlyDSL)."""
@@ -114,6 +179,47 @@ def test_reference_oracle_runs():
     assert torch.isfinite(dq).all()
     assert torch.isfinite(dk).all()
     assert torch.isfinite(dv).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "max_attn_len,contextual_seq_len,target_size",
+    [
+        (0, 0, 20),  # num_targets
+        (64, 0, 0),  # sliding window
+        (0, 64, 0),  # contextual prefix
+        (64, 0, 20),  # window + targets
+    ],
+)
+def test_flydsl_bwd_variants(max_attn_len, contextual_seq_len, target_size, dtype):
+    batch, heads, attn_dim, hidden_dim, max_seq_len = 32, 4, 128, 128, 512
+    alpha = 1.0 / attn_dim * 10000
+
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=batch,
+        max_seq_len=max_seq_len,
+        sparsity=0.5,
+        heads=heads,
+        attn_dim=attn_dim,
+        hidden_dim=hidden_dim,
+        target_size=target_size,
+        dtype=dtype,
+        device=torch.device("cuda"),
+    )
+    dout = torch.randn_like(v)
+
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len, dout,
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len,
+    )
+    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
 
 
 def test_silu_derivative_formula():

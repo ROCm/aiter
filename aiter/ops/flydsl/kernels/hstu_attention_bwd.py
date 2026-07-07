@@ -126,14 +126,10 @@ def validate_hstu_attention_bwd(
         raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
     if not causal:
         raise ValueError("hstu_attention_bwd only supports causal attention")
-
-    # Masking variants are not supported yet (causal-only).
-    if has_targets:
-        raise ValueError("hstu_attention_bwd does not support num_targets yet")
-    if max_attn_len != 0:
-        raise ValueError("hstu_attention_bwd does not support max_attn_len yet")
-    if contextual_seq_len != 0:
-        raise ValueError("hstu_attention_bwd does not support contextual_seq_len yet")
+    if contextual_seq_len < 0:
+        raise ValueError(f"contextual_seq_len must be non-negative, got {contextual_seq_len}")
+    if max_attn_len < 0:
+        raise ValueError(f"max_attn_len must be non-negative, got {max_attn_len}")
 
     if batch <= 0:
         raise ValueError(f"batch must be positive, got {batch}")
@@ -239,6 +235,8 @@ def build_hstu_attention_bwd(
 
     elem_dtype = _dtype_to_elem_type(dtype_str)
     is_bf16 = dtype_str == "bf16"
+    has_window = max_attn_len > 0
+    has_contextual = contextual_seq_len > 0
 
     K_STEPS = head_dim // MFMA_K  # real contraction steps (resident K side)
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
@@ -322,6 +320,25 @@ def build_hstu_attention_bwd(
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
+
+        # ---- Masked-id clamps (contextual shift then target-tail clamp; oracle order) ----
+        num_target = fx.Int32(0)
+        if has_targets:
+            num_target = fx.Int32(num_targets[batch_idx])
+        max_id = seq_len
+        if has_contextual:
+            max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
+        if has_targets:
+            max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
+
+        def to_id(x):
+            xid = x
+            if has_contextual:
+                xid = xid - fx.Int32(contextual_seq_len - 1)
+                xid = (xid < fx.Int32(0)).select(fx.Int32(0), xid)
+            if has_targets:
+                xid = (xid > max_id).select(max_id, xid)
+            return xid
 
         # ---- Global tensor views ----
         def grouped_loader(t, dim, g):
@@ -433,14 +450,18 @@ def build_hstu_attention_bwd(
             elems = [fx.Float32(v).to(elem_dtype) for v in vals]
             return Vec.from_elements(elems, elem_dtype).ir_value()
 
-        kv_owned_ids = kv_rows  # causal-only: id == raw position
+        kv_owned_ids = [to_id(kv_rows[og]) for og in range_constexpr(KV_OWNED_SUBTILES)]
 
-        # ---- Streamed query range: causal lower bound (q >= kv) ----
+        # ---- Streamed query range ----
+        # Base: causal lower bound (q >= kv). Contextual: prefix queries (id 0) attend keys
+        # above their diagonal, so the streamed-q loop must start at 0 to include them.
         kv_start_row = kv_tile_idx * fx.Int32(BLOCK_M)
         active = kv_start_row < seq_len
         q_upper = active.select(seq_len, fx.Int32(0))
         n_q_tiles = (q_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
         q_tile_start = kv_start_row // fx.Int32(BLOCK_N)
+        if has_contextual:
+            q_tile_start = fx.Int32(0)
 
         N_ACC_DV = D_CHUNKS * KV_OWNED_SUBTILES  # dV accumulators
         N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES  # dK accumulators
@@ -530,6 +551,7 @@ def build_hstu_attention_bwd(
                 q_base = q_start + fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 q_raw = [q_base + fx.Int32(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                 q_in_seq = [q_raw[i] < seq_len for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                q_ids = [to_id(q_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(K_STEPS_K):
@@ -538,9 +560,18 @@ def build_hstu_attention_bwd(
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
                     def keep_row(i):
-                        """causal mask for (streamed q = q_raw[i], owned kv = kv_owned_ids[og])."""
-                        dist = q_raw[i] - kv_owned_ids[og]
+                        """mask for (streamed query q_raw[i], owned key kv_rows[og]).
+
+                        Same predicate as the forward: causal (or diagonal), optional sliding
+                        window, optional contextual prefix opener; then in-sequence gate.
+                        """
+                        dist = q_ids[i] - kv_owned_ids[og]
                         keep = (q_raw[i] == kv_rows[og]) | (dist > fx.Int32(0))
+                        if has_window:
+                            keep = keep & (dist <= fx.Int32(max_attn_len))
+                        if has_contextual:
+                            ctx = (q_ids[i] == fx.Int32(0)) & (kv_owned_ids[og] < max_id)
+                            keep = keep | ctx
                         keep = keep & q_in_seq[i] & kv_in_bounds[og]
                         return keep
 
