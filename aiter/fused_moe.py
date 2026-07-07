@@ -51,11 +51,97 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_TRUTHY_ENV = ("1", "true", "True", "yes", "on")
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
 # so there is no overhead.
 kernel_bench_callable = None
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "") in _TRUTHY_ENV
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
+def _fused_topk_use_herd(M: int, expert: int, topk: int) -> bool:
+    """HERD topk for FlyDSL/ATOM MoE.
+
+    AITER_FLYDSL_USE_HERD is the FlyDSL-facing switch. AITER_TRITON_USE_HERD is
+    also honored so perf comparisons can flip both stacks with one existing env.
+    """
+    if not (_env_truthy("AITER_FLYDSL_USE_HERD") or _env_truthy("AITER_TRITON_USE_HERD")):
+        return False
+    if topk + 1 > expert:
+        return False
+    min_m = _env_int(
+        "AITER_FLYDSL_HERD_MIN_M", _env_int("AITER_TRITON_HERD_MIN_M", 16)
+    )
+    max_m = _env_int(
+        "AITER_FLYDSL_HERD_MAX_M", _env_int("AITER_TRITON_HERD_MAX_M", 128)
+    )
+    return min_m <= M <= max_m
+
+
+def _fused_topk_herd(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    topk_ids: Optional[torch.Tensor],
+    topk_weights: Optional[torch.Tensor],
+):
+    """FlyDSL-style HERD topk: top-(k+1), drop least-popular, keep k."""
+    M, expert = gating_output.shape
+    device = gating_output.device
+    if topk_weights is None:
+        topk_weights = torch.empty(M, topk, dtype=dtypes.fp32, device=device)
+    if topk_ids is None:
+        topk_ids = torch.empty(M, topk, dtype=dtypes.i32, device=device)
+
+    kp1 = topk + 1
+    cand_val, cand_idx = torch.topk(gating_output.float(), kp1, dim=1)
+
+    # Match Triton HERD's tie-break order: first sort candidates by expert id,
+    # then drop argmin(popularity, score, expert-id column).
+    cand_idx, order = torch.sort(cand_idx, dim=1)
+    cand_val = torch.gather(cand_val, 1, order)
+
+    pop = torch.zeros(expert, dtype=torch.int64, device=device)
+    pop.scatter_add_(
+        0,
+        cand_idx.reshape(-1),
+        torch.ones(M * kp1, dtype=torch.int64, device=device),
+    )
+    cand_pop = pop[cand_idx]
+
+    is_min_pop = cand_pop == cand_pop.min(dim=1, keepdim=True).values
+    inf = float("inf")
+    val_for_min_pop = torch.where(
+        is_min_pop, cand_val, torch.full_like(cand_val, inf)
+    )
+    is_min_val = is_min_pop & (
+        val_for_min_pop == val_for_min_pop.min(dim=1, keepdim=True).values
+    )
+    cols = torch.arange(kp1, device=device).expand(M, kp1)
+    drop_col = torch.where(is_min_val, cols, torch.full_like(cols, 1 << 30)).argmin(
+        dim=1
+    )
+
+    keep = torch.ones(M, kp1, dtype=torch.bool, device=device)
+    keep.scatter_(1, drop_col.unsqueeze(1), False)
+    kept_val = cand_val[keep].reshape(M, topk)
+    kept_idx = cand_idx[keep].reshape(M, topk)
+    kept_weight = torch.softmax(kept_val, dim=1) if renormalize else kept_val
+
+    topk_weights[:M, :].copy_(kept_weight.to(topk_weights.dtype))
+    topk_ids[:M, :].copy_(kept_idx.to(topk_ids.dtype))
+    return topk_weights[:M, :], topk_ids[:M, :]
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -2784,6 +2870,11 @@ def fused_topk(
 
     M, _ = hidden_states.shape
     expert = gating_output.shape[1]
+
+    if _fused_topk_use_herd(M, expert, topk):
+        return _fused_topk_herd(
+            gating_output, topk, renormalize, topk_ids, topk_weights
+        )
 
     token_expert_indicies = torch.empty(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
