@@ -1,10 +1,13 @@
-"""hstu_attention_bwd - FlyDSL kernel (Phase 1: dV only, causal-only)
+"""hstu_attention_bwd - FlyDSL kernel (causal-only; computes dV and dK)
 
 Backward of HSTU attention. Given dO, recompute S = alpha*Q*K^T and sigma from
 Q,K (nothing is stashed by the forward), form the masked, silu-gated attention
-weights, and produce gradients. This first phase implements **dV only**:
+weights, and produce gradients. This kernel computes **dV and dK** (dQ is not
+implemented here yet):
 
-    dV[kv, d] = (1/N) * sum_q P[q, kv] * dO[q, d],   P = mask .* silu(alpha*Q*K^T)
+    dV[kv, d]  = (1/N) * sum_q P[q, kv] * dO[q, d],   P = mask .* silu(alpha*Q*K^T)
+    dK[kv, hc] = alpha  * sum_q dS[q, kv] * Q[q, hc]
+    dS[q, kv]  = mask .* (1/N) * silu'(alpha*S) * (dO * V^T)[q, kv]
 
 i.e. dV = A^T dO with A = mask .* silu(S)/N (the 1/N is hoisted to the epilogue,
 exactly as the forward hoists it to the O epilogue).
@@ -20,7 +23,7 @@ tiled MFMA pipeline with roles swapped. dV reduces over the **query** index, so:
   - the causal bound becomes a **lower** bound on the streamed q tiles (q >= kv),
   - dV is a single-writer accumulator (each KV row owned by one program) -> no atomics.
 
-Constraints (Phase 1):
+Constraints:
   - causal only; no num_targets / max_attn_len / contextual_seq_len yet.
   - dtype in {f16, bf16}; accumulate in fp32.
   - head_dim % 16 == 0, hidden_dim % 16 == 0; (batch*num_heads) % 8 == 0.
@@ -124,13 +127,13 @@ def validate_hstu_attention_bwd(
     if not causal:
         raise ValueError("hstu_attention_bwd only supports causal attention")
 
-    # Phase 1 restrictions: masking variants land in Phase 4.
+    # Masking variants are not supported yet (causal-only).
     if has_targets:
-        raise ValueError("hstu_attention_bwd Phase 1 does not support num_targets yet")
+        raise ValueError("hstu_attention_bwd does not support num_targets yet")
     if max_attn_len != 0:
-        raise ValueError("hstu_attention_bwd Phase 1 does not support max_attn_len yet")
+        raise ValueError("hstu_attention_bwd does not support max_attn_len yet")
     if contextual_seq_len != 0:
-        raise ValueError("hstu_attention_bwd Phase 1 does not support contextual_seq_len yet")
+        raise ValueError("hstu_attention_bwd does not support contextual_seq_len yet")
 
     if batch <= 0:
         raise ValueError(f"batch must be positive, got {batch}")
