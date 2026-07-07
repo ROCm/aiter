@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 
 
@@ -99,7 +100,7 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     head_dim: int,
     dtype: torch.dtype,
     eps: float = 1e-6,
-    quant_dtype=torch.float8_e4m3fnuz,
+    quant_dtype=dtypes.fp8,
 ):
     torch.manual_seed(42)
     device = "cuda"
@@ -171,25 +172,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_tokens", type=int, default=None)
     parser.add_argument("--num_heads", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
-    parser.add_argument(
-        "--quant_dtype",
-        type=str,
-        default="all",
-        choices=["all", "e4m3fnuz", "e4m3fn"],
-        help="FP8 output dtype to test (default: both).",
-    )
     args = parser.parse_args()
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
-    _QUANT_DTYPES = {
-        "e4m3fnuz": torch.float8_e4m3fnuz,
-        "e4m3fn": torch.float8_e4m3fn,
-    }
-    quant_dtypes = (
-        list(_QUANT_DTYPES.values())
-        if args.quant_dtype == "all"
-        else [_QUANT_DTYPES[args.quant_dtype]]
-    )
+    # Match the rest of aiter's op_tests (test_quant / test_gemm_a8w8 /
+    # test_fused_qk_rmsnorm_per_token_quant): the FP8 format is always the
+    # GPU-native one (dtypes.fp8 -> gfx942 e4m3fnuz, otherwise OCP e4m3fn),
+    # which is exactly what the kernel quantizes against via opus::fp8_t.
+    quant_dtypes = [dtypes.fp8]
 
     if args.num_tokens is not None and args.num_heads is not None:
         test_configs = [(args.num_tokens, args.num_heads, 128)]

@@ -3,7 +3,11 @@
 
 #include "aiter_hip_common.h"
 #include "py_itfs_common.h"
-#include "aiter_opus_plus.h"
+// This TU only needs core opus type/traits (bf16_t/fp16_t/fp8_t, cast, finfo,
+// vector_traits), all of which live in opus/opus.hpp. Avoid pulling in the much
+// heavier aiter_opus_plus.h (+ hip_reduce.h, c10, hip_bf16) that hipcc would
+// otherwise parse on BOTH the host and device passes of every .cu compile.
+#include "opus/opus.hpp"
 #include "dispatch_utils.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
@@ -554,14 +558,24 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
     TORCH_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
     TORCH_CHECK(num_heads <= 128, "ONLY num_heads <= 128 is supported (block must cover all heads), got ", num_heads);
     TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
-    TORCH_CHECK(scale.numel() == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
 
     // head_dim must be unit-stride for vectorized loads; token/head may be strided slices.
     TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
     TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
+
     // The kernel writes out via a flat row-major [num_tokens, num_heads*head_dim]
-    // index, so out must be contiguous (a strided out would be silently corrupted).
+    // index, so out must be contiguous AND large enough for every (token, head,
+    // elem) it will touch; otherwise a too-small/strided out is silently corrupted.
+    const int64_t out_elems = static_cast<int64_t>(num_tokens) * num_heads * head_dim;
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous [num_tokens, num_heads*head_dim]");
+    TORCH_CHECK(out.numel() == out_elems,
+                "out must have num_tokens*num_heads*head_dim (", out_elems, ") elements, got ", out.numel());
+
+    // scale is indexed as a flat scale[token_id] fp32 buffer, so it must be a
+    // contiguous float32 tensor with exactly num_tokens elements.
+    TORCH_CHECK(scale.scalar_type() == at::ScalarType::Float, "scale must be float32, got ", scale.scalar_type());
+    TORCH_CHECK(scale.is_contiguous(), "scale must be contiguous");
+    TORCH_CHECK(scale.numel() == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
 
     constexpr int thread_data_size = 16;
     gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size>(
@@ -585,12 +599,19 @@ void gated_rmsnorm_fp8_per_token_quant(
     TORCH_CHECK(out.is_cuda(), "Output must be on CUDA device");
     TORCH_CHECK(scale.is_cuda(), "Scale must be on CUDA device");
 
-    if (x.scalar_type() == at::ScalarType::BFloat16 &&
-        (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+    // The kernel is instantiated with opus::fp8_t and quantizes against
+    // opus::finfo<fp8_t>::max(), which is the *hardware-native* FP8 format
+    // (gfx942 -> e4m3fnuz/240, otherwise OCP e4m3fn/448). The output dtype does
+    // NOT select the range, so an out tensor typed as the non-native FP8 would be
+    // written with the wrong encoding. Require the native dtype (torch_fp8 does a
+    // runtime gfx94 arch query on the host) so the bits match what downstream reads.
+    TORCH_CHECK(out.scalar_type() == torch_fp8,
+                "out must be the hardware-native FP8 dtype (", torch_fp8, ") on this GPU, got ", out.scalar_type());
+
+    if (x.scalar_type() == at::ScalarType::BFloat16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::bf16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon);
-    } else if (x.scalar_type() == at::ScalarType::Half &&
-               (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+    } else if (x.scalar_type() == at::ScalarType::Half) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::fp16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon);
     } else {
