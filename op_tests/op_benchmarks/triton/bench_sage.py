@@ -1528,6 +1528,13 @@ def benchmark_single_case(
     explicit_block_attn_mask: Optional[torch.Tensor] = None,
 ) -> float:
     shape = infer_shape_spec(q, v, args.layout)
+    if os.environ.get("ILP_DUP_Q", "0") != "0" and args.layout == "bshd":
+        # DEBUG: make rows 32:64 of each 64-tile identical to rows 0:31 so ILP pipeA (rows 0-31)
+        # and pipeB (rows 32-63) process IDENTICAL queries -> their outputs must match.
+        b_, s_, h_, d_ = q.shape
+        if s_ % 64 == 0:
+            qv = q.view(b_, s_ // 64, 64, h_, d_)
+            qv[:, :, 32:64, :, :] = qv[:, :, 0:32, :, :]
     block_attn_mask = (
         explicit_block_attn_mask
         if explicit_block_attn_mask is not None
@@ -1545,6 +1552,79 @@ def benchmark_single_case(
     if args.compare_to_ref:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        if os.environ.get("ILP_DUP_Q", "0") != "0":
+            o = current_primary.float()
+            b_, s_, h_, d_ = o.shape
+            if s_ % 64 == 0:
+                ov = o.reshape(b_, s_ // 64, 64, h_, d_)
+                a = ov[:, :, 0:32].reshape(-1, d_)
+                bb = ov[:, :, 32:64].reshape(-1, d_)
+                cs = torch.nn.functional.cosine_similarity(a, bb, dim=1)
+                print(f"[DUP-Q] pipeA(0:32) vs pipeB(32:64): mean row-cos={cs.mean().item():.5f} "
+                      f"min={cs.min().item():.5f} maxabsdiff={(a-bb).abs().max().item():.4e} "
+                      f"A_rms={a.pow(2).mean().sqrt().item():.4e} B_rms={bb.pow(2).mean().sqrt().item():.4e}")
+                for nb in range(4):
+                    lo, hi = nb * 32, nb * 32 + 32
+                    csb = torch.nn.functional.cosine_similarity(a[:, lo:hi], bb[:, lo:hi], dim=1)
+                    rat = (a[:, lo:hi].abs().mean() / bb[:, lo:hi].abs().mean().clamp_min(1e-12))
+                    print(f"[DUP-Q]   ch[{lo}:{hi}] A-vs-B cos={csb.mean().item():.4f} magA/magB={rat.item():.4f}")
+        if os.environ.get("DBG_DUMP_FAMAX", "0") != "0":
+            raw = current_primary[0, 0, 0, :8].contiguous().view(torch.uint8).cpu()
+            f = raw.view(torch.float32).numpy()
+            print(f"[FAMAX] FA_max_a={f[0]:.4e} L_a={f[1]:.4e} FA_max_b={f[2]:.4e} L_b={f[3]:.4e} L_a/L_b={f[1]/f[3] if f[3] else float('nan'):.4f}")
+            return 0.0
+        if os.environ.get("ILP_DUMP_FAMAX2", "0") != "0":
+            import numpy as _np
+            raw = current_primary[0, 0, 0, :2].contiguous().view(torch.uint8).cpu()
+            f = raw.view(torch.float32).numpy()
+            print(f"[FAMAX2] pipeA seeded FA_max (row0 lane) = {f[0]:.5e}")
+            return 0.0
+        if os.environ.get("ILP_DUMP_SRAW", "0") != "0":
+            import numpy as _np
+            raw = current_primary[0, 0, 0, :128].contiguous().view(torch.uint8).cpu()
+            f = raw.view(torch.float32).numpy()  # 64 f32 = all 4 subtiles for lane's rows
+            _np.set_printoptions(precision=3, suppress=True, linewidth=220)
+            for st in range(4):
+                seg = f[st*16:st*16+16]
+                print(f"[SRAW] subtile{st} (k{st*32}-{st*32+31}) min={seg.min():.3e} max={seg.max():.3e} mean={seg.mean():.3e} :: {seg}")
+            # per-row raw-f32 RMS across the first 64 query rows (pipeA=0:32, pipeB=32:64)
+            allraw = current_primary[0, :64, 0, :].contiguous().view(torch.uint8).cpu().view(torch.float32).numpy().reshape(64, -1)
+            rms = (allraw.astype(_np.float64) ** 2).mean(1) ** 0.5
+            print("[SRAW] per-row raw-f32 RMS rows0-7:  ", [f"{x:.3g}" for x in rms[0:8]])
+            print("[SRAW] per-row raw-f32 RMS rows16-23:", [f"{x:.3g}" for x in rms[16:24]])
+            print("[SRAW] per-row raw-f32 RMS rows32-39:", [f"{x:.3g}" for x in rms[32:40]])
+            e0 = allraw[:, 0]
+            print("[SRAW] per-row elem0 rows0-31:", [f"{x:.3g}" for x in e0[0:32]])
+            return 0.0
+        if os.environ.get("ILP_DUMP_S", "") != "":
+            import numpy as _np
+            o = current_primary.float()
+            s = o[0, 0, 0, :32].cpu().numpy()
+            _np.set_printoptions(precision=3, suppress=True, linewidth=200)
+            half = os.environ["ILP_DUMP_S"]
+            print(f"[DUMP-S] {half} (32 f32 scores):", s)
+            print(f"[DUMP-S] {half} min={s.min():.4e} max={s.max():.4e} mean={s.mean():.4e}")
+            return 0.0
+        if os.environ.get("ILP_DUMP_P", "0") != "0":
+            import numpy as _np
+            raw = current_primary[0, 0, 0, :32].contiguous().view(torch.uint8).cpu()
+            fp8 = raw.view(torch.float8_e4m3fn).float().numpy()
+            _np.set_printoptions(precision=3, suppress=True, linewidth=200)
+            print("[DUMP-P] subtile0 (k0-31):", fp8[0:16])
+            print("[DUMP-P] subtile1 (k32-63):", fp8[16:32])
+            print("[DUMP-P] subtile2 (k64-95):", fp8[32:48])
+            print("[DUMP-P] subtile3 (k96-127):", fp8[48:64])
+            return 0.0
+        if os.environ.get("ILP_DUMP_READ", "0") != "0":
+            o = current_primary.float()
+            import numpy as _np
+            a = o[0, 0, 0, :32].cpu().numpy()
+            b = o[0, 32, 0, :32].cpu().numpy()
+            _np.set_printoptions(precision=3, suppress=True, linewidth=200)
+            print("[DUMP] rowA(0) :", a[:12])
+            print("[DUMP] rowB(32):", b[:12])
+            print("[DUMP] |rowA|max=%.3e |rowB|max=%.3e" % (_np.abs(a).max(), _np.abs(b).max()))
+            return 0.0
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         check_output_against_reference(args, current_primary, ref_primary)
 
