@@ -340,7 +340,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 301  # barrier-trim: step 3 moved before B3, B7 eliminated (3→2 barriers/chunk)
+    _K5_KERNEL_REVISION = 302  # HIP-aligned pipeline: u/g prefetch before GEMM1, k[t+1] after gating, B7 eliminated
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -681,6 +681,52 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
             #    the readout removes that coverage).
             if const_expr(not LDS_HT_INDEPENDENT or HT_STORE_OVERLAP_GEMM2):
                 gpu.barrier()
+
+            # ============================================================
+            # 0. PREFETCH u + g BEFORE step 1 (HIP-aligned, rev302):
+            # Issue all scalar HBM loads for u (16 bf16) and g (1 g_last +
+            # 16 g_row = 17 f32) NOW, right after B1. The intervening LDS
+            # writes (step 1-3, ~16 cy) + B3 barrier (~30 cy) + GEMM1
+            # (128 cy) = ~174 cy of overlap hide most of the ~300 cy HBM
+            # latency; 3-wave occupancy covers the remaining ~93 cy stall.
+            # ============================================================
+            u_pf_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+            u_prefetch = []
+            for _pf_m in range_constexpr(BT_MTILES):
+                for _pf_e in range_constexpr(4):
+                    _pf_row = (
+                        i_t_i32 * fx.Int32(BT)
+                        + fx.Int32(_pf_m * 16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(_pf_e)
+                    )
+                    _pf_safe = (_pf_row < T_local).select(_pf_row, fx.Int32(0))
+                    u_prefetch.append(
+                        v_[fx.Index(v_base + _pf_safe * stride_v + u_pf_col)]
+                    )
+
+            if const_expr(USE_G):
+                _pf_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
+                _pf_last_idx = (_pf_chunk_end < T_local).select(
+                    _pf_chunk_end, T_local
+                ) - fx.Int32(1)
+                g_last_pf = g_[fx.Index(i_h * T_flat + bos + _pf_last_idx)]
+                g_row_pf = []
+                for _pf_m in range_constexpr(BT_MTILES):
+                    for _pf_e in range_constexpr(4):
+                        _pf_in_chunk = (
+                            fx.Int32(_pf_m * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(_pf_e)
+                        )
+                        _pf_abs = i_t_i32 * fx.Int32(BT) + _pf_in_chunk
+                        _pf_ib = _pf_abs < T_local
+                        _pf_safe_abs = _pf_ib.select(_pf_abs, fx.Int32(0))
+                        g_row_pf.append((
+                            g_[fx.Index(i_h * T_flat + bos + _pf_safe_abs)],
+                            _pf_ib,
+                        ))
+
             ht_v_col = wid * fx.Int32(16) + lane_n
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(K_SUB_PER_BLOCK):
@@ -823,18 +869,13 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
             for _i in range_constexpr(BT_MTILES):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
 
-            # W_PF_INTERLEAVE_GEMM1: issue NEXT chunk's w/k vec_loads INTERLEAVED
-            # into the GEMM1 (m_bt,kb,slot) iterations -- one load on each of the
-            # first NUM_W_LOADS+K_LOAD_BATCHES flat slots -- so each
-            # buffer_load_dwordx4's HBM latency hides behind GEMM1's MFMA chain
-            # AND GEMM2 is left free to hide the deferred h-snapshot store. The
-            # loaded values are carried in registers to the yield (mirrors HIP's
-            # next-chunk load in run_gemm1).
+            # W_PF_INTERLEAVE_GEMM1 (rev302): issue NEXT chunk's w vec_loads
+            # INTERLEAVED into the GEMM1 loop (first NUM_W_LOADS slots). k[t+1]
+            # is NO LONGER interleaved here -- it is issued after gating (step 6)
+            # so GEMM2's MFMA chain hides its HBM latency (HIP-aligned pipeline).
             if const_expr(W_PF_INTERLEAVE and W_PF_INTERLEAVE_GEMM1):
                 next_i_t_i32 = i_t_i32 + fx.Int32(1)
                 w_next_pf = [None] * NUM_W_LOADS
-                if const_expr(K_PF_INTERLEAVE):
-                    k_next_pf = [None] * K_LOAD_BATCHES
 
             for m_bt in range_constexpr(BT_MTILES):
                 for kb in range_constexpr(NUM_K_BLOCKS):
@@ -843,22 +884,11 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                             g1_slot = (
                                 (m_bt * NUM_K_BLOCKS + kb) * K_SUB_PER_BLOCK + slot
                             )
-                            # slots [0, NUM_W_LOADS) carry w; the next
-                            # K_LOAD_BATCHES slots carry k.
                             if const_expr(g1_slot < NUM_W_LOADS):
                                 kb_w = g1_slot // NUM_LOAD_BATCHES_64
                                 batch_w = g1_slot % NUM_LOAD_BATCHES_64
                                 w_next_pf[g1_slot] = w_.vec_load(
                                     (fx.Index(_w_load_off(next_i_t_i32, kb_w, batch_w)),),
-                                    LOAD_VEC_WIDTH,
-                                )
-                            elif const_expr(
-                                K_PF_INTERLEAVE
-                                and g1_slot < NUM_W_LOADS + K_LOAD_BATCHES
-                            ):
-                                batch_k = g1_slot - NUM_W_LOADS
-                                k_next_pf[batch_k] = k_.vec_load(
-                                    (fx.Index(_k_load_off(next_i_t_i32, batch_k)),),
                                     LOAD_VEC_WIDTH,
                                 )
                         w_lds_row_idx = fx.Index(m_bt * 16) + lane_n_idx
@@ -877,44 +907,16 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                         )
 
             # ============================================================
-            # 5. v_new = u - b_v  (u loaded inline, no prefetch)
+            # 5. v_new = u - b_v  (rev302: consume prefetched u from VGPR)
             # ============================================================
-            # EXPERIMENT (u-prefetch): read u from lds_u [BT, BV] (staged above)
-            # instead of 16 scalar HBM loads. lds_u is chunk-local (rows 0..BT)
-            # and block-local in V (cols 0..BV), so the indices drop the
-            # i_t*BT / i_v*BV offsets used for the HBM address.
-            u_lds_col = wid * fx.Int32(16) + lane_n
-            u_hbm_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
             vn_frags = []
             for m_bt in range_constexpr(BT_MTILES):
-                bv_val = bv_accs[m_bt]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    if const_expr(USE_LDS_U):
-                        u_lds_row = (
-                            fx.Int32(m_bt * 16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        u_lds_idx = u_lds_row * fx.Int32(LDS_U_STRIDE) + u_lds_col
-                        u_raw = _lds_read_u_scalar(fx.Index(u_lds_idx))
-                    else:
-                        # rev210 path: scalar u read straight from HBM.
-                        u_bt_row_raw = (
-                            i_t_i32 * fx.Int32(BT)
-                            + fx.Int32(m_bt * 16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        safe_u_row = (u_bt_row_raw < T_local).select(
-                            u_bt_row_raw, fx.Int32(0)
-                        )
-                        u_off = v_base + safe_u_row * stride_v + u_hbm_col
-                        u_raw = v_[fx.Index(u_off)]
-                    u_bf16 = fx.BFloat16(u_raw)
-                    u_f32_elems.append(u_bf16.to(fx.Float32))
+                    u_raw = u_prefetch[m_bt * 4 + elem_i]
+                    u_f32_elems.append(fx.BFloat16(u_raw).to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
-                vn_frags.append(u_f32 - bv_val)
+                vn_frags.append(u_f32 - bv_accs[m_bt])
 
             # ============================================================
             # 5b. Store v_new (pre-gating). EXPERIMENT (vn-b128): stage to
@@ -1001,46 +1003,16 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                             _emit_vn_store(vn_off, bf16_v)
 
             # ============================================================
-            # 6. Gating. OPT-C(g) (PHASE-4, gated by USE_LDS_G): read g from the
-            # staged lds_g (published at the w-barrier above) instead of ~17
-            # scalar HBM loads/lane. g is chunk-local in lds_g (rows 0..BT-1).
-            # USE_LDS_G=False falls back to the rev215 inline-from-HBM path.
+            # 6. Gating (rev302: consume prefetched g from VGPR, no HBM load).
             # ============================================================
-            next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
-            last_idx_raw = (next_chunk_end < T_local).select(
-                next_chunk_end, T_local
-            ) - fx.Int32(1)
-
             if const_expr(USE_G):
-                if const_expr(USE_LDS_G):
-                    # g_last: chunk's last in-bounds row, as a chunk-local index.
-                    g_last_in_chunk = last_idx_raw - i_t_i32 * fx.Int32(BT)
-                    g_last = lds_g[fx.Index(g_last_in_chunk)]
-                else:
-                    # rev215 inline: load g_last directly from HBM (head-major
-                    # [H, T_flat]; absolute index i_h*T_flat + bos + last_idx).
-                    g_last = g_[fx.Index(i_h * T_flat + bos + last_idx_raw)]
-                exp_g_last = _fast_exp(g_last)
+                exp_g_last = _fast_exp(g_last_pf)
 
                 for m_bt in range_constexpr(BT_MTILES):
                     gate_elems = []
                     for elem_i in range_constexpr(4):
-                        in_chunk_row = (
-                            fx.Int32(m_bt * 16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        abs_row = i_t_i32 * fx.Int32(BT) + in_chunk_row
-                        in_bounds = abs_row < T_local
-                        if const_expr(USE_LDS_G):
-                            # in_chunk_row in [0,BT) is always a valid lds_g
-                            # index; OOB rows were staged as 0.0, masked below.
-                            g_row = lds_g[fx.Index(in_chunk_row)]
-                        else:
-                            # rev215 inline: per-lane g_row straight from HBM.
-                            safe_abs_row = in_bounds.select(abs_row, fx.Int32(0))
-                            g_row = g_[fx.Index(i_h * T_flat + bos + safe_abs_row)]
-                        gate = _fast_exp(g_last - g_row)
+                        g_row_val, in_bounds = g_row_pf[m_bt * 4 + elem_i]
+                        gate = _fast_exp(g_last_pf - g_row_val)
                         gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                     gate_vec = vector.from_elements(T.f32x4, gate_elems)
                     vn_frags[m_bt] = vn_frags[m_bt] * gate_vec
@@ -1052,16 +1024,21 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_s
 
             # ============================================================
-            # 7. B7 ELIMINATED (barrier-trim rev301). The old B7 guarded:
-            #   (a) lds_w WAR (GEMM1 read → next chunk write) -- now covered
-            #       by B1 at the top of the NEXT chunk (all warps must finish
-            #       this chunk, including GEMM1, before any warp passes B1).
-            #   (b) lds_k RAW (step 3 write → GEMM2 read) -- now covered by
-            #       B3, since step 3 was moved before B3 (rev301).
-            #   (c) lds_ht RAW (step 1 write → ht readout) -- already covered
-            #       by B3 (step 1 is before B3, readout is after B3).
-            # Net: 3 barriers/chunk → 2 barriers/chunk (B1 + B3).
+            # 7. k[t+1] prefetch (rev302, HIP-aligned): issue next chunk's k
+            # HBM vec loads HERE (after gating, before GEMM2) so GEMM2's 32
+            # MFMA + next chunk's staging/GEMM1 hide the ~300 cy HBM latency.
+            # Moved from GEMM1 interleave to free GEMM1 for u/g overlap.
+            # k[t+1] is carried via yield iter_args to the next chunk's step 3.
             # ============================================================
+            if const_expr(W_PF_INTERLEAVE and K_PF_INTERLEAVE):
+                k_next_pf = []
+                for batch in range_constexpr(K_LOAD_BATCHES):
+                    k_next_pf.append(
+                        k_.vec_load(
+                            (fx.Index(_k_load_off(next_i_t_i32, batch)),),
+                            LOAD_VEC_WIDTH,
+                        )
+                    )
 
             # HT_STORE_OVERLAP_GEMM2: deferred h-snapshot readout + HBM store,
             # issued HERE (after gating, before GEMM2) so GEMM2's MFMA chain
@@ -1093,38 +1070,22 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
             # BT_MTILES 16-row tiles; vn_frags[m_bt] is each reduction tile.
             # (numpy-verified index formulas, err ~1e-5.)
             # ============================================================
-            # W_PF_INTERLEAVE: issue NEXT chunk's w vec_loads INTERLEAVED into the
-            # GEMM2 outer (kb,slot) iterations -- one load on each of the first
-            # NUM_W_LOADS slots -- so each buffer_load_dwordx4's HBM latency is
-            # hidden behind the following MFMA chain (mirrors baseline OPT-W).
-            # When W_PF_INTERLEAVE_GEMM1, the loads were already issued in GEMM1
-            # (above) so this GEMM2 interleave is skipped.
+            # GEMM2 w fallback: when W_PF_INTERLEAVE_GEMM1 is False, w[t+1]
+            # loads are interleaved into GEMM2 instead. k[t+1] is always
+            # issued at step 7 above (rev302), not interleaved here.
             if const_expr(W_PF_INTERLEAVE and not W_PF_INTERLEAVE_GEMM1):
                 next_i_t_i32 = i_t_i32 + fx.Int32(1)
                 w_next_pf = [None] * NUM_W_LOADS
-                if const_expr(K_PF_INTERLEAVE):
-                    k_next_pf = [None] * K_LOAD_BATCHES
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(K_SUB_PER_BLOCK):
                     acc_idx = kb * K_SUB_PER_BLOCK + slot
                     if const_expr(W_PF_INTERLEAVE and not W_PF_INTERLEAVE_GEMM1):
                         g2_slot = kb * K_SUB_PER_BLOCK + slot
-                        # slots [0, NUM_W_LOADS) carry the w prefetch loads;
-                        # slots [NUM_W_LOADS, NUM_W_LOADS+K_LOAD_BATCHES) carry k.
                         if const_expr(g2_slot < NUM_W_LOADS):
                             kb_w = g2_slot // NUM_LOAD_BATCHES_64
                             batch_w = g2_slot % NUM_LOAD_BATCHES_64
                             w_next_pf[g2_slot] = w_.vec_load(
                                 (fx.Index(_w_load_off(next_i_t_i32, kb_w, batch_w)),),
-                                LOAD_VEC_WIDTH,
-                            )
-                        elif const_expr(
-                            K_PF_INTERLEAVE
-                            and g2_slot < NUM_W_LOADS + K_LOAD_BATCHES
-                        ):
-                            batch_k = g2_slot - NUM_W_LOADS
-                            k_next_pf[batch_k] = k_.vec_load(
-                                (fx.Index(_k_load_off(next_i_t_i32, batch_k)),),
                                 LOAD_VEC_WIDTH,
                             )
                     for m_bt in range_constexpr(BT_MTILES):
