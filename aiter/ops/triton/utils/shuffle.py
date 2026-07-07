@@ -153,7 +153,7 @@ def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tens
     return scales
 
 
-def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch=None) -> torch.Tensor:
+def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch="gfx950") -> torch.Tensor:
     """MXFP4 e8m0 block-scale preshuffle, built on the ``shuffle_scale_gemm``
     reshape/permute structure. Drop-in for ``aiter.ops.shuffle.shuffle_scale``
     (non-``guinterleave``) / ``fp4_utils.e8m0_shuffle``.
@@ -181,8 +181,11 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch=None) -> torch.Tensor:
     assert scales.ndim == 2, "scale must be a 2D tensor"
 
     arch = arch or get_arch()
-    preshuffle_factor = mxfp4_scale_preshuffle_factor(arch)
-    scale_kwidth = 4 if arch == "gfx1250" else 8
+
+    if arch == "gfx1250":
+        preshuffle_factor, scale_kwidth = 16, 4
+    else:
+        preshuffle_factor, scale_kwidth = 32, 8
 
     m, n = scales.shape
     m_pad = (m + 255) // 256 * 256
@@ -201,9 +204,6 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch=None) -> torch.Tensor:
 
 # --- MXFP4 preshuffle GEMM operand prep (consumed by ATOM gemm_a4w4_quant) ---
 
-# MXFP4 block/group size; also the gfx950 (CDNA4) scale preshuffle factor.
-_MXFP4_BLOCK_SIZE = 32
-
 
 def mxfp4_scale_preshuffle_factor(arch=None) -> int:
     """Per-arch e8m0 scale preshuffle (collapse) factor for the MXFP4 preshuffle
@@ -211,10 +211,10 @@ def mxfp4_scale_preshuffle_factor(arch=None) -> int:
     (gfx950 CDNA4). Applies to BOTH the activation (M-axis) and weight (N-axis)
     scales, and must match the tile emitted by ``shuffle_scale_gemm_e8m0``.
     """
-    return 16 if (arch or get_arch()) in ("gfx1250",) else _MXFP4_BLOCK_SIZE
+    return 16 if (arch or get_arch()) in ("gfx1250",) else 32
 
 
-def collapse_mxfp4_gemm_scale(scale, rows_valid=None, arch=None):
+def collapse_mxfp4_gemm_scale(scale, block_size, rows_valid=None, arch=None):
     """Re-collapse an un-collapsed ``(rows_pad, kgroups_pad)`` e8m0 scale (as
     produced by ``shuffle_scale_gemm_e8m0``) into the packed layout the preshuffle
     GEMM consumes, by the arch preshuffle factor (``mxfp4_scale_preshuffle_factor``).
@@ -225,13 +225,13 @@ def collapse_mxfp4_gemm_scale(scale, rows_valid=None, arch=None):
     to always collapse.
     """
     scale = scale.view(torch.uint8)
-    if rows_valid is not None and rows_valid < _MXFP4_BLOCK_SIZE:
+    if rows_valid is not None and rows_valid < block_size:
         return scale[:rows_valid, ...]
     pf = mxfp4_scale_preshuffle_factor(arch)
     return scale.view(scale.shape[0] // pf, -1)
 
 
-def quant_mxfp4_act_preshuffle(x, params_dtype, m, arch=None):
+def quant_mxfp4_act_preshuffle(x, params_dtype, m, block_size, arch=None):
     """Arch-aware online MXFP4 activation quant for the preshuffle GEMM path.
 
     Returns ``(x, x_scale)`` with ``x_scale`` already collapsed by the arch
@@ -247,14 +247,18 @@ def quant_mxfp4_act_preshuffle(x, params_dtype, m, arch=None):
 
     arch = arch or get_arch()
     quant_func = get_hip_quant(QuantType.per_1x32)
-    if arch in ("gfx1250",) and m >= _MXFP4_BLOCK_SIZE:
+    if arch in ("gfx1250",):
+        # shuffle is pinned at gfx950, quant then shuffle manually
         x, x_scale = quant_func(x, quant_dtype=params_dtype, shuffle=False)
-        x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch=arch)
+        if m >= block_size:
+            x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch="gfx1250")
     else:
         x, x_scale = quant_func(
-            x, quant_dtype=params_dtype, shuffle=(m >= _MXFP4_BLOCK_SIZE)
+            x,
+            quant_dtype=params_dtype,
+            shuffle=(m >= block_size),
         )
-    return x, collapse_mxfp4_gemm_scale(x_scale, rows_valid=m, arch=arch)
+    return x, collapse_mxfp4_gemm_scale(x_scale, block_size, rows_valid=m, arch=arch)
 
 
 # --- MoE MX scales (a8w4 / a8w8 / a16w4 / a4w4) ---
