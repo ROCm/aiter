@@ -713,22 +713,35 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             route_E = 1
             route_max_m = int(contiguous_m)
 
-            _grouped_dbg(f"start route ({fused_quant_mode})")
-            (
-                masked_m,
-                topids_to_rows,
-            ) = flydsl_moe_topids_to_rows(
-                topk_ids,
-                E,
-                max_m,
+            _use_fused_route_psum = (
+                int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+                and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
             )
-            _grouped_dbg("route done, start psum+remap")
-            _starts_t, psum_t, _ = contiguous_psum_remap(
-                masked_m, topids_to_rows, E, max_m, tile_m
-            )
-            m_tile_map = psum_t
-            rows_to_tokens = None
-            _grouped_dbg("psum+remap done")
+            if _use_fused_route_psum:
+                _grouped_dbg(f"start fused route+psum+remap ({fused_quant_mode})")
+                masked_m, topids_to_rows, psum_t = fused_route_psum_remap(
+                    topk_ids, E, max_m, tile_m
+                )
+                m_tile_map = psum_t
+                rows_to_tokens = None
+                _grouped_dbg("fused route+psum+remap done")
+            else:
+                _grouped_dbg(f"start route ({fused_quant_mode})")
+                (
+                    masked_m,
+                    topids_to_rows,
+                ) = flydsl_moe_topids_to_rows(
+                    topk_ids,
+                    E,
+                    max_m,
+                )
+                _grouped_dbg("route done, start psum+remap")
+                _starts_t, psum_t, _ = contiguous_psum_remap(
+                    masked_m, topids_to_rows, E, max_m, tile_m
+                )
+                m_tile_map = psum_t
+                rows_to_tokens = None
+                _grouped_dbg("psum+remap done")
 
             _grouped_dbg(f"start route-indexed quant+preshuffle ({fused_quant_mode})")
             grouped_a1, grouped_a1_scale = flydsl_moe_fused_quant_preshuffle(
@@ -1211,6 +1224,58 @@ def _get_compiled_contiguous_psum_remap():
     )
 
     return build_moe_contiguous_psum_remap_module()
+
+
+@functools.cache
+def _get_compiled_route_psum_fused():
+    """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_route_psum_fused_module,
+    )
+
+    return build_moe_route_psum_fused_module()
+
+
+# One workgroup handles every route, so the fused kernel only applies while the
+# route count fits a single block's grid-stride sweep and E fits the scan.
+_FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
+_FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+
+
+def fused_route_psum_remap(
+    topk_ids: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+):
+    """Single-launch route+atomic+psum+remap for small token counts.
+
+    Equivalent to ``flydsl_moe_topids_to_rows`` followed by
+    ``contiguous_psum_remap``, but fused into one workgroup. Returns
+    (masked_m, topids_to_rows[token_num, topk], psum).
+    """
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    experts = int(experts)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    launch = _get_compiled_route_psum_fused()
+    launch(
+        topk_ids.to(torch.int32).reshape(-1),
+        topids_to_rows,
+        masked_m,
+        starts,
+        psum,
+        int(numel),
+        experts,
+        int(max_m),
+        int(tile_m),
+        stream=torch.cuda.current_stream(),
+    )
+    return masked_m, topids_to_rows.view(token_num, topk), psum
 
 
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
