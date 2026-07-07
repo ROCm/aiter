@@ -53,6 +53,12 @@ void p2p_bw_test(fptr_t _fa,
                   int64_t blocks,
                   int64_t reg_inp_ptr,
                   int64_t reg_inp_bytes);
+void reduce_scatter(fptr_t _fa,
+                    const aiter_tensor_t& inp,
+                    const aiter_tensor_t& out,
+                    int64_t m, int64_t n, int64_t k,
+                    int64_t split_dim,
+                    int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 // register_input/output_buffer receive direct device pointers per rank.

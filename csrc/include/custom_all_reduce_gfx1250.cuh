@@ -453,6 +453,227 @@ __global__ void  p2p_bandwidth_test_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// gfx1250 reduce_scatter kernels
+// ---------------------------------------------------------------------------
+enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
+
+// reduce_scatter, scatter on first dim — vectorized.
+// cond: numel % (ngpus * pack_size) == 0
+// shape: input flat numel -> output flat numel / ngpus
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) rs_gfx1250_split_first_dim(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int range)
+{
+    int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride              = blockDim.x * gridDim.x;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int idx = tid; idx < range; idx += stride)
+    {
+        int load_index = rank * range + idx;
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = upcast_s(ptrs[0][load_index][j]);
+#pragma unroll
+        for(int g = 1; g < ngpus; ++g)
+        {
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(ptrs[g][load_index][j]);
+        }
+        P out_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            out_val[j] = downcast_s<T>(acc[j]);
+        *(reinterpret_cast<P*>(result) + idx) = out_val;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// reduce_scatter, scatter on last dim — scalar fallback.
+// cond: n % ngpus == 0
+// shape: input (m, n) -> output (m, n / ngpus)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim_naive(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int m, int n)
+{
+    int size      = m * n / ngpus;
+    int splited_n = n / ngpus;
+    int index     = blockIdx.x * blockDim.x + threadIdx.x;
+    const T* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const T*)_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int i = index; i < size; i += blockDim.x * gridDim.x)
+    {
+        int index_x    = i % splited_n;
+        int index_y    = i / splited_n;
+        int load_index = index_y * n + rank * splited_n + index_x;
+        opus::fp32_t rslt_reg = 0.0f;
+#pragma unroll
+        for(int j = 0; j < ngpus; ++j)
+            rslt_reg += upcast_s(ptrs[j][load_index]);
+        result[i] = downcast_s<T>(rslt_reg);
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// reduce_scatter, scatter on last dim — vectorized.
+// cond: n % (ngpus * pack_size) == 0
+// shape: input (m, n) -> output (m, n / ngpus)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) rs_gfx1250_split_lastdim(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int m, int n)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int size        = m * n / (ngpus * pack_size);
+    int splited_n   = n / (ngpus * pack_size);
+    int packed_dim_n = n / pack_size;
+    int index       = blockIdx.x * blockDim.x + threadIdx.x;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int i = index; i < size; i += blockDim.x * gridDim.x)
+    {
+        int index_x    = i % splited_n;
+        int index_y    = i / splited_n;
+        int load_index = index_y * packed_dim_n + rank * splited_n + index_x;
+        P inp_reg[ngpus];
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            inp_reg[g] = ptrs[g][load_index];
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = upcast_s(inp_reg[0][j]);
+#pragma unroll
+        for(int g = 1; g < ngpus; ++g)
+        {
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(inp_reg[g][j]);
+        }
+        P out_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            out_val[j] = downcast_s<T>(acc[j]);
+        *(reinterpret_cast<P*>(result) + i) = out_val;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// reduce_scatter, scatter on middle dim — scalar fallback.
+// cond: n % ngpus == 0
+// shape: input (m, n, k) -> output (m, n / ngpus, k)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim_naive(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int m, int n, int k)
+{
+    int size      = m * n * k / ngpus;
+    int splited_n = n / ngpus;
+    int index     = blockIdx.x * blockDim.x + threadIdx.x;
+    const T* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const T*)_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int i = index; i < size; i += blockDim.x * gridDim.x)
+    {
+        int index_m    = i / (splited_n * k);
+        int index_n    = (i % (splited_n * k)) / k;
+        int index_k    = (i % (splited_n * k)) % k;
+        int load_index = index_m * (n * k) + (rank * splited_n + index_n) * k + index_k;
+        opus::fp32_t rslt_reg = 0.0f;
+#pragma unroll
+        for(int j = 0; j < ngpus; ++j)
+            rslt_reg += upcast_s(ptrs[j][load_index]);
+        result[i] = downcast_s<T>(rslt_reg);
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// reduce_scatter, scatter on middle dim — vectorized along k.
+// cond: n % ngpus == 0 && k % pack_size == 0
+// shape: input (m, n, k) -> output (m, n / ngpus, k)
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 1) rs_gfx1250_split_middim(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int m, int n, int k)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int size         = m * n * k / (pack_size * ngpus);
+    int splited_n    = n / ngpus;
+    int packed_dim_k = k / pack_size;
+    int index        = blockIdx.x * blockDim.x + threadIdx.x;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int i = index; i < size; i += blockDim.x * gridDim.x)
+    {
+        int index_m    = i / (splited_n * packed_dim_k);
+        int index_n    = (i % (splited_n * packed_dim_k)) / packed_dim_k;
+        int index_k    = (i % (splited_n * packed_dim_k)) % packed_dim_k;
+        int load_index = index_m * (n * packed_dim_k) + (rank * splited_n + index_n) * packed_dim_k + index_k;
+        P inp_reg[ngpus];
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            inp_reg[g] = ptrs[g][load_index];
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = upcast_s(inp_reg[0][j]);
+#pragma unroll
+        for(int g = 1; g < ngpus; ++g)
+        {
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(inp_reg[g][j]);
+        }
+        P out_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            out_val[j] = downcast_s<T>(acc[j]);
+        *(reinterpret_cast<P*>(result) + i) = out_val;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
 // sync latency
 // ---------------------------------------------------------------------------
 template <int ngpus>
@@ -816,6 +1037,77 @@ public:
         {
             ar_gfx1250_naive_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
                 input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);
+        }
+    }
+
+    template <typename T>
+    void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
+                               int m, int n, int k,
+                               ReduceScatterSplitDim split_dim)
+    {
+        RankData* ptrs          = get_buffer_RD(stream, input);
+        constexpr int pack_size = 16 / sizeof(T);
+        constexpr int kGridCap  = kMaxBlocks;
+
+        switch(split_dim)
+        {
+        case ReduceScatterSplitDim::kFirst: {
+            int range = k / (world_size_ * pack_size);
+            dim3 block(512);
+            dim3 grid(std::min(kGridCap, (range + 511) / 512));
+            if(world_size_ == 2)
+                rs_gfx1250_split_first_dim<T, 2>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            else
+                rs_gfx1250_split_first_dim<T, 4>
+                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+            break;
+        }
+        case ReduceScatterSplitDim::kLast: {
+            bool vec  = (k % (world_size_ * pack_size) == 0);
+            int size  = vec ? (n * k) / (world_size_ * pack_size)
+                            : (n * k) / world_size_;
+            dim3 block(256);
+            dim3 grid(std::min(kGridCap, (size + 255) / 256));
+#define LAUNCH_LAST_1250(NG)                                                    \
+    do {                                                                        \
+        if(vec)                                                                 \
+            rs_gfx1250_split_lastdim<T, NG>                                     \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
+                                             rank_, n, k);                      \
+        else                                                                    \
+            rs_gfx1250_split_lastdim_naive<T, NG>                               \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
+                                             rank_, n, k);                      \
+    } while(0)
+            if(world_size_ == 2) { LAUNCH_LAST_1250(2); }
+            else                 { LAUNCH_LAST_1250(4); }
+#undef LAUNCH_LAST_1250
+            break;
+        }
+        case ReduceScatterSplitDim::kMid: {
+            bool vec  = (k % pack_size == 0);
+            int size  = vec ? (m * n * k) / (world_size_ * pack_size)
+                            : (m * n * k) / world_size_;
+            dim3 block(256);
+            dim3 grid(std::min(kGridCap, (size + 255) / 256));
+#define LAUNCH_MID_1250(NG)                                                     \
+    do {                                                                        \
+        if(vec)                                                                 \
+            rs_gfx1250_split_middim<T, NG>                                      \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
+                                             rank_, m, n, k);                   \
+        else                                                                    \
+            rs_gfx1250_split_middim_naive<T, NG>                                \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
+                                             rank_, m, n, k);                   \
+    } while(0)
+            if(world_size_ == 2) { LAUNCH_MID_1250(2); }
+            else                 { LAUNCH_MID_1250(4); }
+#undef LAUNCH_MID_1250
+            break;
+        }
+        default: printf("reduce_scatter split_dim error!\n");
         }
     }
 };

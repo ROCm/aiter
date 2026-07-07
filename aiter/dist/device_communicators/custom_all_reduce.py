@@ -473,6 +473,7 @@ class CustomAllreduce:
             self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
             self._ops_all_gather = ops.all_gather_gfx1250
+            self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
             self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
             self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
@@ -484,6 +485,7 @@ class CustomAllreduce:
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
             self._ops_all_gather = None
+            self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_dispose = ops.dispose
             self._ops_register_input_buffer = ops.register_input_buffer
             self._ops_register_output_buffer = ops.register_output_buffer
@@ -944,7 +946,7 @@ class CustomAllreduce:
         m, n, k, split_dim = self._compute_rs_args(tuple(inp.shape), dim, inp.numel())
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
-        ops.reduce_scatter(
+        self._ops_reduce_scatter(
             self._ptr,
             inp,
             out,

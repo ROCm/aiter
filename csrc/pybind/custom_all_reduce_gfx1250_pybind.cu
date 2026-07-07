@@ -21,6 +21,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("use_new"), py::arg("open_fp8_quant"),
           py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
+    m.def("reduce_scatter", &aiter::reduce_scatter,
+          py::arg("_fa"), py::arg("inp"), py::arg("out"),
+          py::arg("m"), py::arg("n"), py::arg("k"),
+          py::arg("split_dim"),
+          py::arg("reg_ptr"), py::arg("reg_bytes"));
     m.def("all_gather", &aiter::all_gather,
           py::arg("_fa"), py::arg("inp"), py::arg("out"),
           py::arg("dim"), py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));

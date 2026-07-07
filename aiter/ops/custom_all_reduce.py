@@ -259,6 +259,20 @@ def all_reduce_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="reduce_scatter", develop=True)
+def reduce_scatter_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    split_dim: int,
+    reg_ptr: int,
+    reg_bytes: int,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="all_gather", develop=True)
 def all_gather_gfx1250(
     _fa: int,
