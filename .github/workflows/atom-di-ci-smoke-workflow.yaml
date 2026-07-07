@@ -157,28 +157,6 @@ jobs:
           fi
           git rev-parse HEAD
 
-      - name: Patch ATOMesh submit runner label
-        run: |
-          set -euo pipefail
-          cd ATOM
-          python3 - <<'PY'
-          from pathlib import Path
-
-          for rel in (
-              ".github/scripts/atomesh/pd_matrix.py",
-              ".github/scripts/atomesh/pd_submit.sh",
-              ".github/workflows/atomesh-benchmark.yaml",
-          ):
-              path = Path(rel)
-              text = path.read_text(encoding="utf-8")
-              text = text.replace("atomesh-cicd-mi350", "aiter-di-ci-spur-login")
-              path.write_text(text, encoding="utf-8")
-          PY
-          rg -n "atomesh-cicd-mi350|aiter-di-ci-spur-login" \
-            .github/scripts/atomesh/pd_matrix.py \
-            .github/scripts/atomesh/pd_submit.sh \
-            .github/workflows/atomesh-benchmark.yaml
-
       - name: Install matrix dependencies
         run: python3 -m pip install pyyaml
 
