@@ -855,7 +855,7 @@ def build_module(
             f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
         if not AITER_DISABLE_KERNARG_PRELOAD:
-            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=16"]
+            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=32"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))

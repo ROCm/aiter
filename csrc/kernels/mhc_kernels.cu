@@ -1569,6 +1569,7 @@ namespace aiter {
         DTYPE_I* residual,
         DTYPE_I* norm_weight,
         int m,
+        int n_splits,
         int gemm_out_mul_stride,
         int residual_stride,
         float rms_eps,
@@ -1576,8 +1577,7 @@ namespace aiter {
         float hc_sinkhorn_eps,
         float norm_eps,
         float hc_post_mult_value,
-        int sinkhorn_repeat,
-        int n_splits
+        int sinkhorn_repeat
     )
     {
         static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
@@ -1999,6 +1999,7 @@ namespace aiter {
             reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(norm_weight.data_ptr()), \
             m, \
+            n_splits, \
             gemm_out_mul_stride, \
             residual_stride, \
             rms_eps, \
@@ -2006,8 +2007,7 @@ namespace aiter {
             hc_sinkhorn_eps, \
             norm_eps, \
             hc_post_mult_value, \
-            sinkhorn_repeat, \
-            n_splits \
+            sinkhorn_repeat \
         ); \
     });
 
