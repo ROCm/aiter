@@ -412,9 +412,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int csv_qseqlen           = config_max_seqlen_q;
     if(!is_gfx1250)
     {
-        if(q_type == "fp8" && kv_type == "fp8" &&
-           ((gqa_ratio == 16 && config_max_seqlen_q == 4) ||
-            ((gqa_ratio == 64 || gqa_ratio == 128) && config_max_seqlen_q == 1)))
+        // `supported` (fp8-gated, set in the sub_Q block above) drives BOTH the
+        // (sub_Q, config) setup AND this CSV lookup-key normalization, so the two
+        // can never disagree -- every whitelisted (gqa, msq) pair maps to the
+        // single shipped (Gqa=64, qSeqLen=1) row. NOTE: an intermediate change
+        // had narrowed this to only (gqa16,msq4)/(gqa64|128,msq1), which dropped
+        // the gqa16+msq{1,2} and gqa32+msq1 entry points -- they hit "cannot find
+        // suitable kernel" even though the qh64 .co serves them and the sub_Q
+        // block still whitelists them (see test_v4_nm_gqa16_qseqlen1_*).
+        if(supported)
         {
             csv_gqa     = 64;
             csv_qseqlen = 1;
