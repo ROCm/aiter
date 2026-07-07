@@ -262,6 +262,32 @@ def run_fused_softmax(
     return topk_weights, topk_ids
 
 
+@perftest(num_iters=100, num_warmup=1)
+def run_vllm_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    route_scale: float,
+):
+    """vLLM-adapted topkGatingSoftmax kernel (topk_softmax_kernels.cu)."""
+    tokens, _ = gating_output.shape
+    topk_weights = torch.empty(
+        (tokens, topk), dtype=torch.float32, device=gating_output.device
+    )
+    topk_ids = torch.empty(
+        (tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    token_expert_indices = torch.empty(
+        (tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    # need_renorm=True: renorm among top-K (matches softmax-route convention)
+    aiter.topk_softmax(
+        topk_weights, topk_ids, token_expert_indices, gating_output, need_renorm=False
+    )
+    if route_scale != 1.0:
+        topk_weights.mul_(route_scale)
+    return topk_weights, topk_ids
+
+
 def benchmark_topk_sigmoid(
     num_experts: int = 128,
     num_tokens: int = 1024,
@@ -273,6 +299,7 @@ def benchmark_topk_sigmoid(
     # run benchmarks
     (scores_torch, indices_torch), avg_torch = run_torch(gating_output.clone(), topk)
     (scores_fused, indices_fused), avg_fused = run_fused(gating_output.clone(), topk)
+
     # check correctness
     score_errors = checkAllclose(scores_torch, scores_fused, tol_err_ratio=0.01)
     index_errors = checkAllclose(indices_torch, indices_fused, tol_err_ratio=0.01)
@@ -409,7 +436,7 @@ def benchmark_topk_softmax(
     topk: int = 8,
     dtype: torch.dtype = torch.bfloat16,
     route_scale: float = 1.0,
-    use_bias: bool = True,
+    use_bias: bool = False,
 ):
     torch.random.manual_seed(2)
     gating_output = _make_gating(num_experts, num_tokens, dtype)
@@ -425,16 +452,32 @@ def benchmark_topk_softmax(
     (w_fused, i_fused), avg_fused = run_fused_softmax(
         gating_output.clone(), bias, topk, route_scale
     )
+    # vLLM kernel: no bias support, pass gating_output directly
+    (w_vllm, i_vllm), avg_vllm = run_vllm_softmax(
+        gating_output.clone(), topk, route_scale
+    )
 
     sel = _selection_scores(gating_output, bias, "softmax")
-    id_err = (
+    id_err_fused = (
         _count_routing_mismatches(
             i_fused,
             i_torch,
             sel,
             topk,
             bias=bias,
-            label=f"softmax E={num_experts} T={num_tokens} k={topk} {dtype}",
+            label=f"softmax/fused E={num_experts} T={num_tokens} k={topk} {dtype}",
+        )
+        / num_tokens
+    )
+    # vLLM kernel compared against torch (no bias, sel_scores == softmax(x))
+    sel_nobias = _selection_scores(gating_output, torch.empty(0), "softmax")
+    id_err_vllm = (
+        _count_routing_mismatches(
+            i_vllm,
+            i_torch,
+            sel_nobias,
+            topk,
+            label=f"softmax/vllm E={num_experts} T={num_tokens} k={topk} {dtype}",
         )
         / num_tokens
     )
@@ -446,15 +489,18 @@ def benchmark_topk_softmax(
         "dtype": str(dtype).split(".")[-1],
         "torch_us": avg_torch,
         "fused_us": avg_fused,
-        "uplift": avg_torch / avg_fused,
-        "id_errors": id_err,
-        "max_weight_err": _max_weight_error(w_fused, i_fused, w_torch, i_torch),
+        "vllm_us": avg_vllm,
+        "fused_uplift": avg_torch / avg_fused,
+        "vllm_uplift": avg_torch / avg_vllm,
+        "id_err_fused": id_err_fused,
+        "id_err_vllm": id_err_vllm,
     }
-    if id_err > 0.01:
-        print(
-            f"\n[ERROR] softmax: num_experts={num_experts}, num_tokens={num_tokens}, "
-            f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
-        )
+    for label, id_err in (("fused", id_err_fused), ("vllm", id_err_vllm)):
+        if id_err > 0.01:
+            print(
+                f"\n[ERROR] softmax/{label}: num_experts={num_experts}, num_tokens={num_tokens}, "
+                f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
+            )
     return result
 
 
@@ -576,7 +622,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-tokens",
         type=str2tuple,
-        default=[64, 1024, 2048],
+        default=[16384, 4096, 1024, 256, 64, 1],
         help="Comma-separated list of number of tokens (default: 64,1024,2048)",
     )
     parser.add_argument(
@@ -669,7 +715,7 @@ if __name__ == "__main__":
             itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
         )
         print("\n" + "=" * 80)
-        print("topk_softmax benchmark (via topk_gating)")
+        print("topk_softmax benchmark: topk_gating (fused) vs topk_softmax (vLLM)")
         print("=" * 80)
         collected = []
         for num_experts, num_tokens, topk, dtype in softmax_configs:
@@ -679,8 +725,9 @@ if __name__ == "__main__":
             collected.append(result)
         df = pd.DataFrame(collected)
         print(df.to_string(index=False))
-        print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
-        errors = df[df["id_errors"] > 0.01]
+        print(f"\nAverage fused uplift: {df['fused_uplift'].mean():.2f}x")
+        print(f"Average vllm  uplift: {df['vllm_uplift'].mean():.2f}x")
+        errors = df[(df["id_err_fused"] > 0.01) | (df["id_err_vllm"] > 0.01)]
         if len(errors) > 0:
             print(f"\nERROR: {len(errors)} softmax config(s) had id errors > 1%!")
             print(errors.to_string(index=False))
