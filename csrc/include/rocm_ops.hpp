@@ -1934,6 +1934,15 @@ namespace py = pybind11;
             py::arg("scale_dtype")       = std::string("e8m0"));                        \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
     m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);                  \
+    m.def("fused_qk_norm_rope_1way_fp8_perhead_quant",                                  \
+          &aiter::fused_qk_norm_rope_1way_fp8_perhead_quant,                            \
+          py::arg("q"), py::arg("k"), py::arg("w_q"), py::arg("w_k"),                   \
+          py::arg("cos_sin"),                                                           \
+          py::arg("batch_size"), py::arg("num_tokens"),                                 \
+          py::arg("num_heads_q"), py::arg("num_heads_k"), py::arg("head_size"),         \
+          py::arg("is_interleaved"), py::arg("eps"),                                    \
+          py::arg("q_fp8"), py::arg("k_fp8"), py::arg("q_descale"), py::arg("k_descale"), \
+          py::arg("q_unquantized"), py::arg("k_unquantized"));                            \
     m.def("fused_qk_norm_rope_2way_fp8_perhead_quant",                                  \
           &aiter::fused_qk_norm_rope_2way_fp8_perhead_quant,                            \
           py::arg("q0"), py::arg("k0"), py::arg("q1"), py::arg("k1"),                   \
@@ -1949,6 +1958,11 @@ namespace py = pybind11;
           py::arg("v0"),                                                                  \
           py::arg("v1"),                                                                  \
           py::arg("v_fp8"),                                                               \
+          py::arg("v_descale"));                                                          \
+    m.def("v_1way_per_head_fp8_quant",                                                    \
+          &aiter::v_1way_per_head_fp8_quant,                                              \
+          py::arg("v"),                                                                   \
+          py::arg("v_fp8"),                                                                 \
           py::arg("v_descale"));
 
 #define SMOOTHQUANT_PYBIND                      \
