@@ -636,11 +636,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template prefetch_kv_rope<kCheckBoundaryNext, kIsRopeWarp>(
                     next_sub, warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
 
-                // Drain all band loads (carriers + staging + RoPE lds). Correctness-
-                // first; the carrier/staging overlap can be re-pipelined later.
-                kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
-
                 // Carrier strip 0.
+                kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/6>(warp_idx);
                 const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0.nope_dw, scale_f0);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0.nope_dw, scale_f0);
@@ -650,6 +647,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template store_kv_tile_step<0u, kTile, 1>(next_sub, warp_idx, dw);
 
                 // Carrier strip 1.
+                kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/4>(warp_idx);
                 const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p1.nope_dw, scale_f1);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p1.nope_dw, scale_f1);
@@ -660,6 +658,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
                 // Staged strip 2 (lo & hi).
                 {
+                    kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/2>(warp_idx);
                     const hk::u32x4 s2   = kv_manager.template load_staged_kv_carrier<0u>(stage_t0);
                     const float     sf2  = hk_mla::e8m0_to_f32(scale_s0);
                     __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
@@ -674,6 +673,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // Staged strip 3 (lo only; hi strip 3 is the RoPE DMA above).
                 if constexpr(!kIsRopeWarp)
                 {
+                    kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
                     const hk::u32x4 s3   = kv_manager.template load_staged_kv_carrier<1u>(stage_t0);
                     const float     sf3  = hk_mla::e8m0_to_f32(scale_s1);
                     __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
