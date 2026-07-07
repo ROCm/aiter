@@ -1778,6 +1778,14 @@ def _run_perf_comparison(args: PrefillArgs):
     fly_vs_vllm = (
         us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
     )
+    # FlyDSL_mfma16_hip speedup vs Triton_vk.
+    fly_hip_vs_vk = (
+        us_triton_vk / us_fly_mfma16_hip if (us_fly_mfma16_hip > 0 and us_fly_mfma16_hip == us_fly_mfma16_hip) else float("nan")
+    )
+    # FlyDSL_mfma16_3wave_opt2 speedup vs Triton_vk.
+    fly_3w_vs_vk = (
+        us_triton_vk / us_fly_mfma16_3wave_opt2 if (us_fly_mfma16_3wave_opt2 > 0 and us_fly_mfma16_3wave_opt2 == us_fly_mfma16_3wave_opt2) else float("nan")
+    )
     # HIP speedup vs Triton_vk (>1 means HIP is faster than Triton_vk).
     hip_vs_vk = (
         us_triton_vk / us_hip if (us_hip > 0 and us_hip == us_hip) else float("nan")
@@ -1807,6 +1815,8 @@ def _run_perf_comparison(args: PrefillArgs):
             "flydsl_vs_vk": fly_vs_vk,
             "flydsl_vs_origin_opt": fly_vs_origin_opt,
         "flydsl_vs_vllm": fly_vs_vllm,
+        "fly_hip_vs_vk": fly_hip_vs_vk,
+        "fly_3w_vs_vk": fly_3w_vs_vk,
         "hip_vs_vk": hip_vs_vk,
         "flydsl_opt_vs_vk": fly_opt_vs_vk,
         }
@@ -1923,8 +1933,10 @@ def _print_perf_table():
         ("Tri_vk", "Triton_vk(us)", 6),
         ("vLLM", "vLLM_vk(us)", 6),
         ("fly/vk", "flydsl_vs_vk", 6),
+        ("fh/vk", "fly_hip_vs_vk", 6),
         ("hip/vk", "hip_vs_vk", 6),
         ("2w/vk", "flydsl_opt_vs_vk", 6),
+        ("3w/vk", "fly_3w_vs_vk", 6),
     ]
 
     def _fmt_cell(val, key, width):
