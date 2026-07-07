@@ -6,13 +6,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/atom-di-ci-smoke-workflow.yaml"
+      - ".github/scripts/atom-di-ci/**"
   workflow_dispatch:
     inputs:
-      atom_ref:
-        description: "ROCm/ATOM ref containing the mesh Slurm script"
-        required: false
-        type: string
-        default: "main"
       spur_account:
         description: "Spur account"
         required: false
@@ -22,42 +18,28 @@ on:
         description: "Spur partition or queue"
         required: false
         type: string
-        default: "amd-frameworks"
+        default: "default"
       spur_nodelist:
-        description: "Candidate Spur nodes; the 2P1D ATOM script uses the first 3"
+        description: "Candidate Spur nodes; the 2P1D smoke uses the first 3"
         required: false
         type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
       model_path:
-        description: "DeepSeek-V4-Pro model path visible on Slurm nodes"
+        description: "DeepSeek-V4-Pro model path visible on Spur nodes"
         required: false
         type: string
         default: "/data/models2/DeepSeek-V4-Pro"
       docker_image:
-        description: "ATOM image used by the ATOM mesh script"
+        description: "ATOM image used by the AITER CI scripts"
         required: false
         type: string
         default: "rocm/atom-dev:latest"
       shared_root:
-        description: "Shared root mounted by the ATOM script containers, for example /it-share/..."
+        description: "Shared /data root for scripts, logs, and results"
         required: false
         type: string
         default: ""
-      isl_list:
-        description: "Input lengths for the smoke benchmark"
-        required: false
-        type: string
-        default: "8192"
-      osl:
-        description: "Output length for the smoke benchmark"
-        required: false
-        type: string
-        default: "1"
-      conc_list:
-        description: "Concurrency list for the smoke benchmark"
-        required: false
-        type: string
-        default: "2"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -70,19 +52,14 @@ jobs:
     runs-on: [self-hosted, aiter-di-ci-spur-login]
     timeout-minutes: 180
     env:
-      ATOM_REF: main
       SPUR_ACCOUNT: amd-frameworks
-      SPUR_PARTITION: amd-frameworks
+      SPUR_PARTITION: default
       SPUR_NODELIST: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
       MODEL_PATH: /data/models2/DeepSeek-V4-Pro
       DOCKER_IMAGE: rocm/atom-dev:latest
       SHARED_ROOT_BASE: /data/xinhuang/spur_dsv4_logs
-      ISL_LIST: "8192"
-      OSL: "1"
-      CONC_LIST: "2"
-      RUN_GSM8K: "0"
-      RANDOM_RANGE_RATIO: "0.8"
-      SCRIPT_PATH: atom/mesh/scripts/ds_v4_2p_tp8_1d_tp8_atom_mtp_dpa_slurm.sh
+      AITER_CI_SUBMIT_MODE: spur-script
+      AITER_CI_USE_NODELIST: "1"
     steps:
       - name: Show runner and Spur state
         run: |
@@ -90,7 +67,9 @@ jobs:
           hostname
           whoami
           pwd
-          command -v spur
+          command -v sbatch
+          sbatch --help | sed -n '1,80p' || true
+          command -v spur || true
           spur --version || true
           spur --help || true
           spur queue || true
@@ -108,28 +87,19 @@ jobs:
               event = json.load(f)
 
           inputs = event.get("inputs") or {}
-
           defaults = {
-              "ATOM_REF": "main",
               "SPUR_ACCOUNT": "amd-frameworks",
-              "SPUR_PARTITION": "amd-frameworks",
+              "SPUR_PARTITION": "default",
               "SPUR_NODELIST": "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16",
               "MODEL_PATH": "/data/models2/DeepSeek-V4-Pro",
               "DOCKER_IMAGE": "rocm/atom-dev:latest",
-              "ISL_LIST": "8192",
-              "OSL": "1",
-              "CONC_LIST": "2",
           }
           input_names = {
-              "ATOM_REF": "atom_ref",
               "SPUR_ACCOUNT": "spur_account",
               "SPUR_PARTITION": "spur_partition",
               "SPUR_NODELIST": "spur_nodelist",
               "MODEL_PATH": "model_path",
               "DOCKER_IMAGE": "docker_image",
-              "ISL_LIST": "isl_list",
-              "OSL": "osl",
-              "CONC_LIST": "conc_list",
           }
 
           for env_name, default in defaults.items():
@@ -142,169 +112,144 @@ jobs:
               run_id = os.environ["GITHUB_RUN_ID"]
               run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
               shared_root = f"/data/xinhuang/spur_dsv4_logs/aiter_spur_login_{run_id}_{run_attempt}"
-              print(f"SHARED_ROOT={shared_root}")
-          else:
-              print(f"SHARED_ROOT={shared_root}")
 
-          print("RUN_GSM8K=0")
+          print(f"SHARED_ROOT={shared_root}")
+          print(f"AITER_CI_LOG_ROOT={shared_root}/logs")
+          print(f"AITER_CI_RESULT_DIR={shared_root}/results")
+          print(f"AITER_CI_SHARED_SCRIPT_ROOT={shared_root}/scripts")
           PY
 
-      - name: Checkout ATOM mesh scripts
+      - name: Checkout AITER scripts
         uses: actions/checkout@v4
-        with:
-          repository: ROCm/ATOM
-          ref: main
-          path: ATOM
 
-      - name: Select ATOM ref
-        run: |
-          set -euo pipefail
-          cd ATOM
-          if [[ "${ATOM_REF}" != "main" ]]; then
-            git fetch --depth=1 origin "${ATOM_REF}"
-            git checkout FETCH_HEAD
-          fi
-          git rev-parse HEAD
-
-      - name: Prepare shared ATOM source and patched Spur script
+      - name: Prepare shared AITER CI scripts
         run: |
           set -euo pipefail
 
-          shared_root="${SHARED_ROOT}"
-          case "${shared_root}" in
-            /it-share/*|/mnt/*|/data/*) ;;
+          case "${SHARED_ROOT}" in
+            /data/*) ;;
             *)
-              echo "shared_root must be under /it-share, /mnt, or /data so Slurm node containers can see the copied ATOM source."
+              echo "shared_root must be under /data so Spur compute nodes can see scripts and logs."
               exit 2
               ;;
           esac
 
-          atom_source="${shared_root}/ATOM"
-          log_root="${shared_root}/job"
-          script_src="ATOM/${SCRIPT_PATH}"
-          script_dst="${shared_root}/$(basename "${SCRIPT_PATH}")"
-          shim_dir="${shared_root}/spur-shims"
+          mkdir -p "${AITER_CI_SHARED_SCRIPT_ROOT}" "${AITER_CI_LOG_ROOT}" "${AITER_CI_RESULT_DIR}"
+          cp -R --no-preserve=mode,ownership,timestamps .github/scripts/atom-di-ci/. "${AITER_CI_SHARED_SCRIPT_ROOT}/"
+          chmod +x "${AITER_CI_SHARED_SCRIPT_ROOT}"/*.sh
+          find "${AITER_CI_SHARED_SCRIPT_ROOT}" -maxdepth 1 -type f -printf "%f %s bytes\n" | sort
 
-          test -f "${script_src}"
-          mkdir -p "${shared_root}" "${log_root}" "${shim_dir}"
-          rm -rf "${atom_source}"
-          cp -R --no-preserve=mode,ownership,timestamps ATOM "${atom_source}"
-
-          sed \
-            -e "s|/it-share/yajizhan|/data/xinhuang|g" \
-            -e "s|/data/xinhuang/code/ATOM|${atom_source}|g" \
-            -e "s|/data/xinhuang/slurm_dsv4_logs|${shared_root}|g" \
-            "${script_src}" > "${script_dst}"
-          chmod +x "${script_dst}"
-
-          cat > "${shim_dir}/scontrol" <<'SHIM'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          if [[ "${1:-}" == "show" && "${2:-}" == "hostnames" ]]; then
-            IFS=',' read -ra nodes <<< "${3:-}"
-            printf '%s\n' "${nodes[@]}"
-            exit 0
-          fi
-          echo "Unsupported scontrol invocation: $*" >&2
-          exit 2
-          SHIM
-          chmod +x "${shim_dir}/scontrol"
-
-          cat > "${shim_dir}/srun" <<'SHIM'
-          #!/usr/bin/env bash
-          set -euo pipefail
-
-          node=""
-          time_limit=""
-          args=()
-          while [[ $# -gt 0 ]]; do
-            case "$1" in
-              --nodelist=*) node="${1#--nodelist=}" ; shift ;;
-              --nodelist) node="${2:-}" ; shift 2 ;;
-              --time=*) time_limit="${1#--time=}" ; shift ;;
-              --time) time_limit="${2:-}" ; shift 2 ;;
-              --nodes=*|--ntasks=*) shift ;;
-              --nodes|--ntasks) shift 2 ;;
-              *) args+=("$1") ; shift ;;
-            esac
-          done
-
-          if [[ -z "${node}" ]]; then
-            echo "srun shim requires --nodelist" >&2
-            exit 2
-          fi
-          if [[ "${#args[@]}" -eq 0 ]]; then
-            echo "srun shim requires a command" >&2
-            exit 2
-          fi
-
-          spur_args=(run --nodes "${node}")
-          if [[ -n "${SPUR_ACCOUNT:-}" ]]; then
-            spur_args+=(--account "${SPUR_ACCOUNT}")
-          fi
-          if [[ -n "${SPUR_PARTITION:-}" ]]; then
-            spur_args+=(--partition "${SPUR_PARTITION}")
-          fi
-          if [[ -n "${time_limit}" ]]; then
-            spur_args+=(--time "${time_limit}")
-          fi
-
-          exec spur "${spur_args[@]}" -- "${args[@]}"
-          SHIM
-          chmod +x "${shim_dir}/srun"
-
-          {
-            echo "ATOM_SOURCE_FOR_SLURM=${atom_source}"
-            echo "LOG_ROOT=${log_root}"
-            echo "PATCHED_SCRIPT=${script_dst}"
-            echo "SPUR_SHIM_DIR=${shim_dir}"
-          } >> "${GITHUB_ENV}"
-
-          echo "Prepared ATOM source: ${atom_source}"
-          echo "Prepared patched script: ${script_dst}"
-          echo "Prepared Spur shim dir: ${shim_dir}"
-          sed -n '1,80p' "${script_dst}"
-
-      - name: Run DeepSeek-V4-Pro 2P1D ATOM mesh smoke job with Spur
+      - name: Generate AITER CI 2P1D smoke cell
         run: |
           set -euo pipefail
 
-          echo "Running ${PATCHED_SCRIPT}"
-          echo "Shared root: ${SHARED_ROOT}"
-          IFS=',' read -ra candidate_nodes <<< "${SPUR_NODELIST}"
-          if [[ "${#candidate_nodes[@]}" -lt 3 ]]; then
-            echo "Need at least 3 Spur nodes for the ATOM 2P1D script; got: ${SPUR_NODELIST}"
-            exit 2
-          fi
-          atom_mesh_nodelist="${candidate_nodes[0]},${candidate_nodes[1]},${candidate_nodes[2]}"
+          cell_json="${AITER_CI_RESULT_DIR}/cell.json"
+          nodes="$(echo "${SPUR_NODELIST}" | cut -d, -f1,2,3)"
 
-          echo "Spur candidate nodes: ${SPUR_NODELIST}"
-          echo "ATOM 2P1D nodes: ${atom_mesh_nodelist}"
-          echo "Model path: ${MODEL_PATH}"
-          echo "Docker image: ${DOCKER_IMAGE}"
-          echo "ISL/OSL/CONC: ${ISL_LIST}/${OSL}/${CONC_LIST}"
-          echo "RUN_GSM8K=${RUN_GSM8K}"
+          python3 - "${cell_json}" "${nodes}" <<'PY'
+          import json
+          import os
+          import sys
 
-          set +e
-          spur_output="$(
-            SLURM_JOB_ID="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" \
-            SLURM_JOB_NODELIST="${atom_mesh_nodelist}" \
-            PATH="${SPUR_SHIM_DIR}:${PATH}" \
-            bash "${PATCHED_SCRIPT}" 2>&1
-          )"
-          spur_status=$?
-          set -e
+          cell_path, raw_nodes = sys.argv[1:3]
+          nodes = [node.strip() for node in raw_nodes.split(",") if node.strip()]
+          if len(nodes) != 3:
+              raise SystemExit(f"Expected exactly 3 nodes for 2P1D smoke, got {nodes}")
 
-          echo "${spur_output}"
-          echo "SPUR_STATUS=${spur_status}" >> "${GITHUB_ENV}"
+          cell = {
+              "id": "deepseek-v4-pro-2p1d-dpa-gsm8k",
+              "model": "DeepSeek-V4-Pro",
+              "backend": "atom",
+              "image": os.environ["DOCKER_IMAGE"],
+              "model_path": os.environ["MODEL_PATH"],
+              "precision": "FP4",
+              "topology": "2p1d",
+              "display_topology": "2P1D-TP8-DPA",
+              "nodes": nodes,
+              "num_nodes": 3,
+              "isl": [8192],
+              "osl": 1024,
+              "concurrency": [64],
+              "concurrency_x": "64",
+              "random_range_ratio": "0.8",
+              "request_rate": "inf",
+              "num_prompts_multiplier": 10,
+              "wait_server_timeout": 2500,
+              "wait_router_timeout": 300,
+              "runner": {
+                  "slurm_account": os.environ.get("SPUR_ACCOUNT", ""),
+                  "slurm_partition": os.environ.get("SPUR_PARTITION", "default"),
+                  "gpus_per_node": 8,
+                  "cpus_per_task": 1,
+                  "time_limit": "08:00:00",
+                  "log_root": os.environ["AITER_CI_LOG_ROOT"],
+              },
+              "service": {
+                  "prefill": {
+                      "port": 8010,
+                      "workers": 2,
+                      "tp": 8,
+                      "enable_dp_attention": True,
+                  },
+                  "decode": {
+                      "port": 8020,
+                      "workers": 1,
+                      "tp": 8,
+                      "enable_dp_attention": True,
+                  },
+                  "router": {"port": 8000, "policy": "random", "prometheus_port": 29100},
+              },
+              "server_args": {
+                  "kv_cache_dtype": "fp8",
+                  "block_size": 16,
+                  "gpu_memory_utilization": 0.85,
+                  "max_num_seqs": 256,
+              },
+              "env": {
+                  "common": {
+                      "PYTHONUNBUFFERED": "1",
+                      "AITER_LOG_LEVEL": "WARNING",
+                      "AITER_BF16_FP8_MOE_BOUND": "0",
+                      "ATOM_MOE_GU_ITLV": "1",
+                      "GPU_MAX_HW_QUEUES": "5",
+                      "ATOM_CPU_AFFINITY": "1",
+                  },
+                  "prefill": {"ATOM_HOST_IP": "${ROLE_IP}"},
+                  "decode": {"ATOM_HOST_IP": "${ROLE_IP}"},
+              },
+              "run_eval": True,
+              "run_benchmark": False,
+              "accuracy": {
+                  "task": "gsm8k",
+                  "fewshot": 3,
+                  "limit": None,
+                  "concurrency": [64],
+              },
+          }
+          with open(cell_path, "w", encoding="utf-8") as f:
+              json.dump(cell, f, indent=2)
+          print(json.dumps({
+              "id": cell["id"],
+              "nodes": cell["nodes"],
+              "model_path": cell["model_path"],
+              "image": cell["image"],
+              "eval_concurrency": cell["accuracy"]["concurrency"],
+          }, indent=2))
+          PY
 
-          echo "=== Spur logs ==="
-          find "${SHARED_ROOT}" -maxdepth 3 -type f \( -name "*.out" -o -name "*.err" -o -name "*.log" \) -print -exec tail -n 240 {} \; || true
+          echo "AITER_CI_CELL_JSON=${cell_json}" >> "${GITHUB_ENV}"
 
-          echo "=== ATOM mesh result files ==="
-          find "${LOG_ROOT}" -maxdepth 4 -type f \( -name "*.json" -o -name "*.log" -o -name "*.out" -o -name "*.err" \) -print | sort || true
+      - name: Run DeepSeek-V4-Pro 2P1D AITER CI smoke job with Spur
+        run: |
+          set -euo pipefail
+          cd "${AITER_CI_SHARED_SCRIPT_ROOT}"
 
-          exit "${spur_status}"
+          AITER_CI_SUBMIT_MODE="${AITER_CI_SUBMIT_MODE}" \
+          AITER_CI_USE_NODELIST="${AITER_CI_USE_NODELIST}" \
+          ./pd_spur_submit.sh \
+            --cell-json "${AITER_CI_CELL_JSON}" \
+            --result-dir "${AITER_CI_RESULT_DIR}" \
+            --scripts-root "${AITER_CI_SHARED_SCRIPT_ROOT}"
 
       - name: Collect ATOMesh smoke logs
         if: always()
