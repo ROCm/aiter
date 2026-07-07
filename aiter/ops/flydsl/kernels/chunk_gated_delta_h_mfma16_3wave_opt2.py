@@ -167,12 +167,12 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # =False reaches 4 waves/SIMD (VGPR 136->128, LDS 44->35KB) but is ~20%
     # SLOWER (578us vs 480us) because u reverts to 16 scalar buffer_load_ushort
     # -- higher occupancy does NOT compensate the extra VMEM traffic. Keep True.
-    USE_LDS_U = True
+    USE_LDS_U = False
 
     # EXPERIMENT toggle: v_new output store. True = stage to lds_vn [BT,V] then
     # coalesced b128 read-out (independent buffer, ~8.5KB, keeps 3 waves);
     # False = original 16 scalar buffer_store_short straight to HBM.
-    USE_LDS_VN_STORE = True
+    USE_LDS_VN_STORE = False
 
     # EXPERIMENT toggle (OPT-C(g), rev219+): stage the chunk's 64 per-row g into
     # lds_g (one coalesced load/thread, +256 B LDS) and read g from LDS in
@@ -182,7 +182,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # vmcnt(16) drain is fully hidden by 3-wave overlap, so it is not the
     # binding wait -- but ON cuts buffer_load 41->21 / removes the redundant HBM
     # g traffic, so kept True as the cleaner / lower-traffic default.
-    USE_LDS_G = True
+    USE_LDS_G = False
 
     # EXPERIMENT toggle (w-prefetch-interleave, rev224): cross-chunk w register
     # prefetch carried via the scf.for iter_args, with the NEXT chunk's w
@@ -340,7 +340,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 230  # NUM_WARPS=BV//16 variable (BV in {16,32,64}); N_REPEAT disentangled -> K_SUB_PER_BLOCK
+    _K5_KERNEL_REVISION = 301  # barrier-trim: step 3 moved before B3, B7 eliminated (3→2 barriers/chunk)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -785,13 +785,13 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                 g_stage_val = g_stage_in_bounds.select(g_stage_val, fx.Float32(0.0))
                 lds_g[fx.Index(g_stage_row)] = g_stage_val
 
-            gpu.barrier()
-
             # ============================================================
-            # 3. k -> lds_k [K, BT]. K_PF_INTERLEAVE: k already in registers
-            # (prefetched in prev chunk's GEMM2 / prologue) -- store-only. Else:
-            # load 8 contiguous tokens (BT, row-contiguous) per thread, store to
-            # lds_k. (k-load params hoisted to outer scope.)
+            # 3. k -> lds_k [K, BT]. Moved BEFORE the barrier (was after it)
+            # so that B3 publishes BOTH lds_w and lds_k, eliminating the need
+            # for the old B7 barrier before GEMM2. The lds_k WAR (prev chunk's
+            # GEMM2 read vs this write) is protected by B1 at the top of the
+            # chunk. K_PF_INTERLEAVE: k already in registers (prefetched in
+            # prev chunk's GEMM1 / prologue) -- store-only.
             # ============================================================
             if const_expr(W_PF_INTERLEAVE and K_PF_INTERLEAVE):
                 for batch in range_constexpr(K_LOAD_BATCHES):
@@ -803,23 +803,18 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                 k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
                 abs_tok = i_t_i32 * fx.Int32(BT) + k_load_tokbase
                 in_b = abs_tok < T_local
-                # k is [B, Hg, K, T_flat] (token innermost); the absolute token
-                # within the sequence is i_t*BT + tokbase. The chunk offset
-                # i_t*BT MUST be in the address (previously only used for the
-                # bounds check -> chunks i_t>0 read chunk-0's k -> GEMM2 wrong).
                 k_off = k_base + k_row * T_flat + abs_tok
                 k_off = in_b.select(k_off, k_base)
                 k_vec = k_.vec_load((fx.Index(k_off),), LOAD_VEC_WIDTH)
                 k_lds_off = k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
                 lds_k.vec_store((fx.Index(k_lds_off),), k_vec, LOAD_VEC_WIDTH)
 
-            # NOTE (barrier-trim): removed the post-k-load barrier. It guarded
-            # the lds_k RAW (step 3 cooperative write -> step 8 GEMM2 read), but
-            # nothing reads or overwrites lds_k between here and GEMM2 (GEMM1
-            # reads lds_w, v_new reads lds_u, gating reads lds_g), and the
-            # step-7 cross-chunk barrier (B7, line ~801) sits right before GEMM2
-            # and already publishes this write as a pre-read fence. lds_k's
-            # lds_ht alias WAR for the NEXT chunk is covered by B1 (step 1).
+            # B3: publishes lds_w + lds_k + lds_ht for GEMM1 (lds_w), GEMM2
+            # (lds_k), and the deferred ht readout (lds_ht). With step 3
+            # moved before this barrier, B7 (the old cross-chunk WAR barrier
+            # before GEMM2) is eliminated -- all RAW hazards are now covered
+            # by this single barrier.
+            gpu.barrier()
 
             # ============================================================
             # 4. GEMM1: b_v = w @ h^T (h from registers). VWARP.
@@ -1057,19 +1052,21 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_s
 
             # ============================================================
-            # 7. Cross-chunk WAR barrier. GEMM2 below feeds vn straight from
-            # registers (vn_frags) -- no lds_vn round-trip -- so there is no
-            # vn LDS publish to wait on. This barrier still guards the lds_w
-            # WAR hazard: the current chunk's GEMM1 reads of lds_w must finish
-            # before the NEXT chunk's cooperative w-load overwrites lds_w.
-            # (lds_k's WAR is covered by the post-w-load barrier.)
+            # 7. B7 ELIMINATED (barrier-trim rev301). The old B7 guarded:
+            #   (a) lds_w WAR (GEMM1 read → next chunk write) -- now covered
+            #       by B1 at the top of the NEXT chunk (all warps must finish
+            #       this chunk, including GEMM1, before any warp passes B1).
+            #   (b) lds_k RAW (step 3 write → GEMM2 read) -- now covered by
+            #       B3, since step 3 was moved before B3 (rev301).
+            #   (c) lds_ht RAW (step 1 write → ht readout) -- already covered
+            #       by B3 (step 1 is before B3, readout is after B3).
+            # Net: 3 barriers/chunk → 2 barriers/chunk (B1 + B3).
             # ============================================================
-            gpu.barrier()
 
             # HT_STORE_OVERLAP_GEMM2: deferred h-snapshot readout + HBM store,
-            # issued HERE (after step-7 barrier, before GEMM2) so GEMM2's MFMA
-            # chain below hides the buffer_store latency. lds_ht still holds this
-            # chunk's PRE-gating snapshot (staged at step 1, independent buffer,
+            # issued HERE (after gating, before GEMM2) so GEMM2's MFMA chain
+            # hides the buffer_store latency. lds_ht still holds this chunk's
+            # PRE-gating snapshot (staged at step 1, independent buffer,
             # untouched since -- gating only mutated the h_accs REGISTERS). The
             # buffer_store is fire-and-forget; with loads moved to GEMM1, GEMM2
             # has no vmcnt wait to drain it early. Mirrors HIP's
