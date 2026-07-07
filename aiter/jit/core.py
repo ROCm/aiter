@@ -1325,8 +1325,11 @@ def _ctypes_call(func, fc_name, md_name):
                 argtypes.append(ctypes.c_float)
             else:
                 argtypes.append(ctypes.c_void_p)
-        if has_tensor:
-            argtypes.append(ctypes.c_void_p)  # hipStream_t
+        # hipStream_t: the caller always appends the current stream to the args, so the
+        # argtypes must always declare it -- otherwise ctypes takes the variadic path
+        # (ffi_prep_cif_var) for torch-free modules whose params are all non-tensor, which
+        # fails on stricter libffi builds.
+        argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
 
         _cache["lib"] = lib
