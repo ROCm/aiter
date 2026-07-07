@@ -5,6 +5,7 @@ import functools
 import itertools
 import os
 import json
+import warnings
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -346,9 +347,10 @@ def moe_gemm_a8w4(
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
     # Temporary: TDM async_gather over mxfp8 activations and prefill is broken on gfx1250
-    assert not (
-        use_gluon and gather_indx is not None and M > 1024 and x_has_mx
-    ), "do_gather (TDM async_gather) is not supported on gfx1250 for M > 1024 with mxfp8 activations."
+    if use_gluon and gather_indx is not None and M > 1024 and x_has_mx:
+        warnings.warn(
+            "do_gather (TDM async_gather) is not supported on gfx1250 for M > 1024 with mxfp8 activations."
+        )
     if preshuffled:
         # preshuffle layout is (E, K_packed*16, N//16); w.shape[-1] = N//16
         N = w.shape[-1] * 16
