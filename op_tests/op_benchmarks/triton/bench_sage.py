@@ -869,18 +869,29 @@ def _build_fp6_k_coalesced_packer(device):
 
 def _build_fp4_v_packer(device):
     """Per-channel fp4 (E2M1) V packer for aiter_f6f4 -- the analogue of the Q/K fp6
-    packers. Wraps the host module's fused Triton packer (quantize_fp4_v_colmajor_lds_triton,
-    which reads a permuted view through strides -- no copy) and returns the kernel-ready
-    strided col-major LDS view + per-channel descale. V [b, sk, h_kv, 128] float ->
-    (uint8 view [b, sk, h_kv, 128] over a [b,h_kv,sk*64] buffer with seq stride 64, descale
-    f32 [b, h_kv, 128])."""
+    packers. Returns the kernel-ready strided col-major LDS view + per-channel descale.
+    V [b, sk, h_kv, 128] float -> (uint8 view [b, sk, h_kv, 128] over a [b,h_kv,sk*64]
+    buffer with seq stride 64, descale f32 [b, h_kv, 128]).
+
+    On-device TORCH pack by default (quantize_fp4_v_colmajor_lds_torch): CUDA-graph /
+    inductor friendly (no host sync, traceable) and cosine-equivalent to the fused Triton
+    packer. Set AITER_VFP4_TRITON=1 to use the fused Triton packer instead (reads the
+    permuted view through strides -- no copy)."""
     hp = _load_fp4_v_pack_mod()
+    _use_triton = (
+        os.environ.get("AITER_VFP4_TRITON", "0") != "0"
+        and getattr(hp, "_HP_HAVE_TRITON", False)
+        and hasattr(hp, "quantize_fp4_v_colmajor_lds_triton")
+    )
 
     def _packer(v: torch.Tensor):
         b_, sk_, h_kv_, d_ = v.shape
         assert d_ == 128 and sk_ % 128 == 0, (d_, sk_)
         v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, 128], non-contiguous (read via strides)
-        packed, descale = hp.quantize_fp4_v_colmajor_lds_triton(v_tok)
+        if _use_triton:
+            packed, descale = hp.quantize_fp4_v_colmajor_lds_triton(v_tok)
+        else:
+            packed, descale = hp.quantize_fp4_v_colmajor_lds_torch(v_tok)
         # +64B slack so the last-token strided window (stride 64 < 128) stays in storage bounds.
         packed = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
         v_view = torch.as_strided(
