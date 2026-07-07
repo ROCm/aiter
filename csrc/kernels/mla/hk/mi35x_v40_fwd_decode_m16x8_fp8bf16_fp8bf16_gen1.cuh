@@ -504,10 +504,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // (rescale already applied by A -> false). A from next[0], B from next[+kSubPong].
             if constexpr(kHasPv)
             {
-                hk_mla_v40_pv_stage<false, T, typename R::p_mfma_a_t>(
-                    kv_manager, p_lds_kv_next, rescale, do_rescale);
-                hk_mla_v40_pv_stage<false, T, typename R::p_mfma_b_t, 32u>(
-                    kv_manager, p_lds_kv_next, rescale, false);
+                // One PV call contracts BOTH KV sub-tiles (kBlockN=64) -> single prologue.
+                hk_mla_v40_pv_stage<false, T>(kv_manager, p_lds_kv_next, rescale, do_rescale);
             }
 
             __builtin_amdgcn_s_setprio(3);
@@ -810,12 +808,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             //
             if constexpr(kPvAtEnd && (kSkipCompute == false))
             {
-                // Two sub-tiles: A (rescale folded) inits/accumulates oaccu, then B
-                // accumulates (rescale already applied by A -> false).
-                hk_mla_v40_pv_stage<kIsFirstIter, T, typename R::p_mfma_a_t>(
-                    kv_manager, p_lds_kv_curr, rescale, do_rescale);
-                hk_mla_v40_pv_stage<false, T, typename R::p_mfma_b_t, 32u>(
-                    kv_manager, p_lds_kv_curr, rescale, false);
+                // One PV call contracts BOTH KV sub-tiles (kBlockN=64) -> single prologue.
+                hk_mla_v40_pv_stage<kIsFirstIter, T>(kv_manager, p_lds_kv_curr, rescale, do_rescale);
             }
 
             // ---- Epilogue ----
@@ -838,10 +832,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // (kHasPv), so it needs nothing here. Hi: PV already ran at end.
                 if constexpr((!kPvAtEnd) && (kSkipCompute == false))
                 {
-                    hk_mla_v40_pv_stage<false, T, typename R::p_mfma_a_t>(
-                        kv_manager, p_lds_kv_curr, rescale, do_rescale);
-                    hk_mla_v40_pv_stage<false, T, typename R::p_mfma_b_t, 32u>(
-                        kv_manager, p_lds_kv_curr, rescale, false);
+                    // One PV call contracts BOTH KV sub-tiles (kBlockN=64).
+                    hk_mla_v40_pv_stage<false, T>(kv_manager, p_lds_kv_curr, rescale, do_rescale);
                 }
 
                 // ---- Attention-sink fold ----
