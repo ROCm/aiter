@@ -74,7 +74,7 @@ jobs:
       ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO: /data/models2/DeepSeek-V4-Pro
       ATOMESH_LOG_ROOT: /data/xinhuang/spur_dsv4_logs
       ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
-      ATOMESH_SLURM_SUBMIT_RUNNER: atomesh-cicd-mi350
+      ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
       ATOMESH_SLURM_ACCOUNT: ""
       ATOMESH_SLURM_PARTITION: ""
       ATOMESH_MODEL_ROOT: /data/models2
@@ -157,6 +157,28 @@ jobs:
           fi
           git rev-parse HEAD
 
+      - name: Patch ATOMesh submit runner label
+        run: |
+          set -euo pipefail
+          cd ATOM
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for rel in (
+              ".github/scripts/atomesh/pd_matrix.py",
+              ".github/scripts/atomesh/pd_submit.sh",
+              ".github/workflows/atomesh-benchmark.yaml",
+          ):
+              path = Path(rel)
+              text = path.read_text(encoding="utf-8")
+              text = text.replace("atomesh-cicd-mi350", "aiter-di-ci-spur-login")
+              path.write_text(text, encoding="utf-8")
+          PY
+          rg -n "atomesh-cicd-mi350|aiter-di-ci-spur-login" \
+            .github/scripts/atomesh/pd_matrix.py \
+            .github/scripts/atomesh/pd_submit.sh \
+            .github/workflows/atomesh-benchmark.yaml
+
       - name: Install matrix dependencies
         run: python3 -m pip install pyyaml
 
@@ -205,7 +227,7 @@ jobs:
           cell["concurrency_x"] = "x".join(str(value) for value in conc)
           cell["run_eval"] = False
           cell["accuracy"]["concurrency"] = conc
-          cell["runner"]["slurm_submit_runner"] = "atomesh-cicd-mi350"
+          cell["runner"]["slurm_submit_runner"] = "aiter-di-ci-spur-login"
           cell["runner"]["slurm_account"] = ""
           cell["runner"]["slurm_partition"] = ""
           cell["runner"]["log_root"] = os.environ["ATOMESH_LOG_ROOT"]
