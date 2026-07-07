@@ -42,7 +42,7 @@ def run_ck(input, weight, eps, residual=None, use_model_sensitive_rmsnorm=0):
             residual_out,
             weight,
             eps,
-            use_model_sensitive_rmsnorm,
+            use_model_sensitive_rmsnorm=use_model_sensitive_rmsnorm,
         )
     return output, residual_out
 
@@ -97,13 +97,24 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     # checkAllclose(a, d, atol=0.03, msg='cu')
     # checkAllclose(res_a, res_d, atol=0.01, msg='cu res check')
 
+    # gemma_norm: opus folds (weight + 1); reference uses weight (w + 1). Fresh tensors
+    # because run_cu above rewrites input/res in place.
+    gx = torch.randn(dim, dtype=dtype, device="cuda")
+    gr = torch.randn(dim, dtype=dtype, device="cuda")
+    gout = torch.empty_like(gx)
+    gres = torch.empty_like(gx)
+    aiter.rmsnorm2d_fwd_with_add(gout, gx, gr, gres, weight, 1e-5, gemma_norm=True)
+    (g, gres_ref, *_), _ = run_torch(gx, (weight + 1).to(dtype), 1e-5, residual=gr)
+    checkAllclose(g, gout, atol=0.03, msg="gemma out")
+    checkAllclose(gres_ref, gres, msg="gemma res check")
+
 
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_rmsnorm2d(dtype, m, n)
 
-l_dtype = ["fp16", "bf16"]
+l_dtype = ["fp16", "bf16", "fp32"]
 l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 l_n = [4096, 8192, 16384, 32768, 65536]
 parser = argparse.ArgumentParser(
