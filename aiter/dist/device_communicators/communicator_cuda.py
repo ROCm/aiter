@@ -25,6 +25,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_quant_no_prefill_max_bytes = int(
         os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
     )
+    _custom_ar_hold_inputs = (
+        os.environ.get("AITER_CUSTOM_AR_HOLD_INPUTS", "0") == "1"
+    )
 
     def __init__(
         self,
@@ -82,6 +85,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
+                hold_inputs=self._custom_ar_hold_inputs,
                 # symm_mem_enabled=(
                 #     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 # ),

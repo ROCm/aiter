@@ -53,17 +53,20 @@ void reduce_scatter(fptr_t _fa,
                     int64_t k,
                     int64_t split_dim,
                     int64_t reg_ptr,
-                    int64_t reg_bytes);
+                    int64_t reg_bytes,
+                    bool end_sync = true);
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t dim);
+                    int64_t dim,
+                    bool end_sync = true);
 void all_gather_unreg(fptr_t _fa,
                       const aiter_tensor_t& inp,
                       int64_t reg_buffer,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
-                      int64_t dim);
+                      int64_t dim,
+                      bool end_sync = true);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,
@@ -74,7 +77,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm = false);
+                             bool gemma_norm = false,
+                             bool end_sync = true);
 void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  const aiter_tensor_t& inp,
                                  const aiter_tensor_t& res_inp,
@@ -85,7 +89,8 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  int64_t reg_ptr,
                                  int64_t reg_bytes,
                                  bool use_1stage,
-                                 bool gemma_norm = false);
+                                 bool gemma_norm = false,
+                                 bool end_sync = true);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,
@@ -97,7 +102,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    int64_t reg_ptr,
                                    int64_t reg_bytes,
                                    bool use_1stage,
-                                   bool gemma_norm = false);
+                                   bool gemma_norm = false,
+                                   bool end_sync = true);
 void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              const aiter_tensor_t& inp,
                                              const aiter_tensor_t& res_inp,
@@ -111,7 +117,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_bytes,
                                              bool use_1stage,
                                              int64_t bf16_out_ptr = 0,
-                                             bool transpose_scale = false);
+                                             bool transpose_scale = false,
+                                             bool end_sync = true);
 void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          const aiter_tensor_t& inp,
                                          const aiter_tensor_t& res_inp,
@@ -123,7 +130,8 @@ void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          int64_t reg_ptr,
                                          int64_t reg_bytes,
                                          bool use_1stage,
-                                         int64_t bf16_out_ptr = 0);
+                                         int64_t bf16_out_ptr = 0,
+                                         bool end_sync = true);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,

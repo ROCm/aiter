@@ -351,6 +351,7 @@ class CustomAllreduce:
         device: Union[int, str, torch.device],
         max_size=1024 * 1024 * 1024,  # 2GB bf16/half
         enable_register_for_capturing: bool = True,
+        hold_inputs: bool = False,
     ) -> None:
         """
         Args:
@@ -364,6 +365,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self.hold_inputs = hold_inputs
+        self._inputs: List[torch.Tensor] = []
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -486,6 +489,24 @@ class CustomAllreduce:
             [h.data_ptr() for h in handles],
             offsets,
         )
+
+    def _record_collective_inputs(self, *inputs: torch.Tensor) -> None:
+        """Keep current inputs alive until the next collective is enqueued.
+
+        When final device-side end_sync is disabled, peer ranks may still
+        read a registered input after Python has returned from the launch. The
+        next custom collective's internal start_sync proves all ranks have
+        advanced past the prior collective, so replacing this list after that
+        next launch safely releases the previous inputs.
+        """
+        if not self.hold_inputs:
+            return
+        self._inputs = [
+            inp for inp in inputs if isinstance(inp, torch.Tensor)
+        ]
+
+    def flush_recorded_inputs(self) -> None:
+        self._inputs.clear()
 
     @contextmanager
     def capture(self):
@@ -706,7 +727,9 @@ class CustomAllreduce:
             split_dim,
             reg,
             reg_bytes,
+            end_sync=not self.hold_inputs,
         )
+        self._record_collective_inputs(inp)
 
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
@@ -754,7 +777,9 @@ class CustomAllreduce:
             inp,
             out,
             dim,
+            end_sync=not self.hold_inputs,
         )
+        self._record_collective_inputs(inp)
         return out
 
     def all_gather_unreg(
@@ -851,6 +876,7 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                     gemma_norm,
+                    end_sync=not self.hold_inputs,
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -865,7 +891,9 @@ class CustomAllreduce:
                     reg_bytes,
                     use_1stage,
                     gemma_norm,
+                    end_sync=not self.hold_inputs,
                 )
+            self._record_collective_inputs(inp)
             return out, res_out
         else:
             if out is None:
@@ -888,7 +916,9 @@ class CustomAllreduce:
                 reg_bytes,
                 use_1stage,
                 gemma_norm,
+                end_sync=not self.hold_inputs,
             )
+            self._record_collective_inputs(inp)
             return out, res_out, scale_out
 
     def custom_fused_ar_rms(
@@ -1108,7 +1138,9 @@ class CustomAllreduce:
             use_1stage,
             bf16_ptr,
             transpose_scale,
+            end_sync=not self.hold_inputs,
         )
+        self._record_collective_inputs(inp)
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
@@ -1361,7 +1393,9 @@ class CustomAllreduce:
             reg_bytes,
             use_1stage,
             bf16_ptr,
+            end_sync=not self.hold_inputs,
         )
+        self._record_collective_inputs(inp)
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
@@ -1479,6 +1513,7 @@ class CustomAllreduce:
         )
 
     def close(self):
+        self.flush_recorded_inputs()
         if not self.disabled and getattr(self, "_ptr", 0):
             ops.dispose(self._ptr)
             self._ptr = 0
