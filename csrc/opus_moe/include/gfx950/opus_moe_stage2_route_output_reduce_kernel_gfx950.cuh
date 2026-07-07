@@ -36,6 +36,69 @@ opus_moe_stage2_route_reduce_pack_bf16x4(const float* acc, int base)
         opus_moe_gfx950_cvt_pk_bf16_f32(acc[base + 2], acc[base + 3]);
     return static_cast<uint64_t>(packed01) | (static_cast<uint64_t>(packed23) << 32);
 }
+
+struct OpusMoeStage2RouteReduceMxFp8Group
+{
+    uint64_t data;
+    float scale;
+};
+
+struct OpusMoeStage2RouteReduceMxFp8View
+{
+    const uint8_t* __restrict__ ptr;
+    int64_t row_stride_bytes;
+    int scale_off;
+
+    __device__ __forceinline__ OpusMoeStage2RouteReduceMxFp8Group
+    load_group(int route_row, int col) const
+    {
+        const uint8_t* row = ptr + static_cast<int64_t>(route_row) * row_stride_bytes;
+        return {*reinterpret_cast<const uint64_t*>(row + col),
+                opus_moe_gfx950_e8m0_to_float_scale(row[scale_off + (col >> 3)])};
+    }
+};
+
+struct OpusMoeStage2RouteReduceBf16RouteView
+{
+    const hip_bfloat16* __restrict__ route_out;
+    int64_t route_stride;
+
+    __device__ __forceinline__ uint64_t load_x4(int route_row, int col) const
+    {
+        return *reinterpret_cast<const uint64_t*>(
+            route_out + static_cast<int64_t>(route_row) * route_stride + col);
+    }
+
+    __device__ __forceinline__ hip_bfloat16 load(int route_row, int col) const
+    {
+        return route_out[static_cast<int64_t>(route_row) * route_stride + col];
+    }
+};
+
+struct OpusMoeStage2RouteReduceBf16OutView
+{
+    hip_bfloat16* __restrict__ out;
+    int64_t out_stride;
+
+    __device__ __forceinline__ void store_x4(int token, int col, uint64_t packed) const
+    {
+        *reinterpret_cast<uint64_t*>(
+            out + static_cast<int64_t>(token) * out_stride + col) = packed;
+    }
+
+    __device__ __forceinline__ void store(int token, int col, hip_bfloat16 value) const
+    {
+        out[static_cast<int64_t>(token) * out_stride + col] = value;
+    }
+};
+
+static __device__ __forceinline__ opus::fp32x4_t
+opus_moe_stage2_route_reduce_dequant_fp8x4(uint32_t packed, float scale)
+{
+    const auto values =
+        opus::fp8_to_fp32_packed_x4(__builtin_bit_cast(opus::fp8x4_t, packed));
+    return values * opus::fp32x4_t{scale, scale, scale, scale};
+}
 #endif
 
 // ROUTE_FP8 selects the packed MXFP8 path at compile time. Unlike decode, this
@@ -60,8 +123,6 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
     // Compile-time bound when TOPK>0 (launch guarantees TOPK == kargs.topk).
     const int topk_loop = (TOPK > 0) ? TOPK : kargs.topk;
     const int route_row_base = (TOPK > 0) ? token * TOPK : token * kargs.topk;
-    const hip_bfloat16* __restrict__ route_out_bf16 =
-        reinterpret_cast<const hip_bfloat16*>(kargs.route_out);
 
     // MXFP8 route_out: read fp8 e4m3 + per-8col e8m0 scale, dequant, sum over topk.
     // 8-col groups: one uint64 fp8 load + one e8m0 scale byte per group (scale is
@@ -72,45 +133,36 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
         if(col_end > kargs.model_dim)
             return;
 
-        using f32x2 = float __attribute__((ext_vector_type(2)));
-        const uint8_t* __restrict__ ro8 = kargs.route_out;
-        const int64_t rstride = kargs.route_out_row_bytes;
-        const int scale_off = kargs.model_dim;
+        const OpusMoeStage2RouteReduceMxFp8View route_view{
+            kargs.route_out, kargs.route_out_row_bytes, kargs.model_dim};
+        const OpusMoeStage2RouteReduceBf16OutView out_view{
+            kargs.out_bf16, kargs.stride_o_t};
         // Interleave each 8-column read/sum/write group to keep loads wide while
         // overlapping the final bf16 writes.
         constexpr int NG = elems_per_thread / 8;
 #pragma unroll
-        for(int group = 0; group < NG; ++group)
+        for(int group_idx = 0; group_idx < NG; ++group_idx)
         {
-            const int col = col_base + group * 8;
-            f32x2 acc[4] = {f32x2{0.0f, 0.0f}, f32x2{0.0f, 0.0f},
-                            f32x2{0.0f, 0.0f}, f32x2{0.0f, 0.0f}};
+            const int col = col_base + group_idx * 8;
+            opus::fp32x4_t acc_lo{0.0f, 0.0f, 0.0f, 0.0f};
+            opus::fp32x4_t acc_hi{0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for(int slot = 0; slot < topk_loop; ++slot)
             {
-                const uint8_t* rp =
-                    ro8 + static_cast<int64_t>(route_row_base + slot) * rstride;
-                const uint64_t f8 = *reinterpret_cast<const uint64_t*>(rp + col);
-                const float sf = __builtin_bit_cast(
-                    float, static_cast<uint32_t>(rp[scale_off + (col >> 3)]) << 23);
-                const f32x2 s2 = f32x2{sf, sf};
-                const uint32_t lo32 = static_cast<uint32_t>(f8);
-                const uint32_t hi32 = static_cast<uint32_t>(f8 >> 32);
-                acc[0] += __builtin_amdgcn_cvt_pk_f32_fp8(lo32, false) * s2;
-                acc[1] += __builtin_amdgcn_cvt_pk_f32_fp8(lo32, true) * s2;
-                acc[2] += __builtin_amdgcn_cvt_pk_f32_fp8(hi32, false) * s2;
-                acc[3] += __builtin_amdgcn_cvt_pk_f32_fp8(hi32, true) * s2;
+                const auto mx_group = route_view.load_group(route_row_base + slot, col);
+                acc_lo += opus_moe_stage2_route_reduce_dequant_fp8x4(
+                    static_cast<uint32_t>(mx_group.data), mx_group.scale);
+                acc_hi += opus_moe_stage2_route_reduce_dequant_fp8x4(
+                    static_cast<uint32_t>(mx_group.data >> 32), mx_group.scale);
             }
-            const uint32_t p01 = opus_moe_gfx950_cvt_pk_bf16_f32(acc[0][0], acc[0][1]);
-            const uint32_t p23 = opus_moe_gfx950_cvt_pk_bf16_f32(acc[1][0], acc[1][1]);
-            const uint32_t p45 = opus_moe_gfx950_cvt_pk_bf16_f32(acc[2][0], acc[2][1]);
-            const uint32_t p67 = opus_moe_gfx950_cvt_pk_bf16_f32(acc[3][0], acc[3][1]);
-            hip_bfloat16* op = kargs.out_bf16 +
-                               static_cast<int64_t>(token) * kargs.stride_o_t + col;
-            reinterpret_cast<uint64_t*>(op)[0] =
-                static_cast<uint64_t>(p01) | (static_cast<uint64_t>(p23) << 32);
-            reinterpret_cast<uint64_t*>(op)[1] =
-                static_cast<uint64_t>(p45) | (static_cast<uint64_t>(p67) << 32);
+            const uint32_t p01 = opus_moe_gfx950_cvt_pk_bf16_f32(acc_lo[0], acc_lo[1]);
+            const uint32_t p23 = opus_moe_gfx950_cvt_pk_bf16_f32(acc_lo[2], acc_lo[3]);
+            const uint32_t p45 = opus_moe_gfx950_cvt_pk_bf16_f32(acc_hi[0], acc_hi[1]);
+            const uint32_t p67 = opus_moe_gfx950_cvt_pk_bf16_f32(acc_hi[2], acc_hi[3]);
+            out_view.store_x4(
+                token, col, static_cast<uint64_t>(p01) | (static_cast<uint64_t>(p23) << 32));
+            out_view.store_x4(
+                token, col + 4, static_cast<uint64_t>(p45) | (static_cast<uint64_t>(p67) << 32));
         }
         return;
     }
@@ -118,6 +170,10 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
     {
         static_assert(elems_per_thread % 4 == 0);
         constexpr int groups_per_thread = elems_per_thread / 4;
+        const OpusMoeStage2RouteReduceBf16RouteView route_view{
+            reinterpret_cast<const hip_bfloat16*>(kargs.route_out), kargs.stride_route_out_t};
+        const OpusMoeStage2RouteReduceBf16OutView out_view{
+            kargs.out_bf16, kargs.stride_o_t};
         if(col_end <= kargs.model_dim)
         {
             float acc[elems_per_thread];
@@ -135,10 +191,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                 for(int group = 0; group < groups_per_thread; ++group)
                 {
                     const int col = col_base + group * 4;
-                    const uint64_t packed =
-                        *reinterpret_cast<const uint64_t*>(
-                            route_out_bf16 +
-                            static_cast<int64_t>(route_row) * kargs.stride_route_out_t + col);
+                    const uint64_t packed = route_view.load_x4(route_row, col);
                     opus_moe_stage2_route_reduce_accum_bf16x4(acc, group * 4, packed);
                 }
             }
@@ -149,10 +202,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                 const int col = col_base + group * 4;
                 const uint64_t packed_out =
                     opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4);
-                *reinterpret_cast<uint64_t*>(kargs.out_bf16 +
-                                             static_cast<int64_t>(token) *
-                                                 kargs.stride_o_t +
-                                             col) = packed_out;
+                out_view.store_x4(token, col, packed_out);
             }
             return;
         }
@@ -192,10 +242,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                     if(group < valid_groups4)
                     {
                         const int col = col_base + group * 4;
-                        const uint64_t packed =
-                            *reinterpret_cast<const uint64_t*>(
-                                route_out_bf16 +
-                                static_cast<int64_t>(route_row) * kargs.stride_route_out_t + col);
+                        const uint64_t packed = route_view.load_x4(route_row, col);
                         opus_moe_stage2_route_reduce_accum_bf16x4(acc, group * 4, packed);
                     }
                 }
@@ -207,11 +254,8 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                 if(group < valid_groups4)
                 {
                     const int col = col_base + group * 4;
-                    *reinterpret_cast<uint64_t*>(kargs.out_bf16 +
-                                                 static_cast<int64_t>(token) *
-                                                     kargs.stride_o_t +
-                                                 col) =
-                        opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4);
+                    out_view.store_x4(
+                        token, col, opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4));
                 }
             }
             return;
@@ -237,10 +281,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                 if(group < valid_groups4)
                 {
                     const int col = col_base + group * 4;
-                    const uint64_t packed =
-                        *reinterpret_cast<const uint64_t*>(
-                            route_out_bf16 +
-                            static_cast<int64_t>(route_row) * kargs.stride_route_out_t + col);
+                    const uint64_t packed = route_view.load_x4(route_row, col);
                     opus_moe_stage2_route_reduce_accum_bf16x4(acc, group * 4, packed);
                 }
             }
@@ -251,10 +292,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                 if(tail < scalar_tail)
                 {
                     const int col = col_base + j;
-                    const hip_bfloat16 value =
-                        route_out_bf16[static_cast<int64_t>(route_row) *
-                                            kargs.stride_route_out_t +
-                                        col];
+                    const hip_bfloat16 value = route_view.load(route_row, col);
                     acc[j] += static_cast<float>(value);
                 }
             }
@@ -266,10 +304,8 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
             if(group < valid_groups4)
             {
                 const int col = col_base + group * 4;
-                *reinterpret_cast<uint64_t*>(kargs.out_bf16 +
-                                             static_cast<int64_t>(token) * kargs.stride_o_t +
-                                             col) =
-                    opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4);
+                out_view.store_x4(
+                    token, col, opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4));
             }
         }
 #pragma unroll
@@ -279,8 +315,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
             if(tail < scalar_tail)
             {
                 const int col = col_base + j;
-                kargs.out_bf16[static_cast<int64_t>(token) * kargs.stride_o_t + col] =
-                    opus_moe_gfx950_cvt_bf16_f32(acc[j]);
+                out_view.store(token, col, opus_moe_gfx950_cvt_bf16_f32(acc[j]));
             }
         }
     }

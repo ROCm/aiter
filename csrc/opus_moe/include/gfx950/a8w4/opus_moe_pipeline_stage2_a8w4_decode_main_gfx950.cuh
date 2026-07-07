@@ -20,7 +20,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_pack_a_mfma_reg(
     opus_moe_stage2_a8w4_decode_u32x4_t hi,
     Reg& reg)
 {
-    const auto packed = __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+    const auto packed = opus::concat_vector(lo, hi);
     reg = __builtin_bit_cast(opus::remove_cvref_t<Reg>, packed);
 }
 
@@ -30,7 +30,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_unpack_b_mfma_reg(
     Reg& reg)
 {
     const opus_moe_stage2_a8w4_decode_u32x4_t zero{};
-    const auto packed = __builtin_shufflevector(value, zero, 0, 1, 2, 3, 4, 5, 6, 7);
+    const auto packed = opus::concat_vector(value, zero);
     reg = __builtin_bit_cast(opus::remove_cvref_t<Reg>, packed);
 }
 
@@ -734,7 +734,7 @@ inline __device__ float opus_moe_stage2_a8w4_decode_mxfp8_scale_from_e8m0(
     // fp8 = bf16 / 2^(E-127); power-of-2 scaling is exact.
     return e8m0 == 0
         ? 1.0f
-        : __builtin_bit_cast(float, static_cast<uint32_t>(e8m0) << 23);
+        : opus_moe_gfx950_e8m0_to_float_scale(static_cast<uint32_t>(e8m0));
 }
 
 inline __device__ opus::u8x8_t

@@ -37,6 +37,11 @@ inline __device__ uint16_t opus_moe_gfx950_bf16_to_bits(hip_bfloat16 value)
 #endif
 }
 
+inline __device__ float opus_moe_gfx950_e8m0_to_float_scale(uint32_t e8m0)
+{
+    return __builtin_bit_cast(float, e8m0 << 23);
+}
+
 inline __device__ hip_bfloat16 opus_moe_gfx950_cvt_bf16_f32(float value)
 {
     return opus_moe_gfx950_bf16_from_bits(
