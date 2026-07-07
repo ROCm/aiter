@@ -1,6 +1,8 @@
 name: ATOM DI CI smoke workflow
 
 on:
+  schedule:
+    - cron: "0 16 * * *"  # 12:00 AM Beijing Time (UTC+8)
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
