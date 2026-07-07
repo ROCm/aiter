@@ -349,8 +349,11 @@ def fused_moe_(
 
         _out_str = "bf16"
         _tile_m = 16 if M < 2048 else 32 if M < 16384 else 64
+        # Tile N/K tuned for MI355X TP=8 decode/prefill shapes.
+        # Small M (decode): tile_n=128 keeps N-tiles large enough to saturate waves.
+        # Large M (prefill): tile_n=128, tile_k=256 amortises prologue cost.
         _tile_n = 128
-        _tile_k = 128
+        _tile_k = 256 if M >= 32 else 128
         _kn1 = (
             flydsl_kernel_name(
                 1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
@@ -1650,11 +1653,13 @@ def fused_moe_2stages(
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         _tile_m = 16 if token_num < 2048 else 32 if token_num < 16384 else 64
+        _tile_n_s2 = 128
+        _tile_k_s2 = 256 if token_num >= 32 else 128
         _kn1 = (
-            flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128) + "_gui"
+            flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, _tile_n_s2, _tile_k_s2) + "_gui"
         )
         _kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128, "atomic"
+            2, "bf16", "fp4bf16", "bf16", _tile_m, _tile_n_s2, 128, "atomic"
         )
         metadata = MOEMetadata(
             functools.partial(
