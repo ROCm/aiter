@@ -20,7 +20,7 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    is_fn_pack_bf16: int = 0,  # 1: bf16 (hi/lo) MFMA compute; 0: fp32 MFMA (gfx950 only)
+    is_fn_pack_bf16: int = 0,
 ) -> None: ...
 
 
@@ -418,7 +418,7 @@ def mhc_fused_post_pre_gemm_sqrsum(
     tile_m: int = 16,  # 16, 32 or 64
     tile_n: int = 32,  # 16 or 32
     tile_k: int = 32,  # 32 or 64
-    is_fn_pack_bf16: int = 0,  # 1: bf16 (hi/lo) MFMA compute; 0: fp32 MFMA (gfx950 only)
+    is_fn_pack_bf16: int = 0,
 ) -> None: ...
 
 

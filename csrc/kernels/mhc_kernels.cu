@@ -20,12 +20,17 @@ namespace aiter {
 #endif
 
     // is_fn_pack_bf16 selects the bf16 (fn hi/lo split) matrix compute over the fp32
-    // one. gfx950 uses the native wave64 mfma_f32_16x16x32_bf16 (8 bf16/lane);
-    // gfx1250 uses the wave32 wmma_f32_16x16x32_bf16 (16 bf16/lane, UNVERIFIED - no HW
-    // here). Both are gated per-arch below so the arch-specific builtin never reaches
-    // the wrong device pass. gfx942/host have no K=32 bf16 matmul -> flag is a no-op
-    // (fp32 fallback).
-#if defined(__gfx950__) || defined(__gfx1250__)
+    // one. Wave64 CDNA (gfx942/gfx950/gfx9_4_generic) use opus::mfma<bf16,..,16,16,32>
+    // (8 bf16/lane) -- native K=32 on gfx950, chained K=16 (mfma_..16x16x16bf16_1k) on
+    // gfx942; gfx1250 uses the wave32 wmma_f32_16x16x32_bf16 (16 bf16/lane, UNVERIFIED
+    // - no HW here). Gated per-arch below so each arch's builtin only reaches its own
+    // device pass; other arches (host) fall back to fp32.
+#if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx9_4_generic__)
+#define MHC_BF16_MFMA 1
+#else
+#define MHC_BF16_MFMA 0
+#endif
+#if MHC_BF16_MFMA || defined(__gfx1250__)
     static constexpr bool mhc_bf16_mma_avail = true;
 #else
     static constexpr bool mhc_bf16_mma_avail = false;
@@ -354,7 +359,7 @@ namespace aiter {
         static constexpr int n_chunks_bf16 = vec_tile / 8;
         static_assert(!mhc_bf16_mma_avail || vec_tile % 8 == 0,
                       "bf16 path needs vec_tile a multiple of 8");
-#if defined(__gfx950__)   // bf16 MFMA (mfma_f32_16x16x32_bf16) is gfx950-only
+#if MHC_BF16_MFMA   // wave64 CDNA bf16 MFMA (gfx942 chained-K16 / gfx950 native K32)
         auto lds_read_fn_chunk_bf16 = [&](float* s_fn_rd_ptr, float (&raw)[repeat_n][8], int c) {
             #pragma unroll
             for (int n = 0; n < repeat_n; n++) {
@@ -432,7 +437,7 @@ namespace aiter {
                 lds_load_fn_tile((k) + 2);                                                        \
             }                                                                                     \
         } while (0)
-#endif // __gfx950__ (bf16 path)
+#endif // MHC_BF16_MFMA (wave64 bf16 path)
 
 #if defined(__gfx1250__)   // wave32 WMMA bf16 (UNVERIFIED - no gfx1250 HW to validate)
         // 16 bf16/lane WMMA fragment. On wave32 x's v_a index == the WMMA fragment K
@@ -590,7 +595,7 @@ namespace aiter {
         // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
         // pass; every other arch compiles the fp32 path unconditionally, so the flag is
         // a no-op there (falls back to fp32).
-#if defined(__gfx950__)
+#if MHC_BF16_MFMA
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
         if constexpr (is_fn_pack_bf16) {                                   \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
@@ -2375,8 +2380,8 @@ namespace aiter {
                         (s_offset % tile_k) + k_split_offset);
                     s_offset += step;
                     if constexpr (is_fn_pack_bf16 && mhc_bf16_mma_avail) {
-#if defined(__gfx950__)
-                        // bf16 MFMA (gfx950): one mfma_f32_16x16x32_bf16 contracts
+#if MHC_BF16_MFMA
+                        // bf16 MFMA (wave64 CDNA): one mfma_f32_16x16x32_bf16 contracts
                         // ds_read_vec (=8) K-elems/lane x 4 lane-groups = 32 K, replacing
                         // the 8 scalar fp32 MFMAs. fn (fp32) splits into hi + unscaled
                         // bf16 residual (fn - fp32(fn_hi)); bf16 shares fp32's 8-bit
