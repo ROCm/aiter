@@ -56,10 +56,11 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     // Compile-time warp type (chosen by the __global__ wrapper's entry divergence).
     constexpr bool kIsRopeWarp = (kWarpType == WarpTypeM16x8::HiRoPEWarp);
 
-    // Deferred-PV grouping: Lo (LoNoPEWarp, warps 0-3) defers its PV by one tile;
-    // Hi (HiRoPEWarp, warps 4-7) keeps PV at call end. Staggering the
-    // two groups on a shared SIMD lets Lo's PV overlap Hi's QK/softmax.
-    constexpr bool kPvAtEnd = (kWarpType != WarpTypeM16x8::LoNoPEWarp);
+    // Deferred-PV grouping: defers its PV by one tile if false;
+    constexpr bool kPvAtEnd = (kWarpType == WarpTypeM16x8::LoNoPEWarp);
+
+    // Run softmax WITHOUT packed-ALU (v_pk_*) ops if false
+    constexpr bool kSoftmaxUsePk = (kWarpType == WarpTypeM16x8::LoNoPEWarp);
 
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -435,7 +436,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // mfma is the Hi/at-end path), so Lo zeroes oaccu once on its first
             // compute call. row_max/row_sum_e are still initialised by the
             // kIsFirstIter softmax below (shared with Hi).
-            if constexpr((!kPvAtEnd) && kIsFirstIter)
+            if constexpr((kPvAtEnd == false) && kIsFirstIter)
             {
                 hk::zero(oaccu);
             }
@@ -519,7 +520,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             }
             else
             {
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/8));
+                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/9));
             }
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -719,22 +720,22 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 const uint32_t kv_end_eff_u    = static_cast<uint32_t>(kv_end_eff);
                 if((kv_tile_start_u + 32u) > kv_end_eff_u)
                 {
-                    softmax_mask_p<true, k_p_comp_begin>(col_0_idx * 4u + kv_tile_start_u,
-                                                         kv_end_eff_u);
+                    softmax_mask_p<true, k_p_comp_begin, kSoftmaxUsePk>(
+                        col_0_idx * 4u + kv_tile_start_u, kv_end_eff_u);
                 }
                 else
                 {
-                    softmax_mask_p<false, k_p_comp_begin>(col_0_idx * 4u + kv_tile_start_u,
-                                                          kv_end_eff_u);
+                    softmax_mask_p<false, k_p_comp_begin, kSoftmaxUsePk>(
+                        col_0_idx * 4u + kv_tile_start_u, kv_end_eff_u);
                 }
                 if((kv_tile_start_u + 64u) > kv_end_eff_u)
                 {
-                    softmax_mask_p<true, k_p_comp_begin + 8u>(
+                    softmax_mask_p<true, k_p_comp_begin + 8u, kSoftmaxUsePk>(
                         col_0_idx * 4u + kv_tile_start_u + 32u, kv_end_eff_u);
                 }
                 else
                 {
-                    softmax_mask_p<false, k_p_comp_begin + 8u>(
+                    softmax_mask_p<false, k_p_comp_begin + 8u, kSoftmaxUsePk>(
                         col_0_idx * 4u + kv_tile_start_u + 32u, kv_end_eff_u);
                 }
 
@@ -774,15 +775,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     }
                 }
 
-                __builtin_amdgcn_sched_barrier(0);
-                __builtin_amdgcn_s_setprio(1);
-                __builtin_amdgcn_sched_barrier(0);
-
                 // exp + sum + warp_reduce(add) -> row_sum_e. Updates p_comp in
                 // place to hold exp(p_comp - row_max). rescale==1.0 when the
                 // running max was kept stale, so the prior row_sum_e carries
                 // forward unscaled.
-                softmax_p1_prescaled_16<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
+                softmax_p1_prescaled_16<kIsFirstIter, k_p_comp_begin, comp_t, kSoftmaxUsePk>(
+                    &row_sum_e, row_max, rescale);
 
                 // ---- fp32->bf16 pack (p_comp -> p_mfma overlay) ----
                 // 16 fp32 -> 8 bf16x2 dwords. A: p_comp 0:7 -> p_mfma 0:3;
@@ -795,13 +793,6 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 5, k_p_comp_begin + 10>();
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 6, k_p_comp_begin + 12>();
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 7, k_p_comp_begin + 14>();
-            }
-
-            if constexpr(kWarpType == WarpTypeM16x8::LoNoPEWarp)
-            {
-                __builtin_amdgcn_sched_barrier(0);
-                __builtin_amdgcn_s_setprio(0);
-                __builtin_amdgcn_sched_barrier(0);
             }
 
             // ---- oaccu rescale + PV GEMM ----
