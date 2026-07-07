@@ -335,80 +335,24 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    # fp4_bf16 INTERLEAVE: FlyDSL kernel takes raw bf16 activations and handles
-    # gate+up interleave internally. Bypass CSV lookup — no tuned entries exist yet.
-    #
-    # FlyDSL INTERLEAVE is only profitable when the K-loop has enough iterations to
-    # amortise its per-iteration synchronisation overhead.  Empirically on MI355X TP=8:
-    #   - M < 32 (tile_k=128): too few MFMAs per loop body → fall back to CK-tile.
-    #   - model_dim // 256 < 20 (e.g. 3072 → 12 K-steps): too few K-tiles even at
-    #     tile_k=256 → fall back to CK-tile (e.g. GPT-OSS inter_dim=512 shapes).
-    # Both conditions must hold for FlyDSL to win; otherwise CK-tile is dispatched.
-    _flydsl_itlv_profitable = M >= 32 and model_dim // 256 >= 20
-    if (
-        quant_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.fp4x2
-        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
-        and gate_mode == GateMode.INTERLEAVE
-        and is_flydsl_available()
-        and _flydsl_itlv_profitable
-    ):
-        logger.info("[fused_moe] fp4_bf16 INTERLEAVE: dispatching to FlyDSL kernel")
-        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
-
-        _out_str = "bf16"
-        _tile_m = 16 if M < 2048 else 32 if M < 16384 else 64
-        # Tile N/K tuned for MI355X TP=8 decode/prefill shapes.
-        # Small M (decode): tile_n=128 keeps N-tiles large enough to saturate waves.
-        # Large M (prefill): tile_n=128, tile_k=256 amortises prologue cost.
-        _tile_n = 128
-        _tile_k = 256 if M >= 32 else 128
-        _kn1 = (
-            flydsl_kernel_name(
-                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
-            )
-            + "_gui"
-        )
-        _kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
-        )
-        metadata = MOEMetadata(
-            functools.partial(
-                _flydsl_stage1_wrapper,
-                kernelName=_kn1,
-                activation=activation,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=_kn2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            _tile_m,
-            1,
-            False,
-        )
-    else:
-        metadata = get_2stage_cfgs(
-            get_padded_M(M),  # consider token_num > 1024 as prefill
-            model_dim,
-            inter_dim,
-            E,
-            topk,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            quant_type,
-            isG1U1,
-            activation,
-            doweight_stage1,
-            hidden_pad,
-            intermediate_pad,
-            isShuffled,
-            gate_mode,
-        )
+    metadata = get_2stage_cfgs(
+        get_padded_M(M),  # consider token_num > 1024 as prefill
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        quant_type,
+        isG1U1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        isShuffled,
+        gate_mode,
+    )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -952,6 +896,14 @@ def get_2stage_cfgs(
         df = pd.read_csv(tune_file)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
+        # Coerce numeric index columns so they match Python int keys built at lookup time.
+        # Some CSVs have mixed-type columns (e.g. act_type values shifted into topk) which
+        # cause pandas to read numeric columns as 'object' dtype (strings). Drop rows where
+        # topk or expert are not numeric, then cast to int to ensure key equality.
+        for col in ("topk", "expert", "cu_num"):
+            if col in df.columns:
+                df = df[pd.to_numeric(df[col], errors="coerce").notna()]
+                df[col] = df[col].astype(int)
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -1283,20 +1235,20 @@ def get_2stage_cfgs(
             stage2_has_bias=enable_bias and is_flydsl2,
         )
     if (
-        q_type == QuantType.per_1x32
+        not kernelName1  # only fire when CSV produced no match; a CSV hit returns above
+        and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
-        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
+        and gate_mode == GateMode.SEPARATED  # INTERLEAVE falls through to ck2stages below
         and is_flydsl_available()
     ):
-        # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
-        # Supports both SEPARATED and INTERLEAVE gate modes.
-        # Uses FlyDSL compile_moe_gemm1/2 with in_dtype="fp4_bf16".
+        # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
+        # INTERLEAVE shapes always use CSV rows; unmatched INTERLEAVE falls through to ck2stages.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
         _tile_k = 128
-        _gui_tag = "_gui" if gate_mode == GateMode.INTERLEAVE else ""
+        _gui_tag = ""
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = (
@@ -1651,69 +1603,28 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    # fp4_bf16 INTERLEAVE: bypass CSV lookup, use FlyDSL directly.
-    # Only profitable when K-loop depth is sufficient (see fused_moe_ comment for rationale).
-    _flydsl_itlv_profitable = token_num >= 32 and model_dim // 256 >= 20
-    if (
-        quant_type == QuantType.per_1x32
-        and w1.dtype == dtypes.fp4x2
-        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
-        and gate_mode == GateMode.INTERLEAVE
-        and is_flydsl_available()
-        and _flydsl_itlv_profitable
-    ):
-        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
-
-        _tile_m = 16 if token_num < 2048 else 32 if token_num < 16384 else 64
-        _tile_n_s2 = 128
-        _tile_k_s2 = 256 if token_num >= 32 else 128
-        _kn1 = (
-            flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, _tile_n_s2, _tile_k_s2) + "_gui"
-        )
-        _kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", "bf16", _tile_m, _tile_n_s2, 128, "atomic"
-        )
-        metadata = MOEMetadata(
-            functools.partial(
-                _flydsl_stage1_wrapper,
-                kernelName=_kn1,
-                activation=activation,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=_kn2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            _tile_m,
-            1,
-            False,
-        )
-        q_dtype_a = dtypes.bf16
-        # get_inter_dim doubles inter_dim for fp4x2 weights (w1.shape[-1]=model_dim//2).
-        # The real inter_dim is w1.shape[1]//2 (physical N tiles / 2).
+    # fp4_bf16 INTERLEAVE: q_dtype_a is bf16 (set above). For INTERLEAVE, get_inter_dim
+    # returns inter_dim*2 (physical weight dim); correct it so CSV lookup uses the right shape.
+    if gate_mode == GateMode.INTERLEAVE and w1.dtype == dtypes.fp4x2:
         inter_dim = w1.shape[1] // 2
-    else:
-        metadata = get_2stage_cfgs(
-            get_padded_M(token_num),  # consider token_num > 1024 as prefill
-            model_dim,
-            inter_dim,
-            E,
-            topk,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            quant_type,
-            isG1U1,
-            activation,
-            doweight_stage1,
-            hidden_pad,
-            intermediate_pad,
-            is_shuffled,
-            gate_mode,
-        )
+    metadata = get_2stage_cfgs(
+        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        quant_type,
+        isG1U1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        is_shuffled,
+        gate_mode,
+    )
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
