@@ -173,7 +173,7 @@ def _build_inputs(
 # ---------------------------------------------------------------------------
 @needs_gfx950
 def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
-    """Regression guard for the 18-slot v4 nm kernarg layout.
+    """Regression guard for the 21-slot (336B) v4 nm legacy kernarg layout.
 
     Locks in the *scalar* portion (slot 7 scalar_f, slot 8-12 ints, slot 15
     int) of the kernarg buffer produced by csrc/py_itfs_cu/asm_mla_v4.cu for
@@ -194,31 +194,44 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     torch.cuda.synchronize()
 
     captured = capfd.readouterr()
-    # The dispatcher fprintf's "[aiter kernarg 288B]" then 18 rows of 16
-    # hex bytes. Parse the 18 rows out of stderr.
+    # The dispatcher fprintf's "[aiter kernarg <N>B]" then N/16 rows of 16 hex
+    # bytes. On gfx950 the legacy (non-preload) ABI is 21 slots x 16B = 336B:
+    # slots 0-18 from the original layout + slots 19/20 (valid_split scratch)
+    # added by the kargs-preload change. Parse the rows out of stderr.
     import re
 
     lines = captured.err.splitlines()
-    try:
-        start = next(
-            i for i, line in enumerate(lines) if line.startswith("[aiter kernarg 304B]")
-        )
-    except StopIteration:
+    marker = re.compile(r"^\[aiter kernarg (\d+)B\]$")
+    start = None
+    arg_size = None
+    for i, line in enumerate(lines):
+        m = marker.match(line.strip())
+        if m:
+            start = i
+            arg_size = int(m.group(1))
+            break
+    if start is None:
         pytest.fail(
             "kernarg hexdump not found in stderr — "
             "AITER_V4_NM_DUMP_KERNARG env var may have been ignored, "
-            "or jinja was changed and the dump code removed.\n"
+            "or the dump code was removed.\n"
             f"stderr was: {captured.err[:500]}"
         )
+    assert arg_size == 336, (
+        f"expected 336B legacy kernarg (21 slots) on gfx950, got {arg_size}B — "
+        "the MlaV4KernelArgsLegacy layout changed; update this guard."
+    )
+    n_slots = arg_size // 16
     hex_rows = []
-    # 19 slots (PR-2: added ptr_sink at slot 18 / offset 0x120).
-    for line in lines[start + 1 : start + 1 + 19]:
+    for line in lines[start + 1 : start + 1 + n_slots]:
         m = re.match(r"^((?:[0-9a-fA-F]{2}\s*){16})$", line.strip())
         if not m:
             break
         hex_rows.append(bytes.fromhex(line.strip().replace(" ", "")))
 
-    assert len(hex_rows) == 19, f"expected 19 hex rows of kernarg, got {len(hex_rows)}"
+    assert (
+        len(hex_rows) == n_slots
+    ), f"expected {n_slots} hex rows of kernarg, got {len(hex_rows)}"
     kargs = b"".join(hex_rows)
 
     # Each slot is 16 bytes; first 4 bytes carry the payload, rest is padding.
@@ -277,6 +290,18 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     for slot_idx in (0, 1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18):
         ptr = int.from_bytes(slot(slot_idx)[:8], "little")
         assert ptr != 0, f"slot {slot_idx} pointer is NULL"
+
+    # Slots 19/20 are the valid_split scratch added by the kargs-preload change.
+    # On gfx950 the legacy path leaves them zero: the C entry (void)-ignores
+    # valid_split_count / use_valid_split_count_reduce and the shipped .co never
+    # touches the buffer. Lock that contract (it's what makes the wrapper's
+    # torch.empty(valid_split_count) allocation safe here).
+    assert (
+        int.from_bytes(slot(19)[:8], "little") == 0
+    ), "slot 19 (ptr_valid_split) must be NULL on gfx950 (kernel ignores it)"
+    assert (
+        slot_u32(20) == 0
+    ), "slot 20 (s_use_valid_split) must be 0 on gfx950 (kernel ignores it)"
 
 
 # ---------------------------------------------------------------------------

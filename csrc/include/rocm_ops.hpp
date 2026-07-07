@@ -1747,7 +1747,8 @@ namespace py = pybind11;
           py::arg("use_shuffle_layout"),                    \
           py::arg("block_size"),                            \
           py::arg("x"),                                     \
-          py::arg("rotary_dim") = 0);
+          py::arg("rotary_dim") = 0,                       \
+          py::arg("gemma_norm") = false)
 
 #define FUSED_QKNORM_IDXRQKNORM_PYBIND      \
     m.def("fused_qknorm_idxrqknorm",        \
