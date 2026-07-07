@@ -514,7 +514,7 @@ def fp8_unit_scale_ref(x: torch.Tensor) -> torch.Tensor:
     return x.float().to(fp8_dtype).float()
 
 
-@perftest(num_iters=10, num_warmup=1, num_rotate_args=1)
+@perftest(num_iters=10, num_warmup=1)
 def run_fused_qknorm_idxrqknorm(
     case: dict,
     mode: str,
