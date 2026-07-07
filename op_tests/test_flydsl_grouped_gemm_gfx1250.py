@@ -250,19 +250,13 @@ def init_weight_scales(
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
 
-def _make_topk(
-    hidden_states: torch.Tensor, experts: int, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route via ``fused_topk``: normal (random gating) by default; round-robin
-    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
-    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
-    priority) restricts topk to the first n experts. Returns
-    ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
-    tokens = hidden_states.shape[0]
+def _make_routing_score(tokens: int, experts: int, topk: int) -> torch.Tensor:
+    """Build the ``(tokens, experts)`` gating score honoring the routing env
+    controls: ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest priority) activates
+    n randomly-chosen experts (round-robin balanced); ``AITER_MOE_EXPERT_BALANCE``
+    round-robins over all experts; otherwise random gating. Shared by the FlyDSL
+    (``_make_topk``) and gluon routing paths so both react to the same env."""
     if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
-        # Highest priority: activate n randomly-chosen experts (NOT the first n);
-        # the other experts-n are masked to -inf. Load is spread evenly across
-        # the n active experts by round-robin (balanced), so all n are used.
         n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
         if n_act < topk or n_act > experts or n_act > tokens * topk:
             raise ValueError(
@@ -283,6 +277,19 @@ def _make_topk(
             end_col = start_col + topk
     else:
         score = torch.randn((tokens, experts), dtype=torch.float32)
+    return score
+
+
+def _make_topk(
+    hidden_states: torch.Tensor, experts: int, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route via ``fused_topk``: normal (random gating) by default; round-robin
+    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
+    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
+    priority) restricts topk to the first n experts. Returns
+    ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
+    tokens = hidden_states.shape[0]
+    score = _make_routing_score(tokens, experts, topk)
     topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
     return topk_id.to(torch.int32), topk_w
 
@@ -719,6 +726,250 @@ def set_data_format(data_format: str) -> None:
     logger.info("grouped GEMM data format: %s", data_format)
 
 
+# ---------------------------------------------------------------------------
+# Real-world MoE data loader (dumped .pt)
+# ---------------------------------------------------------------------------
+def _load_realworld_moe(path: str) -> dict:
+    """Load a dumped real-world MoE layer (.pt) into GPU tensors for the benches.
+
+    Expected dump keys (e.g. moe_layers_0_ffn_experts_decode_0.pt):
+      hidden_states(x): (T, K) bf16 activations
+      w1(w13_weight):   (E, ...) uint8 mxfp4 gate+up weight (folded)
+      w2(w2_weight):    (E, ...) uint8 mxfp4 down weight (folded)
+      w13_scale/w2_scale: uint8 e8m0, triton-swizzle layout (E, N, K//32)
+      gather_idx/expt_hist: routing (topk_ids field itself is None)
+      topk_weights:     (T*topk,) bf16
+
+    Layout notes (verified against the shuffle/swizzle helpers):
+      * Weight ROWS are **gguu** (all gate rows, then all up rows), pre-shuffled.
+        The folded dump reshapes to (E, 2*I, K//2) (the moe_shuffle_weight form);
+        an extra transpose(1,2) gives the (E, K//2, N) col-major form the gluon
+        moe_gemm_a8w4 `w` consumes.
+      * Scales are in the triton ``swizzle_scales_gfx1250`` layout (E, N, K//32);
+        FlyDSL's ``moe_shuffle_scale`` layout (E, K//32, N) differs and is NOT
+        equivalent -- the FlyDSL bench transposes to the right *shape* to run
+        (perf timing only; correctness is not the goal here).
+      * Routing uses ONLY the topk ids: dump's ``topk_ids`` is None, so we
+        reconstruct the per-token expert assignment from gather_idx + expt_hist.
+    """
+    d = torch.load(path, map_location="cuda", weights_only=False)
+
+    x = d["hidden_states(x)"].to(torch.bfloat16)
+    tokens, K = x.shape
+    w13 = d["w1(w13_weight)"]  # uint8 mxfp4, gguu, pre-shuffled
+    w2 = d["w2(w2_weight)"]  # uint8 mxfp4
+    E = w13.shape[0]
+    # I inferred from the down-weight byte count: w2 holds K*I fp4 = K*I/2 bytes.
+    I = (w2.shape[1] * w2.shape[2] * 2) // K
+    topk = d["topk_weights"].shape[0] // tokens
+
+    # Folded dump -> the moe_shuffle_weight form (also the reshape base for gluon).
+    w1_shuf = w13.reshape(E, 2 * I, K // 2)  # (E, 2*I, K//2)
+    w2_shuf = w2.reshape(E, K, I // 2)  # (E, K, I//2)
+
+    # Reconstruct the real per-token expert assignment from gather_idx + expt_hist:
+    #   expert at sorted position p = repeat_interleave(arange(E), hist)[p]
+    #   gather_idx[p] = source flattened index (token*topk + slot)
+    gather = d["gather_idx"].long()
+    hist = d["expt_hist"].long()
+    expert_of_pos = torch.repeat_interleave(torch.arange(E, device=x.device), hist)
+    topk_ids_flat = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
+    topk_ids_flat[gather] = expert_of_pos.to(torch.int32)
+    topk_ids = topk_ids_flat.reshape(tokens, topk)  # (T, topk) int32
+    topk_weights = d["topk_weights"].reshape(tokens, topk).to(torch.bfloat16)
+
+    # (T, E) gating score with only the routed experts finite, so a top-k over it
+    # reproduces exactly the dumped assignment (used by the gluon triton_routing).
+    routing_score = torch.full(
+        (tokens, E), float("-inf"), dtype=torch.float32, device=x.device
+    )
+    rows = torch.arange(tokens, device=x.device).unsqueeze(1).expand(tokens, topk)
+    routing_score[rows, topk_ids.long()] = topk_weights.float()
+
+    return {
+        "x": x,
+        "w1_shuf": w1_shuf,
+        "w2_shuf": w2_shuf,
+        "w1_scale": d["w13_scale"],  # triton swizzle layout (E, N, K//32)
+        "w2_scale": d["w2_scale"],
+        "topk_ids": topk_ids,
+        "topk_weights": topk_weights,
+        "routing_score": routing_score,
+        "experts": E,
+        "tokens": tokens,
+        "topk": topk,
+        "model_dim": K,
+        "inter_dim": I,
+        "meta": d.get("meta", {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gluon (Triton) a8w4 MoE performance benchmark
+# ---------------------------------------------------------------------------
+# Times the reference gluon a8w4 two-stage MoE MLP (gemm1 + swiglu, then gemm2)
+# from ``aiter.ops.triton.moe.moe_op_gemm_a8w4`` on the same shapes as the
+# FlyDSL grouped bench, so the two backends are directly comparable.
+def _bench_gluon_a8w4_moe(
+    *,
+    experts: int,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    use_bias: bool = True,
+    seed: int = 0,
+    warmup: int = 5,
+    iters: int = 101,
+    data: Optional[dict] = None,
+) -> float:
+    """Build gluon a8w4 MoE inputs, time gemm1+gemm2 end-to-end. Returns us.
+
+    When ``data`` (from ``_load_realworld_moe``) is provided, use the real
+    activations / pre-quantized weights / pre-swizzled scales / topk-ids routing
+    instead of random init; shape args are ignored (derived from the data).
+    """
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+        moe_gemm_a8w4,
+        swizzle_scales_gfx1250,
+    )
+    from aiter.ops.triton.moe.moe_routing.routing import routing as triton_routing
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+    from aiter.test_common import run_perftest
+
+    def _swizzle(scale: torch.Tensor, N: int, Kdim: int):
+        # gfx1250 MoE B-scale layout requires N % 32 == 0 and K % (32*8) == 0.
+        if N % 32 == 0 and Kdim % (32 * 8) == 0:
+            return swizzle_scales_gfx1250(scale), "GFX1250_SCALE"
+        return scale, None
+
+    if data is not None:
+        # Real-world path: weights already mxfp4 (gguu), scales pre-swizzled.
+        # gluon `w` is (E, K//2, N) col-major -> transpose the shuffle form.
+        # Routing uses only the reconstructed topk ids (via routing_score).
+        topk = data["topk"]
+        x = data["x"]
+        logits = data["routing_score"]
+        w1_q, w1_scale = data["w1_shuf"].transpose(1, 2), data["w1_scale"]
+        w2_q, w2_scale = data["w2_shuf"].transpose(1, 2), data["w2_scale"]
+        swz1 = swz2 = "GFX1250_SCALE"
+        b1 = b2 = None  # dump carries no bias
+    else:
+        K = model_dim  # hidden dim
+        I = inter_dim  # intermediate dim
+
+        torch.manual_seed(seed)
+        # bf16 activations; routing honors AITER_MOE_NUM_EXPERT_ACTIVATED /
+        # AITER_MOE_EXPERT_BALANCE via the shared score builder (topk == n_expts_act).
+        x = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
+        logits = _make_routing_score(tokens, experts, topk).to(torch.float16)
+
+        # gemm1 weight: (E, K, 2*I) -> swiglu -> I; gemm2 weight: (E, I, K).
+        w1 = torch.randn((experts, K, 2 * I))
+        w2 = torch.randn((experts, I, K))
+        w1_q, w1_scale = downcast_to_mxfp(w1.to(torch.bfloat16), torch.uint8, axis=1)
+        w2_q, w2_scale = downcast_to_mxfp(w2.to(torch.bfloat16), torch.uint8, axis=1)
+        w1_scale, swz1 = _swizzle(w1_scale, 2 * I, K)
+        w2_scale, swz2 = _swizzle(w2_scale, K, I)
+
+        if use_bias:
+            b1 = torch.randn((experts, 2 * I)).float()
+            b2 = torch.randn((experts, K)).float()
+        else:
+            b1 = b2 = None
+
+    fp8 = torch.float8_e4m3fn
+
+    def _call():
+        # routing is part of the timed MoE work (matches the fused_moe bench).
+        rdata, gather_indx, scatter_indx = triton_routing(logits, topk)
+        # stage1: dynamic per-1x32 MXFP8 activation quant (e8m0 block scale),
+        # apply swiglu; bf16 output feeds stage2's requant.
+        x1, x1_scale = downcast_to_mxfp(x, fp8, axis=-1)
+        a2 = moe_gemm_a8w4(
+            x1,
+            w1_q,
+            x1_scale,
+            w1_scale,
+            None,
+            None,
+            b1,
+            rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swz1,
+            apply_swiglu=True,
+        )
+        # stage2: requant the stage1 output to MXFP8, scatter/combine to (T, K).
+        a2_q, a2_scale = downcast_to_mxfp(a2, fp8, axis=-1)
+        return moe_gemm_a8w4(
+            a2_q,
+            w2_q,
+            a2_scale,
+            w2_scale,
+            None,
+            None,
+            b2,
+            rdata,
+            scatter_indx=scatter_indx,
+            swizzle_mx_scale=swz2,
+        )
+
+    torch.cuda.synchronize()
+    _, us = run_perftest(_call, num_warmup=warmup, num_iters=iters, testGraph=False)
+    return us
+
+
+def _bench_flydsl_a8w4_realworld(
+    data: dict,
+    *,
+    activation: ActivationType = ActivationType.Swiglu,
+    swiglu_limit: float = 7.0,
+    warmup: int = 5,
+    iters: int = 101,
+) -> float:
+    """Time the FlyDSL grouped a8w4 MoE (via ``fused_moe``) on real-world data.
+
+    Perf timing only -- no correctness gate. Weights are fed in the FlyDSL
+    ``moe_shuffle_weight`` form (dump reshape); scales are transposed to the
+    ``moe_shuffle_scale`` shape so the kernel runs (layout is not numerically
+    equivalent, see ``_load_realworld_moe``). gguu weights -> GateMode.SEPARATED.
+    Routing uses ONLY the reconstructed topk ids + dumped topk weights.
+    """
+    from aiter.test_common import run_perftest
+
+    x = data["x"]
+    # gguu (SEPARATED) grouped GEMM: weight (E, 2*I, K//2) / (E, K, I//2) uint8.
+    w1_arg = data["w1_shuf"]
+    w2_arg = data["w2_shuf"]
+    # FlyDSL wants scale shape (E, K//32, N); dump is (E, N, K//32) -> transpose.
+    w1_scale = data["w1_scale"].transpose(-1, -2).contiguous()
+    w2_scale = data["w2_scale"].transpose(-1, -2).contiguous()
+    topk_id = data["topk_ids"]
+    topk_w = data["topk_weights"]
+
+    def _call():
+        return fused_moe(
+            x,
+            w1_arg,
+            w2_arg,
+            topk_w,
+            topk_id,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            bias1=None,
+            bias2=None,
+            gate_mode=GateMode.SEPARATED.value,
+            dtype=dtypes.bf16,
+            swiglu_limit=swiglu_limit,
+        )
+
+    torch.cuda.synchronize()
+    _, us = run_perftest(_call, num_warmup=warmup, num_iters=iters, testGraph=False)
+    return us
+
+
 def main() -> None:
     if not is_gfx1250():
         print("skipping: requires gfx1250")
@@ -726,11 +977,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("bench", "verify", "kernel"),
+        choices=("bench", "verify", "kernel", "gluon"),
         default="bench",
         help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
         "correctness only. kernel: time the gemm1 and gemm2 kernels in "
-        "isolation (loop each launch alone).",
+        "isolation (loop each launch alone). gluon: time the reference gluon "
+        "(Triton) a8w4 two-stage MoE MLP for comparison.",
+    )
+    parser.add_argument(
+        "--data-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="load a dumped real-world MoE layer (.pt) instead of random init. "
+        "gluon and bench scenarios only; shape args (experts/tokens/model-dim/"
+        "inter-dim) are derived from the data. Weights are gguu mxfp4, scales "
+        "pre-swizzled; routing uses the dumped topk ids.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
@@ -812,7 +1074,14 @@ def main() -> None:
     os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
-    if args.model_dim < 512 or args.inter_dim < 512:
+    # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
+    # K tiles); the gluon reference path has no such limit, and --data-file
+    # derives its (valid) dims from the dump, so skip the check in those cases.
+    if (
+        args.scenario != "gluon"
+        and args.data_file is None
+        and (args.model_dim < 512 or args.inter_dim < 512)
+    ):
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
             "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
@@ -820,6 +1089,27 @@ def main() -> None:
         )
 
     set_data_format(args.data_format)
+
+    # Real-world data: load once, derive shapes, force a single-run token list.
+    realworld = None
+    if args.data_file is not None:
+        if args.scenario not in ("gluon", "bench"):
+            raise SystemExit(
+                "--data-file is only supported with --scenario gluon or bench"
+            )
+        realworld = _load_realworld_moe(args.data_file)
+        args.experts = realworld["experts"]
+        args.topk = realworld["topk"]
+        args.model_dim = realworld["model_dim"]
+        args.inter_dim = realworld["inter_dim"]
+        args.tokens = [realworld["tokens"]]
+        print(
+            f"[data-file] {args.data_file}: E={realworld['experts']} "
+            f"tokens={realworld['tokens']} topk={realworld['topk']} "
+            f"K={realworld['model_dim']} I={realworld['inter_dim']} "
+            f"meta={realworld['meta']}",
+            flush=True,
+        )
 
     # --tokens accepts one or more counts; run once per value. Each iteration
     # sets args.tokens to a single int so run_moe reads it unchanged.
@@ -830,6 +1120,81 @@ def main() -> None:
         args.tokens = _tok
         if len(token_list) > 1:
             print(f"\n===== tokens={_tok} =====", flush=True)
+
+        # gluon scenario: time the reference gluon (Triton) a8w4 two-stage MoE
+        # instead of the FlyDSL grouped path. No correctness gate (perf only).
+        if args.scenario == "gluon":
+            us = _bench_gluon_a8w4_moe(
+                experts=args.experts,
+                tokens=_tok,
+                topk=args.topk,
+                model_dim=args.model_dim,
+                inter_dim=args.inter_dim,
+                use_bias=not args.no_bias,
+                warmup=args.warmup,
+                iters=args.iters,
+                data=realworld,
+            )
+            print(
+                f"[bench gluon a8w4] two-stage MoE end-to-end us = {us:.2f}",
+                flush=True,
+            )
+            rows.append(
+                {
+                    "data_format": "a8w4",
+                    "layout": "gluon",
+                    "act": args.act,
+                    "init": "realworld" if realworld is not None else "random",
+                    "experts": args.experts,
+                    "tokens": _tok,
+                    "topk": args.topk,
+                    "model_dim": args.model_dim,
+                    "inter_dim": args.inter_dim,
+                    "logits_diff": None,
+                    "rel_l2": None,
+                    "pass": True,
+                    "us": us,
+                    "gemm1_us": None,
+                    "gemm2_us": None,
+                }
+            )
+            continue
+
+        # bench scenario with real-world data: time the FlyDSL grouped path via
+        # fused_moe on the dumped tensors (perf only, no correctness gate).
+        if realworld is not None:  # scenario == "bench" (restricted above)
+            us = _bench_flydsl_a8w4_realworld(
+                realworld,
+                activation=activation,
+                swiglu_limit=args.swiglu_limit,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+            print(
+                f"[bench flydsl a8w4 realworld] fused_moe end-to-end us = {us:.2f}",
+                flush=True,
+            )
+            rows.append(
+                {
+                    "data_format": "a8w4",
+                    "layout": args.layout,
+                    "act": args.act,
+                    "init": "realworld",
+                    "experts": args.experts,
+                    "tokens": _tok,
+                    "topk": args.topk,
+                    "model_dim": args.model_dim,
+                    "inter_dim": args.inter_dim,
+                    "logits_diff": None,
+                    "rel_l2": None,
+                    "pass": True,
+                    "us": us,
+                    "gemm1_us": None,
+                    "gemm2_us": None,
+                }
+            )
+            continue
+
         tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
         # raise_on_fail=False so one out-of-gate token does not abort the
         # sweep; the failure is recorded and reported after the table.
