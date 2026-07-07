@@ -70,7 +70,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 1
     split_k = 1
-    block_k = 256
+    block_k = 512
 
     if block_m == 16:
         block_n = 128
@@ -122,22 +122,13 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     group_m = 4
     xcd_swizzle = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
+    num_stages = 2
     split_k = 1
-    block_k = 256
+    block_k = 512
 
     if block_m == 16:
         block_n = 128
         num_warps = 4
-
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
-            block_n = block_n // 2
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
 
     elif block_m == 32:
         if n <= 1024:
@@ -152,6 +143,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
 
     else:
         block_n = 128
+        block_k = 256
         num_warps = 4
 
     ret = {
@@ -246,7 +238,8 @@ def moe_gemm_a16w4(
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
-
+    if use_gluon:
+        w_scales_kernel = w_scales.transpose(1, 2)
     # compute optimization flags
     if use_gluon:
         config = get_kernel_config_gluon(M, N, K, routing_data)
@@ -298,7 +291,6 @@ def moe_gemm_a16w4(
 
     # launch kernel
     if use_gluon:
-        w_scales_kernel = w_scales.transpose(1, 2).contiguous()
         _moe_gemm_a16w4_gluon[(grid,)](
             y,
             y.stride(0),
@@ -313,8 +305,8 @@ def moe_gemm_a16w4(
             w.stride(2),
             w_scales_kernel,
             w_scales_kernel.stride(0),  # stride_w_mx_e
-            w_scales_kernel.stride(2),  # stride_w_mx_k (innermost, = 1)
             w_scales_kernel.stride(1),  # stride_w_mx_n
+            w_scales_kernel.stride(2),  # stride_w_mx_k
             bias,
             stride_bias,
             gammas,
@@ -342,7 +334,7 @@ def moe_gemm_a16w4(
             NUM_BUFFERS=2,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             SPLIT_K=config["split_k"],
-            MASK_K_LIMIT=K % config["block_k"],
+            EVEN_K=K % config["block_k"] == 0,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
