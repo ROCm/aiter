@@ -541,7 +541,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
           py::arg("use_1stage"),                                                               \
-          py::arg("gemma_norm") = false);                                                      \
+          py::arg("gemma_norm")   = false,                                                     \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                  \
     m.def("fused_allreduce_rmsnorm_quant_per_group",                                            \
           &aiter::fused_allreduce_rmsnorm_quant_per_group,                                      \
           py::arg("_fa"),                                                                       \
@@ -2242,7 +2243,8 @@ namespace py = pybind11;
           py::arg("sqrsum"),                    \
           py::arg("x"),                         \
           py::arg("fn"),                        \
-          py::arg("tile_k") = 128);             \
+          py::arg("tile_k") = 128,              \
+          py::arg("is_fn_pack_bf16") = 0);      \
     m.def("mhc_pre_big_fuse",                   \
           &aiter::mhc_pre_big_fuse,             \
           "mhc_pre_big_fuse",                   \
@@ -2299,7 +2301,8 @@ namespace py = pybind11;
           py::arg("fn"),                        \
           py::arg("tile_m") = 16,               \
           py::arg("tile_n") = 32,               \
-          py::arg("tile_k") = 32);
+          py::arg("tile_k") = 32,               \
+          py::arg("is_fn_pack_bf16") = 0);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \
