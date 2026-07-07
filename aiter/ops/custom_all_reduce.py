@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_cu_num
 
 MD_NAME = "module_custom_all_reduce"
 FUSED_AR_MHC_MD_NAME = "module_fused_ar_mhc"
@@ -82,6 +83,7 @@ def fused_allreduce_rmsnorm(
     reg_bytes: int,
     use_1stage: bool,
     gemma_norm: bool = False,
+    zero_fill: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -98,7 +100,21 @@ def fused_allreduce_rmsnorm_pad(
     reg_bytes: int,
     use_1stage: bool,
     gemma_norm: bool = False,
+    zero_fill: Optional[torch.Tensor] = None,
 ) -> None: ...
+
+
+def is_prezero_free(num_tokens: int, n: int, out_hidden_dim: int = 4096) -> bool:
+    """True if zeroing the ``(num_tokens, n)`` buffer rides the fused
+    allreduce-rmsnorm launch for free: AR CTAs (one per token row) plus zero-fill
+    CTAs fit one wave across all CUs. Each zero-fill CTA covers
+    ``8 * round_up(out_hidden_dim / 8, 32)`` elements (the AR block dim); the
+    default 4096 reproduces the legacy 512-thread estimate.
+    """
+    launch_threads = ((out_hidden_dim // 8 + 31) // 32) * 32
+    per_cta = 8 * launch_threads
+    prezero_cta = (num_tokens * n + per_cta - 1) // per_cta
+    return num_tokens + prezero_cta < get_cu_num()
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
