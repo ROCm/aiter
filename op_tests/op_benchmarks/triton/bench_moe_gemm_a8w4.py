@@ -11,6 +11,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
+    get_gluon_a8w4_tile_m_scale,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.shuffle import shuffle_weight_gfx1250
@@ -228,7 +229,11 @@ def bench_mlp_single_weight_init(
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+        rdata, gather_indx, scatter_indx = routing(
+            logits,
+            n_expts_act,
+            tile_m_scale=get_gluon_a8w4_tile_m_scale(logits.shape[0] * n_expts_act),
+        )
         if x_dtype_str == "fp8":
             x = downcast_to_static_fp8(x, static_scale)
             x = moe_gemm_a8w4(

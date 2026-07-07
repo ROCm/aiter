@@ -258,13 +258,22 @@ def get_ctas_per_cga(num_ctas, is_prefill):
         return [1, num_ctas]
 
 
+def get_gluon_a8w4_tile_m_scale(m):
+    """CGA M-shards for ``m`` matmul rows, to pass as ``tile_m_scale`` to
+    ``routing()``. ``m == num_tokens * n_expts_act`` in the standard gathered
+    flow. Returns 1 off the gluon path, so it is always safe to call."""
+    if get_arch() != "gfx1250":
+        return 1
+    return get_ctas_per_cga(4, is_prefill=m >= 1024)[0]
+
+
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_buffers = 3
-    num_ctas = 4
-    ctas_per_cga = get_ctas_per_cga(num_ctas, is_prefill=m >= 1024)
+    ctas_per_cga = get_ctas_per_cga(4, is_prefill=m >= 1024)
+    num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
     split_k = 1
     block_k = 512
 
@@ -290,6 +299,9 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         block_n = 256
         block_k = 256
         num_warps = 4
+
+    block_m *= ctas_per_cga[0]
+    block_n *= ctas_per_cga[1]
 
     ret = {
         "block_m": block_m,
@@ -458,6 +470,17 @@ def moe_gemm_a8w4(
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
+    # ExptData must match the kernel's effective block_m; the caller aligns it via
+    # tile_m_scale on routing(). Pure check, no kernel launched.
+    assert (
+        expt_data is None
+        or config["block_m"] == routing_data.effective_expt_data_block_m()
+    ), (
+        f"ExptData built for block_m={routing_data.effective_expt_data_block_m()} "
+        f"but kernel needs block_m={config['block_m']}. Pass "
+        f"tile_m_scale=get_gluon_a8w4_tile_m_scale(M) to routing() "
+        f"(M == number of matmul rows, i.e. num_tokens * n_expts_act)."
+    )
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
@@ -863,7 +886,11 @@ def main():
     print(f"  Device: {device}, Architecture: {arch}")
 
     logits = torch.randn((args.M, args.E), dtype=torch.float16, device=device)
-    routing_data, gather_idx, scatter_idx = routing(logits, args.n_expts_act)
+    routing_data, gather_idx, scatter_idx = routing(
+        logits,
+        args.n_expts_act,
+        tile_m_scale=get_gluon_a8w4_tile_m_scale(args.M),
+    )
 
     config = get_kernel_config_gluon(args.M, args.N, args.K, routing_data)
     pipeline = "decode" if config["block_m"] == 16 else "prefill"

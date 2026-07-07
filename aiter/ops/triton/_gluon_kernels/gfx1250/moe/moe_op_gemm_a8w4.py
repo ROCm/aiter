@@ -932,7 +932,6 @@ def _moe_gemm_a8w4_prefill(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     num_ctas: gl.constexpr,
-    # CGA / multicast layouts, built host-side by get_moe_a8w4_prefill_layouts.
     WMMA_LAYOUT: gl.constexpr,
     DOT_LAYOUT_X: gl.constexpr,
     DOT_LAYOUT_W: gl.constexpr,

@@ -6,6 +6,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
+from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
+    _expt_data_only_kernel,
+)
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
@@ -63,6 +66,12 @@ class RoutingData:
     n_expts_tot: int = field()
     n_expts_act: int = field()
     expt_data: ExptData = None
+    # block_m that ``expt_data`` was built for; differs from ``block_m`` when a
+    # ``tile_m_scale`` was passed. ``None`` -> treat as ``block_m``.
+    expt_data_block_m: int = None
+
+    def effective_expt_data_block_m(self):
+        return self.block_m if self.expt_data_block_m is None else self.expt_data_block_m
 
     def n_blocks(self, n_rows, block_m):
         if n_rows <= self.n_expts_tot:
@@ -261,6 +270,42 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
     return token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK, block_m_log2
 
 
+def compute_expt_data(hist, n_expts_tot, n_gates, block_m):
+    """Rebuild :class:`ExptData` from a precomputed histogram for a given
+    ``block_m``.
+
+    ``token_offs_raw`` is block_m-independent, but ``token_offs_pad`` (padded
+    tile offsets) and ``block_pid_map`` (the tile -> (block, expert) map read by
+    the matmul kernel) both encode ``block_m``. When a kernel config scales
+    ``block_m`` (e.g. a CGA/multicast layout that splits a tile across CTAs
+    along M), the routing metadata built at ``routing()`` time no longer matches
+    the kernel's effective ``block_m`` and must be regenerated. ``n_gates`` is
+    the total number of routed gates (== ``sum(hist)``)."""
+    device = hist.device
+    (
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+        _blocks1,
+        BLOCK_A,
+        block_m_log2,
+    ) = _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device)
+    _expt_data_only_kernel[(n_expts_tot,)](
+        hist,
+        n_expts_tot,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+        block_pid_map.shape[0],
+        n_gates,
+        block_m_log2,
+        BLOCK=BLOCK_A,
+        EQUAL_BLOCK=(n_expts_tot == BLOCK_A),
+        num_warps=1,
+    )
+    return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+
 # --------------------------
 # routing
 # --------------------------
@@ -279,6 +324,7 @@ def routing(
     num_expert_group: int | None = None,
     topk_group: int | None = None,
     expert_group: torch.Tensor | None = None,
+    tile_m_scale: int = 1,
 ):
     """Routing entry point. ``score_mode`` selects the path:
 
@@ -294,6 +340,11 @@ def routing(
     ``block_m`` is not supplied by the caller: it is derived internally from the
     raw ``logits`` shape and the originally requested ``n_expts_act``.
 
+    ``tile_m_scale`` (default 1) scales the ``block_m`` used to build ExptData
+    (not ``RoutingData.block_m``), so a CGA kernel finds metadata matching its
+    effective ``block_m``. Pass ``get_gluon_a8w4_tile_m_scale(M)``; leave at 1
+    for non-CGA kernels.
+
     Returns ``(RoutingData, gather_indx, scatter_indx)``.
     """
     num_tokens, n_expts_tot = logits.shape
@@ -303,6 +354,7 @@ def routing(
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    expt_block_m = block_m * tile_m_scale
 
     # ------------------------------------------------------------------
     # flat top-k path: plain top-k + softmax (score_mode is None)
@@ -338,10 +390,20 @@ def routing(
             token_offs_raw,
             token_offs_pad,
             block_pid_map,
-        ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+        ) = sort_fn(
+            expt_scal, expt_indx, n_expts_tot, bitmatrix, expt_block_m, HIST_BLOCK_M
+        )
         expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
         return (
-            RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+            RoutingData(
+                block_m,
+                gate_scal,
+                hist,
+                n_expts_tot,
+                n_expts_act,
+                expt_data,
+                expt_data_block_m=expt_block_m,
+            ),
             topk_indx,
             gate_indx,
         )
@@ -410,7 +472,9 @@ def routing(
         token_offs_raw,
         token_offs_pad,
         block_pid_map,
-    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+    ) = sort_fn(
+        expt_scal, expt_indx, n_expts_tot, bitmatrix, expt_block_m, HIST_BLOCK_M
+    )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(
         block_m=block_m,
@@ -419,6 +483,7 @@ def routing(
         n_expts_tot=n_expts_tot,
         n_expts_act=n_expts_act,
         expt_data=expt_data,
+        expt_data_block_m=expt_block_m,
     )
     return routing_data, topk_indx, gate_indx
 
@@ -433,6 +498,7 @@ def routing_from_hash(
     score_mode: str = "sqrtsoftplus",
     renorm: bool = True,
     routed_scaling_factor: float = 1.0,
+    tile_m_scale: int = 1,
 ):
     """All-Triton routing for the a8w4 path on DeepSeek-V4 hash layers.
 
@@ -446,6 +512,7 @@ def routing_from_hash(
     from .topk import hash_routing
 
     n_tokens, n_expts_tot = router_logits.shape
+    expt_block_m = block_m * tile_m_scale
 
     expt_scal, expt_indx, bitmatrix = hash_routing(
         router_logits,
@@ -472,7 +539,9 @@ def routing_from_hash(
         token_offs_raw,
         token_offs_pad,
         block_pid_map,
-    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
+    ) = sort_fn(
+        expt_scal, expt_indx, n_expts_tot, bitmatrix, expt_block_m, HIST_BLOCK_M
+    )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(
         block_m=block_m,
@@ -481,6 +550,7 @@ def routing_from_hash(
         n_expts_tot=n_expts_tot,
         n_expts_act=n_expts_act,
         expt_data=expt_data,
+        expt_data_block_m=expt_block_m,
     )
     return routing_data, topk_indx, gate_indx
 

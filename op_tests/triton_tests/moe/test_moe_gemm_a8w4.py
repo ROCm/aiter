@@ -12,6 +12,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
+    get_gluon_a8w4_tile_m_scale,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.shuffle import shuffle_weight_gfx1250
@@ -46,7 +47,11 @@ def init_routing_data(
     m, n_expts_tot, n_expts_act, do_gather, do_scatter, device="cuda"
 ):
     logits = torch.randn((m, n_expts_tot), dtype=torch.float16, device=device)
-    routing_data, gather_idx, scatter_idx = routing(logits, n_expts_act)
+    routing_data, gather_idx, scatter_idx = routing(
+        logits,
+        n_expts_act,
+        tile_m_scale=get_gluon_a8w4_tile_m_scale(m * n_expts_act),
+    )
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
     scatter_idx = scatter_idx if do_scatter else None
