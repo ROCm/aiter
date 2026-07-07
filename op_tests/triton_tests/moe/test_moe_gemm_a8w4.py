@@ -247,11 +247,15 @@ def test_op(
     if get_arch() == "gfx1250":
         # if act_dtype_str == "mxfloat8_e4m3fn":
         #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
+        # temporary
+        if (
+            do_gather
+            and (m * n_expts_act) > 1024
+            and act_dtype_str == "mxfloat8_e4m3fn"
+        ):
+            pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
-        # temporary
-        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32:
-            pytest.skip("Test will take too long time on FFM")
 
     if hbm_swizzling:
         if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):

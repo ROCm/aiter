@@ -370,24 +370,15 @@ def moe_gemm_a8w4(
     # StridedLayout callers keep their tuned BK<256.
     if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
         config["block_k"] = 256
-    # pad x_scales to a whole number of BLOCK_K tiles for async_copy
-    # fallback to TDM gather if we don't pad x_scales
+    # Fall back to TDM if the scale width is below the gfx1250 direct-to-LDS
+    # floor (32 bits = 4 uint8 scales) or K is uneven
     X_SCALE_TDM = False
     if use_gluon and x_has_mx:
         mx_scale_block_k = config["block_k"] // 32
-        padded_ks = triton.cdiv(K, config["block_k"]) * mx_scale_block_k
-        if padded_ks > x_scales.shape[-1]:
-            x_scales = torch.nn.functional.pad(
-                x_scales, (0, padded_ks - x_scales.shape[-1])
-            )
-        # If x_scales still isn't a whole number of BLOCK_K tiles (i.e. the pad
-        # above is disabled), the async_copy x_scale load would read OOB in K.
-        # Fall back to TDM gather.
-        # also fallback if the scale width is less than 16
         ASYNC_COPY_MIN_SCALE_WIDTH = 16
-        X_SCALE_TDM = True  # mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or padded_ks > x_scales.shape[-1]
-        stride_x_mx_m = x_scales.stride(0)
-        stride_x_mx_k = x_scales.stride(1)
+        X_SCALE_TDM = (
+            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
+        )
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -450,10 +441,6 @@ def moe_gemm_a8w4(
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
-    if use_gluon:
-        clamp_bounds = (K % config["block_k"] != 0) or (
-            triton.cdiv(K, config["block_k"]) < config["num_buffers"]
-        )
     # launch kernel
     if use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
@@ -501,9 +488,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
-            CLAMP_BOUNDS=clamp_bounds,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
@@ -561,7 +546,6 @@ def moe_gemm_a8w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
             X_SCALE_TDM=X_SCALE_TDM,
-            CLAMP_BOUNDS=clamp_bounds,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
