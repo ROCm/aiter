@@ -12,6 +12,6 @@ This document records all general information on where to find common references
 
 #### Constraints
 
-* Use `HIP_VISIBLE_DEVICES=7`. We are on a share node, so following this is critical!
+* Use `HIP_VISIBLE_DEVICES=6`. We are on a share node, so following this is critical!
 * Our backward kernel should be compatible with the forward one, so must mirror what's necessary to mirror.
 * Please do not add any nothing of "Phase" in your code comment. The "Phases" are for development only and keeping track on where were are, but are not of interests to any other person.
