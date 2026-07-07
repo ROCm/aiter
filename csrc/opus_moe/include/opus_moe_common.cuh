@@ -3,7 +3,15 @@
 #pragma once
 
 #include <cstdint>
+
+// Keep generated minimal-HIP TUs from later pulling full HIP bf16 headers.
+#if defined(__HIPCC_RTC__) || defined(HIP_MINIMAL_HPP)
+#include <opus/hip_minimal.hpp>
+#include <opus/opus.hpp>
+using hip_bfloat16 = opus::bf16_t;
+#else
 #include <hip/hip_bfloat16.h>
+#endif
 
 #include "opus_moe_stage2_a8w4_meta.h"
 
@@ -98,6 +106,7 @@ struct opus_moe_stage2_a8w4_kargs
     int64_t route_out_row_bytes;  // fp8 route_out row stride bytes (= model_dim + model_dim/8).
 };
 
+#ifdef __HIP_DEVICE_COMPILE__
 static __device__ __forceinline__ int opus_moe_token_id(int32_t packed)
 {
     return packed & 0x00ffffff;
@@ -107,3 +116,4 @@ static __device__ __forceinline__ int opus_moe_topk_slot(int32_t packed)
 {
     return static_cast<uint32_t>(packed) >> 24;
 }
+#endif
