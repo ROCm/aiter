@@ -25,9 +25,8 @@ using namespace hk_mla;
 // SIMD-pairing comments stay stable.
 enum class WarpTypeM16x8 : uint8_t
 {
-    LoNoPEWarp, // warps 0-3: NoPE
-    HiNoPEWarp, // warps 4,6: NoPE
-    HiRoPEWarp  // warps 5,7: RoPE owner
+    LoNoPEWarp, // warps 0-3: tile 0 (cols 0-255), pure NoPE
+    HiRoPEWarp  // warps 4-7: tile 1 (cols 256-511), NoPE + RoPE
 };
 
 #include "hk_mla_v40_fwd_decode_gen1_common.cuh"
@@ -58,7 +57,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     constexpr bool kIsRopeWarp = (kWarpType == WarpTypeM16x8::HiRoPEWarp);
 
     // Deferred-PV grouping: Lo (LoNoPEWarp, warps 0-3) defers its PV by one tile;
-    // Hi (HiNoPEWarp/HiRoPEWarp, warps 4-7) keeps PV at call end. Staggering the
+    // Hi (HiRoPEWarp, warps 4-7) keeps PV at call end. Staggering the
     // two groups on a shared SIMD lets Lo's PV overlap Hi's QK/softmax.
     constexpr bool kPvAtEnd = (kWarpType != WarpTypeM16x8::LoNoPEWarp);
 
@@ -135,7 +134,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
     // ---- Managers ----
     QManager8to16bitsV1<T> q_manager;
-    KvManager8to16bitsV1<T> kv_manager;
+    KvManager8to16bitsV2<T> kv_manager;
     OManager16bitsV4Gen1Swizzle<T, out_t> o_manager;
     OManager32bitsV4Gen1Swizzle<T, split_t> split_o_manager;
 
@@ -318,7 +317,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // kv_ld_row_base_idx is the lane's row in a 32-row tile). Returns -1 if the
         // sub-tile is entirely OOB.
         auto resolve_row_kv_ld = [&](const int32_t tile_start) -> int32_t {
-            const int32_t tile_end = tile_start + 32;
+            const int32_t tile_end = tile_start + 16;
             int32_t row_kv_ld;
             if(tile_end <= kv_end)
             {
@@ -340,14 +339,17 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // Bytes of one 32-row KV sub-tile in a pong (sub-tile B lives at +kSubPong).
         constexpr uint32_t kSubPong = 32u * T::kQkHeadDim * sizeof(hk::bf16); // 32768
 
-        // kBlockN=64 processes two 32-row sub-tiles (A,B) per iter. Each carries its
-        // own resolved KV row. Tile 0's rows go to the prologue; the next 64-tile's
-        // rows seed the first lambda call. `row_kv_ld_next_next_{a,b}` is a one-deep
-        // carry updated each call for the call after.
-        const int32_t row_kv_ld_first_a = resolve_row_kv_ld(kv_start);
-        const int32_t row_kv_ld_first_b = resolve_row_kv_ld(kv_start + 32);
-        int32_t row_kv_ld_next_next_a = resolve_row_kv_ld(kv_start + T::kBlockN);      // +64
-        int32_t row_kv_ld_next_next_b = resolve_row_kv_ld(kv_start + T::kBlockN + 32); // +96
+        // V2 band remap: each warp owns ONE 16-row band of the 64-row tile.
+        //   band_off = this warp's band token offset (0/16/32/48)
+        //   sub_off  = its 32-row sub-tile's LDS base offset (A=0, B=kSubPong)
+        // -> ONE resolved KV row per lane (no A/B pair).
+        const int32_t   band_off = static_cast<int32_t>((warp_idx & 3u) * 16u);
+        const uintptr_t sub_off  = static_cast<uintptr_t>(((warp_idx >> 1) & 1u)) * kSubPong;
+
+        // Tile 0's band rows go to the prologue; the next 64-tile's band rows seed the
+        // first lambda call. `row_kv_ld_next_next` is a one-deep carry.
+        const int32_t row_kv_ld_first     = resolve_row_kv_ld(kv_start + band_off);
+        int32_t row_kv_ld_next_next       = resolve_row_kv_ld(kv_start + T::kBlockN + band_off);
 
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
@@ -391,33 +393,13 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             __builtin_amdgcn_sched_barrier(0);
         }
 
-        // Prologue: prefetch + cvt+store the first 64-row KV tile (sub-tiles A,B)
-        // into the curr pong (A at [0], B at [+kSubPong]). kCheckBoundary is true
-        // when a sub-tile straddles the batch tail (A iff kv_len<32, B iff kv_len<64).
-        if(kv_len < 32)
-        {
-            kv_manager.template async_load_k<true, kIsRopeWarp>(
-                p_lds_kv_curr, warp_idx, params.p_kv_buffer, params.p_kv_buffer_rope,
-                row_kv_ld_first_a);
-        }
-        else
-        {
-            kv_manager.template async_load_k<false, kIsRopeWarp>(
-                p_lds_kv_curr, warp_idx, params.p_kv_buffer, params.p_kv_buffer_rope,
-                row_kv_ld_first_a);
-        }
-        if(kv_len < T::kBlockN)
-        {
-            kv_manager.template async_load_k<true, kIsRopeWarp>(
-                p_lds_kv_curr + kSubPong, warp_idx, params.p_kv_buffer, params.p_kv_buffer_rope,
-                row_kv_ld_first_b);
-        }
-        else
-        {
-            kv_manager.template async_load_k<false, kIsRopeWarp>(
-                p_lds_kv_curr + kSubPong, warp_idx, params.p_kv_buffer, params.p_kv_buffer_rope,
-                row_kv_ld_first_b);
-        }
+        // Prologue: prefetch + cvt+store this warp's 16x256 band of the first 64-row
+        // KV tile into its sub-tile base (curr + sub_off). One boundary check on the
+        // band's own rows (row_kv_ld_first == -1 when the whole band is past kv_len).
+        // kCheckBoundary=true always (cold path).
+        kv_manager.template async_load_k<true, kIsRopeWarp>(
+            p_lds_kv_curr + sub_off, warp_idx, params.p_kv_buffer, params.p_kv_buffer_rope,
+            row_kv_ld_first);
 
         // ---- mla_main lambda (Phase 4g) ----
         //
@@ -464,57 +446,51 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 (kIsGlobalLast == false) || (kCheckBoundaryNext == false),
                 "kIsGlobalLast == true means no next tile, so kCheckBoundaryNext must be false.");
 
-            // Snapshot next-tile KV rows (A,B sub-tiles; set by prior call or prologue).
-            int32_t row_kv_ld_next_a = 0;
-            int32_t row_kv_ld_next_b = 0;
+            // Snapshot this warp's NEXT-tile band KV row (set by prior call/prologue).
+            int32_t row_kv_ld_next = 0;
             if constexpr(kIsGlobalLast == false)
             {
-                row_kv_ld_next_a = row_kv_ld_next_next_a;
-                row_kv_ld_next_b = row_kv_ld_next_next_b;
+                row_kv_ld_next = row_kv_ld_next_next;
 
                 // Lo warps use 2x PV GEMM to hide latency of loading next-next rows.
                 if constexpr(kWarpType == WarpTypeM16x8::LoNoPEWarp)
                 {
-                    row_kv_ld_next_next_a = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);      // +128
-                    row_kv_ld_next_next_b = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN + 32); // +160
+                    row_kv_ld_next_next =
+                        resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN + band_off); // +128
                 }
             }
 
-            // ---- Phase A: prefetch NEXT tile into the next-pong ----
-            // 2 halves (kColOffset 0 + 256) per tile. Carriers live in VGPRs
-            // until the wait+cvt+store sequence below; the gap in between
-            // hides vmcnt latency under QK MFMAs.
-            constexpr uint32_t kTileCols = 256u;
-            // 2 NoPE carriers (sub-tile A only). Sub-tile B reuses these carriers in
-            // Phase B after A's cvt+store frees them -- keeps only 2 carriers live
-            // across QK so the compiler has scratch for the QK ds_read address (the
-            // 4-carrier interleaved schedule exhausted scratch -> clobbered pinned k_0).
-            typename KvManager8to16bitsV1<T>::KvTilePrefetch p0, p1;
-            // Sub-tile B staging. buffer_load_lds's LDS dst is wave-uniform (m0/SGPR);
-            // HW adds laneId*16 (wave-local). So m0 = per-warp base (p_lds_kv_stage +
-            // k*8192 + warp*1024); each lane writes m0 + laneId*16. Read matches at
-            // the same per-warp base + laneId*16.
-            constexpr uint32_t kStageWarpBytes = 64u * 16u;      // 1024
+            // ---- Phase A: prefetch this warp's NEXT-tile band into the next-pong ----
+            // V2 band: 4 col-strips of 16x64. strips 0,1 -> VGPR carriers (hidden under
+            // QK, 2-carrier ceiling); strip 2 (+ strip 3 for lo) -> staging LDS; tile-1
+            // strip 3 (RoPE) DMAs to LDS in Phase B. Single row index (row_kv_ld_next).
+            constexpr uint32_t kTile = kIsRopeWarp ? 1u : 0u;
+            typename KvManager8to16bitsV2<T>::KvTilePrefetch p0, p1;
+            // Staging: buffer_load_lds dst is wave-uniform m0; HW adds laneId*16. Two
+            // slots (strip 2 @ +0, strip 3 @ +kStageTileBytes), each per-warp base
+            // p_lds_kv_stage + slot*8192 + warp*1024. Read matches at the same base.
+            constexpr uint32_t kStageWarpBytes = 64u * 16u;           // 1024
             constexpr uint32_t kStageTileBytes = 8u * kStageWarpBytes; // 8192
-            const uintptr_t stage_b_t0 = p_lds_kv_stage + warp_idx * kStageWarpBytes;
-            const uintptr_t stage_b_t1 = p_lds_kv_stage + kStageTileBytes + warp_idx * kStageWarpBytes;
-            uint32_t scale_b0 = 0u, scale_b1 = 0u;
+            const uintptr_t stage_t0 = p_lds_kv_stage + warp_idx * kStageWarpBytes;
+            const uintptr_t stage_t1 = p_lds_kv_stage + kStageTileBytes + warp_idx * kStageWarpBytes;
+            uint32_t scale_s0 = 0u, scale_s1 = 0u;
 
-            // Issue sub-tile A's NoPE prefetches before the barrier so their vmem
-            // load latency overlaps the barrier wait. NoPE is VGPR-landing only
-            // (no LDS write), so it's safe ahead of the barrier that protects
-            // p_lds_kv_next. RoPE halves (waves 5,7) DMA straight to LDS in Phase B.
+            // Issue NoPE carriers + staging before the barrier so their vmem latency
+            // overlaps the barrier wait. NoPE carriers are VGPR-landing; staging DMAs
+            // to the (private) stage LDS -- both safe ahead of the p_lds_kv_next barrier.
             if constexpr(kIsGlobalLast == false)
             {
-                kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext, kIsRopeWarp>(
-                    warp_idx, params.p_kv_buffer, row_kv_ld_next_a, p0);
-                kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
-                    warp_idx, params.p_kv_buffer, row_kv_ld_next_a, p1);
+                kv_manager.template prefetch_kv_nope<0u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
+                    warp_idx, params.p_kv_buffer, row_kv_ld_next, p0);
+                kv_manager.template prefetch_kv_nope<1u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
+                    warp_idx, params.p_kv_buffer, row_kv_ld_next, p1);
 
-                kv_manager.template prefetch_kv_nope_lds<0u, kCheckBoundaryNext, kIsRopeWarp>(
-                    warp_idx, params.p_kv_buffer, row_kv_ld_next_b, stage_b_t0, scale_b0);
-                kv_manager.template prefetch_kv_nope_lds<kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
-                    warp_idx, params.p_kv_buffer, row_kv_ld_next_b, stage_b_t1, scale_b1);
+                kv_manager.template prefetch_kv_nope_lds<2u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
+                    warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t0, scale_s0);
+                if constexpr(!kIsRopeWarp) // lo tile 0: strip 3 is also NoPE (staged)
+                    kv_manager
+                        .template prefetch_kv_nope_lds<3u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
+                            warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t1, scale_s1);
             }
 
             // ---- Lo deferred PV (of the PREVIOUS tile) ----
@@ -536,12 +512,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
             __builtin_amdgcn_s_setprio(3);
 
-            // Keep A's loads AND B's staging loads in flight across the barrier + QK
-            // (both hidden). A NoPE+scale = 4, B staging = 2 lds + 2 scale ubyte = 4;
-            // total 8. RoPE waves: A 2 + B-staging (tile0 lds + scale) 2 = 4.
+            // Keep this warp's band loads in flight across the barrier + QK (hidden).
+            // Lo: 2 carriers (dwx4+ubyte=4) + 2 staged (lds+ubyte=4) = 8.
+            // Hi: 2 carriers (4) + 1 staged (2) = 6 (strip-3 RoPE issued in Phase B).
             if constexpr(kIsRopeWarp)
             {
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/4));
+                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/6));
             }
             else
             {
@@ -652,85 +628,70 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // delayed by the cvt+store traffic on p_lds_kv_next.
             if constexpr(kIsGlobalLast == false)
             {
-                constexpr uint32_t kTileCols = 256u;
+                // This warp's band goes into its own sub-tile base (next + sub_off).
+                const uintptr_t next_sub = p_lds_kv_next + sub_off;
                 hk::u32x4 dw;
 
-                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
-                    p_lds_kv_next, warp_idx, params.p_kv_buffer_rope, row_kv_ld_next_a);
-                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
-                    p_lds_kv_next + kSubPong, warp_idx, params.p_kv_buffer_rope, row_kv_ld_next_b);
+                // RoPE (hi warps only): strip 3 (cols 448-511) DMAs vmem->LDS.
+                kv_manager.template prefetch_kv_rope<kCheckBoundaryNext, kIsRopeWarp>(
+                    next_sub, warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
 
-                // ---- sub-tile A: cvt+store (p0,p1 in flight from Phase A) -> next[0] ----
-                // RoPE half of A (waves 5,7) DMAs into next[0]; then drain A's NoPE
-                // (staged 2->0, mirroring the single-tile path).
-                
-                kv_manager.template wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/6>(warp_idx);
+                // Drain all band loads (carriers + staging + RoPE lds). Correctness-
+                // first; the carrier/staging overlap can be re-pipelined later.
+                kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
+
+                // Carrier strip 0.
                 const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0.nope_dw, scale_f0);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0.nope_dw, scale_f0);
-                kv_manager.template store_kv_tile_step<0u, 0u, 0, kIsRopeWarp>(p_lds_kv_next, warp_idx, dw);
+                kv_manager.template store_kv_tile_step<0u, kTile, 0>(next_sub, warp_idx, dw);
                 kv_manager.template cvt_kv_tile_step<2>(dw, p0.nope_dw, scale_f0);
                 kv_manager.template cvt_kv_tile_step<3>(dw, p0.nope_dw, scale_f0);
-                kv_manager.template store_kv_tile_step<0u, 0u, 1, kIsRopeWarp>(p_lds_kv_next, warp_idx, dw);
-                if constexpr(!kIsRopeWarp)
-                {
-                    kv_manager.template wait_kv_loads<0u, kTileCols, kIsRopeWarp, /*kVmCnt=*/4>(warp_idx);
-                    const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
-                    kv_manager.template cvt_kv_tile_step<0>(dw, p1.nope_dw, scale_f1);
-                    kv_manager.template cvt_kv_tile_step<1>(dw, p1.nope_dw, scale_f1);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0, kIsRopeWarp>(
-                        p_lds_kv_next, warp_idx, dw);
-                    kv_manager.template cvt_kv_tile_step<2>(dw, p1.nope_dw, scale_f1);
-                    kv_manager.template cvt_kv_tile_step<3>(dw, p1.nope_dw, scale_f1);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1, kIsRopeWarp>(
-                        p_lds_kv_next, warp_idx, dw);
-                }
+                kv_manager.template store_kv_tile_step<0u, kTile, 1>(next_sub, warp_idx, dw);
 
-                // ---- sub-tile B: staged nope_dw + held scale -> next[+kSubPong] ----
-                if constexpr(kIsRopeWarp)
-                {
-                    kv_manager.template wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/4>(warp_idx);
-                }
-                else
-                {
-                    kv_manager.template wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/2>(warp_idx);
-                }
+                // Carrier strip 1.
+                const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
+                kv_manager.template cvt_kv_tile_step<0>(dw, p1.nope_dw, scale_f1);
+                kv_manager.template cvt_kv_tile_step<1>(dw, p1.nope_dw, scale_f1);
+                kv_manager.template store_kv_tile_step<1u, kTile, 0>(next_sub, warp_idx, dw);
+                kv_manager.template cvt_kv_tile_step<2>(dw, p1.nope_dw, scale_f1);
+                kv_manager.template cvt_kv_tile_step<3>(dw, p1.nope_dw, scale_f1);
+                kv_manager.template store_kv_tile_step<1u, kTile, 1>(next_sub, warp_idx, dw);
 
-                p0.nope_dw = kv_manager.template load_staged_kv_carrier<0>(stage_b_t0);
-                const float scale_f0b = hk_mla::e8m0_to_f32(scale_b0);
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                kv_manager.template cvt_kv_tile_step<0>(dw, p0.nope_dw, scale_f0b);
-                kv_manager.template cvt_kv_tile_step<1>(dw, p0.nope_dw, scale_f0b);
-                kv_manager.template store_kv_tile_step<0u, 0u, 0, kIsRopeWarp, kSubPong>(
-                    p_lds_kv_next, warp_idx, dw);
-                kv_manager.template cvt_kv_tile_step<2>(dw, p0.nope_dw, scale_f0b);
-                kv_manager.template cvt_kv_tile_step<3>(dw, p0.nope_dw, scale_f0b);
-                kv_manager.template store_kv_tile_step<0u, 0u, 1, kIsRopeWarp, kSubPong>(
-                    p_lds_kv_next, warp_idx, dw);
-
-                if constexpr(!kIsRopeWarp)
+                // Staged strip 2 (lo & hi).
                 {
-                    kv_manager.template wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
-                    p1.nope_dw = kv_manager.template load_staged_kv_carrier<32>(stage_b_t0);
-                    const float scale_f1b = hk_mla::e8m0_to_f32(scale_b1);
+                    const hk::u32x4 s2   = kv_manager.template load_staged_kv_carrier<0u>(stage_t0);
+                    const float     sf2  = hk_mla::e8m0_to_f32(scale_s0);
                     __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                    kv_manager.template cvt_kv_tile_step<0>(dw, p1.nope_dw, scale_f1b);
-                    kv_manager.template cvt_kv_tile_step<1>(dw, p1.nope_dw, scale_f1b);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0, kIsRopeWarp, kSubPong>(
-                        p_lds_kv_next, warp_idx, dw);
-                    kv_manager.template cvt_kv_tile_step<2>(dw, p1.nope_dw, scale_f1b);
-                    kv_manager.template cvt_kv_tile_step<3>(dw, p1.nope_dw, scale_f1b);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1, kIsRopeWarp, kSubPong>(
-                        p_lds_kv_next, warp_idx, dw);
+                    kv_manager.template cvt_kv_tile_step<0>(dw, s2, sf2);
+                    kv_manager.template cvt_kv_tile_step<1>(dw, s2, sf2);
+                    kv_manager.template store_kv_tile_step<2u, kTile, 0>(next_sub, warp_idx, dw);
+                    kv_manager.template cvt_kv_tile_step<2>(dw, s2, sf2);
+                    kv_manager.template cvt_kv_tile_step<3>(dw, s2, sf2);
+                    kv_manager.template store_kv_tile_step<2u, kTile, 1>(next_sub, warp_idx, dw);
+                }
+
+                // Staged strip 3 (lo only; hi strip 3 is the RoPE DMA above).
+                if constexpr(!kIsRopeWarp)
+                {
+                    const hk::u32x4 s3   = kv_manager.template load_staged_kv_carrier<1u>(stage_t0);
+                    const float     sf3  = hk_mla::e8m0_to_f32(scale_s1);
+                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+                    kv_manager.template cvt_kv_tile_step<0>(dw, s3, sf3);
+                    kv_manager.template cvt_kv_tile_step<1>(dw, s3, sf3);
+                    kv_manager.template store_kv_tile_step<3u, kTile, 0>(next_sub, warp_idx, dw);
+                    kv_manager.template cvt_kv_tile_step<2>(dw, s3, sf3);
+                    kv_manager.template cvt_kv_tile_step<3>(dw, s3, sf3);
+                    kv_manager.template store_kv_tile_step<3u, kTile, 1>(next_sub, warp_idx, dw);
                 }
             }
 
-            // ---- Update row_kv_ld_next_next_{a,b} for the call AFTER this one ----
+            // ---- Update row_kv_ld_next_next for the call AFTER this one ----
             // Hi warps use softmax + PV GEMM to hide latency of loading next-next rows.
             if constexpr((kIsGlobalLast == false) && (kWarpType != WarpTypeM16x8::LoNoPEWarp))
             {
-                row_kv_ld_next_next_a = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);      // +128
-                row_kv_ld_next_next_b = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN + 32); // +160
+                row_kv_ld_next_next =
+                    resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN + band_off); // +128
             }
 
             // ---- Softmax + fp32->bf16 pack ----
@@ -1297,22 +1258,17 @@ void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdPar
     const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
 
     // Diverge on warp type ONCE at kernel entry so each type compiles as its own
-    // body (compile-time kWarpType, no runtime warp-idx branches inside). PV is
-    // at call end for every warp; the only functional split is RoPE-owner
-    // (warps 5,7) vs NoPE. The Lo/Hi NoPE split is vestigial.
+    // body (compile-time kWarpType). Band remap (V2): warps 0-3 own tile 0 (pure
+    // NoPE) = LoNoPEWarp; warps 4-7 own tile 1 (NoPE + RoPE) = HiRoPEWarp. The band
+    // (warp&3) stays runtime inside each type.
     if(warp_idx < 4u)
     {
         mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::LoNoPEWarp>(params,
                                                                                       warp_idx);
     }
-    else if(KvManager8to16bitsV1<T>::wave_is_rope_owner(warp_idx))
-    {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiRoPEWarp>(params,
-                                                                                      warp_idx);
-    }
     else
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiNoPEWarp>(params,
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiRoPEWarp>(params,
                                                                                       warp_idx);
     }
 }

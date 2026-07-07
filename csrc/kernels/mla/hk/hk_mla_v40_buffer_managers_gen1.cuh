@@ -1406,6 +1406,294 @@ class KvManager8to16bitsV1
     }
 };
 
+// ---- m16x8 band-remapped KV manager -------------------------------------------
+// Each warp owns ONE 16-row band x one 256-col tile (16x256 patch = 4 dwordx4/lane):
+//   band = warp & 3 (rows [band*16, +16)); tile = warp >> 2 (0 = cols 0-255, 1 = 256-511)
+//   sub-tile A = bands {0,1} (rows 0-31 -> pong[0]); B = bands {2,3} (rows 32-63 -> pong[+kSubPong])
+//   row_tile (16-row sub-block half within the 32-row sub-tile) = warp & 1
+// vs. V1 (each warp loads part of BOTH sub-tiles): now ONE row index per lane, and
+// warps 0-3 = pure NoPE (tile 0), warps 4-7 = NoPE+RoPE (tile 1) -> 2 warp types.
+//
+// LDS layout is byte-identical to V1, so the READERS (load_k_to_gpr /
+// load_transposed_v_to_gpr) + constants + cvt + KvTilePrefetch are inherited. Only
+// the load mapping / prefetch / store are overridden. (Static methods don't virtual-
+// dispatch, so any V1 method that calls an overridden one is re-defined here.)
+//
+// Per-warp load: strips 0,1 -> VGPR carriers (hidden under QK); strip 2 (+ strip 3
+// for lo) -> staging LDS. tile-1 strip 3 (cols 448-511) is RoPE (direct vmem->LDS).
+template <typename T>
+class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
+{
+    using Base      = KvManager8to16bitsV1<T>;
+    using kv_nope_t = typename T::kv_nope_t;
+    using kv_rope_t = typename T::kv_rope_t;
+
+    public:
+    using KvTilePrefetch = typename Base::KvTilePrefetch;
+    using Base::kColTilesPerTile;
+    using Base::kNumRowTiles;
+    using Base::kSubBlockBytes;
+    using Base::kSubBlockCols;
+    using Base::kTileCols;
+    using Base::kWaveTileCols;
+    using Base::cvt_kv_tile_step;
+    using Base::kv_tile_scale_f;
+    using Base::sub_block_byte_offset;
+
+    // A tile's 256 cols = 4 col-strips of 64. tile-1 strip 3 (cols 448-511) is RoPE.
+    static constexpr bool is_nope_strip(uint32_t tile, uint32_t strip)
+    { return (tile == 0u) || (strip < 3u); }
+
+    // ---- Mapping overrides (see class header) ----
+    // Row within the warp's 16-row band; the band token offset (band*16) is folded
+    // into kv_tile_start by the caller's resolve, so this is warp-independent.
+    __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
+    { (void)warp_idx; return opus::lane_id() >> 2; }
+
+    // 16-row sub-block half within the warp's 32-row sub-tile.
+    __device__ __forceinline__ static constexpr uint32_t wave_row_tile(const uint32_t warp_idx)
+    { return warp_idx & 1u; }
+
+    // All hi warps (4-7) touch the RoPE region (tile 1, cols 448-511).
+    __device__ __forceinline__ static constexpr bool wave_is_rope_owner(const uint32_t warp_idx)
+    { return warp_idx >= 4u; }
+
+    // ---- Phase A: NoPE prefetch -> VGPR carrier (one col-strip) ----
+    template <uint32_t kColStrip, uint32_t kTile, bool kCheckBoundary, bool kIsRopeWarp>
+    __device__ __forceinline__ static void prefetch_kv_nope(const uint32_t warp_idx,
+                                                            const kv_nope_t* p_kv_buf_nope,
+                                                            const int32_t row_kv_ld,
+                                                            KvTilePrefetch& prefetch_out)
+    {
+        static_assert(kColStrip < 4u, "prefetch_kv_nope: kColStrip must be 0..3.");
+        static_assert(kTile < 2u, "prefetch_kv_nope: kTile must be 0 or 1.");
+        (void)warp_idx;
+        constexpr bool kIsNoPEPath = is_nope_strip(kTile, kColStrip);
+        if constexpr(kIsNoPEPath)
+        {
+            uint32_t lane_idx = opus::lane_id();
+            asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
+            const uint32_t col_group = lane_idx & 3u;
+            const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
+
+            constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
+            const uint64_t as_u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
+            const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
+            const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
+            const uint32_t v_off_nope =
+                in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
+                          : 0u;
+            const uint32_t s_off_nope = kColStrip * kWaveTileCols;             // strip*64
+            constexpr int i_off_nope  = static_cast<int>(kTile * kTileCols);   // tile*256
+
+            constexpr uint32_t kScaleBaseOff = 448u;
+            const uint32_t v_off_scale =
+                in_bounds ? static_cast<uint32_t>(row_kv_ld) * kPackedStride : 0u;
+            const uint32_t s_off_scale = kColStrip * 2u;
+            constexpr int i_off_scale =
+                static_cast<int>(kScaleBaseOff + kTile * kColTilesPerTile);
+
+            prefetch_out.nope_dw =
+                in_bounds ? hkm::buffer_load_dwordx4(br, v_off_nope, s_off_nope, i_off_nope)
+                          : hk::u32x4{0u, 0u, 0u, 0u};
+            prefetch_out.scale_dw =
+                in_bounds ? hkm::buffer_load_ubyte(br, v_off_scale, s_off_scale, i_off_scale) : 0u;
+        }
+    }
+
+    // ---- Phase A: NoPE prefetch -> staging LDS (one col-strip) ----
+    template <uint32_t kColStrip, uint32_t kTile, bool kCheckBoundary, bool kIsRopeWarp>
+    __device__ __forceinline__ static void
+    prefetch_kv_nope_lds(const uint32_t warp_idx, const kv_nope_t* p_kv_buf_nope,
+                         const int32_t row_kv_ld, const uintptr_t p_lds_stage_tile,
+                         uint32_t& scale_out)
+    {
+        static_assert(kColStrip < 4u, "prefetch_kv_nope_lds: kColStrip must be 0..3.");
+        static_assert(kTile < 2u, "prefetch_kv_nope_lds: kTile must be 0 or 1.");
+        (void)warp_idx;
+        scale_out = 0u;
+        constexpr bool kIsNoPEPath = is_nope_strip(kTile, kColStrip);
+        if constexpr(kIsNoPEPath)
+        {
+            uint32_t lane_idx = opus::lane_id();
+            asm volatile("" : "+v"(lane_idx));
+            const uint32_t col_group = lane_idx & 3u;
+            const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
+
+            constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
+            const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
+            const uint32_t v_off_nope =
+                in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
+                          : 0u;
+            // Fold tile + strip gmem offset into s_off, i_off=0 so the LDS dst is
+            // exactly p_lds_stage_tile + lane*16 (imm offset would shift LDS too).
+            const uint32_t s_off_nope = kColStrip * kWaveTileCols + kTile * kTileCols;
+
+            const __amdgpu_buffer_rsrc_t rsrc_lds = __builtin_amdgcn_make_buffer_rsrc(
+                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)), 0, 0xffffffff, 0x00020000);
+            if(in_bounds)
+            {
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(
+                    rsrc_lds, (hk::as3_uint32_ptr)(p_lds_stage_tile),
+                    /*size=*/16, v_off_nope, /*s_off=*/s_off_nope, /*i_off=*/0, /*aux=*/0);
+            }
+
+            const uint64_t as_u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
+            const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
+            constexpr uint32_t kScaleBaseOff = 448u;
+            const uint32_t v_off_scale =
+                in_bounds ? static_cast<uint32_t>(row_kv_ld) * kPackedStride : 0u;
+            const uint32_t s_off_scale = kColStrip * 2u;
+            constexpr int i_off_scale =
+                static_cast<int>(kScaleBaseOff + kTile * kColTilesPerTile);
+            scale_out =
+                in_bounds ? hkm::buffer_load_ubyte(br, v_off_scale, s_off_scale, i_off_scale) : 0u;
+        }
+    }
+
+    // Reconstruct a carrier from a staged strip (ds_read the 16B this lane wrote).
+    // kSlot (staging tile 0/1) is folded into the ds_read imm so both staged strips
+    // share ONE base pointer -- only that base need cross QK (not a 2nd stage_t1 VGPR).
+    static constexpr uint32_t kStageSlotBytes = 8u * (64u * 16u); // 8192, matches kernel
+    template <uint32_t kSlot>
+    __device__ __forceinline__ static hk::u32x4
+    load_staged_kv_carrier(const uintptr_t p_lds_stage_base)
+    {
+        constexpr uint32_t kImmOffset = kSlot * kStageSlotBytes;
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx));
+        return hkm::ds_read_b128<hk::u32x4>(
+            static_cast<uint32_t>(p_lds_stage_base + lane_idx * 16u), kImmOffset);
+    }
+
+    // ---- Phase A: RoPE prefetch (vmem -> LDS direct) ----
+    // Hi warps only; writes the warp's band RoPE (cols 448-511) into sub-blocks
+    // (row_tile, 14) and (row_tile, 15). p_lds_kv is the sub-tile base (pong +
+    // subtile*kSubPong) chosen by the caller. Mirrors V1's body with row_tile = warp&1.
+    template <bool kCheckBoundary, bool kIsRopeWarp>
+    __device__ __forceinline__ static void prefetch_kv_rope(const uintptr_t p_lds_kv,
+                                                            const uint32_t warp_idx,
+                                                            const kv_rope_t* p_kv_buf_rope,
+                                                            const int32_t row_kv_ld)
+    {
+        const uint32_t lane_idx  = opus::lane_id();
+        const uint32_t col_group = lane_idx & 3u;
+        const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
+        if constexpr(kIsRopeWarp)
+        {
+            constexpr uint32_t kRopeStride    = T::kQkRopeHeadDim * sizeof(hk::bf16);   // 128
+            constexpr uint32_t kRopeColTileLo = T::kQkNopeHeadDim / kSubBlockCols;      // 14
+            constexpr uint32_t kRopeColTileHi = kRopeColTileLo + 1u;                    // 15
+            constexpr uint32_t kVStride       = kSubBlockCols * sizeof(hk::bf16);       // 64
+            const uint32_t row_tile           = wave_row_tile(warp_idx);
+            if(in_bounds)
+            {
+                const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
+                const uint32_t v_off_lo =
+                    static_cast<uint32_t>(row_kv_ld) * kRopeStride + col_group_swz * 32u;
+                const uintptr_t p_dst_lo =
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo);
+                const uintptr_t p_dst_hi_adj =
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) - 16u;
+                auto g_kv_rope =
+                    opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
+                                                         (hk::as3_uint32_ptr)(p_dst_lo),
+                                                         /*size=*/16, v_off_lo, 0u, 0, 0);
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
+                                                         (hk::as3_uint32_ptr)(p_dst_hi_adj),
+                                                         /*size=*/16, v_off_lo, 0u, 16, 0);
+                (void)kVStride;
+            }
+            else
+            {
+                constexpr uint32_t kInterSbStride = kNumRowTiles * kSubBlockBytes; // 2048
+                const hk::u32x4 zero{0u, 0u, 0u, 0u};
+                const uint32_t addr_lo = static_cast<uint32_t>(
+                    p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileLo) + lane_idx * 16u);
+                hkm::ds_write_b128(zero, addr_lo, 0);
+                hkm::ds_write_b128(zero, addr_lo, static_cast<int>(kInterSbStride));
+            }
+        }
+    }
+
+    // ---- Phase C: cvt+store one bf16 sub-block (one col-strip, lo/hi half) ----
+    // p_lds_kv is the sub-tile base (pong + subtile*kSubPong). row_tile = warp&1.
+    template <uint32_t kColStrip, uint32_t kTile, uint32_t kStep>
+    __device__ __forceinline__ static void
+    store_kv_tile_step(const uintptr_t p_lds_kv, const uint32_t warp_idx, const hk::u32x4& dw)
+    {
+        static_assert(kColStrip < 4u, "store_kv_tile_step: kColStrip must be 0..3.");
+        static_assert(kTile < 2u, "store_kv_tile_step: kTile must be 0 or 1.");
+        static_assert(kStep < 2u, "store_kv_tile_step: kStep must be 0 or 1.");
+
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx)); // break-CSE: don't hold store addr across QK
+        const uint32_t row_in_tile = lane_idx >> 2;
+        const uint32_t col_group   = lane_idx & 3u;
+        const uint32_t row_tile    = wave_row_tile(warp_idx);
+
+        // Fold the compile-time col-tile offset into the ds_write imm; the address VGPR
+        // then carries only the runtime row_tile + per-lane terms (frees the col-tile
+        // scaling from the held address, easing VGPR pressure across the loop).
+        constexpr uint32_t kColTileGlobalLo = kTile * kColTilesPerTile + kColStrip * 2u;
+        const uint32_t byte_in_sb  = col_group << 4;
+        const uintptr_t p_dst_lane = p_lds_kv + row_tile * kSubBlockBytes +
+                                     row_in_tile * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb;
+        const uint32_t addr        = static_cast<uint32_t>(p_dst_lane);
+        // sub_block(rt, ct) = (ct*kNumRowTiles + rt)*kSubBlockBytes; rt is in the addr,
+        // ct + kStep (both compile-time, each +1 col-tile = kNumRowTiles*kSubBlockBytes)
+        // go in the imm. Max (14+1)*2048 = 30720 < 65536.
+        constexpr uint32_t kImmOff =
+            (kColTileGlobalLo + kStep) * (kNumRowTiles * kSubBlockBytes);
+        hkm::ds_write_b128(dw, addr, kImmOff);
+    }
+
+    // ---- Phase B: wait for prefetch loads ----
+    template <bool kIsRopeWarp, int32_t kVmCnt = 0>
+    __device__ __forceinline__ static void wait_kv_loads(const uint32_t warp_idx)
+    {
+        (void)warp_idx;
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/kVmCnt));
+        __builtin_amdgcn_sched_barrier(0);
+    }
+
+    // ---- Convenience wrapper: non-overlapped full-band load (prologue) ----
+    // Loads the warp's full 16x256 band (4 NoPE strips for lo; 3 NoPE + 1 RoPE for
+    // hi) into the sub-tile base p_lds_kv. kCheckBoundary always true (cold path).
+    template <bool kCheckBoundary, bool kIsRopeWarp>
+    __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
+                                                        const uint32_t warp_idx,
+                                                        const kv_nope_t* p_kv_buf_nope,
+                                                        const kv_rope_t* p_kv_buf_rope,
+                                                        const int32_t row_kv_ld)
+    {
+        constexpr uint32_t kTile = kIsRopeWarp ? 1u : 0u;
+        prefetch_kv_rope<kCheckBoundary, kIsRopeWarp>(p_lds_kv, warp_idx, p_kv_buf_rope, row_kv_ld);
+
+        // Cold path: one strip at a time (single carrier, drain, cvt+store) -- no need
+        // to keep 4 carriers live, which would spill.
+        hk::u32x4 dw;
+        opus::static_for<4>([&](auto s_) {
+            constexpr uint32_t s = s_.value;
+            if constexpr(is_nope_strip(kTile, s))
+            {
+                KvTilePrefetch pf;
+                prefetch_kv_nope<s, kTile, kCheckBoundary, kIsRopeWarp>(
+                    warp_idx, p_kv_buf_nope, row_kv_ld, pf);
+                wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
+                const float scale_f = kv_tile_scale_f(pf);
+                Base::template cvt_kv_tile_step<0>(dw, pf.nope_dw, scale_f);
+                Base::template cvt_kv_tile_step<1>(dw, pf.nope_dw, scale_f);
+                store_kv_tile_step<s, kTile, 0>(p_lds_kv, warp_idx, dw);
+                Base::template cvt_kv_tile_step<2>(dw, pf.nope_dw, scale_f);
+                Base::template cvt_kv_tile_step<3>(dw, pf.nope_dw, scale_f);
+                store_kv_tile_step<s, kTile, 1>(p_lds_kv, warp_idx, dw);
+            }
+        });
+    }
+};
+
 // per call and un-swizzle on the bounce-LDS read side: lane L reads from LDS sub-tile
 // `sb8_perm_subtile(L_subtile)` so that its dwordx4 VRAM destination lands at the
 // straight (un-permuted) data col — adjacent lanes write to adjacent VRAM cols,
