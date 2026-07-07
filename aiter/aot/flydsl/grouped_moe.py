@@ -11,6 +11,7 @@ import argparse
 import csv
 import sys
 import time
+import traceback
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -20,6 +21,7 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
@@ -28,6 +30,11 @@ _TILE_K = 256
 
 def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _align_max_m(raw_max_m: int, warp_tile_m: int) -> int:
+    """Mirror grouped_moe_gfx1250's max_m rounding (>= one warp tile)."""
+    return max(int(warp_tile_m), _align_up(raw_max_m, warp_tile_m))
 
 
 def _preshuffled_scale_shape(
@@ -93,12 +100,23 @@ def _scheduler_variants(row, base_job):
     # runtime cannot launch.
     explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
     contiguous_modes = [True] if explicit_contiguous else [False, True]
+    warp_tile_m = base_job["tile_m"] // base_job["m_warp"]
+    # Contiguous-M sizes max_m as max(cfg.max_m, token_num*topk) (default 0 when
+    # the CSV omits max_m); dense uses cfg.max_m (default token_num). max_m is
+    # baked into the GEMM kernel_tag, so AOT must derive it per-mode exactly as
+    # grouped_moe_gfx1250 does or the precompiled kernel never gets hit.
+    contiguous_max_m = _align_max_m(
+        max(_as_int(row.get("max_m"), 0), base_job["token_num"] * base_job["topk"]),
+        warp_tile_m,
+    )
     variants = []
     for contiguous in contiguous_modes:
         variant = dict(base_job)
         variant["grouped_persistent_m"] = False
         variant["grouped_contiguous_m"] = contiguous
         variant["expert_sched_mode"] = False
+        if contiguous:
+            variant["max_m"] = contiguous_max_m
         variants.append(variant)
     return variants
 
@@ -123,10 +141,7 @@ def parse_csv(csv_path: str):
             warp_tile_m = tile_m // m_warp
             topk = int(row.get("topk") or 1)
             raw_max_m = _as_int(row.get("max_m"), token_num)
-            max_m = max(
-                warp_tile_m,
-                ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m,
-            )
+            max_m = _align_max_m(raw_max_m, warp_tile_m)
             base_job = {
                 "kernel_name": row.get("kernelName1", "grouped_gemm1"),
                 "model_dim": int(row["model_dim"]),
@@ -164,6 +179,210 @@ def parse_csv(csv_path: str):
 GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 
 
+def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contiguous):
+    """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE fast path
+    launches around gemm1/gemm2."""
+    import torch
+
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_remap_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_quant_preshuffle_module,
+        build_moe_fused_quant_preshuffle_route_ksplit_module,
+        build_moe_fused_route_quant_scatter_module,
+        build_moe_fused_route_quant_scatter_st_ksplit_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_topids_to_rows_module,
+    )
+
+    dev = torch.device("cpu")
+    i32 = torch.int32
+    u8 = torch.uint8
+    bf16 = torch.bfloat16
+    E = job["experts"]
+    topk = job["topk"]
+    model_dim = job["model_dim"]
+    inter_dim = job["inter_dim"]
+    max_m = job["max_m"]
+    tile_m = job["tile_m"]
+    token_num = max(1, job["token_num"])
+    out_dtype = job["out_dtype"]
+    numel = token_num * topk
+    grid = max(1, (numel + 255) // 256)
+
+    def _route_ksplit(feat_dim, source_topk, out_e, out_m):
+        # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
+        # sets remap_rows on the grouped MoE fast path (row_starts stays None).
+        launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            source_topk=source_topk,
+            remap_rows=False,
+        )
+        launch(
+            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            1,
+            numel,
+            grid,
+            stream=0,
+        )
+
+    def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding):
+        launch = build_moe_fused_quant_preshuffle_module(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            skip_padding=skip_padding,
+        )
+        n_rows = out_e * out_m
+        launch(
+            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            n_rows,
+            out_m,
+            grid,
+            stream=0,
+        )
+
+    def _topids_to_rows():
+        launch = build_moe_topids_to_rows_module()
+        launch(
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            numel,
+            max_m,
+            grid,
+            stream=0,
+        )
+
+    # --- Stage1 activation prep (a1): fused route + MX-quant + scatter ---
+    if contiguous:
+        # DeepGEMM contiguous-M: topids_to_rows -> contiguous psum+remap ->
+        # route-indexed quant+preshuffle into a single contiguous (E=1) buffer.
+        ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
+        contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
+
+        _topids_to_rows()
+
+        psum_remap = build_moe_contiguous_psum_remap_module()
+        psum_remap(
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            numel,
+            E,
+            max_m,
+            tile_m,
+            stream=0,
+        )
+
+        _route_ksplit(
+            feat_dim=model_dim,
+            source_topk=topk,
+            out_e=1,
+            out_m=contiguous_m,
+        )
+        a2_out_e, a2_out_m = 1, contiguous_m
+    else:
+        # Dense masked layout (one (E, max_m, *) bucket per expert).
+        use_routeks_stage1 = token_num > 1 and topk > 1 and quant_mode == "fp4"
+        use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
+        if use_routeks_stage1:
+            _topids_to_rows()
+            _route_ksplit(
+                feat_dim=model_dim,
+                source_topk=topk,
+                out_e=E,
+                out_m=max_m,
+            )
+        else:
+            build_route = (
+                build_moe_fused_route_quant_scatter_st_ksplit_module
+                if use_st_ksplit
+                else build_moe_fused_route_quant_scatter_module
+            )
+            launch = build_route(
+                model_dim=model_dim,
+                topk=topk,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                use_expert_row_base=False,
+                max_m=max_m,
+            )
+            launch(
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                numel,
+                grid,
+                stream=0,
+            )
+        a2_out_e, a2_out_m = E, max_m
+
+    # --- Stage2 activation prep (a2): fused grouped quant + preshuffle ---
+    # Runtime passes topids_to_rows whenever route rows fit the output capacity
+    # (almost always), taking the route-ksplit path with source_topk=0; the
+    # plain skip-padding path is the rare capacity-overflow fallback.
+    capacity_rows = a2_out_e * a2_out_m
+    if numel < capacity_rows:
+        _route_ksplit(
+            feat_dim=inter_dim,
+            source_topk=0,
+            out_e=a2_out_e,
+            out_m=a2_out_m,
+        )
+    else:
+        # masked_m is None on the contiguous path -> skip_padding=False;
+        # passed on the dense path -> skip_padding=True.
+        _plain_preshuffle(
+            feat_dim=inter_dim,
+            out_e=a2_out_e,
+            out_m=a2_out_m,
+            skip_padding=not contiguous,
+        )
+
+    # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
+    # split_k mirrors stage2's split_k2: when split_k2 > 1 the GEMM emits an
+    # unreduced (split_k, E, max_m, model_dim) tensor and gather-reduce folds the
+    # split slices itself, so its kernel identity depends on split_k. Hardcoding
+    # 1 here makes the token=1 / split_k2>1 CSV rows miss the AOT cache at
+    # inference. vec width is token-count dependent at runtime; cover both so
+    # run-only coverage holds across inference batch sizes, not just the CSV token.
+    split_k = job["split_k2"]
+    for vec in (2, 4):
+        gather_reduce = build_moe_gather_reduce_module(
+            model_dim, topk, out_dtype, split_k, vec
+        )
+        gather_reduce(
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            token_num,
+            a2_out_e * a2_out_m * (model_dim // 2),
+            stream=0,
+        )
+
+
 def compile_one_config(**job):
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -176,168 +395,212 @@ def compile_one_config(**job):
     )
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
+    shape_str = (
+        # Use .get() so a missing key can't raise here, outside the try below:
+        # an escaping exception would crash the worker (exitcode != 0), which the
+        # AOT pool misreads as a transient failure and retries -> potential deadlock.
+        f"{job.get('kernel_name', 'grouped_gemm')}  "
+        f"model_dim={job.get('model_dim')} inter_dim={job.get('inter_dim')} "
+        f"E={job.get('experts')} topk={job.get('topk')} "
+        f"contiguous={bool(job.get('grouped_contiguous_m', False))}"
+    )
 
     t0 = time.time()
-    dev = torch.device("cpu")
-    dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
-    pack = 2 if job["data_format"] == "fp4" else 1
-    compiler1 = (
-        compile_moe_grouped_gemm1_mxfp4_masked
-        if job["data_format"] == "fp4"
-        else compile_moe_grouped_gemm1_a8w4_masked
-    )
-    compiler2 = (
-        compile_moe_grouped_gemm2_mxfp4_masked
-        if job["data_format"] == "fp4"
-        else compile_moe_grouped_gemm2_a8w4_masked
-    )
-    warp_tile_m = job["tile_m"] // job["m_warp"]
-    contiguous = bool(job.get("grouped_contiguous_m", False))
-    common = dict(
-        model_dim=job["model_dim"],
-        inter_dim=job["inter_dim"],
-        experts=job["experts"],
-        max_m=job["max_m"],
-        tile_m=job["tile_m"],
-        tile_n=job["tile_n"],
-        tile_k=job["tile_k"],
-        m_warp=job["m_warp"],
-        n_warp=job["n_warp"],
-        out_dtype=job["out_dtype"],
-        num_buffers=job["num_buffers"],
-        grouped_persistent_m=job["grouped_persistent_m"],
-        grouped_contiguous_m=contiguous,
-        persistent_workers=job["persistent_workers"],
-        expert_sched_mode=job["expert_sched_mode"],
-    )
-    if contiguous:
-        act_lead = 1
-        ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
-        rows = max(job["tile_m"], _align_up(ub, job["tile_m"]))
-    else:
-        act_lead = job["experts"]
-        rows = job["max_m"]
-    with (
-        compile_only_env(),
-        override_env("FLYDSL_GPU_ARCH", aot_arch),
-        FakeTensorMode(),
-    ):
-        masked_m = torch.full(
-            (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
+    try:
+        dev = torch.device("cpu")
+        dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
+        pack = 2 if job["data_format"] == "fp4" else 1
+        # Fused prep kernels quantize activations to MXFP8 for a8w4 weights.
+        quant_mode = "fp4" if job["data_format"] == "fp4" else "fp8"
+        compiler1 = (
+            compile_moe_grouped_gemm1_mxfp4_masked
+            if job["data_format"] == "fp4"
+            else compile_moe_grouped_gemm1_a8w4_masked
         )
-        # Contiguous-M layout tensor (mirrors runtime psum_t); None otherwise.
-        contiguous_layout = (
-            torch.empty((job["experts"],), dtype=torch.int32, device=dev)
-            if contiguous
-            else None
+        compiler2 = (
+            compile_moe_grouped_gemm2_mxfp4_masked
+            if job["data_format"] == "fp4"
+            else compile_moe_grouped_gemm2_a8w4_masked
         )
-        y1 = torch.empty((act_lead, rows, job["inter_dim"]), dtype=dtype)
-        x1 = torch.empty((act_lead, rows, job["model_dim"] // pack), dtype=torch.uint8)
-        w1 = torch.empty(
-            (job["experts"], 2 * job["inter_dim"], job["model_dim"] // 2),
-            dtype=torch.uint8,
+        warp_tile_m = job["tile_m"] // job["m_warp"]
+        contiguous = bool(job.get("grouped_contiguous_m", False))
+        common = dict(
+            model_dim=job["model_dim"],
+            inter_dim=job["inter_dim"],
+            experts=job["experts"],
+            max_m=job["max_m"],
+            tile_m=job["tile_m"],
+            tile_n=job["tile_n"],
+            tile_k=job["tile_k"],
+            m_warp=job["m_warp"],
+            n_warp=job["n_warp"],
+            out_dtype=job["out_dtype"],
+            num_buffers=job["num_buffers"],
+            grouped_persistent_m=job["grouped_persistent_m"],
+            grouped_contiguous_m=contiguous,
+            persistent_workers=job["persistent_workers"],
+            expert_sched_mode=job["expert_sched_mode"],
         )
-        sx1 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m)),
-            dtype=torch.uint8,
-        )
-        sw1 = torch.empty(
-            (
+        if contiguous:
+            act_lead = 1
+            ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
+            rows = max(job["tile_m"], _align_up(ub, job["tile_m"]))
+        else:
+            act_lead = job["experts"]
+            rows = job["max_m"]
+        with (
+            compile_only_env(),
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
+            masked_m = torch.full(
+                (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
+            )
+            # Contiguous-M layout tensor (mirrors runtime psum_t); None otherwise.
+            contiguous_layout = (
+                torch.empty((job["experts"],), dtype=torch.int32, device=dev)
+                if contiguous
+                else None
+            )
+            y1 = torch.empty((act_lead, rows, job["inter_dim"]), dtype=dtype)
+            x1 = torch.empty(
+                (act_lead, rows, job["model_dim"] // pack), dtype=torch.uint8
+            )
+            w1 = torch.empty(
+                (job["experts"], 2 * job["inter_dim"], job["model_dim"] // 2),
+                dtype=torch.uint8,
+            )
+            sx1 = torch.empty(
+                (
+                    act_lead,
+                    *_preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m),
+                ),
+                dtype=torch.uint8,
+            )
+            sw1 = torch.empty(
+                (
+                    job["experts"],
+                    *_preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
+                ),
+                dtype=torch.uint8,
+            )
+            y2 = torch.empty((act_lead, rows, job["model_dim"]), dtype=dtype)
+            x2 = torch.empty(
+                (act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8
+            )
+            w2 = torch.empty(
+                (job["experts"], job["model_dim"], job["inter_dim"] // 2),
+                dtype=torch.uint8,
+            )
+            sx2 = torch.empty(
+                (
+                    act_lead,
+                    *_preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m),
+                ),
+                dtype=torch.uint8,
+            )
+            sw2 = torch.empty(
+                (
+                    job["experts"],
+                    *_preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
+                ),
+                dtype=torch.uint8,
+            )
+            exe1 = compiler1(
+                act=job["act"],
+                stage1_weight_layout=job["stage1_weight_layout"],
+                split_k=job["split_k1"],
+                **common,
+            )
+            exe1(
+                y1,
+                x1,
+                w1,
+                sx1,
+                sw1,
+                masked_m,
+                job["max_m"],
+                job["inter_dim"],
+                job["model_dim"],
                 job["experts"],
-                *_preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
-            ),
-            dtype=torch.uint8,
-        )
-        y2 = torch.empty((act_lead, rows, job["model_dim"]), dtype=dtype)
-        x2 = torch.empty((act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8)
-        w2 = torch.empty(
-            (job["experts"], job["model_dim"], job["inter_dim"] // 2),
-            dtype=torch.uint8,
-        )
-        sx2 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m)),
-            dtype=torch.uint8,
-        )
-        sw2 = torch.empty(
-            (
+                stream=0,
+                _m_tile_map=contiguous_layout,
+            )
+            # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
+            # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
+            # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
+            # bias-free kernel so neither path JITs at first inference.
+            bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
+            exe1(
+                y1,
+                x1,
+                w1,
+                sx1,
+                sw1,
+                masked_m,
+                job["max_m"],
+                job["inter_dim"],
+                job["model_dim"],
                 job["experts"],
-                *_preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
-            ),
-            dtype=torch.uint8,
-        )
-        exe1 = compiler1(
-            act=job["act"],
-            stage1_weight_layout=job["stage1_weight_layout"],
-            split_k=job["split_k1"],
-            **common,
-        )
-        exe1(
-            y1,
-            x1,
-            w1,
-            sx1,
-            sw1,
-            masked_m,
-            job["max_m"],
-            job["inter_dim"],
-            job["model_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-        )
-        # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
-        # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
-        # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
-        # bias-free kernel so neither path JITs at first inference.
-        bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
-        exe1(
-            y1,
-            x1,
-            w1,
-            sx1,
-            sw1,
-            masked_m,
-            job["max_m"],
-            job["inter_dim"],
-            job["model_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-            bias=bias1,
-        )
-        exe2 = compiler2(split_k=job["split_k2"], **common)
-        exe2(
-            y2,
-            x2,
-            w2,
-            sx2,
-            sw2,
-            masked_m,
-            job["max_m"],
-            job["model_dim"],
-            job["inter_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-        )
-        # Bias-epilogue variant for stage2 (gemm2_bias_*); see stage1 note above.
-        bias2 = torch.empty((job["experts"], job["model_dim"]), dtype=dtype)
-        exe2(
-            y2,
-            x2,
-            w2,
-            sx2,
-            sw2,
-            masked_m,
-            job["max_m"],
-            job["model_dim"],
-            job["inter_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-            bias=bias2,
-        )
-    return {**job, "compile_time": time.time() - t0, "compile_arch": aot_arch}
+                stream=0,
+                _m_tile_map=contiguous_layout,
+                bias=bias1,
+            )
+            exe2 = compiler2(split_k=job["split_k2"], **common)
+            exe2(
+                y2,
+                x2,
+                w2,
+                sx2,
+                sw2,
+                masked_m,
+                job["max_m"],
+                job["model_dim"],
+                job["inter_dim"],
+                job["experts"],
+                stream=0,
+                _m_tile_map=contiguous_layout,
+            )
+            # Bias-epilogue variant for stage2 (gemm2_bias_*); see stage1 note above.
+            bias2 = torch.empty((job["experts"], job["model_dim"]), dtype=dtype)
+            exe2(
+                y2,
+                x2,
+                w2,
+                sx2,
+                sw2,
+                masked_m,
+                job["max_m"],
+                job["model_dim"],
+                job["inter_dim"],
+                job["experts"],
+                stream=0,
+                _m_tile_map=contiguous_layout,
+                bias=bias2,
+            )
+            # Non-GEMM auxiliary kernels the run-only fast path launches around
+            # the GEMMs (fused route+quant+scatter, grouped quant+preshuffle,
+            # contiguous prefix-sum(+remap), gather-reduce). These were fused in
+            # gfx1250_moe_splitk_fused, so AOT mirrors the new wrappers, not the
+            # legacy route_maps/scatter_copy kernels.
+            _compile_grouped_moe_aux_kernels(
+                job,
+                dtype=dtype,
+                quant_mode=quant_mode,
+                wmma_rep=warp_tile_m // 16,
+                contiguous=contiguous,
+            )
+        elapsed = time.time() - t0
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
+        return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
+    except Exception as e:
+        # Catch everything and return cleanly with compile_time=None: the AOT pool
+        # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
+        # NOT retry it. An escaping exception crashes the worker (exitcode != 0),
+        # which the pool misreads as a transient failure and retries -> deadlock.
+        print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
+        traceback.print_exc()
+        return {**job, "compile_time": None, "compile_arch": aot_arch}
 
 
 def main(argv=None):
