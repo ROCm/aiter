@@ -64,39 +64,28 @@ concurrency:
 permissions:
   contents: read
 
-jobs:
-  atom-di-ci-smoke:
-    runs-on: [self-hosted, aiter-di-ci-spur-login]
-    timeout-minutes: 420
-    env:
-      ATOM_REF: zwan/mesh-model-ci-spur
-      ATOMESH_IMAGE: rocm/atom-dev:latest
-      ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO: /data/models2/DeepSeek-V4-Pro
-      ATOMESH_LOG_ROOT: /data/xinhuang/spur_dsv4_logs
-      ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
-      ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
-      ATOMESH_SLURM_ACCOUNT: ""
-      ATOMESH_SLURM_PARTITION: ""
-      ATOMESH_MODEL_ROOT: /data/models2
-      ATOMESH_1P1D_NODES: ""
-      ATOMESH_2P1D_NODES: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
-      ISL_LIST: "8192"
-      OSL: "1"
-      CONC_LIST: "2"
-    steps:
-      - name: Show runner and Spur-compatible Slurm state
-        run: |
-          set -euo pipefail
-          hostname
-          whoami
-          pwd
-          command -v sbatch
-          sbatch --version || true
-          command -v squeue
-          squeue --help | head -80 || true
-          command -v scancel
-          command -v spur && spur --help | head -120 || true
+env:
+  ATOM_REF_DEFAULT: zwan/mesh-model-ci-spur
+  ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
+  ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
+  ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
+  ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
+  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
+  ISL_LIST_DEFAULT: "8192"
+  OSL_DEFAULT: "1"
+  CONC_LIST_DEFAULT: "2"
+  ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
+  ATOMESH_SLURM_ACCOUNT: ""
+  ATOMESH_SLURM_PARTITION: ""
+  ATOMESH_MODEL_ROOT: /data/models2
+  ATOMESH_1P1D_NODES: ""
 
+jobs:
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      cell_id: ${{ steps.cell.outputs.cell_id }}
+    steps:
       - name: Apply ATOM DI smoke inputs
         run: |
           set -euo pipefail
@@ -110,34 +99,26 @@ jobs:
 
           inputs = event.get("inputs") or {}
 
-          def value(name: str, default: str) -> str:
+          def value(name: str, default_env: str) -> str:
               raw = inputs.get(name, "")
+              default = os.environ[default_env]
               return raw if raw not in ("", None) else default
 
-          atom_ref = value("atom_ref", "zwan/mesh-model-ci-spur")
-          image = value("atomesh_image", "rocm/atom-dev:latest")
-          model_path = value("model_path", "/data/models2/DeepSeek-V4-Pro")
-          log_root = value("log_root", "/data/xinhuang/spur_dsv4_logs")
-          shared_workspace_root = value(
-              "shared_workspace_root", "/data/xinhuang/atomesh-ci"
+          print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
+          print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
+          print(
+              "ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO="
+              + value("model_path", "ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT")
           )
-          node_list = value(
-              "spur_nodelist",
-              "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15",
+          print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
+          print(
+              "ATOMESH_SHARED_WORKSPACE_ROOT="
+              + value("shared_workspace_root", "ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT")
           )
-          isl_list = value("isl_list", "8192")
-          osl = value("osl", "1")
-          conc_list = value("conc_list", "2")
-
-          print(f"ATOM_REF={atom_ref}")
-          print(f"ATOMESH_IMAGE={image}")
-          print(f"ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO={model_path}")
-          print(f"ATOMESH_LOG_ROOT={log_root}")
-          print(f"ATOMESH_SHARED_WORKSPACE_ROOT={shared_workspace_root}")
-          print(f"ATOMESH_2P1D_NODES={node_list}")
-          print(f"ISL_LIST={isl_list}")
-          print(f"OSL={osl}")
-          print(f"CONC_LIST={conc_list}")
+          print(f"ATOMESH_2P1D_NODES={value('spur_nodelist', 'ATOMESH_2P1D_NODES_DEFAULT')}")
+          print(f"ISL_LIST={value('isl_list', 'ISL_LIST_DEFAULT')}")
+          print(f"OSL={value('osl', 'OSL_DEFAULT')}")
+          print(f"CONC_LIST={value('conc_list', 'CONC_LIST_DEFAULT')}")
           PY
 
       - name: Checkout ATOM PR 1475 source
@@ -194,6 +175,7 @@ jobs:
         run: python3 -m pip install pyyaml
 
       - name: Build DeepSeek-V4-Pro 2P1D benchmark cell
+        id: cell
         run: |
           set -euo pipefail
           cd ATOM
@@ -261,7 +243,54 @@ jobs:
               encoding="utf-8",
           )
           print(json.dumps(cell, indent=2))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"cell_id={cell['id']}\n")
           PY
+
+      - name: Package patched ATOM source
+        run: tar -C ATOM -czf atom-source.tar.gz .
+
+      - name: Upload ATOMesh smoke config
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-di-ci-smoke-config
+          path: |
+            atomesh-cell.json
+            atomesh-matrix.json
+            atom-source.tar.gz
+
+  atom-di-ci-smoke:
+    needs: [load-config]
+    runs-on: [self-hosted, aiter-di-ci-spur-login]
+    timeout-minutes: 420
+    env:
+      ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
+    steps:
+      - name: Show runner and Spur-compatible Slurm state
+        run: |
+          set -euo pipefail
+          hostname
+          whoami
+          pwd
+          command -v sbatch
+          sbatch --help | head -80 || true
+          command -v squeue
+          squeue --help | head -80 || true
+          command -v scancel
+          command -v spur && spur --help | head -120 || true
+
+      - name: Download ATOMesh smoke config
+        uses: actions/download-artifact@v4
+        with:
+          name: atom-di-ci-smoke-config
+
+      - name: Unpack patched ATOM source
+        run: |
+          set -euo pipefail
+          rm -rf ATOM
+          mkdir -p ATOM
+          tar -C ATOM -xzf atom-source.tar.gz
 
       - name: Run ATOMesh benchmark cell via PR 1475 submitter
         run: |
