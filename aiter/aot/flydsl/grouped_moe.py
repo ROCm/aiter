@@ -390,21 +390,30 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     # inference. vec width is token-count dependent at runtime; cover both so
     # run-only coverage holds across inference batch sizes, not just the CSV token.
     split_k = job["split_k2"]
+    # Route weights are fed to the epilogue in their native dtype (see
+    # flydsl_moe_gather_reduce). Pre-compile both the f32 and bf16 weight
+    # variants so inference hits the AOT cache regardless of the caller's
+    # topk_weight dtype, instead of recompiling one at runtime.
+    # out_dtype is "bf16"/"f16"; `dtype` is its matching torch dtype.
+    w_dtype_to_torch = {"f32": torch.float32, out_dtype: dtype}
     for vec in (2, 4):
-        gather_reduce = build_moe_gather_reduce_module(
-            model_dim, topk, out_dtype, split_k, vec
-        )
-        gather_reduce(
-            torch.empty(
-                (split_k * a2_out_e * a2_out_m, model_dim), dtype=dtype, device=dev
-            ),
-            torch.empty((token_num, topk), dtype=i32, device=dev),
-            torch.empty((token_num, topk), dtype=dtype, device=dev),
-            torch.empty((token_num, model_dim), dtype=dtype, device=dev),
-            token_num,
-            a2_out_e * a2_out_m * (model_dim // 2),
-            stream=0,
-        )
+        for w_dtype, w_torch in w_dtype_to_torch.items():
+            gather_reduce = build_moe_gather_reduce_module(
+                model_dim, topk, out_dtype, split_k, vec, w_dtype
+            )
+            gather_reduce(
+                torch.empty(
+                    (split_k * a2_out_e * a2_out_m, model_dim),
+                    dtype=dtype,
+                    device=dev,
+                ),
+                torch.empty((token_num, topk), dtype=i32, device=dev),
+                torch.empty((token_num, topk), dtype=w_torch, device=dev),
+                torch.empty((token_num, model_dim), dtype=dtype, device=dev),
+                token_num,
+                a2_out_e * a2_out_m * (model_dim // 2),
+                stream=0,
+            )
 
 
 def compile_one_config(**job):

@@ -1089,10 +1089,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
         _grouped_dbg("start gather-reduce output")
+        # Feed route weights to the epilogue in their native dtype: the kernel
+        # picks the matching weight-load path (f32/bf16/f16) from gather_w.dtype
+        # and always accumulates in f32. Forcing a dtype here would insert a
+        # pointless fp32<->bf16 copy kernel between gemm2 and gather-reduce.
+        # .contiguous() is a no-op when already contiguous (the common case).
         gather_w = (
-            torch.ones((token_num, topk), dtype=dtype, device=device)
+            torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
             if doweight_stage1
-            else topk_weight.to(dtype)
+            else topk_weight.contiguous()
         )
         flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
         _grouped_dbg("gather-reduce output done")
@@ -1165,6 +1170,7 @@ def _get_compiled_gather_reduce(
     out_dtype: str,
     split_k: int = 1,
     vec_dwords: int = 2,
+    w_dtype: str = "f32",
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -1172,7 +1178,7 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
     )
 
 
@@ -1359,10 +1365,14 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
 def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
     topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
-    gather_w: torch.Tensor,  # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
+    gather_w: torch.Tensor,  # (token_num, topk) route weight, f32/bf16/f16
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]]."""
+    """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
+
+    ``gather_w`` may be f32 (native route weights, no host-side cast) or match
+    ``grouped_out``'s bf16/f16; the kernel accumulates in f32 either way.
+    """
     if grouped_out.dim() == 4:
         split_k, E, max_m, model_dim = grouped_out.shape
     else:
@@ -1376,6 +1386,16 @@ def flydsl_moe_gather_reduce(
         out_dtype = "f16"
     else:
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
+    if gather_w.dtype == torch.float32:
+        w_dtype = "f32"
+    elif gather_w.dtype == torch.bfloat16:
+        w_dtype = "bf16"
+    elif gather_w.dtype == torch.float16:
+        w_dtype = "f16"
+    else:
+        raise ValueError(
+            f"unsupported gather_w dtype {gather_w.dtype}; need f32/bf16/f16"
+        )
 
     grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
     if out is None:
@@ -1385,7 +1405,7 @@ def flydsl_moe_gather_reduce(
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec
+        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     launch(
