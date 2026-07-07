@@ -8,8 +8,8 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from .quant import get_dtype_max
 from typing import Optional
 
-# opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
-# shuffle_scale quant and exotic dtypes fall back to module_rmsnorm_quant.
+# opus (module_rmsnorm) is the sole rmsnorm backend for every path -- plain norm,
+# fused-add, and dynamic/smooth/grouped/MXFP4 quant (fp16/bf16/fp32, any hidden).
 _DTYPE_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 
 
@@ -543,7 +543,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
                 use_model_sensitive_rmsnorm,
             )
     else:
-        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        # grouped / shuffle quant runs on the opus arq kernel (n<=8192).
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm add_dynamicquant supports hidden<=8192"
@@ -561,7 +561,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
 
 # ---------------------------------------------------------------------------
-# module_rmsnorm_quant surface, now served by opus (add_rmsnorm_quant_opus).
+# The former module_rmsnorm_quant API surface, now served by opus (add_rmsnorm_quant_opus).
 # out_code: -1 no-quant, 0 int8, 1 fp8, 2 fp4x2. Grouped/shuffle/fp4 + strided.
 # ---------------------------------------------------------------------------
 @compile_ops("module_rmsnorm", fc_name="add_rmsnorm_quant_opus_raw", ffi_type="ctypes")

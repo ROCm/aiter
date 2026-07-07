@@ -1075,7 +1075,6 @@ def _get_ck_exclude_modules():
         "module_pa_metadata",
         "module_ps_metadata",
         "module_quant",
-        "module_rmsnorm_quant",
         "module_rope_1c_uncached_fwd",
         "module_rope_1c_uncached_bwd",
         "module_rope_2c_uncached_fwd",
