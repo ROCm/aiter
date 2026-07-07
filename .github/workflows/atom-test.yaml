@@ -84,9 +84,9 @@ jobs:
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
-              # Kimi-K2.5 ATOM (in-tree) downstream gate. Config (model_path,
+              # Kimi-K2.7 ATOM (in-tree) downstream gate. Config (model_path,
               # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
-              {"model_name": "Kimi-K2.5-MXFP4"},
+              {"model_name": "Kimi-K2.7-Code-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -104,10 +104,10 @@ jobs:
               "linux-atom-mi35x-1": "linux-aiter-do-mi350x-1",
           }
 
-          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.5
+          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.7
           # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
           model_runner_overrides = {
-              "Kimi-K2.5-MXFP4": "linux-aiter-do-mi350x-4",
+              "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-4",
               "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
               "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
               "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-2",     # -tp 2 (MXFP4)
