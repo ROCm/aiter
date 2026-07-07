@@ -153,22 +153,26 @@ def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tens
     return scales
 
 
-def shuffle_scale_gemm_e8m0(scales: torch.Tensor) -> torch.Tensor:
+def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch=None) -> torch.Tensor:
     """MXFP4 e8m0 block-scale preshuffle, built on the ``shuffle_scale_gemm``
     reshape/permute structure. Drop-in for ``aiter.ops.shuffle.shuffle_scale``
     (non-``guinterleave``) / ``fp4_utils.e8m0_shuffle``.
 
-    ``e8m0_shuffle`` pads the ``(M, K_groups)`` scale to ``M`` a multiple of 256
-    and ``K_groups`` a multiple of 8, then applies a fixed row-``(2, 16)`` /
-    K-``(2, 4)`` tile permute. That permute is *byte-identical* to the gfx950
-    GEMM scale tile ``shuffle_scale_gemm(..., preshuffle_factor=32,
-    scale_kwidth=8)`` -- both map source ``(m, n)`` to flat offset
-    ``e1 + e4*2 + e2*4 + e5*64 + (n//8)*256 + (m//32)*(N_pad*32)`` with
-    ``e1=(m%32)//16, e2=(m%32)%16, e4=(n%8)//4, e5=(n%8)%4`` -- so we reuse it.
+    Arch-aware. The GEMM scale tile differs per arch (same split as
+    ``shuffle_scale_gemm``), so the tile parameters and the ``(M, K_groups)``
+    padding are selected from ``arch`` (defaulting to ``get_arch()``):
 
-    The e8m0 layout is arch-independent (it is *not* the gfx1250 GEMM tile),
-    so ``arch`` is pinned to ``"gfx950"`` rather than queried. Returns the
-    padded ``(M_pad, K_groups_pad)`` view, matching ``e8m0_shuffle``.
+    * gfx950:  ``preshuffle_factor = 32``, ``scale_kwidth = 8`` -- byte-identical
+      to the reference ``fp4_utils.e8m0_shuffle`` (row-``(2,16)`` / K-``(2,4)``).
+    * gfx1250: ``preshuffle_factor = 16``, ``scale_kwidth = 4`` -- the gfx1250
+      WMMA GEMM scale tile.
+
+    The column padding is a multiple of ``scale_kwidth`` (8 on gfx950, matching
+    the reference; 4 on gfx1250). The row padding is a multiple of 256, which is
+    the reference gfx950 M-tile and is divisible by both preshuffle factors, so
+    the tile reshape is valid on either arch. Returns the padded
+    ``(M_pad, K_groups_pad)`` view; the consumer (``gemm_a4w4_quant``) re-collapses
+    it by ``preshuffle_factor``, so load-time tile and forward collapse now agree.
     """
     if scales is None:
         return scales
@@ -176,14 +180,23 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor) -> torch.Tensor:
         return scales
     assert scales.ndim == 2, "scale must be a 2D tensor"
 
+    arch = arch or get_arch()
+    if arch == "gfx1250":
+        preshuffle_factor, scale_kwidth = 16, 4
+    else:
+        preshuffle_factor, scale_kwidth = 32, 8
+
     m, n = scales.shape
     m_pad = (m + 255) // 256 * 256
-    n_pad = (n + 7) // 8 * 8
+    n_pad = (n + scale_kwidth - 1) // scale_kwidth * scale_kwidth
     padded = torch.empty((m_pad, n_pad), dtype=scales.dtype, device=scales.device)
     padded[:m, :n] = scales
 
     tiled = shuffle_scale_gemm(
-        padded, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        padded,
+        arch=arch,
+        preshuffle_factor=preshuffle_factor,
+        scale_kwidth=scale_kwidth,
     )
     return tiled.reshape(m_pad, n_pad)
 
