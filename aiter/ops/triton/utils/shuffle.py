@@ -181,10 +181,8 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch=None) -> torch.Tensor:
     assert scales.ndim == 2, "scale must be a 2D tensor"
 
     arch = arch or get_arch()
-    if arch == "gfx1250":
-        preshuffle_factor, scale_kwidth = 16, 4
-    else:
-        preshuffle_factor, scale_kwidth = 32, 8
+    preshuffle_factor = mxfp4_scale_preshuffle_factor(arch)
+    scale_kwidth = 4 if arch == "gfx1250" else 8
 
     m, n = scales.shape
     m_pad = (m + 255) // 256 * 256
@@ -199,6 +197,64 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch=None) -> torch.Tensor:
         scale_kwidth=scale_kwidth,
     )
     return tiled.reshape(m_pad, n_pad)
+
+
+# --- MXFP4 preshuffle GEMM operand prep (consumed by ATOM gemm_a4w4_quant) ---
+
+# MXFP4 block/group size; also the gfx950 (CDNA4) scale preshuffle factor.
+_MXFP4_BLOCK_SIZE = 32
+
+
+def mxfp4_scale_preshuffle_factor(arch=None) -> int:
+    """Per-arch e8m0 scale preshuffle (collapse) factor for the MXFP4 preshuffle
+    GEMM: 16 on gfx1250 (WMMA tiles both M and N in 16-lane groups), 32 elsewhere
+    (gfx950 CDNA4). Applies to BOTH the activation (M-axis) and weight (N-axis)
+    scales, and must match the tile emitted by ``shuffle_scale_gemm_e8m0``.
+    """
+    return 16 if (arch or get_arch()) in ("gfx1250",) else _MXFP4_BLOCK_SIZE
+
+
+def collapse_mxfp4_gemm_scale(scale, rows_valid=None, arch=None):
+    """Re-collapse an un-collapsed ``(rows_pad, kgroups_pad)`` e8m0 scale (as
+    produced by ``shuffle_scale_gemm_e8m0``) into the packed layout the preshuffle
+    GEMM consumes, by the arch preshuffle factor (``mxfp4_scale_preshuffle_factor``).
+
+    ``rows_valid`` (the activation M): when provided and smaller than the MXFP4
+    block size, the padded rows are sliced to ``[:rows_valid]`` rather than
+    collapsed (the small-M activation case). Weight scales pass ``rows_valid=None``
+    to always collapse.
+    """
+    scale = scale.view(torch.uint8)
+    if rows_valid is not None and rows_valid < _MXFP4_BLOCK_SIZE:
+        return scale[:rows_valid, ...]
+    pf = mxfp4_scale_preshuffle_factor(arch)
+    return scale.view(scale.shape[0] // pf, -1)
+
+
+def quant_mxfp4_act_preshuffle(x, params_dtype, m, arch=None):
+    """Arch-aware online MXFP4 activation quant for the preshuffle GEMM path.
+
+    Returns ``(x, x_scale)`` with ``x_scale`` already collapsed by the arch
+    preshuffle factor, ready for ``gemm_afp4wfp4_preshuffle``.
+
+    ``get_hip_quant``'s built-in scale shuffle is gfx950-pinned
+    (``per_1x32_mx_quant_hip`` pads to the 32/8 tile, no arch branch). On gfx1250
+    we quantize WITHOUT that shuffle and apply the arch-aware e8m0 tile (16/4) via
+    ``shuffle_scale_gemm_e8m0``, so the activation scale matches the gfx1250 GEMM
+    instead of arriving in the gfx950 layout.
+    """
+    from aiter import QuantType, get_hip_quant
+
+    arch = arch or get_arch()
+    quant_func = get_hip_quant(QuantType.per_1x32)
+    if arch in ("gfx1250",) and m >= _MXFP4_BLOCK_SIZE:
+        x, x_scale = quant_func(x, quant_dtype=params_dtype, shuffle=False)
+        x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch=arch)
+    else:
+        x, x_scale = quant_func(
+            x, quant_dtype=params_dtype, shuffle=(m >= _MXFP4_BLOCK_SIZE)
+        )
+    return x, collapse_mxfp4_gemm_scale(x_scale, rows_valid=m, arch=arch)
 
 
 # --- MoE MX scales (a8w4 / a8w8 / a16w4 / a4w4) ---
