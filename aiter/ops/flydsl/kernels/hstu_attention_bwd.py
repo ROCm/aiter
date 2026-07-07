@@ -241,6 +241,8 @@ def build_hstu_attention_bwd(
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
     K_STEPS_K = HEAD_DIM_K // MFMA_K  # padded steps (streamed Q side)
     D_CHUNKS = hidden_dim // MFMA_M  # dV accumulator / GEMM2 chunks
+    DK_STEPS = hidden_dim // MFMA_K  # dA contraction steps (over hidden d)
+    HC_CHUNKS = head_dim // MFMA_M  # dK accumulator chunks (over head_dim)
 
     num_kv_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
     hz_per_group = (batch * num_heads) // NUM_GRID_GROUPS
@@ -281,10 +283,12 @@ def build_hstu_attention_bwd(
     def hstu_attention_bwd(
         q: fx.Tensor,
         k: fx.Tensor,
+        v: fx.Tensor,
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
         dv: fx.Tensor,
+        dk: fx.Tensor,
     ) -> None:
         elem_type = elem_dtype.ir_type
         compute_type = fx.Float32.ir_type
@@ -326,7 +330,8 @@ def build_hstu_attention_bwd(
 
             return load
 
-        k_load = grouped_loader(k, head_dim, MFMA_LANE_K)  # resident K (B-operand)
+        k_load = grouped_loader(k, head_dim, MFMA_LANE_K)  # resident K (B-operand for S)
+        v_load = grouped_loader(v, hidden_dim, MFMA_LANE_K)  # resident V (B-operand for dA)
         do_load = grouped_loader(do, hidden_dim, VEC_DO)  # streamed dO register prefetch
 
         q_head_offset = head_idx * fx.Int32(head_dim)
@@ -353,7 +358,7 @@ def build_hstu_attention_bwd(
             kv_rows.append(local)
             kv_in_bounds.append(local < seq_len)
 
-        # ---- Resident K B-operand packs (per owned KV sub-tile) ----
+        # ---- Resident K B-operand packs (per owned KV sub-tile), for GEMM1 S = Q*K^T ----
         k_packs = []  # k_packs[ks][og]
         for ks in range_constexpr(K_STEPS):
             k_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
@@ -363,6 +368,18 @@ def build_hstu_attention_bwd(
                 raw = k_load(fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_LANE_K)).ir_value()
                 per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
             k_packs.append(per_og)
+
+        # ---- Resident V B-operand packs (per owned KV sub-tile), for dA = dO*V^T ----
+        # b_pack[i] = V[kv = lane_mod_16, d = ks*16 + lane_div_16*4 + i]; contraction over d.
+        v_packs = []  # v_packs[ks][og]
+        for ks in range_constexpr(DK_STEPS):
+            v_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+            per_og = []
+            for og in range_constexpr(KV_OWNED_SUBTILES):
+                safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
+                raw = v_load(fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_LANE_K)).ir_value()
+                per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
+            v_packs.append(per_og)
 
         def _fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=arith.FastMathFlags.fast)
@@ -374,16 +391,29 @@ def build_hstu_attention_bwd(
         c_inv_n = fx.Float32(1.0 / max_seq_len)
         c_neg_log2e = fx.Float32(-_LOG2E)
         c_one_f = fx.Float32(1.0)
+        c_neg_one_f = fx.Float32(-1.0)
         c_zero_f = fx.Float32(0.0)
 
-        def silu_scale_batch(s_list):
-            """silu(alpha*s); 1/N hoisted to the dV epilogue (mirrors forward)."""
+        def silu_and_grad_batch(s_list):
+            """Return (silu(alpha*s), silu'(alpha*s)) for a list of raw scores s.
+
+            With sc = alpha*s, sig = sigmoid(sc):
+              silu = sc*sig
+              silu' = sig*(1 + sc*(1 - sig))     (the SiLU derivative w.r.t. sc)
+            Uses the same fast exp2/rcp sigmoid as the forward so numerics match.
+            1/N is applied later (dV epilogue for P; dS gate for silu').
+            """
             sc = [_fmul(s, c_alpha) for s in s_list]
             tt = [_fmul(s, c_neg_log2e) for s in sc]
             emu = [llvm.call_intrinsic(compute_type, "llvm.amdgcn.exp2.f32", [t], [], []) for t in tt]
             den = [_fadd(c_one_f, e) for e in emu]
             sig = [llvm.call_intrinsic(compute_type, "llvm.amdgcn.rcp.f32", [d], [], []) for d in den]
-            return [_fmul(sc[i], sig[i]) for i in range(len(s_list))]
+            silu = [_fmul(sc[i], sig[i]) for i in range(len(s_list))]
+            grad = [
+                _fmul(sig[i], _fadd(c_one_f, _fmul(sc[i], _fadd(c_one_f, _fmul(c_neg_one_f, sig[i])))))
+                for i in range(len(s_list))
+            ]
+            return silu, grad
 
         def pack_p(vals):
             if is_bf16:
@@ -409,7 +439,9 @@ def build_hstu_attention_bwd(
         n_q_tiles = (q_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
         q_tile_start = kv_start_row // fx.Int32(BLOCK_N)
 
-        N_ACC = D_CHUNKS * KV_OWNED_SUBTILES
+        N_ACC_DV = D_CHUNKS * KV_OWNED_SUBTILES  # dV accumulators
+        N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES  # dK accumulators
+        N_ACC = N_ACC_DV + N_ACC_DK  # loop-carried [dV..., dK...]
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         # ---- Streamed Q DMA: global -> LDS (dword, swizzled) ----
@@ -477,13 +509,19 @@ def build_hstu_attention_bwd(
                 packs.append(Vec.load(mfma_pack_type, q_smem.get(), [fx.Index(q_row), fx.Index(q_swz_col(q_row, q_col))]))
             return packs
 
-        def compute_p_tile(q_start, q_packs_by_ng):
-            """GEMM1 for one streamed-query tile; returns P packs [ng][og].
+        def compute_s_tile(q_start, q_packs_by_ng):
+            """GEMM1 for one streamed-query tile.
+
+            Returns (p_packs, s_meta):
+              - p_packs[ng][og]: packed P = mask .* silu(alpha*S)  (GEMM2 A-operand for dV)
+              - s_meta[ng][og] = (grad_vals[4], keep[4]): the SiLU-derivative gate and mask,
+                retained so dS = keep .* (1/N) .* grad .* dA can be formed after dO publishes.
 
             C fragment C[m=q, n=kv]: value[i] -> (q = ng*16 + lane_div_16*4 + i,
             kv = og*16 + lane_mod_16). Mask keeps (q >= kv) or diagonal.
             """
             p_packs = [[None for _ in range_constexpr(KV_OWNED_SUBTILES)] for _ in range_constexpr(Q_STREAM_SUBTILES)]
+            s_meta = [[None for _ in range_constexpr(KV_OWNED_SUBTILES)] for _ in range_constexpr(Q_STREAM_SUBTILES)]
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 q_packs = [Vec(q_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)]
                 q_base = q_start + fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
@@ -503,11 +541,14 @@ def build_hstu_attention_bwd(
                         keep = keep & q_in_seq[i] & kv_in_bounds[og]
                         return keep
 
-                    s_vals = [keep_row(i).select(s_vals[i], c_zero_f) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                    p_packs[ng][og] = pack_p(silu_scale_batch(s_vals))
-            return p_packs
+                    keep = [keep_row(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                    silu_vals, grad_vals = silu_and_grad_batch(s_vals)
+                    p_vals = [keep[i].select(silu_vals[i], c_zero_f) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                    p_packs[ng][og] = pack_p(p_vals)
+                    s_meta[ng][og] = (grad_vals, keep)
+            return p_packs, s_meta
 
-        # ==== GEMM2: P^T(reused frag) * dO -> dV ====
+        # ==== GEMM2 (dV): P^T(reused frag) * dO -> dV ====
         def accum_dv_tile(dv_acc, p_packs):
             """dV[kv, d] += P^T[kv, q] * dO[q, d]. A = P frag, B = dO[q, d]."""
             for c in range_constexpr(D_CHUNKS):
@@ -527,46 +568,106 @@ def build_hstu_attention_bwd(
                     dv_acc[acc_off] = cur
             return dv_acc
 
+        # ==== dA = dO * V^T; dS = keep .* (1/N) .* silu' .* dA -> packed dS frag ====
+        def read_do_a_packs(ng):
+            """dO A-operand packs for dA: a_pack[i] = dO[q = ng*16 + lane_mod_16,
+            d = ks*16 + lane_div_16*4 + i] (4 contiguous d)."""
+            q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
+            packs = []
+            for ks in range_constexpr(DK_STEPS):
+                d_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                packs.append(Vec.load(mfma_pack_type, do_smem.get(), [fx.Index(q_row), fx.Index(d_col)]))
+            return packs
+
+        def compute_ds_packs(s_meta):
+            """Form packed dS fragments [ng][og] from dA (=dO*V^T) and the retained gate/mask."""
+            ds_packs = [[None for _ in range_constexpr(KV_OWNED_SUBTILES)] for _ in range_constexpr(Q_STREAM_SUBTILES)]
+            for ng in range_constexpr(Q_STREAM_SUBTILES):
+                do_a = read_do_a_packs(ng)
+                for og in range_constexpr(KV_OWNED_SUBTILES):
+                    cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
+                    for ks in range_constexpr(DK_STEPS):
+                        cur = mfma_acc(do_a[ks].ir_value(), v_packs[ks][og], cur)
+                    da_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                    grad_vals, keep = s_meta[ng][og]
+                    ds_vals = []
+                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        gated = _fmul(_fmul(c_inv_n, grad_vals[i]), da_vals[i])
+                        ds_vals.append(keep[i].select(gated, c_zero_f))
+                    ds_packs[ng][og] = pack_p(ds_vals)
+            return ds_packs
+
+        # ==== GEMM (dK): dS^T(reused frag) * Q -> dK (alpha applied at epilogue) ====
+        def accum_dk_tile(dk_acc, ds_packs):
+            """dK[kv, hc] += dS^T[kv, q] * Q[q, hc]. A = dS frag, B = Q[q, hc]."""
+            for c in range_constexpr(HC_CHUNKS):
+                qb_packs = []
+                for ng in range_constexpr(Q_STREAM_SUBTILES):
+                    hc_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                    q_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    elems = []
+                    for i in range_constexpr(MFMA_LANE_K):
+                        q_row = q_lane + fx.Int32(i)
+                        elems.append(Vec.load(Vec.make_type(1, elem_dtype), q_smem.get(), [fx.Index(q_row), fx.Index(q_swz_col(q_row, hc_col))]))
+                    qb_packs.append(Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value())
+                for og in range_constexpr(KV_OWNED_SUBTILES):
+                    acc_off = c * KV_OWNED_SUBTILES + og
+                    cur = dk_acc[acc_off]
+                    for ng in range_constexpr(Q_STREAM_SUBTILES):
+                        cur = mfma_acc(ds_packs[ng][og], qb_packs[ng], cur)
+                    dk_acc[acc_off] = cur
+            return dk_acc
+
         do_reg_outstanding = NUM_BATCHES_DO
 
-        def run_q_tile(dv_acc, q_start):
+        def run_q_tile(dv_acc, dk_acc, q_start):
             async_load_q(q_start)
             do_vecs = async_load_do_regs(q_start)
             _waitcnt_vm_n(do_reg_outstanding)
             gpu.barrier()
             q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
-            p_packs = compute_p_tile(q_start, q_packs)
+            p_packs, s_meta = compute_s_tile(q_start, q_packs)
             _waitcnt_vm_n(0)
             store_do_regs_to_lds(do_vecs)
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_DO, 0)
-            gpu.barrier()
+            gpu.barrier()  # dO published; Q still resident in LDS for dK's B-operand
             dv_acc = accum_dv_tile(dv_acc, p_packs)
-            return dv_acc
+            ds_packs = compute_ds_packs(s_meta)
+            dk_acc = accum_dk_tile(dk_acc, ds_packs)
+            return dv_acc, dk_acc
 
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
             for q_tile, it in range(fx.Index(q_tile_start), fx.Index(n_q_tiles), fx.Index(1), init=acc_init):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-                dv_acc = [it_list[i] for i in range(N_ACC)]
+                dv_acc = [it_list[i] for i in range(N_ACC_DV)]
+                dk_acc = [it_list[N_ACC_DV + i] for i in range(N_ACC_DK)]
                 q_start = fx.Int32(q_tile) * fx.Int32(BLOCK_N)
-                dv_acc = run_q_tile(dv_acc, q_start)
-                loop_results = yield dv_acc
+                dv_acc, dk_acc = run_q_tile(dv_acc, dk_acc, q_start)
+                loop_results = yield dv_acc + dk_acc
 
-            # ---- Epilogue: store dV (1/N hoisted here) ----
-            # GEMM2 C[m=kv, n=d]: kv row = kv_wave_base + og*16 + lane_div_16*4 + e;
-            # d column = c*16 + lane_mod_16.
+            # ---- Epilogue: store dV (1/N hoisted here) and dK (alpha applied here) ----
+            # dV C[m=kv, n=d]: kv row = kv_wave_base + og*16 + lane_div_16*4 + e; d col = c*16 + lane_mod_16.
+            # dK C[m=kv, n=hc]: same kv row layout; hc col = c*16 + lane_mod_16; scaled by alpha.
             results = list(loop_results) if isinstance(loop_results, (list, tuple)) else [loop_results]
+            dv_results = results[:N_ACC_DV]
+            dk_results = results[N_ACC_DV:]
             for og in range_constexpr(KV_OWNED_SUBTILES):
                 kv_row_base = kv_wave_base + fx.Int32(og * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 for e in range_constexpr(MFMA_ELEMS_PER_LANE):
                     kv_row_e = kv_row_base + fx.Int32(e)
                     if kv_row_e < seq_len:
                         for c in range_constexpr(D_CHUNKS):
-                            ov = results[c * KV_OWNED_SUBTILES + og]
+                            ov = dv_results[c * KV_OWNED_SUBTILES + og]
                             d_col = fx.Int32(c * MFMA_M) + lane_mod_16
                             val = fx.Float32(_fmul(Vec(ov)[e], c_inv_n)).to(elem_dtype)
                             dv[fx.Int64(seq_start + kv_row_e), head_idx, d_col] = val
+                        for c in range_constexpr(HC_CHUNKS):
+                            kv_ = dk_results[c * KV_OWNED_SUBTILES + og]
+                            hc_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                            valk = fx.Float32(_fmul(Vec(kv_)[e], c_alpha)).to(elem_dtype)
+                            dk[fx.Int64(seq_start + kv_row_e), head_idx, hc_col] = valk
 
     _hstu_compile_hints = {
         "fast_fp_math": True,
@@ -577,10 +678,12 @@ def build_hstu_attention_bwd(
     def launch_hstu_attention_bwd(
         q: fx.Tensor,
         k: fx.Tensor,
+        v: fx.Tensor,
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
         dv: fx.Tensor,
+        dk: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
         allocator.finalized = False
@@ -592,10 +695,12 @@ def build_hstu_attention_bwd(
         hstu_attention_bwd(
             q,
             k,
+            v,
             do,
             seq_offsets,
             num_targets,
             dv,
+            dk,
             value_attrs={
                 "passthrough": [
                     ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],

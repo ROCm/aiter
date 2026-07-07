@@ -116,6 +116,20 @@ def test_reference_oracle_runs():
     assert torch.isfinite(dv).all()
 
 
+def test_silu_derivative_formula():
+    """Lock the SiLU-derivative gate silu'(s) = sigma(s)*(1 + s*(1-sigma(s)))
+    against torch autograd, independent of the kernel."""
+    import torch.nn.functional as F
+
+    s = torch.linspace(-8.0, 8.0, 257, dtype=torch.float64, requires_grad=True)
+    (grad_ref,) = torch.autograd.grad(F.silu(s).sum(), s)
+
+    sig = torch.sigmoid(s.detach())
+    grad_formula = sig * (1.0 + s.detach() * (1.0 - sig))
+
+    torch.testing.assert_close(grad_formula, grad_ref, atol=1e-10, rtol=1e-10)
+
+
 # --------------------------------------------------------------------------- #
 # Input validation
 # --------------------------------------------------------------------------- #
@@ -176,7 +190,7 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
         (16, 2, 128, 128, 1024),  # larger, multi-tile
     ],
 )
-def test_flydsl_bwd_dv_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, dtype):
+def test_flydsl_bwd_dv_dk_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, dtype):
     alpha = 1.0 / attn_dim * 10000
 
     q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
@@ -192,11 +206,13 @@ def test_flydsl_bwd_dv_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, d
     )
     dout = torch.randn_like(v)
 
-    _, _, dv_ref = hstu_bwd_reference(
+    _, dk_ref, dv_ref = hstu_bwd_reference(
         max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
     )
-    _, _, dv = flydsl_hstu_attention_bwd(
+    _, dk, dv = flydsl_hstu_attention_bwd(
         max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0
     )
     # Relaxed tolerance: bf16/f16 inputs + fast-math SiLU (non-IEEE) recompute.
+    # dK carries two extra matmuls (dA and dS^T Q) so it accumulates more error than dV.
     torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)

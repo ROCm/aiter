@@ -546,9 +546,9 @@ def flydsl_hstu_attention_bwd(
         **cfg,
     )
 
-    # Phase 1 computes dV only; dQ/dK are returned as zeros until Phase 2/3.
+    # Phases 1-2 compute dV and dK; dQ is returned as zeros until Phase 3.
     dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
+    dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
     nt = num_targets
@@ -561,10 +561,12 @@ def flydsl_hstu_attention_bwd(
             launcher,
             q.contiguous(),
             k.contiguous(),
+            v.contiguous(),
             dout.contiguous(),
             seq_offsets.contiguous(),
             nt.contiguous(),
             dv,
+            dk,
             fx.Stream(launch_stream),
         )
     return dq, dk, dv
