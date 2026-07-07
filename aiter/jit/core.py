@@ -872,7 +872,15 @@ def build_module(
                 "-mllvm -amdgpu-early-inline-all=true",
                 "-mllvm -amdgpu-function-calls=false",
             ]
-        if hip_version > Version("6.2.41133"):
+        # -amdgpu-coerce-illegal-types=1 miscompiles the GLM-5.2 DSA sparse-attn
+        # kernel on toolchains where the bundled hipcc's LLVM disagrees with the
+        # aiter build's expectation (vLLM-ROCm nightly): the flag is accepted by
+        # the driver (so hip_flag_checker can't catch it) but produces a runtime
+        # GPU memory-access fault at ~10k context. AITER_DISABLE_COERCE_ILLEGAL_TYPES=1
+        # opts out. Default (unset) keeps current behavior.
+        if hip_version > Version("6.2.41133") and (
+            int(os.getenv("AITER_DISABLE_COERCE_ILLEGAL_TYPES", "0")) == 0
+        ):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
