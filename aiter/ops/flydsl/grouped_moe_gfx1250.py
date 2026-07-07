@@ -545,6 +545,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tdm_as_in_prologue_req = (
             os.environ["AITER_GROUPED_GEMM_AS_PROLOGUE"] in _TRUTHY_ENV
         )
+    # gfx1250 workaround: split_k>1 routes stage1 through the raw-gemm + separate
+    # finalize/split-k-reduce path, which faults on DeepSeek shapes
+    # (moe_stage1_finalize_act ..._sk2 illegal address). Forcing split_k=1 keeps
+    # stage1 on the fused (activation-in-epilogue) path that the op-tests validate.
+    if os.environ.get("AITER_GROUPED_FORCE_SPLIT_K1", "0") in _TRUTHY_ENV:
+        split_k1 = 1
+        split_k2 = 1
+        _grouped_dbg("AITER_GROUPED_FORCE_SPLIT_K1: forcing split_k1=split_k2=1")
     # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
     # to n_warp*64 / 256 when the column is absent.
     tile_n = (
