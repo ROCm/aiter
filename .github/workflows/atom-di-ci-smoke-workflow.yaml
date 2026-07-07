@@ -157,6 +157,39 @@ jobs:
           fi
           git rev-parse HEAD
 
+      - name: Patch ATOMesh Spur submit runner label
+        run: |
+          set -euo pipefail
+          cd ATOM
+          python3 - <<'PY'
+          from pathlib import Path
+
+          old = "atomesh-cicd-mi350"
+          new = "aiter-di-ci-spur-login"
+          paths = [
+              Path(".github/scripts/atomesh/pd_matrix.py"),
+              Path(".github/scripts/atomesh/pd_submit.sh"),
+              Path(".github/workflows/atomesh-benchmark.yaml"),
+          ]
+
+          for path in paths:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              path.write_text(text.replace(old, new), encoding="utf-8")
+              print(f"{path}: replaced {count} occurrence(s)")
+
+          remaining = []
+          for path in paths:
+              if old in path.read_text(encoding="utf-8"):
+                  remaining.append(str(path))
+
+          if remaining:
+              raise SystemExit(
+                  "Failed to replace all ATOMesh Spur runner labels in: "
+                  + ", ".join(remaining)
+              )
+          PY
+
       - name: Install matrix dependencies
         run: python3 -m pip install pyyaml
 
