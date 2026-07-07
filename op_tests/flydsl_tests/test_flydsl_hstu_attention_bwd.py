@@ -190,7 +190,7 @@ def test_validate_bwd_inputs_rejects_cpu_tensors():
         (16, 2, 128, 128, 1024),  # larger, multi-tile
     ],
 )
-def test_flydsl_bwd_dv_dk_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, dtype):
+def test_flydsl_bwd_all_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, dtype):
     alpha = 1.0 / attn_dim * 10000
 
     q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
@@ -206,13 +206,14 @@ def test_flydsl_bwd_dv_dk_causal(batch, heads, attn_dim, hidden_dim, max_seq_len
     )
     dout = torch.randn_like(v)
 
-    _, dk_ref, dv_ref = hstu_bwd_reference(
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
         max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
     )
-    _, dk, dv = flydsl_hstu_attention_bwd(
+    dq, dk, dv = flydsl_hstu_attention_bwd(
         max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0
     )
     # Relaxed tolerance: bf16/f16 inputs + fast-math SiLU (non-IEEE) recompute.
-    # dK carries two extra matmuls (dA and dS^T Q) so it accumulates more error than dV.
+    # dQ/dK carry extra matmuls (dA and dS reductions) so they accumulate more error than dV.
     torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)

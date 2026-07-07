@@ -22,6 +22,9 @@ from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
     build_hstu_attention_bwd,
 )
+from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
+    build_hstu_attention_bwd_dq,
+)
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
@@ -522,7 +525,7 @@ def flydsl_hstu_attention_bwd(
         num_targets=num_targets,
     )
 
-    # Phase 1 default tile config (correctness-first; tuning lands in Phase 5).
+    # Default tile config (correctness-first; tuning/CSV plumbing lands later).
     cfg = dict(
         block_m=block_m if block_m is not None else 64,
         block_n=block_n if block_n is not None else 32,
@@ -530,7 +533,7 @@ def flydsl_hstu_attention_bwd(
         waves_per_eu=waves_per_eu if waves_per_eu is not None else 0,
     )
 
-    launcher = build_hstu_attention_bwd(
+    build_kwargs = dict(
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_dim=hidden_dim,
@@ -544,9 +547,12 @@ def flydsl_hstu_attention_bwd(
         max_seq_len=N,
         **cfg,
     )
+    # dV/dK come from the KV-owned kernel; dQ from the Q-owned kernel. Both are
+    # single-writer (no atomics): dV/dK reduce over the query index, dQ over the key index.
+    dvdk_launcher = build_hstu_attention_bwd(**build_kwargs)
+    dq_launcher = build_hstu_attention_bwd_dq(**build_kwargs)
 
-    # Phases 1-2 compute dV and dK; dQ is returned as zeros until Phase 3.
-    dq = torch.zeros_like(q)
+    dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
@@ -554,18 +560,36 @@ def flydsl_hstu_attention_bwd(
     if nt is None:
         nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
 
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    do_c = dout.contiguous()
+    so_c = seq_offsets.contiguous()
+    nt_c = nt.contiguous()
+
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
     with torch.cuda.device(q.device.index):
         _run_compiled(
-            launcher,
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            dout.contiguous(),
-            seq_offsets.contiguous(),
-            nt.contiguous(),
+            dvdk_launcher,
+            q_c,
+            k_c,
+            v_c,
+            do_c,
+            so_c,
+            nt_c,
             dv,
             dk,
+            fx.Stream(launch_stream),
+        )
+        _run_compiled(
+            dq_launcher,
+            q_c,
+            k_c,
+            v_c,
+            do_c,
+            so_c,
+            nt_c,
+            dq,
             fx.Stream(launch_stream),
         )
     return dq, dk, dv
