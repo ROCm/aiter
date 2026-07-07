@@ -541,7 +541,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
           py::arg("use_1stage"),                                                               \
-          py::arg("gemma_norm") = false);                                                      \
+          py::arg("gemma_norm")   = false,                                                     \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                  \
     m.def("fused_allreduce_rmsnorm_quant_per_group",                                            \
           &aiter::fused_allreduce_rmsnorm_quant_per_group,                                      \
           py::arg("_fa"),                                                                       \
