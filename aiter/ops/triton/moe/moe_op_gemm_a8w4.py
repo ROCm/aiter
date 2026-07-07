@@ -483,6 +483,13 @@ def moe_gemm_a8w4(
         num_blocks_n = grid_n
         grid_n = triton.cdiv(num_blocks_n, config["persistent_iters"])
     grid = grid_m * grid_n * config["split_k"]
+    # With the descriptor-walk TDM API the block offset advances past the tensor
+    # bounds on the last K tile (uneven K) or when there are fewer K tiles than
+    # pipeline buffers; clamp the descriptor in those cases.
+    if use_gluon:
+        clamp_bounds = (K % config["block_k"] != 0) or (
+            triton.cdiv(K, config["block_k"]) < config["num_buffers"]
+        )
     # launch kernel
     if use_gluon and config["use_persistent"]:
         _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
@@ -586,7 +593,7 @@ def moe_gemm_a8w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             X_SCALE_TDM=X_SCALE_TDM,
             PRESHUFFLED=preshuffled,
-            CLAMP_BOUNDS=K % config["block_k"] != 0,
+            CLAMP_BOUNDS=clamp_bounds,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
@@ -654,7 +661,7 @@ def moe_gemm_a8w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
             X_SCALE_TDM=X_SCALE_TDM,
-            CLAMP_BOUNDS=K % config["block_k"] != 0,
+            CLAMP_BOUNDS=clamp_bounds,
             num_warps=config["num_warps"],
             num_ctas=config["num_ctas"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
