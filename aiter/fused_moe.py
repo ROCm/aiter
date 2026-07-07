@@ -337,12 +337,21 @@ def fused_moe_(
 
     # fp4_bf16 INTERLEAVE: FlyDSL kernel takes raw bf16 activations and handles
     # gate+up interleave internally. Bypass CSV lookup — no tuned entries exist yet.
+    #
+    # FlyDSL INTERLEAVE is only profitable when the K-loop has enough iterations to
+    # amortise its per-iteration synchronisation overhead.  Empirically on MI355X TP=8:
+    #   - M < 32 (tile_k=128): too few MFMAs per loop body → fall back to CK-tile.
+    #   - model_dim // 256 < 20 (e.g. 3072 → 12 K-steps): too few K-tiles even at
+    #     tile_k=256 → fall back to CK-tile (e.g. GPT-OSS inter_dim=512 shapes).
+    # Both conditions must hold for FlyDSL to win; otherwise CK-tile is dispatched.
+    _flydsl_itlv_profitable = M >= 32 and model_dim // 256 >= 20
     if (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.INTERLEAVE
         and is_flydsl_available()
+        and _flydsl_itlv_profitable
     ):
         logger.info("[fused_moe] fp4_bf16 INTERLEAVE: dispatching to FlyDSL kernel")
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
@@ -1643,12 +1652,15 @@ def fused_moe_2stages(
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     # fp4_bf16 INTERLEAVE: bypass CSV lookup, use FlyDSL directly.
+    # Only profitable when K-loop depth is sufficient (see fused_moe_ comment for rationale).
+    _flydsl_itlv_profitable = token_num >= 32 and model_dim // 256 >= 20
     if (
         quant_type == QuantType.per_1x32
         and w1.dtype == dtypes.fp4x2
         and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.INTERLEAVE
         and is_flydsl_available()
+        and _flydsl_itlv_profitable
     ):
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
