@@ -2023,7 +2023,19 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
         topk_i32 = arith.constant(topk, type=i32)
         c_K_i32 = arith.constant(K, type=i32)
 
-        in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
+        # Bound input to its exact byte extent so hardware clamps out-of-range
+        # loads to 0 instead of faulting on the tail of non-64-aligned inputs.
+        elem_bytes_in = 2  # bf16 / fp16 activation
+        _in_rows_i32 = (
+            ArithValue(num_tokens_dyn) * topk_i32 if topk > 1
+            else ArithValue(num_tokens_dyn)
+        )
+        _in_nbytes_idx = arith.index_cast(
+            T.index, _in_rows_i32
+        ) * arith.constant(cols * elem_bytes_in, type=T.index)
+        in_rsrc = buffer_ops.create_buffer_resource(
+            inp, max_size=False, num_records_bytes=_in_nbytes_idx
+        )
         out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
         out_scale_rsrc = buffer_ops.create_buffer_resource(
             out_scale, max_size=True
@@ -2037,7 +2049,7 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
 
             _ptr_ty_as1 = ir.Type.parse("!llvm.ptr<1>")
             inp_base_ptr = _fly.extract_aligned_pointer_as_index(_ptr_ty_as1, inp)
-            c_in_elem_bytes_idx = arith.constant(2, type=T.index)  # bf16 / fp16
+            c_in_elem_bytes_idx = arith.constant(elem_bytes_in, type=T.index)
             cols_idx = arith.constant(cols, type=T.index)
             group_size_idx = arith.constant(FP4_GROUP_SIZE, type=T.index)
 
@@ -2092,14 +2104,15 @@ def build_per_1x32_fp4_quant_block_rotation_mfma_moe_sorting_module(
         total_rows_i32 = (
             num_tokens_i32 * topk_i32 if topk > 1 else num_tokens_i32
         )
-        # Persist only: grid-x ceil-div can overrun; clamp every global row read
-        # (no bounds check). Output still gated by store_valid (unclamped row).
+        # Clamp global row reads on the persist overrun and on use_ptr64, whose
+        # raw-pointer loads have no descriptor bound (in_rsrc guards the rest).
+        _clamp_rows = persist_m > 1 or use_ptr64
         last_valid_row_i32 = (
-            total_rows_i32 - c1_i32 if persist_m > 1 else None
+            total_rows_i32 - c1_i32 if _clamp_rows else None
         )
 
         def _clamp_row(row_i32):
-            if persist_m > 1:
+            if _clamp_rows:
                 return arith.minui(row_i32, last_valid_row_i32)
             return row_i32
 
@@ -3067,7 +3080,19 @@ def build_per_1x32_fp4_quant_block_single_rotation_mfma_moe_sorting_module(
         topk_i32 = arith.constant(topk, type=i32)
         c_K_i32 = arith.constant(K, type=i32)
 
-        in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
+        # Bound input to its exact byte extent so hardware clamps out-of-range
+        # loads to 0 instead of faulting on the tail of non-64-aligned inputs.
+        elem_bytes_in = 2  # bf16 / fp16 activation
+        _in_rows_i32 = (
+            ArithValue(num_tokens_dyn) * topk_i32 if topk > 1
+            else ArithValue(num_tokens_dyn)
+        )
+        _in_nbytes_idx = arith.index_cast(
+            T.index, _in_rows_i32
+        ) * arith.constant(cols * elem_bytes_in, type=T.index)
+        in_rsrc = buffer_ops.create_buffer_resource(
+            inp, max_size=False, num_records_bytes=_in_nbytes_idx
+        )
         out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
         out_scale_rsrc = buffer_ops.create_buffer_resource(
             out_scale, max_size=True
@@ -3081,7 +3106,7 @@ def build_per_1x32_fp4_quant_block_single_rotation_mfma_moe_sorting_module(
             inp_base_ptr = _fly.extract_aligned_pointer_as_index(
                 _ptr_ty_as1, inp
             )
-            c_in_elem_bytes_idx = arith.constant(2, type=T.index)
+            c_in_elem_bytes_idx = arith.constant(elem_bytes_in, type=T.index)
             cols_idx = arith.constant(cols, type=T.index)
             group_size_idx = arith.constant(FP4_GROUP_SIZE, type=T.index)
 
@@ -3135,14 +3160,15 @@ def build_per_1x32_fp4_quant_block_single_rotation_mfma_moe_sorting_module(
         total_rows_i32 = (
             num_tokens_i32 * topk_i32 if topk > 1 else num_tokens_i32
         )
-        # Persist only: grid-x ceil-div can overrun; clamp every global row read
-        # (no bounds check). Output still gated by store_valid (unclamped row).
+        # Clamp global row reads on the persist overrun and on use_ptr64, whose
+        # raw-pointer loads have no descriptor bound (in_rsrc guards the rest).
+        _clamp_rows = persist_m > 1 or use_ptr64
         last_valid_row_i32 = (
-            total_rows_i32 - c1_i32 if persist_m > 1 else None
+            total_rows_i32 - c1_i32 if _clamp_rows else None
         )
 
         def _clamp_row(row_i32):
-            if persist_m > 1:
+            if _clamp_rows:
                 return arith.minui(row_i32, last_valid_row_i32)
             return row_i32
 
