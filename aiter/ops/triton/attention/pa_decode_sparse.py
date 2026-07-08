@@ -147,9 +147,18 @@ def pa_decode_sparse(
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
     # arches use the synchronous slot path, where 32 exposes memory latency.
     if use_gluon:
-        block_k = 16
-        attn_num_warps = 1
-        max_num_wg = 1024
+        if quant_kv:
+            # QUANT keeps the single-tile pipeline (block_k=16, 1 warp) so
+            # kv_bufs + scales_smem stay within the 64 KB LDS budget.
+            block_k = 16
+            attn_num_warps = 1
+            max_num_wg = 1024
+        else:
+            # Non-quant uses the two-piece ping-pong path: 32-key tiles split
+            # into two 16-key WMMA sub-tiles, 2 warps to interleave WMMA/VALU.
+            block_k = 32
+            attn_num_warps = 2
+            max_num_wg = 512
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4

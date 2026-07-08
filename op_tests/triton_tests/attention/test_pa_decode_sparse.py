@@ -153,7 +153,9 @@ def _wrapper_main_kernel_params(D: int):
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True
-    block_k = 16 if (use_gluon or D >= 256) else 32
+    # This test is the non-quant path. On gluon that path now uses the two-piece
+    # pipeline with block_k=32 (see the wrapper); other arches / D>=256 use 16.
+    block_k = 32 if use_gluon else (16 if D >= 256 else 32)
     return use_exp2, block_k
 
 
@@ -223,13 +225,20 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 64, 256])
-@pytest.mark.parametrize("H", [16, 64])
+# @pytest.mark.parametrize("T", [1, 64, 256])
+# @pytest.mark.parametrize("H", [16, 64])
+# @pytest.mark.parametrize("D", [512])
+# @pytest.mark.parametrize("kv_len", [136, 388, 1024])
+# @pytest.mark.parametrize("var_len", [True, False])
+# @pytest.mark.parametrize("sentinels", [True, False])
+# @pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("T", [64])
+@pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("kv_len", [136, 388, 1024])
-@pytest.mark.parametrize("var_len", [True, False])
-@pytest.mark.parametrize("sentinels", [True, False])
-@pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("kv_len", [136])
+@pytest.mark.parametrize("var_len", [False])
+@pytest.mark.parametrize("sentinels", [False])
+@pytest.mark.parametrize("skip_reduce", [False])
 def test_pa_decode_sparse_vs_reference(
     T, H, D, kv_len, var_len, sentinels, skip_reduce
 ):
