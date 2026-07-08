@@ -93,6 +93,7 @@ def get_moe_a4w4_layouts_gfx1250(
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
     GatherIndx,
+    X_SCALES_TDM=False,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
     PACKED_BLOCK_M_X = BLOCK_M
@@ -263,16 +264,16 @@ def get_moe_a4w4_layouts_gfx1250(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    if MX_SCALE_BLOCK_K <= 256:
+    if X_SCALES_TDM:
         SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[256, 16]],
+            interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
             shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
             order=[1, 0],
             cga_layout=CGA_A,
         )
     else:
         SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
+            interval_padding_pairs=[[256, 16]],
             shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
             order=[1, 0],
             cga_layout=CGA_A,
@@ -386,7 +387,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_buffers = 3
 
     l2_prefetch_distance = 2
-    x_scales_tdm = False
 
     if block_m == 16:
         block_n = 128
@@ -415,7 +415,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "xcd_swizzle": num_xcds,
         "num_buffers": num_buffers,
         "l2_prefetch_distance": l2_prefetch_distance,
-        "x_scales_tdm": x_scales_tdm,
         "split_k": 1,
         "waves_per_eu": 0,
         "num_ctas": 1,
@@ -599,6 +598,11 @@ def moe_gemm_a4w4(
         assert (
             config["split_k"] == 1
         ), "Split-k is not supported for Gluon backend on gfx1250"
+        mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
+        ASYNC_COPY_MIN_SCALE_WIDTH = 16
+        x_scales_tdm = (mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH) or (
+            K % config["block_k"] != 0
+        )
         # layouts
         layouts = get_moe_a4w4_layouts_gfx1250(
             BLOCK_M=config["block_m"],
@@ -610,6 +614,7 @@ def moe_gemm_a4w4(
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             GatherIndx=gather_indx,
+            X_SCALES_TDM=x_scales_tdm,
         )
         clamp_bounds = (K % config["block_k"] != 0) or (
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
@@ -663,7 +668,7 @@ def moe_gemm_a4w4(
             NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             L2_PREFETCH_DISTANCE=config["l2_prefetch_distance"],
-            X_SCALES_TDM=config.get("x_scales_tdm", False),
+            X_SCALES_TDM=x_scales_tdm,
             EVEN_K=K % config["block_k"] == 0,
             CLAMP_BOUNDS=clamp_bounds,
             **layouts,
