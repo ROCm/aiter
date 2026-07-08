@@ -442,3 +442,7 @@ gfx950,256,12288,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,tor
 gfx950,256,14336,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,asm,10,1,17333.0601,_ZN5aiter24bf16gemm_bf16_tn_256x256E,0.0,1532.89,332.64
 gfx950,256,16384,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,20244.3009,native,0.0,1499.95,312.41
 gfx950,256,32768,129280,7168,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,39920.307,native,0.0,1521.3,270.43
+gfx1201,64,1,64,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,,0.0,0.0,0.0
+gfx1201,64,2,64,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,,0.0,0.0,0.0
+gfx1201,64,4,64,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,,0.0,0.0,0.0
+gfx1201,64,8,64,4096,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,,0.0,0.0,0.0
