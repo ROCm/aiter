@@ -358,6 +358,8 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -389,6 +391,8 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             persist_m=persist_m,
             use_async_copy=use_async_copy,
             k_batch=k_batch,
@@ -1003,8 +1007,14 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
-    """Compile and cache the fused gate activation + quant + scale-sort kernel."""
+    """Compile and cache the fused gate activation + quant + scale-sort kernel.
+
+    situ_beta/situ_linear_beta are compile-time constants for the SiTUv2 split-K
+    post-activation (mirrors the main gemm1 kernel); they are part of the cache
+    key so distinct betas compile distinct modules and never alias on disk."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -1014,6 +1024,8 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -1112,6 +1124,8 @@ def flydsl_moe_stage1(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
@@ -1306,6 +1320,8 @@ def flydsl_moe_stage1(
         b_dtype=b_dtype,
         out_dtype=_gemm_out_dtype,
         act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         persist_m=_persist_m,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
@@ -1350,6 +1366,8 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1375,6 +1393,8 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1398,6 +1418,8 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,

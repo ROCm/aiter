@@ -83,6 +83,8 @@ def compile_mixed_moe_gemm1(
     b_dtype: str = "fp4",
     out_dtype: str = "f16",
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
     model_dim_pad: int = 0,
@@ -106,6 +108,10 @@ def compile_mixed_moe_gemm1(
         raise ValueError(f"a_dtype must be one of ('fp8','fp4'), got {a_dtype!r}")
     if b_dtype not in ("fp8", "fp4"):
         raise ValueError(f"b_dtype must be one of ('fp8','fp4'), got {b_dtype!r}")
+    if situ_beta <= 0.0:
+        raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
+    if situ_linear_beta <= 0.0:
+        raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
 
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
@@ -215,9 +221,22 @@ def compile_mixed_moe_gemm1(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    # Keep the historical name for silu (no cache churn); swiglu/situv2 get a
+    # distinct symbol so they can't alias the silu kernel on disk. beta is
+    # compile-time for situv2 (folded via arith.constant), so two different betas
+    # must map to two different on-disk symbols; bake them into the name (the
+    # lru_cache above already separates them in-process, but the on-disk kernel
+    # cache keys only by the @flyc.kernel symbol name).
+    act_tag = "" if act == "silu" else f"_{act}"
+    if act == "situv2":
+
+        def _beta_tag(v):
+            return repr(float(v)).replace("-", "m").replace(".", "p")
+
+        act_tag += f"_sb{_beta_tag(situ_beta)}_slb{_beta_tag(situ_linear_beta)}"
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}_v32"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -1894,15 +1913,58 @@ def compile_mixed_moe_gemm1(
                 if const_expr(epilogue_pf is not None):
                     _, _, bias_pf = epilogue_pf
 
-                def silu_elem(g):
-                    """silu(x) = x * sigmoid(x); HW fast path: exp2, rcp"""
+                def sigmoid_elem(g):
                     neg_log2e = arith.constant(-1.4426950408889634, type=f32)
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
                     one = arith.constant(1.0, type=f32)
                     den = one + emu
-                    sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
-                    return g * sig
+                    return llvm.call_intrinsic(
+                        f32, "llvm.amdgcn.rcp.f32", [den], [], []
+                    )
+
+                def silu_elem(g):
+                    """silu(x) = x * sigmoid(x); HW fast path: exp2, rcp"""
+                    return g * sigmoid_elem(g)
+
+                def tanh_elem(x):
+                    """tanh(x), expanded via exp2 like preshuffle_gemm's GeLU path."""
+                    zero = arith.constant(0.0, type=f32)
+                    one = arith.constant(1.0, type=f32)
+                    neg_two_log2e = arith.constant(-2.8853900817779268, type=f32)
+                    abs_x = x.maximumf(-x)
+                    e = llvm.call_intrinsic(
+                        f32, "llvm.amdgcn.exp2.f32", [abs_x * neg_two_log2e], [], []
+                    )
+                    den = one + e
+                    recip = llvm.call_intrinsic(
+                        f32, "llvm.amdgcn.rcp.f32", [den], [], []
+                    )
+                    tanh_abs = (one - e) * recip
+                    is_pos = x > zero
+                    return is_pos.select(tanh_abs, -tanh_abs)
+
+                def situ_elem(g):
+                    """situ(x) = beta * tanh(x / beta) * sigmoid(x)"""
+                    situ_beta_f32 = arith.constant(float(situ_beta), type=f32)
+                    situ_beta_rcp_f32 = arith.constant(1.0 / float(situ_beta), type=f32)
+                    return (
+                        situ_beta_f32
+                        * tanh_elem(g * situ_beta_rcp_f32)
+                        * sigmoid_elem(g)
+                    )
+
+                def situ_up_elem(u):
+                    """linear_beta * tanh(up / linear_beta)."""
+                    situ_linear_beta_f32 = arith.constant(
+                        float(situ_linear_beta), type=f32
+                    )
+                    situ_linear_beta_rcp_f32 = arith.constant(
+                        1.0 / float(situ_linear_beta), type=f32
+                    )
+                    return situ_linear_beta_f32 * tanh_elem(
+                        u * situ_linear_beta_rcp_f32
+                    )
 
                 def _clamp_gate(x):
                     # min(x, lim) == -max(-x, -lim); upper bound only.
@@ -1963,10 +2025,27 @@ def compile_mixed_moe_gemm1(
                         result_elems.append(g * sig * (u + one))
                     return vector.from_elements(vec4_f32, result_elems)
 
+                def situ_mul_vec4(gate_v4, up_v4):
+                    """Element-wise situv2(gate, up) on vec4_f32."""
+                    result_elems = []
+                    for ei in range_constexpr(4):
+                        g = vector.extract(
+                            gate_v4, static_position=[ei], dynamic_position=[]
+                        )
+                        u = vector.extract(
+                            up_v4, static_position=[ei], dynamic_position=[]
+                        )
+                        g = _clamp_gate(g)
+                        u = _clamp_lin(u)
+                        result_elems.append(situ_elem(g) * situ_up_elem(u))
+                    return vector.from_elements(vec4_f32, result_elems)
+
                 def act_vec4(gate_v4, up_v4):
                     """Dispatch activation based on `act` parameter."""
                     if const_expr(act == "swiglu"):
                         return swiglu_mul_vec4(gate_v4, up_v4)
+                    elif const_expr(act == "situv2"):
+                        return situ_mul_vec4(gate_v4, up_v4)
                     else:
                         return silu_mul_vec4(gate_v4, up_v4)
 
@@ -1989,6 +2068,10 @@ def compile_mixed_moe_gemm1(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
                         return g * sig * (u + one)
+                    elif const_expr(act == "situv2"):
+                        g = _clamp_gate(g)
+                        u = _clamp_lin(u)
+                        return situ_elem(g) * situ_up_elem(u)
                     else:
                         g = _clamp_gate(g)
                         u = _clamp_lin(u)
@@ -2815,6 +2898,8 @@ def compile_mixed_moe_gemm1(
         tile_k,
         doweight_stage1,
         act,
+        situ_beta,
+        situ_linear_beta,
         enable_bias,
         model_dim_pad,
         inter_dim_pad,

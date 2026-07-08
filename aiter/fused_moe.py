@@ -358,6 +358,8 @@ def fused_moe(
     bias2=None,
     splitk=0,
     swiglu_limit=None,
+    beta=None,
+    linear_beta=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
@@ -385,6 +387,8 @@ def fused_moe(
         bias1=bias1,
         bias2=bias2,
         swiglu_limit=swiglu_limit,
+        beta=beta,
+        linear_beta=linear_beta,
         gate_mode=gate_mode,
     )
 
@@ -450,6 +454,8 @@ def fused_moe_(
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
+    beta: Optional[float] = None,
+    linear_beta: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -680,6 +686,8 @@ def fused_moe_(
             topk_weights=topk_weight,
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
         )
@@ -1012,6 +1020,8 @@ def _flydsl_stage1_wrapper(
     bias1=None,
     topk_ids=None,
     swiglu_limit: Optional[float] = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     **_kwargs,
@@ -1022,7 +1032,12 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    if activation == ActivationType.Swiglu:
+        act = "swiglu"
+    elif activation == ActivationType.Situv2:
+        act = "situv2"
+    else:
+        act = "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -1039,6 +1054,8 @@ def _flydsl_stage1_wrapper(
         b_dtype=parsed["b_dtype"],
         out_dtype=parsed["out_dtype"],
         act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
@@ -1656,7 +1673,10 @@ def get_2stage_cfgs(
     use_mxfp4_flydsl = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and (activation == ActivationType.Swiglu or _flydsl_force)
+        and (
+            activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            or _flydsl_force
+        )
         and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
         and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         and is_shuffled
@@ -1942,6 +1962,8 @@ def fused_moe_2stages(
     topk_ids=None,
     topk_weights=None,
     swiglu_limit=None,
+    beta=None,
+    linear_beta=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
 ):
@@ -2084,6 +2106,13 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+        # SiTUv2 beta/linear_beta are compile-time constants baked into the
+        # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
+        # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
+        extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
+        extra_stage1_args["situ_linear_beta"] = (
+            1.0 if linear_beta is None else float(linear_beta)
+        )
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
@@ -2383,6 +2412,17 @@ def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = 7.0):
     return out_glu * (x_linear + 1)
 
 
+def situv2(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    beta: float = 2.0,
+    linear_beta: float = 1.5,
+) -> torch.Tensor:
+    situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    up_scaled = linear_beta * torch.tanh(up / linear_beta)
+    return situ_gate * up_scaled
+
+
 def torch_moe_stage1(
     hidden_states,
     w1,  # E, inter_dim*2, model_dim
@@ -2398,6 +2438,8 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
     swiglu_limit=None,
+    situ_beta: float = 2.0,
+    situ_linear_beta: float = 1.5,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -2418,7 +2460,10 @@ def torch_moe_stage1(
             w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
         if a1_scale is not None:  # skip a16w4 / mxfp8-bf16-activation ref
-            hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
+            if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
+                hidden_states = hidden_states.to(ctype)
+            else:
+                hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
         else:  # a16w4 / mxfp8 (bf16 reference activation)
             hidden_states = hidden_states.to(ctype)
@@ -2498,11 +2543,14 @@ def torch_moe_stage1(
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
     use_swiglu = activation == aiter.ActivationType.Swiglu
+    use_situv2 = activation == aiter.ActivationType.Situv2
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
             out = swiglu(gate, up, limit=swiglu_limit)
+        elif use_situv2:
+            out = situv2(gate, up, beta=situ_beta, linear_beta=situ_linear_beta)
         else:
             if swiglu_limit:
                 gate = gate.clamp(min=None, max=swiglu_limit)

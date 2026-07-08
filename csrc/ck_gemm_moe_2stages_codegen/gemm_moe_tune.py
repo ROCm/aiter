@@ -491,7 +491,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = (
+            "swiglu"
+            if act_type == ActivationType.Swiglu
+            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
+        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
