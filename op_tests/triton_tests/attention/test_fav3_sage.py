@@ -19,6 +19,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -272,6 +273,324 @@ def test_sage(
         atol=ATOL_fp8,
         rtol=RTOL_fp8,
         max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 256)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("hadamard_rotation", [False, True])
+def test_sage_int8_hadamard(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    hadamard_rotation: bool,
+    dtype=torch.bfloat16,
+):
+    HEAD_SZ = 128
+    BLOCK_R = 128
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        hadamard_rotation=hadamard_rotation,
+        BLOCK_R=BLOCK_R if hadamard_rotation else None,
+    )
+
+    q_ref, k_ref, v_ref = q, k, v
+    if layout == "bhsd":
+        q_ref = q_ref.permute(0, 2, 1, 3).contiguous()
+        k_ref = k_ref.permute(0, 2, 1, 3).contiguous()
+        v_ref = v_ref.permute(0, 2, 1, 3).contiguous()
+
+    torch_out = attention_ref(
+        q_ref, k_ref, v_ref, dropout_p=0.0, dropout_mask=None, causal=False
+    )
+    torch_out, _, _ = torch_out
+
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+def test_sage_int8_hadamard_preserves_float_logits(dtype=torch.bfloat16):
+    """Orthogonal Hadamard should leave pre-quant QK logits unchanged in float."""
+    HEAD_SZ = 128
+    BLOCK_R = 128
+    BATCH, SEQLEN, NUM_HEADS = 1, 32, 4
+
+    torch.manual_seed(7)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_HEADS,
+        NUM_HEADS,
+        SEQLEN,
+        SEQLEN,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        "bshd",
+    )
+    r = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+
+    q_rot = torch.matmul(q, r)
+    k_rot = torch.matmul(k, r)
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    scores_rot = torch.matmul(q_rot, k_rot.transpose(-2, -1))
+
+    assert torch.allclose(
+        scores.float(), scores_rot.float(), rtol=1e-2, atol=1e-2
+    ), "Hadamard rotation should preserve QK logits before quantization"
+
+
+def _sage_int8_attention_ref(
+    q,
+    k,
+    v,
+    layout: str,
+    softmax_scale: float,
+):
+    q_ref, k_ref, v_ref = q, k, v
+    if layout == "bhsd":
+        q_ref = q_ref.permute(0, 2, 1, 3).contiguous()
+        k_ref = k_ref.permute(0, 2, 1, 3).contiguous()
+        v_ref = v_ref.permute(0, 2, 1, 3).contiguous()
+
+    torch_out = attention_ref(
+        q_ref, k_ref, v_ref, dropout_p=0.0, dropout_mask=None, causal=False
+    )
+    torch_out, _, _ = torch_out
+
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+    return torch_out
+
+
+def _mean_abs_error(current, reference):
+    return torch.abs(current.float() - reference.float()).mean().item()
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 256), (512, 512)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (24, 24)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("q_smooth", [False, True])
+def test_sage_int8_q_smooth(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    q_smooth: bool,
+    dtype=torch.bfloat16,
+):
+    """
+    INT8 Sage q_smoothing correctness.
+
+    Reference baseline is bf16 ``attention_ref`` (same as ``test_sage``), not fp16
+    and not sage-without-q_smooth. Sage is a quantized attention approximation;
+    unit tests verify each feature path still lands within the established
+    quantized-attention tolerance band vs full-precision attention.
+    """
+    HEAD_SZ = 128
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        q_smooth=q_smooth,
+    )
+
+    torch_out = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    assert torch_out.shape == triton_out.shape
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch,sq,sk,heads",
+    [
+        (1, 16452, 16452, 24),
+        (2, 29760, 29760, 2),
+        pytest.param(
+            1,
+            75600,
+            75600,
+            5,
+            marks=pytest.mark.skip(
+                reason="large shape; run via bench_sage_qsmooth_compare.py"
+            ),
+        ),
+        pytest.param(
+            1,
+            118808,
+            118808,
+            3,
+            marks=pytest.mark.skip(
+                reason="large shape; run via bench_sage_qsmooth_compare.py"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("layout", ["bshd"])
+@pytest.mark.parametrize("q_smooth", [False, True])
+def test_sage_int8_q_smooth_pr1818_shapes(
+    batch: int,
+    sq: int,
+    sk: int,
+    heads: int,
+    layout: str,
+    q_smooth: bool,
+    dtype=torch.bfloat16,
+):
+    """PR1818 diffusion shapes; same default tile, toggle q_smooth only."""
+    HEAD_SZ = 128
+    config = get_sage_fwd_configs()
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(batch, heads, heads, sq, sk, HEAD_SZ, HEAD_SZ, dtype, layout)
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        config=config,
+        q_smooth=q_smooth,
+    )
+    torch_out = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.0,
+    )
+
+
+def test_sage_int8_q_smooth_reduces_error_on_outliers(dtype=torch.bfloat16):
+    """
+    On head_dim outlier data, q_smooth should be closer to bf16 attention_ref
+    than bare INT8 sage (q_smooth=False).
+    """
+    BATCH, SEQLEN_Q, SEQLEN_K = 1, 128, 128
+    NUM_Q_HEADS = NUM_K_HEADS = 8
+    HEAD_SZ = 128
+    layout = "bshd"
+    config = get_sage_fwd_configs()
+
+    torch.manual_seed(11)
+    torch.cuda.empty_cache()
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    # Inject a dominant outlier dimension typical of bad per-block INT8 scaling.
+    q[..., 0] = q[..., 0] * 32.0
+    k[..., 0] = k[..., 0] * 32.0
+
+    ref = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    out_no_smooth = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        config=config,
+        q_smooth=False,
+    )
+    out_smooth = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        config=config,
+        q_smooth=True,
+    )
+
+    err_no_smooth = _mean_abs_error(out_no_smooth, ref)
+    err_smooth = _mean_abs_error(out_smooth, ref)
+    assert err_smooth < err_no_smooth, (
+        f"q_smooth should reduce error vs bf16 ref on outlier data: "
+        f"smooth={err_smooth:.6f}, no_smooth={err_no_smooth:.6f}"
     )
 
 
