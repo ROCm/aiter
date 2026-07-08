@@ -38,14 +38,13 @@ try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
             flydsl_hgemm,
-            get_flydsl_splitk_hgemm_kernels,
-            SPLIT_K_SEMAPHORE_MAX_LEN,
+            get_flydsl_hgemm_kernels,
         )
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     flydsl_hgemm = None
-    get_flydsl_splitk_hgemm_kernels = None
+    get_flydsl_hgemm_kernels = None
     FLYDSL_TUNE_ERROR = str(exc)
 
 OPUS_TUNE_ERROR = None
@@ -281,7 +280,6 @@ def run_flydsl_gemm_bf16(input, weight, out, bias=None, otype=dtypes.bf16, confi
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
-    stages = config.get("stages", config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -294,25 +292,16 @@ def run_flydsl_gemm_bf16(input, weight, out, bias=None, otype=dtypes.bf16, confi
         weight,
         out=out,
         bias=fused_bias,
-        kernel_family=config.get("kernel_family"),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        block_k_warps=config["block_k_warps"],
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=config.get("async_copy", False),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        auto_shuffle_b=False,
-        c_to_lds=config.get("c_to_lds", False),
-        use_ht=config.get("use_ht", False),
+        tile_m=config["TILE_M"],
+        tile_n=config["TILE_N"],
+        tile_k=config["TILE_K"],
+        stages=config["STAGES"],
+        split_k=config["SPLIT_K"],
+        block_m_warps=config["BLOCK_M_WARPS"],
+        block_n_warps=config["BLOCK_N_WARPS"],
+        block_k_warps=config["BLOCK_K_WARPS"],
+        group_m=config["GROUP_M"],
+        policy="ht" if config["USE_HALF_TILE_INTERLEAVED"] else "ft",
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
@@ -327,10 +316,10 @@ def run_flydsl_gemm_bf16(input, weight, out, bias=None, otype=dtypes.bf16, confi
 
 
 @lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog(m: int, n: int, k: int):
-    if get_flydsl_splitk_hgemm_kernels is None:
+def get_flydsl_bf16_catalog(m: int, n: int, k: int, has_bias: bool):
+    if get_flydsl_hgemm_kernels is None:
         return []
-    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k)
+    kernels = get_flydsl_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k, has_bias=has_bias)
     catalog = [
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
@@ -714,35 +703,19 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if flydsl_hgemm is None or get_flydsl_splitk_hgemm_kernels is None:
+        if flydsl_hgemm is None or get_flydsl_hgemm_kernels is None:
             logger.warning(f"FlyDSL not available, skip. reason: {FLYDSL_TUNE_ERROR}")
             return []
         if scaleAB or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K)
+        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, has_bias)
         weight_key = "shuffleweights" if is_shuffle else "weights"
-        min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
-            if config.get("b_preshuffle", False) != is_shuffle:
+            if is_shuffle:
                 continue
-            if config["tile_m"] > max(M, min_tile_m):
-                continue
-            if N < config["tile_n"] or N % config["tile_n"] != 0:
-                continue
-            if K % config["split_k"] != 0:
-                continue
-            ks = K // config["split_k"]
-            if ks < config["tile_k"] or ks % config["tile_k"] != 0:
-                continue
-            if config["split_k"] > 1:
-                counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
-                    N // config["tile_n"]
-                )
-                if counters > SPLIT_K_SEMAPHORE_MAX_LEN:
-                    continue
             info = (
                 info_keys,
                 solidx,

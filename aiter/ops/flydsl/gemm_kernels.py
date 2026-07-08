@@ -22,7 +22,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from .kernels.hgemm_wmma_gfx950 import hgemm
+from .kernels.hgemm_wmma_gfx950 import hgemm, hgemm_get_configs, infer_has_k_tail
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
@@ -73,429 +73,30 @@ SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
 
-# Keep the generic auto-generated catalog aligned with the upstream FlyDSL
-# reference tuning space. The wider local one-off search space introduced
-# gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
-# and higher split-K values are now capped at 8 for better accuracy.
-HGEMM_TILE_N_OPTIONS = (64, 128, 256)
-HGEMM_TILE_K_OPTIONS = (64, 128, 256)
-HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
-HGEMM_STAGE_OPTIONS = tuple([i for i in range(2, 9)])
-HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 14))
-HGEMM_MAX_SPLIT_K = 13
-HGEMM_WARP_SHAPE_OPTIONS = [
-    (wm, wn, wk) for wm, wn, wk in product([1, 2, 4], repeat=3) if wm * wn * wk <= 16
-]
-KERNEL_CONFIG_VARIANTS = [
-    {
-        "block_m_warps": wm,
-        "block_n_warps": wn,
-        "block_k_warps": wk,
-        "b_to_lds": True,
-        "use_ht": use_ht,
-    }
-    for wm, wn, wk in HGEMM_WARP_SHAPE_OPTIONS
-    for use_ht in (False, True)
-]
-
 _HGEMM_KERNELS: Dict[str, Dict] = {}
 
 
-def _normalize_supported_kernel_metadata(
-    *,
-    async_copy: bool,
-    c_to_lds: bool,
-) -> tuple[int, bool, bool]:
-    # Latest `hgemm.py` fixes these choices internally instead of exposing
-    # multiple codegen variants to the wrapper layer.
-    if async_copy != KERNEL_ASYNC_COPY:
-        raise ValueError(
-            "Current kernel fixes async_copy from the active GPU architecture; "
-            f"got async_copy={async_copy}, expected {KERNEL_ASYNC_COPY}"
-        )
-    if c_to_lds != FIXED_C_TO_LDS:
-        raise ValueError(
-            f"Current kernel only supports c_to_lds={FIXED_C_TO_LDS}; "
-            f"got c_to_lds={c_to_lds}"
-        )
-    return KERNEL_ASYNC_COPY, FIXED_C_TO_LDS
-
-
 def flydsl_kernel_name(
-    stages: int,
     dtype: str,
     out_dtype: str,
     tile_m: int,
     tile_n: int,
     tile_k: int,
+    stages: int,
     split_k: int,
-    block_m_warp: int,
-    block_n_warp: int,
-    block_k_warp: int,
-    async_copy: bool,
-    b_to_lds: bool,
-    b_preshuffle: bool = False,
-    c_to_lds: bool = False,
-    kernel_family: str = KERNEL_FAMILY_HGEMM,
-    n_tile_repeat: int = 1,
-    persistent_n_tiles: int = 1,
-    waves_per_eu: int = 0,
-    b_to_lds_unroll: int = 0,
-    use_ht: bool = False,
+    block_m_warps: int,
+    block_n_warps: int,
+    block_k_warps: int,
+    has_bias: bool,
+    has_k_tail: bool,
+    group_m: int,
+    policy: str,
 ) -> str:
-    async_copy, c_to_lds = _normalize_supported_kernel_metadata(
-        async_copy=async_copy,
-        c_to_lds=c_to_lds,
-    )
-    if b_preshuffle and b_to_lds:
-        raise ValueError(
-            "Current kernel requires b_to_lds=False when b_preshuffle=True"
-        )
-    if kernel_family == KERNEL_FAMILY_HGEMM and b_preshuffle:
-        raise ValueError("Current generic kernel only supports `b_preshuffle=False`")
-    if kernel_family == KERNEL_FAMILY_HGEMM and use_ht:
-        if stages != 2 or block_k_warp != 1 or not b_to_lds:
-            raise ValueError(
-                "HT HGEMM requires stages=2, block_k_warp=1, and b_to_lds=True"
-            )
-    if kernel_family == KERNEL_FAMILY_SMALL_M and b_preshuffle:
-        raise ValueError("small-M kernel only supports `b_preshuffle=False`")
-    if kernel_family == KERNEL_FAMILY_SMALL_M and use_ht:
-        raise ValueError("small-M kernel does not support `use_ht=True`")
-    name = (
-        f"flydsl_gemm{stages}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
-    )
-    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}_block_k_warp{block_k_warp}"
-    name += (
-        f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}"
-        f"_c_to_lds{c_to_lds}"
-    )
-    if use_ht:
-        name += "_use_htTrue"
-    if kernel_family == KERNEL_FAMILY_SMALL_M:
-        name += "_small_m"
-        if n_tile_repeat > 1:
-            name += f"_nr{n_tile_repeat}"
-        if persistent_n_tiles > 1:
-            name += f"_pn{persistent_n_tiles}"
-        if waves_per_eu > 0:
-            name += f"_wpe{waves_per_eu}"
-        if b_to_lds_unroll > 0:
-            name += f"_ur{b_to_lds_unroll}"
-    elif kernel_family != KERNEL_FAMILY_HGEMM:
-        raise ValueError(
-            f"Unsupported kernel_family={kernel_family!r}; expected "
-            f"{KERNEL_FAMILY_HGEMM!r} or {KERNEL_FAMILY_SMALL_M!r}"
-        )
+    name = f"flydsl_hgemm_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}x{stages}_ks{split_k}"
+    name += f"_w{block_m_warps}x{block_n_warps}x{block_k_warps}_bias{int(has_bias)}_ktail{int(has_k_tail)}"
+    name += f"_gm{group_m}_p{policy}"
     name += f"_{get_gfx()}"
     return name
-
-
-def _stream_cache_key(stream: torch.cuda.Stream) -> SplitKStreamKey:
-    device_index = stream.device.index
-    if device_index is None:
-        raise ValueError(f"Unable to determine device index for stream {stream!r}")
-    return (device_index, int(stream.cuda_stream))
-
-
-def _normalize_launch_stream(
-    device: torch.device,
-    stream: Optional[torch.cuda.Stream],
-) -> torch.cuda.Stream:
-    launch_stream = (
-        torch.cuda.current_stream(device=device) if stream is None else stream
-    )
-    if launch_stream.device != device:
-        raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
-    return launch_stream
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def _hgemm_tile_m_options(m: Optional[int]) -> tuple[int, ...]:
-    if m is None:
-        return HGEMM_TILE_M_OPTIONS
-    max_tile_m = max(96, _align_up(max(1, m) * 2, 16))
-    return tuple(tile_m for tile_m in HGEMM_TILE_M_OPTIONS if tile_m <= max_tile_m)
-
-
-def _hgemm_split_k_options(k: Optional[int], tile_k: int) -> tuple[int, ...]:
-    if k is None:
-        return HGEMM_BASE_SPLIT_K_OPTIONS
-    return tuple(
-        split_k
-        for split_k in HGEMM_BASE_SPLIT_K_OPTIONS
-        if split_k <= HGEMM_MAX_SPLIT_K
-        and k % split_k == 0
-        and (k // split_k) % tile_k == 0
-    )
-
-
-def _estimate_hgemm_lds_bytes(
-    *,
-    dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    stages: int,
-    block_k_warps: int,
-    b_to_lds: bool,
-) -> int:
-    if dtype not in {"f16", "bf16"}:
-        raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
-
-    dtype_bytes = 2
-    ab_lds_bytes = stages * tile_m * tile_k * dtype_bytes
-    if b_to_lds:
-        ab_lds_bytes = _align_up(ab_lds_bytes, 16)
-        ab_lds_bytes += stages * tile_n * tile_k * dtype_bytes
-    c_lds_bytes = block_k_warps * tile_m * tile_n * dtype_bytes
-    return max(ab_lds_bytes, c_lds_bytes)
-
-
-def selection_filter(m, n, k, kwargs):
-    TILE_M = kwargs["TILE_M"]
-    TILE_N = kwargs["TILE_N"]
-    TILE_K = kwargs["TILE_K"]
-    STAGES = kwargs["STAGES"]
-    SPLIT_K = kwargs["SPLIT_K"]
-    BLOCK_M_WARPS = kwargs["BLOCK_M_WARPS"]
-    BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
-    BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
-    B_TO_LDS = kwargs.get("B_TO_LDS", True)
-    USE_HT = kwargs.get("USE_HT", False)
-    GPU_ARCH = get_rocm_arch()
-    DTYPE_BYTES = 2
-
-    if USE_HT:
-        if not (STAGES == 2 and BLOCK_K_WARPS == 1 and B_TO_LDS):
-            return False
-
-    def get_stage_smem_use(stages_):
-        SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
-        if B_TO_LDS:
-            SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
-        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
-        return SMEM_USE
-
-    smem_use_s0 = get_stage_smem_use(STAGES)
-    # smem_use_s1 = get_stage_smem_use(STAGES + 3)
-    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
-    if not (smem_use_s0 <= smem_cap):
-        return False
-    if m >= 4096 and n >= 4096 and k >= 4096:
-        if not (
-            TILE_M == 256
-            and TILE_N == 256
-            and TILE_K == 64
-            and STAGES == 2
-            and SPLIT_K == 1
-            and BLOCK_M_WARPS == 2
-            and BLOCK_N_WARPS == 4
-            and BLOCK_K_WARPS == 1
-        ):
-            return False
-    return True
-
-
-def _validate_hgemm_tiling(
-    m: int,
-    n: int,
-    k: int,
-    *,
-    dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    pack_n: int,
-    split_k: int,
-    stages: int,
-    block_m_warps: int,
-    block_n_warps: int,
-    block_k_warps: int,
-    b_to_lds: bool,
-    use_ht: bool,
-) -> None:
-    config = {
-        "TILE_M": tile_m,
-        "TILE_N": tile_n,
-        "TILE_K": tile_k,
-        "STAGES": stages,
-        "SPLIT_K": split_k,
-        "BLOCK_M_WARPS": block_m_warps,
-        "BLOCK_N_WARPS": block_n_warps,
-        "BLOCK_K_WARPS": block_k_warps,
-        "B_TO_LDS": b_to_lds,
-        "USE_HT": use_ht,
-    }
-    if not selection_filter(m, n, k, config):
-        raise ValueError(
-            f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
-        )
-
-    if tile_m < 1 or tile_n < 1 or tile_k < 1:
-        raise ValueError(
-            f"Tile sizes must be positive, got tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}"
-        )
-    if block_m_warps < 1 or block_n_warps < 1 or block_k_warps < 1:
-        raise ValueError(
-            "Warp tiling must be positive, got "
-            f"block_m_warps={block_m_warps}, block_n_warps={block_n_warps}, block_k_warps={block_k_warps}"
-        )
-    if tile_k < 32:
-        raise ValueError(
-            f"Invalid tile_k={tile_k}; latest kernel requires tile_k >= 32"
-        )
-    if tile_k % 32 != 0:
-        raise ValueError(
-            f"Invalid tile_k={tile_k}; latest kernel requires tile_k % 32 == 0"
-        )
-    if split_k < 1:
-        raise ValueError(f"Invalid split_k={split_k}; split_k must be >= 1")
-    if pack_n != 1:
-        raise ValueError(
-            f"Current kernel only supports `pack_n=1`; got pack_n={pack_n}"
-        )
-
-    warp_atom_m = 16
-    warp_atom_n = 16
-
-    if tile_m % (block_m_warps * warp_atom_m) != 0:
-        raise ValueError(
-            f"Invalid tiling: tile_m={tile_m} must be divisible by "
-            f"block_m_warps * 16 = {block_m_warps * warp_atom_m}"
-        )
-    if tile_n % (block_n_warps * warp_atom_n) != 0:
-        raise ValueError(
-            f"Invalid tiling: tile_n={tile_n} must be divisible by "
-            f"block_n_warps * 16 = {block_n_warps * warp_atom_n}"
-        )
-
-    block_n = tile_n
-    if n < block_n or n % block_n != 0:
-        raise ValueError(
-            f"Invalid N for this kernel: N={n} must satisfy N >= {block_n} and N % {block_n} == 0"
-        )
-
-    if k % split_k != 0:
-        raise ValueError(
-            f"Invalid split-K: K={k} must be divisible by split_k={split_k}"
-        )
-
-    ks = k // split_k
-    if ks < tile_k or ks % tile_k != 0:
-        raise ValueError(
-            f"Invalid K for this kernel: K/split_k={ks} must satisfy "
-            f">= tile_k={tile_k} and % tile_k == 0"
-        )
-
-    block_threads = block_m_warps * block_n_warps * block_k_warps * 64
-    ldg_vec_size = 8
-    block_vecs = ldg_vec_size * block_threads
-    block_mk_size = tile_m * tile_k
-    block_nk_size = tile_n * tile_k
-    block_mn_size = tile_m * tile_n
-    if block_mk_size % block_vecs != 0:
-        raise ValueError(
-            "Invalid tile combination: tile_m * tile_k must be divisible by "
-            f"ldg_vec_size * block_threads = {block_vecs}; got {block_mk_size}"
-        )
-    if block_nk_size % block_vecs != 0:
-        raise ValueError(
-            "Invalid tile combination: tile_n * tile_k must be divisible by "
-            f"ldg_vec_size * block_threads = {block_vecs}; got {block_nk_size}"
-        )
-    if block_mn_size % block_vecs != 0:
-        raise ValueError(
-            "Invalid tile combination: tile_m * tile_n must be divisible by "
-            f"ldg_vec_size * block_threads = {block_vecs}; got {block_mn_size}"
-        )
-    ldg_reg_a_count = block_mk_size // block_vecs
-    ldg_reg_b_count = block_nk_size // block_vecs
-    ldg_reg_c_count = block_mn_size // block_vecs
-    if ldg_reg_a_count < 1 or ldg_reg_b_count < 1:
-        raise ValueError(
-            "Invalid tile combination: requires at least one vectorized global load per thread "
-            f"(got ldg_reg_a_count={ldg_reg_a_count}, ldg_reg_b_count={ldg_reg_b_count})"
-        )
-    if ldg_reg_c_count < 1:
-        raise ValueError(
-            "Invalid tile combination: requires at least one vectorized C load/store per thread "
-            f"(got ldg_reg_c_count={ldg_reg_c_count})"
-        )
-
-    lds_bytes = _estimate_hgemm_lds_bytes(
-        dtype=dtype,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        stages=stages,
-        block_k_warps=block_k_warps,
-        b_to_lds=b_to_lds,
-    )
-    lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
-    if lds_bytes > lds_limit:
-        raise ValueError(
-            "Invalid tile combination: estimated LDS usage "
-            f"{lds_bytes} exceeds the hardware limit {lds_limit}"
-        )
-
-
-def _normalize_registry_config(
-    *,
-    dtype: str,
-    stages: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    split_k: int,
-    block_m_warps: int,
-    block_n_warps: int,
-    block_k_warps: int,
-    b_to_lds: bool,
-    use_ht: bool = False,
-) -> Optional[Dict]:
-    config = {
-        "kernel_family": KERNEL_FAMILY_HGEMM,
-        "stages": int(stages),
-        "tile_m": int(tile_m),
-        "tile_n": int(tile_n),
-        "tile_k": int(tile_k),
-        "split_k": int(split_k),
-        "block_m_warps": int(block_m_warps),
-        "block_n_warps": int(block_n_warps),
-        "block_k_warps": int(block_k_warps),
-        "async_copy": KERNEL_ASYNC_COPY,
-        "b_to_lds": bool(b_to_lds),
-        "b_preshuffle": False,
-        "c_to_lds": FIXED_C_TO_LDS,
-        "use_ht": bool(use_ht),
-    }
-
-    try:
-        _validate_hgemm_tiling(
-            1,
-            config["tile_n"],
-            config["tile_k"] * config["split_k"],
-            dtype=dtype,
-            tile_m=config["tile_m"],
-            tile_n=config["tile_n"],
-            tile_k=config["tile_k"],
-            pack_n=1,
-            split_k=config["split_k"],
-            stages=config["stages"],
-            block_m_warps=config["block_m_warps"],
-            block_n_warps=config["block_n_warps"],
-            block_k_warps=config["block_k_warps"],
-            b_to_lds=config["b_to_lds"],
-            use_ht=config["use_ht"],
-        )
-    except ValueError:
-        return None
-
-    return config
 
 
 def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
@@ -559,7 +160,7 @@ def get_flydsl_splitk_hgemm_kernel_params(name: str) -> Optional[Dict]:
 def get_flydsl_hgemm_kernels(
     dtype: str,
     out_dtype: str,
-    *,
+    has_bias: bool,
     m: Optional[int] = None,
     n: Optional[int] = None,
     k: Optional[int] = None,
@@ -571,97 +172,53 @@ def get_flydsl_hgemm_kernels(
         raise ValueError(
             "m, n, k must be provided together when requesting shape-aware kernels"
         )
-    tile_ms = _hgemm_tile_m_options(m)
-    for tile_m, tile_n, tile_k, stages, variant in product(
-        tile_ms,
-        HGEMM_TILE_N_OPTIONS,
-        HGEMM_TILE_K_OPTIONS,
-        HGEMM_STAGE_OPTIONS,
-        KERNEL_CONFIG_VARIANTS,
-    ):
-        if n is not None and (n < tile_n or n % tile_n != 0):
-            continue
-        split_k_options = _hgemm_split_k_options(k, tile_k)
-        if not split_k_options:
-            continue
-        for split_k in split_k_options:
-            config = _normalize_registry_config(
-                dtype=dtype,
-                stages=stages,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                split_k=split_k,
-                block_m_warps=variant["block_m_warps"],
-                block_n_warps=variant["block_n_warps"],
-                block_k_warps=variant["block_k_warps"],
-                b_to_lds=variant["b_to_lds"],
-                use_ht=variant["use_ht"],
-            )
-            if config is None:
-                continue
-            config["dtype"] = dtype
-            config["out_dtype"] = out_dtype
-            config["target_gfx"] = get_gfx()
-            name = flydsl_kernel_name(
-                config["stages"],
-                dtype,
-                out_dtype,
-                config["tile_m"],
-                config["tile_n"],
-                config["tile_k"],
-                config["split_k"],
-                config["block_m_warps"],
-                config["block_n_warps"],
-                config["block_k_warps"],
-                config["async_copy"],
-                config["b_to_lds"],
-                config["b_preshuffle"],
-                config["c_to_lds"],
-                use_ht=config["use_ht"],
-            )
-            kernels[name] = config
-    # NOTE: Keep the old small_m registry generation here for now, but leave it
-    # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.
-    #
-    # if m is not None and n is not None and k is not None:
-    #     for config in (
-    #         iter_small_m_registry_configs(
-    #             dtype,
-    #             out_dtype,
-    #             m=m,
-    #             n=n,
-    #             k=k,
-    #         )
-    #         or ()
-    #     ):
-    #         name = flydsl_kernel_name(
-    #             config["stage"],
-    #             dtype,
-    #             out_dtype,
-    #             config["tile_m"],
-    #             config["tile_n"],
-    #             config["tile_k"],
-    #             config["split_k"],
-    #             config["block_m_warps"],
-    #             config["block_n_warps"],
-    #             config["async_copy"],
-    #             config["b_to_lds"],
-    #             c_to_lds=config["c_to_lds"],
-    #             kernel_family=KERNEL_FAMILY_SMALL_M,
-    #             n_tile_repeat=config["n_tile_repeat"],
-    #             persistent_n_tiles=config["persistent_n_tiles"],
-    #             waves_per_eu=config["waves_per_eu"],
-    #             b_to_lds_unroll=config["b_to_lds_unroll"],
-    #         )
-    #         kernels[name] = config
+    configs = hgemm_get_configs(m, n, k)
+    for config in configs:
+        tile_m = config["TILE_M"]
+        tile_n = config["TILE_N"]
+        tile_k = config["TILE_K"]
+        stages = config["STAGES"]
+        split_k = config["SPLIT_K"]
+        block_m_warps = config["BLOCK_M_WARPS"]
+        block_n_warps = config["BLOCK_N_WARPS"]
+        block_k_warps = config["BLOCK_K_WARPS"]
+        policy = "ht" if config["USE_HALF_TILE_INTERLEAVED"] else "ft"
+        group_m = config["GROUP_M"]
+        has_k_tail = infer_has_k_tail(
+            k=k,
+            split_k=config["SPLIT_K"],
+            tile_k=config["TILE_K"],
+            is_ht=config["USE_HALF_TILE_INTERLEAVED"],
+        )
+        name = flydsl_kernel_name(
+            dtype=dtype,
+            out_dtype=out_dtype,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            stages=stages,
+            split_k=split_k,
+            block_m_warps=block_m_warps,
+            block_n_warps=block_n_warps,
+            block_k_warps=block_k_warps,
+            has_bias=has_bias,
+            has_k_tail=has_k_tail,
+            group_m=group_m,
+            policy=policy,
+        )
+        config["HAS_BIAS"] = has_bias
+        config["HAS_K_TAIL"] = has_k_tail
+        kernels[name] = config
     return kernels
 
 
 def _register_all_configs():
     for dtype in ("bf16", "fp16"):
         for out_dtype in ("fp16", "bf16"):
-            _HGEMM_KERNELS.update(get_flydsl_hgemm_kernels(dtype, out_dtype))
+            for has_bias in (True, False):
+                _HGEMM_KERNELS.update(
+                    get_flydsl_hgemm_kernels(dtype, out_dtype, has_bias)
+                )
 
 
 _register_all_configs()

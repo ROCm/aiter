@@ -43,6 +43,184 @@ from .hgemm_wmma_gfx950_utils import (
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
 
+def assert_hgemm_wmma_kernel(
+    DTYPE: str,
+    TILE_M: int = 128,
+    TILE_N: int = 128,
+    TILE_K: int = 64,
+    STAGES: int = 2,
+    SPLIT_K: int = 1,
+    BLOCK_M_WARPS: int = 2,
+    BLOCK_N_WARPS: int = 2,
+    BLOCK_K_WARPS: int = 1,
+    HAS_BIAS: bool = False,
+    HAS_K_TAIL: bool = False,
+    GROUP_M: int = 0,
+    USE_HALF_TILE_INTERLEAVED: bool = False,
+):
+    assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
+    assert STAGES >= 2
+    IS_HT = USE_HALF_TILE_INTERLEAVED
+    BLOCK_M = TILE_M
+    BLOCK_N = TILE_N
+    BLOCK_K = TILE_K
+    HALF_BLOCK_M = BLOCK_M // 2
+    HALF_BLOCK_N = BLOCK_N // 2
+    IS_FP8 = "fp8" in DTYPE
+    WARP_SIZE = 64
+    IN_DTYPE_BYTES = 1 if IS_FP8 else 2
+    OUT_DTYPE_BYTES = 2
+    GPU_ARCH = get_rocm_arch()
+
+    if IS_FP8:
+        assert BLOCK_K >= 128
+        WMMA_IMPL = WmmaFp8_m16n16k128()
+        DMA_BYTES = 16
+        MFMA_PER_WARP_K = 1
+    elif GPU_ARCH == "gfx942":
+        assert BLOCK_K >= 16
+        WMMA_IMPL = WmmaHalf_m16n16k16(DTYPE)
+        DMA_BYTES = 4
+        MFMA_PER_WARP_K = 2
+    else:
+        assert BLOCK_K >= 32
+        WMMA_IMPL = WmmaHalf_m16n16k32(DTYPE)
+        DMA_BYTES = 16
+        MFMA_PER_WARP_K = 1
+
+    if IS_HT:
+        assert STAGES == 2
+        assert BLOCK_M_WARPS == 2
+        assert BLOCK_K_WARPS == 1
+        assert HALF_BLOCK_M * 2 == BLOCK_M
+        assert HALF_BLOCK_N * 2 == BLOCK_N
+
+    WMMA_M = WMMA_IMPL.WMMA_M
+    WMMA_N = WMMA_IMPL.WMMA_N
+    WMMA_K = WMMA_IMPL.WMMA_K
+    WARP_ATOM_M = WMMA_M
+    WARP_ATOM_N = WMMA_N
+    WARP_ATOM_K = WMMA_K * MFMA_PER_WARP_K
+    WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K
+
+    WARP_K_STEPS = BLOCK_K // WARP_GROUP_K
+    assert WARP_K_STEPS * WARP_GROUP_K == BLOCK_K
+
+    K_SLICE = BLOCK_K // BLOCK_K_WARPS
+    assert K_SLICE * BLOCK_K_WARPS == BLOCK_K
+    assert K_SLICE % WARP_ATOM_K == 0
+
+    BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
+    if IS_HT:
+        WARP_M_STEPS = HALF_BLOCK_M // BLOCK_M_WARPS // WARP_ATOM_M
+        WARP_N_STEPS = HALF_BLOCK_N // BLOCK_N_WARPS // WARP_ATOM_N
+        assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
+        assert HALF_BLOCK_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
+        assert HALF_BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
+    else:
+        WARP_M_STEPS = BLOCK_M // BLOCK_M_WARPS // WARP_ATOM_M
+        WARP_N_STEPS = BLOCK_N // BLOCK_N_WARPS // WARP_ATOM_N
+        assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
+        assert BLOCK_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
+        assert BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
+    WARP_M = WARP_M_STEPS * WARP_ATOM_M
+    WARP_N = WARP_N_STEPS * WARP_ATOM_N
+    if IS_HT:
+        assert HALF_BLOCK_M == BLOCK_M_WARPS * WARP_M
+        assert HALF_BLOCK_N == BLOCK_N_WARPS * WARP_N
+    else:
+        assert BLOCK_M == BLOCK_M_WARPS * WARP_M
+        assert BLOCK_N == BLOCK_N_WARPS * WARP_N
+    BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
+    BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
+    BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
+
+    if IS_HT:
+        STG_SIZE_PER_M_STEP = BLOCK_M_WARPS * WARP_ATOM_M * HALF_BLOCK_N
+        STG_WORK_SIZE_PER_M_STEP = STG_SIZE_PER_M_STEP // BLOCK_THREADS
+        assert (STG_SIZE_PER_M_STEP % BLOCK_THREADS == 0) and (
+            STG_WORK_SIZE_PER_M_STEP >= 1
+        )
+        STG_VEC_SIZE = 8 if STG_WORK_SIZE_PER_M_STEP >= 8 else STG_WORK_SIZE_PER_M_STEP
+        assert STG_VEC_SIZE in [8, 4]
+        assert (STG_WORK_SIZE_PER_M_STEP % STG_VEC_SIZE == 0) and (
+            STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE >= 1
+        )
+    else:
+        STG_VEC_SIZE = 8
+
+    BLOCK_VECS_STG = STG_VEC_SIZE * BLOCK_THREADS
+    STG_C_X_THREADS = BLOCK_N // STG_VEC_SIZE
+    assert STG_C_X_THREADS * STG_VEC_SIZE == BLOCK_N
+    STG_C_ITERS = BLOCK_MN_SIZE // BLOCK_VECS_STG
+    assert STG_C_ITERS * BLOCK_VECS_STG == BLOCK_MN_SIZE
+    LDG_ASYNC_VEC_SIZE = DMA_BYTES // IN_DTYPE_BYTES
+    assert LDG_ASYNC_VEC_SIZE * IN_DTYPE_BYTES == DMA_BYTES
+    LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
+    assert LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE == BLOCK_K
+    LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
+    assert LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE == BLOCK_K
+    assert (BLOCK_M * BLOCK_N) % (BLOCK_THREADS * STG_VEC_SIZE) == 0
+
+    if IS_HT:
+        LDG_A_ITERS_AS = HALF_BLOCK_M * BLOCK_K // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert (
+            LDG_A_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS
+            == HALF_BLOCK_M * BLOCK_K
+        )
+        LDG_B_ITERS_AS = HALF_BLOCK_N * BLOCK_K // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert (
+            LDG_B_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS
+            == HALF_BLOCK_N * BLOCK_K
+        )
+        assert (2 * LDG_B_ITERS_AS + 2 * LDG_A_ITERS_AS) < 63
+        assert HALF_BLOCK_N % STG_VEC_SIZE == 0
+    else:
+        LDG_A_ITERS_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert LDG_A_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS == BLOCK_MK_SIZE
+        LDG_B_ITERS_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert LDG_B_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS == BLOCK_NK_SIZE
+        LDG_WAIT_COUNT = LDG_B_ITERS_AS + LDG_A_ITERS_AS
+        assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
+
+    # LDS parameters:
+    allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
+    smem_a_offset = allocator._align(allocator.ptr, 16)
+    AS_BYTES = STAGES * BLOCK_M * BLOCK_K * IN_DTYPE_BYTES
+    allocator.ptr = smem_a_offset + AS_BYTES
+    SMEM_USE = AS_BYTES
+    smem_b_offset = allocator._align(allocator.ptr, 16)
+    BS_BYTES = STAGES * BLOCK_N * BLOCK_K * IN_DTYPE_BYTES
+    allocator.ptr = smem_b_offset + BS_BYTES
+    SMEM_USE += BS_BYTES
+    SMEM_USE_ = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * OUT_DTYPE_BYTES)
+    allocator.ptr += SMEM_USE_ - SMEM_USE
+    assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
+
+    KERNEL_NAME = f"HGEMM_{DTYPE}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_TN"
+    KERNEL_NAME += "_HT" if IS_HT else "_FT"
+    KERNEL_NAME += f"_GM{max(GROUP_M, 0)}"
+    KERNEL_NAME += "_BIAS" if HAS_BIAS else ""
+    KERNEL_NAME += "_KTAIL" if HAS_K_TAIL else ""
+    KERNEL_NAME = KERNEL_NAME.upper()
+
+    splitk_protocol = SplitKProtocol(
+        SPLIT_K,
+        BLOCK_M,
+        BLOCK_N,
+        STG_VEC_SIZE,
+        OUT_DTYPE_BYTES,
+        BLOCK_THREADS,
+        HAS_BIAS,
+    )
+    assert splitk_protocol is not None
+
+    block_swizzle = BlockSwizzle(NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=GROUP_M)
+    assert block_swizzle is not None
+
+    return
+
+
 @functools.lru_cache(maxsize=16384)
 def compile_hgemm_wmma_kernel(
     DTYPE: str,
@@ -1619,6 +1797,25 @@ def hgemm_validate(dtype_str, m, n, k, kwargs):
     IS_FP8 = "fp8" in dtype_str
     DTYPE_BYTES = 1 if IS_FP8 else 2
 
+    try:
+        assert_hgemm_wmma_kernel(
+            DTYPE=dtype_str,
+            TILE_M=TILE_M,
+            TILE_N=TILE_N,
+            TILE_K=TILE_K,
+            STAGES=STAGES,
+            SPLIT_K=SPLIT_K,
+            BLOCK_M_WARPS=BLOCK_M_WARPS,
+            BLOCK_N_WARPS=BLOCK_N_WARPS,
+            BLOCK_K_WARPS=BLOCK_K_WARPS,
+            HAS_BIAS=True,
+            HAS_K_TAIL=True,
+            GROUP_M=kwargs["GROUP_M"],
+            USE_HALF_TILE_INTERLEAVED=USE_HALF_TILE_INTERLEAVED,
+        )
+    except Exception as e:
+        return False
+
     if USE_HALF_TILE_INTERLEAVED:
         if not (STAGES == 2 and BLOCK_K_WARPS == 1 and BLOCK_M_WARPS == 2):
             return False
@@ -1686,6 +1883,19 @@ def get_semaphore(stream, device):
     return semaphore, signal
 
 
+def infer_has_k_tail(k: int, split_k: int, tile_k: int, is_ht: bool):
+    working_k = (k + split_k - 1) // split_k
+    last_working_k = k - (split_k - 1) * working_k
+    has_k_tail = (working_k % tile_k != 0) or (last_working_k % tile_k != 0)
+    if is_ht:
+        working_k_tiles = (working_k + tile_k - 1) // tile_k
+        last_working_k_tiles = (last_working_k + tile_k - 1) // tile_k
+        has_k_tail = (
+            has_k_tail or (working_k_tiles % 2 != 0) or (last_working_k_tiles % 2 != 0)
+        )
+    return has_k_tail
+
+
 def hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1735,21 +1945,12 @@ def hgemm(
     )
     kwargs.update(user_kwargs)
 
-    working_k = (k + kwargs["SPLIT_K"] - 1) // kwargs["SPLIT_K"]
-    last_working_k = k - (kwargs["SPLIT_K"] - 1) * working_k
-    kwargs["HAS_K_TAIL"] = (working_k % kwargs["TILE_K"] != 0) or (
-        last_working_k % kwargs["TILE_K"] != 0
+    kwargs["HAS_K_TAIL"] = infer_has_k_tail(
+        k=k,
+        split_k=kwargs["SPLIT_K"],
+        tile_k=kwargs["TILE_K"],
+        is_ht=kwargs["USE_HALF_TILE_INTERLEAVED"],
     )
-    if kwargs["USE_HALF_TILE_INTERLEAVED"]:
-        working_k_tiles = (working_k + kwargs["TILE_K"] - 1) // kwargs["TILE_K"]
-        last_working_k_tiles = (last_working_k + kwargs["TILE_K"] - 1) // kwargs[
-            "TILE_K"
-        ]
-        kwargs["HAS_K_TAIL"] = (
-            kwargs["HAS_K_TAIL"]
-            or (working_k_tiles % 2 != 0)
-            or (last_working_k_tiles % 2 != 0)
-        )
 
     kwargs["HAS_BIAS"] = False if bias is None else True
 
