@@ -920,22 +920,14 @@ def compile_mxscale_gemm(
                 return _d
 
             def wst_active_load(dg0, dg1):
-                """WST single-descriptor TDM load; weight-loader wave uses .cg.
+                """WST single-descriptor TDM load, shared by all loader waves.
 
-                In wave-specialized mode one instruction serves all loader waves
-                via a per-wave-selected descriptor, but CPOL is a compile-time
-                immediate -- so a uniform (scalar) branch on the weight-loader
-                wave predicate gives the weight load .cg while the other tensors
-                (A / scales) keep the default policy.
+                In wave-specialized mode one instruction serves every loader wave
+                (A / B / scales) via a per-wave-selected descriptor, and CPOL is a
+                compile-time immediate -- so all waves share the one cache modifier.
                 """
                 desc = tdm_ops.TDMDescriptor2D(dg0, dg1)
-                _if = scf.IfOp(tdm_wave_is_b, results_=[], has_else=True)
-                with ir.InsertionPoint(_if.then_block):
-                    tdm_ops.tensor_load_2d(desc, cache_policy=TDM_CG_CACHE_POLICY)
-                    scf.YieldOp([])
-                with ir.InsertionPoint(_if.else_block):
-                    tdm_ops.tensor_load_2d(desc, cache_policy=0)
-                    scf.YieldOp([])
+                tdm_ops.tensor_load_2d(desc, cache_policy=TDM_CG_CACHE_POLICY)
 
             def make_desc_as(memref, k_base):
                 k_scale_off = k_base // arith.index(SCALE_BLOCK)
