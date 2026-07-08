@@ -281,7 +281,23 @@ def _moe_gemm_a16w4(
     # so the unpack along K lines up element-for-element with the scale.
     # threads_per_warp = [8, 4] = 32 (wave32 on gfx1250).
 
-    PACKED_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+    PACKED_LOAD_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 32],
+            [0, 64],
+            [0, 128],
+            [64, 0],
+        ],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 16]],
+        warp_bases=[[16, 0], [32, 0]],
+        block_bases=[],
+        shape=[128, 256],
+    )
+    PACKED_DOT_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[
             [0, 1],
             [0, 2],
@@ -431,7 +447,8 @@ def _moe_gemm_a16w4(
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
         r_idx = read_idx % NUM_BUFFERS
         x_tile = x_buffer.index(r_idx).load(layout=DOT_LAYOUT_X)
-        w_packed = w_buffer.index(r_idx).load(layout=PACKED_LAYOUT)
+        w_packed = w_buffer.index(r_idx).load(layout=PACKED_LOAD_LAYOUT)
+        w_packed = gl.convert_layout(w_packed, layout=PACKED_DOT_LAYOUT)
         ws_buffer_slice = ws_buffer.index(r_idx)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
             ws_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -481,7 +498,8 @@ def _moe_gemm_a16w4(
         )
         r_idx = read_idx % NUM_BUFFERS
         x_tile = x_buffer.index(r_idx).load(layout=DOT_LAYOUT_X)
-        w_packed = w_buffer.index(r_idx).load(layout=PACKED_LAYOUT)
+        w_packed = w_buffer.index(r_idx).load(layout=PACKED_LOAD_LAYOUT)
+        w_packed = gl.convert_layout(w_packed, layout=PACKED_DOT_LAYOUT)
         ws_buffer_slice = ws_buffer.index(r_idx)
 
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
