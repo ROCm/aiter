@@ -84,6 +84,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    USE_ATOMIC_ADD: gl.constexpr = False,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -471,6 +472,7 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    USE_ATOMIC_ADD: gl.constexpr = False,
 ):
     """
     this is currently a copy of the bandwidth_bound kernel
@@ -749,30 +751,53 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     else:
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
-    tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
-    )
-    tdm_smem_c = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        layout=tdm_shared_c,
-    )
-    tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
+    if USE_ATOMIC_ADD:
+        # Split-K accumulation via global atomic-add into a single (M, N)
+        # buffer, instead of writing per-split partials to c[pid_k] and running
+        # a separate reduce kernel. All NUM_KSPLIT programs owning a given
+        # (M, N) tile race on the same addresses, trading the reduce-kernel
+        # launch + its (NUM_KSPLIT, M, N) read traffic for atomic contention in
+        # the epilogue. c_ptr has no pid_k offset; the accumulation dtype is the
+        # caller-provided buffer dtype (fp32 or bf16, both fadd on cdna4).
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
+        )
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
+        )
+        c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.cdna4.buffer_atomic_add(
+            ptr=c_ptr,
+            offsets=c_offsets,
+            value=acc.to(c_ptr.type.element_ty),
+            mask=c_mask,
+        )
+    else:
+        # Store — offset c_ptr by pid_k * stride_ck for split-K
+        tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+        )
+        tdm_smem_c = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            layout=tdm_shared_c,
+        )
+        tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
 
-    gl.barrier()
+        gl.barrier()
 
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr + pid_k * stride_ck,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        layout=tdm_shared_c,
-    )
-    gl.amd.gfx1250.tdm.async_store(
-        c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr + pid_k * stride_ck,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+            layout=tdm_shared_c,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _PRESHUFFLE_GLUON_REPR_KEYS = [
@@ -864,6 +889,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    USE_ATOMIC_ADD: gl.constexpr = False,
 ):
     """
     Gluon gfx1250 kernel for a8w8 blockscale GEMM with preshuffled weights.
@@ -1288,30 +1314,53 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_ab_scale
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
-    tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
-    )
-    tdm_smem_c = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        layout=tdm_shared_c,
-    )
-    tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
+    if USE_ATOMIC_ADD:
+        # Split-K accumulation via global atomic-add into a single (M, N)
+        # buffer, instead of writing per-split partials to c[pid_k] and running
+        # a separate reduce kernel. All NUM_KSPLIT programs owning a given
+        # (M, N) tile race on the same addresses, trading the reduce-kernel
+        # launch + its (NUM_KSPLIT, M, N) read traffic for atomic contention in
+        # the epilogue. c_ptr has no pid_k offset; the accumulation dtype is the
+        # caller-provided buffer dtype (fp32 or bf16, both fadd on cdna4).
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
+        )
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
+        )
+        c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.cdna4.buffer_atomic_add(
+            ptr=c_ptr,
+            offsets=c_offsets,
+            value=acc.to(c_ptr.type.element_ty),
+            mask=c_mask,
+        )
+    else:
+        # Store — offset c_ptr by pid_k * stride_ck for split-K
+        tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+        )
+        tdm_smem_c = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            layout=tdm_shared_c,
+        )
+        tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
 
-    gl.barrier()
+        gl.barrier()
 
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr + pid_k * stride_ck,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        layout=tdm_shared_c,
-    )
-    gl.amd.gfx1250.tdm.async_store(
-        c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr + pid_k * stride_ck,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+            layout=tdm_shared_c,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _gemm_a8w8_blockscale_preshuffle_compute_bound_repr = make_kernel_repr(
@@ -1365,6 +1414,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    USE_ATOMIC_ADD: gl.constexpr = False,
 ):
     """
     Gluon gfx1250 kernel for a8w8 blockscale GEMM with preshuffled weights.
@@ -1789,30 +1839,53 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_ab_scale
 
-    # Store — offset c_ptr by pid_k * stride_ck for split-K
-    tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
-    )
-    tdm_smem_c = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        layout=tdm_shared_c,
-    )
-    tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
+    if USE_ATOMIC_ADD:
+        # Split-K accumulation via global atomic-add into a single (M, N)
+        # buffer, instead of writing per-split partials to c[pid_k] and running
+        # a separate reduce kernel. All NUM_KSPLIT programs owning a given
+        # (M, N) tile race on the same addresses, trading the reduce-kernel
+        # launch + its (NUM_KSPLIT, M, N) read traffic for atomic contention in
+        # the epilogue. c_ptr has no pid_k offset; the accumulation dtype is the
+        # caller-provided buffer dtype (fp32 or bf16, both fadd on cdna4).
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
+        )
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
+        )
+        c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.cdna4.buffer_atomic_add(
+            ptr=c_ptr,
+            offsets=c_offsets,
+            value=acc.to(c_ptr.type.element_ty),
+            mask=c_mask,
+        )
+    else:
+        # Store — offset c_ptr by pid_k * stride_ck for split-K
+        tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+        )
+        tdm_smem_c = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            layout=tdm_shared_c,
+        )
+        tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
 
-    gl.barrier()
+        gl.barrier()
 
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr + pid_k * stride_ck,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        layout=tdm_shared_c,
-    )
-    gl.amd.gfx1250.tdm.async_store(
-        c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr + pid_k * stride_ck,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+            layout=tdm_shared_c,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _KERNEL_MAP = {

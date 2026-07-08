@@ -253,6 +253,7 @@ def gemm_a8w8_blockscale_preshuffle(
     is_x_scale_tranposed: Optional[bool] = True,
     kernel_type: str = "bandwidth_bound",
     backend: Optional[str] = None,
+    use_atomic_add: Optional[bool] = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -298,13 +299,29 @@ def gemm_a8w8_blockscale_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True, backend=backend)
 
+    # Split-K accumulation via in-kernel global atomic-add instead of a separate
+    # reduce kernel. Only meaningful when we actually split K. The caller must
+    # provide `y` as a pre-zeroed accumulator; the split-K programs atomic-add
+    # into it directly and it is returned as-is (no reduce, no cast). The
+    # accumulation dtype is simply whatever dtype `y` has.
+    use_atomic_add = bool(use_atomic_add) and config["NUM_KSPLIT"] > 1
+    if use_atomic_add:
+        assert (
+            backend == "gluon"
+        ), "use_atomic_add is only implemented for the gluon backend"
+        assert y is not None, (
+            "use_atomic_add requires the caller to pass `y` as a pre-zeroed "
+            "accumulator tensor of shape (M, N); its dtype defines the "
+            "accumulation precision."
+        )
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
         K, config["NUM_KSPLIT"]
     )  # How big each split_k partition is
-    if config["NUM_KSPLIT"] > 1:
+    if not use_atomic_add and config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N),
             dtype=torch.float32,
@@ -312,6 +329,23 @@ def gemm_a8w8_blockscale_preshuffle(
         )
     else:
         y_pp = None
+
+    # Pick the output buffer and its strides for the kernel. In atomic mode all
+    # split-K programs accumulate into the single caller-provided (M, N) buffer
+    # `y` (no pid_k offset, so stride_ck is unused / 0).
+    if use_atomic_add:
+        c_buf = y
+        c_stride_k, c_stride_m, c_stride_n = 0, y.stride(0), y.stride(1)
+    elif config["NUM_KSPLIT"] == 1:
+        c_buf = y
+        c_stride_k, c_stride_m, c_stride_n = 0, y.stride(0), y.stride(1)
+    else:
+        c_buf = y_pp
+        c_stride_k, c_stride_m, c_stride_n = (
+            y_pp.stride(0),
+            y_pp.stride(1),
+            y_pp.stride(2),
+        )
 
     # If block size is greater than split k size, shrink the block size
     if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
@@ -374,6 +408,7 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
+        extra_constexpr["USE_ATOMIC_ADD"] = use_atomic_add
         config["NUM_BUFFERS"] = config.pop("num_stages", 1)
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
@@ -381,7 +416,7 @@ def gemm_a8w8_blockscale_preshuffle(
     impl[grid](
         x,
         w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        c_buf,
         x_scale,
         w_scale,
         M,
@@ -391,9 +426,9 @@ def gemm_a8w8_blockscale_preshuffle(
         x.stride(1),
         w.stride(0),
         w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        c_stride_k,
+        c_stride_m,
+        c_stride_n,
         x_scale.stride(1) if is_x_scale_tranposed else x_scale.stride(0),
         (
             (x_scale.numel() // x_scale.stride(0))
@@ -405,6 +440,11 @@ def gemm_a8w8_blockscale_preshuffle(
         **config,
         **extra_constexpr,
     )
+
+    if use_atomic_add:
+        # The split-K partials were already summed in-kernel into the
+        # caller-provided accumulator `y`; nothing more to do (no reduce kernel).
+        return y
 
     if config["NUM_KSPLIT"] > 1:
         if skip_reduce:
