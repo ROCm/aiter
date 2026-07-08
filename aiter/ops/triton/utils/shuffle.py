@@ -158,17 +158,15 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch="gfx950") -> torch.Tensor
     reshape/permute structure. Drop-in for ``aiter.ops.shuffle.shuffle_scale``
     (non-``guinterleave``) / ``fp4_utils.e8m0_shuffle``.
 
-    Arch-aware. The GEMM scale tile differs per arch (same split as
-    ``shuffle_scale_gemm``), so the tile parameters and the ``(M, K_groups)``
-    padding are selected from ``arch`` (defaulting to ``get_arch()``):
+    Arch-aware.
 
     * gfx950:  ``preshuffle_factor = 32``, ``scale_kwidth = 8`` -- byte-identical
-      to the reference ``fp4_utils.e8m0_shuffle`` (row-``(2,16)`` / K-``(2,4)``).
+      to ``fp4_utils.e8m0_shuffle`` (row-``(2,16)`` / K-``(2,4)``).
     * gfx1250: ``preshuffle_factor = 16``, ``scale_kwidth = 4`` -- the gfx1250
       WMMA GEMM scale tile.
 
-    The column padding is a multiple of ``scale_kwidth`` (8 on gfx950, matching
-    the reference; 4 on gfx1250). The row padding is a multiple of 256, which is
+    The column padding is a multiple of ``scale_kwidth`` (8 on gfx950; 4 on gfx1250). 
+    The row padding is a multiple of 256, which is
     the reference gfx950 M-tile and is divisible by both preshuffle factors, so
     the tile reshape is valid on either arch. Returns the padded
     ``(M_pad, K_groups_pad)`` view; the consumer (``gemm_a4w4_quant``) re-collapses
