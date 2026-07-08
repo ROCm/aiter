@@ -523,8 +523,13 @@ def gemm_afp4wfp4_preshuffle(
         return y
 
     if config["NUM_KSPLIT"] > 1:
+        # get_splitk works in PACKED-K units (K//2), matching the non-preshuffle
+        # gemm_afp4wfp4 path (which passes x.shape[1]). Passing K_elems here made
+        # its //2 partition math 2x too large -> a degenerate split (e.g. K=7168:
+        # SPLITK_BLOCK==K, NUM_KSPLIT==2 with overlapping halves) whose 2nd split
+        # reads entirely past the operands -> GPU memory access fault at decode.
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+            K_bytes, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
 
         config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
@@ -573,7 +578,9 @@ def gemm_afp4wfp4_preshuffle(
         w_scales,
         M,
         N,
-        K_elems,
+        # kernel's split guard `pid_k*SPLITK_BLOCK_SIZE//2 < K` compares a PACKED
+        # column start against K, so K must be packed (K//2), like the plain path.
+        K_bytes,
         x_fp4.stride(0),
         x_fp4.stride(1),
         w_preshuf.stride(0),
