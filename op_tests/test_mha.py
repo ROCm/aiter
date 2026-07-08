@@ -1103,12 +1103,8 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     )
 
 
-# ---------------------------------------------------------------------------
-# OPUS gfx950 dense D=128 bf16 forward, validated THROUGH flash_attn_func.
-# Curated (batch, seqlen, nheads_q, nheads_kv) spread, all within the opus gate
-# (seqlen_q == seqlen_k == seqlen): le2 (<=128), pipelined odd/even, partial last
-# tile (n % 64 != 0), and large n; MHA + GQA + MQA; a couple of batch sizes.
-# ---------------------------------------------------------------------------
+# OPUS gfx950 dense D=128 via flash_attn_func. Cases span the gate (sq==sk):
+# le2 (<=128), pipelined odd/even, partial last tile (n%64), large n; MHA/GQA/MQA.
 _OPUS_CASES = [
     (2, 64, 8, 2),  # le2 1-tile, GQA
     (2, 128, 16, 1),  # le2 2-tile, MQA
@@ -1134,13 +1130,11 @@ _OPUS_CASES = [
 def test_flash_attn_func_opus(
     batch_size, seqlen, nheads, nheads_k, causal, monkeypatch
 ):
-    """Validate the OPUS gfx950 dense D=128 bf16 kernel THROUGH flash_attn_func.
+    """Validate the OPUS D=128 kernel THROUGH flash_attn_func.
 
-    The opus path only engages when AITER_ENABLE_FMHA_OPUS=1 AND the
-    gate holds (gfx950, bf16, D=128, dense, seqlen_q == seqlen_k, no dropout /
-    bias / alibi / swa / sink / descale, inference / no LSE). The env var is set
-    via monkeypatch scoped to THIS test only, so pytest restores it on teardown
-    and the other test_mha.py cases keep exercising the default v3/CK dispatch.
+    Opus engages only with AITER_ENABLE_FMHA_OPUS=1 + the gate (gfx950, bf16,
+    D=128, dense, sq==sk, inference/no-LSE). The env is monkeypatched scoped to
+    this test so the other cases keep exercising the default v3/CK dispatch.
     """
     if get_gfx() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
@@ -1165,17 +1159,12 @@ def test_flash_attn_func_opus(
             return_attn_probs=False,
         )
 
-    # fp32-upcast reference + a non-upcast torch run to size the bf16 tolerance,
-    # matching the tolerance convention used by the other cases in this file.
     out_ref, _ = run_torch(q, k, v, causal=causal)
     out_pt, _ = run_torch(q, k, v, causal=causal, upcast=False, reorder_ops=True)
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     print(f"[opus] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
     assert (out - out_ref).abs().max().item() <= out_tol
 
-    # Assert flash_attn_func actually routed to opus (not silently v3/CK): its
-    # output must be bit-identical to a direct call of the opus wrapper (same
-    # kernel + same default 1/sqrt(d) scale).
     with torch.no_grad():
         out_opus = fmha_fwd_hd128_bf16_opus_fwd(
             q, k, v, softmax_scale=d**-0.5, causal=causal

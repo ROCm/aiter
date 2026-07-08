@@ -84,9 +84,9 @@ jobs:
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
-              # Kimi-K2.5 ATOM (in-tree) downstream gate. Config (model_path,
+              # Kimi-K2.7 ATOM (in-tree) downstream gate. Config (model_path,
               # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
-              {"model_name": "Kimi-K2.5-MXFP4"},
+              {"model_name": "Kimi-K2.7-Code-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -104,10 +104,10 @@ jobs:
               "linux-atom-mi35x-1": "linux-aiter-do-mi350x-1",
           }
 
-          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.5
+          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.7
           # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
           model_runner_overrides = {
-              "Kimi-K2.5-MXFP4": "linux-aiter-do-mi350x-4",
+              "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-4",
               "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
               "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
               "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-2",     # -tp 2 (MXFP4)
@@ -148,12 +148,9 @@ jobs:
                   base_args = str(model.get("extraArgs", "")).strip()
                   model["extraArgs"] = f"{base_args} {extra_args}".strip()
               model["label"] = model.get("runner", "")
+              model["display_name"] = model.get("display_name", model["model_name"])
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
               model["run_on_pr"] = True
-              model["job_name"] = (
-                  f"Accuracy ({model['model_name']}, {model['model_path']}, "
-                  f"{model.get('extraArgs', '')}, {model['runner']})"
-              )
               return model
 
           # Models force-included in ci:atom_full regardless of their ATOM
@@ -199,7 +196,7 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'ci:atom_full') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: [check-signal, load-atom-models]
-    name: ${{ matrix.job_name }}
+    name: Accuracy (${{ matrix.display_name }}, ${{ matrix.runner }})
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -357,10 +354,28 @@ jobs:
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         timeout-minutes: 90
         env:
+          MODEL_NAME: ${{ matrix.model_name }}
+          DISPLAY_NAME: ${{ matrix.display_name }}
+          MODEL_PATH: ${{ matrix.model_path }}
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
+          RUNNER_NAME: ${{ matrix.runner }}
+          ACCURACY_TEST_THRESHOLD: ${{ matrix.accuracy_test_threshold }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
         run: |
           set -euo pipefail
+          echo "ATOM accuracy config:"
+          printf '  display_name: %s\n' "$DISPLAY_NAME"
+          printf '  model_name: %s\n' "$MODEL_NAME"
+          printf '  model_path: %s\n' "$MODEL_PATH"
+          printf '  runner: %s\n' "$RUNNER_NAME"
+          printf '  accuracy_threshold: %s\n' "$ACCURACY_TEST_THRESHOLD"
+          echo "  extraArgs:"
+          if [ -n "$MODEL_EXTRA_ARGS" ]; then
+            printf '%s\n' "$MODEL_EXTRA_ARGS"
+          else
+            echo "<empty>"
+          fi
+
           echo ""
           echo "========== Launching ATOM server =========="
           if docker exec atom_aiter_test bash -lc "[ -d /models ]"; then
