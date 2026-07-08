@@ -15,13 +15,10 @@ from torch import Tensor
 
 import flydsl.expr as fx
 from aiter import logger
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from .kernels.hgemm_wmma_gfx950 import hgemm, hgemm_get_configs, infer_has_k_tail
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
@@ -37,40 +34,6 @@ def _get_dtypes():
     from aiter.utility import dtypes
 
     return dtypes
-
-
-SPLIT_K_SEMAPHORE_MAX_LEN = 256
-FIXED_STAGE = 2
-FIXED_C_TO_LDS = False
-KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
-KERNEL_FAMILY_HGEMM = "hgemm"
-KERNEL_FAMILY_SMALL_M = "small_m"
-_HGEMM_KERNEL_RE = re.compile(
-    r"^flydsl_gemm(?P<stages>\d+)_"
-    r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
-    r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
-    r"split_k(?P<split_k>\d+)_"
-    r"block_m_warp(?P<block_m_warps>\d+)_"
-    r"block_n_warp(?P<block_n_warps>\d+)_"
-    r"block_k_warp(?P<block_k_warps>\d+)_"
-    r"async_copy(?P<async_copy>True|False)_"
-    r"b_to_lds(?P<b_to_lds>True|False)_"
-    r"b_preshuffle(?P<b_preshuffle>True|False)_"
-    r"c_to_lds(?P<c_to_lds>True|False)"
-    r"(?:_use_ht(?P<use_ht>True|False))?"
-    r"(?P<small_m_suffix>"
-    r"(?:_small_m)"
-    r"(?:_nr(?P<n_tile_repeat>\d+))?"
-    r"(?:_pn(?P<persistent_n_tiles>\d+))?"
-    r"(?:_wpe(?P<waves_per_eu>\d+))?"
-    r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
-    r")?"
-    r"_(?P<target_gfx>gfx[0-9a-z]+)$"
-)
-
-SplitKStreamKey = tuple[int, int]
-SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
-SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
 
 _HGEMM_KERNELS: Dict[str, Dict] = {}
@@ -99,60 +62,9 @@ def flydsl_kernel_name(
     return name
 
 
-def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
-    m = _HGEMM_KERNEL_RE.fullmatch(name)
-    if m is None:
-        return None
-    if m.group("a_dtype") != m.group("w_dtype"):
-        return None
-
-    kernel_family = (
-        KERNEL_FAMILY_SMALL_M
-        if m.group("small_m_suffix") is not None
-        else KERNEL_FAMILY_HGEMM
-    )
-    block_k_warps = m.group("block_k_warps")
-    block_k_warps = int(block_k_warps) if block_k_warps else 1
-    use_ht = m.group("use_ht")
-    use_ht = use_ht == "True" if use_ht else False
-    config: Dict[str, object] = {
-        "kernel_family": kernel_family,
-        "stages": int(m.group("stages")),
-        "tile_m": int(m.group("tile_m")),
-        "tile_n": int(m.group("tile_n")),
-        "tile_k": int(m.group("tile_k")),
-        "split_k": int(m.group("split_k")),
-        "block_m_warps": int(m.group("block_m_warps")),
-        "block_n_warps": int(m.group("block_n_warps")),
-        "block_k_warps": block_k_warps,
-        "async_copy": m.group("async_copy") == "True",
-        "b_to_lds": m.group("b_to_lds") == "True",
-        "b_preshuffle": m.group("b_preshuffle") == "True",
-        "c_to_lds": m.group("c_to_lds") == "True",
-        "use_ht": use_ht,
-        "dtype": m.group("a_dtype"),
-        "out_dtype": m.group("out_dtype"),
-        "target_gfx": m.group("target_gfx"),
-    }
-    if kernel_family == KERNEL_FAMILY_SMALL_M:
-        config["n_tile_repeat"] = int(m.group("n_tile_repeat") or 1)
-        config["persistent_n_tiles"] = int(m.group("persistent_n_tiles") or 1)
-        config["waves_per_eu"] = int(m.group("waves_per_eu") or 0)
-        config["b_to_lds_unroll"] = int(m.group("b_to_lds_unroll") or 0)
-    return config
-
-
-def get_flydsl_splitk_hgemm_kernel_params(name: str) -> Optional[Dict]:
+def get_flydsl_hgemm_kernel_params(name: str) -> Optional[Dict]:
     config = _HGEMM_KERNELS.get(name)
     if config is not None:
-        config = dict(config)
-        if "_use_htTrue" in name:
-            config["use_ht"] = True
-        return dict(config)
-    config = _parse_hgemm_kernel_params(name)
-    if config is not None:
-        if "_use_htTrue" in name:
-            config["use_ht"] = True
         return dict(config)
     return None
 
@@ -208,6 +120,8 @@ def get_flydsl_hgemm_kernels(
         )
         config["HAS_BIAS"] = has_bias
         config["HAS_K_TAIL"] = has_k_tail
+        config["dtype"] = dtype
+        config["out_dtype"] = out_dtype
         kernels[name] = config
     return kernels
 

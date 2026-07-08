@@ -49,7 +49,7 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
-    get_flydsl_splitk_hgemm_kernel_params,
+    get_flydsl_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
@@ -147,8 +147,8 @@ def parse_csv(csv_path: str):
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
-            elif kernel_name.startswith("flydsl_gemm"):
-                params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
+            elif kernel_name.startswith("flydsl_hgemm"):
+                params = get_flydsl_hgemm_kernel_params(kernel_name)
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "hgemm"
@@ -211,26 +211,19 @@ def _compile_hgemm_to_cache(
     k: int,
     dtype: str,
     out_dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    stages: int,
-    split_k: int,
-    block_m_warps: int,
-    block_n_warps: int,
-    block_k_warps: int,
-    n_tile_repeat: int = 1,
-    persistent_n_tiles: int = 1,
-    waves_per_eu: int = 0,
-    b_to_lds_unroll: int = 0,
-    async_copy: bool,
-    b_to_lds: bool,
-    b_preshuffle: bool,
-    c_to_lds: bool,
-    target_gfx: str,
-    kernel_family: str = "hgemm",
-    has_bias: bool = False,
-    use_ht: bool = False,
+    has_bias: bool,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+    GROUP_M: int,
+    HAS_BIAS: bool,
+    HAS_K_TAILL: bool,
     **kwargs,
 ):
     del kwargs, out_dtype
@@ -257,28 +250,19 @@ def _compile_hgemm_to_cache(
     stream = fx.Stream(0)
 
     exe = compile_flydsl_hgemm_kernel(
-        dtype,
-        n,
-        k,
-        kernel_family=kernel_family,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        stages=stages,
-        split_k=split_k,
-        block_m_warps=block_m_warps,
-        block_n_warps=block_n_warps,
-        block_k_warps=block_k_warps,
-        n_tile_repeat=n_tile_repeat,
-        persistent_n_tiles=persistent_n_tiles,
-        waves_per_eu=waves_per_eu,
-        b_to_lds_unroll=b_to_lds_unroll,
-        async_copy=async_copy,
-        b_to_lds=b_to_lds,
-        b_preshuffle=b_preshuffle,
-        c_to_lds=c_to_lds,
-        has_bias=has_bias,
-        use_ht=use_ht,
+        dtype=dtype,
+        tile_m=TILE_M,
+        tile_n=TILE_N,
+        tile_k=TILE_K,
+        stages=STAGES,
+        split_k=SPLIT_K,
+        block_m_warps=BLOCK_M_WARPS,
+        block_n_warps=BLOCK_N_WARPS,
+        block_k_warps=BLOCK_K_WARPS,
+        has_bias=HAS_BIAS,
+        has_k_tail=HAS_K_TAILL,
+        group_m=GROUP_M,
+        policy="ht" if USE_HALF_TILE_INTERLEAVED else "ft",
     )
     # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
     # optional bias and split-K sync tensors.
@@ -289,9 +273,11 @@ def _compile_hgemm_to_cache(
         _ptr_view_safe(a),
         _ptr_view_safe(b),
         _ptr_view_safe(launch_bias),
-        m,
         _ptr_view_safe(semaphore),
         _ptr_view_safe(signal),
+        m,
+        n,
+        k,
         stream,
     )
 
