@@ -28,10 +28,29 @@ full, tiled, masked, sequence-parallel kernel that plugs into a `torch.autograd.
 > - ✅ **Phase 3** — `dQ` via a second Q-owned kernel; full dense causal backward. Green.
 > - ✅ **Phase 4** — masking variants (`num_targets`, `max_attn_len`, `contextual_seq_len`,
 >   combos, asymmetric dims). Green (26 tests).
-> - 🔜 **Interlude** — perf baseline: hook a `flydsl` provider into the recsys `bench_hstu.py`
->   harness, capture ms/TFLOP-s vs Triton on the production shapes (next).
-> - ⬜ **Phase 5** — tiling + config/CSV plumbing.
-> - ⬜ Phases 6–8 pending.
+> - ✅ **Interlude** — perf baseline captured on **MI300X (`gfx942`)**: `flydsl` provider added
+>   to the recsys `bench_hstu.py`/`sweep_hstu.py`; ms/TFLOP-s vs Triton recorded over P1–P4 ×
+>   {512,1024,2048,16384} × {fwd,bwd}. Results in `docs/HSTU_backward_optimization_log.md`.
+>   Headline: FlyDSL bwd ~2.4–3.5× faster at small batch (B=120); ~parity→0.77× at large batch
+>   (B=1024), gap closing with seq_len (near parity at N=16384).
+> - ✅ **Phase 5** — tiling + config/CSV plumbing: cached `_compile_bwd_launcher`, tuned→default→
+>   custom override chain, `_bwd_tuned_config_map`/`_BWD_CSV_COLUMNS`. Green (33 tests: +4
+>   block-override, +3 tuned-CSV).
+> - ❎ **Phase 6 (N/A)** — sequence-parallel `dQ` sync is **subsumed by the Phase-3 two-kernel
+>   design**: `dV`/`dK` (KV-owned) and `dQ` (Q-owned) are each fully tile-parallel *and*
+>   single-writer, so there is no `dQ` read-modify-write to guard. The vestigial `sequence_parallel`
+>   knob was removed.
+> - ✅ **Phase 7 (partial)** — bench + tuning: added `op_tests/op_benchmarks/flydsl/tune_hstu_attn_bwd.py`
+>   (sweeps tile configs, emits the tuned CSV). Committed `hstu_attention_bwd_tuned.csv` for P1–P4 ×
+>   {512,1024,2048} dense causal on `gfx942`. Finding: `(192,32,4,0)` wins at N=2048 (~6–9% over
+>   default), default `(64,32,4,0)` best at N≤1024. End-to-end: B1024/H8/N2048 bwd 71.5→64.0 ms
+>   (−10.5%), Triton gap 1.29×→1.16×. Remaining: mask-regime + N=16384 tuning, and `gfx950` (34 tests green).
+> - ✅ **Phase 8** — autograd integration: `FlydslHstuAttention(torch.autograd.Function)` + a
+>   `flydsl_hstu_attention(...)` drop-in wrapper (fwd + bwd as one differentiable op). Green
+>   (`test_flydsl_autograd_end_to_end`, 6 cases). **Full suite: 40 tests.**
+> - ✅ **Phase 9** — layout-algebra cleanup & de-duplication: shared `hstu_attention_common.py`
+>   (`grouped_loader`, `swz_col`, `decode_lane` via `idx2crd`); both backward kernels import it.
+>   Behavior-preserving (40 tests green; B1024/H8/N2048 bwd 63.95 ms, no regression).
 >
 > **Design note.** The backward is **two lock-free kernels**: a KV-owned kernel
 > (`hstu_attention_bwd.py`) for `dV`/`dK` (reduce over the query index) and a Q-owned kernel
@@ -427,7 +446,7 @@ HIP_VISIBLE_DEVICES=7 /workspaces/git/meta/aiter/flydsl_venv/bin/python bench_hs
 interlude is measurement-only; it changes no kernel code and is a prerequisite for the Phase 7
 tuning loop, which will reuse the same harness + CSV.)*
 
-### Phase 5 — Tiling, block sizes & config plumbing
+### Phase 5 — Tiling, block sizes & config plumbing  ✅ DONE
 
 **Goal:** make the kernel tunable and give it the same host-side config machinery as the forward.
 
@@ -450,7 +469,33 @@ tuning loop, which will reuse the same harness + CSV.)*
   a small helper module if it pays off).
 - **Exit:** grads correct across multiple tile configs; config selection unit-tested.
 
-### Phase 6 — Sequence-parallel `dQ` synchronization  *(performance / scaling)*
+> **Implemented as (Phase 5, actual).** Added to `hstu_attention_kernels.py`, mirroring the
+> forward: `_BWD_CSV_COLUMNS` (forward schema + a `sequence_parallel` column), a cached
+> `_bwd_tuned_config_map` (best-duration-wins, reuses the forward `_problem_key`), `_get_bwd_tuned_config`,
+> a conservative `_get_bwd_default_config` (`64/32/4/0`, valid across all supported/asymmetric dims),
+> and a `@lru_cache`d `_compile_bwd_launcher` that resolves **tuned → default → custom-override** and
+> builds the `(dV/dK, dQ)` launcher pair. `flydsl_hstu_attention_bwd` now routes through it (public
+> signature unchanged). Default tuned CSV path: `hstu_attention_bwd_tuned.csv` (not committed yet —
+> populated by the tuning phase). Tests: `test_flydsl_bwd_block_size_overrides` (4 configs) +
+> `test_bwd_tuned_csv_*` (3). Full suite: 33 green. *(No `sequence_parallel` column — see Phase 6.)*
+
+### Phase 6 — Sequence-parallel `dQ` synchronization  ❎ N/A (subsumed by Phase 3)
+
+> **Resolution.** This phase existed to guard a `dQ` read-modify-write hazard that arises **only in a
+> fused, KV-parallel backward** (theory §5.2–§5.3), where many KV programs add partial `dQ` into the
+> same query rows. The Phase-3 implementation instead uses a **separate Q-owned `dQ` kernel**
+> (`hstu_attention_bwd_dq.py`, grid `num_q_tiles·batch·num_heads`, register `dq_acc`, single store),
+> alongside the KV-owned `dV`/`dK` kernel (grid `num_kv_tiles·batch·num_heads`). **Both kernels are
+> already fully tile-parallel *and* single-writer**, so there is no cross-program `dQ` accumulation to
+> synchronize — the goal of `SEQUENCE_PARALLEL=True` (full parallelism) and the safety of
+> `SEQUENCE_PARALLEL=False` (no races) are achieved simultaneously by construction. Adding
+> scratch/atomics/locks would only add a slower path. The vestigial `sequence_parallel` kwarg and CSV
+> column were removed. The trade we accept is one extra `S`/`dS` recompute in the `dQ` kernel
+> (recompute-over-bandwidth), which the interlude benchmarks show is competitive. The
+> `test_bwd_sequence_parallel_matches_serial` / race-stress tests below are therefore not applicable
+> (no serial-vs-parallel duality exists). Perf tuning of the tile configs moves to Phase 7.
+
+<details><summary>Original (fused-kernel) plan, kept for context</summary>
 
 **Goal:** allow KV blocks to run as **separate programs**, which requires guarding the `dQ`
 read-modify-write (theory §5.3). This is the trickiest, most GPU-specific part and is deliberately
@@ -473,7 +518,9 @@ last.
   `sequence_parallel` config/CSV column.
 - **Exit:** sequence-parallel path matches serial path deterministically; race stress test stable.
 
-### Phase 7 — Benchmarking & tuning
+</details>
+
+### Phase 7 — Benchmarking & tuning  ✅ DONE (gfx942, dense causal)
 
 **Goal:** know how fast we are and produce a tuned CSV, matching the forward's tuning workflow.
 
@@ -488,7 +535,20 @@ last.
 - **Exit:** benchmark runs on `gfx950` (and `gfx942`), tuned CSV committed, perf recorded relative
   to Triton bwd.
 
-### Phase 8 — Autograd integration & end-to-end
+> **Implemented as (Phase 7, actual).** Rather than extend the fork's single-shape forward bench, a
+> dedicated tuner `op_tests/op_benchmarks/flydsl/tune_hstu_attn_bwd.py` sweeps a curated
+> `(block_m, block_n, num_waves, waves_per_eu)` shortlist per problem, times the full backward (both
+> kernels) via `triton.testing.do_bench` on realistic jagged inputs (mirrors the recsys harness's
+> length distribution, not the test generator's power-law-clamped one), and writes the fastest config
+> per problem to `aiter/ops/flydsl/hstu_attention_bwd_tuned.csv` (best-duration-wins, invalid configs
+> auto-skipped). No `sequence_parallel` axis (Phase 6 N/A). Ran the `prod` grid (P1–P4 ×
+> {512,1024,2048}, bf16, `gfx942`): **`(192,32,4,0)` is fastest at N=2048** (~6–9% over the
+> `(64,32,4,0)` default), default wins at N≤1024. End-to-end via the recsys harness, B1024/H8/N2048
+> bwd improved **71.5 → 64.0 ms (−10.5%)**, closing the Triton gap from 1.29× to 1.16×. Correctness of
+> the shipped tuned config is locked by adding `(192,32,4,0)` to `test_flydsl_bwd_block_size_overrides`.
+> Follow-ups: tune the mask regimes and `N=16384`, and re-tune on `gfx950`. Full suite: 34 green.
+
+### Phase 8 — Autograd integration & end-to-end  ✅ DONE
 
 **Goal:** make the FlyDSL forward + backward usable as a single differentiable op, mirroring
 Triton's `_AttentionFunction`.
@@ -504,6 +564,74 @@ Triton's `_AttentionFunction`.
     with the arg positions matching the public signature (copy the Triton `_AttentionFunction`
     None-padding pattern).
 - **Exit:** end-to-end gradient test green; op is drop-in differentiable.
+
+> **Implemented as (Phase 8, actual).** Added `FlydslHstuAttention(torch.autograd.Function)` to
+> `hstu_attention_kernels.py`, mirroring the Triton `_AttentionFunction`: `forward(ctx, N, alpha, q,
+> k, v, seq_offsets, causal, num_targets, max_attn_len, contextual_seq_len)` saves `(q,k,v,
+> seq_offsets[,num_targets])` + scalars and calls `flydsl_hstu_attention_fwd`; `backward` runs under
+> `torch.inference_mode()`, calls `flydsl_hstu_attention_bwd`, and returns `(None, None, dq, dk, dv,
+> None, None, None, None, None)` (grads for q/k/v only). A `flydsl_hstu_attention(...)` convenience
+> wrapper exposes `.apply`, and both are added to `__all__`. Test `test_flydsl_autograd_end_to_end`
+> compares `.grad` after `out.backward(dout)` against the autograd oracle for dense/targets/window ×
+> bf16/f16 (6 cases). Full suite: **40 green**.
+
+### Phase 9 — Layout-algebra cleanup & de-duplication  ✅ DONE
+
+**Goal:** reduce hand-rolled integer index arithmetic and remove the ~3× copy-pasted indexing
+idioms across the HSTU backward kernels by (a) centralizing shared helpers in one module and
+(b) expressing index maps with FlyDSL **layout algebra** (`make_layout` / `idx2crd` / `crd2idx` /
+`make_view` / composed swizzle) wherever it is a clean, behavior-preserving win.
+
+**Finding that scopes this phase (from a survey of all three kernels).** There is **no
+forward↔backward "layout-algebra gap"**: the forward (`hstu_attention_fwd.py`) and both backward
+kernels (`hstu_attention_bwd.py`, `hstu_attention_bwd_dq.py`) share the *same* hybrid style. They
+already use layout algebra for the coalesced vector loads (`grouped_loader` = `make_layout` +
+`make_view`), but do manual arithmetic for: lane/wave decomposition (`tid // WARP_SIZE`,
+`lane % 16`, …), the XOR LDS swizzle (`k_swz_col`/`q_swz_col`), the DMA pass-map loops
+(`pair = tid + d*BLOCK_THREADS; row = pair // pairs_per_row; …`), MFMA operand gather, and the
+epilogue scatter. Crucially these idioms are **duplicated verbatim** (roles relabelled) across the
+three files. Some manual indexing is **inherent and stays**: the `raw_ptr_buffer_load_lds` DMA path,
+the bf16 `pack_p`/fragment bitcast, and the jagged `seq_offsets`/`to_id` masking (business logic,
+not addressing).
+
+**Non-goals (explicitly out of scope for this cleanup).** A full CuTe-style rewrite to
+`TiledMma.partition_A/B/C` and `make_tiled_copy` — no aiter FlyDSL kernel uses those yet, it would be
+a large re-architecture of hot, *tuned* kernels, and the forward blueprint doesn't use them either.
+No change to the numeric recipe, tile configs, grid, or public API. This phase must be
+**behavior-preserving** (same MLIR-level addressing, same results, no perf regression).
+
+**Default scope decision (revisit if perf/risk dictates).** Refactor the **backward kernels only**
+(our domain, Phases 1–8), leaving the vendored forward untouched but designing the shared module so
+the forward *could* adopt it later. Staged:
+- **9a — Shared helper module.** Extract the duplicated idioms into
+  `kernels/hstu_attention_common.py`: `grouped_loader`, a `swz_col(tile_row, col, rows, shift)`
+  swizzle helper, a lane/wave decomposition helper, and a DMA pass-map builder. Both backward kernels
+  import them (removes the copy-paste; single source of truth).
+- **9b — Layout-algebra idioms.** Replace manual lane/wave arithmetic with
+  `idx2crd(tid, make_layout(...))` + `fx.get(...)` (the "Pattern B" idiom other aiter kernels already
+  use), i.e. `(wave, lane)` and `(lane_div_16, lane_mod_16)` come from layouts, not `//`/`%`.
+- **9c — (optional) swizzle as a layout.** Evaluate composing the XOR swizzle into the LDS layout
+  (`make_composed_layout` + `Swizzle`) instead of applying `col ^ …` at each access; adopt only if it
+  stays behavior-identical and doesn't regress perf.
+
+**Red / gate:** the existing **40-test** suite is the correctness guard (this is a pure refactor, so
+no new numeric tests are required); add a tiny standalone unit test only for any extracted helper with
+self-contained logic (e.g. `swz_col`). **Green:** kernels build and the full suite passes. **Refactor:**
+keep each step small and independently test-green. **Exit:** suite green **and** no regression on the
+tuned `N=2048` shape (spot-check via the tuner/bench, e.g. B1024/H8/N2048 ≈ 64 ms).
+
+> **Implemented as (Phase 9, actual).** Added `kernels/hstu_attention_common.py` with `grouped_loader`
+> (unchanged; `make_layout` + `make_view`), `swz_col(tile_row, col, rows, shift)` (the shared XOR
+> swizzle), and `decode_lane(tid, num_waves, warp_size, mfma_n)` which derives
+> `(wave_id, lane, lane_div_16, lane_mod_16)` from two `idx2crd(tid, make_layout(...))` maps instead of
+> `//`/`%`. Both backward kernels (`hstu_attention_bwd.py`, `hstu_attention_bwd_dq.py`) now import
+> these; their local `grouped_loader`/`*_swz_col`/lane-math were removed (`*_swz_col` kept as one-line
+> aliases so call sites are untouched). **Gotcha:** `idx2crd`/`fx.get` yield MLIR `index`-typed values;
+> the kernels' address math is `i32`, so `decode_lane` casts each coordinate back with `fx.Int32(...)`
+> (otherwise MLIR fails to verify `arith.muli(index, i32)`). Kept behavior-preserving and
+> perf-neutral (B1024/H8/N2048 bwd 63.95 ms vs 64.04 ms pre-refactor). Scope held to the **backward**
+> kernels; the vendored forward is untouched (the shared module is forward-adoptable later). No
+> `TiledMma`/`make_tiled_copy` rewrite (deliberate non-goal). Full suite: **40 green**.
 
 ---
 
@@ -549,11 +677,12 @@ From theory §6 and §7.2 — each deserves at least one targeted assertion:
 | 2 | `dK` + `dS` | `test_flydsl_bwd_dv_dk_causal`, `test_silu_derivative_formula` | ✅ done |
 | 3 | `dQ`, full dense causal | `test_flydsl_bwd_all_causal` (dq/dk/dv, bf16/f16 × 3 shapes) | ✅ done |
 | 4 | Mask variants | `test_flydsl_bwd_variants`, `test_flydsl_bwd_asymmetric_dims` | ✅ done |
-| — | Perf baseline (interlude) | `flydsl` provider in recsys `bench_hstu.py`; baseline CSV over P1–P4 | 🔜 next |
-| 5 | Tiling + config | `test_bwd_block_size_overrides`, `test_bwd_tuned_csv_*` | ⬜ |
-| 6 | Sequence-parallel `dQ` | `test_bwd_sequence_parallel_matches_serial`, race stress | ⬜ |
-| 7 | Bench + tune | bench correctness gate + `hstu_attention_bwd_tuned.csv` | ⬜ |
-| 8 | Autograd integration | `test_flydsl_autograd_end_to_end` | ⬜ |
+| — | Perf baseline (interlude) | `flydsl` provider in recsys `bench_hstu.py`; baseline CSVs over P1–P4 | ✅ done |
+| 5 | Tiling + config | `test_flydsl_bwd_block_size_overrides`, `test_bwd_tuned_csv_*` | ✅ done |
+| 6 | Sequence-parallel `dQ` | — (subsumed by Phase-3 two-kernel design; knob removed) | ❎ N/A |
+| 7 | Bench + tune | `tune_hstu_attn_bwd.py` + `hstu_attention_bwd_tuned.csv` | ✅ done (gfx942, dense causal) |
+| 8 | Autograd integration | `test_flydsl_autograd_end_to_end` | ✅ done |
+| 9 | Layout-algebra cleanup / de-dup | existing 40-suite as guard | ✅ done |
 
 ---
 
