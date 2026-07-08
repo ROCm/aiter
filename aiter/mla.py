@@ -1260,17 +1260,19 @@ def mla_decode_fwd_v4_nm(
     # we still pass *something* through to satisfy the C ABI.
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
 
-    # Per-batch valid KV split count writeback buffer. Always allocated (and
-    # passed to the asm kernel) so it has a valid destination; whether stage2
-    # actually uses it is gated by use_valid_split_count_reduce. Sized [num_seqs]
-    # with num_kv_splits already resolved, and initialized to num_kv_splits so a
-    # min() against it is a no-op until the kernel overwrites it with the real
-    # (smaller) valid count. v4 nm's split_indptr is uniform (every seq uses all
-    # num_kv_splits). Mirrors the V3 mla_decode_fwd path (see the stage1 call
-    # above).
-    valid_split_count = torch.full(
-        (num_seqs,), num_kv_splits, dtype=dtypes.i32, device=q.device
-    )
+    # Per-batch valid KV split count buffer. Always allocated (and passed to the
+    # asm kernel) so the ABI has a valid device destination, but INTENTIONALLY
+    # left uninitialized: v4 nm ships only for gfx950, where the stage2 reduce
+    # runs with USE_VALID_SPLIT_COUNT_REDUCE=0 (see the stage2 launch below) so
+    # it never reads this buffer's content, and the v4 nm decode kernel doesn't
+    # write it back either -- only the pointer matters. torch.empty avoids the
+    # per-call fill that torch.full would launch (a vectorized_elementwise_kernel
+    # that shows up as an extra slice right before the decode kernel in a
+    # per-call perf trace). NOTE: this relies on v4 nm being gfx950-only; a
+    # future non-gfx950 kernel whose stage2 reads valid_split_count would need a
+    # real init (torch.full) here.
+    valid_split_count = torch.empty((num_seqs,), dtype=dtypes.i32, device=q.device)
+
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
     aiter.mla_decode_v4_asm(
