@@ -192,40 +192,6 @@ def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
 
 
-def _make_contiguous_psum_layout(
-    *,
-    masked_m: torch.Tensor,
-    rows_to_tokens: torch.Tensor,
-    topids_to_rows: torch.Tensor,
-    experts: int,
-    max_m: int,
-    tile_m: int,
-    token_num: int,
-    topk: int,
-):
-    """Build DeepGEMM psum layout. contiguous_m is a static upper bound (CUDAGraph-safe)."""
-    device = masked_m.device
-
-    starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
-    ub = int(token_num) * int(topk) + int(experts) * int(tile_m) - int(topk)
-    contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
-
-    old_flat = topids_to_rows.reshape(-1)
-    expert = torch.div(old_flat, int(max_m), rounding_mode="floor")
-    slot = old_flat - expert * int(max_m)
-    new_flat = starts_t[expert.to(torch.long)] + slot
-    remapped_topids = new_flat.to(torch.int32).view_as(topids_to_rows)
-
-    # Inverse map (contiguous row -> source token) via one scatter.
-    remapped_rows = torch.full(
-        (int(contiguous_m),), -1, device=device, dtype=torch.int32
-    )
-    src_tokens = rows_to_tokens[old_flat.to(torch.long)]
-    remapped_rows[new_flat.to(torch.long)] = src_tokens
-
-    return remapped_topids, remapped_rows, psum_t, int(contiguous_m)
-
-
 def _grouped_a8w4_preshuffle_e8m0_scale(
     scale: torch.Tensor,
     warp_tile: int,
@@ -743,31 +709,58 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             # layout; the same ``rows_to_tokens`` drives the in-GEMM A gather and
             # the host-side scale preshuffle.
             _grouped_dbg("gather MoE: build route maps + token-order quant")
-            topids_to_rows, rows_to_tokens, masked_m = build_route_maps(
-                topk_ids, E, max_m
-            )
             if effective_grouped_contiguous_m:
-                # Remap the (E, max_m) maps into the DeepGEMM contiguous layout;
-                # ``rows_to_tokens`` becomes (contiguous_m,) (contiguous row ->
-                # source token) and doubles as the gather index.
-                (
-                    topids_to_rows,
-                    rows_to_tokens,
-                    m_tile_map,
-                    contiguous_m,
-                ) = _make_contiguous_psum_layout(
-                    masked_m=masked_m,
-                    rows_to_tokens=rows_to_tokens,
-                    topids_to_rows=topids_to_rows,
-                    experts=E,
-                    max_m=max_m,
-                    tile_m=tile_m,
-                    token_num=token_num,
-                    topk=topk,
-                )
+                # Build the DeepGEMM contiguous layout with the inverse map
+                # ``rows_to_tokens`` (contiguous row -> source token, -1 pad)
+                # emitted in-kernel -- no host-side scatter. ``rows_to_tokens``
+                # doubles as the in-GEMM A gather index.
+                ub = int(token_num) * int(topk) + int(E) * int(tile_m) - int(topk)
+                contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
                 route_E = 1
                 route_max_m = int(contiguous_m)
+                _use_fused_route_psum = (
+                    int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+                    and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
+                )
+                if _use_fused_route_psum:
+                    (
+                        masked_m,
+                        topids_to_rows,
+                        m_tile_map,
+                        rows_to_tokens,
+                    ) = fused_route_psum_remap(
+                        topk_ids,
+                        E,
+                        max_m,
+                        tile_m,
+                        want_inverse=True,
+                        contiguous_m=contiguous_m,
+                    )
+                else:
+                    topids_to_rows, _rows_masked, masked_m = build_route_maps(
+                        topk_ids, E, max_m
+                    )
+                    (
+                        _starts_t,
+                        m_tile_map,
+                        _contig_m_t,
+                        rows_to_tokens,
+                    ) = contiguous_psum_remap(
+                        masked_m,
+                        topids_to_rows,
+                        E,
+                        max_m,
+                        tile_m,
+                        want_inverse=True,
+                        contiguous_m=contiguous_m,
+                        topk=topk,
+                    )
             else:
+                # Masked (E, max_m) layout: ``build_route_maps`` already yields the
+                # inverse map in masked coordinates, which is the gather index.
+                topids_to_rows, rows_to_tokens, masked_m = build_route_maps(
+                    topk_ids, E, max_m
+                )
                 route_E = E
                 route_max_m = max_m
             if data_format == "fp4":
@@ -1419,12 +1412,21 @@ def fused_route_psum_remap(
     experts: int,
     max_m: int,
     tile_m: int,
+    *,
+    want_inverse: bool = False,
+    contiguous_m: int = 0,
 ):
     """Single-launch route+atomic+psum+remap for small token counts.
 
     Equivalent to ``flydsl_moe_topids_to_rows`` followed by
     ``contiguous_psum_remap``, but fused into one workgroup. Returns
     (masked_m, topids_to_rows[token_num, topk], psum).
+
+    When ``want_inverse`` is set (gather MoE), also emits the contiguous
+    ``rows_to_tokens`` inverse map (contiguous row -> source token, -1 pad)
+    in-kernel, avoiding the host-side ``_make_contiguous_psum_layout`` scatter;
+    ``contiguous_m`` is the static upper bound sizing that buffer. Returns
+    (masked_m, topids_to_rows, psum, rows_to_tokens) in that case.
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
@@ -1434,6 +1436,14 @@ def fused_route_psum_remap(
     masked_m = torch.empty(experts, dtype=torch.int32, device=device)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
     psum = torch.empty(experts, dtype=torch.int32, device=device)
+    if want_inverse:
+        rt_size = int(contiguous_m)
+        rows_to_tokens = torch.empty(rt_size, dtype=torch.int32, device=device)
+        emit_inverse = 1
+    else:
+        rt_size = 0
+        rows_to_tokens = torch.empty(1, dtype=torch.int32, device=device)
+        emit_inverse = 0
     launch = _get_compiled_route_psum_fused()
     launch(
         topk_ids.to(torch.int32).reshape(-1),
@@ -1441,12 +1451,18 @@ def fused_route_psum_remap(
         masked_m,
         starts,
         psum,
+        rows_to_tokens,
         int(numel),
         experts,
         int(max_m),
         int(tile_m),
+        int(topk),
+        int(rt_size),
+        int(emit_inverse),
         stream=torch.cuda.current_stream(),
     )
+    if want_inverse:
+        return masked_m, topids_to_rows.view(token_num, topk), psum, rows_to_tokens
     return masked_m, topids_to_rows.view(token_num, topk), psum
 
 
@@ -1477,8 +1493,19 @@ def contiguous_psum_remap(
     experts: int,
     route_max_m: int,
     tile_m: int,
+    *,
+    want_inverse: bool = False,
+    contiguous_m: int = 0,
+    topk: int = 0,
 ):
-    """Tile-aligned psum and in-place masked-row -> contiguous-row remap."""
+    """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
+
+    When ``want_inverse`` is set (gather MoE), also emits the contiguous
+    ``rows_to_tokens`` inverse map (contiguous row -> source token, -1 pad)
+    in-kernel; ``contiguous_m`` sizes that buffer and ``topk`` maps a flat
+    route index back to its token. Returns (starts, psum, contiguous_m_t,
+    rows_to_tokens) in that case, else (starts, psum, contiguous_m_t).
+    """
     device = masked_m.device
     experts = int(experts)
     masked_m_i32 = masked_m[:experts].to(torch.int32)
@@ -1486,6 +1513,16 @@ def contiguous_psum_remap(
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     topids_flat = topids_to_rows.reshape(-1)
+    if want_inverse:
+        rt_size = int(contiguous_m)
+        rows_to_tokens = torch.empty(rt_size, dtype=torch.int32, device=device)
+        emit_inverse = 1
+        _topk = int(topk) if int(topk) > 0 else int(topids_to_rows.shape[-1])
+    else:
+        rt_size = 0
+        rows_to_tokens = torch.empty(1, dtype=torch.int32, device=device)
+        emit_inverse = 0
+        _topk = 0
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         masked_m_i32,
@@ -1493,12 +1530,18 @@ def contiguous_psum_remap(
         starts,
         psum,
         contiguous_m_t,
+        rows_to_tokens,
         int(topids_flat.numel()),
         experts,
         int(route_max_m),
         int(tile_m),
+        int(_topk),
+        int(rt_size),
+        int(emit_inverse),
         stream=torch.cuda.current_stream(),
     )
+    if want_inverse:
+        return starts, psum, contiguous_m_t, rows_to_tokens
     return starts, psum, contiguous_m_t
 
 

@@ -177,15 +177,23 @@ def build_moe_contiguous_psum_remap_module():
         starts: fx.Tensor,
         psum: fx.Tensor,
         contiguous_m: fx.Tensor,
+        rows_to_tokens: fx.Tensor,  # (rt_size,) i32 out (contiguous row -> token)
         numel: Int32,
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
+        topk: Int32,
+        rt_size: Int32,
+        emit_inverse: Int32,
     ):
         i32 = T.i32
         tid = ArithValue(fx.thread_idx.x)
         tile_v = ArithValue(tile_m)
         tile_minus_1 = tile_v - arith.constant(1, type=i32)
+        topk_v = ArithValue(topk)
+        do_inverse = arith.cmpi(
+            CmpIPredicate.ne, ArithValue(emit_inverse), arith.constant(0, type=i32)
+        )
 
         lds_base = allocator.get_base()
         lds0 = STensor(
@@ -204,6 +212,26 @@ def build_moe_contiguous_psum_remap_module():
         s_rsrc = buffer_ops.create_buffer_resource(starts, max_size=True)
         p_rsrc = buffer_ops.create_buffer_resource(psum, max_size=True)
         c_rsrc = buffer_ops.create_buffer_resource(contiguous_m, max_size=True)
+        rt_rsrc = buffer_ops.create_buffer_resource(rows_to_tokens, max_size=True)
+
+        # Gather only: prefill the contiguous row -> token inverse map with -1 so
+        # padding rows (never hit by a route) stay masked.
+        _if_prefill = scf.IfOp(do_inverse)
+        with ir.InsertionPoint(_if_prefill.then_block):
+            rt_size_idx = arith.index_cast(T.index, ArithValue(rt_size))
+            pre_loop = scf.ForOp(
+                arith.index_cast(T.index, tid),
+                rt_size_idx,
+                arith.index(MAX_EXPERTS_PER_BLOCK),
+            )
+            with ir.InsertionPoint(pre_loop.body):
+                pre_i32 = arith.index_cast(i32, pre_loop.induction_variable)
+                buffer_ops.buffer_store(
+                    arith.constant(-1, type=i32), rt_rsrc, pre_i32
+                )
+                scf.YieldOp([])
+            scf.YieldOp([])
+        gpu.barrier()
 
         in_expert = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
         _if_load = scf.IfOp(in_expert)
@@ -280,7 +308,14 @@ def build_moe_contiguous_psum_remap_module():
             expert = ArithValue(arith.divui(row, m))
             slot = row - expert * m
             start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
+            contig_row = ArithValue(start) + slot
+            buffer_ops.buffer_store(contig_row, rows_rsrc, route_i32)
+            # Inverse map: contiguous row -> source token (= route // topk).
+            _if_inv = scf.IfOp(do_inverse)
+            with ir.InsertionPoint(_if_inv.then_block):
+                token = arith.divui(route_i32, topk_v)
+                buffer_ops.buffer_store(ArithValue(token), rt_rsrc, contig_row)
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit
@@ -290,10 +325,14 @@ def build_moe_contiguous_psum_remap_module():
         starts: fx.Tensor,
         psum: fx.Tensor,
         contiguous_m: fx.Tensor,
+        rows_to_tokens: fx.Tensor,
         numel: fx.Int32,
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
+        topk: fx.Int32,
+        rt_size: fx.Int32,
+        emit_inverse: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -306,10 +345,14 @@ def build_moe_contiguous_psum_remap_module():
             starts,
             psum,
             contiguous_m,
+            rows_to_tokens,
             numel,
             experts,
             route_max_m,
             tile_m,
+            topk,
+            rt_size,
+            emit_inverse,
         ).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
@@ -353,15 +396,23 @@ def build_moe_route_psum_fused_module():
         masked_m: fx.Tensor,  # (E,) i32 out (per-expert counts)
         starts: fx.Tensor,  # (E,) i32 out (contiguous row base per expert)
         psum: fx.Tensor,  # (E,) i32 out (= m_tile_map)
+        rows_to_tokens: fx.Tensor,  # (rt_size,) i32 out (contiguous row -> token)
         numel: Int32,
         experts: Int32,
         max_m: Int32,
         tile_m: Int32,
+        topk: Int32,
+        rt_size: Int32,  # contiguous_m upper bound (buffer size for prefill)
+        emit_inverse: Int32,  # 0/1: also emit ``rows_to_tokens``
     ):
         i32 = T.i32
         tid = ArithValue(fx.thread_idx.x)
         tile_v = ArithValue(tile_m)
         tile_minus_1 = tile_v - arith.constant(1, type=i32)
+        topk_v = ArithValue(topk)
+        do_inverse = arith.cmpi(
+            CmpIPredicate.ne, ArithValue(emit_inverse), arith.constant(0, type=i32)
+        )
 
         lds_base = allocator.get_base()
         lds_cnt = STensor(
@@ -385,8 +436,28 @@ def build_moe_route_psum_fused_module():
         m_rsrc = buffer_ops.create_buffer_resource(masked_m, max_size=True)
         s_rsrc = buffer_ops.create_buffer_resource(starts, max_size=True)
         p_rsrc = buffer_ops.create_buffer_resource(psum, max_size=True)
+        rt_rsrc = buffer_ops.create_buffer_resource(rows_to_tokens, max_size=True)
 
         in_expert = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
+
+        # Phase A0 (gather only): prefill the contiguous row -> token inverse map
+        # with -1 so padding rows (never hit by a route) stay masked.
+        _if_prefill = scf.IfOp(do_inverse)
+        with ir.InsertionPoint(_if_prefill.then_block):
+            rt_size_idx = arith.index_cast(T.index, ArithValue(rt_size))
+            pre_loop = scf.ForOp(
+                arith.index_cast(T.index, tid),
+                rt_size_idx,
+                arith.index(MAX_EXPERTS_PER_BLOCK),
+            )
+            with ir.InsertionPoint(pre_loop.body):
+                pre_i32 = arith.index_cast(i32, pre_loop.induction_variable)
+                buffer_ops.buffer_store(
+                    arith.constant(-1, type=i32), rt_rsrc, pre_i32
+                )
+                scf.YieldOp([])
+            scf.YieldOp([])
+        gpu.barrier()
 
         # Phase A: zero the LDS per-expert atomic counter.
         _if_zero = scf.IfOp(in_expert)
@@ -485,7 +556,14 @@ def build_moe_route_psum_fused_module():
             expert = ArithValue(arith.divui(row, m))
             slot = row - expert * m
             start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
+            contig_row = ArithValue(start) + slot
+            buffer_ops.buffer_store(contig_row, rows_rsrc, route_i32)
+            # Inverse map: contiguous row -> source token (= route // topk).
+            _if_inv = scf.IfOp(do_inverse)
+            with ir.InsertionPoint(_if_inv.then_block):
+                token = arith.divui(route_i32, topk_v)
+                buffer_ops.buffer_store(ArithValue(token), rt_rsrc, contig_row)
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit
@@ -495,10 +573,14 @@ def build_moe_route_psum_fused_module():
         masked_m: fx.Tensor,
         starts: fx.Tensor,
         psum: fx.Tensor,
+        rows_to_tokens: fx.Tensor,
         numel: fx.Int32,
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
+        topk: fx.Int32,
+        rt_size: fx.Int32,
+        emit_inverse: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -511,10 +593,14 @@ def build_moe_route_psum_fused_module():
             masked_m,
             starts,
             psum,
+            rows_to_tokens,
             numel,
             experts,
             max_m,
             tile_m,
+            topk,
+            rt_size,
+            emit_inverse,
         ).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
