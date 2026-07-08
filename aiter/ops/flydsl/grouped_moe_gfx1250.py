@@ -792,9 +792,43 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     _grouped_dbg("scale layout done")
 
-    grouped_a2 = torch.empty(
-        (route_E, route_max_m, inter_dim), dtype=dtype, device=device
+    _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
+    if _bias1_arg is not None and _bias1_arg.dtype != dtype:
+        _bias1_arg = _bias1_arg.to(dtype)
+
+    # Fuse gemm1's output MXFP4 quant + scale-preshuffle into the GEMM epilogue
+    # (folds the standalone moe_fused_quant_preshuffle kernel). Enabled by default
+    # for the eligible fp4 gugu (interleaved) / gguu (dual-B) paths; opt out with
+    # AITER_FLYDSL_FUSE_GEMM1_QUANT=0. The scale is laid out for gemm2's A-scale
+    # (wmma_rep = warp_tile_m2 // 16). gugu de-interleaves output cols (needs
+    # warp_tile_n%64==0); gguu keeps them (needs warp_tile_n%32==0).
+    _wr2 = warp_tile_m2 // 16
+    _q_warp_align = 32 if stage1_weight_layout == "gguu" else 64
+    _fuse_gemm1_quant = (
+        os.environ.get("AITER_FLYDSL_FUSE_GEMM1_QUANT", "1")
+        not in ("", "0", "false", "False")
+        and (not _use_naive)
+        and data_format == "fp4"
+        and stage1_weight_layout in ("gugu", "gguu")
+        and int(split_k1) == 1
+        and (tile_n // n_warp) % _q_warp_align == 0
+        and _bias1_arg is None
+        and int(route_max_m) % (_wr2 * 16) == 0
     )
+    if _fuse_gemm1_quant:
+        grouped_a2 = None
+        grouped_a2_payload = torch.empty(
+            (route_E, route_max_m, inter_dim // 2), dtype=torch.uint8, device=device
+        )
+        grouped_a2_scale = torch.empty(
+            (route_E, route_max_m // _wr2, (inter_dim // 32) * _wr2),
+            dtype=torch.uint8,
+            device=device,
+        )
+    else:
+        grouped_a2 = torch.empty(
+            (route_E, route_max_m, inter_dim), dtype=dtype, device=device
+        )
     stage1_compiler = (
         compile_moe_grouped_gemm1_mxfp4_masked
         if data_format == "fp4"
@@ -826,16 +860,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             and wave_specialized_tdm_req
         ),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
+        **(
+            {"stage1_quant_out": "fp4", "stage1_quant_wmma_rep": _wr2}
+            if _fuse_gemm1_quant
+            else {}
+        ),
     )
     _grouped_dbg("stage1 compile done; start launch")
-    _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
-    if _bias1_arg is not None and _bias1_arg.dtype != dtype:
-        _bias1_arg = _bias1_arg.to(dtype)
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
+    _stage1_y = grouped_a2_payload if _fuse_gemm1_quant else grouped_a2
+    _stage1_qscale = grouped_a2_scale if _fuse_gemm1_quant else None
     stage1(
-        grouped_a2,
+        _stage1_y,
         grouped_a1,
         grouped_w1,
         grouped_a1_scale,
@@ -850,6 +888,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
+        _quant_scale=_stage1_qscale,
     )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
@@ -857,7 +896,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 "gemm1",
                 functools.partial(
                     stage1,
-                    grouped_a2,
+                    _stage1_y,
                     grouped_a1,
                     grouped_w1,
                     grouped_a1_scale,
@@ -872,6 +911,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                     _m_tile_prefix=m_tile_prefix,
                     _m_tile_map=m_tile_map,
                     bias=_bias1_arg,
+                    _quant_scale=_stage1_qscale,
                 ),
             )
         )
@@ -882,7 +922,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     # Optional single-token stage1 dump.
     _dump_a2 = os.environ.get("AITER_GROUPED_DUMP_A2", "0")
-    if _dump_a2 not in ("", "0", "false", "False"):
+    if _dump_a2 not in ("", "0", "false", "False") and grouped_a2 is not None:
         if token_num == 1:
             _routed_experts = topk_ids[0].to(torch.long)
             _a2_tt = grouped_a2[_routed_experts, 0].view(token_num, topk, inter_dim)
@@ -938,6 +978,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
             a2_scale_raw, warp_tile=warp_tile_m2, scale_k_per_tile=tile_k2 // 32
         )
+    elif _fuse_gemm1_quant:
+        # gemm1 already wrote grouped_a2_payload + grouped_a2_scale in its fused
+        # quant epilogue; nothing to do here.
+        _grouped_dbg("a2 payload+scale produced by fused gemm1 quant epilogue")
     else:
         from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
 
@@ -1135,12 +1179,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
         def _bench_fn():
             stage1(
-                grouped_a2, _bench_a1, grouped_w1, _bench_a1_scale,
+                _stage1_y, _bench_a1, grouped_w1, _bench_a1_scale,
                 grouped_w1_scale, _bench_masked_m, max_m, inter_dim, model_dim, E,
                 stream=torch.cuda.current_stream(),
                 swiglu_limit=swiglu_limit,
                 _m_tile_prefix=m_tile_prefix, _m_tile_map=_bench_m_tile_map,
                 bias=_bias1_arg,
+                _quant_scale=_stage1_qscale,
             )
             _s2_result = stage2(
                 _stage2_out, _bench_a2_payload, grouped_w2, _bench_a2_scale,
