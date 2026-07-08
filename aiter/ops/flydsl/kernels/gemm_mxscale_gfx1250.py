@@ -590,7 +590,7 @@ def compile_mxscale_gemm(
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
     _act_tag = stage1_act_mode if stage1_act_mode is not None else "noact"
     module_name = (
-        f"kernel_mxscale_{data_format}"
+        f"kernel_mxscale_moe_gemm_{data_format}"
         f"_m{M}n{N}k{K}e{batch_count}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_sk{split_k}"

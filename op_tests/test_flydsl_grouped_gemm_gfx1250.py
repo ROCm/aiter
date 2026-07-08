@@ -822,12 +822,17 @@ def _bench_gluon_a8w4_moe(
     warmup: int = 5,
     iters: int = 101,
     data: Optional[dict] = None,
+    const_init: Optional[float] = None,
 ) -> float:
     """Build gluon a8w4 MoE inputs, time gemm1+gemm2 end-to-end. Returns us.
 
     When ``data`` (from ``_load_realworld_moe``) is provided, use the real
     activations / pre-quantized weights / pre-swizzled scales / topk-ids routing
     instead of random init; shape args are ignored (derived from the data).
+
+    ``const_init`` (random-init path only) fills activations, weights, and bias
+    with the constant VALUE instead of random values (mirrors the FlyDSL path);
+    weight scales are derived from the constant weights via ``downcast_to_mxfp``.
     """
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
@@ -861,20 +866,31 @@ def _bench_gluon_a8w4_moe(
         torch.manual_seed(seed)
         # bf16 activations; routing honors AITER_MOE_NUM_EXPERT_ACTIVATED /
         # AITER_MOE_EXPERT_BALANCE via the shared score builder (topk == n_expts_act).
-        x = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
+        if const_init is not None:
+            x = torch.full((tokens, K), float(const_init), dtype=torch.bfloat16)
+        else:
+            x = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
         logits = _make_routing_score(tokens, experts, topk).to(torch.float16)
 
         # gemm1 weight: (E, K, 2*I) -> swiglu -> I; gemm2 weight: (E, I, K).
-        w1 = torch.randn((experts, K, 2 * I))
-        w2 = torch.randn((experts, I, K))
+        if const_init is not None:
+            w1 = torch.full((experts, K, 2 * I), float(const_init))
+            w2 = torch.full((experts, I, K), float(const_init))
+        else:
+            w1 = torch.randn((experts, K, 2 * I))
+            w2 = torch.randn((experts, I, K))
         w1_q, w1_scale = downcast_to_mxfp(w1.to(torch.bfloat16), torch.uint8, axis=1)
         w2_q, w2_scale = downcast_to_mxfp(w2.to(torch.bfloat16), torch.uint8, axis=1)
         w1_scale, swz1 = _swizzle(w1_scale, 2 * I, K)
         w2_scale, swz2 = _swizzle(w2_scale, K, I)
 
         if use_bias:
-            b1 = torch.randn((experts, 2 * I)).float()
-            b2 = torch.randn((experts, K)).float()
+            if const_init is not None:
+                b1 = torch.full((experts, 2 * I), float(const_init))
+                b2 = torch.full((experts, K), float(const_init))
+            else:
+                b1 = torch.randn((experts, 2 * I)).float()
+                b2 = torch.randn((experts, K)).float()
         else:
             b1 = b2 = None
 
@@ -1134,6 +1150,7 @@ def main() -> None:
                 warmup=args.warmup,
                 iters=args.iters,
                 data=realworld,
+                const_init=args.const_init,
             )
             print(
                 f"[bench gluon a8w4] two-stage MoE end-to-end us = {us:.2f}",
@@ -1144,7 +1161,11 @@ def main() -> None:
                     "data_format": "a8w4",
                     "layout": "gluon",
                     "act": args.act,
-                    "init": "realworld" if realworld is not None else "random",
+                    "init": (
+                        "realworld"
+                        if realworld is not None
+                        else ("const" if args.const_init is not None else "random")
+                    ),
                     "experts": args.experts,
                     "tokens": _tok,
                     "topk": args.topk,
