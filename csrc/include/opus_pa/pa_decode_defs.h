@@ -51,8 +51,8 @@ struct pa_decode_kargs {
     uint32_t _pad_bs[3];   // 0xC4
     uint32_t stride_kvhead;// 0xD0  bytes per kv-head within one block
     uint32_t _pad_kvs[3];  // 0xD4
-    uint32_t mtp;          // 0xE0
-    uint32_t _pad_mtp[3];  // 0xE4
+    uint32_t stride_Q_batch;  // 0xE0  bytes between batch slices of Q/O (Q.stride(0)*esize)
+    uint32_t _pad_mtp[3];     // 0xE4
     uint32_t gqa_ratio;    // 0xF0
     uint32_t _pad_gqa[3];  // 0xF4
     void* ptr_QTP;         // 0x100 optional Q token positions (MTP)

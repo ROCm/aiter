@@ -8,6 +8,7 @@
 
 #include "opus_pa/pa_decode_defs.h"
 #include "opus_pa/kernels/pa_fp8_utils.hpp"
+#include "opus_pa/kernels/pa_output_utils.hpp"
 #include "opus_pa/kernels/pa_q_swizzle_utils.hpp"
 #include "opus_pa/kernels/pa_scores_compact_utils.hpp"
 
@@ -38,6 +39,26 @@ __device__ __forceinline__ void pa_tail_mask_dense(float (*s_scores)[SUB_KV],
     for (int idx = threadIdx.x; idx < GQA * SUB_KV; idx += blockDim.x) {
         const int g = idx / SUB_KV;
         const int ki = idx % SUB_KV;
+        if (ki >= tile_kv || kv_offset + ki >= static_cast<int>(ctx_len)) {
+            s_scores[g][ki] = kNegInf;
+        }
+    }
+    __syncthreads();
+}
+
+// Tail tile: mask one pi slice of KV columns beyond ctx_len.
+template<int GQA, int SUB_KV>
+__device__ __forceinline__ void pa_tail_mask_pi_slice(float (*s_scores)[SUB_KV],
+                                                      int kv_offset,
+                                                      int pi,
+                                                      int tile_kv,
+                                                      uint32_t ctx_len) {
+    constexpr int kHalf = SUB_KV / 2;
+    const int kv_base = pi * kHalf;
+    for (int idx = threadIdx.x; idx < GQA * kHalf; idx += blockDim.x) {
+        const int g = idx / kHalf;
+        const int kl = idx % kHalf;
+        const int ki = kv_base + kl;
         if (ki >= tile_kv || kv_offset + ki >= static_cast<int>(ctx_len)) {
             s_scores[g][ki] = kNegInf;
         }
@@ -87,6 +108,34 @@ __device__ __forceinline__ void scores_apply_qk_dequant_pi(float (*s_scores)[SUB
     __syncthreads();
 }
 
+// Per-pi slice absmax for P quant (sp3 pa_fuse step6.6 on pi slice only).
+template<int GQA, int SUB_KV>
+__device__ __forceinline__ void pa_fuse_compute_row_dyn_scales_slice(float (*s_vq)[SUB_KV],
+                                                                     int kv_base,
+                                                                     int slice_kv,
+                                                                     int tile_kv,
+                                                                     float* p_deq_scales,
+                                                                     float row_dyn_scale[GQA]) {
+    __shared__ float absmax_smem[256];
+
+    for (int g = 0; g < GQA; ++g) {
+        float row_absmax = 1e-6f;
+        for (int k = threadIdx.x; k < slice_kv; k += blockDim.x) {
+            const int gi = kv_base + k;
+            if (gi < tile_kv) {
+                row_absmax = fmaxf(row_absmax, fabsf(s_vq[g][gi]));
+            }
+        }
+        block_reduce_max_float(absmax_smem, blockDim.x, row_absmax);
+        if (threadIdx.x == 0) {
+            const float absmax = absmax_smem[0];
+            p_deq_scales[g] = absmax / kMaxDynBasisFp8;
+            row_dyn_scale[g] = kMaxDynBasisFp8 / absmax;
+        }
+        __syncthreads();
+    }
+}
+
 // Compute per-query P quant scales from VQ-weighted softmax (full tile, CPU-aligned).
 template<int GQA, int SUB_KV>
 __device__ __forceinline__ void pa_fuse_compute_row_dyn_scales(float (*s_vq)[SUB_KV],
@@ -98,7 +147,7 @@ __device__ __forceinline__ void pa_fuse_compute_row_dyn_scales(float (*s_vq)[SUB
     for (int g = 0; g < GQA; ++g) {
         float row_absmax = 1e-6f;
         for (int kv = threadIdx.x; kv < tile_kv; kv += blockDim.x) {
-            row_absmax = fmaxf(row_absmax, poc_kl_quant_row_abs(s_vq[g][kv]));
+            row_absmax = fmaxf(row_absmax, fabsf(s_vq[g][kv]));
         }
         block_reduce_max_float(absmax_smem, blockDim.x, row_absmax);
         if (threadIdx.x == 0) {
@@ -268,6 +317,36 @@ __device__ __forceinline__ void pa_fuse_alu_slice(float (*s_scores)[SUB_KV],
     __syncthreads();
 }
 
+// sp3 core_loop per-pi: fuse slice + per-slice P quant + p_deq for cl_gemm1(pi).
+template<int GQA, int SUB_KV>
+__device__ __forceinline__ void pa_fuse_alu_pi_tile(float (*s_scores)[SUB_KV],
+                                                    int pi,
+                                                    int tile_kv,
+                                                    const float v_scale_pi[SUB_KV / 2],
+                                                    float scale_log2e,
+                                                    float* fa_max,
+                                                    float* L_acc,
+                                                    float* delta_scale,
+                                                    uint8_t (*p_fp8)[SUB_KV],
+                                                    float* p_deq_scales) {
+    constexpr int kHalf = SUB_KV / 2;
+    const int kv_base = pi * kHalf;
+    __shared__ float row_dyn_scale[GQA];
+
+    pa_fuse_alu_slice<GQA, SUB_KV>(s_scores, kv_base, kHalf, tile_kv, nullptr, nullptr,
+                                   v_scale_pi, scale_log2e, fa_max, L_acc, delta_scale);
+    pa_fuse_compute_row_dyn_scales_slice<GQA, SUB_KV>(s_scores, kv_base, kHalf, tile_kv,
+                                                      p_deq_scales, row_dyn_scale);
+    pa_fuse_quant_p_slice<GQA, SUB_KV>(s_scores, kv_base, kHalf, tile_kv, p_fp8, row_dyn_scale);
+}
+
+// Rescale unnormalized O accumulator with the same online-softmax delta as L (sp3 step6).
+template<int GQA, int HEAD_DIM>
+__device__ __forceinline__ void pa_fuse_rescale_o_acc(float (*o_acc)[HEAD_DIM],
+                                                      const float* delta_scale) {
+    pa_r_procss_rescale<GQA, HEAD_DIM>(o_acc, delta_scale);
+}
+
 // Per-query row FP8 quant on VQ-weighted softmax (matches CPU quant() per row).
 template<int GQA, int SUB_KV>
 __device__ __forceinline__ void pa_fuse_quant_p_rows(float (*s_vq)[SUB_KV],
@@ -280,7 +359,7 @@ __device__ __forceinline__ void pa_fuse_quant_p_rows(float (*s_vq)[SUB_KV],
     for (int g = 0; g < GQA; ++g) {
         float row_absmax = 1e-6f;
         for (int kv = threadIdx.x; kv < tile_kv; kv += blockDim.x) {
-            row_absmax = fmaxf(row_absmax, poc_kl_quant_row_abs(s_vq[g][kv]));
+            row_absmax = fmaxf(row_absmax, fabsf(s_vq[g][kv]));
         }
         block_reduce_max_float(absmax_smem, blockDim.x, row_absmax);
         if (threadIdx.x == 0) {
@@ -405,7 +484,34 @@ template<int GQA, int SUB_KV, int P_SLICE>
 __device__ __forceinline__ void p_fp8_gather_lane_packed(const uint8_t p_fp8[GQA][SUB_KV],
                                                          int kv_base,
                                                          int lane,
+                                                         int wave,
                                                          uint32_t packed[2]) {
+    constexpr int kRowsPerGroup = 4;
+    const int col = lane & 15;
+    const int row_group = lane >> 4;
+
+    uint8_t bytes[8];
+#pragma unroll
+    for (int reg_k = 0; reg_k < 8; ++reg_k) {
+        const int j = reg_k >> 2;
+        const int inner_k = reg_k & 3;
+        const int qi = row_group * kRowsPerGroup + inner_k;
+        const int ki = kv_base + j * 64 + mfma_wave_n_offset(wave) + col;
+        bytes[reg_k] = (qi < GQA && ki < kv_base + P_SLICE) ? p_fp8[qi][ki]
+                                                            : static_cast<uint8_t>(0);
+    }
+    packed[0] = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+                (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+    packed[1] = static_cast<uint32_t>(bytes[4]) | (static_cast<uint32_t>(bytes[5]) << 8) |
+                (static_cast<uint32_t>(bytes[6]) << 16) | (static_cast<uint32_t>(bytes[7]) << 24);
+}
+
+// Gather FP8 P for GEMM1 MFMA A-operand (sp3 cl_gemm1): kv index has no wave offset.
+template<int GQA, int SUB_KV, int P_SLICE>
+__device__ __forceinline__ void p_fp8_gather_lane_packed_gemm1(const uint8_t p_fp8[GQA][SUB_KV],
+                                                               int kv_base,
+                                                               int lane,
+                                                               uint32_t packed[2]) {
     constexpr int kRowsPerGroup = 4;
     const int col = lane & 15;
     const int row_group = lane >> 4;
@@ -434,7 +540,21 @@ __device__ __forceinline__ void p_mfma_gather_a_pair(const uint8_t p_fp8[GQA][SU
                                                      uint32_t& lo,
                                                      uint32_t& hi) {
     uint32_t packed[2] = {};
-    p_fp8_gather_lane_packed<GQA, SUB_KV, P_SLICE>(p_fp8, kv_base, lane, packed);
+    p_fp8_gather_lane_packed_gemm1<GQA, SUB_KV, P_SLICE>(p_fp8, kv_base, lane, packed);
+    lo = packed[0];
+    hi = packed[1];
+}
+
+// Legacy GEMM0-style gather (includes wave offset in kv); kept for bisect.
+template<int GQA, int SUB_KV, int P_SLICE>
+__device__ __forceinline__ void p_mfma_gather_a_pair_wave(const uint8_t p_fp8[GQA][SUB_KV],
+                                                          int kv_base,
+                                                          int lane,
+                                                          int wave,
+                                                          uint32_t& lo,
+                                                          uint32_t& hi) {
+    uint32_t packed[2] = {};
+    p_fp8_gather_lane_packed<GQA, SUB_KV, P_SLICE>(p_fp8, kv_base, lane, wave, packed);
     lo = packed[0];
     hi = packed[1];
 }
@@ -468,54 +588,121 @@ __device__ __forceinline__ void p_fp8_to_compact_regs(const uint8_t* p_fp8_row,
     p_fp8_to_compact_regs_slice<SUB_KV>(p_fp8_row, 0, lane, p_compact);
 }
 
-// sp3 step9 decompact for one pi: reshaped[0..7] -> p_regs[0..7] (k=0..3 MFMA steps).
-__device__ __forceinline__ void p_decompact_for_gemm1_pi(const uint32_t reshaped[kQRegDwords],
-                                                         uint32_t p_regs[16]) {
+// sp3 step9: DPP row_shl:[8] on 32-bit P fp8 packs.
+__device__ __forceinline__ uint32_t dpp_row_shl8_u32(uint32_t v) {
+#if defined(__gfx942__) || defined(__gfx950__)
+    const int bits = __builtin_amdgcn_mov_dpp(static_cast<int>(v), 0x114, 0xf, 0xf, true);
+    return static_cast<uint32_t>(bits);
+#else
+    (void)v;
+    return 0u;
+#endif
+}
+
+// sp3 prologue: row_shl:[8] bound_ctrl on 0xffffffff -> _v_unPack (lanes 0..7 keep, 8..15 zero).
+__device__ __forceinline__ uint32_t p_sp3_unpack_mask_u32(int lane) {
+#if defined(__gfx942__) || defined(__gfx950__)
+    (void)lane;
+    return dpp_row_shl8_u32(0xffffffffu);
+#else
+    return ((lane & 15) < 8) ? 0xffffffffu : 0u;
+#endif
+}
+
+// sp3 pa_fuse step8 (S-reshape wr/rd) + step9 (row_shl decompact) -> _v_S[0..15] for cl_gemm1.
+__device__ __forceinline__ void p_reshape_sp3_step8_9(const uint32_t p_compact[2],
+                                                      uint32_t* dyn_resp_lds,
+                                                      int lane,
+                                                      int wave,
+                                                      uint32_t p_regs[16]) {
 #pragma unroll
     for (int k = 0; k < 16; ++k) {
         p_regs[k] = 0;
     }
-#pragma unroll
-    for (int k = 0; k < kQRegDwords; ++k) {
-        p_regs[k] = reshaped[k];
-    }
-}
 
-__device__ __forceinline__ void p_decompact_for_gemm1(const uint32_t p_compact[kQRegDwords],
-                                                      uint32_t p_regs[16]) {
-    p_decompact_for_gemm1_pi(p_compact, p_regs);
-#pragma unroll
-    for (int k = 0; k < kQRegDwords; ++k) {
-#if defined(__gfx942__) || defined(__gfx950__)
-        const int sh = __builtin_amdgcn_mov_dpp(p_compact[k], 0x118, 0xf, 0xf, true);
-        p_regs[k + kQRegDwords] = static_cast<uint32_t>(sh);
-#else
-        p_regs[k + kQRegDwords] = p_compact[k];
-#endif
-    }
-}
-
-__device__ __forceinline__ void p_reshape_for_gemm1(uint32_t p_compact[kQRegDwords],
-                                                    uint32_t* dyn_resp_lds,
-                                                    int lane,
-                                                    int wave,
-                                                    uint32_t p_regs[16]) {
+    // step8 write: same as Q_reshape_wr / Dyn_qnt_resp_lds (v_S[0..1] at +0, +256 dwords).
     const uint32_t wr_base = q_reshape_wr_dword_offset(lane, wave);
     dyn_resp_lds[wr_base + 0] = p_compact[0];
     dyn_resp_lds[wr_base + 256] = p_compact[1];
     __syncthreads();
 
+    // step8 read: ds_read_b64 into s_lane[0..7] (same addressing as Q_reshape_rd).
     const int h_id = lane >> 4;
     const int q_id = lane & 0xf;
     const uint32_t rd_base = static_cast<uint32_t>(h_id * 64 + q_id * 2);
-    uint32_t reshaped[kQRegDwords];
-    for (int k = 0; k < kQRegDwords; k += 2) {
+    uint32_t s_lane[kSHalfRegSize];
+#pragma unroll
+    for (int k = 0; k < kSHalfRegSize; k += 2) {
         const uint32_t lds_off = static_cast<uint32_t>(((k & 3) / 2) * 32 + (k / 4) * 256);
         const uint32_t idx = rd_base + lds_off;
-        reshaped[k + 0] = dyn_resp_lds[idx];
-        reshaped[k + 1] = dyn_resp_lds[idx + 1];
+        s_lane[k + 0] = dyn_resp_lds[idx];
+        s_lane[k + 1] = dyn_resp_lds[idx + 1];
     }
-    p_decompact_for_gemm1_pi(reshaped, p_regs);
+
+    // step9: v_S[8+k] = row_shl v_S[k]; v_S[k] &= _v_unPack.
+    const uint32_t unpack = p_sp3_unpack_mask_u32(lane);
+#pragma unroll
+    for (int k = 0; k < kSHalfRegSize; ++k) {
+        p_regs[k + kSHalfRegSize] = dpp_row_shl8_u32(s_lane[k]);
+        p_regs[k] = s_lane[k] & unpack;
+    }
+}
+
+__device__ __forceinline__ void p_reshape_for_gemm1(const uint32_t p_compact[2],
+                                                    uint32_t* dyn_resp_lds,
+                                                    int lane,
+                                                    int wave,
+                                                    uint32_t p_regs[16]) {
+    p_reshape_sp3_step8_9(p_compact, dyn_resp_lds, lane, wave, p_regs);
+}
+
+template<int GQA, int SUB_KV, int P_SLICE>
+__device__ __forceinline__ void p_f32_gather_lane_packed(const float p_f32[GQA][SUB_KV],
+                                                         int kv_base,
+                                                         int tile_kv,
+                                                         const float* p_deq_scales,
+                                                         int lane,
+                                                         int wave,
+                                                         uint32_t packed[2]) {
+    constexpr int kRowsPerGroup = 4;
+    const int col = lane & 15;
+    const int row_group = lane >> 4;
+
+    uint8_t bytes[8];
+#pragma unroll
+    for (int reg_k = 0; reg_k < 8; ++reg_k) {
+        const int j = reg_k >> 2;
+        const int inner_k = reg_k & 3;
+        const int qi = row_group * kRowsPerGroup + inner_k;
+        const int ki = kv_base + j * 64 + mfma_wave_n_offset(wave) + col;
+        if (qi < GQA && ki < tile_kv) {
+            const float inv_deq = 1.f / fmaxf(p_deq_scales[qi], 1e-30f);
+            const float pn = p_f32[qi][ki] * inv_deq;
+            bytes[reg_k] = float_to_fp8_e4m3_bias8(pn);
+        } else {
+            bytes[reg_k] = 0;
+        }
+    }
+    packed[0] = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+                (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+    packed[1] = static_cast<uint32_t>(bytes[4]) | (static_cast<uint32_t>(bytes[5]) << 8) |
+                (static_cast<uint32_t>(bytes[6]) << 16) | (static_cast<uint32_t>(bytes[7]) << 24);
+}
+
+template<int GQA, int SUB_KV>
+__device__ __forceinline__ void p_prepare_mfma_regs_from_scores_slice(
+    const float p_f32[GQA][SUB_KV],
+    int kv_offset,
+    int tile_kv,
+    const float* p_deq_scales,
+    uint32_t* dyn_resp_lds,
+    int lane,
+    int wave,
+    uint32_t p_regs[16]) {
+    uint32_t compact[2] = {};
+    p_f32_gather_lane_packed<GQA, SUB_KV, SUB_KV / 2>(p_f32, kv_offset, tile_kv, p_deq_scales,
+                                                      lane, wave, compact);
+    p_reshape_for_gemm1(compact, dyn_resp_lds, lane, wave, p_regs);
 }
 
 template<int GQA, int SUB_KV>
@@ -525,8 +712,8 @@ __device__ __forceinline__ void p_prepare_mfma_regs_slice(const uint8_t p_fp8[GQ
                                                           int lane,
                                                           int wave,
                                                           uint32_t p_regs[16]) {
-    uint32_t compact[kQRegDwords] = {};
-    p_fp8_gather_lane_packed<GQA, SUB_KV, SUB_KV / 2>(p_fp8, kv_offset, lane, &compact[0]);
+    uint32_t compact[2] = {};
+    p_fp8_gather_lane_packed<GQA, SUB_KV, SUB_KV / 2>(p_fp8, kv_offset, lane, wave, compact);
     p_reshape_for_gemm1(compact, dyn_resp_lds, lane, wave, p_regs);
 }
 

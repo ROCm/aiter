@@ -18,16 +18,6 @@ static constexpr int kDynRspDwords = 768;  // Q reshape uses <=704 dwords per wa
 
 __device__ __forceinline__ float bf16_to_float(bf16_t v) { return static_cast<float>(v); }
 
-__device__ __forceinline__ uint8_t float_to_fp8_e4m3(float x) {
-#if defined(__gfx942__) || defined(__gfx950__)
-    uint32_t w = 0;
-    w = __builtin_amdgcn_cvt_pk_fp8_f32(x, x, w, false);
-    return static_cast<uint8_t>(w & 0xffu);
-#else
-    return static_cast<uint8_t>(static_cast<int>(fabsf(x) * 4.f)) & 0x7fu;
-#endif
-}
-
 // sp3 Q_lds_rd_addr_gen
 __device__ __forceinline__ uint32_t q_lds_rd_byte_offset(int lane, int wave) {
     const int h_id = lane >> 4;
@@ -132,24 +122,10 @@ __device__ __forceinline__ void q_dyn_qt_lane(uint32_t q_regs[kQRegDwords],
     }
 
     uint32_t packed[2] = {0, 0};
-#if defined(__gfx942__) || defined(__gfx950__)
     for (int k = 0; k < kQRegDwords; k += 4) {
-        const int idx = k / 4;
-        uint32_t w = 0;
-        w = __builtin_amdgcn_cvt_pk_fp8_f32(scaled[k + 0], scaled[k + 1], w, false);
-        w = __builtin_amdgcn_cvt_pk_fp8_f32(scaled[k + 2], scaled[k + 3], w, true);
-        packed[idx] = w;
+        packed[k / 4] =
+            float4_to_fp8_pk(scaled[k + 0], scaled[k + 1], scaled[k + 2], scaled[k + 3]);
     }
-#else
-    for (int k = 0; k < 4; ++k) {
-        const uint8_t b = float_to_fp8_e4m3(scaled[k]);
-        packed[0] |= static_cast<uint32_t>(b) << (8 * k);
-    }
-    for (int k = 0; k < 4; ++k) {
-        const uint8_t b = float_to_fp8_e4m3(scaled[k + 4]);
-        packed[1] |= static_cast<uint32_t>(b) << (8 * k);
-    }
-#endif
     q_regs[0] = packed[0];
     q_regs[1] = packed[1];
     for (int k = 2; k < kQRegDwords; ++k) {
@@ -228,12 +204,9 @@ __device__ __forceinline__ void q_swizzle_pipeline_paref_deq(const bf16_t* q_lds
 
     uint32_t packed[2] = {0, 0};
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        packed[0] |= static_cast<uint32_t>(float_to_fp8_e4m3_bias8(scaled[k])) << (8 * k);
-    }
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        packed[1] |= static_cast<uint32_t>(float_to_fp8_e4m3_bias8(scaled[k + 4])) << (8 * k);
+    for (int k = 0; k < kQRegDwords; k += 4) {
+        packed[k / 4] =
+            float4_to_fp8_pk(scaled[k + 0], scaled[k + 1], scaled[k + 2], scaled[k + 3]);
     }
     q_mfma_regs[0] = packed[0];
     q_mfma_regs[1] = packed[1];

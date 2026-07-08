@@ -70,10 +70,13 @@ __device__ __forceinline__ void gemm1_pv_float_reference(const float (*p_f32)[SU
                                                          const uint32_t* page_ids,
                                                          int valid_blks,
                                                          uint32_t stride_blk,
+                                                         uint32_t stride_kvhead,
+                                                         int kv_head_idx,
                                                          int block_size,
                                                          int tile_kv,
                                                          float (*o_out)[HEAD_DIM]) {
-    (void)block_size;
+    const size_t kv_head_off =
+        static_cast<size_t>(kv_head_idx) * static_cast<size_t>(stride_kvhead);
     for (int idx = threadIdx.x; idx < GQA * HEAD_DIM; idx += blockDim.x) {
         const int qi = idx / HEAD_DIM;
         const int di = idx % HEAD_DIM;
@@ -82,7 +85,8 @@ __device__ __forceinline__ void gemm1_pv_float_reference(const float (*p_f32)[SU
             const int blk = kv / block_size;
             const int in_blk = kv % block_size;
             const uint32_t page = (blk < valid_blks) ? page_ids[blk] : 0u;
-            const uint8_t* page_base = v_pool + static_cast<size_t>(page) * stride_blk;
+            const uint8_t* page_base =
+                v_pool + static_cast<size_t>(page) * stride_blk + kv_head_off;
             const uint8_t vv = page_base[v_shuffled_page_offset(in_blk, di, block_size)];
             acc += p_f32[qi][kv] * fp8_e4m3_to_float(vv);
         }
@@ -103,8 +107,11 @@ __device__ __forceinline__ void gemm1_pv_reference_pi_slice(
     int kv_base,
     int slice_kv,
     int tile_kv,
+    uint32_t stride_kvhead,
+    int kv_head_idx,
     const float* p_deq_scales,
     float (*o_out)[HEAD_DIM]) {
+    const size_t kv_head_off = static_cast<size_t>(kv_head_idx) * static_cast<size_t>(stride_kvhead);
     for (int idx = threadIdx.x; idx < GQA * HEAD_DIM; idx += blockDim.x) {
         const int qi = idx / HEAD_DIM;
         const int di = idx % HEAD_DIM;
@@ -117,7 +124,8 @@ __device__ __forceinline__ void gemm1_pv_reference_pi_slice(
             const int blk = kv / block_size;
             const int in_blk = kv % block_size;
             const uint32_t page = (blk < valid_blks) ? page_ids[blk] : 0u;
-            const uint8_t* page_base = v_pool + static_cast<size_t>(page) * stride_blk;
+            const uint8_t* page_base =
+                v_pool + static_cast<size_t>(page) * stride_blk + kv_head_off;
             const uint8_t vv = page_base[v_shuffled_page_offset(in_blk, di, block_size)];
             const float pv = fp8_e4m3_to_float(p_fp8[qi][kv]) * p_deq_scales[qi];
             acc64 += static_cast<double>(pv) * static_cast<double>(fp8_e4m3_to_float(vv));
@@ -175,13 +183,16 @@ __device__ __forceinline__ void gemm1_pv_reference(const uint8_t (*p_fp8)[SUB_KV
                                                    const uint32_t* page_ids,
                                                    int valid_blks,
                                                    uint32_t stride_blk,
+                                                   uint32_t stride_kvhead,
+                                                   int kv_head_idx,
                                                    int block_size,
                                                    int tile_kv,
                                                    const float* p_deq_scales,
                                                    const float* v_scale_pool,
                                                    float (*o_out)[HEAD_DIM]) {
-    (void)block_size;
     (void)v_scale_pool;
+    const size_t kv_head_off =
+        static_cast<size_t>(kv_head_idx) * static_cast<size_t>(stride_kvhead);
     for (int idx = threadIdx.x; idx < GQA * HEAD_DIM; idx += blockDim.x) {
         const int qi = idx / HEAD_DIM;
         const int di = idx % HEAD_DIM;
@@ -191,7 +202,8 @@ __device__ __forceinline__ void gemm1_pv_reference(const uint8_t (*p_fp8)[SUB_KV
             const int blk = kv / block_size;
             const int in_blk = kv % block_size;
             const uint32_t page = (blk < valid_blks) ? page_ids[blk] : 0u;
-            const uint8_t* page_base = v_pool + static_cast<size_t>(page) * stride_blk;
+            const uint8_t* page_base =
+                v_pool + static_cast<size_t>(page) * stride_blk + kv_head_off;
             const uint8_t vv = page_base[v_shuffled_page_offset(in_blk, di, block_size)];
             const float p_deq = p_deq_scales[qi];
             const float pv = fp8_e4m3_to_float(p_fp8[qi][kv]) * p_deq;

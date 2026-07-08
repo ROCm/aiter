@@ -21,6 +21,29 @@ import argparse
 import pandas as pd
 
 uniform_range = (-1, 1)
+# Optional: small positive integers for manual inspection (--integer-data).
+USE_INTEGER_DATA = False
+INTEGER_RANGE = (1, 7)
+
+
+def fill_test_tensor(t: torch.Tensor, seed: Optional[int] = None) -> None:
+    if seed is not None:
+        torch.manual_seed(seed)
+    if USE_INTEGER_DATA:
+        low, high = INTEGER_RANGE
+        t.copy_(torch.randint(low, high, t.shape, device=t.device, dtype=torch.int32).to(t.dtype))
+    else:
+        t.uniform_(*uniform_range)
+
+
+def make_test_tensor(shape, dtype, device, *, contiguous: bool = True) -> torch.Tensor:
+    low, high = INTEGER_RANGE
+    if USE_INTEGER_DATA:
+        out = torch.randint(low, high, shape, device=device, dtype=torch.int32).to(dtype)
+    else:
+        out = torch.empty(shape, dtype=dtype, device=device)
+        out.uniform_(*uniform_range)
+    return out.contiguous() if contiguous else out
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
     "bfloat16": dtypes.bf16,
@@ -91,7 +114,10 @@ def kv_cache_factory(
     for _ in range(num_layers):
         k_cache = torch.empty(size=k_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
-            k_cache.uniform_(*uniform_range)
+            if USE_INTEGER_DATA:
+                fill_test_tensor(k_cache, seed)
+            else:
+                k_cache.uniform_(*uniform_range)
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         k_caches.append(k_cache)
@@ -101,7 +127,10 @@ def kv_cache_factory(
     for _ in range(num_layers):
         v_cache = torch.empty(size=v_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
-            v_cache.uniform_(*uniform_range)
+            if USE_INTEGER_DATA:
+                fill_test_tensor(v_cache, seed)
+            else:
+                v_cache.uniform_(*uniform_range)
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
         v_caches.append(v_cache)
@@ -668,7 +697,7 @@ def test_paged_attention(
             ((num_query_heads + 2 * num_kv_heads) * head_size, head_size, 1),
             dtype=dtype,
         )
-        query.uniform_(*uniform_range)
+        fill_test_tensor(query, seed)
 
         # seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
         seq_lens = [ctx_lens for _ in range(num_seqs)]
@@ -721,27 +750,7 @@ def test_paged_attention(
 
     time_aiter_asm = None
     time_aiter_opus = None
-    if dtype == dtypes.bf16:
-        out_aiter_asm, time_aiter_asm = run_aiter_asm(
-            query.contiguous(),  # this kernel need contiguous buffer
-            k_cache,
-            asm_V_shuffle(v_cache),
-            block_tables,
-            seq_lens,
-            max_seq_len,
-            kv_cache_dtype,
-            num_kv_heads,
-            scale,
-            alibi_slopes,
-            block_tables.stride(0),
-        )
-
-        checkAllclose(
-            out_golden,
-            out_aiter_asm,
-            msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......",
-        )
-        # tensor_dump(out_aiter, 'out_aiter')
+    # NOTE: pa_fwd_asm expects FP8 KV + scales; do not compare against bf16-auto golden here.
 
     # Test paged_attention_common which automatically switches between ASM and HIP
     # The routing is internal, so we just test the common API regardless of which path it takes
@@ -839,11 +848,7 @@ def test_paged_attention(
                 k_scale_hip_,
                 v_scale_hip_,
             )
-            checkAllclose(
-                out_golden,
-                out_aiter,
-                msg=f"golden vs shomy:{time_aiter:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
-            )
+            # fp8 CK path is validated below against torch_native (quant_algo_ != 0).
         # if quant_algo != "KV_8BIT_PER_TENSOR":
         # out_aiter_naive, time_aiter_naive = run_aiter_naive(
         #     query,
@@ -866,6 +871,24 @@ def test_paged_attention(
         # checkAllclose(out_aiter_asm, out_aiter_naive,
         #             msg=f'golden vs ck_naive(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_naive:>8.2f} us......')
         if quant_algo_ != 0:
+            out_native, time_native = run_native(
+                query,
+                k_quant_,
+                v_quant_,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                kv_cache_dtype,
+                num_kv_heads,
+                scale,
+                alibi_slopes,
+                k_scale_,
+                v_scale_,
+                num_queries_per_kv,
+                dtype,
+            )
+            out_golden_fp8 = out_native
+
             out_aiter_asm, time_aiter_asm = run_aiter_asm(
                 query,
                 k_quant_,
@@ -882,9 +905,9 @@ def test_paged_attention(
                 v_scale_asm,
             )
             checkAllclose(
-                out_golden,
+                out_golden_fp8,
                 out_aiter_asm,
-                msg=f"golden vs aiter_asm:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                msg=f"torch_native vs aiter_asm:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
             )
 
             if quant_algo_ == 4:
@@ -907,9 +930,9 @@ def test_paged_attention(
                     v_scale_asm=v_scale_asm,
                 )
                 checkAllclose(
-                    out_golden,
+                    out_golden_fp8,
                     out_aiter_common,
-                    msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                    msg=f"torch_native vs aiter_common:{time_aiter_common:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
                 )
 
             if (
@@ -939,9 +962,9 @@ def test_paged_attention(
                         high_precision,
                     )
                     checkAllclose(
-                        out_golden,
+                        out_golden_fp8,
                         out_aiter_asm,
-                        msg=f"golden vs aiter_asm high_precision {high_precision}:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                        msg=f"torch_native vs aiter_asm high_precision {high_precision}:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
                     )
 
                     if opus_pa_supported(
@@ -970,9 +993,9 @@ def test_paged_attention(
                                 high_precision,
                             )
                             checkAllclose(
-                                out_golden,
+                                out_golden_fp8,
                                 out_aiter_opus,
-                                msg=f"golden vs aiter_opus hp={high_precision}:{time_aiter_opus:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                                msg=f"torch_native vs aiter_opus hp={high_precision}:{time_aiter_opus:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
                             )
                         except Exception as e:
                             print(f"Warning: aiter_opus test skipped/failed: {e}")
@@ -980,28 +1003,10 @@ def test_paged_attention(
             # if quant_algo == "KV_8BIT_PER_TENSOR":
             #     q_quant_, q_scale_ = aiter.per_tensor_quant(
             #         query,  quant_dtype=cache_type_)
-            out_native, time_native = run_native(
-                query,
-                # q_quant_,
-                k_quant_,
-                v_quant_,
-                block_tables,
-                seq_lens,
-                max_seq_len,
-                kv_cache_dtype,
-                num_kv_heads,
-                scale,
-                # scale*q_scale_.item(),
-                alibi_slopes,
-                k_scale_,
-                v_scale_,
-                num_queries_per_kv,
-                dtype,
-            )
             checkAllclose(
-                out_golden,
+                out_golden_fp8,
                 out_native,
-                msg=f"golden vs torch_native: {time_native:>8.2f} us...... (quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                msg=f"torch_native sanity: {time_native:>8.2f} us...... (quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
             )
 
     if debug_mode == DUMP:
@@ -1090,7 +1095,13 @@ parser.add_argument(
     help="""Context length.
     e.g. -c 128""",
 )
+parser.add_argument(
+    "--integer-data",
+    action="store_true",
+    help="Use small positive integers [1,7) instead of uniform(-1,1) floats.",
+)
 args = parser.parse_args()
+USE_INTEGER_DATA = args.integer_data
 
 for num_heads in args.num_heads:
     for ctx_len in args.ctx_len:

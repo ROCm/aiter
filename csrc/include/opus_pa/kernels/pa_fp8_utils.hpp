@@ -145,7 +145,15 @@ __device__ __forceinline__ float fp8_to_float(uint8_t in,
     return out;
 }
 
-__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t v) { return fp8_to_float(v); }
+__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t v) {
+#if defined(PA_FP8_DECODE_SOFTWARE)
+    return fp8_to_float(v);
+#elif defined(__gfx942__) || defined(__gfx950__)
+    return __builtin_amdgcn_cvt_f32_fp8(static_cast<uint32_t>(v), 0);
+#else
+    return fp8_to_float(v);
+#endif
+}
 
 // f32_to_f8 — matches poc_kl common_mi300_fp8.h (non-stochastic).
 __device__ __forceinline__ uint8_t f32_to_f8_bits(uint32_t src_a,
@@ -199,8 +207,35 @@ __device__ __forceinline__ uint8_t f32_to_f8_bits(uint32_t src_a,
 }
 
 __device__ __forceinline__ uint8_t float_to_fp8_e4m3_bias8(float x) {
+#if defined(PA_FP8_ENCODE_SOFTWARE)
     const uint32_t bits = __float_as_uint(x);
     return f32_to_f8_bits(bits, kFp8Fmt, kFp8Bias);
+#elif defined(__gfx942__) || defined(__gfx950__)
+    uint32_t w = 0;
+    w = __builtin_amdgcn_cvt_pk_fp8_f32(x, x, w, false);
+    uint8_t out = static_cast<uint8_t>(w & 0xffu);
+    return (out == 0x80u) ? static_cast<uint8_t>(0) : out;
+#else
+    const uint32_t bits = __float_as_uint(x);
+    return f32_to_f8_bits(bits, kFp8Fmt, kFp8Bias);
+#endif
+}
+
+// Pack four fp32 into one dword (sp3 v_cvt_pk_fp8_f32 x2).
+__device__ __forceinline__ uint32_t float4_to_fp8_pk(float a, float b, float c, float d) {
+#if defined(__gfx942__) || defined(__gfx950__)
+    uint32_t w = 0;
+    w = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, w, false);
+    w = __builtin_amdgcn_cvt_pk_fp8_f32(c, d, w, true);
+    return w;
+#else
+    uint32_t packed = 0;
+    packed |= static_cast<uint32_t>(float_to_fp8_e4m3_bias8(a)) << 0;
+    packed |= static_cast<uint32_t>(float_to_fp8_e4m3_bias8(b)) << 8;
+    packed |= static_cast<uint32_t>(float_to_fp8_e4m3_bias8(c)) << 16;
+    packed |= static_cast<uint32_t>(float_to_fp8_e4m3_bias8(d)) << 24;
+    return packed;
+#endif
 }
 
 }  // namespace pa_decode

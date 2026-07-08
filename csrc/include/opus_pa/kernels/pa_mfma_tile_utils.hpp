@@ -10,7 +10,6 @@
 #include "opus_pa/kernels/pa_gemm1_utils.hpp"
 #include "opus_pa/kernels/pa_mfma_layout_utils.hpp"
 #include "opus_pa/kernels/pa_softmax_utils.hpp"
-#include "opus_pa/kernels/pa_softmax_utils.hpp"
 #include "opus_pa/kernels/pa_v_layout_utils.hpp"
 
 namespace pa_decode {
@@ -23,6 +22,8 @@ __device__ __forceinline__ void load_kv_scale_pi(const float* kq_base,
                                                    const float* vq_base,
                                                    const uint32_t* page_ids,
                                                    int valid_blks,
+                                                   int kv_nheads,
+                                                   int kv_head_idx,
                                                    int pi,
                                                    float k_scale_pi[SUB_KV / 2],
                                                    float v_scale_pi[SUB_KV / 2]) {
@@ -36,8 +37,8 @@ __device__ __forceinline__ void load_kv_scale_pi(const float* kq_base,
         float vs = 1.f;
         if (kq_base != nullptr && bt_slot < valid_blks) {
             const uint32_t page = page_ids[bt_slot];
-            ks = kv_scale_at(kq_base, page, in_blk, BLOCK_SIZE);
-            vs = kv_scale_at(vq_base, page, in_blk, BLOCK_SIZE);
+            ks = kv_scale_at(kq_base, page, in_blk, BLOCK_SIZE, kv_nheads, kv_head_idx);
+            vs = kv_scale_at(vq_base, page, in_blk, BLOCK_SIZE, kv_nheads, kv_head_idx);
         }
         k_scale_pi[i] = ks;
         v_scale_pi[i] = vs;
@@ -151,15 +152,17 @@ __device__ __forceinline__ void gemm1_mfma_pi(const uint8_t (*p_fp8)[SUB_KV],
                                               const uint32_t* page_ids,
                                               int valid_blks,
                                               uint32_t stride_blk,
+                                              uint32_t stride_kvhead,
+                                              int kv_head_idx,
                                               int block_size,
-                                              int tile_kv) {
+                                              int tile_kv,
+                                              int lane,
+                                              int wave) {
     constexpr int kHalf = SUB_KV / 2;
     constexpr int kNumJ = HEAD_DIM / 64;
     constexpr int kNumK = kHalf / 32;  // sp3: 128/32 per pi
     constexpr int kPiKvSlice = 32;
 
-    const int lane = lane_id();
-    const int wave = wave_id();
     const int kv_pi_base = pi * kHalf;
 
 #pragma unroll
@@ -175,16 +178,17 @@ __device__ __forceinline__ void gemm1_mfma_pi(const uint8_t (*p_fp8)[SUB_KV],
             uint32_t p_hi = 0;
             uint32_t v_lo = 0;
             uint32_t v_hi = 0;
-#if defined(PA_GEMM1_LEGACY_PRESHAPE)
+#if PA_GEMM1_LEGACY_PRESHAPE
             p_lo = p_regs[kk * kVsAb + 0];
             p_hi = p_regs[kk * kVsAb + 1];
 #else
-            p_mfma_gather_a_pair<GQA, SUB_KV, kPiKvSlice>(p_fp8, kv_base, lane, p_lo, p_hi);
+            p_mfma_gather_a_pair_wave<GQA, SUB_KV, kPiKvSlice>(p_fp8, kv_base, lane, wave, p_lo,
+                                                               p_hi);
 #endif
 #if defined(PA_GEMM1_VGATHER)
             v_mfma_gather_b_pair<SUB_KV, HEAD_DIM, BLOCK_SIZE>(
-                v_pool, page_ids, valid_blks, stride_blk, block_size, tile_kv, kv_base, head_base,
-                lane, v_lo, v_hi);
+                v_pool, page_ids, valid_blks, stride_blk, stride_kvhead, kv_head_idx, block_size,
+                tile_kv, kv_base, head_base, lane, v_lo, v_hi);
 #else
             const int vV_off = vV_base + kk * kVsAb;
             v_lo = v_regs[vV_off + 0];
@@ -315,6 +319,7 @@ __device__ __forceinline__ void v_regs_bisect_tile(const uint8_t* v_pool,
 template<int GQA, int SUB_KV, int HEAD_DIM, int BLOCK_SIZE, int KV_REG_DWORDS, int NUM_PAIRS,
          int LOAD_INSTS, int IMM_STRIDE>
 __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV],
+                                                 const float (*p_f32)[SUB_KV],
                                                  const uint8_t* v_pool,
                                                  const uint32_t* page_ids,
                                                  int valid_blks,
@@ -324,6 +329,7 @@ __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV]
                                                  int tile_kv,
                                                  int bt_slots,
                                                  int tg_idx,
+                                                 int kv_head_idx,
                                                  const float* p_deq_scales,
                                                  uint32_t* dyn_resp_lds,
                                                  int lane,
@@ -339,6 +345,7 @@ __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV]
 #else
     (void)dbg;
 #endif
+    (void)p_f32;
 
 #if defined(PA_GEMM1_USE_CLGEMM)
     gemm1_clgemm1_tile<GQA, SUB_KV, HEAD_DIM, BLOCK_SIZE, KV_REG_DWORDS, NUM_PAIRS, LOAD_INSTS,
@@ -347,7 +354,8 @@ __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV]
         p_deq_scales, dyn_resp_lds, lane, wave, o_out);
 #if defined(PA_GEMM1_BISECT)
     gemm1_pv_reference<GQA, SUB_KV, HEAD_DIM>(p_fp8, v_pool, page_ids, valid_blks, stride_blk,
-                                              block_size, tile_kv, p_deq_scales, nullptr, o_ref);
+                                              stride_kvhead, kv_head_idx, block_size, tile_kv,
+                                              p_deq_scales, nullptr, o_ref);
     gemm1_bisect_report<GQA, HEAD_DIM>(o_out, o_ref, dbg);
 #endif
     return;
@@ -366,24 +374,26 @@ __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV]
     }
     __syncthreads();
     gemm1_pv_reference<GQA, SUB_KV, HEAD_DIM>(p_fp8, v_pool, page_ids, valid_blks, stride_blk,
-                                              block_size, tile_kv, p_deq_scales, nullptr, o_ref);
+                                              stride_kvhead, kv_head_idx, block_size, tile_kv,
+                                              p_deq_scales, nullptr, o_ref);
 #endif
 
     for (int pi = 0; pi < kPiCount; ++pi) {
         const int kv_offset = pi * kHalf;
         uint32_t p_regs[16] = {};
-#if defined(PA_GEMM1_LEGACY_PRESHAPE)
+#if PA_GEMM1_LEGACY_PRESHAPE
         p_prepare_mfma_regs_slice<GQA, SUB_KV>(p_fp8, kv_offset, dyn_resp_lds, lane, wave,
                                                p_regs);
+        __syncthreads();
 #endif
 #if defined(PA_GEMM1_VREF)
         gemm1_pv_reference_pi_slice<GQA, SUB_KV, HEAD_DIM>(
             p_fp8, v_pool, page_ids, valid_blks, stride_blk, block_size, kv_offset, kHalf, tile_kv,
-            p_deq_scales, o_out);
+            stride_kvhead, kv_head_idx, p_deq_scales, o_out);
 #else
         gemm1_mfma_pi<GQA, SUB_KV, HEAD_DIM, BLOCK_SIZE, KV_REG_DWORDS>(
             p_fp8, v_regs, p_regs, pi, 0, p_deq_scales, o_out, v_pool, page_ids, valid_blks,
-            stride_blk, block_size, tile_kv);
+            stride_blk, stride_kvhead, kv_head_idx, block_size, tile_kv, lane, wave);
 #endif
     }
 

@@ -34,7 +34,8 @@ pa_decode_kargs make_pa_decode_kargs(int batch,
                                    void* dev_kq,
                                    void* dev_vq,
                                    void* dev_qtp,
-                                   int stride_q_bytes,
+                                   int stride_q_kvhead_bytes,
+                                   int stride_q_batch_bytes,
                                    int stride_blk_bytes,
                                    int stride_kvhead_bytes,
                                    float scale_log2e)
@@ -53,11 +54,11 @@ pa_decode_kargs make_pa_decode_kargs(int batch,
     args.scale_log2e    = scale_log2e;
     args.max_blks       = static_cast<uint32_t>(max_blks_per_seq);
     args.kv_nheads      = static_cast<uint32_t>(kv_nheads);
-    args.stride_Q       = static_cast<uint32_t>(stride_q_bytes);
-    args.stride_blk     = static_cast<uint32_t>(stride_blk_bytes);
-    args.stride_kvhead  = static_cast<uint32_t>(stride_kvhead_bytes);
-    args.mtp            = 0;
-    args.gqa_ratio      = static_cast<uint32_t>(gqa);
+    args.stride_Q        = static_cast<uint32_t>(stride_q_kvhead_bytes);
+    args.stride_blk      = static_cast<uint32_t>(stride_blk_bytes);
+    args.stride_kvhead   = static_cast<uint32_t>(stride_kvhead_bytes);
+    args.stride_Q_batch  = static_cast<uint32_t>(stride_q_batch_bytes);
+    args.gqa_ratio       = static_cast<uint32_t>(gqa);
     (void)batch;
     (void)head_dim;
     return args;
@@ -110,7 +111,8 @@ void pa_opus_fwd(aiter_tensor_t& Q,
     AITER_CHECK(pa_opus_config_supported(Q.dtype(), K.dtype(), head_size, block_size, gqa_ratio),
                 "pa_opus_fwd: unsupported config (need bf16 Q, fp8 KV, head=128, block=16, gqa=1|8)");
 
-    const int stride_Q       = static_cast<int>(Q.stride(0) * Q.element_size());
+    const int stride_Q_batch  = static_cast<int>(Q.stride(0) * Q.element_size());
+    const int stride_Q_kvhead = gqa_ratio * head_size * static_cast<int>(sizeof(bf16_t));
     const int stride_KV_head = static_cast<int>(K.stride(1) * K.element_size());
     const int stride_KV_blk  = static_cast<int>(K.stride(0) * K.element_size());
     const float scale_log2e  = static_cast<float>(
@@ -131,7 +133,8 @@ void pa_opus_fwd(aiter_tensor_t& Q,
         K_QScale.has_value() ? K_QScale.value().data_ptr() : nullptr,
         V_QScale.has_value() ? V_QScale.value().data_ptr() : nullptr,
         qo_indptr.has_value() ? qo_indptr.value().data_ptr() : nullptr,
-        stride_Q,
+        stride_Q_kvhead,
+        stride_Q_batch,
         stride_KV_blk,
         stride_KV_head,
         scale_log2e);

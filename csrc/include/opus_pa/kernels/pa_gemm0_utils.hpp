@@ -29,12 +29,17 @@ __device__ __forceinline__ mfma_acc4 mfma_fp8_fp8_step(mfma_acc4 acc,
     return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(a, b, acc, 0, 0, 0);
 }
 
-// sp3 cl_gemm1: v_mfma v_R, v_V, v_S — math O=P@V uses swapped intrinsic order vs register layout.
+// sp3 cl_gemm1 asm: v_mfma v_R, v_V, v_S. Default (P,V) matches HIP R=P@V packing;
+// PA_GEMM1_SWAP_AB=1 uses asm operand order (V,P).
 __device__ __forceinline__ mfma_acc4 mfma_fp8_fp8_gemm1_step(mfma_acc4 acc,
                                                              uint64_t p_packed,
                                                              uint64_t v_packed,
                                                              bool init) {
+#if PA_GEMM1_SWAP_AB
+    return mfma_fp8_fp8_step(acc, v_packed, p_packed, init);
+#else
     return mfma_fp8_fp8_step(acc, p_packed, v_packed, init);
+#endif
 }
 #endif
 

@@ -34,6 +34,7 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
                                                       int bt_slots,
                                                       uint32_t stride_blk,
                                                       float scale_log2e,
+                                                      int kv_head_idx,
                                                       int lane,
                                                       int wave,
                                                       const uint32_t q_mfma_regs[8],
@@ -63,6 +64,7 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
     (void)q_row_stride_elems;
 
     constexpr int kHalf = Traits::SUB_KV / 2;
+    const int kv_nheads = static_cast<int>(kargs.kv_nheads);
     const float* kq_base = static_cast<const float*>(kargs.ptr_KQ);
     const float* vq_base = static_cast<const float*>(kargs.ptr_VQ);
 
@@ -72,62 +74,52 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
 
     load_kv_scale_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                      Traits::KV_REG_DWORDS, Traits::BLOCK_SIZE>(
-        kq_base, vq_base, page_ids, valid_blks, 0, k_scale_pi0, v_scale_pi0);
+        kq_base, vq_base, page_ids, valid_blks, kv_nheads, kv_head_idx, 0, k_scale_pi0,
+        v_scale_pi0);
     load_kv_scale_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                      Traits::KV_REG_DWORDS, Traits::BLOCK_SIZE>(
-        kq_base, vq_base, page_ids, valid_blks, 1, k_scale_pi1, v_scale_pi1);
+        kq_base, vq_base, page_ids, valid_blks, kv_nheads, kv_head_idx, 1, k_scale_pi1,
+        v_scale_pi1);
 
+#if defined(PA_SP3_MFMA_GEMM0)
     load_k_regs_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE, Traits::KV_REG_DWORDS,
                      4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
         static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, lane, wave, wave / 2, bt_slots, k_regs);
+        kargs.stride_kvhead, lane, wave, kv_head_idx, bt_slots, k_regs);
+#else
+    (void)k_regs;
+#endif
 
 #if defined(PA_V_REGS_BISECT)
     v_regs_bisect_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE,
                        Traits::KV_REG_DWORDS, 4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
         static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, lane, wave, wave / 2, bt_slots,
+        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, lane, wave, kv_head_idx, bt_slots,
         static_cast<float*>(kargs.ptr_DBG));
     return;
 #endif
 
-#if !defined(PA_SP3_MFMA_GEMM0)
-    build_scores_tile_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
-                                Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
-        q_fp8_tile, q_deq_scales, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
-        stride_blk, kq_base, Traits::BLOCK_SIZE, tile_kv, k_tile, s_dense);
+    __shared__ float row_dyn_scale[Traits::GQA_RATIO];
 
-    if (tile_kv < Traits::SUB_KV) {
-        pa_tail_mask_dense<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, kv_offset, tile_kv, ctx_len);
-    }
-#else
+#if defined(PA_REF_ALL_FLOAT)
+    build_scores_tile_bf16_lds<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
+                                Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
+        q_lds, q_row_stride_elems, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
+        stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
+        tile_kv, k_tile, s_dense);
+#elif defined(PA_REF_BF16_GEMM0)
+    build_scores_tile_bf16_lds<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
+                                Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
+        q_lds, q_row_stride_elems, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
+        stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
+        tile_kv, k_tile, s_dense);
+#elif defined(PA_SP3_MFMA_GEMM0)
     for (int idx = threadIdx.x; idx < Traits::GQA_RATIO * Traits::SUB_KV; idx += blockDim.x) {
         s_sparse[idx / Traits::SUB_KV][idx % Traits::SUB_KV] = 0.f;
     }
     __syncthreads();
-#endif
 
-#if defined(PA_DUMP_SCORES) && !defined(PA_GEMM1_BISECT)
-    if (kargs.ptr_DBG != nullptr) {
-        float* dbg = static_cast<float*>(kargs.ptr_DBG);
-        for (int idx = threadIdx.x; idx < Traits::GQA_RATIO * tile_kv; idx += blockDim.x) {
-            const int g = idx / tile_kv;
-            const int k = idx % tile_kv;
-            dbg[g * Traits::SUB_KV + k] = s_dense[g][k];
-        }
-        __syncthreads();
-    }
-#endif
-
-    __shared__ float row_dyn_scale[Traits::GQA_RATIO];
-
-#if !defined(PA_SP3_MFMA_GEMM0)
-    // Reference GEMM0: full-tile fuse (matches CPU golden); pi loop only for GEMM1.
-    pa_fuse_alu_tile_scales<Traits::GQA_RATIO, Traits::SUB_KV>(
-        s_dense, tile_kv, q_deq_scales, k_scale_pi0, k_scale_pi1, v_scale_pi0, v_scale_pi1,
-        scale_log2e, fa_max, L_acc, delta_scale, p_fp8, p_deq_scales);
-#else
-    // sp3 MFMA GEMM0: for pi in 0..1: cl_gemm0 -> pa_fuse_alu(pi)
+    // sp3 core_loop: for pi in 0..1: cl_gemm0 -> dequant -> compact -> pa_fuse_alu(pi)
     for (int pi = 0; pi < kPiCount; ++pi) {
         build_scores_mfma_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                              Traits::KV_REG_DWORDS>(
@@ -137,10 +129,9 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
         scores_compact_mfma_pi<Traits::GQA_RATIO, Traits::SUB_KV>(s_sparse, pi, kv_offset, tile_kv,
                                                                   s_dense);
 
-        const float* k_scale_pi = (pi == 0) ? k_scale_pi0 : k_scale_pi1;
         const float* v_scale_pi = (pi == 0) ? v_scale_pi0 : v_scale_pi1;
         pa_fuse_alu_slice<Traits::GQA_RATIO, Traits::SUB_KV>(
-            s_dense, pi * kHalf, kHalf, tile_kv, q_deq_scales, k_scale_pi, v_scale_pi, scale_log2e,
+            s_dense, pi * kHalf, kHalf, tile_kv, q_deq_scales, nullptr, v_scale_pi, scale_log2e,
             fa_max, L_acc, delta_scale);
     }
 
@@ -148,19 +139,31 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
         pa_tail_mask_dense<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, kv_offset, tile_kv, ctx_len);
     }
 
-    pa_fuse_compute_row_dyn_scales<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, tile_kv,
-                                                                       p_deq_scales, row_dyn_scale);
+    pa_fuse_compute_row_dyn_scales<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, tile_kv, p_deq_scales,
+                                                                     row_dyn_scale);
     for (int pi = 0; pi < kPiCount; ++pi) {
-        pa_fuse_quant_p_slice<Traits::GQA_RATIO, Traits::SUB_KV>(
-            s_dense, pi * kHalf, kHalf, tile_kv, p_fp8, row_dyn_scale);
+        pa_fuse_quant_p_slice<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, pi * kHalf, kHalf, tile_kv,
+                                                                  p_fp8, row_dyn_scale);
     }
-#endif
-
-#if defined(PA_SP3_MFMA_GEMM0)
     (void)row_dyn_scale;
+#else
+    build_scores_tile_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
+                                Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
+        q_fp8_tile, q_deq_scales, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
+        stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
+        tile_kv, k_tile, s_dense);
 #endif
 
 #if !defined(PA_SP3_MFMA_GEMM0)
+    if (tile_kv < Traits::SUB_KV) {
+        pa_tail_mask_dense<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, kv_offset, tile_kv, ctx_len);
+    }
+#endif
+
+#if !defined(PA_SP3_MFMA_GEMM0)
+    pa_fuse_alu_tile_scales<Traits::GQA_RATIO, Traits::SUB_KV>(
+        s_dense, tile_kv, q_deq_scales, k_scale_pi0, k_scale_pi1, v_scale_pi0, v_scale_pi1,
+        scale_log2e, fa_max, L_acc, delta_scale, p_fp8, p_deq_scales);
     (void)row_dyn_scale;
 #endif
 
@@ -172,21 +175,26 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
 #if defined(PA_REF_ALL_FLOAT)
     gemm1_pv_float_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
         s_dense, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        Traits::BLOCK_SIZE, tile_kv, o_tile);
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, o_tile);
 #elif defined(PA_REF_FLOAT_GEMM1)
     gemm1_pv_float_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
         s_dense, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        Traits::BLOCK_SIZE, tile_kv, o_tile);
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, o_tile);
+#elif defined(PA_REF_FP8_GEMM1)
+    gemm1_pv_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
+        p_fp8, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, p_deq_scales, nullptr,
+        o_tile);
 #elif defined(PA_SP3_MFMA_GEMM1)
     gemm1_mfma_tile<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE,
                     Traits::KV_REG_DWORDS, 4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
-        p_fp8, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, bt_slots, wave / 2, p_deq_scales,
-        dyn_resp_lds, lane, wave, o_tile, static_cast<float*>(kargs.ptr_DBG));
+        p_fp8, nullptr, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, bt_slots, kv_head_idx, kv_head_idx,
+        p_deq_scales, dyn_resp_lds, lane, wave, o_tile, static_cast<float*>(kargs.ptr_DBG));
 #else
-    gemm1_pv_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
-        p_fp8, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        Traits::BLOCK_SIZE, tile_kv, p_deq_scales, vq_base, o_tile);
+    gemm1_pv_float_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
+        s_dense, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, o_tile);
 #endif
 
     o_acc_add_tile<Traits::GQA_RATIO, Traits::HEAD_DIM>(o_acc, o_tile);
@@ -204,6 +212,7 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
                                int bt_slots,
                                uint32_t stride_blk,
                                float scale_log2e,
+                               int kv_head_idx,
                                int lane,
                                int wave,
                                const uint32_t q_mfma_regs[8],
@@ -229,16 +238,17 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
                                uint32_t k_regs[Traits::KV_REG_DWORDS * 2]) {
 #if defined(PA_MFMA_MAIN_PATH) && defined(PA_USE_SP3_PI)
     core_loop_tile_sp3_pi<Traits>(cl_p, tile, kv_offset, tile_kv, ctx_len, valid_blks, kargs,
-                                  page_ids, bt_slots, stride_blk, scale_log2e, lane, wave,
-                                  q_mfma_regs, q_deq_scales, fa_max, L_acc, delta_scale, o_acc,
-                                  k_scale_pi0, k_scale_pi1, v_scale_pi0, v_scale_pi1, s_sparse,
-                                  s_dense, q_fp8_tile, q_lds, q_row_stride_elems, k_tile, p_fp8,
-                                  p_deq_scales, o_tile, dyn_resp_lds, k_regs);
+                                  page_ids, bt_slots, stride_blk, scale_log2e, kv_head_idx, lane,
+                                  wave, q_mfma_regs, q_deq_scales, fa_max, L_acc, delta_scale,
+                                  o_acc, k_scale_pi0, k_scale_pi1, v_scale_pi0, v_scale_pi1,
+                                  s_sparse, s_dense, q_fp8_tile, q_lds, q_row_stride_elems, k_tile,
+                                  p_fp8, p_deq_scales, o_tile, dyn_resp_lds, k_regs);
     return;
 #endif
     (void)cl_p;
     (void)tile;
 
+    const int kv_nheads = static_cast<int>(kargs.kv_nheads);
     const float* kq_base = static_cast<const float*>(kargs.ptr_KQ);
     const float* vq_base = static_cast<const float*>(kargs.ptr_VQ);
 
@@ -248,21 +258,27 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
 
     load_kv_scale_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                      Traits::KV_REG_DWORDS, Traits::BLOCK_SIZE>(
-        kq_base, vq_base, page_ids, valid_blks, 0, k_scale_pi0, v_scale_pi0);
+        kq_base, vq_base, page_ids, valid_blks, kv_nheads, kv_head_idx, 0, k_scale_pi0,
+        v_scale_pi0);
     load_kv_scale_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                      Traits::KV_REG_DWORDS, Traits::BLOCK_SIZE>(
-        kq_base, vq_base, page_ids, valid_blks, 1, k_scale_pi1, v_scale_pi1);
+        kq_base, vq_base, page_ids, valid_blks, kv_nheads, kv_head_idx, 1, k_scale_pi1,
+        v_scale_pi1);
 
+#if defined(PA_SP3_MFMA_GEMM0)
     load_k_regs_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE, Traits::KV_REG_DWORDS,
                      4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
         static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, lane, wave, wave / 2, bt_slots, k_regs);
+        kargs.stride_kvhead, lane, wave, kv_head_idx, bt_slots, k_regs);
+#else
+    (void)k_regs;
+#endif
 
 #if defined(PA_V_REGS_BISECT)
     v_regs_bisect_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE,
                        Traits::KV_REG_DWORDS, 4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
         static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, lane, wave, wave / 2, bt_slots,
+        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, lane, wave, kv_head_idx, bt_slots,
         static_cast<float*>(kargs.ptr_DBG));
     return;
 #endif
@@ -271,12 +287,14 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
     build_scores_tile_bf16_lds<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                                 Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
         q_lds, q_row_stride_elems, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
-        stride_blk, kq_base, Traits::BLOCK_SIZE, tile_kv, k_tile, s_dense);
+        stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
+        tile_kv, k_tile, s_dense);
 #elif defined(PA_REF_BF16_GEMM0)
     build_scores_tile_bf16_lds<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                                 Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
         q_lds, q_row_stride_elems, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
-        stride_blk, kq_base, Traits::BLOCK_SIZE, tile_kv, k_tile, s_dense);
+        stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
+        tile_kv, k_tile, s_dense);
 #elif defined(PA_SP3_MFMA_GEMM0)
     for (int idx = threadIdx.x; idx < Traits::GQA_RATIO * Traits::SUB_KV; idx += blockDim.x) {
         s_sparse[idx / Traits::SUB_KV][idx % Traits::SUB_KV] = 0.f;
@@ -288,16 +306,22 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
                              Traits::KV_REG_DWORDS>(
             q_mfma_regs, k_regs + pi * Traits::KV_REG_DWORDS, pi, kv_offset, tile_kv, s_sparse);
     }
-    scores_apply_qk_dequant<Traits::GQA_RATIO, Traits::SUB_KV>(
-        s_sparse, tile_kv, q_deq_scales, k_scale_pi0, k_scale_pi1);
-
     scores_compact_mfma_tile<Traits::GQA_RATIO, Traits::SUB_KV>(s_sparse, kv_offset, tile_kv,
                                                                 s_dense, true);
+
+    if (tile_kv < Traits::SUB_KV) {
+        pa_tail_mask_dense<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, kv_offset, tile_kv,
+                                                              ctx_len);
+    }
+
+    scores_apply_qk_dequant<Traits::GQA_RATIO, Traits::SUB_KV>(
+        s_dense, tile_kv, q_deq_scales, k_scale_pi0, k_scale_pi1);
 #else
     build_scores_tile_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
                                 Traits::BLOCK_SIZE, Traits::GEMM0_KV_SLICE>(
         q_fp8_tile, q_deq_scales, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks,
-        stride_blk, kq_base, Traits::BLOCK_SIZE, tile_kv, k_tile, s_dense);
+        stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
+        tile_kv, k_tile, s_dense);
 #endif
 
     if (tile_kv < Traits::SUB_KV) {
@@ -329,21 +353,26 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
 #if defined(PA_REF_ALL_FLOAT)
     gemm1_pv_float_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
         s_dense, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        Traits::BLOCK_SIZE, tile_kv, o_tile);
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, o_tile);
 #elif defined(PA_REF_FLOAT_GEMM1)
     gemm1_pv_float_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
         s_dense, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        Traits::BLOCK_SIZE, tile_kv, o_tile);
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, o_tile);
+#elif defined(PA_REF_FP8_GEMM1)
+    gemm1_pv_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
+        p_fp8, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, p_deq_scales, nullptr,
+        o_tile);
 #elif defined(PA_SP3_MFMA_GEMM1)
     gemm1_mfma_tile<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE,
                     Traits::KV_REG_DWORDS, 4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
-        p_fp8, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, bt_slots, wave / 2, p_deq_scales,
-        dyn_resp_lds, lane, wave, o_tile, nullptr);
+        p_fp8, nullptr, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, Traits::BLOCK_SIZE, tile_kv, bt_slots, kv_head_idx, kv_head_idx,
+        p_deq_scales, dyn_resp_lds, lane, wave, o_tile, nullptr);
 #else
-    gemm1_pv_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
-        p_fp8, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
-        Traits::BLOCK_SIZE, tile_kv, p_deq_scales, vq_base, o_tile);
+    gemm1_pv_float_reference<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM>(
+        s_dense, static_cast<const uint8_t*>(kargs.ptr_V), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, kv_head_idx, Traits::BLOCK_SIZE, tile_kv, o_tile);
 #endif
 
     o_acc_add_tile<Traits::GQA_RATIO, Traits::HEAD_DIM>(o_acc, o_tile);
@@ -375,8 +404,7 @@ __device__ void pa_decode_kernel_body(const pa_decode_kargs& kargs) {
     const int num_aligned_tiles = aligned_kv / Traits::SUB_KV;
     const int tail_kv = static_cast<int>(kv_seq - static_cast<uint32_t>(aligned_kv));
 
-    const uint32_t q_batch_stride =
-        kargs.kv_nheads * Traits::GQA_RATIO * Traits::HEAD_DIM * static_cast<uint32_t>(sizeof(bf16_t));
+    const uint32_t q_batch_stride = kargs.stride_Q_batch;
     const uint8_t* q_byte_base = static_cast<const uint8_t*>(kargs.ptr_Q);
     q_byte_base += kv_head_idx * kargs.stride_Q + batch_id * q_batch_stride;
 
@@ -386,12 +414,15 @@ __device__ void pa_decode_kernel_body(const pa_decode_kargs& kargs) {
 
     constexpr int kQRowStrideElems = Traits::Q_LDS_ROW_ELEMS;
     __shared__ bf16_t q_lds[Traits::Q_LDS_ROWS * kQRowStrideElems];
+    uint32_t* dyn_resp_lds_ptr = nullptr;
+#if defined(PA_SP3_MFMA_GEMM0) || defined(PA_SP3_MFMA_GEMM1)
     __shared__ uint32_t dyn_resp_lds[kDynRspDwords];
-
     for (int i = threadIdx.x; i < kDynRspDwords; i += blockDim.x) {
         dyn_resp_lds[i] = 0;
     }
     __syncthreads();
+    dyn_resp_lds_ptr = dyn_resp_lds;
+#endif
 
     load_q_tile_to_shared<Traits::SUB_Q, Traits::HEAD_DIM, Traits::GQA_RATIO,
                           Traits::Q_LDS_ROWS, Traits::Q_LDS_ROW_ELEMS>(
@@ -400,7 +431,6 @@ __device__ void pa_decode_kernel_body(const pa_decode_kargs& kargs) {
     __shared__ float q_deq_scales[Traits::GQA_RATIO];
     __shared__ uint8_t q_fp8_tile[Traits::GQA_RATIO * Traits::HEAD_DIM];
 
-    // CPU golden / pa_ref: per-query absmax quant (matches gen_pa_buffers).
     q_rowmajor_fp8_per_query_from_lds<Traits::GQA_RATIO, Traits::HEAD_DIM>(
         q_lds, kQRowStrideElems, q_fp8_tile, q_deq_scales);
 
@@ -416,9 +446,11 @@ __device__ void pa_decode_kernel_body(const pa_decode_kargs& kargs) {
     __shared__ float v_scale_pi0[Traits::SUB_KV / 2];
     __shared__ float v_scale_pi1[Traits::SUB_KV / 2];
     __shared__ uint32_t page_ids[kBtSlots];
+    __shared__ uint32_t pages_snap[kBtSlots];
     __shared__ float s_sparse[Traits::GQA_RATIO][Traits::SUB_KV];
     __shared__ float s_dense[Traits::GQA_RATIO][Traits::SUB_KV];
-    __shared__ uint8_t k_tile[Traits::GEMM0_KV_SLICE * Traits::HEAD_DIM];
+    __shared__ uint8_t k_tile_buf[Traits::GEMM0_KV_SLICE * Traits::HEAD_DIM];
+    uint8_t* k_tile = k_tile_buf;
 
     for (int g = threadIdx.x; g < Traits::GQA_RATIO; g += blockDim.x) {
         fa_max[g] = kNegInf;
@@ -435,45 +467,51 @@ __device__ void pa_decode_kernel_body(const pa_decode_kargs& kargs) {
 
 #if defined(PA_SP3_MFMA_GEMM0)
     q_swizzle_pipeline_paref_deq<Traits::GQA_RATIO, Traits::HEAD_DIM>(
-        q_lds, lane, wave, q_deq_scales, q_mfma_regs, dyn_resp_lds);
+        q_lds, lane, wave, q_deq_scales, q_mfma_regs, dyn_resp_lds_ptr);
     __syncthreads();
 #endif
 
-    // sp3 aligned main loop (s_loop_cnt = kv_seq & ~0xff)
     for (int tile = 0; tile < num_aligned_tiles; ++tile) {
         const int kv_offset = tile * Traits::SUB_KV;
         int valid_blks = 0;
         load_block_table_tile_offset<Traits::SUB_KV, Traits::BLOCK_SIZE>(
             static_cast<const uint32_t*>(kargs.ptr_BT), batch_id, kargs.max_blks, kv_seq, kv_offset,
             page_ids, valid_blks);
+        for (int i = threadIdx.x; i < kBtSlots; i += blockDim.x) {
+            pages_snap[i] = page_ids[i];
+        }
+        __syncthreads();
 
         sp3::core_loop_tile<Traits>(cl_p, tile, kv_offset, Traits::SUB_KV, kv_seq, valid_blks,
-                                    kargs, page_ids, kBtSlots, stride_blk, scale_log2e, lane, wave,
-                                    q_mfma_regs, &q_deq_scales[0], &fa_max[0], &L_acc[0], &delta_scale[0],
-                                    &o_acc[0], &k_scale_pi0[0], &k_scale_pi1[0], &v_scale_pi0[0],
+                                    kargs, pages_snap, kBtSlots, stride_blk, scale_log2e, kv_head_idx,
+                                    lane, wave, q_mfma_regs, &q_deq_scales[0], &fa_max[0], &L_acc[0],
+                                    &delta_scale[0], &o_acc[0], &k_scale_pi0[0], &k_scale_pi1[0], &v_scale_pi0[0],
                                     &v_scale_pi1[0], &s_sparse[0], &s_dense[0], q_fp8_tile, q_lds,
                                     Traits::Q_LDS_ROW_ELEMS, k_tile, &p_fp8[0], &p_deq_scales[0],
-                                    &o_tile[0], dyn_resp_lds, k_regs);
+                                    &o_tile[0], dyn_resp_lds_ptr, k_regs);
     }
 
-    // sp3 tail_process (partial last tile)
     if (tail_kv > 0) {
         const int kv_offset = aligned_kv;
         int valid_blks = 0;
         load_block_table_tile_offset<Traits::SUB_KV, Traits::BLOCK_SIZE>(
             static_cast<const uint32_t*>(kargs.ptr_BT), batch_id, kargs.max_blks, kv_seq, kv_offset,
             page_ids, valid_blks);
+        for (int i = threadIdx.x; i < kBtSlots; i += blockDim.x) {
+            pages_snap[i] = page_ids[i];
+        }
+        __syncthreads();
 
         sp3::core_loop_tile<Traits>(cl_p, num_aligned_tiles, kv_offset, tail_kv, kv_seq, valid_blks,
-                                    kargs, page_ids, kBtSlots, stride_blk, scale_log2e, lane, wave,
-                                    q_mfma_regs, &q_deq_scales[0], &fa_max[0], &L_acc[0], &delta_scale[0],
+                                    kargs, pages_snap, kBtSlots, stride_blk, scale_log2e, kv_head_idx,
+                                    lane, wave, q_mfma_regs, &q_deq_scales[0], &fa_max[0], &L_acc[0],
+                                    &delta_scale[0],
                                     &o_acc[0], &k_scale_pi0[0], &k_scale_pi1[0], &v_scale_pi0[0],
                                     &v_scale_pi1[0], &s_sparse[0], &s_dense[0], q_fp8_tile, q_lds,
                                     Traits::Q_LDS_ROW_ELEMS, k_tile, &p_fp8[0], &p_deq_scales[0],
-                                    &o_tile[0], dyn_resp_lds, k_regs);
+                                    &o_tile[0], dyn_resp_lds_ptr, k_regs);
     }
 
     r_write_out_bf16<Traits::GQA_RATIO, Traits::HEAD_DIM>(&o_acc[0], &L_acc[0], out_base,
                                                           Traits::HEAD_DIM);
 }
-

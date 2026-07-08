@@ -23,17 +23,22 @@ __device__ __forceinline__ int k_shuffled_page_offset(int in_blk, int d) {
     return (d / TILE_MAJOR) * kTileStride + in_blk * TILE_MAJOR + (d % TILE_MAJOR);
 }
 
-// Shuffled V page in KV pool: [head_dim, block_size] (poc_kl pa_shuffle V page layout).
+// ASM V_shuffle layout: within each page, bytes are row-major [head_dim, block_size].
 __device__ __forceinline__ int v_shuffled_page_offset(int in_blk, int d, int block_size) {
     return d * block_size + in_blk;
 }
 
-// Per-token scale in shuffled scale pool: page_id * block_size + in_blk (per kv-head).
+// sp3 scale layout: [num_blocks, num_kv_heads, block_size] (see KVQ_load_addr_offs_gen).
 __device__ __forceinline__ float kv_scale_at(const float* scale_pool,
                                              uint32_t page_id,
                                              int in_blk,
-                                             int block_size) {
-    return scale_pool[static_cast<size_t>(page_id) * block_size + in_blk];
+                                             int block_size,
+                                             int kv_nheads,
+                                             int kv_head_idx) {
+    return scale_pool[static_cast<size_t>(page_id) * static_cast<size_t>(kv_nheads) *
+                          static_cast<size_t>(block_size) +
+                      static_cast<size_t>(kv_head_idx) * static_cast<size_t>(block_size) +
+                      static_cast<size_t>(in_blk)];
 }
 
 // Gather K-slice (tile-local page_ids) at global KV offset kv_base.
@@ -42,14 +47,19 @@ __device__ __forceinline__ void gather_k_tile_linear_offset(const uint8_t* k_poo
                                                             const uint32_t* page_ids,
                                                             int valid_blks,
                                                             uint32_t stride_blk,
+                                                            uint32_t stride_kvhead,
+                                                            int kv_head_idx,
                                                             int kv_base,
                                                             uint8_t* k_tile_out) {
+    const size_t kv_head_off =
+        static_cast<size_t>(kv_head_idx) * static_cast<size_t>(stride_kvhead);
     for (int kv = threadIdx.x; kv < KV_SLICE; kv += blockDim.x) {
         const int global_kv = kv_base + kv;
         const int blk_idx = global_kv / BLOCK_SIZE;
         const int in_blk = global_kv % BLOCK_SIZE;
         const uint32_t page = (blk_idx < valid_blks) ? page_ids[blk_idx] : 0u;
-        const uint8_t* page_base = k_pool + static_cast<size_t>(page) * stride_blk;
+        const uint8_t* page_base =
+            k_pool + static_cast<size_t>(page) * stride_blk + kv_head_off;
         for (int d = 0; d < HEAD_DIM; ++d) {
             k_tile_out[kv * HEAD_DIM + d] =
                 page_base[k_shuffled_page_offset<HEAD_DIM, BLOCK_SIZE>(in_blk, d)];
@@ -89,6 +99,9 @@ __device__ __forceinline__ void build_scores_tile_bf16_lds(const bf16_t* q_lds,
                                                             const uint32_t* page_ids,
                                                             int valid_blks,
                                                             uint32_t stride_blk,
+                                                            uint32_t stride_kvhead,
+                                                            int kv_head_idx,
+                                                            int kv_nheads,
                                                             const float* k_scale_pool,
                                                             int block_size,
                                                             int tile_kv,
@@ -103,7 +116,8 @@ __device__ __forceinline__ void build_scores_tile_bf16_lds(const bf16_t* q_lds,
             break;
         }
         gather_k_tile_linear_offset<KV_SLICE, HEAD_DIM, BLOCK_SIZE>(
-            k_pool, page_ids, valid_blks, stride_blk, kv_local_base, k_tile);
+            k_pool, page_ids, valid_blks, stride_blk, stride_kvhead, kv_head_idx, kv_local_base,
+            k_tile);
         for (int idx = threadIdx.x; idx < GQA * slice_kv; idx += blockDim.x) {
             const int qi = idx / slice_kv;
             const int ki = idx % slice_kv;
@@ -111,8 +125,10 @@ __device__ __forceinline__ void build_scores_tile_bf16_lds(const bf16_t* q_lds,
             const int blk_idx = global_kv / BLOCK_SIZE;
             const int in_blk = global_kv % BLOCK_SIZE;
             const uint32_t page = (blk_idx < valid_blks) ? page_ids[blk_idx] : 0u;
-            const float k_scale =
-                k_scale_pool ? kv_scale_at(k_scale_pool, page, in_blk, block_size) : 1.f;
+            const float k_scale = k_scale_pool
+                                      ? kv_scale_at(k_scale_pool, page, in_blk, block_size,
+                                                    kv_nheads, kv_head_idx)
+                                      : 1.f;
             float acc = 0.f;
             double acc64 = 0.0;
 #pragma unroll 4
@@ -145,6 +161,9 @@ __device__ __forceinline__ void build_scores_tile_reference(const uint8_t* q_fp8
                                                             const uint32_t* page_ids,
                                                             int valid_blks,
                                                             uint32_t stride_blk,
+                                                            uint32_t stride_kvhead,
+                                                            int kv_head_idx,
+                                                            int kv_nheads,
                                                             const float* k_scale_pool,
                                                             int block_size,
                                                             int tile_kv,
@@ -158,7 +177,8 @@ __device__ __forceinline__ void build_scores_tile_reference(const uint8_t* q_fp8
             break;
         }
         gather_k_tile_linear_offset<KV_SLICE, HEAD_DIM, BLOCK_SIZE>(
-            k_pool, page_ids, valid_blks, stride_blk, kv_local_base, k_tile);
+            k_pool, page_ids, valid_blks, stride_blk, stride_kvhead, kv_head_idx, kv_local_base,
+            k_tile);
         for (int idx = threadIdx.x; idx < GQA * slice_kv; idx += blockDim.x) {
             const int qi = idx / slice_kv;
             const int ki = idx % slice_kv;
@@ -167,8 +187,10 @@ __device__ __forceinline__ void build_scores_tile_reference(const uint8_t* q_fp8
             const int in_blk = global_kv % BLOCK_SIZE;
             const uint32_t page =
                 (blk_idx < valid_blks) ? page_ids[blk_idx] : 0u;
-            const float k_scale =
-                k_scale_pool ? kv_scale_at(k_scale_pool, page, in_blk, block_size) : 1.f;
+            const float k_scale = k_scale_pool
+                                      ? kv_scale_at(k_scale_pool, page, in_blk, block_size,
+                                                    kv_nheads, kv_head_idx)
+                                      : 1.f;
             const float q_deq = q_deq_scales[qi];
             float acc = 0.f;
             double acc64 = 0.0;
@@ -320,19 +342,11 @@ __device__ __forceinline__ void q_rowmajor_fp8_per_query_from_lds(const bf16_t* 
                                                                   int q_row_stride_elems,
                                                                   uint8_t* q_fp8_out,
                                                                   float* q_deq_scales) {
-    __shared__ float q_f32[GQA * HEAD_DIM];
-
-    for (int i = threadIdx.x; i < GQA * HEAD_DIM; i += blockDim.x) {
-        const int row = i / HEAD_DIM;
-        const int col = i % HEAD_DIM;
-        q_f32[i] = static_cast<float>(q_lds[row * q_row_stride_elems + col]);
-    }
-    __syncthreads();
-
     for (int g = 0; g < GQA; ++g) {
         float row_max = 1e-6f;
         for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
-            const float abs_val = poc_kl_quant_row_abs(q_f32[g * HEAD_DIM + d]);
+            const float abs_val =
+                poc_kl_quant_row_abs(static_cast<float>(q_lds[g * q_row_stride_elems + d]));
             row_max = fmaxf(row_max, abs_val);
         }
         __shared__ float row_max_smem[256];
@@ -352,7 +366,8 @@ __device__ __forceinline__ void q_rowmajor_fp8_per_query_from_lds(const bf16_t* 
         }
         __syncthreads();
         for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
-            const float qn = q_f32[g * HEAD_DIM + d] * scale;
+            const float qv = static_cast<float>(q_lds[g * q_row_stride_elems + d]);
+            const float qn = qv * scale;
             q_fp8_out[g * HEAD_DIM + d] = float_to_fp8_e4m3_bias8(qn);
         }
         __syncthreads();

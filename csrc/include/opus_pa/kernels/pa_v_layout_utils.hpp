@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include "opus_pa/kernels/pa_decode_device_utils.hpp"
+#include "opus_pa/kernels/pa_mfma_layout_utils.hpp"
 #include "opus_pa/kernels/pa_q_gemm_utils.hpp"
 
 namespace pa_decode {
@@ -147,6 +148,8 @@ __device__ __forceinline__ uint8_t v_hbm_tile_byte(const uint8_t* v_pool,
                                                    const uint32_t* page_ids,
                                                    int valid_blks,
                                                    uint32_t stride_blk,
+                                                   uint32_t stride_kvhead,
+                                                   int kv_head_idx,
                                                    int block_size,
                                                    int kv,
                                                    int d) {
@@ -156,7 +159,10 @@ __device__ __forceinline__ uint8_t v_hbm_tile_byte(const uint8_t* v_pool,
         return 0;
     }
     const uint32_t page = page_ids[blk];
-    const uint8_t* page_base = v_pool + static_cast<size_t>(page) * stride_blk;
+    const size_t kv_head_off =
+        static_cast<size_t>(kv_head_idx) * static_cast<size_t>(stride_kvhead);
+    const uint8_t* page_base =
+        v_pool + static_cast<size_t>(page) * stride_blk + kv_head_off;
     return page_base[v_shuffled_page_offset(in_blk, d, block_size)];
 }
 
@@ -177,7 +183,7 @@ __device__ __forceinline__ bool v_brute_decode_from_hbm(const uint8_t* v_pool,
     int d_match = -1;
     for (int kv = 0; kv < tile_kv; ++kv) {
         for (int d = 0; d < HEAD_DIM; ++d) {
-            if (v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, block_size, kv, d) ==
+            if (v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, 0, 0, block_size, kv, d) ==
                 got) {
                 ++match_count;
                 kv_match = kv;
@@ -194,19 +200,21 @@ __device__ __forceinline__ bool v_brute_decode_from_hbm(const uint8_t* v_pool,
     return false;
 }
 
-// Gather one MFMA B-operand pair (V[kv,d] tile) from HBM for P@V MFMA.
+// Gather one MFMA B-operand pair (V[kv,d] tile) from HBM for P@V MFMA (GEMM1 layout).
 template<int SUB_KV, int HEAD_DIM, int BLOCK_SIZE>
 __device__ __forceinline__ void v_mfma_gather_b_pair(const uint8_t* v_pool,
-                                                       const uint32_t* page_ids,
-                                                       int valid_blks,
-                                                       uint32_t stride_blk,
-                                                       int block_size,
-                                                       int tile_kv,
-                                                       int kv_base,
-                                                       int head_base,
-                                                       int lane,
-                                                       uint32_t& lo,
-                                                       uint32_t& hi) {
+                                                     const uint32_t* page_ids,
+                                                     int valid_blks,
+                                                     uint32_t stride_blk,
+                                                     uint32_t stride_kvhead,
+                                                     int kv_head_idx,
+                                                     int block_size,
+                                                     int tile_kv,
+                                                     int kv_base,
+                                                     int head_base,
+                                                     int lane,
+                                                     uint32_t& lo,
+                                                     uint32_t& hi) {
     constexpr int kRowsPerGroup = 4;
     const int col = lane & 15;
     const int row_group = lane >> 4;
@@ -216,12 +224,11 @@ __device__ __forceinline__ void v_mfma_gather_b_pair(const uint8_t* v_pool,
     for (int reg_k = 0; reg_k < 8; ++reg_k) {
         const int j = reg_k >> 2;
         const int inner_k = reg_k & 3;
-        // MFMA B: kv along 64-wide wave columns, d along 4-wide row groups (mirror P gather).
         const int kv = kv_base + j * 64 + col;
         const int d = head_base + row_group * kRowsPerGroup + inner_k;
         bytes[reg_k] = (kv < tile_kv && d < HEAD_DIM)
-                           ? v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, block_size,
-                                             kv, d)
+                           ? v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk,
+                                             stride_kvhead, kv_head_idx, block_size, kv, d)
                            : static_cast<uint8_t>(0);
     }
     lo = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
@@ -297,8 +304,8 @@ __device__ __forceinline__ void v_regs_lane_bisect(const uint32_t* v_regs,
                 v_mem_load_decode_coord_formula<SUB_KV, BLOCK_SIZE>(lane, wave, fch, i_idx, byte_b,
                                                                     IMM_STRIDE, kv_f, d_f);
                 if (kv_f < tile_kv && d_f < HEAD_DIM &&
-                    got != v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, block_size,
-                                           kv_f, d_f)) {
+                    got != v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, stride_kvhead,
+                                           tg_idx, block_size, kv_f, d_f)) {
                     ++local_formula_mm;
                 }
 
@@ -313,8 +320,8 @@ __device__ __forceinline__ void v_regs_lane_bisect(const uint32_t* v_regs,
                                                             stride_blk, load_addr, kv_a, d_a);
                 const bool addr_decode_ok =
                     found && kv_a < tile_kv && d_a < HEAD_DIM &&
-                    got == v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, block_size,
-                                           kv_a, d_a);
+                    got == v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, stride_kvhead,
+                                           tg_idx, block_size, kv_a, d_a);
                 if (!addr_decode_ok) {
                     ++local_addr_decode_mm;
                     if (first_mismatch_pack == 0xffffffffu) {
@@ -331,7 +338,7 @@ __device__ __forceinline__ void v_regs_lane_bisect(const uint32_t* v_regs,
                             ++local_brute_ambig;
                         }
                         if (got != v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk,
-                                                   block_size, kv_b, d_b)) {
+                                                   stride_kvhead, tg_idx, block_size, kv_b, d_b)) {
                             ++local_brute_mm;
                         }
                     } else {
