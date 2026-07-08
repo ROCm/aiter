@@ -627,6 +627,7 @@ def compile_gemm2_a4w4_port(
     g2_bhoist=None,
     g2_ascale_pf=None,
     g2_spart=None,
+    g2_bf16_lds=None,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -660,10 +661,20 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
+    # g2_bf16_lds: store the cshuffle C tile as bf16 (BM*BN*2) instead of f32 (BM*BN*4) so the
+    # kernel occupies more CTA slots (Opus/old-FlyDSL style). Reduce-only for now (atomic keeps the
+    # f32 LDS + bf16 atomic-fadd path); the down-projection out is bf16, so weight is applied then
+    # truncated to bf16 before the LDS store. Enabled by default only for the a8w4 reduce route.
+    if g2_bf16_lds is None:
+        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and use_reduce and is_f8
+    g2_bf16_lds = bool(g2_bf16_lds) and use_reduce
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
-    aStages = 3  # runtime K-loop: triple-buffered A LDS (handles both K_TILES==2 and larger)
-    lds_bytes = max(BM * BN * 4, aStages * slot_bytes)
+    # bf16 C LDS shrinks the output tile to BM*BN*2; with only K_TILES<=2 for the reduce shapes the
+    # A stream is fully prologue-loaded (kStages==2, no in-loop prefetch), so 2 A slots don't alias.
+    aStages = 2 if g2_bf16_lds else 3
+    c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
+    lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     # N_OUT = model_dim/hidden is a runtime arg (i32_hidden); num_n_blocks = N_OUT//256 is computed runtime in the body/launch (HIDDEN_MAX only caps host checks).
     assert HIDDEN_MAX % BK == 0, f"HIDDEN_MAX must be a multiple of {BK}, got {HIDDEN_MAX}"
 
@@ -685,7 +696,8 @@ def compile_gemm2_a4w4_port(
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}_v2"
+    bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -773,6 +785,7 @@ def compile_gemm2_a4w4_port(
                 g2_kstages=g2_kstages,
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
+                g2_bf16_lds=g2_bf16_lds,
             )
 
         if const_expr(not persist and g2_spart <= 0):
@@ -1052,6 +1065,8 @@ def get_g2(
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
+    # bf16 cshuffle LDS: reduce-only, a8w4 default (byte-identical for all other routes).
+    g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and epilog == "reduce" and a_dtype == "fp8"
     key = (
         BM,
         use_nt,
@@ -1068,6 +1083,7 @@ def get_g2(
         g2_bhoist,
         g2_ascale_pf,
         g2_spart,
+        g2_bf16_lds,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -1087,6 +1103,7 @@ def get_g2(
             g2_bhoist=g2_bhoist,
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
+            g2_bf16_lds=g2_bf16_lds,
         )
         G2_CACHE[key] = launch
     return launch

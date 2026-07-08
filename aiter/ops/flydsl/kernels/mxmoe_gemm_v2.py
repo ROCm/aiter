@@ -1044,6 +1044,7 @@ def gemm2_body_v2(
     g2_kstages=2,
     g2_bhoist=True,
     g2_ascale_pf=True,
+    g2_bf16_lds=False,
 ):
     # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     if g2_kstages not in (1, 2):
@@ -1413,6 +1414,7 @@ def gemm2_body_v2(
         use_reduce=use_reduce,
         topk=topk,
         SBM=SBM,
+        g2_bf16_lds=g2_bf16_lds,
     )
 
 
@@ -1434,6 +1436,7 @@ def atomic_bf16_epilog(
     use_reduce=False,
     topk=1,
     SBM=None,
+    g2_bf16_lds=False,
 ):
     if SBM is None:
         SBM = BM
@@ -1442,6 +1445,10 @@ def atomic_bf16_epilog(
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
     lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
+    # bf16 cshuffle LDS: half the C tile footprint (BM*BN*2). Weight is folded in f32 during the
+    # write phase and the tile is truncated to bf16 before the LDS store (single rounding, as old
+    # FlyDSL); readback then loads the already-weighted bf16 pair and stores it straight to out.
+    lds_base_bf16 = lds_typed_ptr(lds_acc_base, T.bf16, align=2) if const_expr(g2_bf16_lds) else None
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // 32
@@ -1462,15 +1469,32 @@ def atomic_bf16_epilog(
     # pre-store fence+barrier (HIP run_one __syncthreads() before the epilog).
     gpu.barrier()
 
-    # write accm -> lds_acc cshuffle (scalar f32 stores, as HIP does)
-    for i in range_constexpr(kMChunks):
-        row_base = fx.Int32(i * 16) + lane_div_16 * 4
-        for J in range_constexpr(4):
-            col = wave * 64 + J * 16 + lane_mod_16
-            vec = Vec(accm[i][J])
-            for v in range_constexpr(4):
-                idx = (row_base + v) * BN + col
-                lds_base_fptr[idx] = fx.Float32(vec[v])
+    # write accm -> lds_acc cshuffle. f32 path: scalar f32 stores (weight applied on readback).
+    # bf16 path: fold the route weight in f32 (per block-row from sorted_weights) then truncate to
+    # bf16 so LDS holds the final weighted output tile.
+    if const_expr(g2_bf16_lds):
+        for i in range_constexpr(kMChunks):
+            row_base = fx.Int32(i * 16) + lane_div_16 * 4
+            # one f32 route-weight per write-phase block row (row_base+v); sorted_weights is padded.
+            w_row = [
+                llvm.load(T.f32, gep1(sweights_base, (m_row + row_base + v) * 4), invariant=True)
+                for v in range_constexpr(4)
+            ]
+            for J in range_constexpr(4):
+                col = wave * 64 + J * 16 + lane_mod_16
+                vec = Vec(accm[i][J])
+                for v in range_constexpr(4):
+                    idx = (row_base + v) * BN + col
+                    lds_base_bf16[idx] = fx.BFloat16(fx.Float32(vec[v]) * fx.Float32(w_row[v]))
+    else:
+        for i in range_constexpr(kMChunks):
+            row_base = fx.Int32(i * 16) + lane_div_16 * 4
+            for J in range_constexpr(4):
+                col = wave * 64 + J * 16 + lane_mod_16
+                vec = Vec(accm[i][J])
+                for v in range_constexpr(4):
+                    idx = (row_base + v) * BN + col
+                    lds_base_fptr[idx] = fx.Float32(vec[v])
 
     gpu.barrier()
 
@@ -1494,10 +1518,14 @@ def atomic_bf16_epilog(
             out_row = token_id
             row_base_addr = out_row * N_OUT + n_block_idx * BN + col_start
         for s in range_constexpr(4):
-            # adjacent ee=0,1 contiguous -> one <2xf32> load (as HIP vectorizes)
+            # adjacent ee=0,1 contiguous -> one 2-wide load.
             idx0 = row_in_block * BN + col_start + s * 64
-            v2 = Vec(lds_vec_load(lds_acc_base, idx0 * 4, Vec.make_type(2, fx.Float32), fx.Float32, align=8))
-            pk = Vec.from_elements([v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32).to(fx.BFloat16)
+            if const_expr(g2_bf16_lds):
+                # LDS already holds the weighted bf16 pair (4B = 2xbf16): load + store straight through.
+                pk = Vec(lds_vec_load(lds_acc_base, idx0 * 2, Vec.make_type(2, fx.BFloat16), fx.BFloat16, align=4))
+            else:
+                v2 = Vec(lds_vec_load(lds_acc_base, idx0 * 4, Vec.make_type(2, fx.Float32), fx.Float32, align=8))
+                pk = Vec.from_elements([v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32).to(fx.BFloat16)
             if const_expr(use_reduce):
                 off = (row_base_addr + fx.Int64(s * 64)) * fx.Int64(2)  # bf16 byte off (i64)
             else:
