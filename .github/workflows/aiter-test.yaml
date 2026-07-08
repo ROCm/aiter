@@ -6,11 +6,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.github/workflows/**'
+      - '.github/workflows/aiter-test.yaml'
+      - '!.github/scripts/sglang_downstream.py'
 
   workflow_dispatch:
   schedule:

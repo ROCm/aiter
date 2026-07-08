@@ -14,10 +14,10 @@ import torch
 # Skip on unsupported arch via the same probe opus uses at import time.
 from aiter.ops.opus._arch import _detect_arch  # noqa: E402
 
-_arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942"})
+_arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 if not _arch_ok:
     print(
-        f"[skip] test_opus_a16w16_gemm requires gfx950/gfx942 (detected {_detected_gfx!r})"
+        f"[skip] test_opus_a16w16_gemm requires gfx950/gfx942/gfx1250 (detected {_detected_gfx!r})"
     )
     sys.exit(0)
 

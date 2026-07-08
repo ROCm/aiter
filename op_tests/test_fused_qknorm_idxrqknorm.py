@@ -283,12 +283,17 @@ def pertoken_quant_ref(x: torch.Tensor):
     """Per-token (per head-dim row) dynamic fp8 quant reference.
 
     x: [..., head_dim] float. Returns (dequant, scale) where
-       scale = amax/448, dequant = round_to_fp8(x/scale)*scale.
+       scale = amax/fp8_max (arch fp8 max: 240 for e4m3fnuz on gfx942,
+       448 for e4m3fn on gfx950+), dequant = round_to_fp8(x/scale)*scale.
     """
     fp8_dtype = fp8_cache_dtype()
     assert fp8_dtype is not None
+    # fp8 max is arch-dependent and MUST match the kernel's fp8Max<cache_t>():
+    # e4m3fnuz (gfx942) -> 240, e4m3fn (gfx950+) -> 448. Hardcoding 448 mis-scales
+    # the e4m3fnuz cache on MI300X.
+    fp8_max = torch.finfo(fp8_dtype).max
     amax = x.float().abs().amax(dim=-1, keepdim=True)
-    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
     deq = (x.float() / scale).to(fp8_dtype).float() * scale
     return deq, scale.squeeze(-1)
 
@@ -350,7 +355,7 @@ def check_pertoken_fp8(
             k_deq_ref, k_scale_ref = pertoken_quant_ref(kref_row)
             v_deq_ref, v_scale_ref = pertoken_quant_ref(vref_row)
 
-            # emitted per-token scales must equal amax/448
+            # emitted per-token scales must equal amax/fp8_max
             k_scale_act = pertoken_scale_at(
                 k_scale,
                 asm_layout=asm_layout,

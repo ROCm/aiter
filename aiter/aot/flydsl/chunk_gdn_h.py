@@ -56,6 +56,7 @@ from aiter.aot.flydsl.common import (
     dedupe_jobs,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.ops.flydsl.kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 
@@ -325,9 +326,10 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             _compile_chunk_gdn_h_to_cache(
                 dtype=dtype,
                 K=K,
@@ -412,11 +414,9 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results: list[dict] = []
 
-    for i, job in enumerate(all_jobs, 1):
-        print(f"\n[{i}/{len(all_jobs)}] ", end="")
-        results.append(compile_one_config(**job))
+    print(f"\n--- Compiling {len(all_jobs)} kernels ---")
+    results = run_jobs_parallel(compile_one_config, all_jobs)
 
     total_elapsed = time.time() - total_t0
 
