@@ -117,7 +117,7 @@ def gemm_a4w4(
     This function is a wrapper for the A4W4 GEMM kernel.
     It is used to perform matrix multiplication with 4-bit quantization.
 
-    On gfx1250 (mi400) the call is dispatched to the dedicated F4GEMM asm path
+    On gfx1250 the call is dispatched to the dedicated F4GEMM asm path
     (preload SGPR mode). MXFP4 vs NVFP4 is selected by the presence of
     ``global_A_scale``/``global_B_scale`` (NVFP4 per-tensor global scales).
     """
@@ -127,22 +127,44 @@ def gemm_a4w4(
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
-        # mi400 F4GEMM is kept on a separate dispatch (different kargs layout
-        # due to preload). See gemm_a4w4_mi400 / asm_f4gemm_mi400.cu.
-        return gemm_a4w4_mi400(
-            A,
-            B,
-            A_scale,
-            B_scale,
-            bias=bias,
-            dtype=dtype,
-            alpha=alpha,
-            beta=beta,
-            bpreshuffle=bpreshuffle,
-            apreshuffle=apreshuffle,
-            global_A_scale=global_A_scale,
-            global_B_scale=global_B_scale,
-        )
+        # F4GEMM is kept on a separate dispatch (different kargs layout due to
+        # preload). See gemm_mxfp4_asm / gemm_nvfp4_asm / asm_f4gemm.cu.
+        # B is always preshuffled here, so ``bpreshuffle`` is accepted for
+        # interface compatibility but not forwarded; ``bias``/``alpha``/``beta``
+        # are not yet plumbed through these kernels.
+        if (
+            bias is not None
+            or (alpha is not None and alpha != 1.0)
+            or (beta is not None and beta != 0.0)
+        ):
+            logger.warning(
+                "gemm_a4w4 on gfx1250 ignores bias/alpha/beta: not yet supported "
+                "by the F4GEMM kernels."
+            )
+        A2 = A.view(m, A.shape[-1])
+        out_shape = (*A.shape[:-1], n)
+        # NVFP4 per-tensor global scale selects the NVFP4 path; otherwise MXFP4.
+        if global_A_scale is not None or global_B_scale is not None:
+            out = gemm_nvfp4_asm(
+                A2,
+                B,
+                A_scale,
+                B_scale,
+                _as_global_scale(global_A_scale),
+                _as_global_scale(global_B_scale),
+                dtype=dtype,
+                a_preshuffle=bool(apreshuffle),
+            )
+        else:
+            out = gemm_mxfp4_asm(
+                A2,
+                B,
+                A_scale,
+                B_scale,
+                dtype=dtype,
+                a_preshuffle=bool(apreshuffle),
+            )
+        return out.view(*out_shape)
     out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(
@@ -239,7 +261,7 @@ def gemm_a4w4_asm(
 
 
 @compile_ops(
-    "module_f4gemm_mi400_asm",
+    "module_f4gemm_asm",
     fc_name="mxfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -255,7 +277,7 @@ def _mxfp4_gemm_asm(
 
 
 @compile_ops(
-    "module_f4gemm_mi400_asm",
+    "module_f4gemm_asm",
     fc_name="nvfp4_gemm_asm",
     ffi_type="ctypes",
 )
@@ -281,7 +303,7 @@ def gemm_mxfp4_asm(
     a_preshuffle: bool = True,
     kernelName: str = "",
 ) -> Tensor:
-    """gfx1250 MXFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e8m0 scales."""
+    """MXFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e8m0 scales."""
     M = A.shape[0]
     N = B.shape[0]
     out = torch.empty((M, N), dtype=dtype, device=A.device)
@@ -308,7 +330,7 @@ def gemm_nvfp4_asm(
     a_preshuffle: bool = True,
     kernelName: str = "",
 ) -> Tensor:
-    """gfx1250 NVFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e4m3 scales + global alphas."""
+    """NVFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e4m3 scales + global alphas."""
     M = A.shape[0]
     N = B.shape[0]
     out = torch.empty((M, N), dtype=dtype, device=A.device)
@@ -333,72 +355,6 @@ def _as_global_scale(scale) -> float:
     if torch.is_tensor(scale):
         return float(scale.detach().reshape(-1)[0].item())
     return float(scale)
-
-
-def gemm_a4w4_mi400(
-    A: Tensor,  # A:[M, K/2] f4x2 (preshuffled when apreshuffle=1)
-    B: Tensor,  # B:[N, K/2] f4x2 (preshuffled when bpreshuffle=1)
-    A_scale: Tensor,  # A_scale:[M, K/block_size] MXFP4: e8m0 (block=32), NVFP4: e4m3 (block=16)
-    B_scale: Tensor,  # B_scale:[N, K/block_size] MXFP4: e8m0 (block=32), NVFP4: e4m3 (block=16)
-    bias: Optional[
-        Tensor
-    ] = None,  # bias:[1, N] f32 (not yet supported by mi400 kernels)
-    dtype: torch.dtype = dtypes.bf16,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-    global_B_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-    kernelName: str = "",
-) -> Tensor:
-    """gfx1250 (mi400) F4GEMM dispatch (preload SGPR mode).
-
-    Routes to the dedicated mxfp4/nvfp4 asm entrypoints. The presence of any
-    NVFP4 per-tensor global scale selects the NVFP4 path; otherwise MXFP4.
-    On mi400 B is always preshuffled, so ``bpreshuffle`` is accepted for
-    interface compatibility but not forwarded. ``bias``/``alpha``/``beta`` are
-    not yet plumbed through the mi400 kernels.
-    """
-    if (
-        bias is not None
-        or (alpha is not None and alpha != 1.0)
-        or (beta is not None and beta != 0.0)
-    ):
-        logger.warning(
-            "gemm_a4w4 on gfx1250 ignores bias/alpha/beta: not yet supported by "
-            "the mi400 F4GEMM kernels."
-        )
-
-    m = A.numel() // A.shape[-1]
-    n = B.shape[0]
-    out_shape = (*A.shape[:-1], n)
-    A2 = A.view(m, A.shape[-1])
-
-    is_nvfp4 = global_A_scale is not None or global_B_scale is not None
-    if is_nvfp4:
-        out = gemm_nvfp4_asm(
-            A2,
-            B,
-            A_scale,
-            B_scale,
-            _as_global_scale(global_A_scale),
-            _as_global_scale(global_B_scale),
-            dtype=dtype,
-            a_preshuffle=bool(apreshuffle),
-            kernelName=kernelName,
-        )
-    else:
-        out = gemm_mxfp4_asm(
-            A2,
-            B,
-            A_scale,
-            B_scale,
-            dtype=dtype,
-            a_preshuffle=bool(apreshuffle),
-            kernelName=kernelName,
-        )
-    return out.view(*out_shape)
 
 
 def gen_gemm_a4w4_blockscale_fake_tensors(

@@ -457,7 +457,9 @@ def mhc_pre_norm_split_hip(
 
 
 @benchmark()
-def test_mhc_pre(m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False):
+def test_mhc_pre(
+    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, fn_pack_bf16=False
+):
     if fuse_rmsnorm and test_hc_head:
         raise ValueError("fuse_rmsnorm and hc_head are mutually exclusive")
 
@@ -521,6 +523,30 @@ def test_mhc_pre(m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False
     ret = {"fuse_rmsnorm": fuse_rmsnorm, "test_hc_head": test_hc_head}
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
+
+    # bf16 (fn hi/lo pack) GEMM path: same mhc_pre but is_fn_pack_bf16=1. On gfx950 this
+    # uses the native bf16 MFMA; on gfx1250 the wave32 bf16 WMMA (UNVERIFIED); on other
+    # arches it falls back to fp32 (so err/us == the fp32 columns).
+    if fn_pack_bf16:
+        (
+            post_mix_bf16,
+            comb_mix_bf16,
+            layer_input_bf16,
+        ), hip_bf16_us = run_perftest(
+            aiter.mhc_pre,
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            is_fn_pack_bf16=1,
+            **hip_kwargs,
+        )
+        ret["hip_bf16_err"] = checkAllclose(
+            layer_input_ref, layer_input_bf16, msg="layer_input(bf16)"
+        )
+        ret["hip_bf16_us"] = hip_bf16_us
+        if hip_us and hip_bf16_us:
+            ret["bf16_speedup"] = hip_us / hip_bf16_us
     if fuse_rmsnorm:
         ret["hip_nofuse_us"] = hip_nofuse_us
         ret["TB/s"] = (
@@ -754,7 +780,9 @@ def mhc_post_pre_unfused_hip(
 
 
 @benchmark()
-def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False):
+def test_mhc_post_pre(
+    m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False, fn_pack_bf16=False
+):
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton."""
     if hidden_size < 512:
         aiter.logger.info(
@@ -863,6 +891,38 @@ def test_mhc_post_pre(m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False
     ret["hip_unfused_err"] = hip_unfused_err
     ret["fused_us"] = fused_us
     ret["hip_fused_err"] = hip_fused_err
+
+    # bf16 (fn hi/lo pack) compute path: same fused kernel but is_fn_pack_bf16=1. gfx950
+    # native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); other arches fall back to
+    # fp32 (err/us == the fp32 fused columns).
+    if fn_pack_bf16:
+        (
+            post_mix_bf16,
+            comb_mix_bf16,
+            layer_input_bf16,
+            next_residual_bf16,
+        ), fused_bf16_us = run_perftest(
+            aiter.mhc_fused_post_pre,
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            force_fused=True,
+            is_fn_pack_bf16=1,
+            **hip_kwargs,
+        )
+        ret["fused_bf16_err"] = checkAllclose(
+            layer_input_ref, layer_input_bf16, msg="fused/layer_input(bf16)"
+        )
+        checkAllclose(
+            next_residual_ref, next_residual_bf16, msg="fused/next_residual(bf16)"
+        )
+        ret["fused_bf16_us"] = fused_bf16_us
+        if fused_us and fused_bf16_us:
+            ret["bf16_speedup"] = fused_us / fused_bf16_us
     # print(f"next_residual_ref: {next_residual_ref}")
     # print(f"next_residual_fused: {next_residual_fused}")
 
@@ -994,6 +1054,14 @@ parser.add_argument(
     help="In mhc_post_pre summary, add large_m_us / hip_large_m_err columns "
     "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
 )
+parser.add_argument(
+    "--fn_pack_bf16",
+    action="store_true",
+    help="Also run the bf16 (fn hi/lo pack) compute path (is_fn_pack_bf16=1) and add "
+    "hip_bf16_err/hip_bf16_us (mhc_pre) and fused_bf16_err/fused_bf16_us + bf16_speedup "
+    "(mhc_post_pre). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); "
+    "other arches fall back to fp32.",
+)
 
 args = parser.parse_args()
 
@@ -1008,6 +1076,7 @@ for dtype in args.dtype:
                     hc_mult=hc_mult,
                     test_hc_head=args.hc_head,
                     fuse_rmsnorm=args.fuse_rmsnorm,
+                    fn_pack_bf16=args.fn_pack_bf16,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
@@ -1037,6 +1106,7 @@ if not args.hc_head:
                         hc_mult=hc_mult,
                         fuse_rmsnorm=args.fuse_rmsnorm,
                         large_m=args.largeM,
+                        fn_pack_bf16=args.fn_pack_bf16,
                     )
                     if ret.get("skipped"):
                         continue

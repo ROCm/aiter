@@ -823,6 +823,7 @@ class CustomAllreduce:
         post_per_token_quant: bool = False,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
+        emit_bf16: bool = False,
     ):
         valid_dim = w.numel()
         if res_out is None:
@@ -875,6 +876,15 @@ class CustomAllreduce:
                 scale_out = torch.empty(
                     inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device
                 )
+            # Optional pre-quantization bf16/fp16 mirror of the normed output.
+            # Requested by v32 DSA models (e.g. GLM-5.2) whose indexer GEMMs run
+            # in bf16 while attention QKV keeps per-token FP8. Zero-overhead when
+            # not requested because the kernel branches on the pointer being null.
+            bf16_out = None
+            bf16_ptr = 0
+            if emit_bf16:
+                bf16_out = torch.empty_like(inp)
+                bf16_ptr = int(bf16_out.data_ptr())
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
                 inp,
@@ -887,7 +897,11 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
+                gemma_norm,
+                bf16_ptr,
             )
+            if emit_bf16:
+                return out, res_out, scale_out, bf16_out
             return out, res_out, scale_out
 
     def custom_fused_ar_rms(
@@ -1001,6 +1015,8 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        gemma_norm: bool = False,
+        emit_bf16: bool = False,
     ):
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -1015,12 +1031,21 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
+                    gemma_norm=gemma_norm,
+                    emit_bf16=emit_bf16,
                 )
             else:
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
                 dummy_scale_out = torch.zeros(
                     input.shape[:-1] + (1,), dtype=torch.float32, device=input.device
                 )
+                if emit_bf16:
+                    return (
+                        dummy_out,
+                        torch.zeros_like(input),
+                        dummy_scale_out,
+                        torch.zeros_like(input),
+                    )
                 return dummy_out, torch.zeros_like(input), dummy_scale_out
         else:
             return self.fused_ar_rms(
@@ -1031,6 +1056,8 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 post_per_token_quant=True,
+                gemma_norm=gemma_norm,
+                emit_bf16=emit_bf16,
             )
 
     def fused_ar_rms_per_group_quant(

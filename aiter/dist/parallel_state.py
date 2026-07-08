@@ -174,10 +174,17 @@ def fused_allreduce_rmsnorm_quant_fake(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Real op returns (out_fp8, residual_out, scale). ``out`` is per-token FP8,
+    # NOT bf16 -- declare the correct dtype so torch.compile's assert_size_stride
+    # / dtype checks agree with the runtime tensor.
+    from aiter.utility.dtypes import fp8
+
+    del gemma_norm
     return (
+        torch.empty_like(inp, dtype=fp8),
         torch.empty_like(res_inp),
-        torch.empty_like(inp),
         torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
     )
 
@@ -190,13 +197,55 @@ def fused_allreduce_rmsnorm_quant_(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_out_place(
-        inp, res_inp, w, eps, prefill_support
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm
+    )
+
+
+def fused_allreduce_rmsnorm_quant_emit_bf16_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Real op returns (out_fp8, residual_out, scale, bf16) -- the 4th tensor is
+    # the pre-quantization bf16/fp16 normed activation for v32 DSA indexer GEMMs.
+    from aiter.utility.dtypes import fp8
+
+    del gemma_norm
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
+        torch.empty_like(res_inp),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_emit_bf16_fake)
+def fused_allreduce_rmsnorm_quant_emit_bf16_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_out_place(
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm, emit_bf16=True
     )
 
 
@@ -619,8 +668,25 @@ class GroupCoordinator:
         group_size: int = 128,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
-        if quant_type == "per_token" and group_size == 128 and not emit_bf16:
+        # quant_type arrives already canonicalized to a string ("per_token"/
+        # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        if quant_type == "per_token" and group_size == 128:
+            # Both paths go through torch.library-registered ops so they lower
+            # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
+            # The emit_bf16 variant returns a 4th tensor (the pre-quant bf16
+            # normed output) for v32 DSA models whose indexer GEMMs need it.
+            if emit_bf16:
+                return fused_allreduce_rmsnorm_quant_emit_bf16_(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    group_name=self.unique_name,
+                    prefill_support=prefill_support,
+                    gemma_norm=gemma_norm,
+                )
             return fused_allreduce_rmsnorm_quant_(
                 input_,
                 residual_inp_,
@@ -628,6 +694,7 @@ class GroupCoordinator:
                 eps,
                 group_name=self.unique_name,
                 prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
             )
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -641,6 +708,7 @@ class GroupCoordinator:
             group_size=group_size,
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -772,7 +840,9 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gemma_norm: bool = False,
+        emit_bf16: bool = False,
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_quant(
@@ -781,6 +851,8 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+            emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
         )
 
     def _fused_allreduce_rmsnorm_quant_per_group_out_place(
