@@ -552,8 +552,6 @@ def test_mhc_pre(
             layer_input_ref, layer_input_bf16, msg="layer_input(bf16)"
         )
         ret["hip_bf16_us"] = hip_bf16_us
-        if hip_us and hip_bf16_us:
-            ret["bf16_speedup"] = hip_us / hip_bf16_us
     if fuse_rmsnorm:
         ret["hip_nofuse_us"] = hip_nofuse_us
         ret["TB/s"] = (
@@ -900,8 +898,9 @@ def test_mhc_post_pre(
     ret["hip_fused_err"] = hip_fused_err
 
     # bf16 compute path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn,
-    # then run the fused kernel with is_fn_pack_bf16=1 so it bit-extracts hi/lo. gfx950 native
-    # bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); other arches fall back to fp32.
+    # then run with is_fn_pack_bf16=1 so the gemm bit-extracts hi/lo. Exercised on BOTH the
+    # unfused and fused paths. gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED);
+    # other arches fall back to fp32.
     if fn_pack_bf16:
         from aiter.ops.mhc import mhc_pre_convert_fn
 
@@ -909,6 +908,36 @@ def test_mhc_post_pre(
             fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
         )
         mhc_pre_convert_fn(fn_packed, fn)
+
+        # unfused path (mhc_post + mhc_pre) with packed fn
+        (
+            post_mix_unfused_bf16,
+            comb_mix_unfused_bf16,
+            layer_input_unfused_bf16,
+            next_residual_unfused_bf16,
+        ), unfused_bf16_us = run_perftest(
+            mhc_post_pre_unfused_hip,
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn_packed,
+            hc_scale,
+            hc_base,
+            is_fn_pack_bf16=1,
+            **hip_kwargs,
+        )
+        ret["unfused_bf16_err"] = checkAllclose(
+            layer_input_ref, layer_input_unfused_bf16, msg="unfused/layer_input(bf16)"
+        )
+        checkAllclose(
+            next_residual_ref,
+            next_residual_unfused_bf16,
+            msg="unfused/next_residual(bf16)",
+        )
+        ret["unfused_bf16_us"] = unfused_bf16_us
+
+        # fused path with packed fn
         (
             post_mix_bf16,
             comb_mix_bf16,
@@ -934,8 +963,6 @@ def test_mhc_post_pre(
             next_residual_ref, next_residual_bf16, msg="fused/next_residual(bf16)"
         )
         ret["fused_bf16_us"] = fused_bf16_us
-        if fused_us and fused_bf16_us:
-            ret["bf16_speedup"] = fused_us / fused_bf16_us
     # print(f"next_residual_ref: {next_residual_ref}")
     # print(f"next_residual_fused: {next_residual_fused}")
 
@@ -1071,7 +1098,7 @@ parser.add_argument(
     "--fn_pack_bf16",
     action="store_true",
     help="Also run the bf16 (fn hi/lo pack) compute path (is_fn_pack_bf16=1) and add "
-    "hip_bf16_err/hip_bf16_us (mhc_pre) and fused_bf16_err/fused_bf16_us + bf16_speedup "
+    "hip_bf16_err/hip_bf16_us (mhc_pre) and unfused_bf16_*/fused_bf16_* "
     "(mhc_post_pre). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); "
     "other arches fall back to fp32.",
 )
