@@ -33,6 +33,8 @@ from .kernels.tensor_shim import _run_compiled, get_dtype_str
 __all__ = [
     "flydsl_hstu_attention_fwd",
     "flydsl_hstu_attention_bwd",
+    "flydsl_hstu_attention",
+    "FlydslHstuAttention",
 ]
 
 
@@ -779,4 +781,100 @@ def flydsl_hstu_attention_bwd(
             fx.Stream(launch_stream),
         )
     return dq, dk, dv
+
+
+class FlydslHstuAttention(torch.autograd.Function):
+    """Differentiable HSTU attention: FlyDSL forward + backward as one autograd op.
+
+    Mirrors the Triton `_AttentionFunction`. forward calls
+    `flydsl_hstu_attention_fwd`; backward calls `flydsl_hstu_attention_bwd` (which
+    launches the KV-owned dV/dK kernel and the Q-owned dQ kernel) and returns grads
+    for (q, k, v) only, with None for the non-tensor / non-differentiable args.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        N: int,
+        alpha: float,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        seq_offsets: torch.Tensor,
+        causal: bool,
+        num_targets: Optional[torch.Tensor],
+        max_attn_len: int,
+        contextual_seq_len: int,
+    ) -> torch.Tensor:
+        saved_tensors = [q, k, v, seq_offsets]
+        if num_targets is not None:
+            saved_tensors.append(num_targets)
+        ctx.save_for_backward(*saved_tensors)
+        ctx.N = N
+        ctx.alpha = alpha
+        ctx.causal = causal
+        ctx.has_targets = num_targets is not None
+        ctx.max_attn_len = max_attn_len
+        ctx.contextual_seq_len = contextual_seq_len
+        return flydsl_hstu_attention_fwd(
+            N,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            num_targets,
+            max_attn_len,
+            contextual_seq_len,
+        )
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        with torch.inference_mode():
+            q, k, v, seq_offsets = ctx.saved_tensors[:4]
+            num_targets = ctx.saved_tensors[4] if ctx.has_targets else None
+            dq, dk, dv = flydsl_hstu_attention_bwd(
+                ctx.N,
+                ctx.alpha,
+                q,
+                k,
+                v,
+                dout,
+                seq_offsets,
+                ctx.causal,
+                num_targets,
+                ctx.max_attn_len,
+                ctx.contextual_seq_len,
+            )
+        # Grad positions match forward args:
+        # (N, alpha, q, k, v, seq_offsets, causal, num_targets, max_attn_len, contextual_seq_len)
+        return None, None, dq, dk, dv, None, None, None, None, None
+
+
+def flydsl_hstu_attention(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    causal: bool,
+    num_targets: Optional[torch.Tensor] = None,
+    max_attn_len: int = 0,
+    contextual_seq_len: int = 0,
+) -> torch.Tensor:
+    """Drop-in differentiable HSTU attention (FlyDSL fwd + bwd via autograd)."""
+    return FlydslHstuAttention.apply(
+        N,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        causal,
+        num_targets,
+        max_attn_len,
+        contextual_seq_len,
+    )
 

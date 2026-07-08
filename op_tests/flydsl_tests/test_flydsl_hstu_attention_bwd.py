@@ -14,6 +14,7 @@ import torch
 import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
 from aiter.ops.flydsl.hstu_attention_kernels import (
     flydsl_hstu_attention_bwd,
+    flydsl_hstu_attention,
     _validate_bwd_inputs,
 )
 
@@ -437,3 +438,58 @@ def test_bwd_tuned_csv_best_duration_wins(tmp_path):
 
     (config,) = config_map.values()
     assert config["block_m"] == 256
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end autograd integration
+# --------------------------------------------------------------------------- #
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "max_attn_len,contextual_seq_len,target_size",
+    [
+        (0, 0, 0),    # dense causal
+        (0, 0, 20),   # targets
+        (64, 0, 0),   # window
+    ],
+)
+def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_size, dtype):
+    """FlydslHstuAttention.apply is drop-in differentiable: .grad after .backward()
+    matches torch.autograd.grad on the torch reference."""
+    batch, heads, attn_dim, hidden_dim, max_seq_len = 32, 4, 128, 128, 512
+    alpha = 1.0 / attn_dim * 10000
+
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=batch,
+        max_seq_len=max_seq_len,
+        sparsity=0.5,
+        heads=heads,
+        attn_dim=attn_dim,
+        hidden_dim=hidden_dim,
+        target_size=target_size,
+        dtype=dtype,
+        device=torch.device("cuda"),
+    )
+    dout = torch.randn_like(v)
+
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len, dout,
+    )
+
+    qd = q.detach().clone().requires_grad_(True)
+    kd = k.detach().clone().requires_grad_(True)
+    vd = v.detach().clone().requires_grad_(True)
+
+    out = flydsl_hstu_attention(
+        max_seq_len, alpha, qd, kd, vd, seq_offsets, True, num_targets,
+        max_attn_len, contextual_seq_len,
+    )
+    assert out.requires_grad
+    out.backward(dout)
+
+    torch.testing.assert_close(vd.grad.float(), dv_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(kd.grad.float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(qd.grad.float(), dq_ref, atol=3e-2, rtol=3e-2)
