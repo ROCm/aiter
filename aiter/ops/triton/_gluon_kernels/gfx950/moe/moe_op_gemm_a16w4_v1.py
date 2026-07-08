@@ -211,35 +211,28 @@ def _moe_gemm_a16w4(
 
     # size_per_thread[K]=8 keeps the bf16 transfer at 128 bits, satisfying the
     # buffer_load_to_shared requirement (size_per_thread * element_bits in {32, 128}).
+    '''
     GLOBAL_X_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[16, 4],
         warps_per_cta=[num_warps, 1],
         order=[1, 0]
     )
+    '''
     
-    GLOBAL_W_LAYOUT: gl.constexpr = gl.BlockedLayout(
+    REG_W_PACKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 4],
         threads_per_warp=[16, 4],
         warps_per_cta=[num_warps, 1],
         order=[1, 0]
     )
-    GLOBAL_WS_LAYOUT: gl.constexpr = gl.BlockedLayout(
+    REG_W_UNPACKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[16, 4],
         warps_per_cta=[num_warps, 1],
         order=[1, 0]
     )
-    # Offsets layout for the scale's buffer_load_to_shared. The HW requires
-    # size_per_thread * element_bits in {32, 128}; the e8m0 scales are uint8, so
-    # size_per_thread[K]=4 -> 32 bits. (GLOBAL_WS_LAYOUT's [1,8] would be 64 bits
-    # and fails to lower.) The consume layout from shared stays GLOBAL_WS_LAYOUT.
-    GLOBAL_WS_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 4],
-        threads_per_warp=[1, 64],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0]
-    )
+
     W_K_DIVISOR: gl.constexpr = 2  # fp4: two values packed per uint8 along K
     W_N_DIVISOR: gl.constexpr = 1
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
@@ -258,6 +251,16 @@ def _moe_gemm_a16w4(
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
+    # Offsets layout for the scale's buffer_load_to_shared. The HW requires
+    # size_per_thread * element_bits in {32, 128}; the e8m0 scales are uint8, so
+    # size_per_thread[K]=4 -> 32 bits. (GLOBAL_WS_LAYOUT's [1,8] would be 64 bits
+    # and fails to lower.) The consume layout from shared stays GLOBAL_WS_LAYOUT.
+    LOAD_LAYOUT_WS: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0]
+    )
 
     MFMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
@@ -275,7 +278,7 @@ def _moe_gemm_a16w4(
     if GatherIndx is None:
         X_base += start_m * stride_x_m
         offs_x_m_l = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_X))) % M
-        offs_x_m_g = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, GLOBAL_X_LAYOUT))) % M
+        #offs_x_m_g = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, GLOBAL_X_LAYOUT))) % M
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
@@ -297,11 +300,11 @@ def _moe_gemm_a16w4(
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, 0)
         offs_x_m_l = gl.convert_layout(offs_x_m, gl.SliceLayout(1, LOAD_LAYOUT_X))
-        offs_x_m_g = gl.convert_layout(offs_x_m, gl.SliceLayout(1, GLOBAL_X_LAYOUT))
+        #offs_x_m_g = gl.convert_layout(offs_x_m, gl.SliceLayout(1, GLOBAL_X_LAYOUT))
     offs_x_k_l = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_LAYOUT_X))
-    offs_x_k_g = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, GLOBAL_X_LAYOUT))
     x_offsets = offs_x_m_l[:, None]*stride_x_m + offs_x_k_l[None, :]*stride_x_k
-    x_offsets_g = offs_x_m_g[:, None]*stride_x_m + offs_x_k_g[None, :]*stride_x_k
+    #offs_x_k_g = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, GLOBAL_X_LAYOUT))
+    #x_offsets_g = offs_x_m_g[:, None]*stride_x_m + offs_x_k_g[None, :]*stride_x_k
 
     #W pointers
     W_base = W + expt_id * stride_w_e
@@ -310,9 +313,9 @@ def _moe_gemm_a16w4(
     offs_w_n = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(1, LOAD_LAYOUT_W))) % (N // W_N_DIVISOR)
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(0, LOAD_LAYOUT_W))
     w_offsets = offs_w_k[None, :] * stride_w_k + offs_w_n[:, None] * stride_w_n
-    offs_w_n_g = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(1, GLOBAL_W_LAYOUT))) % (N // W_N_DIVISOR)
-    offs_w_k_g = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(0, GLOBAL_W_LAYOUT))
-    w_offsets_g = offs_w_k_g[None, :] * stride_w_k + offs_w_n_g[:, None] * stride_w_n
+    #offs_w_n_g = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(1, GLOBAL_W_LAYOUT))) % (N // W_N_DIVISOR)
+    #offs_w_k_g = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(0, GLOBAL_W_LAYOUT))
+    #w_offsets_g = offs_w_k_g[None, :] * stride_w_k + offs_w_n_g[:, None] * stride_w_n
 
     #W scale pointers
     WMxScale_base = WMxScale + expt_id * stride_w_mx_e
@@ -326,12 +329,12 @@ def _moe_gemm_a16w4(
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
-    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, GLOBAL_WS_LOAD_LAYOUT))) % N
-    offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, GLOBAL_WS_LOAD_LAYOUT))
-    offs_w_n_scale_g = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, GLOBAL_WS_LAYOUT))) % N
-    offs_w_k_scale_g = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, GLOBAL_WS_LAYOUT))
+    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))) % N
+    offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, LOAD_LAYOUT_WS))
     w_scale_offsets = offs_w_k_scale[None, :] * stride_w_mx_k + offs_w_n_scale[:, None] * stride_w_mx_n 
-    w_scale_offsets_g = offs_w_k_scale_g[None, :] * stride_w_mx_k + offs_w_n_scale_g[:, None] * stride_w_mx_n 
+    #offs_w_n_scale_g = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, GLOBAL_WS_LAYOUT))) % N
+    #offs_w_k_scale_g = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, GLOBAL_WS_LAYOUT))
+    #w_scale_offsets_g = offs_w_k_scale_g[None, :] * stride_w_mx_k + offs_w_n_scale_g[:, None] * stride_w_mx_n 
 
     x_buffer = gl.allocate_shared_memory(
         X.dtype.element_ty, shape= [BLOCK_M, BLOCK_K], layout=SHARED_LAYOUT_X
@@ -362,20 +365,20 @@ def _moe_gemm_a16w4(
         gl.amd.cdna4.async_copy.wait_group(0)
 
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
-            w_scales = ws_buffer.load(GLOBAL_WS_LAYOUT)
+            w_scales = ws_buffer.load(REG_W_UNPACKED_LAYOUT)
             w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
         else:
-            w_scales = gl.load(WMxScale_base + w_scale_offsets_g)
+            w_scales = gl.load(WMxScale_base + w_scale_offsets)
         w_scales = (
             w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
             .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
             .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR))
         )
-        w_scales = gl.convert_layout(w_scales, GLOBAL_WS_LAYOUT)
+        w_scales = gl.convert_layout(w_scales, REG_W_UNPACKED_LAYOUT)
 
         # LDS -> registers
         x = x_buffer.load(DOT_LAYOUT_X)
-        w = w_buffer.load(GLOBAL_W_LAYOUT)
+        w = w_buffer.load(REG_W_PACKED_LAYOUT)
 
         #Scaled upcast to bf16
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1)
@@ -406,8 +409,8 @@ def _moe_gemm_a16w4(
             .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
             .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR))
         )
-        w_scales = gl.convert_layout(w_scales, GLOBAL_WS_LAYOUT)
-        w = gl.convert_layout(w,GLOBAL_W_LAYOUT)
+        w_scales = gl.convert_layout(w_scales, REG_W_UNPACKED_LAYOUT)
+        w = gl.convert_layout(w, REG_W_PACKED_LAYOUT)
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1)
         x = gl.convert_layout(x, DOT_LAYOUT_X)
         # (N, K) -> (K, N) for the MFMA B operand.
