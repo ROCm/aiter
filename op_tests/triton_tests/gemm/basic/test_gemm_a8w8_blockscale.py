@@ -55,7 +55,7 @@ def get_x_vals():
     # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
     # K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
     x_vals += [(512, 512, K) for K in (128, 192, 256, 320)]
-    x_vals += [(v, 8192, 1024) for v in (1, 64, 1024)]
+    x_vals = [(v, 8192, 1024) for v in (1, 64, 1024)]
     x_vals += [(v, 4096, 8192) for v in (1, 64, 1024)]
     x_vals += [(v, 4096, 4096) for v in (1, 64, 1024)]
     x_vals += [(v, 4096, 2048) for v in (1, 64, 1024)]
@@ -137,11 +137,18 @@ def generate_gemm_a8w8_blockscale_inputs(
 )
 @pytest.mark.parametrize("backend", ["gluon", "triton"])
 @pytest.mark.parametrize("shuffle", [True, False])
-def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
+@pytest.mark.parametrize("use_atomic_add", [True, False])
+def test_gemm(dtype, M, N, K, layout, output, backend, shuffle, use_atomic_add):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
     block_shape_n, block_shape_k = block_shape
+
+    if use_atomic_add:
+        # In-kernel split-K atomic-add accumulation is only implemented for the
+        # gluon preshuffle path on gfx1250 (it also needs a pre-zeroed `y`).
+        if not (backend == "gluon" and shuffle and DEVICE_ARCH == "gfx1250"):
+            pytest.skip("use_atomic_add requires the gluon preshuffle path on gfx1250.")
 
     if backend == "gluon":
         if shuffle:
@@ -176,6 +183,12 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
+    if use_atomic_add:
+        # Atomic-add accumulates in-place into the caller-provided buffer, so it
+        # must be a pre-zeroed accumulator whose dtype defines the accum precision.
+        # Use fp32 for the accumulator and downcast the result at compare time.
+        y = torch.zeros((M, N), dtype=torch.float32, device="cuda")
+
     if not shuffle and backend == "gluon" and DEVICE_ARCH == "gfx950":
         impl = gluon_gfx950_gemm_a8w8_blockscale
     else:
@@ -183,7 +196,7 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
             def impl(x, w, xs, ws, dt, y):
                 return gemm_a8w8_blockscale_preshuffle(
-                    x, w, xs, ws, dt, y, backend=backend
+                    x, w, xs, ws, dt, y, backend=backend, use_atomic_add=use_atomic_add
                 )
 
         else:
@@ -193,4 +206,4 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
-    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b.to(dtype), atol=0.01, rtol=1e-2)
