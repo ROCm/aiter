@@ -126,16 +126,15 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 
 def _parse_flydsl_kernel_name(kernel_name: str):
-    """Parse tile config from flydsl kernelName.
-    Returns ``(tile_m, tile_n, tile_k, async_copy, waves_per_eu, xcd_swizzle, lds_stage)``
-    or None on parse failure. The numeric suffix is ``...x{acp}x{wpe}[x{xcd}[x{lds}]]``;
-    the xcd token defaults to 0 and the lds_stage token defaults to 2 for legacy
-    names without them. 
+    """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
+    waves_per_eu, xcd_swizzle, lds_stage, scheduler)``, or None on failure.
+    Legacy names lacking the xcd/lds/scheduler tokens default them to
+    ``0``/``2``/``"Default"``.
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?=_|$)",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?$",
         kernel_name,
     )
     if m is None:
@@ -143,7 +142,8 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     tm, tn, tk, acp, wpe = (int(m.group(i)) for i in range(1, 6))
     xcd_swizzle = int(m.group(6)) if m.group(6) else 0
     lds_stage = int(m.group(7)) if m.group(7) else 2
-    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage)
+    scheduler = m.group(8) if m.group(8) else "Default"
+    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler)
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -168,7 +168,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage = parsed
+    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler = parsed
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -183,6 +183,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         wpe,
         xcd_swizzle,
         lds_stage=lds_stage,
+        enable_scheduler=str(scheduler).lower() != "off",
     )
     return Out
 

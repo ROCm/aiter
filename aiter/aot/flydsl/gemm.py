@@ -71,7 +71,7 @@ _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?_"
+    r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
     r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
 )
 _SHORT_DTYPE = {
@@ -120,6 +120,7 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
         "use_async_copy": int(m.group("async_copy")),
         "waves_per_eu": int(m.group("waves_per_eu")),
         "xcd_swizzle": int(m.group("xcd_swizzle")) if m.group("xcd_swizzle") else 0,
+        "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
     }
 
@@ -304,6 +305,7 @@ def _compile_preshuffle_to_cache(
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
+    lds_stage: int = 2,
     scheduler: str = "Default",
     **kwargs,
 ):
@@ -336,6 +338,7 @@ def _compile_preshuffle_to_cache(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         enable_scheduler=enable_scheduler,
         xcd_swizzle=xcd_swizzle,
+        lds_stage=lds_stage,
     )
     _compile_executable_to_cache(
         exe,

@@ -42,8 +42,8 @@ class kernelInstance:
     use_async_copy: int  # 0 or 1
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     xcd_swizzle: int  # 0=off, >0=group size for XCD remap
-    sScheduler: str  # "Default" (scheduler hints on) | "Off" (compiler default)
     lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
+    sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
 
     @property
     def enable_scheduler(self) -> bool:
@@ -86,11 +86,11 @@ def _ki(
     async_copy=0,
     waves_per_eu=0,
     xcd_swizzle=0,
-    scheduler="Default",
+    lds_stage=2,
     q_dtype_a="fp8",
     q_dtype_w="fp8",
     dtype="bf16",
-    lds_stage=2,
+    scheduler="Default",
 ):
     return kernelInstance(
         tile_m,
@@ -102,8 +102,8 @@ def _ki(
         async_copy,
         waves_per_eu,
         xcd_swizzle,
-        scheduler,
         lds_stage,
+        scheduler,
     )
 
 
@@ -278,20 +278,20 @@ kernels_list_950 = _build_kernels_list(
 # fmt: on
 
 default_kernels_dict_942 = {
-    (-1): _ki(128, 128, 128, 0, 2, scheduler="Default"),
-    (-2): _ki(16, 64, 512, 0, 2, scheduler="Default"),
-    (-3): _ki(32, 64, 512, 0, 2, scheduler="Default"),
-    (-4): _ki(64, 256, 64, 0, 2, scheduler="Default"),
-    (-5): _ki(128, 128, 64, 0, 2, scheduler="Default"),
-    (-6): _ki(128, 64, 128, 0, 2, scheduler="Default"),
-    (-7): _ki(64, 256, 128, 0, 2, scheduler="Default"),
+    (-1): _ki(128, 128, 128, 0, 2, 0, 2, scheduler="Default"),
+    (-2): _ki(16, 64, 512, 0, 2, 0, 2, scheduler="Default"),
+    (-3): _ki(32, 64, 512, 0, 2, 0, 2, scheduler="Default"),
+    (-4): _ki(64, 256, 64, 0, 2, 0, 2, scheduler="Default"),
+    (-5): _ki(128, 128, 64, 0, 2, 0, 2, scheduler="Default"),
+    (-6): _ki(128, 64, 128, 0, 2, 0, 2, scheduler="Default"),
+    (-7): _ki(64, 256, 128, 0, 2, 0, 2, scheduler="Default"),
 }
 
 default_kernels_dict_950 = {
-    (-1): _ki(128, 256, 256, 0, 2, scheduler="Default"),
-    (-2): _ki(16, 64, 512, 0, 2, scheduler="Default"),
-    (-3): _ki(32, 64, 512, 0, 2, scheduler="Default"),
-    (-4): _ki(128, 128, 128, 0, 2, scheduler="Default"),
+    (-1): _ki(128, 256, 256, 0, 2, 0, 2, scheduler="Default"),
+    (-2): _ki(16, 64, 512, 0, 2, 0, 2, scheduler="Default"),
+    (-3): _ki(32, 64, 512, 0, 2, 0, 2, scheduler="Default"),
+    (-4): _ki(128, 128, 128, 0, 2, 0, 2, scheduler="Default"),
 }
 
 arch = get_gfx()
