@@ -69,11 +69,14 @@ MASSIVE_THR = 4  # kMassiveThreshold
 GRP_M256 = int(os.environ.get("MLA_GRP_M256", "16"))
 GRP_M64 = int(os.environ.get("MLA_GRP_M64", "8"))
 
-# Runtime M64 sub-split (JOINT-SEARCH knob). When M64_HI_THR > 0, M64 tiles with
-# n_splits > M64_HI_THR use GRP=M64_HI_GRP (deeper pipeline, wins high-split
-# shapes b8_s32/s26/s13) while low-split tiles keep GRP_M64 (fewer wasted masked
-# lanes, holds b8_s6/s5). Device-side branch -> capture-safe. 0 disables.
-M64_HI_THR = int(os.environ.get("MLA_M64_HI_THR", "0"))
+# Runtime M64 sub-split (lv3 depth lever, default ON). When M64_HI_THR > 0, M64
+# tiles with n_splits > M64_HI_THR take a DEEPER accumulate pipeline
+# (GRP=M64_HI_GRP, more os buffer_loads in flight -> higher vmcnt overlap) while
+# low-split tiles keep GRP_M64 (fewer wasted masked lanes). Device-side branch
+# -> capture-safe. Baked to thr=8/grp=16: measured -5% b8_s32 graph (5.9->5.6us,
+# 0.97->0.92x HIP) and -0.2us b8_s26/s13, with b8_s6/s5 (<=8 splits, keep GRP=8)
+# and the SIMPLE tail unchanged. 0 disables (falls back to a single GRP_M64).
+M64_HI_THR = int(os.environ.get("MLA_M64_HI_THR", "8"))
 M64_HI_GRP = int(os.environ.get("MLA_M64_HI_GRP", "16"))
 # Persistent-launch grid = num_cu * PS_GRID_MULT. HIP uses num_cu*kOccupancy*2
 # (=16 here), but the FlyDSL Tier.ALL kernel runs at occupancy 1 wave/SIMD
