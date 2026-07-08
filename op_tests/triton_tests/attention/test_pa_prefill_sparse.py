@@ -225,7 +225,7 @@ def test_pa_prefill_sparse_vs_reference(T, H, D, prefix_len, extend_len, sentine
         pytest.skip("CUDA required")
 
     if DEVICE_ARCH not in ("gfx1250",):
-        pytest.skip(f"pa_prefill_sparse requires gfx1250")
+        pytest.skip("pa_prefill_sparse requires gfx1250")
 
     total_pages = max(T * prefix_len, 1)
     total_ext = max(T * extend_len, 1)
@@ -288,7 +288,7 @@ def test_pa_prefill_sparse_prefix_only(T, H, D, prefix_len, extend_len):
         pytest.skip("CUDA required")
 
     if DEVICE_ARCH not in ("gfx1250",):
-        pytest.skip(f"pa_prefill_sparse requires gfx1250")
+        pytest.skip("pa_prefill_sparse requires gfx1250")
 
     total_pages = max(T * prefix_len, 1)
 
@@ -354,7 +354,7 @@ def test_pa_prefill_sparse_extend_only(T, H, D, prefix_len, extend_len):
         pytest.skip("CUDA required")
 
     if DEVICE_ARCH not in ("gfx1250",):
-        pytest.skip(f"pa_prefill_sparse requires gfx1250")
+        pytest.skip("pa_prefill_sparse requires gfx1250")
 
     total_ext = max(T * extend_len, 1)
 
