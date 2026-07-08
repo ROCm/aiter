@@ -97,6 +97,13 @@ def _deepgemm_num_1d_blocks_per_group(
 LDS_PAD_A_BYTES = 16
 LDS_PAD_D_BYTES = 16
 
+# Weight (B) TDM cache policy == triton's ".cg" (cache-global) modifier.
+# gfx1250 tensor_load_to_lds CPOL = (scope << 3) | th, with th[2:0] and
+# scope[4:3] (see LLVM AMDGPU CPol). ".cg" = bypass the near cache (L1/L0),
+# cache normally in the far cache (L2) -> th = NT_RT (4); scope = CU (0).
+# Override the raw CPOL immediate via AITER_MXSCALE_TDM_CG_CACHE_POLICY.
+TDM_CG_CACHE_POLICY = int(os.environ.get("AITER_MXSCALE_TDM_CG_CACHE_POLICY", "4"))
+
 
 def compile_mxscale_gemm(
     *,
@@ -799,7 +806,7 @@ def compile_mxscale_gemm(
 
             def make_desc_b(memref, k_base, n_offset=0):
                 k_packed_off = k_base // arith.index(PACK_FACTOR_B)
-                return tdm_ops.make_tensor_descriptor_2d(
+                _d = tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_b,
                     lds_memref=memref,
                     global_offset=(
@@ -817,6 +824,36 @@ def compile_mxscale_gemm(
                     workgroup_mask=b_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
                 )
+                _d.cache_policy = TDM_CG_CACHE_POLICY  # weight -> .cg
+                return _d
+
+            def weight_desc(dg0, dg1):
+                """Weight (B) load descriptor tagged with the .cg cache policy.
+
+                The steady-state / prologue reconstruct B descriptors inline from
+                precomputed dgroups (bypassing make_desc_b), so tag them here too.
+                """
+                _d = tdm_ops.TDMDescriptor2D(dg0, dg1)
+                _d.cache_policy = TDM_CG_CACHE_POLICY
+                return _d
+
+            def wst_active_load(dg0, dg1):
+                """WST single-descriptor TDM load; weight-loader wave uses .cg.
+
+                In wave-specialized mode one instruction serves all loader waves
+                via a per-wave-selected descriptor, but CPOL is a compile-time
+                immediate -- so a uniform (scalar) branch on the weight-loader
+                wave predicate gives the weight load .cg while the other tensors
+                (A / scales) keep the default policy.
+                """
+                desc = tdm_ops.TDMDescriptor2D(dg0, dg1)
+                _if = scf.IfOp(tdm_wave_is_b, results_=[], has_else=True)
+                with ir.InsertionPoint(_if.then_block):
+                    tdm_ops.tensor_load_2d(desc, cache_policy=TDM_CG_CACHE_POLICY)
+                    scf.YieldOp([])
+                with ir.InsertionPoint(_if.else_block):
+                    tdm_ops.tensor_load_2d(desc, cache_policy=0)
+                    scf.YieldOp([])
 
             def make_desc_as(memref, k_base):
                 k_scale_off = k_base // arith.index(SCALE_BLOCK)
@@ -2461,7 +2498,7 @@ def compile_mxscale_gemm(
                             active_addr_hi,
                         ],
                     )
-                    tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, active_dgroup1))
+                    wst_active_load(dg0, active_dgroup1)
                     active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
             else:
                 for i in range_constexpr(pre_loaded):
@@ -2503,7 +2540,7 @@ def compile_mxscale_gemm(
 
                     _prologue_descs = [
                         tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
-                        tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
+                        weight_desc(dg0_b, dgroup1_b),
                     ]
                     if const_expr(not tdm_as_in_prologue):
                         _prologue_descs.append(
@@ -2516,7 +2553,8 @@ def compile_mxscale_gemm(
                     )
                     if const_expr(stage1_dual_b):
                         tdm_ops.tensor_load_2d(
-                            tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up)
+                            tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up),
+                            cache_policy=TDM_CG_CACHE_POLICY,
                         )
                         tdm_ops.tensor_load_2d(
                             tdm_ops.TDMDescriptor2D(dg0_bs_up, dgroup1_bs_up)
@@ -2588,9 +2626,7 @@ def compile_mxscale_gemm(
                                         active_addr_hi,
                                     ],
                                 )
-                                tdm_ops.tensor_load_2d(
-                                    tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
-                                )
+                                wst_active_load(dg0, active_dgroup1)
                                 _ab[0] = arith.addi(_ab[0], active_adv_i32)
 
                             # L2 prefetch stays a mid-compute callback so it issues
@@ -2790,7 +2826,7 @@ def compile_mxscale_gemm(
                                     )
                                 _loop_descs = [
                                     tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
-                                    tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
+                                    weight_desc(dg0_b, dgroup1_b),
                                 ]
                                 if const_expr(not tdm_as_in_prologue):
                                     _loop_descs.append(
@@ -2805,7 +2841,8 @@ def compile_mxscale_gemm(
                                 )
                                 if const_expr(stage1_dual_b):
                                     tdm_ops.tensor_load_2d(
-                                        tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up)
+                                        tdm_ops.TDMDescriptor2D(dg0_b_up, dgroup1_b_up),
+                                        cache_policy=TDM_CG_CACHE_POLICY,
                                     )
                                     tdm_ops.tensor_load_2d(
                                         tdm_ops.TDMDescriptor2D(
@@ -3040,9 +3077,7 @@ def compile_mxscale_gemm(
                                         active_addr_hi,
                                     ],
                                 )
-                                tdm_ops.tensor_load_2d(
-                                    tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
-                                )
+                                wst_active_load(dg0, active_dgroup1)
                                 _ab[0] = arith.addi(_ab[0], active_adv_i32)
 
                             _tail_mid_cb = _tail_mid_ws
@@ -3095,7 +3130,9 @@ def compile_mxscale_gemm(
                                     wave_specialized=wave_specialized_tdm,
                                 )
                                 if const_expr(stage1_dual_b):
-                                    tdm_ops.tensor_load_2d(_desc_b_up)
+                                    tdm_ops.tensor_load_2d(
+                                        _desc_b_up, cache_policy=TDM_CG_CACHE_POLICY
+                                    )
                                     tdm_ops.tensor_load_2d(_desc_bs_up)
 
                             _tail_mid_cb = _tail_mid_nws
