@@ -296,6 +296,36 @@ bool test_packed_vector() {
     return true;
 }
 
+// Generic packing check for any sub-byte pack type (int4_t / uint4_t): full 4-bit range
+// round-trip through the array proxy, packed size + nibble layout, and packed vector.
+template <typename Pack>
+static bool check_pack(const char* name) {
+    // full 0..15 range round-trip in a 16-element packed array (16 * 4 / 8 = 8 bytes)
+    opus::array<Pack, 16> a;
+    for (int i = 0; i < 16; ++i) { Pack x; x.value = (unsigned char)i; a[i] = x; }
+    TEST_ASSERT_EQ((int)sizeof(a), 8, name);
+    for (int i = 0; i < 16; ++i) { Pack x = a[i]; TEST_ASSERT_EQ((int)(unsigned)x.value, i, name); }
+    // nibble layout: element i in byte i/2, low nibble first
+    unsigned char raw[8]; __builtin_memcpy(raw, &a, 8);
+    TEST_ASSERT_EQ((int)raw[0], 0x10, name);
+    TEST_ASSERT_EQ((int)raw[7], 0xFE, name);
+    // packed vector round-trip
+    opus::vector_t<Pack, 8> v;
+    for (int i = 0; i < 8; ++i) { Pack x; x.value = (unsigned char)(7 - i); v[i] = x; }
+    for (int i = 0; i < 8; ++i) { Pack x = v[i]; TEST_ASSERT_EQ((int)(unsigned)x.value, 7 - i, name); }
+    return true;
+}
+
+bool test_pack_int4_uint4() {
+    static_assert(opus::sizeof_bits<opus::int4_t>::value == 4, "sizeof_bits<int4_t>");
+    static_assert(opus::sizeof_bits<opus::uint4_t>::value == 4, "sizeof_bits<uint4_t>");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::int4_t, 16>), 8, "array<int4_t,16> bytes");
+    TEST_ASSERT_EQ((int)sizeof(opus::array<opus::uint4_t, 16>), 8, "array<uint4_t,16> bytes");
+    if (!check_pack<opus::int4_t>("int4_t pack")) return false;
+    if (!check_pack<opus::uint4_t>("uint4_t pack")) return false;
+    return true;
+}
+
 // =============================================================================
 // Tuple Tests
 // =============================================================================
@@ -498,6 +528,7 @@ int main() {
     RUN_TEST(test_packed_array_layout);
     RUN_TEST(test_packed_array_make_concat);
     RUN_TEST(test_packed_vector);
+    RUN_TEST(test_pack_int4_uint4);
 
     std::cout << std::endl << "--- Tuple Tests ---" << std::endl;
     RUN_TEST(test_tuple_basic);
