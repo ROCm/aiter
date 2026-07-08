@@ -1335,6 +1335,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
             offsets=c_offsets,
             value=acc.to(c_ptr.type.element_ty),
             mask=c_mask,
+            sem="relaxed",
         )
     else:
         # Store — offset c_ptr by pid_k * stride_ck for split-K
