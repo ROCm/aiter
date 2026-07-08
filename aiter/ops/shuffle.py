@@ -339,6 +339,16 @@ def shuffle_scale(
 
     n_experts, k_ = src.shape
     n_ = n_experts // experts_cnt
+    # Mirror non-GUI e8m0_shuffle: pad K//32 to a multiple of 8 (K aligned to
+    # 256) so the GUI reshape matches mixed_moe_gemm_2stage scale layout (#3476).
+    k_padded = (k_ + 7) // 8 * 8
+    if k_padded != k_:
+        scale_padded = torch.zeros(
+            n_experts, k_padded, dtype=src.dtype, device=src.device
+        )
+        scale_padded[:, :k_] = src
+        src = scale_padded
+        k_ = k_padded
     # MXFP4 constants
     K_Pack = 2
     N_Pack = 2

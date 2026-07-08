@@ -46,6 +46,29 @@ def flydsl_kernel_name(
     return name
 
 
+def pick_flydsl_stage2_tile_k(inter_dim: int) -> int:
+    """Heuristic stage2 K-tile size for FlyDSL mxfp4/mxfp8 MoE.
+
+    ``inter_dim % 256 != 0`` (e.g. DSV4 TP8 ``inter=640``) must use
+    ``tile_k=128``; ``tile_k=256`` only tiles cleanly when K is 256-aligned.
+    Matches ``fused_moe.get_2stage_cfgs`` FlyDSL fallback (``_s2_tk``).
+    """
+    inter_dim = int(inter_dim)
+    return 256 if (inter_dim % 256 == 0) else 128
+
+
+def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
+    """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value."""
+    inter_dim = int(inter_dim)
+    tile_k = int(tile_k)
+    if inter_dim % tile_k == 0:
+        return tile_k
+    auto = pick_flydsl_stage2_tile_k(inter_dim)
+    if inter_dim % auto == 0:
+        return auto
+    return tile_k
+
+
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     """Lookup kernel params by name.
 
@@ -1541,6 +1564,8 @@ def flydsl_moe_stage2(
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
+
+    tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
