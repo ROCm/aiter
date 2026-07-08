@@ -172,7 +172,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # EXPERIMENT toggle: v_new output store. True = stage to lds_vn [BT,V] then
     # coalesced b128 read-out (independent buffer, ~8.5KB, keeps 3 waves);
     # False = original 16 scalar buffer_store_short straight to HBM.
-    USE_LDS_VN_STORE = False
+    USE_LDS_VN_STORE = True
 
     # EXPERIMENT toggle (OPT-C(g), rev219+): stage the chunk's 64 per-row g into
     # lds_g (one coalesced load/thread, +256 B LDS) and read g from LDS in
@@ -294,14 +294,13 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     #   - False (aliased):     LDS 52992 B/wg -> 3 waves/SIMD, FlyDSL_kvn ~495 us.
     # The independent layout is a ~38us (+~8%) REGRESSION (occupancy 3->2); set
     # to True here for direct re-measurement / A/B comparison.
-    LDS_HT_INDEPENDENT = True
+    LDS_HT_INDEPENDENT = False
     assert (LDS_HT_INDEPENDENT or LDS_HT_ELEMS <= LDS_K_ELEMS), \
         "aliased lds_ht must fit inside lds_k"
     assert (not W_PF_INTERLEAVE_GEMM1 or W_PF_INTERLEAVE), \
         "W_PF_INTERLEAVE_GEMM1 requires W_PF_INTERLEAVE"
     assert (not HT_STORE_OVERLAP_GEMM2 or LDS_HT_INDEPENDENT), \
         "HT_STORE_OVERLAP_GEMM2 requires LDS_HT_INDEPENDENT (lds_ht must survive step1->preGEMM2 unaliased)"
-
     # EXPERIMENT (vn-b128): transpose buffer for the v_new OUTPUT store. v_new is
     # [B,H,T,V] (V innermost); the MFMA-C layout makes a lane's 4 elems stride
     # along BT (by V) -> 16 scalar buffer_store_short. Stage vn into lds_vn
@@ -314,6 +313,8 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     LDS_VN_STRIDE = BV + LDS_VN_PAD  # [BT, BV] : V innermost
     LDS_VN_ELEMS = BT * LDS_VN_STRIDE
     LDS_VN_BYTES = LDS_VN_ELEMS * 2
+    assert (not USE_LDS_VN_STORE or LDS_VN_BYTES <= LDS_W_BYTES), \
+        f"aliased lds_vn ({LDS_VN_BYTES} B) must fit inside lds_w ({LDS_W_BYTES} B)"
 
     # EXPERIMENT (u-prefetch): stage u cooperatively into lds_u [BT, BV] so the
     # per-lane v_new reads come from LDS instead of 16 scalar buffer_load_ushort
@@ -355,10 +356,12 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     lds_u_offset = allocator._align(allocator.ptr, 16)
     if USE_LDS_U:
         allocator.ptr = lds_u_offset + LDS_U_BYTES  # only reserve when used
-    # vn-b128: independent lds_vn (margin is enough, no aliasing needed).
-    lds_vn_offset = allocator._align(allocator.ptr, 16)
-    if USE_LDS_VN_STORE:
-        allocator.ptr = lds_vn_offset + LDS_VN_BYTES  # only reserve when used
+    # vn-b128: lds_vn ALIASES lds_w (no extra LDS, 3 waves preserved).
+    # lds_w is dead after GEMM1 (step 4); lds_vn is used in step 5b (after
+    # GEMM1). A WAR barrier before the stage write guards the cross-wave
+    # hazard (wave A writing lds_vn=lds_w while wave B still in GEMM1).
+    # LDS_VN_BYTES (8704) < LDS_W_BYTES (16896), so it fits.
+    lds_vn_offset = lds_w_offset  # alias into lds_w's space
     # OPT-C(g): tiny per-chunk g staging buffer (256 B), independent.
     lds_g_offset = allocator._align(allocator.ptr, 16)
     if USE_LDS_G:
@@ -931,6 +934,9 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
             #       v_new is token-indexed so guard each row with abs_row<T_local.
             # ============================================================
             if const_expr(SAVE_NEW_VALUE and USE_LDS_VN_STORE):
+                # WAR barrier: lds_vn aliases lds_w; ensure all waves finished
+                # reading lds_w in GEMM1 (step 4) before any wave overwrites it.
+                gpu.barrier()
                 vn_stage_col = wid * fx.Int32(16) + lane_n
                 for m_bt in range_constexpr(BT_MTILES):
                     vn_val = vn_frags[m_bt]
