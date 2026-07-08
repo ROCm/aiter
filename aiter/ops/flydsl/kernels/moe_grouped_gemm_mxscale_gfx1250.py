@@ -63,6 +63,8 @@ class _GroupedA8W4Config:
     tdm_as_in_prologue: bool = False
     grouped_persistent_m: bool = True
     grouped_contiguous_m: bool = False
+    grouped_gather_m: bool = False
+    grouped_gather_scale: bool = False
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
@@ -297,7 +299,15 @@ def _check_stage1_args(
             raise ValueError(
                 f"y must be flat (1, m, {cfg.inter_dim}), got {tuple(y.shape)}"
             )
-        if (
+        if cfg.grouped_gather_m:
+            # Gather MoE: x is the *token-order* activation buffer; its row
+            # count (num_tokens) is independent of the grouped output rows.
+            if x.shape[0] != 1 or x.shape[2] != cfg.model_dim // pack_a:
+                raise ValueError(
+                    f"gather x must be flat (1, num_tokens, "
+                    f"{cfg.model_dim // pack_a}), got {tuple(x.shape)}"
+                )
+        elif (
             x.shape[0] != 1
             or x.shape[1] != y.shape[1]
             or x.shape[2] != cfg.model_dim // pack_a
@@ -310,7 +320,14 @@ def _check_stage1_args(
             raise ValueError(
                 f"y shape must be {(cfg.experts, cfg.max_m, cfg.inter_dim)}, got {tuple(y.shape)}"
             )
-        if tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim // pack_a):
+        if cfg.grouped_gather_m:
+            # Gather MoE keeps A in token order regardless of M scheduler.
+            if x.shape[0] != 1 or x.shape[2] != cfg.model_dim // pack_a:
+                raise ValueError(
+                    f"gather x must be flat (1, num_tokens, "
+                    f"{cfg.model_dim // pack_a}), got {tuple(x.shape)}"
+                )
+        elif tuple(x.shape) != (cfg.experts, cfg.max_m, cfg.model_dim // pack_a):
             raise ValueError(
                 f"x shape must be {(cfg.experts, cfg.max_m, cfg.model_dim // pack_a)}, got {tuple(x.shape)}"
             )
@@ -319,16 +336,38 @@ def _check_stage1_args(
             f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
-    scale_x_shape = preshuffled_scale_shape(
-        scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
-    )
     scale_w_shape = preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
-    expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
-    if tuple(scale_x.shape) != expected_scale_x:
-        raise ValueError(
-            f"scale_x shape must be {expected_scale_x}, got {tuple(scale_x.shape)}"
+    if cfg.grouped_gather_scale:
+        # In-kernel A-scale gather: the scale is the *token-order*, row-major
+        # (un-preshuffled) e8m0 scale, sized by the token-order activation rows.
+        # The kernel gathers it exactly like the A payload.
+        num_tokens_scale = int(x.shape[1])
+        expected_scale_x = (1, num_tokens_scale, cfg.model_dim // 32)
+        if tuple(scale_x.shape) != expected_scale_x:
+            raise ValueError(
+                f"grouped_gather_scale scale_x must be token-order "
+                f"{expected_scale_x}, got {tuple(scale_x.shape)}"
+            )
+    else:
+        if cfg.grouped_gather_m:
+            # Scale stays in grouped layout (host scatter+preshuffle), so it is
+            # sized by grouped output rows, not by token-order x.
+            scale_x_rows = int(y.shape[1])
+        elif cfg.grouped_contiguous_m:
+            scale_x_rows = int(x.shape[1])
+        else:
+            scale_x_rows = cfg.max_m
+        scale_x_shape = preshuffled_scale_shape(
+            scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
         )
+        expected_scale_x = (
+            1 if cfg.grouped_contiguous_m else cfg.experts,
+            *scale_x_shape,
+        )
+        if tuple(scale_x.shape) != expected_scale_x:
+            raise ValueError(
+                f"scale_x shape must be {expected_scale_x}, got {tuple(scale_x.shape)}"
+            )
     if tuple(scale_w.shape) != (cfg.experts, *scale_w_shape):
         raise ValueError(
             f"scale_w shape must be {(cfg.experts, *scale_w_shape)}, got {tuple(scale_w.shape)}"
@@ -359,7 +398,19 @@ def _check_stage1_quant_args(
         )
     pack_a, pack_b = _pack_factors(cfg)
     # A / weight / input-scale checks mirror _check_stage1_args (output aside).
-    if cfg.grouped_contiguous_m:
+    if cfg.grouped_gather_m:
+        # Gather: x is the *token-order* activation (row count = num_tokens),
+        # so the grouped output rows come from the payload/output layout, not x
+        # (mirrors the launch's `contiguous_m = y.shape[1]` for gather).
+        if x.shape[0] != 1 or x.shape[2] != cfg.model_dim // pack_a:
+            raise ValueError(
+                f"gather x must be flat (1, num_tokens, "
+                f"{cfg.model_dim // pack_a}), got {tuple(x.shape)}"
+            )
+        m_rows = 1
+        for _d in payload.shape[:-1]:
+            m_rows *= int(_d)
+    elif cfg.grouped_contiguous_m:
         if (
             x.shape[0] != 1
             or x.shape[2] != cfg.model_dim // pack_a
@@ -1086,6 +1137,8 @@ def _compile_base_a8w4_gemm(
         grouped_masked_m=True,
         grouped_persistent_m=cfg.grouped_persistent_m,
         grouped_contiguous_m=cfg.grouped_contiguous_m,
+        grouped_gather_m=cfg.grouped_gather_m,
+        grouped_gather_scale=cfg.grouped_gather_scale,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
@@ -1122,6 +1175,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
     grouped_contiguous_m: bool = False,
+    grouped_gather_m: bool = False,
+    grouped_gather_scale: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
     stage1_weight_layout: str = "gguu",
@@ -1153,6 +1208,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),
+        grouped_gather_m=bool(grouped_gather_m),
+        grouped_gather_scale=bool(grouped_gather_scale),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
         act=str(act),
@@ -1290,6 +1347,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
+        _gather_index=None,
+        _num_tokens=None,
         _tmp=None,
         _skip_epilogue=False,
         bias=None,
@@ -1462,12 +1521,67 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             grouped_layout = _m_tile_map
             if grouped_layout is None:
                 grouped_layout = masked_m
-            contiguous_m = int(x.shape[1])
+            # Gather MoE reads A from token order, but C/scale/layout are sized
+            # by the grouped contiguous output rows.
+            contiguous_m = int(y.shape[1]) if cfg.grouped_gather_m else int(x.shape[1])
             m_tile_total = (contiguous_m + int(cfg.tile_m) - 1) // int(cfg.tile_m)
+            if cfg.grouped_gather_m:
+                # Gather MoE: A rows come from the token-order buffer via the
+                # gather index (contiguous grouped row -> source token, -1 pad).
+                if _gather_index is None:
+                    raise ValueError(
+                        "grouped_gather_m stage1 requires _gather_index "
+                        "(contiguous-row -> token map)"
+                    )
+                num_tokens = (
+                    int(_num_tokens)
+                    if _num_tokens is not None
+                    else int(_gather_index.numel())
+                )
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
-                if bias is not None:
+                if cfg.grouped_gather_m:
+                    if bias is not None:
+                        _run_compiled(
+                            fused_gemm,
+                            y,
+                            x,
+                            w,
+                            scale_x,
+                            scale_w,
+                            bias,
+                            masked_m,
+                            _unused_m_tile_prefix,
+                            grouped_layout,
+                            _gather_index,
+                            m_tile_total,
+                            contiguous_m,
+                            fused_n,
+                            _swiglu_lim_rt,
+                            num_tokens,
+                            stream,
+                        )
+                    else:
+                        _run_compiled(
+                            fused_gemm,
+                            y,
+                            x,
+                            w,
+                            scale_x,
+                            scale_w,
+                            masked_m,
+                            _unused_m_tile_prefix,
+                            grouped_layout,
+                            _gather_index,
+                            m_tile_total,
+                            contiguous_m,
+                            fused_n,
+                            _swiglu_lim_rt,
+                            num_tokens,
+                            stream,
+                        )
+                elif bias is not None:
                     _run_compiled(
                         fused_gemm,
                         y,
@@ -1502,6 +1616,25 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         _swiglu_lim_rt,
                         stream,
                     )
+            elif cfg.grouped_gather_m:
+                _run_compiled(
+                    _get_raw_base(),
+                    tmp,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    grouped_layout,
+                    _gather_index,
+                    m_tile_total,
+                    contiguous_m,
+                    2 * cfg.inter_dim,
+                    _swiglu_lim_rt,
+                    num_tokens,
+                    stream,
+                )
             else:
                 if bias is not None:
                     _run_compiled(
@@ -1544,10 +1677,61 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             # Dense mode: prefix/map unused, pass placeholders for ABI compat.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
+            if cfg.grouped_gather_m:
+                if _gather_index is None:
+                    raise ValueError(
+                        "grouped_gather_m stage1 requires _gather_index "
+                        "(grouped-row -> token map)"
+                    )
+                num_tokens = (
+                    int(_num_tokens)
+                    if _num_tokens is not None
+                    else int(_gather_index.numel())
+                )
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
-                if bias is not None:
+                if cfg.grouped_gather_m:
+                    if bias is not None:
+                        _run_compiled(
+                            fused_gemm,
+                            y,
+                            x,
+                            w,
+                            scale_x,
+                            scale_w,
+                            bias,
+                            masked_m,
+                            _unused_m_tile_prefix,
+                            _unused_m_tile_map,
+                            _gather_index,
+                            cfg.max_m,
+                            cfg.max_m,
+                            fused_n,
+                            _swiglu_lim_rt,
+                            num_tokens,
+                            stream,
+                        )
+                    else:
+                        _run_compiled(
+                            fused_gemm,
+                            y,
+                            x,
+                            w,
+                            scale_x,
+                            scale_w,
+                            masked_m,
+                            _unused_m_tile_prefix,
+                            _unused_m_tile_map,
+                            _gather_index,
+                            cfg.max_m,
+                            cfg.max_m,
+                            fused_n,
+                            _swiglu_lim_rt,
+                            num_tokens,
+                            stream,
+                        )
+                elif bias is not None:
                     _run_compiled(
                         fused_gemm,
                         y,
@@ -1582,6 +1766,25 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         _swiglu_lim_rt,
                         stream,
                     )
+            elif cfg.grouped_gather_m:
+                _run_compiled(
+                    _get_raw_base(),
+                    tmp,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    _unused_m_tile_map,
+                    _gather_index,
+                    cfg.max_m,
+                    cfg.max_m,
+                    2 * cfg.inter_dim,
+                    _swiglu_lim_rt,
+                    num_tokens,
+                    stream,
+                )
             else:
                 if bias is not None:
                     _run_compiled(

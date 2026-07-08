@@ -583,6 +583,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             f"token_num={token_num} > {_contig_token_threshold}; "
             "auto-enable contiguous M scheduler"
         )
+    # Gather MoE: stage1 reads its activations directly from the token-order
+    # buffer via TDM gather (grouped row -> source token) instead of physically
+    # route-copying them. This is orthogonal to the M scheduler; contiguous-M
+    # stays controlled by CSV/env/threshold above.
+    _want_gather_moe = os.environ.get("AITER_USE_GATHER_MOE", "0") in _TRUTHY_ENV
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
@@ -626,6 +631,33 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     route_E = E
     route_max_m = max_m
     effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
+
+    # Gather MoE is only wired for the fast (non-naive) grouped path. When active,
+    # stage1 reads A from the token-order buffer via TDM gather using
+    # ``rows_to_tokens`` (grouped row -> source token), so the physical payload
+    # route-copy is skipped. The scale still uses the scatter+preshuffle path.
+    use_gather_moe = bool(_want_gather_moe and not _use_naive)
+    if _want_gather_moe and not use_gather_moe:
+        logger.warning(
+            "[grouped_a8w4] AITER_USE_GATHER_MOE requested but unsupported in "
+            "this path (needs fast grouped scheduler); falling back to copy."
+        )
+    # In-kernel A-scale TDM gather (option 2, row-major reader): read the scale
+    # straight from the token-order buffer in the GEMM (like the A payload),
+    # dropping the host scatter+preshuffle. On by default whenever gather MoE is
+    # on; opt out with AITER_GATHER_MOE_SCALE=0. Requires the prologue-hoisted
+    # A-scale to be off (the gather threads As per-stage), so force it off here.
+    _want_gather_scale = (
+        os.environ.get("AITER_GATHER_MOE_SCALE", "1") in _TRUTHY_ENV
+    )
+    use_gather_scale = bool(use_gather_moe and _want_gather_scale)
+    if use_gather_scale:
+        tdm_as_in_prologue_req = False
+    if use_gather_moe and wave_specialized_tdm_req:
+        _grouped_dbg(
+            "gather MoE: wave_specialized_tdm is incompatible with gather; "
+            "forcing it off (--wst / CSV request ignored)"
+        )
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
@@ -702,7 +734,76 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 "fused grouped stage1 prep requires bf16 hidden_states "
                 f"(got {hidden_states.dtype}); set AITER_GROUPED_GEMM_NAIVE=1"
             )
-        if effective_grouped_contiguous_m:
+        if use_gather_moe:
+            # Gather MoE: keep A in token order (no physical payload scatter).
+            # Build the route maps to obtain ``rows_to_tokens`` (grouped row ->
+            # source token, -1 pad), quantize the activations in token order,
+            # and only gather+preshuffle the e8m0 scale into the WMMA layout.
+            # Works with both the (E, max_m) masked layout and the contiguous-M
+            # layout; the same ``rows_to_tokens`` drives the in-GEMM A gather and
+            # the host-side scale preshuffle.
+            _grouped_dbg("gather MoE: build route maps + token-order quant")
+            topids_to_rows, rows_to_tokens, masked_m = build_route_maps(
+                topk_ids, E, max_m
+            )
+            if effective_grouped_contiguous_m:
+                # Remap the (E, max_m) maps into the DeepGEMM contiguous layout;
+                # ``rows_to_tokens`` becomes (contiguous_m,) (contiguous row ->
+                # source token) and doubles as the gather index.
+                (
+                    topids_to_rows,
+                    rows_to_tokens,
+                    m_tile_map,
+                    contiguous_m,
+                ) = _make_contiguous_psum_layout(
+                    masked_m=masked_m,
+                    rows_to_tokens=rows_to_tokens,
+                    topids_to_rows=topids_to_rows,
+                    experts=E,
+                    max_m=max_m,
+                    tile_m=tile_m,
+                    token_num=token_num,
+                    topk=topk,
+                )
+                route_E = 1
+                route_max_m = int(contiguous_m)
+            else:
+                route_E = E
+                route_max_m = max_m
+            if data_format == "fp4":
+                from aiter.ops.quant import per_1x32_f4_quant_hip
+
+                a1_quant, a1_scale_token = per_1x32_f4_quant_hip(
+                    hidden_states, quant_dtype=dtypes.fp4x2, shuffle=False
+                )
+                a1_payload = a1_quant.view(torch.uint8).contiguous()
+                a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
+            else:
+                a1_payload, a1_scale_token_u8 = _quantize_mxfp8_payload(
+                    hidden_states, model_dim
+                )
+            # Gather MoE reads A from token order, so the grouped payload buffer
+            # is never written/read -- skip the allocation.
+            grouped_a1 = None
+            if use_gather_scale:
+                # In-kernel scale gather (option 2): pass the token-order,
+                # row-major e8m0 scale straight through (1, num_tokens, K_scale);
+                # the GEMM gathers + reads it row-major. No host preshuffle.
+                grouped_a1_scale = a1_scale_token_u8.reshape(
+                    1, int(token_num), model_dim // 32
+                ).contiguous()
+                _grouped_dbg("gather MoE: in-kernel scale gather (no preshuffle)")
+            else:
+                grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
+                    a1_scale_token_u8,
+                    rows_to_tokens,
+                    route_E,
+                    route_max_m,
+                    wmma_rep=warp_tile_m // 16,
+                    scale_k_per_tile=tile_k // 32,
+                )
+                _grouped_dbg("gather MoE: scale preshuffle done")
+        elif effective_grouped_contiguous_m:
             from aiter.ops.flydsl.moe_kernels import (
                 flydsl_moe_fused_quant_preshuffle,
                 flydsl_moe_topids_to_rows,
@@ -851,6 +952,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
+        grouped_gather_m=use_gather_moe,
+        grouped_gather_scale=use_gather_scale,
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
@@ -858,6 +961,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             stage1_weight_layout == "gugu"
             and (m_warp * n_warp) == 4
             and wave_specialized_tdm_req
+            # Gather MoE routes the TDM waves through per-row gather descriptors,
+            # which is incompatible with wave-specialized TDM (one tensor per
+            # loader wave). Force it off when gathering.
+            and not use_gather_moe
         ),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
         **(
@@ -872,9 +979,19 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg(f"[crash-probe] before stage1 tokens={token_num} max_m={max_m} E={E}")
     _stage1_y = grouped_a2_payload if _fuse_gemm1_quant else grouped_a2
     _stage1_qscale = grouped_a2_scale if _fuse_gemm1_quant else None
+    if use_gather_moe:
+        # A is the token-order activation buffer; the kernel gathers the rows it
+        # needs via ``rows_to_tokens`` (grouped row -> source token, -1 pad).
+        _stage1_a = a1_payload.view(1, int(token_num), -1)
+        _gather_idx_arg = rows_to_tokens
+        _num_tokens_arg = int(token_num)
+    else:
+        _stage1_a = grouped_a1
+        _gather_idx_arg = None
+        _num_tokens_arg = None
     stage1(
         _stage1_y,
-        grouped_a1,
+        _stage1_a,
         grouped_w1,
         grouped_a1_scale,
         grouped_w1_scale,
@@ -887,6 +1004,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         swiglu_limit=swiglu_limit,
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
+        _gather_index=_gather_idx_arg,
+        _num_tokens=_num_tokens_arg,
         bias=_bias1_arg,
         _quant_scale=_stage1_qscale,
     )
@@ -897,7 +1016,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 functools.partial(
                     stage1,
                     _stage1_y,
-                    grouped_a1,
+                    _stage1_a,
                     grouped_w1,
                     grouped_a1_scale,
                     grouped_w1_scale,
@@ -910,6 +1029,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                     swiglu_limit=swiglu_limit,
                     _m_tile_prefix=m_tile_prefix,
                     _m_tile_map=m_tile_map,
+                    _gather_index=_gather_idx_arg,
+                    _num_tokens=_num_tokens_arg,
                     bias=_bias1_arg,
                     _quant_scale=_stage1_qscale,
                 ),
