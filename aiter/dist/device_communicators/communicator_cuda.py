@@ -379,8 +379,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
             )
-        if emit_bf16:
-            raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
+        # emit_bf16 additionally returns the pre-quantization bf16/fp16 normed
+        # output alongside the per-token FP8 result. Used by v32 DSA models
+        # (e.g. GLM-5.2) whose indexer GEMMs run in bf16 while attention QKV
+        # keeps per-token FP8.
+        bf16_out = None
         hidden_dim = int(input_.shape[-1])
         element_size = input_.element_size()
         total_bytes = input_.numel() * element_size
@@ -411,14 +414,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= total_bytes_limit)
             )
-            out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
+            result = self.ca_comm.custom_fused_ar_rms_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 use_1stage,
                 gemma_norm=gemma_norm,
+                emit_bf16=emit_bf16,
             )
+            if emit_bf16:
+                out, res_out, scale_out, bf16_out = result
+            else:
+                out, res_out, scale_out = result
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_,
@@ -430,9 +438,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            if emit_bf16:
+                # out_ is the pre-quantization bf16/fp16 normed activation.
+                bf16_out = out_
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
     def fused_allreduce_rmsnorm_quant_per_group(

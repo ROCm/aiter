@@ -27,9 +27,7 @@ void fmha_fwd_hd128_bf16_opus_fwd(aiter_tensor_t& q,
                   float softmax_scale);
 
 #ifdef FMHA_FWD_HD128_BF16_OPUS_IMPL
-// ============================================================================
-// Implementation section - only compiled in the .cu translation unit
-// ============================================================================
+// Implementation section - only compiled in the .cu translation unit.
 
 // opus_gqa_traits / opus_gqa_kargs / ceil_div / bf16_t.
 #include "fmha_fwd_hd128_bf16_opus_defs.h"
