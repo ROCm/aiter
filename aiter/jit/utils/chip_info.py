@@ -97,6 +97,7 @@ def get_gfx_runtime() -> str:
 # this backfill.
 _LEGACY_CU_NUM_TO_GFX = {
     256: "gfx950",
+    64: "gfx942",
     80: "gfx942",
     304: "gfx942",
 }
