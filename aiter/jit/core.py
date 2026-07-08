@@ -1587,7 +1587,7 @@ def compile_ops(
 
                     import torch
 
-                    enum_types = ["ActivationType", "QuantType"]
+                    enum_types = ["ActivationType", "QuantType", "MlaVersion"]
 
                     if not op.__doc__.startswith("Members:"):
                         doc_str = op.__doc__.split("\n")[0]
@@ -1688,9 +1688,15 @@ def compile_ops(
                         if aiter_tensor_t is not object:
                             tensor_like_types.add(aiter_tensor_t)
 
+                        enum_type_objs = tuple(
+                            namespace[el] for el in enum_types if el in namespace
+                        )
+
                         def canonicalize_hint(hint):
                             if hint in tensor_like_types:
                                 return ("tensor",)
+                            if hint in enum_type_objs:
+                                return int
 
                             origin = typing.get_origin(hint)
                             if origin in (list, List):
