@@ -202,9 +202,6 @@ def shuffle_scale_gemm_e8m0(scales: torch.Tensor, arch="gfx950") -> torch.Tensor
     return tiled.reshape(m_pad, n_pad)
 
 
-# --- MXFP4 preshuffle GEMM operand prep (consumed by ATOM gemm_a4w4_quant) ---
-
-
 def mxfp4_scale_preshuffle_factor(arch=None) -> int:
     """Per-arch e8m0 scale preshuffle (collapse) factor for the MXFP4 preshuffle
     GEMM: 16 on gfx1250 (WMMA tiles both M and N in 16-lane groups), 32 elsewhere
@@ -251,7 +248,7 @@ def quant_mxfp4_act_preshuffle(x, params_dtype, m, block_size, arch=None):
         # shuffle is pinned at gfx950, quant then shuffle manually
         x, x_scale = quant_func(x, quant_dtype=params_dtype, shuffle=False)
         if m >= block_size:
-            x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch="gfx1250")
+            x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch=arch)
     else:
         x, x_scale = quant_func(
             x,
