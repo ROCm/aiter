@@ -132,6 +132,7 @@ def compile_mxscale_gemm(
     stage1_act: str | None = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
+    maxnreg: int | None = None,
     kernel_tag: str = "gemm",
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
@@ -155,6 +156,11 @@ def compile_mxscale_gemm(
 
     is_fp4 = data_format == "fp4"
     is_a8w4 = data_format == "a8w4"
+
+    # VGPR hard cap (LLVM --amdgpu-num-vgpr): default to 255 for the thin
+    # tile_m==16 shape, uncapped otherwise unless explicitly requested.
+    if maxnreg is None and tile_m == 16:
+        maxnreg = 255
 
     if out_dtype not in ("f32", "bf16", "f16"):
         raise ValueError(
@@ -3852,6 +3858,17 @@ def compile_mxscale_gemm(
         launch_mxscale_gemm_masked_persistent_bias.compile_hints["llvm_options"] = {
             "amdgpu-expert-scheduling-mode": True,
         }
+
+    if maxnreg is not None:
+        for _launcher in (
+            launch_mxscale_gemm,
+            launch_mxscale_gemm_masked,
+            launch_mxscale_gemm_masked_persistent,
+            launch_mxscale_gemm_bias,
+            launch_mxscale_gemm_masked_bias,
+            launch_mxscale_gemm_masked_persistent_bias,
+        ):
+            _launcher.compile_hints["maxnreg"] = maxnreg
 
     if epilogue_bias_mode:
         if grouped_masked_m:
