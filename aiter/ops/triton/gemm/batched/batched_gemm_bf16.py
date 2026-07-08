@@ -43,10 +43,6 @@ def batched_gemm_bf16(
     """
     _LOGGER.info(f"BATCHED_GEMM_BF16: x={tuple(XQ.shape)} w={tuple(WQ.shape)}")
 
-    # Make sure XQ and WQ are contiguous in memory
-    XQ = XQ.contiguous()
-    WQ = WQ.contiguous()
-
     # Check constraints.
     assert XQ.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
     assert XQ.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"

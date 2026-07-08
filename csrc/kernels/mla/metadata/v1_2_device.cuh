@@ -21,6 +21,339 @@ struct MlaMetadataV12Traits
     static constexpr int32_t kLdsBatchInfo = kLdsBatchInfo_;
 };
 
+static constexpr int32_t MLA_V12_FILL_WARPS = 8;
+
+template <typename Traits>
+__device__ __forceinline__ int32_t mla_v12_num_qo_tiles(
+    const MlaMetadataV1KernelParameter& params, QoState<Traits>& qo_state, const int32_t batch_idx)
+{
+    if constexpr(Traits::kQoSplits)
+    {
+        const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
+        if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
+        {
+            return seqlen_qo;
+        }
+        const int32_t packed_qo_len = seqlen_qo * params.num_heads;
+        return integer_divide_ceil_power2(
+            packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
+    }
+    else
+    {
+        return 1;
+    }
+}
+
+template <typename Traits>
+__device__ __forceinline__ int32_t
+mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
+                           QoState<Traits>& qo_state,
+                           int32_t* p_lds_seqlens_qo,
+                           int32_t* p_lds_seqlens_kv,
+                           const int32_t ori_seqlen_qo,
+                           const int32_t num_batches,
+                           const int32_t lane_idx)
+{
+    int32_t sum_blocks = 0;
+    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
+    {
+        const int32_t bid_ori = Traits::kIsSparse ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
+                                                  : (bid / params.qk_batch_ratio);
+        const int32_t kv_end  = params.p_seqlens_kv_indptr[bid_ori + 1];
+        const int32_t seqlen_kv =
+            Traits::kIsSparse ? min(kv_end - params.p_seqlens_kv_indptr[bid_ori], params.topk)
+                              : (kv_end - params.p_seqlens_kv_indptr[bid_ori]);
+
+        if constexpr(Traits::kLdsBatchInfo)
+        {
+            p_lds_seqlens_kv[bid] = seqlen_kv;
+        }
+
+        const int32_t num_blocks = integer_divide_ceil_power2(
+            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
+        const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
+        sum_blocks += (num_blocks + params.fixed_over_head_num_blocks) * num_qo_tiles;
+
+        if constexpr(QoState<Traits>::is_unique() == false)
+        {
+            p_lds_seqlens_qo[bid] =
+                params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
+        }
+    }
+
+    return aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
+        sum_blocks);
+}
+
+// Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan
+// recording each batch's start CU / remainder / prefix counts;
+// phase 2 fills every batch's fragments in parallel (one warp per batch).
+template <typename Traits>
+__launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
+    void kn_get_mla_metadata_v1_2_parallel(MlaMetadataV1KernelParameter params)
+{
+    using QoState = QoState<Traits>;
+
+    const int32_t num_batches = params.num_batches;
+    const int32_t ori_seqlen_qo = params.ori_seqlen_qo;
+
+    extern __shared__ uint8_t p_smem[];
+    int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
+    int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
+    int32_t* p_lds_after      = p_lds_seqlens_kv + (Traits::kLdsBatchInfo ? num_batches : 0);
+
+    // Scalars [payload, num_works, last_reduce_indptr] followed by five per-batch
+    // prefix arrays produced by the phase-1 scan.
+    int32_t* p_lds_scalars        = p_lds_after;
+    int32_t* p_lds_start_cu       = p_lds_scalars + 3;
+    int32_t* p_lds_remain_payload = p_lds_start_cu + num_batches;
+    int32_t* p_lds_works_before   = p_lds_remain_payload + num_batches;
+    int32_t* p_lds_reduce_before  = p_lds_works_before + num_batches;
+    int32_t* p_lds_partial_before = p_lds_reduce_before + num_batches;
+
+    QoState qo_state(
+        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+
+    MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
+
+    const int32_t tid       = threadIdx.x;
+    const int32_t lane_idx  = opus::lane_id();
+    const int32_t warp_id   = tid / opus::get_warp_size();
+    const int32_t num_warps = blockDim.x / opus::get_warp_size();
+    const int32_t overhead  = params.fixed_over_head_num_blocks;
+    const int32_t kv_gran   = params.kv_granularity;
+
+    // Phase 1 (warp 0): closed-form scan, no stores
+    if(warp_id == 0)
+    {
+        const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(params,
+                                                                      qo_state,
+                                                                      p_lds_seqlens_qo,
+                                                                      p_lds_seqlens_kv,
+                                                                      ori_seqlen_qo,
+                                                                      num_batches,
+                                                                      lane_idx);
+
+        const int32_t payload =
+            integer_divide_ceil(sum_blocks, params.num_splits) + overhead;
+        const int32_t blocks_per_cu = payload - overhead;
+
+        if(lane_idx == 0)
+        {
+            params.p_reduce_indptr[0] = 0;
+            params.p_work_indptr[0]   = 0;
+            params.p_work_metadata_ptrs[0] =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.p_work_indptr));
+            params.p_work_metadata_ptrs[1] =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_work_info_set));
+            p_lds_scalars[0] = payload;
+
+            int32_t curr_cu            = 0;
+            int32_t remain_payload     = payload;
+            int32_t num_works          = 0;
+            int32_t last_reduce_indptr = 0;
+            int32_t partial_idx        = 0;
+            for(int32_t bid = 0; bid < num_batches; ++bid)
+            {
+                p_lds_start_cu[bid]       = curr_cu;
+                p_lds_remain_payload[bid] = remain_payload;
+                p_lds_works_before[bid]   = num_works;
+                p_lds_reduce_before[bid]  = last_reduce_indptr;
+                p_lds_partial_before[bid] = partial_idx;
+
+                const int32_t seqlen_kv =
+                    Traits::kLdsBatchInfo
+                        ? p_lds_seqlens_kv[bid]
+                        : (params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid]);
+                const int32_t num_kv_blocks =
+                    integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
+                const int32_t qo_tile_size = qo_state.get_seqlen(bid);
+
+                if(num_kv_blocks + overhead <= remain_payload)
+                {
+                    num_works += 1;
+                    remain_payload -= (num_kv_blocks + overhead);
+                }
+                else
+                {
+                    int32_t num_fresh_frags, num_frags;
+                    if(remain_payload > overhead)
+                    {
+                        const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
+                        num_fresh_frags = integer_divide_ceil(remain_blocks, blocks_per_cu);
+                        num_frags       = num_fresh_frags + 1;
+                        curr_cu += num_fresh_frags;
+                        remain_payload =
+                            payload -
+                            ((remain_blocks - (num_fresh_frags - 1) * blocks_per_cu) + overhead);
+                    }
+                    else
+                    {
+                        num_fresh_frags = integer_divide_ceil(num_kv_blocks, blocks_per_cu);
+                        num_frags       = num_fresh_frags;
+                        curr_cu += num_fresh_frags;
+                        remain_payload =
+                            payload -
+                            ((num_kv_blocks - (num_fresh_frags - 1) * blocks_per_cu) + overhead);
+                    }
+                    num_works += num_frags;
+                    if(num_frags > 1)
+                    {
+                        last_reduce_indptr += num_frags;
+                        partial_idx += num_frags * qo_tile_size;
+                    }
+                }
+            }
+            p_lds_scalars[1] = num_works;          // total works
+            p_lds_scalars[2] = last_reduce_indptr; // total reduce tiles
+        }
+    }
+
+    __syncthreads();
+
+    const int32_t payload       = p_lds_scalars[0];
+    const int32_t blocks_per_cu = payload - overhead;
+    const int32_t total_works   = p_lds_scalars[1];
+    const int32_t num_cu        = params.num_cu;
+
+    // Phase 2a: init work_indptr to total_works
+    for(int32_t cid = tid + 1; cid <= num_cu; cid += blockDim.x)
+    {
+        params.p_work_indptr[cid] = total_works;
+    }
+
+    __syncthreads();
+
+    // Phase 2b: fill works / reduce / work_indptr
+    for(int32_t bid = warp_id; bid < num_batches; bid += num_warps)
+    {
+        const int32_t start_cu           = p_lds_start_cu[bid];
+        const int32_t remain_payload     = p_lds_remain_payload[bid];
+        const int32_t num_works_before   = p_lds_works_before[bid];
+        const int32_t reduce_before      = p_lds_reduce_before[bid];
+        const int32_t partial_idx_before = p_lds_partial_before[bid];
+
+        const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
+        const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
+        const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
+        const int32_t seqlen_kv  = Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
+        const int32_t num_kv_blocks =
+            integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
+        const int32_t qo_tile_size = qo_state.get_seqlen(bid);
+        const int32_t qo_start     = qo_state.get_begin(bid);
+        const int32_t qo_end       = qo_state.get_end(bid);
+
+        const bool fits_current_cu = (num_kv_blocks + overhead <= remain_payload);
+        int32_t num_fresh_frags, num_frags;
+        bool waste_start_cu;
+        if(fits_current_cu)
+        {
+            num_fresh_frags = 1;
+            num_frags       = 1;
+            waste_start_cu  = false;
+        }
+        else if(remain_payload > overhead)
+        {
+            const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
+            num_fresh_frags = integer_divide_ceil(remain_blocks, blocks_per_cu);
+            num_frags       = num_fresh_frags + 1;
+            waste_start_cu  = false;
+        }
+        else
+        {
+            num_fresh_frags = integer_divide_ceil(num_kv_blocks, blocks_per_cu);
+            num_frags       = num_fresh_frags;
+            waste_start_cu  = true;
+        }
+        const bool is_split             = (num_frags > 1);
+        const int32_t first_frag_blocks = remain_payload - overhead;
+
+        // Per-batch reduce bookkeeping + the wasted-CU close (lane 0).
+        if(lane_idx == 0)
+        {
+            if(is_split)
+            {
+                params.p_reduce_indptr[bid + 1]        = reduce_before + num_frags;
+                params.p_reduce_final_map[bid * 2]     = qo_start;
+                params.p_reduce_final_map[bid * 2 + 1] = qo_end;
+            }
+            else
+            {
+                params.p_reduce_indptr[bid + 1] = reduce_before;
+            }
+            if(waste_start_cu && (start_cu + 1 <= num_cu))
+            {
+                params.p_work_indptr[start_cu + 1] = num_works_before;
+            }
+        }
+
+        // Each fragment -> one work covering kv blocks [block_begin, block_end)
+        // of this batch, landing in CU frag_cu.
+        for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
+        {
+            int32_t block_begin, block_end, frag_cu;
+            if(fits_current_cu)
+            {
+                block_begin = 0;
+                block_end   = num_kv_blocks;
+                frag_cu     = start_cu;
+            }
+            else if(!waste_start_cu)
+            {
+                block_begin = (frag_idx == 0) ? 0
+                                              : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
+                block_end   = (frag_idx < num_fresh_frags)
+                                  ? (first_frag_blocks + frag_idx * blocks_per_cu)
+                                  : num_kv_blocks;
+                frag_cu     = start_cu + frag_idx;
+            }
+            else
+            {
+                block_begin = frag_idx * blocks_per_cu;
+                block_end   = (frag_idx < num_fresh_frags - 1) ? ((frag_idx + 1) * blocks_per_cu)
+                                                               : num_kv_blocks;
+                frag_cu     = start_cu + 1 + frag_idx;
+            }
+
+            const int32_t frag_kv_start  = kv_begin + block_begin * kv_gran;
+            const int32_t frag_kv_end    = opus::min(kv_begin + block_end * kv_gran, kv_end);
+            const int32_t work_idx       = num_works_before + frag_idx;
+            const int32_t partial_qo_loc =
+                is_split ? (partial_idx_before + frag_idx * qo_tile_size) : -1;
+
+            MlaWorkInfo work_info{};
+            work_info.batch_idx      = bid;
+            work_info.qo_start       = qo_start;
+            work_info.qo_end         = qo_end;
+            work_info.kv_start       = frag_kv_start;
+            work_info.kv_end         = frag_kv_end;
+            work_info.kv_offset      = kv_end - frag_kv_end;
+            work_info.partial_qo_loc = partial_qo_loc;
+            p_work_info_set[work_idx] = work_info;
+
+            if(is_split)
+            {
+                params.p_reduce_partial_map[reduce_before + frag_idx] =
+                    partial_idx_before + frag_idx * qo_tile_size;
+            }
+
+            // Non-final fragments fully fill (close) their CU with one work.
+            const bool is_last_frag = (frag_idx == num_frags - 1);
+            if(!is_last_frag && (frag_cu + 1 <= num_cu))
+            {
+                params.p_work_indptr[frag_cu + 1] = work_idx + 1;
+            }
+        }
+    }
+
+    // Phase 3: fill the reduce_indptr tail
+    const int32_t total_reduce = p_lds_scalars[2];
+    for(int32_t i = num_batches + tid; i < params.reduce_indptr_size; i += blockDim.x)
+    {
+        params.p_reduce_indptr[i] = total_reduce;
+    }
+}
+
 template <typename Traits>
 __launch_bounds__(opus::get_warp_size(), 1) __global__
     void kn_get_mla_metadata_v1_2(MlaMetadataV1KernelParameter params)
@@ -56,61 +389,12 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     QoState qo_state(
         params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
 
-    auto get_num_qo_tiles = [&](const int32_t batch_idx) {
-        if constexpr(Traits::kQoSplits)
-        {
-            const int32_t seqlen_qo = qo_state.get_seqlen(batch_idx);
-            // When num_heads * 2 > kPackedQoLenPerWg, each tile can hold at most
-            // 1 qo position (floor(kPackedQoLenPerWg / num_heads) == 1), so we
-            // need seqlen_qo tiles. The simple ceil(packed/kPackedQoLenPerWg)
-            // underestimates this for non-power-of-2 num_heads (e.g., 96, 112).
-            if(params.num_heads * 2 > Traits::kPackedQoLenPerWg)
-            {
-                return seqlen_qo;
-            }
-            const int32_t packed_qo_len = seqlen_qo * params.num_heads;
-            return integer_divide_ceil_power2(
-                packed_qo_len, Traits::kPackedQoLenPerWg, Traits::kPackedQoLenPerWg_log2);
-        }
-        else
-        {
-            return 1;
-        }
-    };
-
     const int32_t lane_idx = opus::lane_id();
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
-    int32_t sum_blocks = 0;
-    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
-    {
-        const int32_t bid_ori = Traits::kIsSparse ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
-                                                  : (bid / params.qk_batch_ratio);
-        const int32_t kv_end  = params.p_seqlens_kv_indptr[bid_ori + 1];
-        const int32_t seqlen_kv =
-            Traits::kIsSparse ? min(kv_end - params.p_seqlens_kv_indptr[bid_ori], params.topk)
-                              : (kv_end - params.p_seqlens_kv_indptr[bid_ori]);
-
-        if constexpr(Traits::kLdsBatchInfo)
-        {
-            p_lds_seqlens_kv[bid] = seqlen_kv;
-        }
-
-        const int32_t num_blocks = integer_divide_ceil_power2(
-            seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
-        const int32_t num_qo_tiles = get_num_qo_tiles(bid);
-        sum_blocks += (num_blocks + params.fixed_over_head_num_blocks) * num_qo_tiles;
-
-        if constexpr(QoState::is_unique() == false)
-        {
-            p_lds_seqlens_qo[bid] =
-                params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
-        }
-    }
-
-    sum_blocks = aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
-        sum_blocks);
+    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(
+        params, qo_state, p_lds_seqlens_qo, p_lds_seqlens_kv, ori_seqlen_qo, num_batches, lane_idx);
 
     if(lane_idx == 0)
     {
@@ -150,7 +434,7 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         int32_t remain_payload = payload;
         while(curr_batch < num_batches)
         {
-            const int32_t num_qo_tiles = get_num_qo_tiles(curr_batch);
+            const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, curr_batch);
             const int32_t qo_tile_size =
                 integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
@@ -420,13 +704,36 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
 
     using DummyTraits =
         MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, true, kIsSparse>;
-    const int32_t lds_bytes_per_batch =
-        sizeof(int32_t) * (QoState<DummyTraits>::is_unique() ? 1 : 2);
+    const bool is_unique = QoState<DummyTraits>::is_unique();
+    const int32_t lds_bytes_per_batch = sizeof(int32_t) * (is_unique ? 1 : 2);
     const int32_t max_qo_tiles =
         kQoSplits ? (integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
     const int32_t max_lds_batch_size = lds_size / lds_bytes_per_batch;
 
-    if(params.num_batches <= max_lds_batch_size)
+    const char* parallel_env   = std::getenv("AITER_MLA_META_USE_PARALLEL");
+    const bool parallel_wanted = (parallel_env == nullptr) || (std::atoi(parallel_env) != 0);
+    const bool use_parallel    = parallel_wanted && (max_seqlen_qo == 1) && !kQoSplits &&
+                                 !kIsSparse && (params.page_size == 1) &&
+                                 (params.qk_batch_ratio == 1);
+    const int32_t scratch_bytes =
+        static_cast<int32_t>(sizeof(int32_t)) * (3 + 5 * params.num_batches);
+    const int32_t qo_bytes = is_unique ? 0 : static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
+    const int32_t kv_bytes = static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
+    const int32_t fill_block = warp_size * MLA_V12_FILL_WARPS;
+
+    if(use_parallel && (scratch_bytes + qo_bytes + kv_bytes <= lds_size))
+    {
+        using Traits =
+            MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, true, kIsSparse>;
+        kn_get_mla_metadata_v1_2_parallel<Traits><<<grid, fill_block, lds_size, stream>>>(params);
+    }
+    else if(use_parallel && (scratch_bytes + qo_bytes <= lds_size))
+    {
+        using Traits =
+            MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, false, kIsSparse>;
+        kn_get_mla_metadata_v1_2_parallel<Traits><<<grid, fill_block, lds_size, stream>>>(params);
+    }
+    else if(params.num_batches <= max_lds_batch_size)
     {
         using Traits =
             MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, true, kIsSparse>;
@@ -514,6 +821,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     const bool natively_supported =
         (num_heads == 16) ||
+        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 2)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
