@@ -129,18 +129,21 @@ struct __attribute__((packed)) qkptph_kernargs
 
 static_assert(sizeof(qkptph_kernargs) == 768, "qkptph kernarg ABI must be 768 bytes");
 
-// Find the registered varlen config (mask=2 causal, mode=1), gfx942 fp8 hd128.
-// Only the varlen (packed-Q / cu_seqlens) kernel is shipped: it is correct for
-// all batch sizes (b=1 degenerates to a single segment) and within ~1% of a
-// dedicated batch kernel at b=1, so the batch (mode=0) variant was dropped.
-const fmha_v3_fwdConfig* find_qkptph_cfg()
+// Find the registered varlen config (mask=2 causal, mode=1), gfx942 fp8 hd128,
+// for the requested physical page size. Two kernels are shipped and selected by
+// page_block_size: page=16 (the 32/64-bit ps=16 build) and page=64 (the 64-token
+// retile build); each has its own .co and kernel symbol. Only the varlen
+// (packed-Q / cu_seqlens) kernel is shipped: it is correct for all batch sizes
+// (b=1 degenerates to a single segment) and within ~1% of a dedicated batch
+// kernel at b=1, so the batch (mode=0) variant was dropped.
+const fmha_v3_fwdConfig* find_qkptph_cfg(int page_block_size)
 {
     const std::string arch_id = get_gpu_arch();
     for(const auto& el : cfg_fmha_fwd_fp8_ps)
     {
         const auto& c = el.second;
         if(c.arch == arch_id && c.dtype == "fp8" && c.hdim_q == 128 && c.hdim_v == 128 &&
-           c.mask == 2 && c.mode == 1)
+           c.mask == 2 && c.mode == 1 && c.page == page_block_size)
         {
             return &c;
         }
@@ -180,18 +183,20 @@ mha_batch_prefill_asm(const at::Tensor& q,                   // [total_q, hq, d]
     const std::string arch_id = get_gpu_arch();
     TORCH_CHECK(arch_id == "gfx942",
                 "mha_batch_prefill_asm: only gfx942 is supported, got ", arch_id);
-    TORCH_CHECK(head_size_q == 128 && head_size_v == 128 && page_block_size == 16,
+    TORCH_CHECK(head_size_q == 128 && head_size_v == 128 &&
+                    (page_block_size == 16 || page_block_size == 64),
                 "mha_batch_prefill_asm: requires head_size_q==head_size_v==128 and "
-                "page_block_size==16");
+                "page_block_size in {16, 64}");
     TORCH_CHECK(q.scalar_type() == at::ScalarType::Float8_e4m3fn ||
                     q.scalar_type() == at::ScalarType::Float8_e4m3fnuz,
                 "mha_batch_prefill_asm: q must be fp8 (e4m3)");
     TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
                 "mha_batch_prefill_asm: out must be bf16");
 
-    const fmha_v3_fwdConfig* cfg = find_qkptph_cfg();
+    const fmha_v3_fwdConfig* cfg = find_qkptph_cfg(page_block_size);
     TORCH_CHECK(cfg != nullptr,
-                "mha_batch_prefill_asm: no registered varlen (mode=1) asm config");
+                "mha_batch_prefill_asm: no registered varlen (mode=1) asm config for "
+                "page_block_size=", page_block_size, " (expected 16 or 64)");
 
     hipStream_t stream = at::hip::getCurrentHIPStream().stream();
 
