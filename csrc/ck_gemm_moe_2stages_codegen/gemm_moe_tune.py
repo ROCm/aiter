@@ -80,7 +80,6 @@ torch.set_default_device("cuda")
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
-FLYDSL_FALLBACK_TAG = "flydsl_fallback"
 TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
@@ -3687,7 +3686,6 @@ class FmoeTuner(TunerCommon):
         tunedf,
         args,
     ):
-        self._flydsl_fallbacks = []
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
         keys = self.keys
@@ -3836,27 +3834,13 @@ class FmoeTuner(TunerCommon):
                 else:
                     old_tunedf[col] = 0
 
-        new_fallbacks = getattr(self, "_flydsl_fallbacks", [])
-        new_fb_keys = set()
-        if new_fallbacks:
-            new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
-            new_fb_keys = set(new_fb_df[self.keys].astype(str).apply(tuple, axis=1))
-
+        # Legacy tuned files may carry an obsolete _tag column (and tagged
+        # rows). Drop the tagged rows and the column so the rewrite matches the
+        # current schema.
         if "_tag" in old_tunedf.columns:
-            old_fb_mask = old_tunedf["_tag"].fillna("") == FLYDSL_FALLBACK_TAG
-            if new_fb_keys:
-                old_fb_key_tuples = (
-                    old_tunedf.loc[old_fb_mask, self.keys]
-                    .astype(str)
-                    .apply(tuple, axis=1)
-                )
-                drop_mask = old_fb_mask & old_fb_key_tuples.isin(new_fb_keys)
-            else:
-                drop_mask = old_fb_mask & False
-            kept_old_fb = old_tunedf[old_fb_mask & ~drop_mask].copy()
-            old_tunedf = old_tunedf[~old_fb_mask].drop(columns=["_tag"])
-        else:
-            kept_old_fb = pd.DataFrame(columns=list(old_tunedf.columns) + ["_tag"])
+            old_tunedf = old_tunedf[old_tunedf["_tag"].fillna("") == ""].drop(
+                columns=["_tag"]
+            )
 
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
@@ -3872,22 +3856,9 @@ class FmoeTuner(TunerCommon):
                 subset=self.keys,
                 keep="last",
             )
-        resultdf["_tag"] = ""
-
-        if new_fallbacks:
-            new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
-            new_fb_df["_tag"] = FLYDSL_FALLBACK_TAG
-            resultdf = pd.concat([resultdf, new_fb_df], ignore_index=True)
-
-        if len(kept_old_fb) > 0:
-            resultdf = pd.concat([resultdf, kept_old_fb], ignore_index=True)
-
-        resultdf = resultdf.astype(str).drop_duplicates(
-            subset=self.keys + ["_tag"], keep="last"
-        )
-        # Canonical column order (self.columns, so gfx stays the first column);
-        # any extra columns such as _tag are kept at the end. Without this an
-        # incremental tune of a legacy file would append gfx at the back.
+        # Canonical column order (self.columns, so gfx stays the first column).
+        # Without this an incremental tune of a legacy file would append gfx at
+        # the back.
         ordered_cols = [c for c in self.columns if c in resultdf.columns]
         ordered_cols += [c for c in resultdf.columns if c not in ordered_cols]
         resultdf = resultdf[ordered_cols]
@@ -3990,13 +3961,6 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
-            # Keep best non-flydsl per (stage, block_m, flat) for FLAT dedup.
-            _non_flydsl = profileDF[
-                ~profileDF["kernelName"].astype(str).str.startswith("flydsl_")
-            ]
-            _non_flydsl_best = _non_flydsl.sort_values("us").drop_duplicates(
-                ["stage", "block_m", "flat"], keep="first"
-            )
             profileDF = profileDF.sort_values("us").drop_duplicates(
                 ["stage", "block_m", "flat"], keep="first"
             )
@@ -4480,83 +4444,6 @@ class FmoeTuner(TunerCommon):
             best_one["q_dtype_a"] = str(best_one["q_dtype_a"])
             best_one["q_dtype_w"] = str(best_one["q_dtype_w"])
             bests.append(best_one)
-
-            best_has_flydsl = str(best_one.get("kernelName1", "")).startswith(
-                "flydsl_"
-            ) or str(best_one.get("kernelName2", "")).startswith("flydsl_")
-            if best_has_flydsl:
-                # Drop ``flat`` so merge is unambiguous; 2-stage fallbacks set flat=0.
-                _nf_s1 = (
-                    _non_flydsl_best[_non_flydsl_best["stage"] == "stage1"]
-                    .drop(
-                        columns=[
-                            c
-                            for c in ["stage", "flat"]
-                            if c in _non_flydsl_best.columns
-                        ]
-                    )
-                    .rename(
-                        columns={
-                            "kernelName": "kernelName1",
-                            "err": "err1",
-                            "us": "us1",
-                            "tflops": "tflops1",
-                            "bw": "bw1",
-                        }
-                    )
-                )
-                _nf_s2 = (
-                    _non_flydsl_best[_non_flydsl_best["stage"] == "stage2"]
-                    .drop(
-                        columns=[
-                            c
-                            for c in ["stage", "ksplit", "flat"]
-                            if c in _non_flydsl_best.columns
-                        ]
-                    )
-                    .rename(
-                        columns={
-                            "kernelName": "kernelName2",
-                            "err": "err2",
-                            "us": "us2",
-                            "tflops": "tflops2",
-                            "bw": "bw2",
-                        }
-                    )
-                )
-                _join_keys = [
-                    c for c in self.keys if c in _nf_s1.columns and c in _nf_s2.columns
-                ] + ["block_m"]
-                non_flydsl_df = pd.merge(_nf_s1, _nf_s2, on=_join_keys, how="inner")
-                if len(non_flydsl_df) > 0:
-                    if q_type == QuantType.per_1x32 and us_qs_cache:
-                        non_flydsl_df["us_quant_sort"] = non_flydsl_df["block_m"].map(
-                            us_qs_cache
-                        )
-                        non_flydsl_df["us1"] = non_flydsl_df["us1"] + non_flydsl_df[
-                            "us_quant_sort"
-                        ].fillna(0)
-                        non_flydsl_df.drop(columns=["us_quant_sort"], inplace=True)
-                    non_flydsl_df["us"] = round(
-                        non_flydsl_df["us1"] + non_flydsl_df["us2"], 4
-                    )
-                    non_flydsl_df["run_1stage"] = 0
-                    non_flydsl_df["xbf16"] = 0
-                    non_flydsl_df["flat"] = 0
-                    non_flydsl_df["tflops"] = 0
-                    non_flydsl_df["bw"] = 0
-                    fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
-                    fb["act_type"] = str(fb["act_type"])
-                    fb["q_type"] = str(fb["q_type"])
-                    fb["dtype"] = str(fb["dtype"])
-                    fb["q_dtype_a"] = str(fb["q_dtype_a"])
-                    fb["q_dtype_w"] = str(fb["q_dtype_w"])
-                    self._flydsl_fallbacks.append(fb)
-                    print(
-                        f"  Fallback (non-flydsl): "
-                        f"{fb['kernelName1']}, {fb['kernelName2']}, "
-                        f"{fb['us']} us"
-                    )
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)
             profile_result["err"] = profile_result["err"].apply(lambda x: f"{x:.1%}")
