@@ -206,6 +206,12 @@ class TunerCommon:
             "otherwise read shapes from -i and run with default kernels.",
         )
         self.parser.add_argument(
+            "--e2e_tune",
+            action="store_true",
+            required=False,
+            help="Run e2e tuning as an alternative to main tuning, using production-op benchmark as the indicator",
+        )
+        self.parser.add_argument(
             "--compare",
             action="store_true",
             required=False,
