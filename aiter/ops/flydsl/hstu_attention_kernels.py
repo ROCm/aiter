@@ -492,10 +492,19 @@ def _validate_bwd_inputs(
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
-# Backward tuned-config plumbing. Same schema as the forward CSV: the backward
-# is two single-writer, fully tile-parallel kernels (dV/dK over the query index,
-# dQ over the key index), so there is no dQ read-modify-write to synchronize and
+# Backward tuned-config plumbing. The backward is two single-writer, fully
+# tile-parallel kernels (dV/dK over the query index, dQ over the key index).
+# Profiling (2026-07-08) showed the two have *different* optimal tile configs:
+# the heavier dV/dK kernel (two accumulator families) prefers a large owned tile
+# for load amortization, while the lighter dQ kernel (one accumulator family)
+# prefers a smaller tile with forced higher occupancy. So the tuned CSV carries a
+# `kernel` discriminator column ("dvdk" | "dq") and each kernel resolves its own
+# config independently. There is still no dQ read-modify-write to synchronize and
 # thus no sequence-parallel knob to tune.
+_BWD_KERNEL_DVDK = "dvdk"
+_BWD_KERNEL_DQ = "dq"
+_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
+
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
     "dtype",
@@ -507,6 +516,7 @@ _BWD_CSV_COLUMNS: list[str] = [
     "has_window",
     "has_contextual",
     "has_targets",
+    "kernel",
     "block_m",
     "block_n",
     "num_waves",
@@ -537,13 +547,17 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             row["has_contextual"],
             row["has_targets"],
         )
+        kernel = row["kernel"].strip().lower()
+        if kernel not in _BWD_KERNELS:
+            raise ValueError(f"unexpected kernel discriminator: {kernel!r}")
         kernel_config = dict(
             block_m=int(row["block_m"]),
             block_n=int(row["block_n"]),
             num_waves=int(row["num_waves"]),
             waves_per_eu=int(row["waves_per_eu"]),
         )
-        return problem_key, duration, kernel_config
+        # Key on (problem, kernel) so dV/dK and dQ tune independently.
+        return (problem_key, kernel), duration, kernel_config
 
     default_tuned_file = (
         Path(__file__).resolve().parent / "hstu_attention_bwd_tuned.csv"
@@ -577,6 +591,7 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
 
 def _get_bwd_tuned_config(
     *,
+    kernel: str,
     dtype_str: str,
     num_heads: int,
     head_dim: int,
@@ -587,7 +602,8 @@ def _get_bwd_tuned_config(
     contextual_seq_len: int,
     has_targets: bool,
 ) -> dict:
-    """Returns the tuned backward config if the CSV has an entry for this problem."""
+    """Returns the tuned config for one backward kernel ("dvdk" | "dq"), if the
+    CSV has an entry for this (problem, kernel)."""
     problem_key = _problem_key(
         _GPU_ARCH,
         dtype_str,
@@ -600,15 +616,17 @@ def _get_bwd_tuned_config(
         contextual_seq_len > 0,
         has_targets,
     )
-    return _bwd_tuned_config_map().get(problem_key, {})
+    return _bwd_tuned_config_map().get((problem_key, kernel), {})
 
 
-def _get_bwd_default_config() -> dict:
+def _get_bwd_default_config(kernel: str) -> dict:
     """Conservative heuristic default when no tuned entry exists.
 
     This tile is valid across every supported shape (including asymmetric and
     non-64-divisible dims) and is what the correctness suite runs against.
-    Tuned CSV entries override it per problem.
+    Per-kernel tuned CSV entries override it. Both kernels share the same
+    conservative default (a known-valid tile); the per-kernel win comes from the
+    tuned CSV, whose entries are validated per shape.
     """
     return dict(block_m=64, block_n=32, num_waves=4, waves_per_eu=0)
 
@@ -637,6 +655,8 @@ def _compile_bwd_launcher(
     Returns two launchers: the KV-owned kernel producing dV/dK, and the Q-owned
     kernel producing dQ. Both consume the same tile config.
     """
+    # Explicit overrides apply to BOTH kernels (this is what the block-size
+    # override tests and the tuner's per-kernel timing rely on).
     custom_config: dict = dict(
         block_m=block_m,
         block_n=block_n,
@@ -645,27 +665,27 @@ def _compile_bwd_launcher(
     )
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
 
-    tuned_config = _get_bwd_tuned_config(
-        dtype_str=dtype_str,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        hidden_dim=hidden_dim,
-        batch=batch,
-        max_seq_len=max_seq_len,
-        max_attn_len=max_attn_len,
-        contextual_seq_len=contextual_seq_len,
-        has_targets=has_targets,
-    )
+    def _resolve(kernel: str) -> dict:
+        # Precedence per kernel: explicit override > tuned CSV entry > default.
+        tuned_config = _get_bwd_tuned_config(
+            kernel=kernel,
+            dtype_str=dtype_str,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            hidden_dim=hidden_dim,
+            batch=batch,
+            max_seq_len=max_seq_len,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            has_targets=has_targets,
+        )
+        return {
+            **_get_bwd_default_config(kernel),
+            **tuned_config,
+            **custom_config,
+        }
 
-    default_config = _get_bwd_default_config()
-
-    kernel_config = {
-        **default_config,
-        **tuned_config,
-        **custom_config,
-    }
-
-    build_kwargs = dict(
+    common_kwargs = dict(
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_dim=hidden_dim,
@@ -677,10 +697,13 @@ def _compile_bwd_launcher(
         alpha=alpha,
         dtype_str=dtype_str,
         max_seq_len=max_seq_len,
-        **kernel_config,
     )
-    dvdk_launcher = build_hstu_attention_bwd(**build_kwargs)
-    dq_launcher = build_hstu_attention_bwd_dq(**build_kwargs)
+    dvdk_launcher = build_hstu_attention_bwd(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DVDK)
+    )
+    dq_launcher = build_hstu_attention_bwd_dq(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DQ)
+    )
     return dvdk_launcher, dq_launcher
 
 
@@ -781,6 +804,88 @@ def flydsl_hstu_attention_bwd(
             fx.Stream(launch_stream),
         )
     return dq, dk, dv
+
+
+def _make_bwd_kernel_runners(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    causal: bool,
+    num_targets: Optional[torch.Tensor],
+    max_attn_len: int,
+    contextual_seq_len: int,
+    *,
+    block_m: Optional[int] = None,
+    block_n: Optional[int] = None,
+    num_waves: Optional[int] = None,
+    waves_per_eu: Optional[int] = None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> dict:
+    """Tuning/profiling helper: build the (dV/dK, dQ) launcher pair with an
+    explicit tile config forced on both, and return zero-arg callables that
+    launch ONLY one kernel each: {"dvdk": fn, "dq": fn}.
+
+    This lets the tuner time the two backward kernels independently (they have
+    different optimal configs) without going through the public entry point,
+    which always launches both. Not part of the public API.
+    """
+    batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
+        q=q, k=k, v=v, dout=dout, seq_offsets=seq_offsets, num_targets=num_targets,
+    )
+    dvdk_launcher, dq_launcher = _compile_bwd_launcher(
+        batch=batch,
+        max_seq_len=N,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        causal=causal,
+        has_targets=num_targets is not None,
+        alpha=alpha,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        dtype_str=dtype_str,
+        block_m=block_m,
+        block_n=block_n,
+        num_waves=num_waves,
+        waves_per_eu=waves_per_eu,
+    )
+
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    nt = num_targets
+    if nt is None:
+        nt = torch.zeros(1, dtype=seq_offsets.dtype, device=v.device)
+
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    do_c = dout.contiguous()
+    so_c = seq_offsets.contiguous()
+    nt_c = nt.contiguous()
+
+    launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
+
+    def run_dvdk():
+        with torch.cuda.device(q.device.index):
+            _run_compiled(
+                dvdk_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, dv, dk,
+                fx.Stream(launch_stream),
+            )
+
+    def run_dq():
+        with torch.cuda.device(q.device.index):
+            _run_compiled(
+                dq_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, dq,
+                fx.Stream(launch_stream),
+            )
+
+    return {_BWD_KERNEL_DVDK: run_dvdk, _BWD_KERNEL_DQ: run_dq}
 
 
 class FlydslHstuAttention(torch.autograd.Function):
