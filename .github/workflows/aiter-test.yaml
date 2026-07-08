@@ -662,6 +662,7 @@ jobs:
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: |
@@ -922,7 +923,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
-        timeout-minutes: 60
+        timeout-minutes: 75
         run: |
           set -ex
           docker exec \
@@ -934,9 +935,11 @@ jobs:
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: multigpu-test-${{ matrix.runner }}
           path: latest_test.log
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Cleanup container

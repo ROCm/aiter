@@ -195,10 +195,12 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: success()
+        if: always()
+        continue-on-error: true
         with:
           name: triton-test-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Cleanup container
@@ -309,10 +311,12 @@ jobs:
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
-        if: success()
+        if: always()
+        continue-on-error: true
         with:
           name: triton-test-mi300x-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Cleanup container
