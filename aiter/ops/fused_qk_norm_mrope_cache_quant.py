@@ -35,4 +35,5 @@ def fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     block_size: int,
     x: int,
     rotary_dim: int = 0,
+    gemma_norm: bool = False,
 ) -> None: ...
