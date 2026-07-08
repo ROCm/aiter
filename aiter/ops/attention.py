@@ -812,9 +812,6 @@ def mla_decode_stage1_asm_fwd(
     # [1] per-tensor
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
-<<<<<<< HEAD
-    # [1] pertensor
-=======
     # round-robin context-parallel (CP) extension:
     #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
     #   cp_world_size : number of CP ranks (W); 1 == disabled
@@ -875,7 +872,6 @@ def mla_decode_v4_asm(
     # kernel skips the write and nullptr is fine.
     valid_split_count: Optional[torch.Tensor] = None,
     use_valid_split_count_reduce: int = 0,
->>>>>>> main
 ) -> None: ...
 
 
