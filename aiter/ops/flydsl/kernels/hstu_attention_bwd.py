@@ -45,6 +45,12 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
 
+from aiter.ops.flydsl.kernels.hstu_attention_common import (
+    decode_lane,
+    grouped_loader,
+    swz_col,
+)
+
 
 def _dtype_to_elem_type(dtype_str: str):
     if dtype_str == "f16":
@@ -303,10 +309,9 @@ def build_hstu_attention_bwd(
             return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
 
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id = tid // fx.Int32(WARP_SIZE)
-        lane = tid % fx.Int32(WARP_SIZE)
-        lane_mod_16 = lane % fx.Int32(MFMA_N)
-        lane_div_16 = lane // fx.Int32(MFMA_N)
+        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+            tid, NUM_WAVES, WARP_SIZE, MFMA_N
+        )
 
         # ---- Group-major grid decode -> (batch_idx, head_idx, kv_tile_idx) ----
         block_id = fx.Int32(gpu.block_idx.x)
@@ -340,16 +345,7 @@ def build_hstu_attention_bwd(
                 xid = (xid > max_id).select(max_id, xid)
             return xid
 
-        # ---- Global tensor views ----
-        def grouped_loader(t, dim, g):
-            in_row = fx.make_layout((dim // g, g), (g, 1))
-
-            def load(row_i64, head_val, colgrp):
-                sub = t[row_i64, head_val, None]
-                return fx.make_view(fx.get_iter(sub), in_row)[colgrp, None].load()
-
-            return load
-
+        # ---- Global tensor views (grouped_loader is shared, layout-algebra based) ----
         k_load = grouped_loader(k, head_dim, MFMA_LANE_K)  # resident K (B-operand for S)
         v_load = grouped_loader(v, hidden_dim, MFMA_LANE_K)  # resident V (B-operand for dA)
         do_load = grouped_loader(do, hidden_dim, VEC_DO)  # streamed dO register prefetch
@@ -366,7 +362,7 @@ def build_hstu_attention_bwd(
         q_lds_byte_base = buffer_ops.extract_base_index(q_smem.get(), address_space=3)
 
         def q_swz_col(tile_row, col):
-            return col ^ ((tile_row & fx.Int32(K_SWZ_ROWS - 1)) << fx.Int32(K_SWZ_SHIFT))
+            return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
 
         kv_wave_base = kv_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(ROWS_PER_WAVE)
 
