@@ -241,9 +241,13 @@ a8w8_scale_kernels_list = {
     1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
 }
 
-a8w8_kernels_list = {
-    2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8", ["fp32_t"]),
+a8w8_noscale_kernels_list = {
+    2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8_noscale", ["fp32_t"]),
 }
+
+# Backward-compatible alias: legacy codegen paths and filters historically
+# referred to this family as "a8w8".
+a8w8_kernels_list = a8w8_noscale_kernels_list
 
 a16w16_kernels_list = {
     # -- MFMA 16x16x32, T_N=2, BS=256 (2-block/CU capable) --
@@ -1024,7 +1028,7 @@ kernels_list = {
 
 default_kernels_dict = {
     (-1): OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
-    (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
+    (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8_noscale",       ["fp32_t"]),
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
 # fmt: on

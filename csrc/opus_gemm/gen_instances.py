@@ -135,6 +135,7 @@ def _kernel_func_for(k):
 
 INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
+    "a8w8_noscale": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
@@ -142,7 +143,7 @@ INPUT_DTYPE_MAP = {
 # All a16w16 tags share the 4-arg (XQ, WQ, Y, int splitK) lookup-table slot.
 A16W16_TUNE_TAGS = set(_A16W16_TAGS)
 # NOSCALE: 3-arg launchers (a16w16 family + a8w8 non-scale).
-NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
+NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8", "a8w8_noscale"}
 
 # SplitK tags live in the <fp32_t> dispatch slot; each instance's traits pick
 # the actual workspace dtype and the reduce launcher writes the requested Y.
@@ -922,7 +923,7 @@ if __name__ == "__main__":
         "--kernel_tag",
         default=None,
         required=False,
-        help="filter kernels by tag (e.g. a16w16, a16w16_flatmm, a16w16_flatmm_splitk, a8w8, a8w8_scale)",
+        help="filter kernels by tag (e.g. a16w16, a16w16_flatmm, a16w16_flatmm_splitk, a8w8_noscale, a8w8, a8w8_scale)",
     )
 
     parser.add_argument(
@@ -974,6 +975,7 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
     TAG_TO_LIST = {
         "a8w8_scale": a8w8_scale_kernels_list,
+        "a8w8_noscale": a8w8_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
         "a16w16_flatmm": a16w16_flatmm_kernels_list,

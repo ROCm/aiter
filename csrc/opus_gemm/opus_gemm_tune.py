@@ -47,10 +47,12 @@ from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.opus.gemm_op_a16w16 import (
     opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
+    _opus_gemm_bf16_dispatch as _opus_gemm_dispatch,
 )
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
+    a8w8_noscale_kernels_list,
     a16w16_kernels_list,
     a16w16_kernels_list_nooob,
     a16w16_kernels_list_cpol,
@@ -962,6 +964,15 @@ a16w16_all_kernels = {
     **gfx1250_clusterlaunch_kernels_list,
 }
 
+a8w8_noscale_all_kernels = {
+    **a8w8_noscale_kernels_list,
+}
+
+opus_all_kernels = {
+    **a16w16_all_kernels,
+    **a8w8_noscale_all_kernels,
+}
+
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
 # non-empty implementation on the run...
 try:
@@ -970,23 +981,25 @@ try:
     _run_arch = get_gfx_runtime().lower()
     a16w16_kernel_ids = sorted(
         kid
-        for kid, k in a16w16_all_kernels.items()
+        for kid, k in opus_all_kernels.items()
         if (getattr(k, "arch_prefix", "") or "gfx950").lower() == _run_arch
     )
 except Exception:
     # rocminfo unavailable -> fall back to enumerating everything so the
     # legacy multi-arch behaviour is preserved on build-only hosts.
-    a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
+    a16w16_kernel_ids = sorted(opus_all_kernels.keys())
 
 
 # -- dtype handling ---------------------------------------------------------- CSV convention
 # (matches gptoss_bf16_*_gemm.csv sch...
 _DTYPE_SHORT_TO_TORCH = {
+    "fp8": dtypes.fp8,
     "bf16": dtypes.bf16,
     "fp32": dtypes.fp32,
 }
 
 _DTYPE_TORCH_TO_CSV_STR = {
+    dtypes.fp8: str(dtypes.fp8),
     dtypes.bf16: "torch.bfloat16",
     dtypes.fp32: "torch.float32",
 }
@@ -994,6 +1007,7 @@ _DTYPE_TORCH_TO_CSV_STR = {
 _DTYPE_CSV_STR_TO_TORCH = {v: k for k, v in _DTYPE_TORCH_TO_CSV_STR.items()}
 
 _DTYPE_TORCH_TO_BPE = {
+    dtypes.fp8: 1,
     dtypes.bf16: 2,
     dtypes.fp32: 4,
 }
@@ -1049,8 +1063,12 @@ def generate_data(
 
     torch.manual_seed(seed)
     # Use the exact (M, N, K) from the tune request.
-    XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
-    WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
+    if dtype == dtypes.fp8:
+        XQ = torch.randn((batch, m, k), dtype=dtypes.fp16, device=device).to(dtype)
+        WQ = torch.randn((batch, n, k), dtype=dtypes.fp16, device=device).to(dtype)
+    else:
+        XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
+        WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
     Y = torch.empty((batch, m, n), dtype=outdtype, device=device)
     # bias dtype matches Y (match_d_out convention). Opus bias is per-output-
     # feature (per-N): the splitk reduce folds a [N] / [batch, N] vector
@@ -1099,6 +1117,26 @@ def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
     _quiet_aiter_logger_once()
     _opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
     ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
+    max_delta = (Y.float() - ref.float()).abs().max().item()
+    max_ref = ref.float().abs().max().item()
+    bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
+    if max_delta > bound:
+        raise RuntimeError(
+            f"maxDelta {max_delta:.1f} exceeds bound {bound:.1f} "
+            f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE})"
+        )
+    return Y
+
+
+def run_opus_gemm_a8w8_noscale(XQ, WQ, Y, bias, kernelId, splitK):
+    """Eager-path runner for a8w8 no-scale kernels.
+
+    Uses the generic opus_gemm binding (fp8 branch) with x_scale/w_scale unset.
+    kernelId/splitK are accepted for tuple-shape compatibility with mp_tuner.
+    """
+    _quiet_aiter_logger_once()
+    _opus_gemm_dispatch(XQ, WQ, Y, None, None, None, None)
+    ref = opus_gemm_ref(XQ, WQ, None, Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
     bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
@@ -1193,6 +1231,37 @@ def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
 
         # Capture-safe sync: guarantees the warmup kernel has completed before we read Y for the
         # max_delta check (above) or before the ou...
+        torch.cuda.current_stream().synchronize()
+    return Y
+
+
+def run_opus_gemm_a8w8_noscale_bench(XQ, WQ, Y, bias, kernelId, splitK):
+    """Bench func for a8w8 no-scale path with capture-safe correctness gate."""
+    _quiet_aiter_logger_once()
+    _opus_gemm_dispatch(XQ, WQ, Y, None, None, None, None)
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        task_key = (
+            id(XQ),
+            id(WQ),
+            id(Y),
+            int(kernelId),
+            int(splitK),
+            0xA8,
+        )
+        if task_key not in _bench_max_delta_checked:
+            _bench_max_delta_checked.add(task_key)
+            ref = opus_gemm_ref(XQ, WQ, None, Y.dtype)
+            max_delta = (Y.float() - ref.float()).abs().max().item()
+            max_ref = ref.float().abs().max().item()
+            bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
+            if max_delta > bound:
+                raise RuntimeError(
+                    f"maxDelta {max_delta:.1f} > bound {bound:.1f} "
+                    f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE}) "
+                    f"for a8w8_noscale kid={kernelId}"
+                )
         torch.cuda.current_stream().synchronize()
     return Y
 
@@ -1321,7 +1390,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     ]
 
     def getKernelName(self, kernelId):
-        k = a16w16_all_kernels.get(kernelId)
+        k = opus_all_kernels.get(kernelId)
         return k.name if k else None
 
     def _setup_specific_arguments(self):
@@ -1768,11 +1837,11 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 )
             if not forced_kids:
                 self.parser.error("--kid given but parsed empty kid set")
-            unknown = forced_kids - set(a16w16_all_kernels.keys())
+            unknown = forced_kids - set(opus_all_kernels.keys())
             if unknown:
                 self.parser.error(
                     f"--kid: unknown kid id(s) {sorted(unknown)} "
-                    f"(known a16w16 kids: {sorted(a16w16_all_kernels.keys())})"
+                    f"(known opus kids: {sorted(opus_all_kernels.keys())})"
                 )
             logger.info(
                 f"OpusGemmA16W16Tuner: --kid filter active, restricting "
@@ -1786,12 +1855,21 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
+            dtype_str = (
+                str(untunedf.loc[i, "dtype"])
+                if "dtype" in untunedf.columns
+                else _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
+            )
+            in_dtype = _dtype_csv_str_to_torch(dtype_str)
             bias_v = (
                 bool(untunedf.loc[i, "bias"])
                 if "bias" in untunedf.columns
                 else bool(args.bias)
             )
-            shape_cands = candidate_kids_for_shape(M, N, K, bias_v, cu_num)
+            if in_dtype is dtypes.fp8:
+                shape_cands = frozenset(a8w8_noscale_all_kernels.keys())
+            else:
+                shape_cands = candidate_kids_for_shape(M, N, K, bias_v, cu_num)
             if forced_kids is not None:
                 # Make sure the requested kids are baked in even if the
                 # shape-driven candidate set would have excluded them.
@@ -1854,32 +1932,39 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             check_rtol = 5e-2 if out_dtype == dtypes.bf16 else 1e-2
             check_atol = check_rtol
 
-            # Sanity check: a16w16-family kernels lock the input to bf16 today (the launcher TORCH_CHECKs
-            # XQ.dtype()==BFloat16).
-            if in_dtype is not dtypes.bf16:
+            # Input dtype support matrix:
+            #   * bf16 -> a16w16-family tuning path
+            #   * fp8  -> a8w8_noscale tuning path (gfx950)
+            if in_dtype not in (dtypes.bf16, dtypes.fp8):
                 logger.warning(
                     f"OpusGemmA16W16Tuner: skipping row M={M} N={N} K={K} "
-                    f"with dtype={dtype_str} (a16w16 kernels currently only "
-                    f"accept bf16 input)"
+                    f"with dtype={dtype_str} (supported input dtypes for "
+                    f"this debug tuner are bf16 and fp8)"
                 )
                 tasks_data.append((0, ()))
                 continue
 
             seed = seed + 1
 
-            # gfx1250: restrict the sweep to the per-shape candidate set.
+            # gfx1250: restrict bf16/a16w16 sweep to the per-shape candidate set.
             _gfx1250_sel = (
                 candidate_kids_for_shape(M, N, K, bias_v, cu_num)
-                if _is_gfx1250
+                if (_is_gfx1250 and in_dtype is dtypes.bf16)
                 else None
             )
+
+            # Candidate kid universe for this row.
+            if in_dtype is dtypes.fp8:
+                row_kernel_ids = sorted(a8w8_noscale_all_kernels.keys())
+            else:
+                row_kernel_ids = a16w16_kernel_ids
 
             total_kernel_nums = 0
             # 7-tuple matches self.keys; result_to_df / calculate read
             # bias / dtype / outdtype from slots 4 / 5 / 6.
             info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
 
-            for kid in a16w16_kernel_ids:
+            for kid in row_kernel_ids:
                 # --kid filter (debug): skip everything outside the explicit set.
                 if forced_kids is not None and kid not in forced_kids:
                     continue
@@ -1890,41 +1975,65 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     and kid not in _gfx1250_sel
                 ):
                     continue
-                k_inst = a16w16_all_kernels[kid]
-
-                # Pre-filter kids that can't produce correct output for this shape.
-                if _kid_rejects_shape(k_inst, M, N, K):
-                    if forced_kids is not None and kid in forced_kids:
-                        logger.warning(
-                            f"OpusGemmA16W16Tuner: --kid {kid} rejected "
-                            f"by shape filter for (M={M},N={N},K={K}); skipping"
-                        )
-                    continue
-                # bias=True is only consumed by split-barrier (a16w16) and splitk (a16w16_flatmm_splitk) kids;
-                # flatmm kids reject any non-empty b...
-                if _kid_rejects_bias(k_inst, bias_v):
-                    continue
-                # outdtype filter: the per-arch tune_lookup tables are keyed by (kid, D_C).
-                _OUT_TORCH_TO_CTYPE = {
-                    dtypes.bf16: "bf16_t",
-                    dtypes.fp32: "fp32_t",
-                }
-                _is_splitk_tag = kid in SPLITK_KIDS
-                _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
-                if _kid_rejects_outdtype(k_inst, out_dtype):
-                    continue
-                if (
-                    not _is_splitk_tag
-                    and _need is not None
-                    and _need not in getattr(k_inst, "output_dtypes", [])
-                ):
+                k_inst = opus_all_kernels.get(kid)
+                if k_inst is None:
                     continue
 
-                # SplitK candidate set per shape+kid.
-                if kid in SPLITK_KIDS:
-                    splitK_range = candidate_splitK(M, N, K, batch, cu_num, k_inst)
-                else:
+                if in_dtype is dtypes.fp8:
+                    # a8w8_noscale tuning path.
+                    if k_inst.kernel_tag not in ("a8w8_noscale", "a8w8"):
+                        continue
+                    if bias_v:
+                        if forced_kids is not None and kid in forced_kids:
+                            logger.warning(
+                                f"OpusGemmA16W16Tuner: --kid {kid} rejected "
+                                f"for fp8 row (a8w8_noscale does not support bias)"
+                            )
+                        continue
+                    if out_dtype is not dtypes.fp32:
+                        if forced_kids is not None and kid in forced_kids:
+                            logger.warning(
+                                f"OpusGemmA16W16Tuner: --kid {kid} rejected "
+                                f"for fp8 row (a8w8_noscale requires outdtype=fp32)"
+                            )
+                        continue
                     splitK_range = [0]
+                    run_func = run_opus_gemm_a8w8_noscale_bench
+                else:
+                    # a16w16-family path.
+                    if _kid_rejects_shape(k_inst, M, N, K):
+                        if forced_kids is not None and kid in forced_kids:
+                            logger.warning(
+                                f"OpusGemmA16W16Tuner: --kid {kid} rejected "
+                                f"by shape filter for (M={M},N={N},K={K}); skipping"
+                            )
+                        continue
+                    # bias=True is only consumed by split-barrier (a16w16) and splitk (a16w16_flatmm_splitk) kids;
+                    # flatmm kids reject any non-empty bias.
+                    if _kid_rejects_bias(k_inst, bias_v):
+                        continue
+                    # outdtype filter: the per-arch tune_lookup tables are keyed by (kid, D_C).
+                    _OUT_TORCH_TO_CTYPE = {
+                        dtypes.bf16: "bf16_t",
+                        dtypes.fp32: "fp32_t",
+                    }
+                    _is_splitk_tag = kid in SPLITK_KIDS
+                    _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
+                    if _kid_rejects_outdtype(k_inst, out_dtype):
+                        continue
+                    if (
+                        not _is_splitk_tag
+                        and _need is not None
+                        and _need not in getattr(k_inst, "output_dtypes", [])
+                    ):
+                        continue
+
+                    # SplitK candidate set per shape+kid.
+                    if kid in SPLITK_KIDS:
+                        splitK_range = candidate_splitK(M, N, K, batch, cu_num, k_inst)
+                    else:
+                        splitK_range = [0]
+                    run_func = run_opus_gemm_bench
 
                 for splitK in splitK_range:
                     info = (info_keys, kid, splitK, "")
@@ -1938,7 +2047,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                             info,
                             generate_data,
                             gen_args,
-                            bench_func,
+                            run_func,
                             (opus_data_idx, kid, splitK),
                             perf_kwargs,
                             opus_gemm_ref,
