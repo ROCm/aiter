@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, memref, scf
+from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
