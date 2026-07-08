@@ -1260,7 +1260,26 @@ def gemm2_body_v2(
                 n += 1
         return n
 
-    if const_expr(g2_kstages == 1):
+    # Step 1: shape-gated, fully-unrolled K_TILES=2 straight-line mainloop (a8w4 reduce / bf16 LDS, BM64).
+    # When the compile cap INTER_MAX//BK == 2 the runtime trip is 1 or 2, so we drop the scf.for entirely
+    # and emit two straight-line tile bodies. This removes the C/B loop-carry (load_c_carry/store_c_carry,
+    # cur/nxt B double-buffer, A-scale carry): each tile's B fragments die before the next stream_b_tile,
+    # so cur+nxt B are never simultaneously live -> lower VGPR. A is fully prologue-staged into both slots
+    # (kStages==2, aStages==2, no in-loop A prefetch). When runtime inter_dim spans only 1 tile
+    # (K_TILES_RT==1) tile-1's A/B/A-scale buffer loads clamp OOB->0, a zero MFMA contribution -> correct.
+    straight_line_k2 = is_f8_a and use_reduce and g2_bf16_lds and (BM == 64) and (K_TILES_MAX == 2)
+    if const_expr(straight_line_k2):
+        gpu.barrier()  # A prologue vmem->LDS (both slots) visible before ds-reads
+        for kt in range_constexpr(2):
+            issue_a_ds_read(fx.Int32(kt))  # const slot 0/1 (no runtime mod)
+            bqf, bsf = stream_b_tile(fx.Int32(kt))  # dies after this tile's mfma_cluster
+            sa = load_a_scale_tile(fx.Int32(kt))
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            mfma_cluster(bqf, bsf, sa)
+            rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
+    elif const_expr(g2_kstages == 1):
         # 1-deep pipe: synchronous B load per K-tile.
         for kt_iv, state in range(fx.Index(0), fx.Index(K_TILES_RT), fx.Index(1), init=load_c_carry()):
             store_c_carry(state)

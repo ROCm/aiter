@@ -1246,12 +1246,15 @@ def mxfp4_moe_gemm2(
         raise AssertionError(f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}")
     if D_HIDDEN > HIDDEN_MAX_DEFAULT:
         raise AssertionError(f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX_DEFAULT})")
+    # INTER_MAX caps compile-time B-view / A-scale-LDS bounds; env override lets shapes with small
+    # inter_dim compile a tighter cap (e.g. 512 -> K_TILES_MAX==2) to unlock the straight-line K2 gemm2.
+    inter_max = int(os.environ.get("MXFP4_G2_INTER_MAX", str(INTER_MAX_DEFAULT)))
     launch = get_g2(
         BM,
         use_nt,
         HIDDEN_MAX_DEFAULT,
         epilog,
-        INTER_MAX_DEFAULT,
+        inter_max,
         a_dtype,
         topk=topk,
         SBM=SBM,
@@ -1259,8 +1262,8 @@ def mxfp4_moe_gemm2(
         cu_num=cu_num,
         has_pad=has_pad,
     )
-    if D_INTER > INTER_MAX_DEFAULT:
-        raise AssertionError(f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX_DEFAULT})")
+    if D_INTER > inter_max:
+        raise AssertionError(f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({inter_max})")
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
