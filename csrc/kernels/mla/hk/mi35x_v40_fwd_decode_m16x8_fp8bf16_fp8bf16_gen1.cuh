@@ -60,7 +60,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     constexpr bool kPvAtEnd = (kWarpType == WarpTypeM16x8::LoNoPEWarp);
 
     // Run softmax WITHOUT packed-ALU (v_pk_*) ops if false
-    constexpr bool kSoftmaxUsePk = (kWarpType == WarpTypeM16x8::LoNoPEWarp);
+    constexpr bool kSoftmaxUsePk = kPvAtEnd;
+    constexpr bool kFinalRescaleUsePk = (kPvAtEnd == false);
 
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -305,6 +306,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         comp_t rescale  = 1.0f;
         bool do_rescale = false;
 
+        // Cross-iter deferred strip-3 (lo warps only): Phase A stages strip 3's NoPE
+        // into private LDS + its e8m0 scale into this carried VGPR (an async load that
+        // lands here). The consume (ds_read staging + cvt + store into the KV pong) is
+        // deferred to the NEXT mla_main call's top -- spreading the cvt work off the
+        // busy Phase B. Every non-first lo call runs it (its predecessor always staged
+        // strip 3); the first call's tile-0 strip 3 came from the prologue.
+        uint32_t s3_scale = 0u;
+
         // Helper: resolve the physical KV row for the 32-row tile that begins
         // at tile_start. Returns -1 if the tile is entirely OOB.
         //
@@ -452,6 +461,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             if constexpr(kIsGlobalLast == false)
             {
                 row_kv_ld_next = row_kv_ld_next_next;
+                // Force the (already-resolved) index into a stable VGPR so the compiler
+                // does NOT rematerialise the get_kv_ld_row buffer_load into the prefetch
+                // address path -- that rematerialisation makes the prefetch address
+                // depend on a just-issued load, forcing an s_waitcnt vmcnt(0) that drains
+                // all in-flight vmem. With it held, this iter's index load is long done.
+                asm volatile("" : "+v"(row_kv_ld_next));
 
                 // Lo warps use 2x PV GEMM to hide latency of loading next-next rows.
                 if constexpr(kWarpType == WarpTypeM16x8::LoNoPEWarp)
@@ -474,7 +489,30 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             constexpr uint32_t kStageTileBytes = 8u * kStageWarpBytes; // 8192
             const uintptr_t stage_t0 = p_lds_kv_stage + warp_idx * kStageWarpBytes;
             const uintptr_t stage_t1 = p_lds_kv_stage + kStageTileBytes + warp_idx * kStageWarpBytes;
-            uint32_t scale_s0 = 0u, scale_s1 = 0u;
+            uint32_t scale_s0 = 0u;
+
+            // ---- Deferred strip-3 consume (lo, non-first calls) ----
+            // The PREVIOUS call staged strip 3 (NoPE in slot 1, scale in s3_scale).
+            // Consume it now -- ds_read staging + cvt + store into THIS tile's KV pong
+            // (p_lds_kv_curr, already swapped in) -- so it completes strips 0-3 before
+            // this iter's QK. Runs even on the last/skip iter (still filling curr KV).
+            // Must precede Phase A, which re-stages slot 1 for the next tile.
+            if constexpr((!kIsRopeWarp) && (!kIsFirstIter))
+            {
+                const uintptr_t curr_sub = p_lds_kv_curr + sub_off;
+                hk::u32x4 dw3, dw4;
+                // skip resolve_row_kv_ld
+                kv_manager.template wait_kv_loads<false, /*kVmCnt=*/1>(warp_idx);
+                const hk::u32x4 s3  = kv_manager.template load_staged_kv_carrier<1u>(stage_t0);
+                const float     sf3 = hk_mla::e8m0_to_f32(s3_scale);
+                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+                kv_manager.template cvt_kv_tile_step<0>(dw3, s3, sf3);
+                kv_manager.template cvt_kv_tile_step<1>(dw3, s3, sf3);
+                kv_manager.template cvt_kv_tile_step<2>(dw4, s3, sf3);
+                kv_manager.template cvt_kv_tile_step<3>(dw4, s3, sf3);
+                kv_manager.template store_kv_tile_step<3u, 0u, 0>(curr_sub, warp_idx, dw3);
+                kv_manager.template store_kv_tile_step<3u, 0u, 1>(curr_sub, warp_idx, dw4);
+            }
 
             // Issue NoPE carriers + staging before the barrier so their vmem latency
             // overlaps the barrier wait. NoPE carriers are VGPR-landing; staging DMAs
@@ -488,10 +526,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
                 kv_manager.template prefetch_kv_nope_lds<2u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t0, scale_s0);
-                if constexpr(!kIsRopeWarp) // lo tile 0: strip 3 is also NoPE (staged)
+                // Strip 3 (lo only): stage NoPE into slot 1; its scale lands in the
+                // carried s3_scale. The consume is deferred to the NEXT call's top.
+                if constexpr(!kIsRopeWarp)
                     kv_manager
                         .template prefetch_kv_nope_lds<3u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
-                            warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t1, scale_s1);
+                            warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t1, s3_scale);
             }
 
             // ---- Lo deferred PV (of the PREVIOUS tile) ----
@@ -669,20 +709,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     kv_manager.template store_kv_tile_step<2u, kTile, 1>(next_sub, warp_idx, dw);
                 }
 
-                // Staged strip 3 (lo only; hi strip 3 is the RoPE DMA above).
-                if constexpr(!kIsRopeWarp)
-                {
-                    kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
-                    const hk::u32x4 s3   = kv_manager.template load_staged_kv_carrier<1u>(stage_t0);
-                    const float     sf3  = hk_mla::e8m0_to_f32(scale_s1);
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
-                    kv_manager.template cvt_kv_tile_step<0>(dw, s3, sf3);
-                    kv_manager.template cvt_kv_tile_step<1>(dw, s3, sf3);
-                    kv_manager.template store_kv_tile_step<3u, kTile, 0>(next_sub, warp_idx, dw);
-                    kv_manager.template cvt_kv_tile_step<2>(dw, s3, sf3);
-                    kv_manager.template cvt_kv_tile_step<3>(dw, s3, sf3);
-                    kv_manager.template store_kv_tile_step<3u, kTile, 1>(next_sub, warp_idx, dw);
-                }
+                // Strip 3 (lo) is deferred to the NEXT call's top (see above); hi's
+                // strip 3 is the RoPE DMA issued at Phase B start.
             }
 
             // ---- Update row_kv_ld_next_next for the call AFTER this one ----
@@ -795,6 +823,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 7, k_p_comp_begin + 14>();
             }
 
+            __builtin_amdgcn_s_setprio(1);
+
             // ---- oaccu rescale + PV GEMM ----
             //
             if constexpr(kPvAtEnd && (kSkipCompute == false))
@@ -847,7 +877,19 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 }
 
                 const comp_t reci_row_sum_e = 1.0f / row_sum_e;
-                hk::mul_vgpr(oaccu, oaccu, reci_row_sum_e);
+                // hk::mul_vgpr generates v_pk_mul; the de-packed sweep generates v_mul.
+                if constexpr(kFinalRescaleUsePk)
+                {
+                    hk::mul_vgpr(oaccu, oaccu, reci_row_sum_e);
+                }
+                else
+                {
+                    opus::static_for<R::k_o_sz>([reci_row_sum_e](auto i) {
+                        asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]"
+                                     :
+                                     : "n"(k_o_begin + i.value), "v"(reci_row_sum_e));
+                    });
+                }
 
                 const uintptr_t p_lds_o             = p_lds_kv_next;
                 // Output is 512 cols regardless of kBlockN: each pair writes 16 oaccu

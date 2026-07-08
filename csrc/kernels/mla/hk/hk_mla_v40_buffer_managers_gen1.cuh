@@ -1561,7 +1561,7 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
     {
         constexpr uint32_t kImmOffset = kSlot * kStageSlotBytes;
         uint32_t lane_idx = opus::lane_id();
-        asm volatile("" : "+v"(lane_idx));
+        asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten staged-read lane live range
         return hkm::ds_read_b128<hk::u32x4>(
             static_cast<uint32_t>(p_lds_stage_base + lane_idx * 16u), kImmOffset);
     }
