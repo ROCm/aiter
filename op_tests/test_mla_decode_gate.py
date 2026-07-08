@@ -12,6 +12,7 @@ bf16/bf16 nhead=16 qseqlen=1 profile; anything out of scope returns True.
 CI runs this via ``python3 op_tests/test_mla_decode_gate.py`` (also
 pytest-collectable).
 """
+
 import os
 
 import pytest
