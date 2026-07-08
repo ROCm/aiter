@@ -1671,7 +1671,39 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             else:
                 dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
             bpes = self._bpes_from_dtype_strs(dtype_str, outdtype_str)
-        return super().calculate(results, bpes=bpes)
+
+        info, time, _err = results
+        if (
+            time is None
+            or time == self.INVALID_TIME
+            or time == self.INF_TIME
+            or time <= 0
+        ):
+            return 0, 0
+
+        row_key = info[0]
+        # Opus key layout is legacy/non-gfx:
+        #   (cu_num, M, N, K, bias, dtype, outdtype)
+        # Keep compatibility with older 4/6-key layouts.
+        if len(row_key) >= 4:
+            _cu_num, M, N, K, *_rest = row_key
+        else:
+            return 0, 0
+
+        M = int(M)
+        N = int(N)
+        K = int(K)
+        flop = M * N * K * 2
+        tflops = round(flop / (time * 1_000_000), 2)
+
+        lhs_bpe, rhs_bpe, out_bpe = bpes
+        bw = round(
+            (M * K * lhs_bpe + N * K * rhs_bpe + M * N * out_bpe)
+            / (time * 1e-6)
+            / 1e9,
+            2,
+        )
+        return tflops, bw
 
     def result_to_df(self, results):
         rows = []
