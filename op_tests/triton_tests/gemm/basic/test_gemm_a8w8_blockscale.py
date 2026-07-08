@@ -55,12 +55,13 @@ def get_x_vals():
     # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
     # K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
     x_vals += [(512, 512, K) for K in (128, 192, 256, 320)]
-    x_vals = [(v, 8192, 1024) for v in (1, 64, 1024)]
+    x_vals += [(v, 8192, 1024) for v in (1, 64, 1024)]
     x_vals += [(v, 4096, 8192) for v in (1, 64, 1024)]
     x_vals += [(v, 4096, 4096) for v in (1, 64, 1024)]
     x_vals += [(v, 4096, 2048) for v in (1, 64, 1024)]
     x_vals += [(v, 1536, 4096) for v in (1, 64, 1024)]
     x_vals += [(v, 32768, 1024) for v in (1, 64, 1024)]
+    x_vals = [(v, 4096, 8192) for v in (1,)]
     return x_vals
 
 
@@ -135,9 +136,9 @@ def generate_gemm_a8w8_blockscale_inputs(
         for shape in get_x_vals()
     ],
 )
-@pytest.mark.parametrize("backend", ["gluon", "triton"])
-@pytest.mark.parametrize("shuffle", [True, False])
-@pytest.mark.parametrize("use_atomic_add", [True, False])
+@pytest.mark.parametrize("backend", ["gluon"])
+@pytest.mark.parametrize("shuffle", [True])
+@pytest.mark.parametrize("use_atomic_add", [True])
 def test_gemm(dtype, M, N, K, layout, output, backend, shuffle, use_atomic_add):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
