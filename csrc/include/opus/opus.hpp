@@ -1479,9 +1479,9 @@ OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) 
 
 // entry point for vectorized cast(), non-dpacks
 template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && !is_packs_v<D> && !is_packs_v<get_value_t<S>>)
-    && !(is_any_of_v<S, bf16x2_t, bf16x4_t>&& std::is_same_v<D, fp8_t >)
-    && !(is_any_of_v<S, fp32x2_t, fp32x4_t>&& std::is_same_v<D, fp8_t >)
-    && !(is_any_of_v<S, fp8x2_t , fp8x4_t >&& std::is_same_v<D, fp32_t>)
+    && !(is_any_of_v<S, bf16x2_t, bf16x4_t> && std::is_same_v<D, fp8_t >)
+    && !(is_any_of_v<S, fp32x2_t, fp32x4_t> && std::is_same_v<D, fp8_t >)
+    && !(is_any_of_v<S, fp8x2_t , fp8x4_t > && std::is_same_v<D, fp32_t>)
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x4N
@@ -3489,16 +3489,6 @@ struct tiled_mma_adaptor : public MMA_ {
         return c_;
     }
 
-    // Tiled per-sub-MFMA iteration with COMPILE-TIME (i_m, i_n, i_k) indices.
-    template<typename VA, typename VB, typename Fn>
-    OPUS_D constexpr void for_each_sub(const VA& a, const VB& b, Fn&& fn) const {
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            fn(i_m, i_n, i_k,
-               a[i_m.value * EXPAND_K + i_k.value],
-               b[i_n.value * EXPAND_K + i_k.value]);
-        });
-    }
-
     template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
@@ -3631,9 +3621,44 @@ struct tiled_mma_adaptor : public MMA_ {
 
     OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
+
+template<typename MMA_, index_t EXPAND_M, index_t EXPAND_N, index_t EXPAND_K, index_t TILE_M, index_t TILE_N, index_t TILE_K>
+struct mxfp_scaled_tiled_mma_adaptor : public tiled_mma_adaptor<MMA_, EXPAND_M, EXPAND_N, EXPAND_K, TILE_M, TILE_N, TILE_K> {
+    using base = tiled_mma_adaptor<MMA_, EXPAND_M, EXPAND_N, EXPAND_K, TILE_M, TILE_N, TILE_K>;
+    using MMA = typename base::MMA;
+    using vtype_mma_a = typename MMA::vtype_a;
+    using vtype_mma_b = typename MMA::vtype_b;
+    using vtype_mma_c = typename MMA::vtype_c;
+    using base::operator();
+
+    // Scaled f8f6f4 tiled MFMA with per-sub-MFMA E8M0 selectors from packed scale words.
+    template<typename VA, typename VB, typename VC, typename ScaleA, typename ScaleB,
+             index_t scale_op_sel_a_base = 0, index_t scale_op_sel_b_base = scale_op_sel_a_base, index_t c_n_base = 0,
+             std::enable_if_t<is_array_v<remove_cvref_t<ScaleA>> && is_array_v<remove_cvref_t<ScaleB>>, bool> = true>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, const ScaleA& scale_a, const ScaleB& scale_b,
+                                     number<scale_op_sel_a_base> = {}, number<scale_op_sel_b_base> = {}, number<c_n_base> = {}) const {
+        constexpr index_t C_N = size<VC>() / EXPAND_M;
+        static_assert(EXPAND_K == 1 && size<VA>() == EXPAND_M && size<VB>() == EXPAND_N);
+        static_assert(size<VC>() == EXPAND_M * C_N && c_n_base + EXPAND_N <= C_N);
+        static_assert(size<ScaleA>() == EXPAND_M && size<ScaleB>() >= (c_n_base + EXPAND_N + 1) / 2);
+
+        VC c_ {c};
+        static_ford<EXPAND_M, EXPAND_N>([&](auto i_m, auto i_n){
+            constexpr index_t i_c_n = c_n_base + i_n.value;
+            constexpr index_t i_c = i_m.value * C_N + i_c_n;
+            c_[i_c] = MMA{}(a[i_m.value], b[i_n.value], c_[i_c], scale_a[i_m.value], scale_b[i_c_n / 2],
+                            number<scale_op_sel_a_base + (i_m.value & 1)>{},
+                            number<scale_op_sel_b_base + (i_c_n & 1)>{});
+        });
+        return c_;
+    }
+};
 }
 struct tiled_mma_adaptor {
     template<typename MMA, index_t... Ts> OPUS_D decltype(auto) operator()(MMA&&, number<Ts>...) { return impl::tiled_mma_adaptor<remove_cvref_t<MMA>, Ts...>{};}
+};
+struct mxfp_scaled_tiled_mma_adaptor {
+    template<typename MMA, index_t... Ts> OPUS_D decltype(auto) operator()(MMA&&, number<Ts>...) { return impl::mxfp_scaled_tiled_mma_adaptor<remove_cvref_t<MMA>, Ts...>{};}
 };
 
 template<typename MMA, index_t E_M, index_t E_N, index_t E_K, index_t T_M, index_t T_N, index_t T_K, typename A = tiled_mma_adaptor>

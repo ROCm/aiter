@@ -7,8 +7,8 @@
 #include "../opus_moe_common.cuh"
 #include "aiter_hip_common.h"
 
-constexpr int kOpusMoeStage2RouteOutputReduceBf16BlockN =
-    opus_moe::kStage2RouteOutputReduceBf16BlockN;
+constexpr int kOpusMoeStage2RouteOutputReduceSmallBlockN =
+    opus_moe::kStage2RouteOutputReduceSmallBlockN;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultBlockN =
     opus_moe::kStage2RouteOutputReduceDefaultBlockN;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultThreads =
@@ -78,9 +78,9 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_dispatch_block_n_gfx9
 {
     switch(block_n)
     {
-    case kOpusMoeStage2RouteOutputReduceBf16BlockN:
+    case kOpusMoeStage2RouteOutputReduceSmallBlockN:
         opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950<
-            kOpusMoeStage2RouteOutputReduceBf16BlockN,
+            kOpusMoeStage2RouteOutputReduceSmallBlockN,
             kOpusMoeStage2RouteOutputReduceDefaultThreads,
             TOPK>(kargs, grid, stream);
         break;

@@ -14,7 +14,6 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
 namespace {
@@ -322,7 +321,7 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.sorted_expert_ids =
         reinterpret_cast<const int32_t*>(sorted_expert_ids.data_ptr());
     kargs.num_valid_ids = reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
-    kargs.out_bf16 = reinterpret_cast<hip_bfloat16*>(out.data_ptr());
+    kargs.out_bf16 = reinterpret_cast<opus_moe_bf16_t*>(out.data_ptr());
     kargs.stride_a_t = inter_states.stride(0);
     kargs.stride_a_k = inter_states.stride(1);
     kargs.stride_w_e = w2.stride(0);
@@ -405,7 +404,7 @@ void opus_moe_stage2_reduce_token_slot_route_output_fwd(aiter_tensor_t& route_ou
 
     opus_moe_stage2_route_reduce_kargs kargs{};
     kargs.route_out = reinterpret_cast<const uint8_t*>(route_out.data_ptr());
-    kargs.out_bf16 = reinterpret_cast<hip_bfloat16*>(out.data_ptr());
+    kargs.out_bf16 = reinterpret_cast<opus_moe_bf16_t*>(out.data_ptr());
     kargs.token_num = token_num;
     kargs.topk = actual_topk;
     kargs.model_dim = model_dim;

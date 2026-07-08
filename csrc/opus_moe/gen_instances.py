@@ -56,11 +56,11 @@ A8W4_ROUTE_REDUCE_KERNEL = (
     "opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950"
 )
 A8W4_ROUTE_REDUCE_TOPK_SPECIALIZATIONS = (0, 4, 6, 8)
-A8W4_ROUTE_REDUCE_BF16_BLOCK_N = 2048
+A8W4_ROUTE_REDUCE_SMALL_BLOCK_N = 2048
 A8W4_ROUTE_REDUCE_DEFAULT_BLOCK_N = 4096
 A8W4_ROUTE_REDUCE_DEFAULT_THREADS = 256
 A8W4_ROUTE_REDUCE_DEFAULT_INSTANCES = (
-    (A8W4_ROUTE_REDUCE_BF16_BLOCK_N, A8W4_ROUTE_REDUCE_DEFAULT_THREADS),
+    (A8W4_ROUTE_REDUCE_SMALL_BLOCK_N, A8W4_ROUTE_REDUCE_DEFAULT_THREADS),
     (A8W4_ROUTE_REDUCE_DEFAULT_BLOCK_N, A8W4_ROUTE_REDUCE_DEFAULT_THREADS),
 )
 
@@ -132,13 +132,13 @@ def _route_reduce_instantiation_rows() -> list[tuple[int, int]]:
     return list(dict.fromkeys(rows))
 
 
-def _a8w4_device_tu_contents(impl_name: str, traits_alias: str) -> str:
+def _a8w4_device_tu_contents(traits_alias: str, traits_type: str) -> str:
     return (
         "// SPDX-License-Identifier: MIT\n"
         "// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.\n"
         "// Auto-generated A8W4 decode device TU; do not edit.\n"
-        '#include "opus/hip_minimal.hpp"\n'
-        f'#include "impl/{impl_name}"\n'
+        f'#include "{A8W4_PIPELINE_HEADER}"\n'
+        f"using {traits_alias} = {traits_type};\n"
         f"template __global__ void {A8W4_KERNEL_FUNC}<{traits_alias}>(\n"
         "    opus_moe_stage2_a8w4_kargs);\n"
     )
@@ -167,6 +167,8 @@ class OpusMoeCodegen:
         self.instances_path = working_path / "instances"
 
     def _prepare_dirs(self) -> None:
+        for obsolete in ("opus_moe_stage2_manifest.h",):
+            (self.working_path / obsolete).unlink(missing_ok=True)
         for path in (self.impl_path, self.instances_path):
             if path.exists():
                 shutil.rmtree(path)
@@ -183,7 +185,7 @@ class OpusMoeCodegen:
 // Auto-generated A8W4 stage2 launcher impl; do not edit.
 #pragma once
 
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__) && !defined(HIP_MINIMAL_HPP)
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "aiter_hip_common.h"
 #endif
 
@@ -197,7 +199,7 @@ __global__ void {A8W4_KERNEL_FUNC}(opus_moe_stage2_a8w4_kargs kargs);
 
 using {traits_alias} = {traits_type};
 
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__) && !defined(HIP_MINIMAL_HPP)
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 void {launcher}(const opus_moe_stage2_a8w4_kargs& kargs, hipStream_t stream)
 {{
     using Traits = {traits_alias};
@@ -251,8 +253,8 @@ void {launcher}(const opus_moe_stage2_a8w4_kargs& kargs, hipStream_t stream)
         for kid in sorted(STAGE2_A8W4_KERNELS):
             (self.instances_path / f"{_a8w4_launcher_name(kid)}.device.cu").write_text(
                 _a8w4_device_tu_contents(
-                    _a8w4_impl_filename(kid),
                     _a8w4_traits_alias(kid),
+                    _a8w4_traits_type(STAGE2_A8W4_KERNELS[kid]),
                 ),
                 encoding="utf-8",
             )
@@ -263,7 +265,6 @@ void {launcher}(const opus_moe_stage2_a8w4_kargs& kargs, hipStream_t stream)
             "// SPDX-License-Identifier: MIT\n",
             "// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.\n",
             "// Auto-generated route-reduce device TU (gfx950); do not edit.\n",
-            '#include "opus/hip_minimal.hpp"\n',
             f'#include "{A8W4_ROUTE_REDUCE_HEADER}"\n',
         ]
         for block_n, threads in rows:
@@ -435,8 +436,8 @@ def _emit_a8w4_meta_header() -> str:
             f"{k.scale_words_per_group_pack};\n",
             f"constexpr int kStage2A8W4DecodeCVec = {k.c_vec};\n",
             f"constexpr int kStage2A8W4DecodeCValuesPerAtomic = {k.c_values_per_atomic};\n",
-            "constexpr int kStage2RouteOutputReduceBf16BlockN = "
-            f"{A8W4_ROUTE_REDUCE_BF16_BLOCK_N};\n",
+            "constexpr int kStage2RouteOutputReduceSmallBlockN = "
+            f"{A8W4_ROUTE_REDUCE_SMALL_BLOCK_N};\n",
             "constexpr int kStage2RouteOutputReduceDefaultBlockN = "
             f"{A8W4_ROUTE_REDUCE_DEFAULT_BLOCK_N};\n",
             "constexpr int kStage2RouteOutputReduceDefaultThreads = "

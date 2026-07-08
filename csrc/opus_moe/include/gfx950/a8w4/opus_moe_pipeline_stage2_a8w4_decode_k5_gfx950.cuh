@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-// K5 generic loop schedule for non-K3 bring-up; instantiated from shared load/compute helpers.
+// K5 loop schedule for non-production bring-up; instantiated from shared load/compute helpers.
 #pragma once
 
 #include "opus_moe_pipeline_stage2_a8w4_decode_policy_gfx950.cuh"
@@ -9,8 +9,6 @@
 #include "opus/opus.hpp"
 
 template<typename T,
-         typename V_A,
-         typename V_B,
          typename LayoutA,
          typename LayoutASmem,
          typename SmemA,
@@ -18,7 +16,7 @@ template<typename T,
          typename GmemAScale,
          typename GmemWScale,
          typename ComputeKTile>
-inline __device__ void opus_moe_stage2_a8w4_decode_run_generic_schedule_gfx950(
+inline __device__ void opus_moe_stage2_a8w4_decode_run_k5_schedule_gfx950(
     int col_base,
     const LayoutA& u_ga,
     const LayoutASmem& u_sa,
@@ -34,6 +32,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_generic_schedule_gfx950(
 {
     using namespace opus;
 
+    static_assert(T::K_TILES == 5);
+
     static_for<T::K_TILES>([&](auto kt) {
         opus_moe_stage2_a8w4_decode_issue_a<T>(
             u_ga, u_sa, s_a, g_a, a_base, wave_id_n, kt, kt.value * T::K_STEP_PACKED);
@@ -48,8 +48,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_generic_schedule_gfx950(
             col_base * T::B_PAYLOAD_ROW_STRIDE_BYTES +
             k_tile0 * T::K_STEP_PACKED * T::B_PAYLOAD_K_STRIDE_BYTES;
 
-        int b_scale[T::HALF_N_MFMA_PER_WAVE];
-        int a_scale[T::M_MFMA_PER_WAVE];
+        opus::array<int, T::HALF_N_MFMA_PER_WAVE> b_scale;
+        opus::array<int, T::M_MFMA_PER_WAVE> a_scale;
         opus_moe_stage2_a8w4_decode_load_b_scale<T>(
             g_w_scale, b_scale_base_word, scale_word_base, b_scale);
         opus_moe_stage2_a8w4_decode_load_a_scale<T>(

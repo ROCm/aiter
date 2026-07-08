@@ -13,13 +13,13 @@
 static __device__ __forceinline__ void
 opus_moe_stage2_route_reduce_accum_bf16x4(float* acc, int base, uint64_t packed)
 {
-    const hip_bfloat16 v0 =
+    const opus_moe_bf16_t v0 =
         opus_moe_gfx950_bf16_from_bits(static_cast<uint16_t>(packed));
-    const hip_bfloat16 v1 =
+    const opus_moe_bf16_t v1 =
         opus_moe_gfx950_bf16_from_bits(static_cast<uint16_t>(packed >> 16));
-    const hip_bfloat16 v2 =
+    const opus_moe_bf16_t v2 =
         opus_moe_gfx950_bf16_from_bits(static_cast<uint16_t>(packed >> 32));
-    const hip_bfloat16 v3 =
+    const opus_moe_bf16_t v3 =
         opus_moe_gfx950_bf16_from_bits(static_cast<uint16_t>(packed >> 48));
     acc[base + 0] += static_cast<float>(v0);
     acc[base + 1] += static_cast<float>(v1);
@@ -60,7 +60,7 @@ struct OpusMoeStage2RouteReduceMxFp8View
 
 struct OpusMoeStage2RouteReduceBf16RouteView
 {
-    const hip_bfloat16* __restrict__ route_out;
+    const opus_moe_bf16_t* __restrict__ route_out;
     int64_t route_stride;
 
     __device__ __forceinline__ uint64_t load_x4(int route_row, int col) const
@@ -69,7 +69,7 @@ struct OpusMoeStage2RouteReduceBf16RouteView
             route_out + static_cast<int64_t>(route_row) * route_stride + col);
     }
 
-    __device__ __forceinline__ hip_bfloat16 load(int route_row, int col) const
+    __device__ __forceinline__ opus_moe_bf16_t load(int route_row, int col) const
     {
         return route_out[static_cast<int64_t>(route_row) * route_stride + col];
     }
@@ -77,7 +77,7 @@ struct OpusMoeStage2RouteReduceBf16RouteView
 
 struct OpusMoeStage2RouteReduceBf16OutView
 {
-    hip_bfloat16* __restrict__ out;
+    opus_moe_bf16_t* __restrict__ out;
     int64_t out_stride;
 
     __device__ __forceinline__ void store_x4(int token, int col, uint64_t packed) const
@@ -86,7 +86,7 @@ struct OpusMoeStage2RouteReduceBf16OutView
             out + static_cast<int64_t>(token) * out_stride + col) = packed;
     }
 
-    __device__ __forceinline__ void store(int token, int col, hip_bfloat16 value) const
+    __device__ __forceinline__ void store(int token, int col, opus_moe_bf16_t value) const
     {
         out[static_cast<int64_t>(token) * out_stride + col] = value;
     }
@@ -171,7 +171,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
         static_assert(elems_per_thread % 4 == 0);
         constexpr int groups_per_thread = elems_per_thread / 4;
         const OpusMoeStage2RouteReduceBf16RouteView route_view{
-            reinterpret_cast<const hip_bfloat16*>(kargs.route_out), kargs.stride_route_out_t};
+            reinterpret_cast<const opus_moe_bf16_t*>(kargs.route_out), kargs.stride_route_out_t};
         const OpusMoeStage2RouteReduceBf16OutView out_view{
             kargs.out_bf16, kargs.stride_o_t};
         if(col_end <= kargs.model_dim)
@@ -292,7 +292,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
                 if(tail < scalar_tail)
                 {
                     const int col = col_base + j;
-                    const hip_bfloat16 value = route_view.load(route_row, col);
+                    const opus_moe_bf16_t value = route_view.load(route_row, col);
                     acc[j] += static_cast<float>(value);
                 }
             }

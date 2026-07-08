@@ -172,7 +172,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_load_a(
     const LayoutASmem& u_sa,
     SmemA& s_a,
     Stage stage,
-    V_A (&v_a)[T::M_MFMA_PER_WAVE])
+    opus::array<V_A, T::M_MFMA_PER_WAVE>& v_a)
 {
     constexpr int StageValue = decltype(stage)::value;
     static_assert(StageValue >= 0 && StageValue < T::A_LDS_STAGES);
@@ -207,7 +207,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_load_b_half(
     int wave_scalar_base,
     NHalf n_half,
     int tile_base,
-    V_B (&v_b)[T::HALF_N_MFMA_PER_WAVE])
+    opus::array<V_B, T::HALF_N_MFMA_PER_WAVE>& v_b)
 {
     constexpr int NHalfValue = decltype(n_half)::value;
     opus::static_for<T::HALF_N_MFMA_PER_WAVE>([&](auto local_ni) {
@@ -232,7 +232,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_load_a_scale(
     GmemAScale& g_a_scale,
     const int* __restrict__ a_scale_base_word,
     int k_group_word_base,
-    int (&a_scale)[T::M_MFMA_PER_WAVE])
+    opus::array<int, T::M_MFMA_PER_WAVE>& a_scale)
 {
     opus::static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
         const int word_offset = a_scale_base_word[mi.value] + k_group_word_base;
@@ -249,7 +249,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_load_b_scale(
     GmemWScale& g_w_scale,
     int b_scale_base_word,
     int k_group_word_base,
-    int (&b_scale)[T::HALF_N_MFMA_PER_WAVE])
+    opus::array<int, T::HALF_N_MFMA_PER_WAVE>& b_scale)
 {
     opus::static_for<T::HALF_N_MFMA_PER_WAVE>([&](auto pair) {
         const int word_offset =
@@ -263,23 +263,23 @@ inline __device__ void opus_moe_stage2_a8w4_decode_load_b_scale(
     });
 }
 
-// Scaled tiled MFMA over one N-half of the wave tile.
 template<typename T,
-         typename Mma,
+         typename TiledMma,
          typename ScalePair,
          typename NHalf,
          typename V_A,
          typename V_B>
 inline __device__ void opus_moe_stage2_a8w4_decode_compute_scaled_half(
-    Mma& mma,
+    TiledMma& tiled_mma,
     int wave_id_m,
-    typename Mma::vtype_c (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
+    opus::array<typename TiledMma::vtype_mma_c,
+                T::M_MFMA_PER_WAVE * T::N_MFMA_PER_WAVE>& v_c,
     ScalePair scale_pair,
     NHalf n_half,
-    const V_A (&v_a)[T::M_MFMA_PER_WAVE],
-    const int (&a_scale)[T::M_MFMA_PER_WAVE],
-    const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
-    const V_B (&v_b)[T::HALF_N_MFMA_PER_WAVE])
+    const opus::array<V_A, T::M_MFMA_PER_WAVE>& v_a,
+    const opus::array<int, T::M_MFMA_PER_WAVE>& a_scale,
+    const opus::array<int, T::HALF_N_MFMA_PER_WAVE>& b_scale,
+    const opus::array<V_B, T::HALF_N_MFMA_PER_WAVE>& v_b)
 {
     using namespace opus;
 
@@ -288,43 +288,31 @@ inline __device__ void opus_moe_stage2_a8w4_decode_compute_scaled_half(
     static_assert(ScalePairValue == 0 || ScalePairValue == 1);
     static_assert(NHalfValue == 0 || NHalfValue == 1);
 
-    // Half-N sub-tile: expand M/N only; tile dims are unused by for_each_sub.
-    auto tiled = make_tiled_mma(mma,
-                                number<T::M_MFMA_PER_WAVE>{},
-                                number<T::HALF_N_MFMA_PER_WAVE>{},
-                                number<1>{},
-                                number<1>{},
-                                number<1>{},
-                                number<1>{});
-    tiled.for_each_sub(v_a, v_b,
-        [&](auto i_m, auto i_n, auto, const auto& s_a, const auto& s_b) {
-            constexpr int mi = i_m.value;
-            constexpr int ni = NHalfValue * T::HALF_N_MFMA_PER_WAVE + i_n.value;
-            constexpr int b_sel = ScalePairValue * 2 + (ni & 1);
-            constexpr int b_scale_index = ni / 2;
-            if constexpr(T::M_MFMA_PER_WAVE == 1 && T::T_M == 2)
-            {
-                constexpr int a_sel_base = ScalePairValue * 2;
-                if(wave_id_m == 0)
-                    v_c[mi][ni] = mma(s_a, s_b, v_c[mi][ni], a_scale[mi],
-                                      b_scale[b_scale_index],
-                                      number<a_sel_base>{}, number<b_sel>{});
-                else
-                    v_c[mi][ni] = mma(s_a, s_b, v_c[mi][ni], a_scale[mi],
-                                      b_scale[b_scale_index],
-                                      number<a_sel_base + 1>{}, number<b_sel>{});
-            }
-            else
-            {
-                constexpr int a_sel = ScalePairValue * 2 + (mi & 1);
-                v_c[mi][ni] = mma(s_a, s_b, v_c[mi][ni], a_scale[mi],
-                                  b_scale[b_scale_index],
-                                  number<a_sel>{}, number<b_sel>{});
-            }
-        });
+    constexpr int ScaleSelectorBase = ScalePairValue * 2;
+    constexpr int NBase = NHalfValue * T::HALF_N_MFMA_PER_WAVE;
+    constexpr bool UseRuntimeASelector = T::M_MFMA_PER_WAVE == 1 && T::T_M == 2;
+
+    if constexpr(UseRuntimeASelector)
+    {
+        if(wave_id_m == 0)
+        {
+            v_c = tiled_mma(v_a, v_b, v_c, a_scale, b_scale,
+                            number<ScaleSelectorBase>{}, number<ScaleSelectorBase>{}, number<NBase>{});
+        }
+        else
+        {
+            v_c = tiled_mma(v_a, v_b, v_c, a_scale, b_scale,
+                            number<ScaleSelectorBase + 1>{}, number<ScaleSelectorBase>{}, number<NBase>{});
+        }
+    }
+    else
+    {
+        v_c = tiled_mma(v_a, v_b, v_c, a_scale, b_scale,
+                        number<ScaleSelectorBase>{}, number<ScaleSelectorBase>{}, number<NBase>{});
+    }
 }
 
-// K5 generic schedule is included after the shared helpers it calls.
+// K5 schedule is included after the shared helpers it calls.
 #include "opus_moe_pipeline_stage2_a8w4_decode_k5_gfx950.cuh"
 
 // Tile mapping: baseline m-fast by default, with optional SWIZZLE_C windowed XCD swizzle.
@@ -496,16 +484,13 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
 }
 
-// Epilogue: direct atomic output or route-out store.
-using opus_moe_stage2_a8w4_decode_u32x4_store_t = opus::vector_t<uint32_t, 4>;
-
 struct OpusMoeStage2A8W4DecodeCShuffleSmem
 {
     uint32_t* __restrict__ pair;
 
-    inline __device__ void store_bf16(int scalar_idx, hip_bfloat16 value)
+    inline __device__ void store_bf16(int scalar_idx, opus_moe_bf16_t value)
     {
-        reinterpret_cast<hip_bfloat16*>(pair)[scalar_idx] = value;
+        reinterpret_cast<opus_moe_bf16_t*>(pair)[scalar_idx] = value;
     }
 
     inline __device__ uint32_t load_pair(int pair_idx)
@@ -513,7 +498,7 @@ struct OpusMoeStage2A8W4DecodeCShuffleSmem
         return pair[pair_idx];
     }
 
-    inline __device__ opus_moe_stage2_a8w4_decode_u32x4_store_t load_pair4(
+    inline __device__ opus_moe_stage2_a8w4_decode_u32x4_t load_pair4(
         int pair_idx)
     {
         return {pair[pair_idx + 0],
@@ -525,7 +510,7 @@ struct OpusMoeStage2A8W4DecodeCShuffleSmem
 
 template<typename T, typename CAcc>
 inline __device__ void opus_moe_stage2_a8w4_decode_write_acc_to_smem(
-    CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
+    opus::array<CAcc, T::M_MFMA_PER_WAVE * T::N_MFMA_PER_WAVE>& v_c,
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     const float* __restrict__ smem_weight,
     OpusMoeStage2A8W4DecodeCShuffleSmem& c_smem)
@@ -538,10 +523,11 @@ inline __device__ void opus_moe_stage2_a8w4_decode_write_acc_to_smem(
             const float weight = smem_weight[local_m];
             static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
                 const int local_col = c_layout.acc_local_col(ni.value);
+                constexpr int c_idx = mi.value * T::N_MFMA_PER_WAVE + ni.value;
                 c_smem.store_bf16(
                     c_layout.smem_scalar_index(local_m, local_col),
                     opus_moe_gfx950_cvt_bf16_f32(
-                        static_cast<float>(v_c[mi.value][ni.value][ii.value]) *
+                        static_cast<float>(v_c[c_idx][ii.value]) *
                         weight));
             });
         });
@@ -550,7 +536,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_write_acc_to_smem(
 
 template<typename T, typename CAcc>
 inline __device__ void opus_moe_stage2_a8w4_decode_store_acc_to_cshuffle(
-    CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
+    opus::array<CAcc, T::M_MFMA_PER_WAVE * T::N_MFMA_PER_WAVE>& v_c,
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     const float* __restrict__ smem_weight,
     uint32_t* __restrict__ smem_c_pair)
@@ -683,7 +669,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
     const int32_t* __restrict__ smem_route_base,
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     int col_base,
-    hip_bfloat16* __restrict__ out,
+    opus_moe_bf16_t* __restrict__ out,
     int64_t output_row_stride)
 {
     opus_moe_stage2_a8w4_decode_store_route_out_groups<T>(
@@ -692,14 +678,14 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
         c_layout,
         [&](int route_row,
             int col0,
-            opus_moe_stage2_a8w4_decode_u32x4_store_t pairs) {
-            hip_bfloat16* row_ptr =
+            opus_moe_stage2_a8w4_decode_u32x4_t pairs) {
+            opus_moe_bf16_t* row_ptr =
                 out + static_cast<int64_t>(route_row) * output_row_stride +
                 col_base + col0;
             auto* row_pair = reinterpret_cast<uint32_t*>(row_ptr);
             __builtin_nontemporal_store(
                 pairs,
-                reinterpret_cast<opus_moe_stage2_a8w4_decode_u32x4_store_t*>(
+                reinterpret_cast<opus_moe_stage2_a8w4_decode_u32x4_t*>(
                     row_pair));
         });
 }
@@ -711,7 +697,7 @@ struct OpusMoeStage2A8W4DecodeMxFp8Group
 };
 
 inline __device__ uint32_t opus_moe_stage2_a8w4_decode_bf16_pair4_amax_bits(
-    opus_moe_stage2_a8w4_decode_u32x4_store_t pairs)
+    opus_moe_stage2_a8w4_decode_u32x4_t pairs)
 {
     uint32_t amax_bits = 0; // 15-bit bf16 magnitude
     amax_bits = max(amax_bits, max(pairs[0] & 0x7fffu, (pairs[0] >> 16) & 0x7fffu));
@@ -739,7 +725,7 @@ inline __device__ float opus_moe_stage2_a8w4_decode_mxfp8_scale_from_e8m0(
 
 inline __device__ opus::u8x8_t
 opus_moe_stage2_a8w4_decode_bf16_pair4_to_fp8x8(
-    opus_moe_stage2_a8w4_decode_u32x4_store_t pairs,
+    opus_moe_stage2_a8w4_decode_u32x4_t pairs,
     float scale)
 {
     const opus::u64_t bf16_0123_bits =
@@ -760,15 +746,15 @@ opus_moe_stage2_a8w4_decode_bf16_pair4_to_fp8x8(
 
 inline __device__ OpusMoeStage2A8W4DecodeMxFp8Group
 opus_moe_stage2_a8w4_decode_bf16_pair4_to_mxfp8(
-    opus_moe_stage2_a8w4_decode_u32x4_store_t pairs)
+    opus_moe_stage2_a8w4_decode_u32x4_t pairs)
 {
     const uint32_t amax_bits =
         opus_moe_stage2_a8w4_decode_bf16_pair4_amax_bits(pairs);
-    const int E =
+    const int e8m0 =
         opus_moe_stage2_a8w4_decode_mxfp8_e8m0_from_amax_bits(amax_bits);
-    const float scale = opus_moe_stage2_a8w4_decode_mxfp8_scale_from_e8m0(E);
+    const float scale = opus_moe_stage2_a8w4_decode_mxfp8_scale_from_e8m0(e8m0);
     return {opus_moe_stage2_a8w4_decode_bf16_pair4_to_fp8x8(pairs, scale),
-            static_cast<opus::u8_t>(E)};
+            static_cast<opus::u8_t>(e8m0)};
 }
 
 // MXFP8 route_out: fp8 e4m3 data + per-8-col e8m0 scale in one row.
@@ -780,7 +766,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     int col_base,
     RouteOutGmem& route_out_gmem,
     int64_t row_stride_bytes,
-    int scale_col_off)
+    int scale_col_offset)
 {
     static_assert(T::B_N == T::C_LDS_N);
     static_assert(!T::DIRECT_ATOMIC_OUT);
@@ -792,9 +778,9 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
         c_layout,
         [&](int route_row,
             int col0,
-            opus_moe_stage2_a8w4_decode_u32x4_store_t pairs) {
+            opus_moe_stage2_a8w4_decode_u32x4_t pairs) {
             const int data_col = col_base + col0;
-            const int scale_col = scale_col_off + (data_col >> 3);
+            const int scale_col = scale_col_offset + (data_col >> 3);
             const auto mxfp8_group =
                 opus_moe_stage2_a8w4_decode_bf16_pair4_to_mxfp8(pairs);
             const int64_t row_base =
@@ -872,10 +858,12 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     if(!has_route)
         return;
 
-    auto mma = make_mfma<D_MFMA_A, D_MFMA_B, D_ACC>(
-        number<T::MMA_M>{},
-        number<T::MMA_N>{},
-        number<T::MMA_K>{});
+    auto tiled_mma = make_tiled_mma<D_MFMA_A, D_MFMA_B, D_ACC>(
+        seq<T::M_MFMA_PER_WAVE, T::HALF_N_MFMA_PER_WAVE, 1>{},
+        seq<1, 1, 1>{},
+        seq<T::MMA_M, T::MMA_N, T::MMA_K>{},
+        mfma_adaptor{},
+        mxfp_scaled_tiled_mma_adaptor{});
 
     const D_A* __restrict__ inter_states =
         reinterpret_cast<const D_A*>(kargs.inter_states_fp8);
@@ -901,17 +889,24 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     auto u_gb = opus_moe_stage2_a8w4_layout_gb<T>(lane_id, wave_id_n);
     auto u_c = opus_moe_stage2_a8w4_layout_c<T>(wave_id_m, wave_id_n);
 
-    typename decltype(mma)::vtype_c v_c[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE];
+    using V_A = typename decltype(tiled_mma)::vtype_mma_a;
+    using V_B = typename decltype(tiled_mma)::vtype_mma_b;
+    using V_C = typename decltype(tiled_mma)::vtype_mma_c;
+    using AFragTile = opus::array<V_A, T::M_MFMA_PER_WAVE>;
+    using BFragHalfTile = opus::array<V_B, T::HALF_N_MFMA_PER_WAVE>;
+    using CFragTile = opus::array<V_C, T::M_MFMA_PER_WAVE * T::N_MFMA_PER_WAVE>;
+    using AScaleTile = opus::array<int, T::M_MFMA_PER_WAVE>;
+    using BScaleHalfTile = opus::array<int, T::HALF_N_MFMA_PER_WAVE>;
+
+    CFragTile v_c;
     static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
         static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
-            clear(v_c[mi.value][ni.value]);
+            clear(v_c[mi.value * T::N_MFMA_PER_WAVE + ni.value]);
         });
     });
 
     // Mainloop: flat memory views plus explicitly scheduled load/compute stages.
     using opus::operator""_I;
-    using V_A = typename decltype(mma)::mfma_type::vtype_a;
-    using V_B = typename decltype(mma)::mfma_type::vtype_b;
 
     static_assert(T::DECODE_EFFECTIVE_INTER_DIM == T::K_TILES * T::K_STEP_PACKED);
     static_assert(T::N_MFMA_PER_WAVE >= 2 && (T::N_MFMA_PER_WAVE % 2) == 0);
@@ -946,22 +941,22 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     };
     auto compute_mma_half_scaled = [&](auto scale_pair, auto n_half,
                                        const auto& v_a,
-                                       const int (&a_scale)[T::M_MFMA_PER_WAVE],
-                                       const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
+                                       const auto& a_scale,
+                                       const auto& b_scale,
                                        const auto& v_b) {
         opus_moe_stage2_a8w4_decode_compute_scaled_half<T>(
-            mma, wave_id_m, v_c, scale_pair, n_half, v_a, a_scale, b_scale, v_b);
+            tiled_mma, wave_id_m, v_c, scale_pair, n_half, v_a, a_scale, b_scale, v_b);
     };
 
     // Load one K-tile's A and both B halves, then compute both halves.
     auto compute_k_tile_both_n_halves = [&](auto scale_pair,
                                             auto stage,
                                             int b_tile_base,
-                                            const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
-                                            const int (&a_scale)[T::M_MFMA_PER_WAVE]) {
-        V_A v_a[T::M_MFMA_PER_WAVE];
-        V_B v_b0[T::HALF_N_MFMA_PER_WAVE];
-        V_B v_b1[T::HALF_N_MFMA_PER_WAVE];
+                                            const auto& b_scale,
+                                            const auto& a_scale) {
+        AFragTile v_a;
+        BFragHalfTile v_b0;
+        BFragHalfTile v_b1;
         load_a_smem_to_reg(stage, v_a);
         load_b_half_gmem_to_reg(0_I, b_tile_base, v_b0);
         load_b_half_gmem_to_reg(1_I, b_tile_base, v_b1);
@@ -983,10 +978,10 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         const int b_tile_base1 = b_tile_base0 + b_tile_stride;
         const int b_tile_base2 = b_tile_base0 + 2 * b_tile_stride;
 
-        int b_scale0[T::HALF_N_MFMA_PER_WAVE];
-        int b_scale1[T::HALF_N_MFMA_PER_WAVE];
-        int a_scale0[T::M_MFMA_PER_WAVE];
-        int a_scale1[T::M_MFMA_PER_WAVE];
+        BScaleHalfTile b_scale0;
+        BScaleHalfTile b_scale1;
+        AScaleTile a_scale0;
+        AScaleTile a_scale1;
 
         issue_a_gmem_to_smem(0_I, 0);
         issue_a_gmem_to_smem(1_I, T::K_STEP_PACKED);
@@ -994,8 +989,8 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
 
         if constexpr(kSplitALoadByNWave)
         {
-            V_B v_b0h0[T::HALF_N_MFMA_PER_WAVE];
-            V_B v_b0h1[T::HALF_N_MFMA_PER_WAVE];
+            BFragHalfTile v_b0h0;
+            BFragHalfTile v_b0h1;
             load_b_half_gmem_to_reg(0_I, b_tile_base0, v_b0h0);
             load_b_half_gmem_to_reg(1_I, b_tile_base0, v_b0h1);
             opus_moe_stage2_a8w4_decode_load_b_scale<T>(
@@ -1009,7 +1004,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
                              T::M_MFMA_PER_WAVE +
                              2 * T::HALF_N_MFMA_PER_WAVE>{});
 
-            V_A v_a0[T::M_MFMA_PER_WAVE];
+            AFragTile v_a0;
             load_a_smem_to_reg(0_I, v_a0);
             __builtin_amdgcn_s_setprio(1);
             compute_mma_half_scaled(0_I, 0_I, v_a0, a_scale0, b_scale0, v_b0h0);
@@ -1027,10 +1022,10 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             compute_k_tile_both_n_halves(0_I, 0_I, b_tile_base0, b_scale0, a_scale0);
         }
 
-        V_A v_a1[T::M_MFMA_PER_WAVE];
-        V_A v_a2[T::M_MFMA_PER_WAVE];
-        V_B v_b1h0[T::HALF_N_MFMA_PER_WAVE];
-        V_B v_b1h1[T::HALF_N_MFMA_PER_WAVE];
+        AFragTile v_a1;
+        AFragTile v_a2;
+        BFragHalfTile v_b1h0;
+        BFragHalfTile v_b1h1;
         if constexpr(kSplitALoadByNWave)
             opus_moe_stage2_a8w4_decode_wait_a(wave_id_n, 1_I);
         else
@@ -1055,8 +1050,8 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         opus_moe_stage2_a8w4_decode_load_a_scale<T>(
             g_a_scale, a_scale_base_word, T::SCALE_WORDS_PER_GROUP_PACK, a_scale1);
 
-        V_B v_b2h0[T::HALF_N_MFMA_PER_WAVE];
-        V_B v_b2h1[T::HALF_N_MFMA_PER_WAVE];
+        BFragHalfTile v_b2h0;
+        BFragHalfTile v_b2h1;
         load_b_half_gmem_to_reg(0_I, b_tile_base2, v_b2h0);
         load_b_half_gmem_to_reg(1_I, b_tile_base2, v_b2h1);
 
@@ -1068,7 +1063,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     }
     else
     {
-        opus_moe_stage2_a8w4_decode_run_generic_schedule_gfx950<T, V_A, V_B>(
+        opus_moe_stage2_a8w4_decode_run_k5_schedule_gfx950<T>(
             col_base,
             u_ga,
             u_sa,
@@ -1094,7 +1089,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             static_cast<unsigned long long>(token_num) *
             static_cast<unsigned long long>(output_rows_per_token) *
             static_cast<unsigned long long>(kargs.stride_o_t) *
-            static_cast<unsigned long long>(sizeof(hip_bfloat16)));
+            static_cast<unsigned long long>(sizeof(opus_moe_bf16_t)));
         auto output_gmem = opus::make_gmem(
             reinterpret_cast<opus::bf16_t*>(kargs.out_bf16),
             output_size_bytes);

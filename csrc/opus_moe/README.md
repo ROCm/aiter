@@ -19,7 +19,7 @@ The `a8w4_decode_k5` metadata family is retained only as a small bring-up
 coverage set for the generalized codegen path; it is not part of the tuned DSV4
 production target set.
 
-Private BF16 route-reduce source is retained for future bring-up, but current
+Private BF16/A16W16 stage2 source is retained for future bring-up, but current
 JIT generation does not emit BF16 launchers/TUs and no Python user API exposes it.
 
 ## Kernel Surfaces
@@ -105,9 +105,9 @@ Host and shared code:
 
 gfx950 code:
 
-- `include/gfx950/opus_moe_arch_gfx950.cuh`: gfx950 launch wrappers and BF16
-  generated manifest dispatch.
-- `include/gfx950/opus_moe_stage2_route_output_reduce_gfx950.cuh`: shared
+- `include/gfx950/opus_moe_arch_gfx950.cuh`: gfx950 launch wrappers,
+  route-reduce dispatch, and generated A8W4 manifest dispatch.
+- `include/gfx950/opus_moe_stage2_route_output_reduce_kernel_gfx950.cuh`: shared
   token/topk route-output reduction.
 - `include/gfx950/opus_moe_stage2_utils_gfx950.cuh`: small gfx950 device
   helpers, including BF16 packing/conversion helpers.
@@ -152,7 +152,7 @@ dumps should stay outside the repository.
 ## Current Limits
 
 - gfx950 only.
-- Private BF16 source is retained but not generated or exposed.
+- Private BF16/A16W16 stage2 source is retained but not generated or exposed.
 - A8W4 production tuning currently targets the `a8w4_decode_k3` family:
   `logical_inter_dim=512`, `inter_dim_pad=128`, effective inter dim `384`,
   and runtime `topk`, `hidden`, and `experts`.

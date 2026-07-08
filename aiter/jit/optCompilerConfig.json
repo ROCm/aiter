@@ -554,7 +554,9 @@
             "'-mllvm --amdgpu-mfma-vgpr-form'"
         ],
         "flags_extra_hip_per_source": {
-            "*.device.cu": ["-D__HIPCC_RTC__"]
+            "*.device.cu": [
+                "-D__HIPCC_RTC__"
+            ]
         },
         "md_name": "'module_moe_opus'",
         "extra_ldflags": "None",

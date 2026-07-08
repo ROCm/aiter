@@ -4,13 +4,13 @@
 
 #include <cstdint>
 
-// Keep generated minimal-HIP TUs from later pulling full HIP bf16 headers.
-#if defined(__HIPCC_RTC__) || defined(HIP_MINIMAL_HPP)
+#if defined(__HIPCC_RTC__)
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
-using hip_bfloat16 = opus::bf16_t;
+using opus_moe_bf16_t = opus::bf16_t;
 #else
 #include <hip/hip_bfloat16.h>
+using opus_moe_bf16_t = hip_bfloat16;
 #endif
 
 #include "opus_moe_stage2_a8w4_meta.h"
@@ -41,13 +41,13 @@ constexpr const char* stage2_bf16_kid_name(int kid)
 
 struct opus_moe_stage2_bf16_kargs
 {
-    const hip_bfloat16* __restrict__ inter_states;
-    const hip_bfloat16* __restrict__ w2;
+    const opus_moe_bf16_t* __restrict__ inter_states;
+    const opus_moe_bf16_t* __restrict__ w2;
     const int32_t* __restrict__ sorted_token_ids;
     const float* __restrict__ sorted_weights;
     const int32_t* __restrict__ sorted_expert_ids;
     const int32_t* __restrict__ num_valid_ids;
-    hip_bfloat16* __restrict__ route_out_bf16;
+    opus_moe_bf16_t* __restrict__ route_out_bf16;
 
     int token_num;
     int topk;
@@ -66,7 +66,7 @@ struct opus_moe_stage2_bf16_kargs
 struct opus_moe_stage2_route_reduce_kargs
 {
     const uint8_t* __restrict__ route_out;
-    hip_bfloat16* __restrict__ out_bf16;
+    opus_moe_bf16_t* __restrict__ out_bf16;
 
     int token_num;
     int topk;
@@ -88,7 +88,7 @@ struct opus_moe_stage2_a8w4_kargs
     const float* __restrict__ sorted_weights;
     const int32_t* __restrict__ sorted_expert_ids;
     const int32_t* __restrict__ num_valid_ids;
-    hip_bfloat16* __restrict__ out_bf16;
+    opus_moe_bf16_t* __restrict__ out_bf16;
 
     int64_t stride_a_t;
     int64_t stride_a_k;

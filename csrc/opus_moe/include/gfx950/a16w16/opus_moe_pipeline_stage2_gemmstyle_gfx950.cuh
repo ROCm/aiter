@@ -717,10 +717,10 @@ opus_moe_stage2_gemmstyle_kernel_gfx950(opus_moe_stage2_bf16_kargs kargs)
                                 number<idx * T::VEC_C>{},
                                 number<(idx + 1) * T::VEC_C>{});
             const int route_row = smem_route_base[local_m];
-            const hip_bfloat16 v0(static_cast<float>(values[0]) * weight);
-            const hip_bfloat16 v1(static_cast<float>(values[1]) * weight);
-            const hip_bfloat16 v2(static_cast<float>(values[2]) * weight);
-            const hip_bfloat16 v3(static_cast<float>(values[3]) * weight);
+            const opus_moe_bf16_t v0(static_cast<float>(values[0]) * weight);
+            const opus_moe_bf16_t v1(static_cast<float>(values[1]) * weight);
+            const opus_moe_bf16_t v2(static_cast<float>(values[2]) * weight);
+            const opus_moe_bf16_t v3(static_cast<float>(values[3]) * weight);
             const uint64_t packed =
                 static_cast<uint64_t>(opus_moe_gfx950_bf16_to_bits(v0)) |
                 (static_cast<uint64_t>(opus_moe_gfx950_bf16_to_bits(v1)) << 16) |
