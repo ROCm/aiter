@@ -1880,6 +1880,11 @@ def hgemm_get_configs(dtype_str, m, n, k):
             selections["GROUP_M"] = [
                 0,
             ]
+        elif m <= 256:
+            selections["TILE_M"] = [tm for tm in selections["TILE_M"] if tm <= m * 2]
+            selections["GROUP_M"] = [
+                0,
+            ]
         selections["SPLIT_K"] = [ks for ks in selections["SPLIT_K"] if k % ks == 0]
     keys = selections.keys()
     values = selections.values()
