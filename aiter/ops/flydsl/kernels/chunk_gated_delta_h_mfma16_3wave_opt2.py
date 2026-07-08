@@ -182,7 +182,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # vmcnt(16) drain is fully hidden by 3-wave overlap, so it is not the
     # binding wait -- but ON cuts buffer_load 41->21 / removes the redundant HBM
     # g traffic, so kept True as the cleaner / lower-traffic default.
-    USE_LDS_G = False
+    USE_LDS_G = True
 
     # EXPERIMENT toggle (w-prefetch-interleave, rev224): cross-chunk w register
     # prefetch carried via the scf.for iter_args, with the NEXT chunk's w
@@ -705,7 +705,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                         v_[fx.Index(v_base + _pf_safe * stride_v + u_pf_col)]
                     )
 
-            if const_expr(USE_G):
+            if const_expr(USE_G and not USE_LDS_G):
                 _pf_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
                 _pf_last_idx = (_pf_chunk_end < T_local).select(
                     _pf_chunk_end, T_local
@@ -1003,9 +1003,44 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                             _emit_vn_store(vn_off, bf16_v)
 
             # ============================================================
-            # 6. Gating (rev302: consume prefetched g from VGPR, no HBM load).
+            # 6. Gating.
+            #    USE_LDS_G=True : read g_last + g_row from lds_g (staged
+            #      at step 2, published by B3). Eliminates ~17 scalar HBM
+            #      loads/lane; trades for ~17 ds_read_b32 (fully cached).
+            #    USE_LDS_G=False: consume prefetched g from VGPR (rev302).
             # ============================================================
-            if const_expr(USE_G):
+            if const_expr(USE_G and USE_LDS_G):
+                g_last_in_chunk = (
+                    ((i_t_i32 + fx.Int32(1)) * fx.Int32(BT) < T_local).select(
+                        (i_t_i32 + fx.Int32(1)) * fx.Int32(BT), T_local
+                    ) - fx.Int32(1) - i_t_i32 * fx.Int32(BT)
+                )
+                g_last_val = lds_g[fx.Index(g_last_in_chunk)]
+                exp_g_last = _fast_exp(g_last_val)
+
+                for m_bt in range_constexpr(BT_MTILES):
+                    gate_elems = []
+                    for elem_i in range_constexpr(4):
+                        in_chunk_row = (
+                            fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        abs_row = i_t_i32 * fx.Int32(BT) + in_chunk_row
+                        in_bounds = abs_row < T_local
+                        g_row_val = lds_g[fx.Index(in_chunk_row)]
+                        gate = _fast_exp(g_last_val - g_row_val)
+                        gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
+                    gate_vec = vector.from_elements(T.f32x4, gate_elems)
+                    vn_frags[m_bt] = vn_frags[m_bt] * gate_vec
+
+                exp_g_last_s = fx.Float32(exp_g_last)
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for nr in range_constexpr(K_SUB_PER_BLOCK):
+                        acc_idx = kb * K_SUB_PER_BLOCK + nr
+                        h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_s
+
+            elif const_expr(USE_G and not USE_LDS_G):
                 exp_g_last = _fast_exp(g_last_pf)
 
                 for m_bt in range_constexpr(BT_MTILES):
