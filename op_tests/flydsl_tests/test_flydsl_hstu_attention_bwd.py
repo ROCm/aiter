@@ -340,7 +340,8 @@ def test_flydsl_bwd_all_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, 
         (64, 32, 4, 0),  # default
         (128, 32, 4, 0),
         (128, 64, 4, 0),
-        (192, 32, 4, 0),  # tuned pick at N=2048
+        (192, 32, 4, 0),  # tuned dV/dK pick at N=2048
+        (128, 32, 4, 2),  # tuned dQ pick (forced-occupancy, small scratch spill)
         (64, 32, 2, 0),
     ],
 )
@@ -392,6 +393,7 @@ def _bwd_row(**overrides) -> dict:
         has_window="False",
         has_contextual="False",
         has_targets="False",
+        kernel="dvdk",
         block_m=128,
         block_n=64,
         num_waves=4,
@@ -438,6 +440,25 @@ def test_bwd_tuned_csv_best_duration_wins(tmp_path):
 
     (config,) = config_map.values()
     assert config["block_m"] == 256
+
+
+def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
+    """dV/dK and dQ resolve independent tuned configs for the same problem."""
+    path = _write_bwd_csv(
+        tmp_path / "tuned_bwd.csv",
+        [
+            _bwd_row(kernel="dvdk", block_m=192, block_n=32, num_waves=4, waves_per_eu=0),
+            _bwd_row(kernel="dq", block_m=128, block_n=32, num_waves=4, waves_per_eu=2),
+        ],
+    )
+
+    config_map = hstu_kernels._bwd_tuned_config_map(path)
+
+    assert len(config_map) == 2
+    # Keys are (problem_key, kernel); pull each kernel's config.
+    by_kernel = {kern: cfg for (_, kern), cfg in config_map.items()}
+    assert by_kernel["dvdk"] == dict(block_m=192, block_n=32, num_waves=4, waves_per_eu=0)
+    assert by_kernel["dq"] == dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=2)
 
 
 # --------------------------------------------------------------------------- #
