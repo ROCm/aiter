@@ -10,9 +10,12 @@ namespace aiter {
 void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
                          aiter_tensor_t& sqrsum, // (split_k, m) / (m)
                          aiter_tensor_t& x,      // (m, hc_hidden_size)
-                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size)
+                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when is_fn_pack_bf16
                          int tile_k = 128,
                          int is_fn_pack_bf16 = 0);
+// Pre-convert fn (fp32) -> packed int32 (hi<<16 | lo) for the bf16 (is_fn_pack_bf16) gemm path.
+void mhc_pre_convert_fn(aiter_tensor_t& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
+                        aiter_tensor_t& fn);       // (hc_mult3, hc_hidden_size) fp32 in
 void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                       aiter_tensor_t& layer_input,     // (m, hidden_size)
