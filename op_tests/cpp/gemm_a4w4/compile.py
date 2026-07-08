@@ -13,5 +13,10 @@ from jit.core import compile_ops, AITER_CSRC_DIR, AITER_CONFIGS  # noqa: E402
 def compile_gemm_a4w4_blockscale() -> None: ...
 
 
+@compile_ops("libgemm_a4w4_asm", fc_name="compile_gemm_a4w4_asm")
+def compile_gemm_a4w4_asm() -> None: ...
+
+
 if __name__ == "__main__":
     compile_gemm_a4w4_blockscale()
+    compile_gemm_a4w4_asm()

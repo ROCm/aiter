@@ -72,6 +72,8 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "compile_gemm_a4w4_blockscale",
+    "compile_gemm_a4w4_asm",
     "init_custom_qr",
     "qr_max_size",
     "qr_destroy",
