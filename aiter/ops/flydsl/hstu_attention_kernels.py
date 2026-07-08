@@ -490,6 +490,203 @@ def _validate_bwd_inputs(
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
+# Backward tuned-config plumbing. Same schema as the forward CSV plus a
+# sequence_parallel column (the dQ-reduction strategy knob).
+_BWD_CSV_COLUMNS: list[str] = [
+    "arch",
+    "dtype",
+    "num_heads",
+    "head_dim",
+    "hidden_dim",
+    "batch",
+    "max_seq_len",
+    "has_window",
+    "has_contextual",
+    "has_targets",
+    "block_m",
+    "block_n",
+    "num_waves",
+    "waves_per_eu",
+    "sequence_parallel",
+    "duration",
+]
+
+
+@functools.lru_cache()
+def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
+    def _parse_row(row: dict) -> tuple[tuple, float, dict]:
+        if set(row.keys()) != set(_BWD_CSV_COLUMNS):
+            raise KeyError(
+                f"unexpected columns: {set(row.keys()) ^ set(_BWD_CSV_COLUMNS)}"
+            )
+
+        duration = float(row["duration"])
+
+        problem_key = _problem_key(
+            row["arch"],
+            row["dtype"],
+            row["num_heads"],
+            row["head_dim"],
+            row["hidden_dim"],
+            row["batch"],
+            row["max_seq_len"],
+            row["has_window"],
+            row["has_contextual"],
+            row["has_targets"],
+        )
+        kernel_config = dict(
+            block_m=int(row["block_m"]),
+            block_n=int(row["block_n"]),
+            num_waves=int(row["num_waves"]),
+            waves_per_eu=int(row["waves_per_eu"]),
+            sequence_parallel=str2bool(row["sequence_parallel"]),
+        )
+        return problem_key, duration, kernel_config
+
+    default_tuned_file = (
+        Path(__file__).resolve().parent / "hstu_attention_bwd_tuned.csv"
+    )
+    tuned_file_path: Path = Path(tuned_file) if tuned_file else default_tuned_file
+    if not tuned_file_path.is_file():
+        return {}
+
+    config_map: dict = {}
+    with tuned_file_path.open(mode="r", encoding="utf-8") as f:
+        for row_idx, row in enumerate(csv.DictReader(f)):
+            try:
+                problem_key, duration, kernel_config = _parse_row(row)
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.warning(
+                    f"[FlyDSL HSTU Bwd] skipping invalid tuned row {row_idx} in {tuned_file_path}: {exc}"
+                )
+                continue
+
+            if duration <= 0.0:
+                continue
+
+            if problem_key not in config_map or duration < config_map[problem_key][0]:
+                config_map[problem_key] = (duration, kernel_config)
+
+    return {
+        problem_key: kernel_config
+        for problem_key, (_, kernel_config) in config_map.items()
+    }
+
+
+def _get_bwd_tuned_config(
+    *,
+    dtype_str: str,
+    num_heads: int,
+    head_dim: int,
+    hidden_dim: int,
+    batch: int,
+    max_seq_len: int,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    has_targets: bool,
+) -> dict:
+    """Returns the tuned backward config if the CSV has an entry for this problem."""
+    problem_key = _problem_key(
+        _GPU_ARCH,
+        dtype_str,
+        num_heads,
+        head_dim,
+        hidden_dim,
+        batch,
+        max_seq_len,
+        max_attn_len > 0,
+        contextual_seq_len > 0,
+        has_targets,
+    )
+    return _bwd_tuned_config_map().get(problem_key, {})
+
+
+def _get_bwd_default_config() -> dict:
+    """Conservative heuristic default when no tuned entry exists.
+
+    This tile is valid across every supported shape (including asymmetric and
+    non-64-divisible dims) and is what the correctness suite runs against.
+    Tuned CSV entries override it per problem.
+    """
+    return dict(block_m=64, block_n=32, num_waves=4, waves_per_eu=0)
+
+
+@functools.lru_cache(maxsize=16384)
+def _compile_bwd_launcher(
+    *,
+    batch: int,
+    max_seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    hidden_dim: int,
+    causal: bool,
+    has_targets: bool,
+    alpha: float,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    dtype_str: str,
+    block_m: Optional[int],
+    block_n: Optional[int],
+    num_waves: Optional[int],
+    waves_per_eu: Optional[int],
+    sequence_parallel: Optional[bool],
+) -> tuple[Callable, Callable]:
+    """Builds the (dV/dK, dQ) launcher pair, resolving tuned -> default -> custom.
+
+    Returns two launchers: the KV-owned kernel producing dV/dK, and the Q-owned
+    kernel producing dQ. Both consume the same tile config.
+    """
+    custom_config: dict = dict(
+        block_m=block_m,
+        block_n=block_n,
+        num_waves=num_waves,
+        waves_per_eu=waves_per_eu,
+    )
+    custom_config = {k: v for k, v in custom_config.items() if v is not None}
+
+    tuned_config = _get_bwd_tuned_config(
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=has_targets,
+    )
+
+    default_config = _get_bwd_default_config()
+
+    kernel_config = {
+        **default_config,
+        **tuned_config,
+        **custom_config,
+    }
+    # sequence_parallel is threaded for cache-key stability and tuned-CSV
+    # round-tripping; the dQ-reduction strategy it selects is not wired into the
+    # build yet, so it is not forwarded to the kernel builders.
+    kernel_config.pop("sequence_parallel", None)
+
+    build_kwargs = dict(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        causal=causal,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=has_targets,
+        alpha=alpha,
+        dtype_str=dtype_str,
+        max_seq_len=max_seq_len,
+        **kernel_config,
+    )
+    dvdk_launcher = build_hstu_attention_bwd(**build_kwargs)
+    dq_launcher = build_hstu_attention_bwd_dq(**build_kwargs)
+    return dvdk_launcher, dq_launcher
+
+
 def flydsl_hstu_attention_bwd(
     N: int,
     alpha: float,
@@ -526,32 +723,27 @@ def flydsl_hstu_attention_bwd(
         num_targets=num_targets,
     )
 
-    # Default tile config (correctness-first; tuning/CSV plumbing lands later).
-    cfg = dict(
-        block_m=block_m if block_m is not None else 64,
-        block_n=block_n if block_n is not None else 32,
-        num_waves=num_waves if num_waves is not None else 4,
-        waves_per_eu=waves_per_eu if waves_per_eu is not None else 0,
-    )
-
-    build_kwargs = dict(
+    # dV/dK come from the KV-owned kernel; dQ from the Q-owned kernel. Both are
+    # single-writer (no atomics): dV/dK reduce over the query index, dQ over the key index.
+    # Config precedence: explicit overrides > tuned CSV > default heuristic.
+    dvdk_launcher, dq_launcher = _compile_bwd_launcher(
+        batch=batch,
+        max_seq_len=N,
         num_heads=num_heads,
         head_dim=head_dim,
         hidden_dim=hidden_dim,
-        batch=batch,
         causal=causal,
-        max_attn_len=max_attn_len,
-        contextual_seq_len=contextual_seq_len,
         has_targets=num_targets is not None,
         alpha=alpha,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
         dtype_str=dtype_str,
-        max_seq_len=N,
-        **cfg,
+        block_m=block_m,
+        block_n=block_n,
+        num_waves=num_waves,
+        waves_per_eu=waves_per_eu,
+        sequence_parallel=sequence_parallel,
     )
-    # dV/dK come from the KV-owned kernel; dQ from the Q-owned kernel. Both are
-    # single-writer (no atomics): dV/dK reduce over the query index, dQ over the key index.
-    dvdk_launcher = build_hstu_attention_bwd(**build_kwargs)
-    dq_launcher = build_hstu_attention_bwd_dq(**build_kwargs)
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)

@@ -6,6 +6,8 @@ dO is synthetic. The FlyDSL forward is only needed for the end-to-end autograd
 phase, so these tests do not depend on it.
 """
 
+import csv
+
 import pytest
 import torch
 
@@ -323,3 +325,118 @@ def test_flydsl_bwd_all_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, 
     torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
+
+
+# --------------------------------------------------------------------------- #
+# Tiling / block-size overrides
+# --------------------------------------------------------------------------- #
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "block_m,block_n,num_waves,waves_per_eu",
+    [
+        (64, 32, 4, 0),  # default
+        (128, 32, 4, 0),
+        (128, 64, 4, 0),
+        (64, 32, 2, 0),
+    ],
+)
+def test_flydsl_bwd_block_size_overrides(block_m, block_n, num_waves, waves_per_eu):
+    """Grads stay correct across explicit tile configs (tiling independence)."""
+    batch, heads, attn_dim, hidden_dim, max_seq_len = 16, 2, 128, 128, 1024
+    alpha = 1.0 / attn_dim * 10000
+
+    q, k, v, seq_offsets, num_targets = generate_hstu_attn_inputs(
+        batch_size=batch,
+        max_seq_len=max_seq_len,
+        sparsity=0.5,
+        heads=heads,
+        attn_dim=attn_dim,
+        hidden_dim=hidden_dim,
+        target_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    dout = torch.randn_like(v)
+
+    dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
+        max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
+    )
+    dq, dk, dv = flydsl_hstu_attention_bwd(
+        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0,
+        block_m=block_m, block_n=block_n, num_waves=num_waves,
+        waves_per_eu=waves_per_eu,
+    )
+    torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(dq.float(), dq_ref, atol=3e-2, rtol=3e-2)
+
+
+# --------------------------------------------------------------------------- #
+# Backward tuned-CSV loading
+# --------------------------------------------------------------------------- #
+
+
+def _bwd_row(**overrides) -> dict:
+    row = dict(
+        arch=hstu_kernels._GPU_ARCH,
+        dtype="bf16",
+        num_heads=4,
+        head_dim=128,
+        hidden_dim=128,
+        batch=256,
+        max_seq_len=1024,
+        has_window="False",
+        has_contextual="False",
+        has_targets="False",
+        block_m=128,
+        block_n=64,
+        num_waves=4,
+        waves_per_eu=2,
+        sequence_parallel="False",
+        duration=1.0,
+    )
+    row.update(overrides)
+    return row
+
+
+def _write_bwd_csv(path, rows) -> str:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=hstu_kernels._BWD_CSV_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return str(path)
+
+
+def test_bwd_tuned_csv_is_picked_up(tmp_path):
+    path = _write_bwd_csv(tmp_path / "tuned_bwd.csv", [_bwd_row()])
+
+    config_map = hstu_kernels._bwd_tuned_config_map(path)
+
+    assert len(config_map) == 1
+    (config,) = config_map.values()
+    assert config == dict(
+        block_m=128, block_n=64, num_waves=4, waves_per_eu=2,
+        sequence_parallel=False,
+    )
+
+
+def test_bwd_tuned_csv_missing_file_returns_empty(tmp_path):
+    assert hstu_kernels._bwd_tuned_config_map(str(tmp_path / "nope.csv")) == {}
+
+
+def test_bwd_tuned_csv_best_duration_wins(tmp_path):
+    path = _write_bwd_csv(
+        tmp_path / "tuned_bwd.csv",
+        [
+            _bwd_row(duration=5.0, block_m=64),
+            _bwd_row(duration=1.0, block_m=256),
+        ],
+    )
+
+    config_map = hstu_kernels._bwd_tuned_config_map(path)
+
+    (config,) = config_map.values()
+    assert config["block_m"] == 256
