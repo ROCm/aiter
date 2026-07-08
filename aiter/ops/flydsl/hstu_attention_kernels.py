@@ -490,8 +490,10 @@ def _validate_bwd_inputs(
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
-# Backward tuned-config plumbing. Same schema as the forward CSV plus a
-# sequence_parallel column (the dQ-reduction strategy knob).
+# Backward tuned-config plumbing. Same schema as the forward CSV: the backward
+# is two single-writer, fully tile-parallel kernels (dV/dK over the query index,
+# dQ over the key index), so there is no dQ read-modify-write to synchronize and
+# thus no sequence-parallel knob to tune.
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
     "dtype",
@@ -507,7 +509,6 @@ _BWD_CSV_COLUMNS: list[str] = [
     "block_n",
     "num_waves",
     "waves_per_eu",
-    "sequence_parallel",
     "duration",
 ]
 
@@ -539,7 +540,6 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             block_n=int(row["block_n"]),
             num_waves=int(row["num_waves"]),
             waves_per_eu=int(row["waves_per_eu"]),
-            sequence_parallel=str2bool(row["sequence_parallel"]),
         )
         return problem_key, duration, kernel_config
 
@@ -629,7 +629,6 @@ def _compile_bwd_launcher(
     block_n: Optional[int],
     num_waves: Optional[int],
     waves_per_eu: Optional[int],
-    sequence_parallel: Optional[bool],
 ) -> tuple[Callable, Callable]:
     """Builds the (dV/dK, dQ) launcher pair, resolving tuned -> default -> custom.
 
@@ -663,10 +662,6 @@ def _compile_bwd_launcher(
         **tuned_config,
         **custom_config,
     }
-    # sequence_parallel is threaded for cache-key stability and tuned-CSV
-    # round-tripping; the dQ-reduction strategy it selects is not wired into the
-    # build yet, so it is not forwarded to the kernel builders.
-    kernel_config.pop("sequence_parallel", None)
 
     build_kwargs = dict(
         num_heads=num_heads,
@@ -704,7 +699,6 @@ def flydsl_hstu_attention_bwd(
     block_n: Optional[int] = None,
     num_waves: Optional[int] = None,
     waves_per_eu: Optional[int] = None,
-    sequence_parallel: Optional[bool] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU attention backward: returns (dq, dk, dv).
@@ -742,7 +736,6 @@ def flydsl_hstu_attention_bwd(
         block_n=block_n,
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
-        sequence_parallel=sequence_parallel,
     )
 
     dq = torch.empty_like(q)
