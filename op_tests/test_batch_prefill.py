@@ -3781,7 +3781,7 @@ from aiter.ops.mha_batch_prefill_asm import mha_batch_prefill_asm  # noqa: E402
 
 _ASM_FP8 = dtypes.fp8
 _ASM_FP8_MAX = float(torch.finfo(_ASM_FP8).max)
-_ASM_PAGE = 16
+_ASM_PAGE = int(os.environ.get("ASM_PAGE", "16"))
 _ASM_VECX = 16  # FP8 128-bit vector width; equals page size
 
 
@@ -3973,10 +3973,21 @@ def run_batch_prefill_asm(
     combined_kv=False,
     num_kv_layers=4,
     kv_layer_idx=2,
+    adversarial=False,
+    adv_amp=120.0,
+    adv_qbias=1.5,
+    assert_nrms=True,
 ):
     """Drive mha_batch_prefill_asm for the given per-batch seqlens (prefill:
     qo_len==kv_len per batch) and validate against the fp32 reference. When
-    bench=True, also time the kernel and report latency + TFLOPS."""
+    bench=True, also time the kernel and report latency + TFLOPS.
+
+    adversarial=True stresses the VFA freeze-max seeding: it plants a single
+    dominant key in a LATE KV tile (beyond the 512-key, 2-tile freeze-max seed),
+    aligned with a query bias, so that key's logit is the true row max for every
+    query that can see it -- but the frozen seed (first 2 tiles) never sampled it.
+    On an exact kernel this is harmless; on freeze-max the frozen P for that key
+    saturates fp8 (e4m3fnuz max 240) and the dominant contribution is lost."""
     torch.manual_seed(seed)
     dev = "cuda"
     batch = len(seqlens)
@@ -3991,11 +4002,23 @@ def run_batch_prefill_asm(
         if use_p_scale
         else None
     )
+    adv_dir = None
+    if adversarial:
+        adv_dir = torch.randn(head_dim, device=dev)
+        adv_dir = adv_dir / adv_dir.norm()
 
     for s in seqlens:
         q = torch.randn(s, num_qo_heads, head_dim, device=dev)
         k = torch.randn(s, num_kv_heads, head_dim, device=dev)
         v = torch.randn(s, num_kv_heads, head_dim, device=dev)
+        if adversarial:
+            # Bias every query along adv_dir, then plant one dominant aligned key
+            # in a late tile (past the first 512 keys = 2 freeze-max seed tiles).
+            q = q + adv_qbias * adv_dir
+            pos = 512 + (s - 512) // 2 if s > 640 else s - 1
+            if os.environ.get("ADV_POS"):
+                pos = int(os.environ["ADV_POS"])
+            k[pos] = k[pos] + adv_amp * adv_dir
         qf8, qdesc = _asm_quant_per_row(q)  # [s,hq,d],[s,hq]
         kf8, kdesc = _asm_quant_per_row(k)  # [s,hk,d],[s,hk]
         # V descale is per-kv-head only (launcher v_descale [hk]).
@@ -4062,6 +4085,21 @@ def run_batch_prefill_asm(
 
     out_f = out.float()
     diff = out_f - out_ref
+    if os.environ.get("ROW_DIAG"):
+        # per-query-row NRMS: diff is [total_q, hq, d]; reduce over hq,d
+        rn = (diff.pow(2).sum(dim=(1, 2)) / out_ref.pow(2).sum(dim=(1, 2)).clamp(min=1e-20)).sqrt()
+        pos = 512 + (seqlens[0] - 512) // 2 if seqlens[0] > 640 else seqlens[0] - 1
+        if os.environ.get("ADV_POS"):
+            pos = int(os.environ["ADV_POS"])
+        top = torch.topk(rn, 12)
+        print(f"    [ROW_DIAG] dominant key pos={pos}; worst rows (idx:nrms):")
+        print("      " + " ".join(f"{int(i)}:{float(v):.3f}" for v, i in zip(top.values, top.indices)))
+        print(f"    [ROW_DIAG] rows<pos mean={rn[:pos].mean():.4f}  rows>=pos mean={rn[pos:].mean():.4f}")
+        w = int(top.indices[0])
+        of = out_f[w].reshape(-1); orf = out_ref[w].reshape(-1)
+        print(f"    [ROW_DIAG] worst row {w}: |out|={of.norm():.3f} |ref|={orf.norm():.3f} "
+              f"dot={torch.dot(of, orf).item():.3f} out[:4]={[round(x,3) for x in of[:4].tolist()]} "
+              f"ref[:4]={[round(x,3) for x in orf[:4].tolist()]}")
     nrms = (diff.pow(2).sum() / out_ref.pow(2).sum().clamp(min=1e-20)).sqrt().item()
     max_abs = diff.abs().max().item()
     cos_sim = torch.nn.functional.cosine_similarity(
@@ -4093,7 +4131,8 @@ def run_batch_prefill_asm(
     if bench:
         msg += f" | latency={latency_ms:.4f} ms  {tflops:.1f} TFLOPS"
     print(msg)
-    assert nrms < 0.06, f"asm kernel vs reference NRMS too high: {nrms:.4e}"
+    if assert_nrms:
+        assert nrms < 0.06, f"asm kernel vs reference NRMS too high: {nrms:.4e}"
     return dict(
         nrms=nrms,
         cos_sim=cos_sim,
@@ -4182,7 +4221,7 @@ def test_batch_prefill_asm_combined_kv(seqlens, num_kv_layers, kv_layer_idx, use
     os.environ.get("AITER_ASM_PERF") != "1",
     reason="perf sweep; set AITER_ASM_PERF=1 to run",
 )
-@pytest.mark.parametrize("seqlen", [512, 1024, 2048, 4096, 8192, 16384, 32768])
+@pytest.mark.parametrize("seqlen", [512, 1024, 2048, 4096, 8192, 16384, 27507, 32768])
 def test_batch_prefill_asm_perf(seqlen):
     run_batch_prefill_asm([seqlen], use_p_scale=True, seed=31, bench=True)
 
