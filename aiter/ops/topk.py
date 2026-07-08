@@ -19,7 +19,7 @@ from ..utility import dtypes
 #   - accepts an Optional[Tensor] correction_bias (None => no bias)
 #   - validates score_func string
 #   - exposes the same C++ kernel under a more accurate name
-@compile_ops("module_moe_topk")
+@compile_ops("module_moe_topk", develop=True)
 def topk_softplus(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -385,14 +385,16 @@ def top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
 ) -> None:
-    """Per-row top-k (decode). Multi-block path uses a persistent, zeroed
-    workspace (memset-free); one-block path allocates internally."""
-    workspace = None
-    if topk_use_mulblocks(numRows, stride0):
-        size = topk_mb_workspace_size(numRows, stride0, k, True)
-        workspace = get_topk_mb_workspace(logits.device, size)
+    """Per-row top-k (decode). Always uses the one-block kernel — the C++
+    side ignores the workspace argument for decode."""
+    # Decode always takes the ob path (see topk_per_row_kernels.cu).
+    # The original mb dispatch is commented out below for reference:
+    #   workspace = None
+    #   if topk_use_mulblocks(numRows, stride0):
+    #       size = topk_mb_workspace_size(numRows, stride0, k, True)
+    #       workspace = get_topk_mb_workspace(logits.device, size)
     return _top_k_per_row_decode(
-        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, workspace
+        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None
     )
 
 

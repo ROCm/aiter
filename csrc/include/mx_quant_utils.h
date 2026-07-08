@@ -175,6 +175,26 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     }
 }
 
+// Block-scale result for an E8M0-quantised group: the stored 1-byte exponent plus
+// the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* (1 / dq_scale)``;
+// store ``byte`` into the block-scale buffer.
+struct E8m0BlockScale {
+    uint8_t byte;
+    float   dq_scale;
+};
+
+// One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant
+// scale from a group amax (same rounding as fp_f32_to_e8m0_scale). Saves callers
+// from re-deriving the exponent byte via ``(__float_as_uint(s) >> 23) & 0xFF``.
+template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode,
+          MxDtype          dtype = MxDtype::FP4_E2M1>
+__device__ __forceinline__ E8m0BlockScale fp_f32_to_e8m0_block_scale(float amax)
+{
+    const float dq = fp_f32_to_e8m0_scale<rmode, dtype>(amax);
+    return E8m0BlockScale{
+        static_cast<uint8_t>((__builtin_bit_cast(uint32_t, dq) >> 23) & 0xFFu), dq};
+}
+
 // Default MXFP4 E8M0 scale helper: NV ROUND_UP / DSv4 / FlashInfer / torchao
 // RCEIL with FP4 E2M1 constants, i.e. ``ceil_pow2(amax / 6)``. This is the
 // industry-default MXFP4 block-scale formula and is preserved as a named
