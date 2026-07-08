@@ -719,7 +719,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             info = (
                 info_keys,
                 solidx,
-                config["split_k"],
+                config["SPLIT_K"],
                 kernel_name,
                 "flydsl",
                 is_shuffle,
