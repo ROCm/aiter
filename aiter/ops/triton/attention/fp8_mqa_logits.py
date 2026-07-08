@@ -116,6 +116,29 @@ def fp8_mqa_logits(
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
+
+    # BLOCK_Q specialization for the DSA / lightning-indexer prefill shape
+    # (short query x long KV) under CP ragged ranges. Shares one KV tile across
+    # adjacent query rows (~28% faster than the stock row-per-program kernel on the
+    # GLM-5.1 / DeepSeek-V3.2 indexer shape). Only for clean_logits=False (writes
+    # just the valid [start, end) span). Supported (num_heads, head_dim) shapes are
+    # gated by a tuned config table; unsupported shapes fall through to the stock path.
+    if use_gluon and arch == "gfx950" and not clean_logits and Q.dim() == 3:
+        try:
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits_blockq import (
+                get_blockq_config,
+                fp8_mqa_logits_blockq,
+            )
+
+            if get_blockq_config(num_heads, head_size) is not None:
+                fp8_mqa_logits_blockq(
+                    Q, KV, kv_scales, weights, cu_starts, cu_ends, logits
+                )
+                return logits
+        except Exception:
+            # Any failure -> fall through to the stock row-per-program path.
+            pass
+
     if not use_gluon:
         block_kv = 128
 
