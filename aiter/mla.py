@@ -195,63 +195,25 @@ def get_meta_param(
     return num_kv_splits, num_kv_splits_indptr
 
 
-# --- Persistent MLA-decode kernel gate (vllm#45943) -------------------------
-#
-# The persistent MLA decode kernel ("mla_a16w16_qh16", selected when the caller
-# passes work_meta_data) is faster than the non-persistent split-KV kernel
-# ("mla_dec_stage1") at light load, but degrades badly under heavy total-KV
-# load (long context x high concurrency). On MI350X (gfx950), Kimi-K2.5 / MLA
-# decode (bf16 q+kv, 16 query heads, kv_lora_rank=512, qk_rope=64, page_size=1,
-# decode_qlen=1) the persistent kernel crosses over from faster to slower at
-# ~200k-400k total KV tokens and reaches ~1.4-1.5x slower than the
-# non-persistent kernel at >=800k total KV. Concurrency matters too: at equal
-# total KV, more sequences (higher batch) crosses over earlier (e.g. 256x1k
-# ~256k KV is already ~1.34x slower while 4x50k ~200k KV is still ~0.90x).
-# This is the vLLM v0.18 -> v0.19+ decode-throughput regression tracked in
-# https://github.com/vllm-project/vllm/issues/45943: v0.18 used
-# the non-persistent kernel; later vLLM builds the persistent metadata and so
-# gets the persistent kernel unconditionally.
-#
-# Gate: when the caller requested the persistent path but total KV exceeds a
-# threshold, fall back to the self-contained non-persistent path (which rebuilds
-# its own num_kv_splits metadata and ignores the persistent work_meta_data).
-# The threshold is tunable via AITER_MLA_DECODE_PERSISTENT_MAX_KV (in KV
-# tokens/pages); set it to 0 to disable the gate and always honor the caller's
-# persistent request (i.e. restore the previous behavior). Default 250000 sits
-# just above the measured 50k-context crossover (keeps 200k persistent, falls
-# back at >=256k) so it never gives up a regime where the persistent kernel wins.
-#
-# Kept intentionally narrow: only bf16 q+kv with 16 query heads (the measured
-# Kimi/DeepSeek TP MLA decode profile) is redirected, since that is the exact
-# shape the crossover was characterized on and one the non-persistent kernel is
-# known to support. All other dtypes/head counts keep the caller's choice.
-_MLA_DECODE_PERSISTENT_MAX_KV_DEFAULT = 250000
+# Persistent MLA-decode kernel gate (vllm#45943): the persistent kernel
+# ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
+# ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
+# 16-head decode). Fall back to non-persistent at/above the batch threshold.
+# Env-tunable (0 disables the gate). Provisional default pending microbench
+# calibration (AIOSS-5156).
+_MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT = 32
 
 
-def _use_persistent_mla_decode(bs, total_kv, nhead, max_seqlen_q, q_dtype, kv_dtype):
-    """Return whether to keep the persistent MLA decode kernel for this shape.
+def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
+    """Whether to keep the persistent MLA decode kernel (vllm#45943).
 
-    Applies the total-KV gate described above. Returns True to keep persistent,
-    False to fall back to the non-persistent split-KV kernel.
+    True keeps the caller's persistent request; False falls back to the
+    non-persistent split-KV kernel at/above the concurrency (batch) threshold.
+    Scoped to the characterized gfx950 bf16 16-head single-token decode profile.
     """
-    try:
-        max_kv = int(
-            os.getenv(
-                "AITER_MLA_DECODE_PERSISTENT_MAX_KV",
-                _MLA_DECODE_PERSISTENT_MAX_KV_DEFAULT,
-            )
-        )
-    except ValueError:
-        max_kv = _MLA_DECODE_PERSISTENT_MAX_KV_DEFAULT
-
-    # max_kv <= 0 disables the gate (always keep persistent).
-    if max_kv <= 0:
-        return True
-
-    # Only redirect the characterized regression profile (bf16 q+kv, 16 heads,
-    # single-token decode). Other shapes keep the caller's persistent request.
     is_regression_profile = (
-        q_dtype == dtypes.bf16
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
         and kv_dtype == dtypes.bf16
         and nhead == 16
         and max_seqlen_q == 1
@@ -259,7 +221,20 @@ def _use_persistent_mla_decode(bs, total_kv, nhead, max_seqlen_q, q_dtype, kv_dt
     if not is_regression_profile:
         return True
 
-    return total_kv < max_kv
+    try:
+        max_batch = int(
+            os.getenv(
+                "AITER_MLA_DECODE_PERSISTENT_MAX_BATCH",
+                _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        max_batch = _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+
+    # max_batch <= 0 disables the gate (always keep persistent).
+    if max_batch <= 0:
+        return True
+    return bs < max_batch
 
 
 def mla_decode_fwd(
@@ -314,12 +289,12 @@ def mla_decode_fwd(
 
     persistent_mode = work_meta_data is not None
 
-    # vllm#45943: fall back to the non-persistent split-KV kernel
-    # above a (tunable) total-KV threshold, where the persistent kernel degrades.
-    # See _use_persistent_mla_decode above for the rationale and env override.
+    # vllm#45943: above the concurrency threshold the persistent kernel is slower, so
+    # fall back to the non-persistent split-KV path (which rebuilds its own
+    # num_kv_splits and ignores work_meta_data). See _use_persistent_mla_decode.
     if persistent_mode:
         persistent_mode = _use_persistent_mla_decode(
-            bs, total_kv, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+            bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
         )
 
     io_transformed = False
