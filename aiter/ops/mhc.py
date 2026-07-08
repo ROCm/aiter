@@ -20,8 +20,25 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    is_fn_pack_bf16: int = 0,
+    is_fn_pack_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
 ) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_pre_convert_fn(
+    fn_packed: Tensor,  # (hc_mult3, hc_hidden_size) int32 out
+    fn: Tensor,  # (hc_mult3, hc_hidden_size) fp32 in
+) -> None: ...
+
+
+def mhc_pre_convert_fn_ref(fn: torch.Tensor) -> torch.Tensor:
+    """Torch equivalent of the HIP ``mhc_pre_convert_fn`` kernel: pack fp32 fn into
+    int32 dwords (hi = bf16(fn) in [31:16], lo = bf16(fn - fp32(hi)) in [15:0])."""
+    hi = fn.to(torch.bfloat16)
+    lo = (fn - hi.to(torch.float32)).to(torch.bfloat16)
+    hi_bits = hi.view(torch.int16).to(torch.int32) & 0xFFFF
+    lo_bits = lo.view(torch.int16).to(torch.int32) & 0xFFFF
+    return ((hi_bits << 16) | lo_bits).to(torch.int32).contiguous()
 
 
 @compile_ops("module_mhc")
@@ -322,7 +339,7 @@ def mhc_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_fn_pack_bf16: int = 0,
+    is_fn_pack_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -342,6 +359,7 @@ def mhc_pre(
     )
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
+    # is_fn_pack_bf16=1: fn is the pre-packed int32 tensor (bf16 hi/lo MFMA path).
     mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k, is_fn_pack_bf16)
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)

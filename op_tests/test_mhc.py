@@ -524,10 +524,17 @@ def test_mhc_pre(
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
 
-    # bf16 (fn hi/lo pack) GEMM path: same mhc_pre but is_fn_pack_bf16=1. On gfx950 this
-    # uses the native bf16 MFMA; on gfx1250 the wave32 bf16 WMMA (UNVERIFIED); on other
-    # arches it falls back to fp32 (so err/us == the fp32 columns).
+    # bf16 GEMM path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn
+    # (fn are constant weights), then run mhc_pre with is_fn_pack_bf16=1 so the gemm
+    # bit-extracts hi/lo instead of recomputing the fp32->bf16 split per (m_block, k).
+    # On gfx950 this uses the native bf16 MFMA; gfx1250 the wave32 bf16 WMMA (UNVERIFIED).
     if fn_pack_bf16:
+        from aiter.ops.mhc import mhc_pre_convert_fn
+
+        fn_packed = torch.empty(
+            fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
+        )
+        mhc_pre_convert_fn(fn_packed, fn)
         (
             post_mix_bf16,
             comb_mix_bf16,
@@ -535,7 +542,7 @@ def test_mhc_pre(
         ), hip_bf16_us = run_perftest(
             aiter.mhc_pre,
             residual,
-            fn,
+            fn_packed,
             hc_scale,
             hc_base,
             is_fn_pack_bf16=1,
@@ -892,10 +899,16 @@ def test_mhc_post_pre(
     ret["fused_us"] = fused_us
     ret["hip_fused_err"] = hip_fused_err
 
-    # bf16 (fn hi/lo pack) compute path: same fused kernel but is_fn_pack_bf16=1. gfx950
-    # native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); other arches fall back to
-    # fp32 (err/us == the fp32 fused columns).
+    # bf16 compute path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn,
+    # then run the fused kernel with is_fn_pack_bf16=1 so it bit-extracts hi/lo. gfx950 native
+    # bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); other arches fall back to fp32.
     if fn_pack_bf16:
+        from aiter.ops.mhc import mhc_pre_convert_fn
+
+        fn_packed = torch.empty(
+            fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
+        )
+        mhc_pre_convert_fn(fn_packed, fn)
         (
             post_mix_bf16,
             comb_mix_bf16,
@@ -907,7 +920,7 @@ def test_mhc_post_pre(
             residual_in,
             post_layer_mix,
             comb_res_mix,
-            fn,
+            fn_packed,
             hc_scale,
             hc_base,
             force_fused=True,

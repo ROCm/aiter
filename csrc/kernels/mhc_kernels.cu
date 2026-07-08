@@ -68,8 +68,48 @@ namespace aiter {
         ival = __builtin_bit_cast(int, val);
         val += __builtin_bit_cast(float,
             __builtin_amdgcn_ds_bpermute((lane_id ^ 16) * 4, ival));
-    
+
         return val;
+    }
+
+    // Pre-convert fn (fp32) into a packed dword: hi = bf16(fn) in [31:16], lo = bf16(fn -
+    // fp32(hi)) in [15:0]. Same 4-byte width as fp32 so the gemm's load / LDS / swizzle are
+    // unchanged; the bf16 gemm (is_fn_pack_bf16) then bit-extracts hi/lo instead of
+    // recomputing the fp32->bf16 split per (m_block, k) -- the split was redundant work
+    // repeated m_blocks times. fn are model weights (constant across forward passes), so
+    // this runs once and the packed int32 tensor is reused every forward.
+    template <typename DTYPE_I>
+    __global__ void mhc_pre_convert_fn_kernel(uint32_t* fn_packed, const float* fn, int64_t numel)
+    {
+        int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= numel) return;
+        float f = fn[i];
+        DTYPE_I hi = static_cast<DTYPE_I>(f);
+        DTYPE_I lo = static_cast<DTYPE_I>(f - static_cast<float>(hi));
+        uint32_t hi_bits = __builtin_bit_cast(uint16_t, hi);
+        uint32_t lo_bits = __builtin_bit_cast(uint16_t, lo);
+        fn_packed[i] = (hi_bits << 16) | lo_bits;
+    }
+
+    // The packed hi/lo are encoded as bf16 -- the activation/MFMA element type the gemm
+    // uses -- so the gemm's bit-extract round-trips.
+    void mhc_pre_convert_fn(
+        torch::Tensor& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
+        torch::Tensor& fn         // (hc_mult3, hc_hidden_size) fp32 in
+    )
+    {
+        TORCH_CHECK(fn.scalar_type() == at::kFloat, "fn must be fp32");
+        TORCH_CHECK(fn_packed.numel() == fn.numel(), "fn_packed and fn must have same numel");
+        int64_t numel = fn.numel();
+        const int block_size = 256;
+        int64_t grid = (numel + block_size - 1) / block_size;
+        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(fn));
+        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        using DTYPE_I = typename t2opus<c10::BFloat16>::type;
+        mhc_pre_convert_fn_kernel<DTYPE_I><<<grid, block_size, 0, stream>>>(
+            reinterpret_cast<uint32_t*>(fn_packed.data_ptr()),
+            reinterpret_cast<const float*>(fn.data_ptr()),
+            numel);
     }
 
 // Branch must match mma_pack_size (= warp_size == 64 ? 1 : 2): the MFMA path
@@ -422,12 +462,15 @@ namespace aiter {
                 _Pragma("unroll")                                                                 \
                 for (int n = 0; n < repeat_n; n++) {                                              \
                     opus::vector_t<opus::bf16_t, 8> fn_hi, fn_lo;                                 \
+                    /* fn is pre-packed (hi<<16|lo, from mhc_pre_convert_fn); bit-extract both */  \
+                    /* bf16, no fp32->bf16 split -- the redundant per-(m_block,k) work removed. */ \
                     _Pragma("unroll")                                                             \
-                    for (int e = 0; e < 8; e++) fn_hi[e] = opus::fp32_to_bf16(raw[n][e]);         \
+                    for (int e = 0; e < 8; e++) {                                                 \
+                        uint32_t bits = __builtin_bit_cast(uint32_t, raw[n][e]);                  \
+                        fn_hi[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits >> 16));      \
+                        fn_lo[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits & 0xFFFFu));  \
+                    }                                                                             \
                     v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
-                    _Pragma("unroll")                                                             \
-                    for (int e = 0; e < 8; e++)                                                   \
-                        fn_lo[e] = opus::fp32_to_bf16(raw[n][e] - opus::bf16_to_fp32(fn_hi[e]));  \
                     v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
                     __builtin_amdgcn_sched_barrier(0);                                            \
                 }                                                                                 \
@@ -493,12 +536,14 @@ namespace aiter {
                 _Pragma("unroll")                                                                 \
                 for (int n = 0; n < repeat_n; n++) {                                              \
                     opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;                                \
+                    /* fn is pre-packed (hi<<16|lo); bit-extract both bf16 -- no fp split. */      \
                     _Pragma("unroll")                                                             \
-                    for (int i = 0; i < 16; i++) fn_hi[i] = opus::fp32_to_bf16(raw[n][i]);        \
+                    for (int i = 0; i < 16; i++) {                                                \
+                        uint32_t bits = __builtin_bit_cast(uint32_t, raw[n][i]);                  \
+                        fn_hi[i] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits >> 16));      \
+                        fn_lo[i] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits & 0xFFFFu));  \
+                    }                                                                             \
                     v_cf[n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
-                    _Pragma("unroll")                                                             \
-                    for (int i = 0; i < 16; i++)                                                  \
-                        fn_lo[i] = opus::fp32_to_bf16(raw[n][i] - opus::bf16_to_fp32(fn_hi[i]));  \
                     v_cf[n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
                     __builtin_amdgcn_sched_barrier(0);                                            \
                 }                                                                                 \
@@ -688,7 +733,7 @@ namespace aiter {
         torch::Tensor& out, // (split_k, m, hc_mult3) / (m, hc_mult3)
         torch::Tensor& sqrsum, // (split_k, m) / (m)
         torch::Tensor& x, // (m, hc_hidden_size)
-        torch::Tensor& fn, // (hc_mult3, hc_hidden_size)
+        torch::Tensor& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 (hi<<16|lo) when is_fn_pack_bf16
         int tile_k = 128,
         int is_fn_pack_bf16 = 0
     )
@@ -2395,14 +2440,15 @@ namespace aiter {
                         }
                         for(int n = 0; n < repeat_n; n++) {
                             opus::vector_t<opus::bf16_t, ds_read_vec> fn_hi8, fn_lo8;
+                            // fn is pre-packed (hi<<16|lo, from mhc_pre_convert_fn); bit-extract
+                            // both bf16 -- no fp32->bf16 split recomputed per (m_block, k).
                             for (int e = 0; e < ds_read_vec; e++) {
-                                fn_hi8[e] = opus::fp32_to_bf16(v_fn[n][e + j * ds_read_vec]);
+                                float fv = v_fn[n][e + j * ds_read_vec];
+                                uint32_t bits = __builtin_bit_cast(uint32_t, fv);
+                                fn_hi8[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits >> 16));
+                                fn_lo8[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits & 0xFFFFu));
                             }
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi8, res_bf, v_cf[b][n]);
-                            for (int e = 0; e < ds_read_vec; e++) {
-                                float f = v_fn[n][e + j * ds_read_vec];
-                                fn_lo8[e] = opus::fp32_to_bf16(f - opus::bf16_to_fp32(fn_hi8[e]));
-                            }
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo8, res_bf, v_cf[b][n]);
                         }
 #elif defined(__gfx1250__)
@@ -2424,17 +2470,18 @@ namespace aiter {
                             }
                             for (int n = 0; n < repeat_n; n++) {
                                 opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;
+                                // fn is pre-packed (hi<<16|lo); bit-extract both bf16 -- no fp split.
                                 for (int e = 0; e < ds_read_vec; e++) {
-                                    fn_hi[e]              = opus::fp32_to_bf16(v_fn[n][e + (j - 1) * ds_read_vec]);
-                                    fn_hi[ds_read_vec + e] = opus::fp32_to_bf16(v_fn[n][e + j * ds_read_vec]);
+                                    float fv0 = v_fn[n][e + (j - 1) * ds_read_vec];
+                                    float fv1 = v_fn[n][e + j * ds_read_vec];
+                                    uint32_t b0 = __builtin_bit_cast(uint32_t, fv0);
+                                    uint32_t b1 = __builtin_bit_cast(uint32_t, fv1);
+                                    fn_hi[e]               = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b0 >> 16));
+                                    fn_hi[ds_read_vec + e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b1 >> 16));
+                                    fn_lo[e]               = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b0 & 0xFFFFu));
+                                    fn_lo[ds_read_vec + e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b1 & 0xFFFFu));
                                 }
                                 v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, res_bf, v_cf[b][n]);
-                                for (int e = 0; e < ds_read_vec; e++) {
-                                    float f0 = v_fn[n][e + (j - 1) * ds_read_vec];
-                                    float f1 = v_fn[n][e + j * ds_read_vec];
-                                    fn_lo[e]              = opus::fp32_to_bf16(f0 - opus::bf16_to_fp32(fn_hi[e]));
-                                    fn_lo[ds_read_vec + e] = opus::fp32_to_bf16(f1 - opus::bf16_to_fp32(fn_hi[ds_read_vec + e]));
-                                }
                                 v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, res_bf, v_cf[b][n]);
                             }
                         }
