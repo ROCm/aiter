@@ -60,9 +60,9 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     first_row = group_id * cW
     remaining = c_num_rows - first_row
     win_h = (remaining < cW).select(remaining, cW)
-    l = xy_g % tids_per_grp
-    row = first_row + (l % win_h)
-    col = l // win_h
+    tid_in_grp = xy_g % tids_per_grp
+    row = first_row + (tid_in_grp % win_h)
+    col = tid_in_grp // win_h
     return row, col
 
 
@@ -89,9 +89,9 @@ def _xcd_remap_compact(xy, num_rows_rt, num_cols, C, W, nXCD=NXCD):
     first_row = group_id * cW
     remaining = nrows - first_row
     win_h = (remaining < cW).select(remaining, cW)  # last window may be short
-    l = xy_g % tids_per_grp
-    row = first_row + (l % win_h)
-    col = l // win_h
+    tid_in_grp = xy_g % tids_per_grp
+    row = first_row + (tid_in_grp % win_h)
+    col = tid_in_grp // win_h
     return row, col
 
 
