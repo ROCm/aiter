@@ -1,0 +1,94 @@
+{
+  "schema": "arch-keyed-v1",
+  "by_arch": {
+    "gfx942": {
+      "gfx": "gfx942",
+      "winners": {
+        "B120D256K256N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 32,
+          "xcd_w": 16,
+          "threads": 512,
+          "cos": 1.0,
+          "ms": 0.4874,
+          "auto_ms": 0.5634,
+          "speedup": 1.156
+        },
+        "B120D512K512N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 32,
+          "xcd_w": 8,
+          "cos": 1.0,
+          "ms": 1.4664,
+          "auto_ms": 1.4839,
+          "speedup": 1.012
+        },
+        "B1024D256K256N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 32,
+          "xcd_w": 8,
+          "threads": 512,
+          "cos": 1.0,
+          "ms": 4.1212,
+          "auto_ms": 4.4491,
+          "speedup": 1.080
+        },
+        "B1024D512K512N7680": {
+          "use_mfma_k32": false,
+          "xcd_c": 240,
+          "xcd_w": 8,
+          "cos": 1.0,
+          "ms": 12.2677,
+          "auto_ms": 12.3749,
+          "speedup": 1.009
+        },
+        "B64D512K1024N8192": {
+          "use_mfma_k32": false,
+          "xcd_c": 240,
+          "xcd_w": 4,
+          "cos": 1.0,
+          "ms": 1.523,
+          "auto_ms": 1.563,
+          "speedup": 1.496
+        }
+      },
+      "fallback": {
+        "by_d_bucket": {
+          "d_le_256": {
+            "config": {
+              "use_mfma_k32": false,
+              "xcd_c": null,
+              "xcd_w": null
+            }
+          },
+          "d_le_512": {
+            "config": {
+              "use_mfma_k32": false,
+              "xcd_c": null,
+              "xcd_w": null
+            }
+          },
+          "d_le_1024": {
+            "config": {
+              "use_mfma_k32": false,
+              "xcd_c": null,
+              "xcd_w": null
+            }
+          },
+          "d_big": {
+            "config": {
+              "use_mfma_k32": false,
+              "xcd_c": null,
+              "xcd_w": null
+            }
+          }
+        },
+        "global": {
+          "use_mfma_k32": false,
+          "xcd_c": null,
+          "xcd_w": null
+        }
+      }
+    }
+  }
+}
