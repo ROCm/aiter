@@ -393,7 +393,7 @@ def _bwd_row(**overrides) -> dict:
         has_window="False",
         has_contextual="False",
         has_targets="False",
-        kernel="dvdk",
+        kernel="dv",
         block_m=128,
         block_n=64,
         num_waves=4,
@@ -443,21 +443,23 @@ def test_bwd_tuned_csv_best_duration_wins(tmp_path):
 
 
 def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
-    """dV/dK and dQ resolve independent tuned configs for the same problem."""
+    """dV, dK and dQ each resolve independent tuned configs for the same problem."""
     path = _write_bwd_csv(
         tmp_path / "tuned_bwd.csv",
         [
-            _bwd_row(kernel="dvdk", block_m=192, block_n=32, num_waves=4, waves_per_eu=0),
+            _bwd_row(kernel="dv", block_m=192, block_n=32, num_waves=4, waves_per_eu=0),
+            _bwd_row(kernel="dk", block_m=192, block_n=32, num_waves=4, waves_per_eu=2),
             _bwd_row(kernel="dq", block_m=128, block_n=32, num_waves=4, waves_per_eu=2),
         ],
     )
 
     config_map = hstu_kernels._bwd_tuned_config_map(path)
 
-    assert len(config_map) == 2
+    assert len(config_map) == 3
     # Keys are (problem_key, kernel); pull each kernel's config.
     by_kernel = {kern: cfg for (_, kern), cfg in config_map.items()}
-    assert by_kernel["dvdk"] == dict(block_m=192, block_n=32, num_waves=4, waves_per_eu=0)
+    assert by_kernel["dv"] == dict(block_m=192, block_n=32, num_waves=4, waves_per_eu=0)
+    assert by_kernel["dk"] == dict(block_m=192, block_n=32, num_waves=4, waves_per_eu=2)
     assert by_kernel["dq"] == dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=2)
 
 

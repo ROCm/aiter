@@ -1,9 +1,24 @@
-"""hstu_attention_bwd - FlyDSL kernel (causal-only; computes dV and dK)
+"""hstu_attention_bwd - FlyDSL kernel (causal-only; computes dV *or* dK)
 
 Backward of HSTU attention. Given dO, recompute S = alpha*Q*K^T and sigma from
 Q,K (nothing is stashed by the forward), form the masked, silu-gated attention
-weights, and produce gradients. This kernel computes **dV and dK** (dQ is not
-implemented here yet):
+weights, and produce one gradient family selected by the build-time `which` flag:
+
+    which="dv":  dV[kv, d]  = (1/N) * sum_q P[q, kv] * dO[q, d],   P = mask .* silu(alpha*Q*K^T)
+    which="dk":  dK[kv, hc] = alpha  * sum_q dS[q, kv] * Q[q, hc]
+                 dS[q, kv]  = mask .* (1/N) * silu'(alpha*S) * (dO * V^T)[q, kv]
+
+**Why split dV and dK into two single-family kernels?** A fused kernel carries
+*both* accumulator families (dV over hidden_dim + dK over head_dim) → ~48 MFMA
+accumulators → ~336 AGPRs at block_m=192, which pins wavefront occupancy at 1
+wave/SIMD (combined VGPR+AGPR ≈ 464 of the 512 pool). The kernel is on-chip
+latency-bound, so that 1-wave occupancy — not compute or bandwidth — is the
+bottleneck. Splitting halves the accumulators (~24 → ~96 AGPR), letting each
+kernel keep its large amortizing tile *and* reach ~2-3 waves/SIMD. The cost is
+recomputing S in both (a recompute-over-occupancy trade, consistent with the
+existing dQ kernel, which also recomputes S).
+
+For dV specifically (below), and dK analogously:
 
     dV[kv, d]  = (1/N) * sum_q P[q, kv] * dO[q, d],   P = mask .* silu(alpha*Q*K^T)
     dK[kv, hc] = alpha  * sum_q dS[q, kv] * Q[q, hc]
@@ -204,11 +219,24 @@ def build_hstu_attention_bwd(
     dtype_str: str,
     max_seq_len: int,
     *,
+    which: str = "dv",
     block_m: int = 64,
     block_n: int = 16,
     num_waves: int = 2,
     waves_per_eu: int = 0,
 ):
+    # `which` selects the single output family this kernel produces:
+    #   "dv" -> dV = A^T dO         (needs S -> silu -> P; one MFMA reduction)
+    #   "dk" -> dK = alpha dS^T Q   (needs S -> silu'; dA = dO V^T -> dS; one reduction)
+    # Splitting dV and dK into two single-family kernels (vs one that carries both
+    # accumulator families) halves the loop-carried MFMA accumulators -> ~half the
+    # AGPRs -> higher wavefront occupancy, which is what hides the on-chip latency
+    # this kernel is bound by. Each recomputes S (recompute-over-occupancy trade).
+    if which not in ("dv", "dk"):
+        raise ValueError(f"which must be 'dv' or 'dk', got {which!r}")
+    produce_dv = which == "dv"
+    produce_dk = which == "dk"
+
     validate_hstu_attention_bwd(
         num_heads,
         head_dim,
@@ -279,7 +307,7 @@ def build_hstu_attention_bwd(
     NUM_BATCHES_DO = max(1, BLOCK_N // ROWS_PER_BATCH_DO)
     DO_NEEDS_GUARD = ROWS_PER_BATCH_DO > BLOCK_N
 
-    allocator = SmemAllocator(None, global_sym_name="hstu_attention_bwd_smem")
+    allocator = SmemAllocator(None, global_sym_name=f"hstu_attention_bwd_{which}_smem")
     q_lds_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = q_lds_offset + q_lds_bytes
     do_lds_offset = allocator._align(allocator.ptr, 16)
@@ -294,9 +322,9 @@ def build_hstu_attention_bwd(
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
-        dv: fx.Tensor,
-        dk: fx.Tensor,
+        out: fx.Tensor,
     ) -> None:
+        # `out` is dV (which=="dv") or dK (which=="dk"). `v` is unused by the dV kernel.
         elem_type = elem_dtype.ir_type
         compute_type = fx.Float32.ir_type
         v4f32_type = Vec.make_type(MFMA_ELEMS_PER_LANE, fx.Float32)
@@ -347,7 +375,7 @@ def build_hstu_attention_bwd(
 
         # ---- Global tensor views (grouped_loader is shared, layout-algebra based) ----
         k_load = grouped_loader(k, head_dim, MFMA_LANE_K)  # resident K (B-operand for S)
-        v_load = grouped_loader(v, hidden_dim, MFMA_LANE_K)  # resident V (B-operand for dA)
+        v_load = grouped_loader(v, hidden_dim, MFMA_LANE_K)  # resident V (B-operand for dA; dK only)
         do_load = grouped_loader(do, hidden_dim, VEC_DO)  # streamed dO register prefetch
 
         q_head_offset = head_idx * fx.Int32(head_dim)
@@ -385,8 +413,10 @@ def build_hstu_attention_bwd(
                 per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
             k_packs.append(per_og)
 
-        # ---- Resident V B-operand packs (per owned KV sub-tile), for dA = dO*V^T ----
+        # ---- Resident V B-operand packs (per owned KV sub-tile), for dA = dO*V^T (dK only) ----
         # b_pack[i] = V[kv = lane_mod_16, d = ks*16 + lane_div_16*4 + i]; contraction over d.
+        # Built unconditionally (dead-code-eliminated in the dV kernel); gating this with an
+        # in-kernel `if` is unsafe -- the FlyDSL AST rewriter traces both branches.
         v_packs = []  # v_packs[ks][og]
         for ks in range_constexpr(DK_STEPS):
             v_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
@@ -459,9 +489,8 @@ def build_hstu_attention_bwd(
         if has_contextual:
             q_tile_start = fx.Int32(0)
 
-        N_ACC_DV = D_CHUNKS * KV_OWNED_SUBTILES  # dV accumulators
-        N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES  # dK accumulators
-        N_ACC = N_ACC_DV + N_ACC_DK  # loop-carried [dV..., dK...]
+        # Single accumulator family (dV or dK) -> half the AGPRs vs the fused kernel.
+        N_ACC = (D_CHUNKS if produce_dv else HC_CHUNKS) * KV_OWNED_SUBTILES
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         # ---- Streamed Q DMA: global -> LDS (dword, swizzled) ----
@@ -573,6 +602,8 @@ def build_hstu_attention_bwd(
 
                     keep = [keep_row(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                     silu_vals, grad_vals = silu_and_grad_batch(s_vals)
+                    # Build both fragments unconditionally; the unused one is DCE'd per `which`
+                    # (in-kernel `if` gating is unsafe -- the AST rewriter traces both branches).
                     p_vals = [keep[i].select(silu_vals[i], c_zero_f) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                     p_packs[ng][og] = pack_p(p_vals)
                     s_meta[ng][og] = (grad_vals, keep)
@@ -650,7 +681,7 @@ def build_hstu_attention_bwd(
 
         do_reg_outstanding = NUM_BATCHES_DO
 
-        def run_q_tile(dv_acc, dk_acc, q_start):
+        def run_q_tile(acc, q_start):
             async_load_q(q_start)
             do_vecs = async_load_do_regs(q_start)
             _waitcnt_vm_n(do_reg_outstanding)
@@ -661,43 +692,42 @@ def build_hstu_attention_bwd(
             store_do_regs_to_lds(do_vecs)
             rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_DO, 0)
             gpu.barrier()  # dO published; Q still resident in LDS for dK's B-operand
-            dv_acc = accum_dv_tile(dv_acc, p_packs)
-            ds_packs = compute_ds_packs(s_meta)
-            dk_acc = accum_dk_tile(dk_acc, ds_packs)
-            return dv_acc, dk_acc
+            # Python ternary (not an `if` statement): only the selected family's IR is
+            # built at trace time, so the loop carries a single accumulator family.
+            acc = (
+                accum_dv_tile(acc, p_packs)
+                if produce_dv
+                else accum_dk_tile(acc, compute_ds_packs(s_meta))
+            )
+            return acc
 
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
             for q_tile, it in range(fx.Index(q_tile_start), fx.Index(n_q_tiles), fx.Index(1), init=acc_init):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
-                dv_acc = [it_list[i] for i in range(N_ACC_DV)]
-                dk_acc = [it_list[N_ACC_DV + i] for i in range(N_ACC_DK)]
+                acc = [it_list[i] for i in range(N_ACC)]
                 q_start = fx.Int32(q_tile) * fx.Int32(BLOCK_N)
-                dv_acc, dk_acc = run_q_tile(dv_acc, dk_acc, q_start)
-                loop_results = yield dv_acc + dk_acc
+                acc = run_q_tile(acc, q_start)
+                loop_results = yield acc
 
-            # ---- Epilogue: store dV (1/N hoisted here) and dK (alpha applied here) ----
-            # dV C[m=kv, n=d]: kv row = kv_wave_base + og*16 + lane_div_16*4 + e; d col = c*16 + lane_mod_16.
-            # dK C[m=kv, n=hc]: same kv row layout; hc col = c*16 + lane_mod_16; scaled by alpha.
+            # ---- Epilogue: store the produced family into `out` ----
+            # dV C[m=kv, n=d]: kv row = kv_wave_base + og*16 + lane_div_16*4 + e; d col = c*16 + lane_mod_16;
+            #   1/N hoisted here (mirrors the forward's O epilogue).
+            # dK C[m=kv, n=hc]: same kv row layout; hc col = c*16 + lane_mod_16; alpha applied here.
             results = list(loop_results) if isinstance(loop_results, (list, tuple)) else [loop_results]
-            dv_results = results[:N_ACC_DV]
-            dk_results = results[N_ACC_DV:]
+            out_chunks = D_CHUNKS if produce_dv else HC_CHUNKS
+            out_scale = c_inv_n if produce_dv else c_alpha
             for og in range_constexpr(KV_OWNED_SUBTILES):
                 kv_row_base = kv_wave_base + fx.Int32(og * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 for e in range_constexpr(MFMA_ELEMS_PER_LANE):
                     kv_row_e = kv_row_base + fx.Int32(e)
                     if kv_row_e < seq_len:
-                        for c in range_constexpr(D_CHUNKS):
-                            ov = dv_results[c * KV_OWNED_SUBTILES + og]
-                            d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                            val = fx.Float32(_fmul(Vec(ov)[e], c_inv_n)).to(elem_dtype)
-                            dv[fx.Int64(seq_start + kv_row_e), head_idx, d_col] = val
-                        for c in range_constexpr(HC_CHUNKS):
-                            kv_ = dk_results[c * KV_OWNED_SUBTILES + og]
-                            hc_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                            valk = fx.Float32(_fmul(Vec(kv_)[e], c_alpha)).to(elem_dtype)
-                            dk[fx.Int64(seq_start + kv_row_e), head_idx, hc_col] = valk
+                        for c in range_constexpr(out_chunks):
+                            ov = results[c * KV_OWNED_SUBTILES + og]
+                            col = fx.Int32(c * MFMA_M) + lane_mod_16
+                            val = fx.Float32(_fmul(Vec(ov)[e], out_scale)).to(elem_dtype)
+                            out[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
 
     _hstu_compile_hints = {
         "fast_fp_math": True,
@@ -712,8 +742,7 @@ def build_hstu_attention_bwd(
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
-        dv: fx.Tensor,
-        dk: fx.Tensor,
+        out: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
         allocator.finalized = False
@@ -729,8 +758,7 @@ def build_hstu_attention_bwd(
             do,
             seq_offsets,
             num_targets,
-            dv,
-            dk,
+            out,
             value_attrs={
                 "passthrough": [
                     ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
