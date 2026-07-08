@@ -12,9 +12,20 @@ out = aiter.mha_batch_prefill_asm(...)            # top-level alias
 from aiter.ops.mha_batch_prefill_asm import mha_batch_prefill_asm
 ```
 
-The kernel is a single **varlen** kernel: it derives every per-batch Q base from
+The kernel is a **varlen** kernel: it derives every per-batch Q base from
 `cu_seqlens_q`, so it is correct for any batch size, including `batch == 1`
 (a single `[0, S]` segment).
+
+Two `.co` binaries are shipped and selected automatically by `page_block_size`:
+
+| `page_block_size` | Kernel `.co` | Addressing |
+|---|---|---|
+| `16` | `fmha_fwd_hd128_fp8_causal_qkptph_vph_ps.co` | 16-token pages; full 64-bit K/V/`k_descale` addressing (per-lane `global_load`), so KV pools >4GB (and `k_descale` pools >2GB) are supported. |
+| `64` | `fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64.co` | 64-token pages; scalar per-page SRD-rebase 64-bit addressing (multi-TB KV pool reachable without per-lane 64-bit VALU). |
+
+Both are causal, persistent-scheduler, packed-varlen, freeze-max builds. The
+launcher is otherwise identical — it derives every stride/pointer from the input
+tensors, so nothing else in the call changes with the page size.
 
 ---
 
@@ -26,7 +37,7 @@ The call **raises** (no silent fallback) unless all of these hold:
 |---|---|
 | GPU arch | `gfx942` (MI300/MI308; the shipped `.co` lives in `hsa/gfx942/fmha_v3_fwd/MI308/`) |
 | Head dim | `head_size_q == head_size_v == 128` |
-| Page size | `page_block_size == 16` |
+| Page size | `page_block_size ∈ {16, 64}` (selects the matching `.co`) |
 | Q/K/V dtype | FP8 E4M3 (`torch.float8_e4m3fnuz` on gfx942) |
 | Output dtype | `torch.bfloat16` |
 | Masking | causal (bottom-right aligned), always on |
@@ -61,8 +72,8 @@ mha_batch_prefill_asm(
 | `b` | batch size (`batch`) |
 | `hq` / `hk` | query heads (`num_heads`) / KV heads (`num_heads_k`); `hq % hk == 0` (GQA) |
 | `d` | head dim = 128 |
-| `page` | page block size = 16 |
-| `x` | FP8 vector width = 16 (== `page`) |
+| `page` | page block size (16 or 64) |
+| `x` | FP8 vector width = 16 |
 | `total_q` | `sum(seqlen_q[i] for i in range(b))` (packed Q rows) |
 | `num_pages` | total physical pages in the pool (`num_total_pages`) |
 
@@ -122,7 +133,7 @@ real value: `real ≈ fp8.float() * descale`. They are applied per token & head.
 |---|---|---|
 | `batch`, `num_heads`, `num_heads_k` | int | `num_heads % num_heads_k == 0`. |
 | `head_size_q`, `head_size_v` | int | Both 128. |
-| `page_block_size` | int | 16. |
+| `page_block_size` | int | 16 or 64. Selects which kernel `.co` is dispatched (see the table at the top). |
 | `num_total_pages` | int | Number of physical pages = `k.shape[0]`. |
 | `max_seqlen_q` | int | `max(seqlen_q[i])`. |
 | `softmax_scale` | float | Usually `1/sqrt(d)`. |
@@ -292,20 +303,28 @@ kv_layer_idx=L)`).
   (e.g. MI300X) need the binary placed in the corresponding arch subfolder.
 - **No KV append**: this is a prefill kernel; it reads the full per-batch KV
   range, it does not write new tokens into the cache.
-- **`kv_len` need not be a multiple of `page` (16).** Only `page_block_size`
-  itself must be 16. A batch allocates `ceil(kv_len / 16)` physical pages; the
+- **`kv_len` need not be a multiple of `page`.** Only `page_block_size` itself
+  must be 16 or 64. A batch allocates `ceil(kv_len / page)` physical pages; the
   last page may be partially filled, and `seqlens_kvcache[i]` gives the exact
   per-batch token count so the kernel masks the unused tail of the final page.
   (The unaligned cases `257`, `300`, `1000`, … are covered by
-  `test_batch_prefill_asm_qseqlen_unaligned_256`.) What *is* fixed is `page == 16`
-  and the per-block inner swizzle.
+  `test_batch_prefill_asm_qseqlen_unaligned_256`.) What *is* fixed is
+  `page_block_size ∈ {16, 64}` and the per-block inner swizzle.
+- **Large KV pools (>4GB):** both kernels address the KV/`k_descale` pools with
+  full 64-bit offsets (the `page=16` build via per-lane `global_load`; the
+  `page=64` build via per-page scalar SRD rebase), so multi-TB paged caches are
+  supported. `num_total_pages` must still equal `k.shape[0]`.
 
 ---
 
 ## Running the tests
 
-All ASM tests are gfx942-only and require the kernel `.co` to be built/deployed
-under `hsa/gfx942/fmha_v3_fwd/MI308/` (see `scripts/f8_fmha_prefill/build_qkptph.sh`).
+All ASM tests are gfx942-only and require both kernel `.co`s to be built/deployed
+under `hsa/gfx942/fmha_v3_fwd/MI308/`. `scripts/f8_fmha_prefill/build_qkptph.sh`
+builds and deploys **both** the `page=16` and `page=64` binaries in one shot.
+
+The test driver selects the page size via the `ASM_PAGE` env var (default `16`);
+set `ASM_PAGE=64` to exercise the 64-token-page kernel through the same tests.
 
 ```bash
 cd /workspace/aiter
@@ -315,6 +334,9 @@ pytest op_tests/test_batch_prefill.py -k combined_kv -v
 
 # All ASM qkptph/vph cases (self-attn, varlen, unaligned, combined-KV):
 pytest op_tests/test_batch_prefill.py -k batch_prefill_asm -v
+
+# Same suite against the 64-token-page kernel:
+ASM_PAGE=64 pytest op_tests/test_batch_prefill.py -k batch_prefill_asm -v
 
 # Latency/TFLOPS perf sweep (opt-in). NOTE: pass -s (disable pytest output
 # capture) so the per-seqlen "latency=... ms ... TFLOPS" lines are printed;
