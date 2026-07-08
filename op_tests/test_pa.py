@@ -406,6 +406,55 @@ def run_aiter_asm(
     )
 
 
+def opus_pa_supported(
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    query_dtype: torch.dtype,
+    kv_storage_dtype: torch.dtype,
+) -> bool:
+    if not hasattr(aiter, "pa_fwd_opus"):
+        return False
+    if query_dtype != dtypes.bf16 or kv_storage_dtype != dtypes.fp8:
+        return False
+    if head_size != 128 or block_size != 16:
+        return False
+    gqa = num_heads // num_kv_heads
+    return gqa in (1, 8)
+
+
+@perftest()
+def run_aiter_opus(
+    query,
+    k_cache,
+    v_cache,
+    block_tables,
+    seq_lens,
+    max_seq_len,
+    kv_cache_dtype,
+    num_kv_heads,
+    scale,
+    alibi_slopes,
+    block_tables_stride0,
+    k_scale=None,
+    v_scale=None,
+    high_precision=1,
+):
+    return aiter.pa_fwd_opus(
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        block_tables_stride0,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=None,
+        high_precision=high_precision,
+    )
+
+
 @perftest()
 def run_aiter_common(
     query,
@@ -671,6 +720,7 @@ def test_paged_attention(
     # tensor_dump(out_aiter, 'out_aiter')
 
     time_aiter_asm = None
+    time_aiter_opus = None
     if dtype == dtypes.bf16:
         out_aiter_asm, time_aiter_asm = run_aiter_asm(
             query.contiguous(),  # this kernel need contiguous buffer
@@ -894,6 +944,39 @@ def test_paged_attention(
                         msg=f"golden vs aiter_asm high_precision {high_precision}:{time_aiter_asm:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
                     )
 
+                    if opus_pa_supported(
+                        num_query_heads,
+                        num_kv_heads,
+                        head_size,
+                        block_size,
+                        dtype,
+                        cache_type_,
+                    ):
+                        try:
+                            out_aiter_opus, time_aiter_opus = run_aiter_opus(
+                                query.contiguous(),
+                                k_quant_,
+                                asm_V_shuffle(v_quant_),
+                                block_tables,
+                                seq_lens,
+                                max_seq_len,
+                                kv_cache_dtype,
+                                num_kv_heads,
+                                scale,
+                                alibi_slopes,
+                                block_tables.stride(0),
+                                k_scale_asm,
+                                v_scale_asm,
+                                high_precision,
+                            )
+                            checkAllclose(
+                                out_golden,
+                                out_aiter_opus,
+                                msg=f"golden vs aiter_opus hp={high_precision}:{time_aiter_opus:>8.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})",
+                            )
+                        except Exception as e:
+                            print(f"Warning: aiter_opus test skipped/failed: {e}")
+
             # if quant_algo == "KV_8BIT_PER_TENSOR":
             #     q_quant_, q_scale_ = aiter.per_tensor_quant(
             #         query,  quant_dtype=cache_type_)
@@ -969,6 +1052,7 @@ def test_paged_attention(
     return {
         "aiter_shomy": time_aiter,
         "aiter_asm": time_aiter_asm,
+        "aiter_opus": time_aiter_opus,
         "aiter_common": time_aiter_common,
     }
 

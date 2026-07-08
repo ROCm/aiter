@@ -530,6 +530,29 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_pa_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_pa_decode.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_pa_decode_launch.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/opus_pa_decode_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-std=c++20'",
+            "'-DOPUS_WA_ISSUE_2028=0'",
+            "'-DPA_MFMA_MAIN_PATH=1'",
+            "'-DPA_SP3_MFMA_GEMM1=1'",
+            "'-DPA_USE_SP3_PI=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_topk": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
