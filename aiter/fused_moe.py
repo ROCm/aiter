@@ -1249,7 +1249,6 @@ def get_2stage_cfgs(
     global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
-    untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
@@ -1293,18 +1292,20 @@ def get_2stage_cfgs(
     )
 
     def MainFunc():
-        with open(untune_file, "a") as f:
-            if os.path.getsize(untune_file) == 0:
-                f.write(
-                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
-                )
-            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
+        q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
+        with open(tune_input_file, "w") as f:
+            f.write(
+                "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+            )
             f.write(
                 f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
             )
         logger.info("\033[34m Start tuning fmoe")
+        tune_only = (
+            "TUNE_ONLY=flydsl_nvfp4 " if str(q_dtype_w) == "nvfp4_bf16" else ""
+        )
         os.system(
-            f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+            f"{tune_only}{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {tune_input_file} -o {tune_file} -o2 {profile_file} --last"
         )
 
     def FinalFunc():
@@ -1338,7 +1339,8 @@ def get_2stage_cfgs(
 
     cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
-        lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
+        lock_name = "__".join(str(k) for k in keys).replace("/", "_")
+        tune_input_file = os.path.join(config_path, f"untuned_fmoe_{lock_name}.csv")
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
@@ -1458,8 +1460,6 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
-        
-        logger.info(f"[fused_moe] tuned config used for {keys}: kernelName1={kernelName1}, kernelName2={kernelName2}")
 
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
@@ -1471,7 +1471,7 @@ def get_2stage_cfgs(
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
+        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys}{', performance may be suboptimal. Consider using AITER_ONLINE_TUNE=1 to tune AITER fused MOE online, or use AITER csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py offline"' if cfg is None else ''}."
     )
 
     def get_block_m() -> int:

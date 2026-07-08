@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -8,6 +10,7 @@ import torch
 from aiter.fused_moe import (
     fused_moe,
     get_2stage_cfgs,
+    get_padded_M,
     moe_sorting,
     torch_moe,
     torch_moe_stage1,
@@ -226,6 +229,68 @@ def _is_unsupported_nvfp4_stage1_shape(
 def _is_unsupported_nvfp4_stage2_shape(model_dim: int, params: dict) -> bool:
     tile_n = int(params["tile_n"])
     return model_dim % tile_n != 0
+
+
+def test_online_tuning(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    tune_file = tmp_path / "tuned_fmoe.csv"
+    tune_file.write_text(
+        "cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+        "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,"
+        "us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,tflops,bw,_tag\n"
+    )
+    monkeypatch.setenv("AITER_CONFIG_FMOE", str(tune_file))
+    monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
+
+    def tuned_tokens() -> list[int]:
+        with tune_file.open(newline="") as f:
+            return [
+                int(row["token"])
+                for row in csv.DictReader(f)
+                if row["q_dtype_w"] == NVFP4_BF16_QDTYPE
+                and "flydsl_moe" in row["kernelName1"]
+            ]
+
+    def get_metadata(m: int):
+        metadata = get_2stage_cfgs(
+            get_padded_M(m),
+            256,
+            128,
+            128,
+            8,
+            DTYPE,
+            DTYPE,
+            NVFP4_BF16_QDTYPE,
+            QuantType.No,
+            True,
+            ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+        )
+        assert metadata.stage1 is not None
+        assert metadata.stage2 is not None
+        return metadata
+
+    for token in [1, 2, 8]:
+        assert token not in tuned_tokens()
+        get_metadata(token)
+        assert token in tuned_tokens()
+
+    before_csv = tune_file.read_text()
+    start = time.perf_counter()
+    get_metadata(6)
+    assert time.perf_counter() - start < 2
+    assert tune_file.read_text() == before_csv
+
+    assert 16 not in tuned_tokens()
+    get_metadata(12)
+    assert 16 in tuned_tokens()
+
+    before_csv = tune_file.read_text()
+    get_metadata(16)
+    assert tune_file.read_text() == before_csv
+
 
 @pytest.mark.parametrize("model_dim", MODEL_DIMS)
 @pytest.mark.parametrize("inter_dim", INTER_DIMS)
