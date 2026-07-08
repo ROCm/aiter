@@ -13,7 +13,10 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 )
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950,
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v2 import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v2,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.reduce import reduce_grouped
@@ -131,12 +134,12 @@ def get_gluon_kernel_config(m, n, k, routing_data):
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
+    num_stages = 2
     split_k = 1
     block_k = 256
 
     if block_m == 16:
-        block_n = 128
+        block_n = 128 
         num_warps = 4
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -149,6 +152,7 @@ def get_gluon_kernel_config(m, n, k, routing_data):
             grid = grid_m * grid_n * split_k
 
     elif block_m == 32:
+        num_stages = 2
         if n <= 1024:
             block_n = 128
             num_warps = 4
@@ -158,11 +162,12 @@ def get_gluon_kernel_config(m, n, k, routing_data):
         else:
             # block_n=512 here overflows LDS once X, W and the (swizzled) scale
             # tile are all staged through shared memory; 256 leaves headroom.
-            block_n = 256
+            block_n = 512
             num_warps = 4
 
     else:
-        block_n = 256
+        num_stages = 1
+        block_n =  256
         num_warps = 4
 
     ret = {
@@ -179,6 +184,7 @@ def get_gluon_kernel_config(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
+    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
 def swizzle_scales_gfx950(data):
@@ -228,6 +234,7 @@ def moe_gemm_a16w4(
 
     arch = get_arch()
     use_gluon = True if arch in ("gfx1250", "gfx950") and backend in[None, "gluon"] else False
+    #print(f"use_gluon={use_gluon}")
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"
@@ -293,7 +300,9 @@ def moe_gemm_a16w4(
     # launch kernel
     
     if use_gluon:
-        _moe_gemm_a16w4_gluon_gfx950[(grid,)](
+        mask_k_limit =K % config["block_k"]
+        if mask_k_limit == 0 and swizzle_mx_scale is not None:
+            _moe_gemm_a16w4_gluon_gfx950_v2[grid,](
             y,
             y.stride(0),
             y.stride(1),
@@ -333,7 +342,62 @@ def moe_gemm_a16w4(
             config["block_k"],
             config["group_m"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=2,
+            NUM_BUFFERS=config["num_stages"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            #MASK_K_LIMIT=K % config["block_k"],
+            #NUM_FULL_K=K // config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+
+            )
+        else:
+            _moe_gemm_a16w4_gluon_gfx950_v1[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),  # stride_w_mx_e
+            w_scales.stride(1),  # stride_w_mx_k
+            w_scales.stride(2),  # stride_w_mx_n
+            bias,
+            stride_bias,
+            gammas,
+            M,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             SPLIT_K=config["split_k"],
             MASK_K_LIMIT=K % config["block_k"],
