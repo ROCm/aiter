@@ -214,6 +214,7 @@ def compile_mla_reduce(
     use_packed_cvt: bool = False,
     use_packed_f32_fma: bool = False,
     disable_guards: bool = False,
+    adaptive: bool = False,
 ):
     """Compile an MLA reduce kernel for fixed (H, Dv, out_dtype, tier).
 
@@ -221,6 +222,15 @@ def compile_mla_reduce(
     every body and branches on device ``n_splits`` per tile (mirrors HIP).
     Other tiers compile a single body for isolated tests. ``persistent`` selects
     the grid-stride launch (kn_mla_reduce_v1_ps); otherwise a 3-D grid launch.
+
+    ``adaptive`` (mutually exclusive with ``persistent``) emits the direct 3-D
+    body but the launcher sizes grid-z to ``num_final_rows`` (the host-known
+    active-tile count = decode batch), NOT ``num_reduce_tile``. This drops the
+    persistent grid-stride WhileOp + per-iteration CSR sentinel load + inter-
+    item LDS-reuse barrier -- the ATT-measured traversal floor (~27% of stalls
+    on b8_s32) -- launching exactly one block per active (tile, head, q-group).
+    Correct because ``process_work_item`` self-guards empty/OOB tiles, and
+    active tiles are the CSR prefix ``[0, num_final_rows)`` on the decode path.
 
     disable_guards: test-only compile-time knob that skips gather/store bounds
     guards so the suite can run a pre-fix kernel in-process. The production
@@ -891,7 +901,7 @@ def compile_mla_reduce(
                 local_seq = seq_i32 - q_start
                 dispatch_tier_body(seq_i32, local_seq)
 
-        if fx.const_expr(persistent):
+        if fx.const_expr(persistent and not adaptive):
             # Grid-stride persistent launch (kn_mla_reduce_v1_ps, reduce.cu:669).
             # 1-D grid; each block grid-strides over the flat work index and
             # terminates once it reaches a tile at the CSR sentinel.
@@ -981,13 +991,19 @@ def compile_mla_reduce(
         idx_tiles = fx.arith.index_cast(T.index, num_reduce_tile)
         idx_H = fx.Index(H)
         idx_ntg = fx.arith.index_cast(T.index, _to_raw(max_seqlen_q))
-        if fx.const_expr(persistent):
+        if fx.const_expr(persistent and not adaptive):
             _ps_mult = int(os.environ.get("MLA_PS_GRID_MULT", PS_GRID_MULT))
             ps_grid = fx.arith.muli(
                 _to_raw(max_splits), fx.arith.constant(_ps_mult, type=T.i32)
             )
             idx_grid = fx.arith.index_cast(T.index, ps_grid)
             grid = (idx_grid, fx.Index(1), fx.Index(1))
+        elif fx.const_expr(adaptive):
+            # One block per active (tile, head, q-group). grid-z = num_final_rows
+            # (= active tiles, CSR prefix) instead of the full num_reduce_tile,
+            # so no idle blocks and no grid-stride traversal.
+            idx_active = fx.arith.index_cast(T.index, _to_raw(num_final_rows))
+            grid = (idx_H, idx_ntg, idx_active)
         else:
             grid = (idx_H, idx_ntg, idx_tiles)
         mla_reduce_kernel(

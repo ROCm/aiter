@@ -1155,3 +1155,111 @@ def test_dispatch_forwards_actual_max_splits(monkeypatch):
     finally:
         mla._flydsl_mla_reduce_enabled.cache_clear()
     assert captured["actual_max_splits"] == 77
+
+
+# ---------------------------------------------------------------------------
+# Adaptive launch (prototype): one block per active (tile, head) instead of the
+# persistent grid-stride kernel. Engages via AITER_MLA_REDUCE_ADAPTIVE_LAUNCH=1
+# on the realistic serving shape (final_output trimmed to the active-tile batch).
+# ---------------------------------------------------------------------------
+_ADAPTIVE_SCENARIOS = [
+    ("b8_s32", 8, 32),
+    ("b8_s13", 8, 13),
+    ("b8_s6", 8, 6),
+    ("b8_s2", 8, 2),
+    ("b1_s32", 1, 32),
+]
+
+
+def _build_adaptive_serving(active_tiles, splits, out_dtype):
+    """Sparse 16384-tile decode grid, final_output trimmed to the active batch
+    (CSR prefix) so the wrapper's adaptive gate engages (mirrors real serving)."""
+    num_reduce_tile = 16384
+    partial_pool = 606
+    active_splits = active_tiles * splits
+    pool_slack = max(0, partial_pool - active_splits)
+    spt = [splits] * active_tiles + [0] * (num_reduce_tile - active_tiles)
+    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+        spt, 16, 512, out_dtype, M=1, gap_stride=1, pool_slack=pool_slack
+    )
+    fout = fout[:active_tiles].contiguous()
+    flse = flse[:active_tiles].contiguous()
+    return po, pl, indptr, fmap, pmap, fout, flse
+
+
+@pytest.mark.parametrize(
+    "label,active,splits", _ADAPTIVE_SCENARIOS, ids=[s[0] for s in _ADAPTIVE_SCENARIOS]
+)
+def test_adaptive_launch_wrapper_vs_hip(monkeypatch, label, active, splits):
+    """Adaptive launch (split-K off) matches HIP on the serving decode shapes."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "0")
+    dt = "bf16"
+    po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
+        active, splits, _out_dtype(dt)
+    )
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
+        )
+
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_adaptive_launch_cudagraph_replay(monkeypatch):
+    """Adaptive launch stays correct under CUDA-graph capture/replay (b8_s32)."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "0")
+    dt = "bf16"
+    po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
+        8, 32, _out_dtype(dt)
+    )
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=32
+        )
+
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+def test_adaptive_launch_single_tile_uses_persistent(monkeypatch):
+    """bs=1 (num_final_rows==1) must not engage adaptive; still matches HIP."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
+    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "0")
+    dt = "bf16"
+    po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
+        1, 32, _out_dtype(dt)
+    )
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=32
+        )
+
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)

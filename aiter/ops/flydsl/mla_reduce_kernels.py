@@ -38,6 +38,17 @@ __all__ = [
 ]
 
 
+def _adaptive_launch_enabled() -> bool:
+    """Gate for the adaptive (active_tiles x H) launch.
+
+    Default-on for multi-tile sparse decode (``num_final_rows > 1`` and
+    ``num_final_rows < num_reduce_tile``). Set
+    ``AITER_MLA_REDUCE_ADAPTIVE_LAUNCH=0`` to force the persistent grid-stride
+    launch. Single-tile decode (bs=1) always uses persistent or split-K.
+    """
+    return os.environ.get("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1") == "1"
+
+
 def _host_tier_dispatch_enabled() -> bool:
     """Opt-in gate for host-visible per-tier dispatch (capture-safe).
 
@@ -233,15 +244,32 @@ def flydsl_mla_reduce_v1(
     else:
         tier = Tier.ALL
 
+    # Adaptive launch: when the decode grid is sparse (active tiles <<
+    # num_reduce_tile) launch one block per active (tile, head, q-group)
+    # instead of the persistent grid-stride kernel. num_final_rows is the
+    # host-known active-tile count (decode batch, CSR prefix).
+    #
+    # Gate: multi-tile batches only (num_final_rows > 1). bs=1 / single-tile
+    # decode is split-K's domain (b1_s128); adaptive regresses there (+1µs).
+    num_final_rows = int(final_output.size(0))
+    use_adaptive = (
+        _adaptive_launch_enabled()
+        and use_reduce_final_map
+        and num_final_rows > 1
+        and num_final_rows < num_reduce_tile
+        and num_final_rows * H * max_seqlen_q <= 4 * num_cu
+    )
+
     kernel = compile_mla_reduce(
         H=H,
         Dv=Dv,
         out_dtype=out_dtype_str,
         tier=tier,
-        persistent=use_persistent,
+        persistent=use_persistent and not use_adaptive,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,
         waves_per_eu=waves_per_eu_from_env(),
+        adaptive=use_adaptive,
     )
 
     if final_lse is None:
