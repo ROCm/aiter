@@ -1861,6 +1861,54 @@ def hgemm_validate(dtype_str, m, n, k, kwargs):
     return True
 
 
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _hgemm_split_k_padded(k, tile_k, split_k):
+    working_k = _ceil_div(k, split_k)
+    padded_k = 0
+    for split_idx in range(split_k):
+        remaining_k = max(k - split_idx * working_k, 0)
+        part_k = min(working_k, remaining_k)
+        if part_k > 0:
+            padded_k += _ceil_div(part_k, tile_k) * tile_k
+    return padded_k
+
+
+def _hgemm_tile_iou(m, n, k, tile_m, tile_n, tile_k, split_k):
+    padded_m = _ceil_div(m, tile_m) * tile_m
+    padded_n = _ceil_div(n, tile_n) * tile_n
+    padded_k = _hgemm_split_k_padded(k, tile_k, split_k)
+    return (m * n * k) / (padded_m * padded_n * padded_k)
+
+
+def _hgemm_tile_iou_threshold(selections, m, n, k, keep_ratio):
+    best_iou = 0.0
+    for tile_m, tile_n, tile_k, split_k in itertools.product(
+        selections["TILE_M"],
+        selections["TILE_N"],
+        selections["TILE_K"],
+        selections["SPLIT_K"],
+    ):
+        best_iou = max(
+            best_iou, _hgemm_tile_iou(m, n, k, tile_m, tile_n, tile_k, split_k)
+        )
+    return best_iou * keep_ratio
+
+
+def _hgemm_config_tile_iou(m, n, k, config):
+    return _hgemm_tile_iou(
+        m,
+        n,
+        k,
+        config["TILE_M"],
+        config["TILE_N"],
+        config["TILE_K"],
+        config["SPLIT_K"],
+    )
+
+
 def hgemm_get_configs(dtype_str, m, n, k):
     selections = {
         "TILE_M": [16, 32, 48, 64, 80, 96, 128, 256],
@@ -1870,21 +1918,17 @@ def hgemm_get_configs(dtype_str, m, n, k):
         "SPLIT_K": [i for i in range(1, 14)],
         "BLOCK_M_WARPS": [1, 2, 4],
         "BLOCK_N_WARPS": [1, 2, 4],
-        "BLOCK_K_WARPS": [1, 2, 4],
+        "BLOCK_K_WARPS": [1, 2],
         "GROUP_M": [0, 4],
         "USE_HALF_TILE_INTERLEAVED": [False, True],
     }
+    keep_ratio = 0.95
     if m is not None and n is not None and k is not None:
-        if m <= 16:
-            selections["TILE_M"] = [16, 32]
+        if m <= 128:
             selections["GROUP_M"] = [
                 0,
             ]
-        elif m <= 256:
-            selections["TILE_M"] = [tm for tm in selections["TILE_M"] if tm <= m * 2]
-            selections["GROUP_M"] = [
-                0,
-            ]
+            keep_ratio = 0.90
         selections["SPLIT_K"] = [ks for ks in selections["SPLIT_K"] if k % ks == 0]
     keys = selections.keys()
     values = selections.values()
@@ -1892,8 +1936,12 @@ def hgemm_get_configs(dtype_str, m, n, k):
     if m is None or n is None or k is None:
         pass
     else:
+        tile_iou_threshold = _hgemm_tile_iou_threshold(selections, m, n, k, keep_ratio)
         configs = [
-            config for config in configs if hgemm_validate(dtype_str, m, n, k, config)
+            config
+            for config in configs
+            if _hgemm_config_tile_iou(m, n, k, config) >= tile_iou_threshold
+            and hgemm_validate(dtype_str, m, n, k, config)
         ]
     return configs
 
