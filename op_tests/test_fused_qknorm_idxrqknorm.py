@@ -483,7 +483,7 @@ def gather_index_cache(
 
 
 def check_close(actual, expected, *, msg: str, rtol: float, atol: float):
-    err = checkAllclose(actual, expected, msg=msg, rtol=rtol, atol=atol)
+    err = checkAllclose(actual.float(), expected.float(), msg=msg, rtol=rtol, atol=atol)
     if err != 0:
         raise AssertionError(f"{msg} mismatch ratio: {err}")
 
