@@ -936,7 +936,9 @@ def compile_moe_gemm1(
                 else:
                     _b_vmem_per_tile = k_unroll * num_acc_n
                 # SEPARATED mode issues two load_b_tile calls per K step.
-                _b_vmem_total = _b_vmem_per_tile if gate_up_interleave else _b_vmem_per_tile * 2
+                _b_vmem_total = (
+                    _b_vmem_per_tile if gate_up_interleave else _b_vmem_per_tile * 2
+                )
 
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
                 def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
@@ -1565,9 +1567,11 @@ def compile_moe_gemm1(
                     else load_b_tile(k0, n_blk_up, n_intra_up)
                 )
                 rocdl.sched_barrier(0)
-                x_regs0 = load_x_tile(k0)                     # A in-flight after B
+                x_regs0 = load_x_tile(k0)  # A in-flight after B
                 rocdl.sched_barrier(0)
-                store_x_tile_to_lds(x_regs0, lds_base_cur)    # vmcnt(0) drains A; B already done
+                store_x_tile_to_lds(
+                    x_regs0, lds_base_cur
+                )  # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
                 _barrier(vmcnt=0, lgkmcnt=0)
 
@@ -1678,7 +1682,7 @@ def compile_moe_gemm1(
                     # ---- stage 0: prefetch+store ping, compute pong ----
                     # A-load → B-loads → compute → A→LDS store → barrier (CK-tile order).
                     next_k1 = k_iv + c_tile_k
-                    x_regs_ping = load_x_tile(next_k1)       # A in-flight
+                    x_regs_ping = load_x_tile(next_k1)  # A in-flight
                     rocdl.sched_barrier(0)
                     _bg_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
                     _bu_ping = (
@@ -1701,7 +1705,7 @@ def compile_moe_gemm1(
 
                     # ---- stage 1: prefetch+store pong, compute ping ----
                     next_k2 = k_iv + c_tile_k + c_tile_k
-                    x_regs_pong = load_x_tile(next_k2)       # A in-flight
+                    x_regs_pong = load_x_tile(next_k2)  # A in-flight
                     rocdl.sched_barrier(0)
                     _bg_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
                     _bu_next = (
@@ -1744,7 +1748,7 @@ def compile_moe_gemm1(
                     b_up_cur = _unflatten_b_tile(list(loop_results[_p_bu:_p_a0]))
                     a0_prefetch_pong = (loop_results[_p_a0], loop_results[_p_a0 + 1])
                 k_tail1 = k_base_idx + arith.index(_k_per_batch - tile_k)
-                x_regs_ping = load_x_tile(k_tail1)            # A in-flight
+                x_regs_ping = load_x_tile(k_tail1)  # A in-flight
                 rocdl.sched_barrier(0)
                 b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
                 b_up_ping = (
@@ -3718,9 +3722,11 @@ def compile_moe_gemm2(
                 k0 = fx.Index(0)
                 b_cur = load_b_tile(k0)
                 rocdl.sched_barrier(0)
-                x_regs0 = load_x_tile(k0)                     # A in-flight after B
+                x_regs0 = load_x_tile(k0)  # A in-flight after B
                 rocdl.sched_barrier(0)
-                store_x_tile_to_lds(x_regs0, lds_base_cur)    # vmcnt(0) drains A; B already done
+                store_x_tile_to_lds(
+                    x_regs0, lds_base_cur
+                )  # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
                 _barrier(vmcnt=0, lgkmcnt=0)
 
@@ -3810,7 +3816,7 @@ def compile_moe_gemm2(
                     k_iv = pair_iv * (c_tile_k_s2 + c_tile_k_s2)
 
                     next_k1 = k_iv + c_tile_k_s2
-                    x_regs_ping = load_x_tile(next_k1)        # A in-flight
+                    x_regs_ping = load_x_tile(next_k1)  # A in-flight
                     rocdl.sched_barrier(0)
                     _bp = load_b_tile(next_k1)
                     rocdl.sched_barrier(0)
@@ -3825,7 +3831,7 @@ def compile_moe_gemm2(
                     )
 
                     next_k2 = k_iv + c_tile_k_s2 + c_tile_k_s2
-                    x_regs_pong = load_x_tile(next_k2)        # A in-flight
+                    x_regs_pong = load_x_tile(next_k2)  # A in-flight
                     rocdl.sched_barrier(0)
                     _bn = load_b_tile(next_k2)
                     rocdl.sched_barrier(0)
@@ -3858,7 +3864,7 @@ def compile_moe_gemm2(
                     )
                 else:
                     k_tail1 = k_in - tile_k
-                    x_regs_ping = load_x_tile(k_tail1)        # A in-flight
+                    x_regs_ping = load_x_tile(k_tail1)  # A in-flight
                     rocdl.sched_barrier(0)
                     b_ping = load_b_tile(k_tail1)
                     rocdl.sched_barrier(0)

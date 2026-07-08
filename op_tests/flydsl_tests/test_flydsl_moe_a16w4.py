@@ -70,7 +70,11 @@ def _call_fused_moe(inp, w1, w2, w1_sc, w2_sc, tw, tid, gate_mode, flydsl_force)
     os.environ["AITER_FLYDSL_FORCE"] = "1" if flydsl_force else "0"
     try:
         return fused_moe(
-            inp, w1, w2, tw, tid,
+            inp,
+            w1,
+            w2,
+            tw,
+            tid,
             w1_scale=w1_sc,
             w2_scale=w2_sc,
             quant_type=QuantType.per_1x32,
@@ -86,10 +90,10 @@ def _call_fused_moe(inp, w1, w2, w1_sc, w2_sc, tw, tid, gate_mode, flydsl_force)
 
 SHAPES = [
     # (model_dim, inter_dim, E, topk, tokens)
-    (3072, 512, 128, 4, 1),   # GPT-OSS tok=1 decode
-    (3072, 512, 128, 4, 4),   # GPT-OSS tok=4 decode
-    (7168, 256, 257, 9, 1),   # DSR1 tok=1 decode
-    (7168, 256, 257, 9, 4),   # DSR1 tok=4 decode
+    (3072, 512, 128, 4, 1),  # GPT-OSS tok=1 decode
+    (3072, 512, 128, 4, 4),  # GPT-OSS tok=4 decode
+    (7168, 256, 257, 9, 1),  # DSR1 tok=1 decode
+    (7168, 256, 257, 9, 4),  # DSR1 tok=4 decode
 ]
 
 
@@ -102,12 +106,19 @@ def test_fp4_bf16_fused_moe(model_dim, inter_dim, E, topk, tokens, gate_mode):
     )
 
     # Reference: CK-tile path
-    ref = _call_fused_moe(inp, w1, w2, w1_sc, w2_sc, tw, tid, gate_mode, flydsl_force=False)
+    ref = _call_fused_moe(
+        inp, w1, w2, w1_sc, w2_sc, tw, tid, gate_mode, flydsl_force=False
+    )
     # FlyDSL path
-    out = _call_fused_moe(inp, w1, w2, w1_sc, w2_sc, tw, tid, gate_mode, flydsl_force=True)
+    out = _call_fused_moe(
+        inp, w1, w2, w1_sc, w2_sc, tw, tid, gate_mode, flydsl_force=True
+    )
 
     err = checkAllclose(
-        ref, out, atol=0.5, rtol=0.1,
+        ref,
+        out,
+        atol=0.5,
+        rtol=0.1,
         msg=f"{gate_mode} {model_dim}x{inter_dim} E={E} k={topk} t={tokens}",
     )
     assert err < 0.05, (

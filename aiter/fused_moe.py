@@ -1239,7 +1239,8 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
-        and gate_mode == GateMode.SEPARATED  # INTERLEAVE falls through to ck2stages below
+        and gate_mode
+        == GateMode.SEPARATED  # INTERLEAVE falls through to ck2stages below
         and is_flydsl_available()
     ):
         # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
