@@ -424,8 +424,16 @@ def compile_mxscale_gemm(
         stage_layout.ptr = stage_b_up_data_rel_off + lds_b_data_bytes
     else:
         stage_b_up_data_rel_off = 0
-    stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
-    stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
+    if tdm_as_in_prologue:
+        # A-scale is hoisted to a single resident full-K buffer (allocated after
+        # the stage arena below); under this mode the per-stage A-scale ring is
+        # neither loaded (the per-step As TDM op is dropped) nor read
+        # (_load_a_scales reads the resident buffer), so don't reserve it per
+        # stage -- that slot would be dead LDS.
+        stage_a_scale_rel_off = 0
+    else:
+        stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
+        stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
     stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_b_scale_rel_off + lds_b_scale_bytes
     if stage1_dual_b:
@@ -443,7 +451,12 @@ def compile_mxscale_gemm(
 
     _last_compute_stage = _base_tail_plan[-1][1]
 
-    stage_pitch_bytes = _align_up(stage_bytes, 1024)
+    # When A-scale is hoisted to the prologue we drop the per-stage As slot and
+    # can pack stages tighter: a 512 B pitch (vs 1024) reclaims the alignment
+    # padding, lowering per-workgroup LDS enough to raise occupancy. Other modes
+    # keep the 1024 B pitch the TDM epilogue aliasing was tuned for.
+    _stage_pitch_align = 512 if tdm_as_in_prologue else 1024
+    stage_pitch_bytes = _align_up(stage_bytes, _stage_pitch_align)
     arena_alloc = SmemAllocator(
         None,
         arch=gpu_arch,
@@ -3388,7 +3401,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 31
+    tdm_store_descriptor_version = 32
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
