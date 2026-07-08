@@ -1854,7 +1854,7 @@ def hgemm_validate(dtype_str, m, n, k, kwargs):
     return True
 
 
-def hgemm_get_configs(m, n, k):
+def hgemm_get_configs(dtype_str, m, n, k):
     selections = {
         "TILE_M": [16, 32, 48, 64, 80, 96, 128, 256],
         "TILE_N": [64, 80, 96, 128, 256],
@@ -1870,7 +1870,12 @@ def hgemm_get_configs(m, n, k):
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
-    configs = [config for config in configs if hgemm_validate(m, n, k, config)]
+    if m is None or n is None or k is None:
+        pass
+    else:
+        configs = [
+            config for config in configs if hgemm_validate(dtype_str, m, n, k, config)
+        ]
     return configs
 
 

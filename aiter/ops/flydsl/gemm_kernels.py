@@ -76,6 +76,7 @@ def get_flydsl_hgemm_kernels(
     m: Optional[int] = None,
     n: Optional[int] = None,
     k: Optional[int] = None,
+    has_k_tail: Optional[bool] = None,
 ) -> Dict[str, Dict]:
     kernels = {}
     if any(dim is None for dim in (m, n, k)) and any(
@@ -84,7 +85,7 @@ def get_flydsl_hgemm_kernels(
         raise ValueError(
             "m, n, k must be provided together when requesting shape-aware kernels"
         )
-    configs = hgemm_get_configs(m, n, k)
+    configs = hgemm_get_configs(dtype, m, n, k)
     for config in configs:
         tile_m = config["TILE_M"]
         tile_n = config["TILE_N"]
@@ -96,12 +97,13 @@ def get_flydsl_hgemm_kernels(
         block_k_warps = config["BLOCK_K_WARPS"]
         policy = "ht" if config["USE_HALF_TILE_INTERLEAVED"] else "ft"
         group_m = config["GROUP_M"]
-        has_k_tail = infer_has_k_tail(
-            k=k,
-            split_k=config["SPLIT_K"],
-            tile_k=config["TILE_K"],
-            is_ht=config["USE_HALF_TILE_INTERLEAVED"],
-        )
+        if has_k_tail is None:
+            has_k_tail = infer_has_k_tail(
+                k=k,
+                split_k=config["SPLIT_K"],
+                tile_k=config["TILE_K"],
+                is_ht=config["USE_HALF_TILE_INTERLEAVED"],
+            )
         name = flydsl_kernel_name(
             dtype=dtype,
             out_dtype=out_dtype,
@@ -130,9 +132,12 @@ def _register_all_configs():
     for dtype in ("bf16", "fp16"):
         for out_dtype in ("fp16", "bf16"):
             for has_bias in (True, False):
-                _HGEMM_KERNELS.update(
-                    get_flydsl_hgemm_kernels(dtype, out_dtype, has_bias)
-                )
+                for has_k_tail in (True, False):
+                    _HGEMM_KERNELS.update(
+                        get_flydsl_hgemm_kernels(
+                            dtype, out_dtype, has_bias, has_k_tail=has_k_tail
+                        )
+                    )
 
 
 _register_all_configs()
