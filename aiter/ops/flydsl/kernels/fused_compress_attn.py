@@ -1491,9 +1491,11 @@ def _build_kernel_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    # Single quant source of truth: "none" | "per_row_fp8" | "fp4".
-    # (ksplit has no "group_fp8" path.) `quant`/`quant_fp4` derived below.
+    # Single quant source of truth: "none" | "per_row_fp8" | "group_fp8" | "fp4".
+    # `quant`/`quant_fp4`/`nm_asm` are derived below. group_fp8 (nm-asm) and fp4
+    # are both K-split-capable (nm-asm on the CSA Main shape; fp4 on the indexer).
     quant_mode: str = "none",
+    quant_group_size: int = 64,
 ):
     """K-split single-kernel: NW-wave LDS-reduced compress + norm + rope +
     scatter (BF16, FP8, or FP4). Constexpr knobs mirror :func:`_build_kernel`
@@ -1530,6 +1532,14 @@ def _build_kernel_ksplit(
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
+    # FP8 group_fp8 (V4 nm-asm) geometry: nope split into groups of
+    # GROUP_SIZE_Q; RTS lanes/group cooperate on amax. Scatter reuses the
+    # shared emitter (byte-identical to legacy / HCA). See _build_kernel.
+    nm_asm = quant_mode == "group_fp8"
+    GROUP_SIZE_Q = quant_group_size
+    RTS = (GROUP_SIZE_Q // VEC) if nm_asm else 1
+    log2_rts = int(math.log2(RTS)) if nm_asm else 0
+
     assert D % BLOCK_THREADS == 0, f"D={D} must divide {BLOCK_THREADS}"
     assert VEC in (2, 4, 8), f"VEC={VEC} outside supported set"
     assert NOPE >= 0 and NOPE % VEC == 0
@@ -1548,6 +1558,11 @@ def _build_kernel_ksplit(
     elif quant and preshuffle:
         assert D % _PRESHUFFLE_TILE == 0
         assert k_per_block % _PRESHUFFLE_TILE == 0
+    if nm_asm:
+        assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
+        assert (
+            NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
+        ), f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D
@@ -1580,9 +1595,11 @@ def _build_kernel_ksplit(
     ]
     if quant:
         _name_parts.append("Q")
-        if quant_fp4:
+        if nm_asm:
+            _name_parts.append(f"nmasm{GROUP_SIZE_Q}")
+        elif quant_fp4:
             _name_parts.append("fp4")
-        if use_ue8m0 and not quant_fp4:
+        elif use_ue8m0:
             _name_parts.append("ue8m0")
         if preshuffle:
             _name_parts.append("psh")
@@ -1617,6 +1634,9 @@ def _build_kernel_ksplit(
         kv_cache_token_stride: Int32,
         cache_scale: fx.Tensor,  # [NB, k_per_block] f32 (dummy if not quant)
         cache_scale_block_stride: Int32,
+        k_rope_buff: fx.Tensor,  # nm_asm only: paged [NB, k_per_block, RD] bf16 rope (dummy otherwise)
+        krope_block_stride: Int32,
+        krope_token_stride: Int32,
         block_table: fx.Tensor,
         block_table_seq_stride: Int32,
     ):
@@ -2087,6 +2107,38 @@ def _build_kernel_ksplit(
                         buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                     else:
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                elif const_expr(nm_asm):
+                    # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope
+                    # bf16 -> separate k_rope_buff. Shared emitter, byte-identical
+                    # to the legacy single-wave / HCA paths (lane == wave-0 lid). --
+                    _nm_cache_base = ArithValue(physical_block) * ArithValue(
+                        kv_cache_block_stride
+                    ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                    _nm_krope_base = ArithValue(physical_block) * ArithValue(
+                        krope_block_stride
+                    ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                    emit_group_fp8_nm_asm_scatter(
+                        normed_lane=normed_lane,
+                        rotated_lane=rotated_lane,
+                        lane=lid,
+                        is_rope_t=is_rope_t,
+                        cache_base=_to_raw(_nm_cache_base),
+                        out_rsrc=buffer_ops.create_buffer_resource(
+                            kv_cache, max_size=True
+                        ),
+                        krope_base=_to_raw(_nm_krope_base),
+                        krope_rsrc=buffer_ops.create_buffer_resource(
+                            k_rope_buff, max_size=True
+                        ),
+                        VEC=VEC,
+                        NOPE=NOPE,
+                        RTS=RTS,
+                        log2_rts=log2_rts,
+                        ROPE_THREAD_LO=ROPE_THREAD_LO,
+                        wave_width=BLOCK_THREADS,
+                        vecVf32=vecVf32,
+                        fm_fast=fm_fast,
+                    )
                 elif const_expr(not quant_fp4):
                     # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
@@ -2413,6 +2465,9 @@ def _build_kernel_ksplit(
         kv_cache_token_stride: fx.Int32,
         cache_scale: fx.Tensor,
         cache_scale_block_stride: fx.Int32,
+        k_rope_buff: fx.Tensor,
+        krope_block_stride: fx.Int32,
+        krope_token_stride: fx.Int32,
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
         plan_capacity: fx.Int32,
@@ -2446,6 +2501,9 @@ def _build_kernel_ksplit(
             kv_cache_token_stride,
             cache_scale,
             cache_scale_block_stride,
+            k_rope_buff,
+            krope_block_stride,
+            krope_token_stride,
             block_table,
             block_table_seq_stride,
         )
@@ -2578,8 +2636,9 @@ def compile_flydsl_fused_compress_attn_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    # "none" | "per_row_fp8" | "fp4" (single quant selector; no group_fp8).
+    # "none" | "per_row_fp8" | "group_fp8" | "fp4" (single quant selector).
     quant_mode: str = "none",
+    quant_group_size: int = 64,
 ):
     launcher = _build_kernel_ksplit(
         head_dim=head_dim,
@@ -2594,6 +2653,7 @@ def compile_flydsl_fused_compress_attn_ksplit(
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
         quant_mode=quant_mode,
+        quant_group_size=quant_group_size,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -2904,12 +2964,12 @@ def flydsl_fused_compress_attn(
         and rope_head_dim == 64
         and ratio == 4
         and overlap
-        and _mode == "fp8"
+        and _mode == "per_row_fp8"
     )
     # FP4 indexer: same compress geometry as the FP8 indexer (D=128, RD=64,
-    # ratio=4, overlap), only the scatter dtype differs. The K-split win
-    # comes from parallelizing the serial online-softmax pool, which is dtype
-    # -agnostic, so the FP8 wave-count heuristic carries over.
+    # ratio=4, overlap), only the scatter dtype differs. The K-split win comes
+    # from parallelizing the dtype-agnostic online-softmax pool, so the FP8
+    # wave-count heuristic carries over.
     _is_csa_indexer_fp4 = (
         head_dim == 128
         and rope_head_dim == 64
@@ -2917,15 +2977,32 @@ def flydsl_fused_compress_attn(
         and overlap
         and _mode == "fp4"
     )
+    # group_fp8 (nm-asm) CSA Main shares the CSA Main geometry (D=512, K=8); it is
+    # ported to the K-split kernel via the shared nm-asm scatter emitter.
+    _is_csa_main_nm = (
+        head_dim == 512
+        and rope_head_dim == 64
+        and ratio == 4
+        and overlap
+        and _quant
+        and nm_asm
+    )
     if (
         k_split_num_waves is None
         and has_bt
-        and (_is_csa_main or _is_csa_indexer or _is_csa_indexer_fp4)
+        and (
+            _is_csa_main
+            or _is_csa_indexer
+            or _is_csa_indexer_fp4
+            or _is_csa_main_nm
+        )
     ):
         nw_eff = csa_ksplit_num_waves(plan_capacity)
     else:
         nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
-    use_ksplit = nw_eff > 1 and has_bt and not nm_asm  # nm_asm: legacy only (for now)
+    # nm_asm now K-split-capable only on the validated CSA Main shape; all other
+    # nm_asm shapes still fall back to the legacy single-wave kernel.
+    use_ksplit = nw_eff > 1 and has_bt and (not nm_asm or _is_csa_main_nm)
     if use_ksplit:
         k_split_num_waves = nw_eff
         if K_pool % k_split_num_waves != 0:
@@ -2944,7 +3021,8 @@ def flydsl_fused_compress_attn(
             preshuffle=preshuffle,
             rms_weight_is_bf16=_rms_weight_is_bf16,
             rms_eps=float(rms_eps),
-            quant_mode=_mode,  # never "group_fp8" here (use_ksplit excludes nm_asm)
+            quant_mode=_mode,  # resolved: none|per_row_fp8|group_fp8|fp4
+            quant_group_size=64,
         )
         if stream is None:
             stream = torch.cuda.current_stream()
@@ -2971,6 +3049,9 @@ def flydsl_fused_compress_attn(
             kv_cache_token_stride,
             cs_arg,
             cs_block_stride,
+            krope_arg,
+            krope_block_stride,
+            krope_token_stride,
             bt_arg,
             bt_seq_stride,
             plan_capacity,
