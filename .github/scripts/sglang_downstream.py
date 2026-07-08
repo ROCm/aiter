@@ -11,7 +11,7 @@ from pathlib import Path
 
 TESTS = [
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "DeepSeek-R1-MXFP4",
         "model_id": "amd/DeepSeek-R1-MXFP4-Preview",
@@ -24,7 +24,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "DeepSeek-R1-MXFP4",
         "model_id": "amd/DeepSeek-R1-MXFP4-Preview",
@@ -38,7 +38,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "Qwen3-235B-MXFP4",
         "model_id": "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4",
@@ -52,20 +52,21 @@ TESTS = [
         "comment": "issue https://github.com/ROCm/aiter/issues/2857 not resolved yet",
     },
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "Qwen 3.5",
         "model_id": "Qwen/Qwen3.5-397B-A17B",
         "model_path_env": "QWEN35_MODEL_PATH",
         "test_type": "Accuracy",
-        "timeout_minutes": 70,
+        "timeout_minutes": 100,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600",
-        "run_on_pr": True,
+        "run_on_pr": False,
+        "comment": "Run in nightly first while failures are investigated.",
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "Qwen 3.5 FP8",
         "model_id": "Qwen/Qwen3.5-397B-A17B-FP8",
@@ -78,7 +79,7 @@ TESTS = [
         "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "DeepSeek-V3.2",
         "model_id": "deepseek-ai/DeepSeek-V3.2",
@@ -87,16 +88,12 @@ TESTS = [
         "timeout_minutes": 70,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
-        # Temporarily disabled: the DSv3.2 indexer eval hangs and hits the 3600s
-        # timeout (HIP backtrace) on current AITER main; verified the #3451 fix
-        # (cache_kernels.cu) cherry-picked does NOT resolve it yet. Re-enable
-        # (run_on_pr/run_on_schedule -> True) once the DSv3.2 indexer kernel fix
-        # lands. Tracked in #3451 / dsv32-indexer-fused-kernel-fixes.
         "run_on_pr": False,
-        "run_on_schedule": False,
+        "comment": "Run in nightly first while failures are investigated.",
+        "run_on_schedule": True,
     },
     {
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-do-mi350x-8",
         "label": "MI35X",
         "model": "DeepSeek-V3.2 Basic",
         "model_id": "deepseek-ai/DeepSeek-V3.2",

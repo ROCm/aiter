@@ -429,8 +429,9 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
+    backend: str | None = None,
 ):
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
 
-    return get_gemm_config(config_name, M, N, K)
+    return get_gemm_config(config_name, M, N, K, backend=backend)
