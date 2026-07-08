@@ -1,0 +1,13 @@
+arch,dtype,num_heads,head_dim,hidden_dim,batch,max_seq_len,has_window,has_contextual,has_targets,block_m,block_n,num_waves,waves_per_eu,duration
+gfx942,bf16,4,128,128,1024,512,False,False,False,64,32,4,0,3.280341
+gfx942,bf16,4,128,128,1024,1024,False,False,False,64,32,4,0,9.950090
+gfx942,bf16,4,128,128,1024,2048,False,False,False,192,32,4,0,29.469830
+gfx942,bf16,8,128,128,1024,512,False,False,False,64,32,4,0,6.459033
+gfx942,bf16,8,128,128,1024,1024,False,False,False,64,32,4,0,20.015099
+gfx942,bf16,8,128,128,1024,2048,False,False,False,192,32,4,0,58.706298
+gfx942,bf16,4,128,128,120,512,False,False,False,64,32,4,0,0.448710
+gfx942,bf16,4,128,128,120,1024,False,False,False,64,32,4,0,1.397243
+gfx942,bf16,4,128,128,120,2048,False,False,False,192,32,4,0,3.919256
+gfx942,bf16,8,128,128,120,512,False,False,False,64,32,4,0,0.858537
+gfx942,bf16,8,128,128,120,1024,False,False,False,64,32,4,0,2.701148
+gfx942,bf16,8,128,128,120,2048,False,False,False,192,32,4,0,7.698022

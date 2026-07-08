@@ -339,6 +339,7 @@ def test_flydsl_bwd_all_causal(batch, heads, attn_dim, hidden_dim, max_seq_len, 
         (64, 32, 4, 0),  # default
         (128, 32, 4, 0),
         (128, 64, 4, 0),
+        (192, 32, 4, 0),  # tuned pick at N=2048
         (64, 32, 2, 0),
     ],
 )
@@ -394,7 +395,6 @@ def _bwd_row(**overrides) -> dict:
         block_n=64,
         num_waves=4,
         waves_per_eu=2,
-        sequence_parallel="False",
         duration=1.0,
     )
     row.update(overrides)
@@ -417,10 +417,7 @@ def test_bwd_tuned_csv_is_picked_up(tmp_path):
 
     assert len(config_map) == 1
     (config,) = config_map.values()
-    assert config == dict(
-        block_m=128, block_n=64, num_waves=4, waves_per_eu=2,
-        sequence_parallel=False,
-    )
+    assert config == dict(block_m=128, block_n=64, num_waves=4, waves_per_eu=2)
 
 
 def test_bwd_tuned_csv_missing_file_returns_empty(tmp_path):
