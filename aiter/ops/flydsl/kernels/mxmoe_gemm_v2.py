@@ -1237,6 +1237,30 @@ def gemm2_body_v2(
                     i0=2 * sub,
                 )
 
+    # Step 2: N-half B split (straight-line K2 only; BM64 -> not is_bm16). One N-half's B (J in
+    # {2*half_n, 2*half_n+1} -> 4 frags = 16 regs) + its single B-scale word are loaded and consumed
+    # before the other half loads, halving the peak B live set (32 -> 16). accm[i][J] keys on absolute
+    # J so J stays absolute; bqf is a length-4 list with only this half's two J-slots populated.
+    def stream_b_half(kt_rt, half_n):
+        bqf = [None, None, None, None]
+        for j in (2 * half_n, 2 * half_n + 1):
+            bqf[j] = [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
+            for half in range_constexpr(2):
+                fx.copy(b_catom, bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None], bqf[j][half])
+        bsf = fx.make_fragment_like(bs_frag_tmpl)
+        fx.copy(bs_copy_atom, bscale_views[half_n][lane_div_16, lane_mod_16, kt_rt, None], bsf)
+        return bqf, bsf
+
+    def mfma_cluster_half(bqf, bsf, sa, half_n):
+        # Both J in this half share mni==half_n -> one B-scale word (sb) for the pair.
+        sb = _raw(Vec(bsf.load())[0])
+        for j in (2 * half_n, 2 * half_n + 1):
+            in_b = j % 2
+            for sub in range_constexpr(kSubBlocks):
+                mma_one_j(
+                    j, in_b, sa[sub], sb, bqf, is_f8_a, cbsz_a, a_vals, a_frags, accm, c_frags, mma_atoms, i0=2 * sub
+                )
+
     # zero C (fp4 fragments accumulate in place; fp8 accm pre-init above).
     if const_expr(not is_f8_a):
         for i in range_constexpr(kMChunks):
@@ -1272,13 +1296,15 @@ def gemm2_body_v2(
         gpu.barrier()  # A prologue vmem->LDS (both slots) visible before ds-reads
         for kt in range_constexpr(2):
             issue_a_ds_read(fx.Int32(kt))  # const slot 0/1 (no runtime mod)
-            bqf, bsf = stream_b_tile(fx.Int32(kt))  # dies after this tile's mfma_cluster
             sa = load_a_scale_tile(fx.Int32(kt))
-            rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
-            mfma_cluster(bqf, bsf, sa)
-            rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
+            # Step 2: process each N-half's B just-in-time so its 4 frags die before the other half loads.
+            for half_n in range_constexpr(2):
+                bqf, bsf = stream_b_half(fx.Int32(kt), half_n)
+                rocdl.sched_barrier(0)
+                rocdl.s_setprio(1)
+                mfma_cluster_half(bqf, bsf, sa, half_n)
+                rocdl.s_setprio(0)
+                rocdl.sched_barrier(0)
     elif const_expr(g2_kstages == 1):
         # 1-deep pipe: synchronous B load per K-tile.
         for kt_iv, state in range(fx.Index(0), fx.Index(K_TILES_RT), fx.Index(1), init=load_c_carry()):
