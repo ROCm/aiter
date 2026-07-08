@@ -160,6 +160,9 @@ def _moe_gemm_a8w4_decode(
     stride_y_mx_m: gl.constexpr = 0,
     stride_y_mx_n: gl.constexpr = 0,
     HAS_MX_OUT: gl.constexpr = False,
+    # gate/up packing for the fused swiglu: True = interleaved (GUGU),
+    # False = contiguous halves (GGUU). See _swiglu.
+    SWIGLU_INTERLEAVED: gl.constexpr = True,
 ):
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
@@ -604,7 +607,13 @@ def _moe_gemm_a8w4_decode(
         acc = acc + bias[None, :]
 
     if APPLY_SWIGLU:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
+        out = _swiglu(
+            acc,
+            alpha,
+            limit,
+            ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL,
+            INTERLEAVED=SWIGLU_INTERLEAVED,
+        )
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -734,6 +743,9 @@ def _moe_gemm_a8w4_prefill(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    # gate/up packing for the fused swiglu: True = interleaved (GUGU),
+    # False = contiguous halves (GGUU). See _swiglu.
+    SWIGLU_INTERLEAVED: gl.constexpr = True,
 ):
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
@@ -1253,7 +1265,13 @@ def _moe_gemm_a8w4_prefill(
         acc = acc + bias[None, :]
 
     if APPLY_SWIGLU:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
+        out = _swiglu(
+            acc,
+            alpha,
+            limit,
+            ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL,
+            INTERLEAVED=SWIGLU_INTERLEAVED,
+        )
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",

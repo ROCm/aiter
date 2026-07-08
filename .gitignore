@@ -92,3 +92,6 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+
+# Local Claude instructions (per-user, not for VCS)
+CLAUDE.md
