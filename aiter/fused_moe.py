@@ -1755,7 +1755,10 @@ def get_2stage_cfgs(
                 split_k=_split_k,
                 dtype=dtype,
                 post_activation_layout=(
-                    "standard" if swiglu_mxfp4_bf16_cktile else "auto"
+                    # "warp_raked" re-syncs gate/up for the post-#6978 CK epilogue.
+                    "warp_raked"
+                    if swiglu_mxfp4_bf16_cktile
+                    else "auto"
                 ),
             ),
             functools.partial(
@@ -2676,6 +2679,15 @@ def ck_moe_stage1(
     return out
 
 
+def _derake_gate_up_to_standard(valid_out, inter_dim, nlane=16):
+    """Reorder warp_raked (#6978) gate/up columns back to standard [gate|up]."""
+    M = valid_out.shape[0]
+    flat = valid_out.view(M, inter_dim // nlane, 2, nlane)
+    gate = flat[:, :, 0, :].reshape(M, inter_dim)
+    up = flat[:, :, 1, :].reshape(M, inter_dim)
+    return torch.cat([gate, up], dim=-1).contiguous()
+
+
 def cktile_moe_stage1(
     hidden_states,
     w1,
@@ -2750,7 +2762,13 @@ def cktile_moe_stage1(
 
     if needs_post_activation:
         valid_out = tmp_out[: token_num * topk, :]
-        if post_activation_layout == "auto":
+        # "warp_raked": CK PR #6978 interleaves gate/up in the N dimension.
+        # De-rake back to standard [gate|up], then fall through to the bias-aware
+        # standard path (OAI SwiGLU + bias).
+        if post_activation_layout == "warp_raked":
+            valid_out = _derake_gate_up_to_standard(valid_out, out.shape[-1])
+            is_interleaved = False
+        elif post_activation_layout == "auto":
             is_interleaved = (
                 hasattr(torch, "float4_e2m1fn_x2")
                 and w1.dtype == torch.float4_e2m1fn_x2
