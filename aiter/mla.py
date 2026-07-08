@@ -195,7 +195,7 @@ def get_meta_param(
     return num_kv_splits, num_kv_splits_indptr
 
 
-# Persistent MLA-decode kernel gate (vllm#45943): the persistent kernel
+# Persistent MLA-decode kernel gate: the persistent kernel
 # ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
 # ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
 # 16-head decode). Fall back to non-persistent at/above the batch threshold.
@@ -205,7 +205,7 @@ _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT = 32
 
 
 def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
-    """Whether to keep the persistent MLA decode kernel (vllm#45943).
+    """Whether to keep the persistent MLA decode kernel.
 
     True keeps the caller's persistent request; False falls back to the
     non-persistent split-KV kernel at/above the concurrency (batch) threshold.
@@ -289,7 +289,7 @@ def mla_decode_fwd(
 
     persistent_mode = work_meta_data is not None
 
-    # vllm#45943: above the concurrency threshold the persistent kernel is slower, so
+    # Above the concurrency threshold the persistent kernel is slower, so
     # fall back to the non-persistent split-KV path (which rebuilds its own
     # num_kv_splits and ignores work_meta_data). See _use_persistent_mla_decode.
     if persistent_mode:
