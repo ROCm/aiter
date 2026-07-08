@@ -278,7 +278,6 @@ def _moe_gemm_a16w4(
     if GatherIndx is None:
         X_base += start_m * stride_x_m
         offs_x_m_l = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_X))) % M
-        #offs_x_m_g = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, GLOBAL_X_LAYOUT))) % M
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
@@ -300,11 +299,8 @@ def _moe_gemm_a16w4(
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, 0)
         offs_x_m_l = gl.convert_layout(offs_x_m, gl.SliceLayout(1, LOAD_LAYOUT_X))
-        #offs_x_m_g = gl.convert_layout(offs_x_m, gl.SliceLayout(1, GLOBAL_X_LAYOUT))
     offs_x_k_l = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_LAYOUT_X))
     x_offsets = offs_x_m_l[:, None]*stride_x_m + offs_x_k_l[None, :]*stride_x_k
-    #offs_x_k_g = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, GLOBAL_X_LAYOUT))
-    #x_offsets_g = offs_x_m_g[:, None]*stride_x_m + offs_x_k_g[None, :]*stride_x_k
 
     #W pointers
     W_base = W + expt_id * stride_w_e
@@ -313,9 +309,6 @@ def _moe_gemm_a16w4(
     offs_w_n = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(1, LOAD_LAYOUT_W))) % (N // W_N_DIVISOR)
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(0, LOAD_LAYOUT_W))
     w_offsets = offs_w_k[None, :] * stride_w_k + offs_w_n[:, None] * stride_w_n
-    #offs_w_n_g = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(1, GLOBAL_W_LAYOUT))) % (N // W_N_DIVISOR)
-    #offs_w_k_g = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(0, GLOBAL_W_LAYOUT))
-    #w_offsets_g = offs_w_k_g[None, :] * stride_w_k + offs_w_n_g[:, None] * stride_w_n
 
     #W scale pointers
     WMxScale_base = WMxScale + expt_id * stride_w_mx_e
@@ -332,9 +325,6 @@ def _moe_gemm_a16w4(
     offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))) % N
     offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, LOAD_LAYOUT_WS))
     w_scale_offsets = offs_w_k_scale[None, :] * stride_w_mx_k + offs_w_n_scale[:, None] * stride_w_mx_n 
-    #offs_w_n_scale_g = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, GLOBAL_WS_LAYOUT))) % N
-    #offs_w_k_scale_g = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, GLOBAL_WS_LAYOUT))
-    #w_scale_offsets_g = offs_w_k_scale_g[None, :] * stride_w_mx_k + offs_w_n_scale_g[:, None] * stride_w_mx_n 
 
     x_buffer = gl.allocate_shared_memory(
         X.dtype.element_ty, shape= [BLOCK_M, BLOCK_K], layout=SHARED_LAYOUT_X
