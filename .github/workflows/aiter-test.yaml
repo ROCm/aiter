@@ -922,7 +922,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
-        timeout-minutes: 60
+        timeout-minutes: 75
         run: |
           set -ex
           docker exec \

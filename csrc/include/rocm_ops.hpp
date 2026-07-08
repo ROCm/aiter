@@ -541,7 +541,8 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
           py::arg("use_1stage"),                                                               \
-          py::arg("gemma_norm") = false);                                                      \
+          py::arg("gemma_norm")   = false,                                                     \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                  \
     m.def("fused_allreduce_rmsnorm_quant_per_group",                                            \
           &aiter::fused_allreduce_rmsnorm_quant_per_group,                                      \
           py::arg("_fa"),                                                                       \
@@ -1747,7 +1748,8 @@ namespace py = pybind11;
           py::arg("use_shuffle_layout"),                    \
           py::arg("block_size"),                            \
           py::arg("x"),                                     \
-          py::arg("rotary_dim") = 0);
+          py::arg("rotary_dim") = 0,                       \
+          py::arg("gemma_norm") = false)
 
 #define FUSED_QKNORM_IDXRQKNORM_PYBIND      \
     m.def("fused_qknorm_idxrqknorm",        \
@@ -1934,6 +1936,15 @@ namespace py = pybind11;
             py::arg("scale_dtype")       = std::string("e8m0"));                        \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
     m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);                  \
+    m.def("fused_qk_norm_rope_1way_fp8_perhead_quant",                                  \
+          &aiter::fused_qk_norm_rope_1way_fp8_perhead_quant,                            \
+          py::arg("q"), py::arg("k"), py::arg("w_q"), py::arg("w_k"),                   \
+          py::arg("cos_sin"),                                                           \
+          py::arg("batch_size"), py::arg("num_tokens"),                                 \
+          py::arg("num_heads_q"), py::arg("num_heads_k"), py::arg("head_size"),         \
+          py::arg("is_interleaved"), py::arg("eps"),                                    \
+          py::arg("q_fp8"), py::arg("k_fp8"), py::arg("q_descale"), py::arg("k_descale"), \
+          py::arg("q_unquantized"), py::arg("k_unquantized"));                            \
     m.def("fused_qk_norm_rope_2way_fp8_perhead_quant",                                  \
           &aiter::fused_qk_norm_rope_2way_fp8_perhead_quant,                            \
           py::arg("q0"), py::arg("k0"), py::arg("q1"), py::arg("k1"),                   \
@@ -1949,6 +1960,11 @@ namespace py = pybind11;
           py::arg("v0"),                                                                  \
           py::arg("v1"),                                                                  \
           py::arg("v_fp8"),                                                               \
+          py::arg("v_descale"));                                                          \
+    m.def("v_1way_per_head_fp8_quant",                                                    \
+          &aiter::v_1way_per_head_fp8_quant,                                              \
+          py::arg("v"),                                                                   \
+          py::arg("v_fp8"),                                                                 \
           py::arg("v_descale"));
 
 #define SMOOTHQUANT_PYBIND                      \
@@ -2227,7 +2243,8 @@ namespace py = pybind11;
           py::arg("sqrsum"),                    \
           py::arg("x"),                         \
           py::arg("fn"),                        \
-          py::arg("tile_k") = 128);             \
+          py::arg("tile_k") = 128,              \
+          py::arg("is_fn_pack_bf16") = 0);      \
     m.def("mhc_pre_big_fuse",                   \
           &aiter::mhc_pre_big_fuse,             \
           "mhc_pre_big_fuse",                   \
@@ -2284,7 +2301,8 @@ namespace py = pybind11;
           py::arg("fn"),                        \
           py::arg("tile_m") = 16,               \
           py::arg("tile_n") = 32,               \
-          py::arg("tile_k") = 32);
+          py::arg("tile_k") = 32,               \
+          py::arg("is_fn_pack_bf16") = 0);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \

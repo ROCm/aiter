@@ -314,11 +314,8 @@ def fmha_v3_fwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
-# OPUS gfx950 dense D=128 bf16 forward. In-file @compile_ops stub so mha.py is
-# self-contained like the sibling backends (no inline cross-module import). Named
-# with a leading underscore, with fc_name pointing at the pybind symbol
-# `fmha_fwd_hd128_bf16_opus_fwd` in the `module_fmha_fwd_hd128_bf16_opus` module.
-# The kernel writes `out` in place and returns None.
+# OPUS gfx950 dense D=128 bf16 forward: low-level @compile_ops stub bound to the
+# pybind symbol via fc_name. Writes `out` in place, returns None.
 @compile_ops(
     "module_fmha_fwd_hd128_bf16_opus",
     fc_name="fmha_fwd_hd128_bf16_opus_fwd",
@@ -342,15 +339,9 @@ def fmha_fwd_hd128_bf16_opus_fwd(
     causal: bool,
     out: Optional[Tensor] = None,
 ) -> Tensor:
-    """Public wrapper: allocates `out` if needed and forwards to the OPUS gfx950
-    D=128 bf16 kernel entry point (two-layer pattern, mirroring
-    `fmha_fwd_with_sink_asm`).
-
-    The kernel applies `softmax_scale` to Q·K^T internally, handles the GQA head
-    fan-out, and writes the attention output into `out` in place (no LSE). q/k/v
-    are dense bshd ([batch, seq, head, dim]); `out` matches [B, S, H_q, D_v].
-    This is the mha.py-local wrapper (plain function, no torch-op registration)
-    and the sole owner of the OPUS D=128 binding/public API.
+    """Public wrapper for the OPUS gfx950 D=128 bf16 kernel: allocates `out`
+    ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
+    to Q·K^T internally, handles GQA fan-out, and produces no LSE. Dense bshd q/k/v.
     """
     batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
@@ -1845,18 +1836,16 @@ def _flash_attn_forward(
         return ret
 
     def can_impl_fmha_fwd_hd128_bf16_opus():
-        # OPUS gfx950 dense D=128 bf16 forward (hand-written HIP kernel). Env-gated
-        # (OFF by default) so it only supersedes the v3/CK path when explicitly
-        # enabled via AITER_ENABLE_FMHA_OPUS. Inference-only: the kernel
-        # produces the output only (no softmax LSE, no dropout mask), so it must
-        # never capture a case that needs LSE / the autograd backward path.
+        # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
+        # supersedes v3/CK when enabled. Inference-only (no LSE/dropout mask), so it
+        # must never capture return_lse / the autograd backward path.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         ret = get_gfx() == "gfx950"
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (hdim_q == 128 and hdim_v == 128)
         ret = ret and (nhead_q % nhead_k == 0)
-        # dense only (no varlen), and the kernel requires seqlen_q == seqlen_k.
+        # dense only (no varlen); kernel requires seqlen_q == seqlen_k.
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         ret = ret and (seqlen_q == seqlen_k)
         # no bias / alibi / dropout / sliding-window / sink / quant-descale.
@@ -1865,8 +1854,7 @@ def _flash_attn_forward(
         ret = ret and (window_size_left == -1 and window_size_right == -1)
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-        # inference-only: no LSE => cannot serve return_lse (grad implies return_lse)
-        # or the attention-probs path.
+        # inference-only: no LSE (grad implies return_lse) and no attn-probs.
         ret = ret and (not return_lse) and (not return_softmax)
         return ret
 
@@ -1950,12 +1938,8 @@ def _flash_attn_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_hd128_bf16_opus():
-        # OPUS gfx950 dense D=128 bf16 forward via the public wrapper (two-layer
-        # pattern like fmha_fwd_with_sink_asm). q/k/v are dense bshd [B,S,H,D]; the
-        # kernel applies softmax_scale to Q·K^T internally and handles the GQA head
-        # fan-out. Inference-only, so the LSE / dropout-mask / rng slots are
-        # placeholders (the gate guarantees not return_lse / not return_softmax, so
-        # the caller never consumes them) -- mirrors the sink-asm branch shape.
+        # OPUS gfx950 dense D=128 forward. Inference-only: the lse/S_dmask/rng slots
+        # are unused placeholders (gate guarantees not return_lse/return_softmax).
         out_ = fmha_fwd_hd128_bf16_opus_fwd(
             q,
             k,
