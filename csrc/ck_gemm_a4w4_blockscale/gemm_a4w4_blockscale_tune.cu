@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+#include "gemm_a4w4_blockscale.h"
+
 #include "gemm_a4w4_blockscale_common.cuh"
 #include "gemm_a4w4_blockscale_manifest.h"
 #include "gemm_a4w4_blockscale_lookup.h"
 #include <string>
 
-using BlockwiseKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, int)>;
+using BlockwiseKernel = aiter_tensor_t& (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    int, hipStream_t);
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -43,8 +44,8 @@ BlockwiseKernel blockwise_dispatch(int id)
         static_assert(false, "blockwise_dispatch used with unsupported dtype!");
     } }();
 
-  TORCH_CHECK(id < lookup.size(),
-              "Kernel id " + std::to_string(id)  +" is out of range!");
+  AITER_CHECK(id < (int)lookup.size(),
+              "Kernel id ", id, " is out of range!");
   auto it = lookup.find(id);
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
@@ -55,36 +56,34 @@ BlockwiseKernel blockwise_dispatch(int id)
   return lookup.find(0)->second;
 }
 
-torch::Tensor gemm_a4w4_blockscale_tune(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
+namespace aiter {
+
+aiter_tensor_t& gemm_a4w4_blockscale_tune(
+    aiter_tensor_t& XQ,
+    aiter_tensor_t& WQ,
+    aiter_tensor_t& x_scale,
+    aiter_tensor_t& w_scale,
+    aiter_tensor_t& Y,
     int kernelId,
-    int splitK)
+    int splitK,
+    hipStream_t stream)
 {
-  TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-  TORCH_CHECK( x_scale.dtype() == w_scale.dtype(),
-              "Scales should have the same dtype!");
-  std::optional<torch::Tensor> bias = std::nullopt;
+  AITER_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
+  AITER_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  int K = XQ.size(1);
-  int KBatch = std::pow(2, splitK);
-
-  if (Y.dtype() == at::ScalarType::Half)
+  if (Y.dtype() == AITER_DTYPE_fp16)
   {
-    blockwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK);
+    blockwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
   }
-  else if (Y.dtype() == at::ScalarType::BFloat16)
+  else if (Y.dtype() == AITER_DTYPE_bf16)
   {
-    blockwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK);
+    blockwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
   }
   else
   {
-    TORCH_CHECK(false, "Unsupported scales/output dtype!");
+    AITER_CHECK(false, "Unsupported scales/output dtype!");
   }
   return Y;
 }
+
+} // namespace aiter

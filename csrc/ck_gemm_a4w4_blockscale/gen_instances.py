@@ -51,20 +51,21 @@ class gemm_a4w4_blockscale_codegen:
 #include "gemm_a4w4_blockscale_common.cuh"
 
 template <typename CDataType>
-torch::Tensor
+aiter_tensor_t&
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
 
     // Check if this input needs to be padded.
-    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int M = XQ.size(0); // 2D: [M, K/2]
     int N = WQ.size(0);
     int K = WQ.size(1);
     // TODO - padding
@@ -91,7 +92,7 @@ torch::Tensor
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
+        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -121,14 +122,15 @@ torch::Tensor
 
 #include "impl/{name}.cuh"
 
-template torch::Tensor
+template aiter_tensor_t&
 {name}<{dtypes}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream
     );
 
 """
@@ -222,19 +224,20 @@ template torch::Tensor
 #ifdef USE_ROCM
 
 #include <cstdlib>
-
-#include <torch/extension.h>
+#include <hip/hip_runtime.h>
+#include "aiter_tensor.h"
 """
         MAINFEST_template = """
 template <typename CDataType>
-torch::Tensor
+aiter_tensor_t&
 {kernel_name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    int splitK);
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    aiter_tensor_t &Y,
+    int splitK,
+    hipStream_t stream);
 """
         MAINFEST_end = """
 

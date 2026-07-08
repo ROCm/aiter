@@ -1,21 +1,30 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_tensor.h"
+#include <hip/hip_runtime.h>
 #include <string>
-#include <torch/all.h>
-#include <torch/extension.h>
-torch::Tensor gemm_a4w4_blockscale(torch::Tensor& A,
-                                   torch::Tensor& B,
-                                   torch::Tensor& a_scale,
-                                   torch::Tensor& b_scale,
-                                   torch::Tensor& C,
-                                   int splitK,
-                                   std::string kernelName = "");
 
-torch::Tensor gemm_a4w4_blockscale_tune(torch::Tensor& XQ,
-                                        torch::Tensor& WQ,
-                                        torch::Tensor& x_scale,
-                                        torch::Tensor& w_scale,
-                                        torch::Tensor& Y,
-                                        int kernelId,
-                                        int splitK);
+namespace aiter {
+
+__attribute__((visibility("default")))
+aiter_tensor_t& gemm_a4w4_blockscale(aiter_tensor_t& XQ,
+                                      aiter_tensor_t& WQ,
+                                      aiter_tensor_t& x_scale,
+                                      aiter_tensor_t& w_scale,
+                                      aiter_tensor_t& Y,
+                                      int splitK,
+                                      hipStream_t stream,
+                                      std::string kernelName = "");
+
+__attribute__((visibility("default")))
+aiter_tensor_t& gemm_a4w4_blockscale_tune(aiter_tensor_t& XQ,
+                                           aiter_tensor_t& WQ,
+                                           aiter_tensor_t& x_scale,
+                                           aiter_tensor_t& w_scale,
+                                           aiter_tensor_t& Y,
+                                           int kernelId,
+                                           int splitK,
+                                           hipStream_t stream);
+
+} // namespace aiter

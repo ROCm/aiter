@@ -6,31 +6,19 @@
 #undef __HIP_NO_HALF_OPERATORS__
 #undef __HIP_NO_HALF_CONVERSIONS__
 
-#include <iostream>
-#include <numeric>
-#include <initializer_list>
 #include <cstdlib>
 
-#include <ATen/ATen.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/tensor_layout.hpp"
 #include "ck/tensor_operation/gpu/element/unary_element_wise_operation.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_xdl_cshuffle_v3_mx.hpp"
-#include "ck/library/utility/host_tensor_generator.hpp"
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 #include "ck/utility/data_type.hpp"
 #include "ck/utility/sequence.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_mx_gemm.hpp"
-#include "ck/library/utility/check_err.hpp"
-#include "ck/library/utility/device_memory.hpp"
-#include "ck/library/utility/fill.hpp"
-#include "ck/library/utility/host_tensor.hpp"
 
 template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
@@ -112,14 +100,17 @@ using DeviceGemmHelperF4BlockScale = ck::tensor_operation::device::DeviceGemmMX_
 // clang-format on
 
 template <typename CDataType, typename DeviceGemmInstance>
-__forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
-    torch::Tensor &A,
-    torch::Tensor &B,
-    torch::Tensor &a_scale,
-    torch::Tensor &b_scale,
-    torch::Tensor &C,
-    int splitK)
+__forceinline__ aiter_tensor_t& gemm_a4w4_blockscale_impl(
+    aiter_tensor_t& A,
+    aiter_tensor_t& B,
+    aiter_tensor_t& a_scale,
+    aiter_tensor_t& b_scale,
+    aiter_tensor_t& C,
+    int splitK,
+    hipStream_t stream)
 {
+    HipDeviceGuard guard(A.device_id);
+
     int M = A.size(0);
     int N = B.size(0);
     int K = A.size(1) * 2; // always fp4_x2
@@ -136,7 +127,6 @@ __forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
     auto a_element_op = AElementOp{};
     auto b_element_op = BElementOp{};
     auto c_element_op = CElementOp{};
-
 
     // do GEMM
     auto device_gemm = DeviceGemmInstance{};
@@ -159,9 +149,9 @@ __forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
                                              b_element_op,
                                              c_element_op);
 
-    TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
+    AITER_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
+    invoker.Run(argument, StreamConfig{stream});
     return C;
 }
 
