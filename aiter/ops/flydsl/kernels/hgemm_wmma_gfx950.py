@@ -91,6 +91,7 @@ def assert_hgemm_wmma_kernel(
     if IS_HT:
         assert STAGES == 2
         assert BLOCK_M_WARPS == 2
+        assert BLOCK_N_WARPS >= 2
         assert BLOCK_K_WARPS == 1
         assert HALF_BLOCK_M * 2 == BLOCK_M
         assert HALF_BLOCK_N * 2 == BLOCK_N
@@ -274,6 +275,7 @@ def compile_hgemm_wmma_kernel(
     if IS_HT:
         assert STAGES == 2
         assert BLOCK_M_WARPS == 2
+        assert BLOCK_N_WARPS >= 2
         assert BLOCK_K_WARPS == 1
         assert HALF_BLOCK_M * 2 == BLOCK_M
         assert HALF_BLOCK_N * 2 == BLOCK_N
@@ -1817,7 +1819,12 @@ def hgemm_validate(dtype_str, m, n, k, kwargs):
         return False
 
     if USE_HALF_TILE_INTERLEAVED:
-        if not (STAGES == 2 and BLOCK_K_WARPS == 1 and BLOCK_M_WARPS == 2):
+        if not (
+            STAGES == 2
+            and BLOCK_K_WARPS == 1
+            and BLOCK_M_WARPS == 2
+            and BLOCK_N_WARPS >= 2
+        ):
             return False
 
     def get_stage_smem_use(stages_):
@@ -1867,6 +1874,13 @@ def hgemm_get_configs(dtype_str, m, n, k):
         "GROUP_M": [0, 4],
         "USE_HALF_TILE_INTERLEAVED": [False, True],
     }
+    if m is not None and n is not None and k is not None:
+        if m <= 16:
+            selections["TILE_M"] = [16, 32]
+            selections["GROUP_M"] = [
+                0,
+            ]
+        selections["SPLIT_K"] = [ks for ks in selections["SPLIT_K"] if k % ks == 0]
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
@@ -1888,13 +1902,18 @@ def get_semaphore(stream, device):
     return semaphore, signal
 
 
-def infer_has_k_tail(k: int, split_k: int, tile_k: int, is_ht: bool):
+def infer_has_k_tail(k: int, split_k: int, tile_k: int, stages: int, is_ht: bool):
     working_k = (k + split_k - 1) // split_k
     last_working_k = k - (split_k - 1) * working_k
+    working_k_tiles = (working_k + tile_k - 1) // tile_k
+    last_working_k_tiles = (last_working_k + tile_k - 1) // tile_k
     has_k_tail = (working_k % tile_k != 0) or (last_working_k % tile_k != 0)
+    has_k_tail = (
+        has_k_tail
+        or (working_k_tiles < stages - 1)
+        or (last_working_k_tiles < stages - 1)
+    )
     if is_ht:
-        working_k_tiles = (working_k + tile_k - 1) // tile_k
-        last_working_k_tiles = (last_working_k + tile_k - 1) // tile_k
         has_k_tail = (
             has_k_tail or (working_k_tiles % 2 != 0) or (last_working_k_tiles % 2 != 0)
         )
@@ -1954,6 +1973,7 @@ def hgemm(
         k=k,
         split_k=kwargs["SPLIT_K"],
         tile_k=kwargs["TILE_K"],
+        stages=kwargs["STAGES"],
         is_ht=kwargs["USE_HALF_TILE_INTERLEAVED"],
     )
 

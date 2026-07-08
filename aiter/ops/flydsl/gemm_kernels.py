@@ -102,6 +102,7 @@ def get_flydsl_hgemm_kernels(
                 k=k,
                 split_k=config["SPLIT_K"],
                 tile_k=config["TILE_K"],
+                stages=config["STAGES"],
                 is_ht=config["USE_HALF_TILE_INTERLEAVED"],
             )
         name = flydsl_kernel_name(
