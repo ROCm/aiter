@@ -361,3 +361,74 @@ def test_op(
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+def _gguu_swiglu_ref(acc, alpha, limit, add_residual):
+    """GGUU (separated [gate|up]) swiglu reference, mirroring _swiglu with
+    INTERLEAVED=False: gate = first half, up = second half."""
+    half = acc.shape[-1] // 2
+    gate = acc[:, :half].float()
+    up = acc[:, half:].float()
+    if limit is not None:
+        gate = torch.clamp(gate, max=limit)
+        up = torch.clamp(up, min=-limit, max=limit)
+    s = gate * torch.sigmoid(alpha * gate)
+    return s * (up + 1.0) if add_residual else s * up
+
+
+@pytest.mark.parametrize("m", [1, 8, 32])
+@pytest.mark.parametrize("intermediate", [2048])  # DSv4-Flash: N = 2*2048 = 4096
+@pytest.mark.parametrize("k", [4096])  # hidden_size
+@pytest.mark.parametrize("n_expts_tot, n_expts_act", [(1, 1), (128, 4)])
+def test_op_gguu_fused_act_quant(m, intermediate, k, n_expts_tot, n_expts_act, device="cuda"):
+    """In-GEMM1 act+quant fusion for the GGUU (separated gate|up) layout:
+    moe_gemm_a8w4(is_guinterleave=False, apply_swiglu=True, out_mx_quant=True)
+    must emit (fp8 e4m3, ue8m0) whose dequant matches silu(gate)*up on the
+    separated halves. The wrapper forces a single full-width N-block so gate[i]
+    and up[i] land in the same tile."""
+    if get_arch() != "gfx1250":
+        pytest.skip("GGUU fused swiglu is gluon (gfx1250) only.")
+
+    n = 2 * intermediate  # gate|up width
+    if (k // 2) % 32 != 0 or n % 16 != 0:
+        pytest.skip("preshuffle requires (k//2)%32==0 and N%16==0.")
+
+    torch.manual_seed(0)
+    alpha, limit, add_residual = 1.0, 0.0, False
+    swiglu_limit_ref = None  # limit<=0 => no clamp, matches kernel skip
+
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather=True, do_scatter=False, device=device
+    )
+    x_tri, w_tri, bias_tri, _ = init_compute_data(
+        m, n, k, gindx, sindx, n_expts_tot, n_expts_act,
+        torch.bfloat16, torch.bfloat16, has_y_gammas=False, device=device,
+    )
+    x_ref, w_ref = x_tri.clone(), w_tri.clone()
+
+    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, torch.uint8, axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    w_tri = shuffle_weight_gfx1250(w_tri)
+    swizzle_mx_scale = "GFX1250_SCALE"
+    w_scale_tri = shuffle_scale_moe(
+        w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+    )
+
+    x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, torch.float8_e4m3fn, axis=-1)
+    x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
+
+    # reference: matmul (bf16 [gate|up]) then GGUU swiglu in fp32
+    acc = moe_gemm_torch(
+        x_ref, w_ref, bias_tri, rdata, gindx, sindx, None, apply_swiglu=False
+    )
+    ref_act = _gguu_swiglu_ref(acc, alpha, swiglu_limit_ref, add_residual)
+
+    y_fp8, y_scale = moe_gemm_a8w4(
+        x_tri, w_tri, x_mx_scales_tri, w_scale_tri,
+        bias=bias_tri, routing_data=rdata, gather_indx=gindx,
+        swizzle_mx_scale=swizzle_mx_scale,
+        apply_swiglu=True, alpha=alpha, limit=limit, swiglu_add_residual=add_residual,
+        is_guinterleave=False, preshuffled=True, out_mx_quant=True,
+    )
+    y_deq = upcast_from_mxfp(y_fp8, y_scale, torch.bfloat16, axis=-1)
+    assert_close(ref_act, y_deq, maxtol=4e-1, rmstol=4e-2)

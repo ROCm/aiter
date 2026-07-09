@@ -311,6 +311,9 @@ def moe_gemm_a8w4(
     alpha=1.0,
     limit=1.0,
     swiglu_add_residual=True,
+    # gate/up packing consumed by the fused swiglu. True = interleaved (GUGU,
+    # [g0,u0,g1,u1,...]); False = contiguous halves (GGUU, [gate | up]).
+    is_guinterleave=True,
     preshuffled=False,
     unpadded_N=None,
     unpadded_K=None,
@@ -400,6 +403,24 @@ def moe_gemm_a8w4(
         reduction_n_matmul = 1
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
+    # GGUU (is_guinterleave=False) packs gate/up as contiguous halves, so the
+    # fused swiglu can only pair them when a single BLOCK_N spans the whole
+    # output row. Interleaved (GUGU) has matched gate/up pairs in every block.
+    # SWIGLU_INTERLEAVED is only threaded into the gluon matmul kernels, so the
+    # split_k reduce path and the gfx950 triton kernel stay GUGU-only for now.
+    if apply_swiglu and not is_guinterleave:
+        assert use_gluon and config["split_k"] == 1, (
+            "GGUU (is_guinterleave=False) fused swiglu is only wired for the "
+            "gluon (gfx1250) matmul path with split_k==1."
+        )
+        # Force a single full-width N-block so gate[i] and up[i] (contiguous
+        # halves N apart) land in the same tile for the in-block swiglu. No
+        # tuned config carries block_n >= N, so override it here rather than
+        # asserting. OUT_BLOCK_N = block_n // 2 stays a multiple of 32 because
+        # padded_N (= gate|up width) is. Wide tile => bump warps for occupancy.
+        config["block_n"] = triton.next_power_of_2(padded_N)
+        config["split_k"] = 1
+        config["num_warps"] = max(config["num_warps"], 8)
     # allocate output memory. With out_mx_quant=True, the kernel writes fp8 e4m3
     # into y; otherwise the requested out_dtype (bf16).
     if out_mx_quant:
@@ -503,6 +524,7 @@ def moe_gemm_a8w4(
             stride_y_mx_m=stride_y_mx_m,
             stride_y_mx_n=stride_y_mx_n,
             HAS_MX_OUT=out_mx_quant,
+            SWIGLU_INTERLEAVED=is_guinterleave,
         )
     elif use_gluon:
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
@@ -556,6 +578,7 @@ def moe_gemm_a8w4(
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            SWIGLU_INTERLEAVED=is_guinterleave,
         )
     else:
         _moe_gemm_a8w4_triton[(grid,)](

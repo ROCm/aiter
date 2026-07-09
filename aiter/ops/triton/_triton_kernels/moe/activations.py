@@ -11,14 +11,29 @@ def clip(x, limit, clip_lower: tl.constexpr):
 
 
 @triton.jit
-def _swiglu(input, alpha, limit, ADD_RESIDUAL: tl.constexpr):
+def _swiglu(
+    input, alpha, limit, ADD_RESIDUAL: tl.constexpr, INTERLEAVED: tl.constexpr = True
+):
     """
     SwiGLU activation
 
     s = silu(gelu), then returns s * (linear + 1) if ADD_RESIDUAL else s * linear.
     if alpha=1.0, then this is the same as the SiLU activation.
+
+    INTERLEAVED selects how gate/up are packed along the last axis of ``input``:
+      True  (GUGU): interleaved pairs [g0,u0,g1,u1,...]  -> gelu=even, linear=odd.
+      False (GGUU): contiguous halves [g0..g_{h-1}, u0..u_{h-1}] -> gelu=first
+                    half, linear=second half. Only valid when the activation
+                    block spans the full output row (both halves in one block).
     """
-    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    half: tl.constexpr = input.shape[1] // 2
+    if INTERLEAVED:
+        gelu, linear = tl.split(tl.reshape(input, (input.shape[0], half, 2)))
+    else:
+        # Move the [gate|up] axis to the last dim so tl.split separates halves.
+        gelu, linear = tl.split(
+            tl.permute(tl.reshape(input, (input.shape[0], 2, half)), (0, 2, 1))
+        )
     gelu = gelu.to(tl.float32)
     if limit is not None:
         gelu = clip(gelu, limit, clip_lower=False)
