@@ -2624,6 +2624,32 @@ def ck_moe_stage1(
     return out
 
 
+def _cktile_tensor_stats(name, t):
+    """Summarize a CK output tensor for AITER_CKTILE_DEBUG post-call logging."""
+    try:
+        tf = t.detach().to(torch.float32)
+        finite = torch.isfinite(tf)
+        n_nan = int(torch.isnan(tf).sum().item())
+        n_inf = int(torch.isinf(tf).sum().item())
+        n_finite = int(finite.sum().item())
+        if n_finite > 0:
+            ff = tf[finite]
+            vmin = float(ff.min().item())
+            vmax = float(ff.max().item())
+            vmean = float(ff.mean().item())
+            vabsmax = float(ff.abs().max().item())
+        else:
+            vmin = vmax = vmean = vabsmax = float("nan")
+        return (
+            f"[CKTILE-DEBUG] {name} out"
+            f" shape={tuple(t.shape)} dtype={t.dtype}"
+            f" min={vmin:.6g} max={vmax:.6g} mean={vmean:.6g} absmax={vabsmax:.6g}"
+            f" nan={n_nan} inf={n_inf}"
+        )
+    except Exception as e:  # never let debug logging break the forward pass
+        return f"[CKTILE-DEBUG] {name} out <stats failed: {e}>"
+
+
 def cktile_moe_stage1(
     hidden_states,
     w1,
@@ -2709,6 +2735,16 @@ def cktile_moe_stage1(
         split_k,
         kernel_name,
     )
+    if os.environ.get("AITER_CKTILE_DEBUG", "0") == "1":
+        print(
+            _cktile_tensor_stats(
+                "stage1 gemm1"
+                f" (kind={'gemm1_split_k' if split_k > 1 else 'gemm1_gate_up'}"
+                f" M={token_num} split_k={split_k})",
+                tmp_out,
+            ),
+            flush=True,
+        )
 
     if needs_post_activation:
         valid_out = tmp_out[: token_num * topk, :]
@@ -2777,6 +2813,14 @@ def cktile_moe_stage1(
                 aiter.swiglu_and_mul(out, valid_out)
             else:
                 aiter.gelu_and_mul(out, valid_out)
+    if os.environ.get("AITER_CKTILE_DEBUG", "0") == "1":
+        print(
+            _cktile_tensor_stats(
+                f"stage1 gemm1 final (post_act={needs_post_activation} M={token_num})",
+                out,
+            ),
+            flush=True,
+        )
     return out
 
 
@@ -2830,6 +2874,14 @@ def cktile_moe_stage2(
         block_m,
         kernel_name=kernel_name,
     )
+    if os.environ.get("AITER_CKTILE_DEBUG", "0") == "1":
+        print(
+            _cktile_tensor_stats(
+                f"stage2 gemm2 (M={a2.shape[0] * a2.shape[1]})",
+                out,
+            ),
+            flush=True,
+        )
     return out
 
 
