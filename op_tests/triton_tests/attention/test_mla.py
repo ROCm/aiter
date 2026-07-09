@@ -9,10 +9,9 @@ from aiter.ops.triton.attention.mla import (
     mla_prefill_fwd,
     mla_decode_fwd,
 )
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
-    batched_swizzle_scales_gfx1250,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -120,12 +119,12 @@ def dynamic_nvfp4_quant_kv_buffer(
         cache_shuffled_scale = cache_shuffled_scale.view(
             -1, num_kv_heads, block_size, scale_width
         )
-        cache_shuffled = shuffle_weight(cache_shuffled).view(
+        cache_shuffled = shuffle_weight(cache_shuffled, arch="gfx950").view(
             -1, num_kv_heads, block_size * quant_head_size
         )
-        cache_shuffled_scale = batched_swizzle_scales_gfx1250(
-            cache_shuffled_scale
-        ).view(-1, num_kv_heads, block_size * scale_width)
+        cache_shuffled_scale = shuffle_scale_batched(cache_shuffled_scale).view(
+            -1, num_kv_heads, block_size * scale_width
+        )
         cache_shuffled = torch.cat(
             [
                 cache_shuffled.view(torch.uint8),
