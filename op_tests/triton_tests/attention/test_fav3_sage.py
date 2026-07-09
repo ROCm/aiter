@@ -383,15 +383,21 @@ def test_sage_int8_hadamard_preserves_float_logits(dtype=torch.bfloat16):
         dtype,
         "bshd",
     )
-    r = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+    # Property check in float32: bf16 matmul rounds each multiply-add, so
+    # (q@r)@(k@r)^T != q@k^T when computed in bf16 even for orthogonal R.
+    q_f = q.float()
+    k_f = k.float()
+    r = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=torch.float32) / (
+        BLOCK_R**0.5
+    )
 
-    q_rot = torch.matmul(q, r)
-    k_rot = torch.matmul(k, r)
-    scores = torch.matmul(q, k.transpose(-2, -1))
+    q_rot = torch.matmul(q_f, r)
+    k_rot = torch.matmul(k_f, r)
+    scores = torch.matmul(q_f, k_f.transpose(-2, -1))
     scores_rot = torch.matmul(q_rot, k_rot.transpose(-2, -1))
 
     assert torch.allclose(
-        scores.float(), scores_rot.float(), rtol=1e-2, atol=1e-2
+        scores, scores_rot, rtol=1e-3, atol=1e-3
     ), "Hadamard rotation should preserve QK logits before quantization"
 
 
