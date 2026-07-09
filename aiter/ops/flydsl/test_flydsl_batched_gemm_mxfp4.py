@@ -9,7 +9,7 @@ Covers out[b] = dequant(x[b]) @ dequant(w[b]).T across two variants and two layo
 
 Usage:
     python aiter/ops/flydsl/test_flydsl_batched_gemm_mxfp4.py
-    python aiter/ops/flydsl/test_flydsl_batched_gemm_mxfp4.py --variant a8w4
+    python aiter/ops/flydsl/test_flydsl_batched_gemm_mxfp4.py --variant a8w4 --layout mbn
 """
 
 import argparse
@@ -18,9 +18,11 @@ import sys
 import pytest
 import torch
 
+import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_batched_gemm_mxfp4
 from aiter.test_common import checkAllclose
+from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 
@@ -38,71 +40,37 @@ SHAPES = [
     (4, 1024, 1280, 8192),
 ]
 
-_MXFP4_LUT = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-]
 
-
-def _mxfp4_to_f32(x):
-    """uint8 packed mxfp4 (..., K//2) -> f32 (..., K). Low nibble = even K, high = odd."""
-    x = x.repeat_interleave(2, dim=-1)
-    x[..., ::2] = x[..., ::2] & 0xF
-    x[..., 1::2] = x[..., 1::2] >> 4
-    lut = torch.tensor(_MXFP4_LUT, dtype=torch.float32, device=x.device)
-    return lut[x.long()]
-
-
-def _e8m0_to_f32(x):
-    return 2 ** ((x.to(torch.float32) - 127))
-
-
-def _rand_fp4_codes(shape):
-    low = torch.randint(0, 16, shape, dtype=torch.uint8, device="cuda")
-    high = torch.randint(0, 16, shape, dtype=torch.uint8, device="cuda")
-    return low | (high << 4)
-
-
-def _rand_scales(shape):
-    # e8m0 in [124, 128) -> 2^{-3..0}; no NaN (128 would be NaN in e8m0).
-    return torch.randint(124, 128, shape, dtype=torch.uint8, device="cuda")
+def _quant_fp4(x_2d):
+    """Per-1x32 MXFP4 quant (aiter triton) -> (codes uint8 [.,K//2], scale uint8 [.,K//32])."""
+    qf = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    codes, scale = qf(x_2d, shuffle=False)
+    return codes.view(torch.uint8), scale.view(torch.uint8)
 
 
 def gen_inputs(variant, B, M, N, K, dtype):
-    """Returns (x, w, x_scales, w_scales, ref) for the given variant."""
+    """Returns (x, w, x_scales, w_scales, ref) with unshuffled scales (wrapper shuffles)."""
     torch.manual_seed(5)
-    w = _rand_fp4_codes((B, N, K // 2))
-    x_scales = _rand_scales((B, M, K // SCALE_GROUP_SIZE))
-    w_scales = _rand_scales((B, N, K // SCALE_GROUP_SIZE))
+    wc = [_quant_fp4(torch.randn(N, K, dtype=dtype)) for _ in range(B)]
+    w = torch.stack([c for c, _ in wc])
+    w_scales = torch.stack([s for _, s in wc])
 
     if variant == "a8w4":
-        x = (
-            (torch.randn(B, M, K, device="cuda") * 4.0)
-            .to(torch.float8_e4m3fn)
-            .view(torch.uint8)
+        x = (torch.randn(B, M, K) * 4.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        x_scales = torch.randint(
+            124, 128, (B, M, K // SCALE_GROUP_SIZE), dtype=torch.uint8
         )
         x_f32 = x.view(torch.float8_e4m3fn).to(torch.float32)
     else:  # a4w4
-        x = _rand_fp4_codes((B, M, K // 2))
-        x_f32 = _mxfp4_to_f32(x)
+        xc = [_quant_fp4(torch.randn(M, K, dtype=dtype)) for _ in range(B)]
+        x = torch.stack([c for c, _ in xc])
+        x_scales = torch.stack([s for _, s in xc])
+        x_f32 = fp4_utils.mxfp4_to_f32(x)
 
-    xs = _e8m0_to_f32(x_scales.repeat_interleave(SCALE_GROUP_SIZE, -1))
-    ws = _e8m0_to_f32(w_scales.repeat_interleave(SCALE_GROUP_SIZE, -1))
-    ref = torch.bmm(x_f32 * xs, (_mxfp4_to_f32(w) * ws).transpose(1, 2)).to(dtype)
+    w_f32 = fp4_utils.mxfp4_to_f32(w)
+    xs = fp4_utils.e8m0_to_f32(x_scales.repeat_interleave(SCALE_GROUP_SIZE, -1))
+    ws = fp4_utils.e8m0_to_f32(w_scales.repeat_interleave(SCALE_GROUP_SIZE, -1))
+    ref = torch.bmm(x_f32 * xs, (w_f32 * ws).transpose(1, 2)).to(dtype)
     return x, w, x_scales, w_scales, ref
 
 

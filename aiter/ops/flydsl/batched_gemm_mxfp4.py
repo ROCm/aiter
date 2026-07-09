@@ -5,7 +5,7 @@
 
 out[b] = dequant(x[b]) @ dequant(w[b]).T  (per-1x32 e8m0 scales folded into a scaled
 16x16x128 MFMA). gfx950 only. The batch index rides grid.z; weights and e8m0 scales are
-CK-preshuffled host-side before launch.
+CK-preshuffled host-side (aiter shuffle_weight / shuffle_scale) before launch.
 
 Two batched layouts for the A input and C output (weights stay batch-contiguous):
   - bmn: contiguous [B, M, *] / [B, M, N] (plain per-batch).
@@ -22,12 +22,11 @@ import functools
 
 import torch
 
-import flydsl.compiler as flyc
-
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 from .kernels.mxfp4_preshuffle import compile_mxfp4_gemm
-from .kernels.mxfp4_preshuffle_utils import shuffle_scale_w4, shuffle_weight_w4
+from .moe_kernels import _run_compiled
 
 SCALE_GROUP_SIZE = 32
 
@@ -37,8 +36,11 @@ _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
 
 @functools.lru_cache(maxsize=None)
 def _get_launcher(
-    N, K, tile_m, tile_n, tile_k, a_dtype, out_dtype, use_async_copy, batch, strides
+    N, K, tile_m, tile_n, tile_k, a_dtype, out_dtype, use_async_copy, batch, M, strides
 ):
+    # M is part of the cache key (not passed to compile): flyc.compile bakes tensor
+    # sizes, so each M needs its own launcher -> its own _run_compiled cache slot.
+    del M
     return compile_mxfp4_gemm(
         N=N,
         K=K,
@@ -54,22 +56,25 @@ def _get_launcher(
 
 
 def _shuffled_operands(x, w, x_scales, w_scales, B, M, K):
-    """Per-batch preshuffle: A codes plain (real M rows), B + both scales CK-shuffled,
-    A-scales padded to M/32. Returns lists (a, sa) and the concatenated (B_flat, SB_flat).
-    """
+    """Per-batch preshuffle: A codes plain (real M rows), B + both scales CK-shuffled via
+    aiter shuffle_weight / shuffle_scale (A-scales padded to M/32; shuffle_scale over-pads
+    rows to 256, so slice back to the real length). Returns lists (a, sa) and the
+    concatenated (B_flat, SB_flat)."""
     M32 = (M + 31) // 32 * 32
     a_list, sa_list, b_list, sb_list = [], [], [], []
     for b in range(B):
         a_list.append(x[b].contiguous().view(-1))
-        b_list.append(shuffle_weight_w4(w[b].contiguous(), 16, False, False).view(-1))
+        b_list.append(shuffle_weight(w[b].contiguous(), layout=(16, 16)).view(-1))
         sa = x_scales[b]
         if M32 != M:
             pad = torch.zeros(
                 (M32 - M, K // SCALE_GROUP_SIZE), dtype=sa.dtype, device=sa.device
             )
             sa = torch.cat([sa, pad], dim=0)
-        sa_list.append(shuffle_scale_w4(sa.contiguous(), 1, False).view(-1))
-        sb_list.append(shuffle_scale_w4(w_scales[b].contiguous(), 1, False).view(-1))
+        sa = sa.contiguous()
+        sa_list.append(shuffle_scale(sa).reshape(-1)[: sa.numel()])
+        wsb = w_scales[b].contiguous()
+        sb_list.append(shuffle_scale(wsb).reshape(-1)[: wsb.numel()])
     return a_list, sa_list, torch.cat(b_list), torch.cat(sb_list)
 
 
@@ -181,32 +186,12 @@ def flydsl_batched_gemm_mxfp4(
         out_dtype,
         use_async_copy,
         B,
+        M,
         tuple(sorted(strides.items())),
     )
-    args = (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
-
-    # flyc.compile bakes tensor sizes, so cache the CompiledFunction per M.
-    cf = getattr(launcher, "_cf_cache", {}).get(M)
-    if cf is not None:
-        cf(*args)
-    else:
-        try:
-            cf = flyc.compile(launcher, *args)  # first call compiles AND executes
-        except Exception:
-            # flyc.compile leaks ir.Context on failure, poisoning subsequent JIT calls;
-            # drain it to isolate the failure (see moe_kernels._run_compiled).
-            try:
-                from flydsl._mlir import ir
-
-                while ir.Context.current is not None:
-                    ir.Context.current.__exit__(None, None, None)
-            except Exception:
-                pass
-            raise
-        cache = getattr(launcher, "_cf_cache", None)
-        if cache is None:
-            cache = launcher._cf_cache = {}
-        cache[M] = cf
+    _run_compiled(
+        launcher, (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
+    )
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
