@@ -36,6 +36,7 @@ __all__ = [
     "mxfp4_moe_gemm1",
     "mxfp4_moe_gemm2",
     "select_pipe_config",
+    "select_gemm2_config",
     "gemm1_use_nt",
     "gemm2_use_nt",
 ]
@@ -253,6 +254,51 @@ def gemm1_use_nt(experts, topk, tokens, bm_stage1):
 def gemm2_use_nt(experts, topk, tokens, bm_stage2):
     """Reuse-aware gemm2 w2 cache policy; identical reuse metric to gemm1, keyed on bm_stage2."""
     return gemm1_use_nt(experts, topk, tokens, bm_stage2)
+
+
+# gemm2-only tuned overrides: sig (model_dim,inter_dim,experts) -> {tokens: (bm_s2, epilog,
+# persist, use_nt)}. Produced by tune_gemm2_v2.py under AITER_FMOE_V2=1 (baseline-gemm1
+# producer): the sorted-stream SBM/stage1 tile is dictated by the stage1 config and is NOT
+# stored here -- only the gemm2-side knobs are. Absent sig/token -> select_gemm2_config
+# falls back to select_pipe_config + gemm2_use_nt.
+_GEMM2_TUNED_TABLE = {
+    # NOTE: one inner dict per sig; do NOT repeat the sig key (dup keys overwrite).
+    (6144, 512, 257): {  # (bm_s2, epilog, persist, use_nt)
+        1: (32, 'reduce', False, True),  # 4.985us ok100% sbm32
+        2: (32, 'atomic', False, False),  # 5.946us ok100% sbm32
+        4: (32, 'reduce', False, True),  # 12.726us ok100% sbm32
+        8: (32, 'reduce', False, False),  # 20.457us ok100% sbm32
+        16: (32, 'atomic', False, False),  # 36.226us ok100% sbm32
+        32: (32, 'atomic', False, True),  # 64.799us ok100% sbm32
+        64: (64, 'reduce', False, True),  # 84.535us ok100% sbm64
+        128: (32, 'atomic', False, True),  # 70.371us ok100% sbm32
+        256: (64, 'atomic', False, True),  # 90.692us ok100% sbm64
+        512: (32, 'atomic', True, True),  # 83.007us ok100% sbm32
+        1024: (64, 'reduce', True, True),  # 104.510us ok100% sbm64
+        2048: (64, 'reduce', True, False),  # 170.830us ok100% sbm128
+        4096: (64, 'reduce', True, False),  # 248.961us ok100% sbm64
+        8192: (64, 'reduce', True, False),  # 410.807us ok100% sbm64
+        16384: (64, 'reduce', True, False),  # 789.103us ok100% sbm128
+        32768: (64, 'reduce', True, False),  # 1484.276us ok100% sbm128
+    },
+}
+
+
+def select_gemm2_config(model_dim, inter_dim, experts, topk, tokens):
+    """gemm2 deploy config -> (bm_s2, epilog, persist, use_nt).
+
+    Prefers _GEMM2_TUNED_TABLE (nearest token bucket); else derives from the current
+    select_pipe_config + gemm2_use_nt production defaults. Does not return SBM: the sort
+    padding unit is set by the stage1 tile, not by gemm2 tuning.
+    """
+    sig = (model_dim, inter_dim, experts)
+    tuned = _GEMM2_TUNED_TABLE.get(sig)
+    if tuned is not None:
+        return tuned[_nearest_token_key(tuned, tokens)]
+    bm, epilog, _bm_stage1, persist, _bn, _k_wave = select_pipe_config(
+        model_dim, inter_dim, experts, topk, tokens
+    )
+    return bm, epilog, persist, gemm2_use_nt(experts, topk, tokens, bm)
 
 
 # ---- gemm1 (up/gate-proj) compile ----

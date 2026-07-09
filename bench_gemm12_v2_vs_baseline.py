@@ -49,6 +49,7 @@ from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
     mxfp4_moe_gemm1,
     mxfp4_moe_gemm2,
     select_pipe_config,
+    select_gemm2_config,
     gemm1_use_nt,
     gemm2_use_nt,
 )
@@ -860,18 +861,22 @@ def main():
             BM_v2, epilog, BM_S1, persist, BN_v2, KW_v2 = select_pipe_config(
                 args.model_dim, args.inter_dim, args.experts, args.topk, token
             )
-            if args.stage == "gemm2" and os.environ.get("AITER_FMOE_V2", "0") == "1":
-                # The producer is baseline gemm1, so use its sort padding unit.
-                BM_S1 = sort_bm
-            if args.stage == "gemm2" and BM_S1 % BM_v2 != 0:
-                # gemm2 consumes an SBM-strided sorted stream and requires SBM
-                # to be a multiple of its BM. Tiny-M gemm1 may choose BM16, so
-                # promote the standalone gemm2 bench input stream to BM32.
-                BM_S1 = BM_v2
-            if args.stage == "gemm1":
-                use_nt = gemm1_use_nt(args.experts, args.topk, token, BM_S1)
+            if args.stage == "gemm2":
+                # Honor tuned gemm2 overrides (_GEMM2_TUNED_TABLE via select_gemm2_config);
+                # falls back to select_pipe_config/gemm2_use_nt defaults when no tuned entry.
+                BM_v2, epilog, persist, use_nt = select_gemm2_config(
+                    args.model_dim, args.inter_dim, args.experts, args.topk, token
+                )
+                if os.environ.get("AITER_FMOE_V2", "0") == "1":
+                    # The producer is baseline gemm1, so use its sort padding unit.
+                    BM_S1 = sort_bm
+                if BM_S1 % BM_v2 != 0:
+                    # gemm2 consumes an SBM-strided sorted stream and requires SBM
+                    # to be a multiple of its BM. Tiny-M gemm1 may choose BM16, so
+                    # promote the standalone gemm2 bench input stream to BM32.
+                    BM_S1 = BM_v2
             else:
-                use_nt = gemm2_use_nt(args.experts, args.topk, token, BM_v2)
+                use_nt = gemm1_use_nt(args.experts, args.topk, token, BM_S1)
 
         if v2_g2 is not None:
             # Override the v2 gemm2 config with the CSV-pinned kernel name.
