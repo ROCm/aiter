@@ -283,10 +283,6 @@ struct const_subbyte_reference {
 };
 } // namespace impl
 
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-// array, enhanced C like array style. One 2-parameter definition for both plain and sub-byte "pack"
-// element types (selected via is_packs_v): a pack stores a ceil(N*bits/8)-byte buffer with proxy access,
-// else a plain value_type[N]. array_storage picks the storage type/count lazily (T::storage only for packs).
 namespace impl {
 template<typename V, index_t N, bool = is_packs_v<V>> struct array_storage { using type = V; static constexpr index_t count = N; };
 template<typename V, index_t N> struct array_storage<V, N, true> { using type = typename V::storage; static constexpr index_t count = packed_bytes_v<V, N>; };
