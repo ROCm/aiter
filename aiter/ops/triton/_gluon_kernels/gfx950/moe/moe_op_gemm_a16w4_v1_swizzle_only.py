@@ -277,6 +277,7 @@ def _moe_gemm_a16w4(
     if GatherIndx is None:
         X_base += start_m * stride_x_m
         offs_x_m_l = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_X))) % M
+        offs_x_m_l = tl.max_contiguous(tl.multiple_of(offs_x_m_l % M, BLOCK_M), BLOCK_M)
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
@@ -307,6 +308,10 @@ def _moe_gemm_a16w4(
     # not read out of bounds; the extra columns are masked out at store time.
     # K-major W tile [PACKED_BLOCK_K_W, PACKED_BLOCK_N_W] (K on axis 0).
     offs_w_n = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(0, LOAD_LAYOUT_W))) % (N // W_N_DIVISOR)
+    offs_w_n = tl.max_contiguous(
+        tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
+        PACKED_BLOCK_N_W,
+    )
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(1, LOAD_LAYOUT_W))
     w_offsets = offs_w_k[:, None] * stride_w_k + offs_w_n[None, :] * stride_w_n
 
@@ -319,6 +324,9 @@ def _moe_gemm_a16w4(
     SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
 
     offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))) % N
+    offs_w_n_scale = tl.max_contiguous(
+        tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
+    )
     offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, LOAD_LAYOUT_WS))
     w_scale_offsets = offs_w_k_scale[None, :] * stride_w_mx_k + offs_w_n_scale[:, None] * stride_w_mx_n 
 
