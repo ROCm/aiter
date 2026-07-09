@@ -460,17 +460,22 @@ def compile_mxscale_gemm(
 
     lds_a_stride_bytes = packed_tile_k_a + LDS_PAD_A_BYTES
 
-    lds_a_data_bytes = tile_m * lds_a_stride_bytes
-    lds_b_data_bytes = tile_n * packed_tile_k_b
-    _scale_guard_bytes = 16
-    lds_a_scale_bytes = tile_m * scale_k_per_tile + _scale_guard_bytes
-    lds_b_scale_bytes = tile_n * scale_k_per_tile + _scale_guard_bytes
-    interleaved_scale_cols_a = wmma_m_rep * scale_k_per_tile
-
     def _align_up(value: int, align: int) -> int:
         if value % align == 0:
             return value
         return (value + align - 1) // align * align
+
+    lds_a_data_bytes = tile_m * lds_a_stride_bytes
+    lds_b_data_bytes = tile_n * packed_tile_k_b
+    # Scale-buffer "guard" == round each scale buffer up to a 256B boundary. The
+    # padding (0 when the scale bytes are already 256-aligned) absorbs the b128
+    # scale-load tail over-fetch (ds_load_b128 always pulls a full 16B / 4 dwords
+    # even when the per-lane scale count isn't a multiple of 4) and keeps the
+    # next buffer 256-aligned.
+    _SCALE_ALIGN = 256
+    lds_a_scale_bytes = _align_up(tile_m * scale_k_per_tile, _SCALE_ALIGN)
+    lds_b_scale_bytes = _align_up(tile_n * scale_k_per_tile, _SCALE_ALIGN)
+    interleaved_scale_cols_a = wmma_m_rep * scale_k_per_tile
 
     # TDM descriptors partition a tile cooperatively across ``num_warps`` by
     # deriving per-wave offsets from ``wave_id``. In wave-specialized mode we
@@ -493,6 +498,18 @@ def compile_mxscale_gemm(
     )
     stage_a_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_a_data_rel_off + lds_a_data_bytes
+    # A-scale immediately after A-data (B and B-scale follow) so its b128 tail
+    # over-fetch spills into the following B-data (valid LDS), not past the buffer.
+    if tdm_as_in_prologue:
+        # A-scale is hoisted to a single resident full-K buffer at the front of
+        # the arena (allocated below); under this mode the per-stage A-scale ring
+        # is neither loaded (the per-step As TDM op is dropped) nor read
+        # (_load_a_scales reads the resident buffer), so don't reserve it per
+        # stage -- that slot would be dead LDS.
+        stage_a_scale_rel_off = 0
+    else:
+        stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
+        stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
     stage_b_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_b_data_rel_off + lds_b_data_bytes
     if stage1_dual_b:
@@ -500,16 +517,6 @@ def compile_mxscale_gemm(
         stage_layout.ptr = stage_b_up_data_rel_off + lds_b_data_bytes
     else:
         stage_b_up_data_rel_off = 0
-    if tdm_as_in_prologue:
-        # A-scale is hoisted to a single resident full-K buffer (allocated after
-        # the stage arena below); under this mode the per-stage A-scale ring is
-        # neither loaded (the per-step As TDM op is dropped) nor read
-        # (_load_a_scales reads the resident buffer), so don't reserve it per
-        # stage -- that slot would be dead LDS.
-        stage_a_scale_rel_off = 0
-    else:
-        stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
-        stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
     stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_b_scale_rel_off + lds_b_scale_bytes
     if stage1_dual_b:
@@ -527,11 +534,9 @@ def compile_mxscale_gemm(
 
     _last_compute_stage = _base_tail_plan[-1][1]
 
-    # When A-scale is hoisted to the prologue we drop the per-stage As slot and
-    # can pack stages tighter: a 512 B pitch (vs 1024) reclaims the alignment
-    # padding, lowering per-workgroup LDS enough to raise occupancy. Other modes
-    # keep the 1024 B pitch the TDM epilogue aliasing was tuned for.
-    _stage_pitch_align = 512 if tdm_as_in_prologue else 1024
+    # Each stage's scale buffers are already 256-aligned, so round the whole stage
+    # to a 256B pitch; every stage base then lands on a 256 boundary.
+    _stage_pitch_align = 256
     stage_pitch_bytes = _align_up(stage_bytes, _stage_pitch_align)
     arena_alloc = SmemAllocator(
         None,
@@ -542,32 +547,37 @@ def compile_mxscale_gemm(
         ),
     )
 
-    stage_phys_order = [i for i in range(num_buffers) if i != _last_compute_stage]
-    stage_phys_order.append(_last_compute_stage)
-    stage_base_off = [0] * num_buffers
-    for phys_i, logical_i in enumerate(stage_phys_order):
-        stage_base_off[logical_i] = phys_i * stage_pitch_bytes
-    arena_alloc.ptr = stage_pitch_bytes * num_buffers
-    arena_total_bytes = arena_alloc.ptr
-
     # tdm_as_in_prologue: a single resident A-scale buffer holding this K-chunk's
     # entire A-scale, loaded once by wave0 in the prologue. Same 2D layout as the
     # global tile -- (WMMA_M*m_warp) super-rows, num_k_tiles tiles side by side,
-    # so the row stride is num_k_tiles * interleaved_scale_cols_a. Placed after
-    # the stage arena; the epilogue D-store may alias it (As is dead by then).
+    # so the row stride is num_k_tiles * interleaved_scale_cols_a. Placed at the
+    # FRONT of the arena (offset 0): As-full is a b128 reader whose tail load
+    # over-fetches up to 12B, so it must be followed by valid LDS (stage0's data),
+    # not sit at the arena end where the over-read would run past the buffer. The
+    # epilogue D-store (also at offset 0) may alias it -- As is dead by then.
     as_full_row_stride = num_k_tiles * interleaved_scale_cols_a
     _as_lds_cols = (
         as_full_row_stride if tdm_as_in_prologue else interleaved_scale_cols_a
     )
-    lds_a_scale_full_bytes = (
-        tile_m * scale_k_per_tile * num_k_tiles + _scale_guard_bytes
+    lds_a_scale_full_bytes = _align_up(
+        tile_m * scale_k_per_tile * num_k_tiles, _SCALE_ALIGN
     )
     if tdm_as_in_prologue:
-        as_full_rel_off = _align_up(arena_alloc.ptr, 16)
-        arena_alloc.ptr = as_full_rel_off + lds_a_scale_full_bytes
-        arena_total_bytes = arena_alloc.ptr
+        as_full_rel_off = 0
+        # Stages start on the next 256 boundary after the resident As-full buffer.
+        _stage_region_base = _align_up(lds_a_scale_full_bytes, _stage_pitch_align)
     else:
         as_full_rel_off = 0
+        _stage_region_base = 0
+
+    stage_phys_order = [i for i in range(num_buffers) if i != _last_compute_stage]
+    stage_phys_order.append(_last_compute_stage)
+    stage_base_off = [0] * num_buffers
+    for phys_i, logical_i in enumerate(stage_phys_order):
+        stage_base_off[logical_i] = _stage_region_base + phys_i * stage_pitch_bytes
+    arena_alloc.ptr = _stage_region_base + stage_pitch_bytes * num_buffers
+    arena_total_bytes = arena_alloc.ptr
+
     epilogue_fence_threshold_bytes = tdm_epilogue_fence_threshold_bytes(
         stage_base_off=stage_base_off,
         tail_plan=_base_tail_plan,
