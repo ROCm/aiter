@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""MXFP4 (E2M1) and MXFP6 (E2M3) preshuffle GEMM, per-32 E8M0 scales consumed
-inside a scaled 16x16x128 MFMA.  Data layout matches
+"""MXFP4 (E2M1), MXFP6 (E2M3) and MXFP8 (E4M3) A x MXFP4 B preshuffle GEMM, per-32
+E8M0 scales consumed inside a scaled 16x16x128 MFMA.  Data layout matches
 ``tests/kernels/utils/fp4_utils`` (CK weight preshuffle ``shuffle_weight_w4(.,16)``
 + ``shuffle_scale_w4``).
 

@@ -11,7 +11,9 @@ Two batched layouts for the A input and C output (weights stay batch-contiguous)
   - bmn: contiguous [B, M, *] / [B, M, N] (plain per-batch).
   - mbn: physical [M, B, *] / [M, B, N], the deepseek-v4 grouped-output path. The
     interleaving + explicit kernel strides are handled here; callers pass logical
-    [B, M, *] data either way and get a logical [B, M, N] result.
+    [B, M, *] data either way and get a logical [B, M, N] result. NOTE: the mbn result
+    is a non-contiguous view (physically [M, B, N]) — call .contiguous() before ops
+    that require contiguity.
 """
 
 from __future__ import annotations
@@ -21,7 +23,8 @@ import functools
 import torch
 
 import flydsl.compiler as flyc
-from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.mxfp4_preshuffle import compile_mxfp4_gemm
 from .kernels.mxfp4_preshuffle_utils import shuffle_scale_w4, shuffle_weight_w4
@@ -88,14 +91,17 @@ def flydsl_batched_gemm_mxfp4(
 
     a_dtype='fp4' (a4w4): x is (B, M, K//2) uint8 fp4 codes (2 codes/byte).
     a_dtype='fp8' (a8w4): x is (B, M, K) uint8 MXFP8 E4M3 codes (1 byte/code).
+    a_dtype='fp6' (a6w4): x is (B, M, K) uint8 FP8-padded MXFP6 E2M3 codes; the kernel
+        supports it but this entry point is NOT exercised by the test suite (unvalidated).
     w:        (B, N, K//2) uint8 fp4 codes (plain [N, K//2], shuffled host-side).
     x_scales: (B, M, K//32) uint8 e8m0; w_scales: (B, N, K//32) uint8 e8m0.
-    layout='bmn' -> [B,M,*] A/C; 'mbn' -> [M,B,*] A/C (deepseek grouped-output).
+    layout='bmn' -> [B,M,*] A/C; 'mbn' -> [M,B,*] A/C (deepseek grouped-output). The mbn
+        result is a non-contiguous [B,M,N] view of a physical [M,B,N] buffer.
     Returns out (B, M, N) in `dtype` (bf16/fp16).
     """
-    if get_rocm_arch() != "gfx950":
+    if get_gfx() != "gfx950":
         raise RuntimeError(
-            f"[FlyDSL] MXFP4 preshuffle GEMM requires gfx950, got {get_rocm_arch()}"
+            f"[FlyDSL] MXFP4 preshuffle GEMM requires gfx950, got {get_gfx()}"
         )
     if a_dtype not in _A_CODES_PER_BYTE:
         raise ValueError(
@@ -108,6 +114,12 @@ def flydsl_batched_gemm_mxfp4(
     N = w.shape[1]
     K = x_scales.shape[-1] * SCALE_GROUP_SIZE
 
+    # tile_m % 16 (m_chunks = BM//16) and tile_n % 64 (num_acc_n = (BN//4)//16) must be
+    # exact or the kernel's chunk counts truncate and silently drop work.
+    if tile_m % 16 != 0:
+        raise RuntimeError(f"[FlyDSL] tile_m ({tile_m}) must be a multiple of 16")
+    if tile_n % 64 != 0:
+        raise RuntimeError(f"[FlyDSL] tile_n ({tile_n}) must be a multiple of 64")
     if N % tile_n != 0:
         raise RuntimeError(f"[FlyDSL] N ({N}) must be a multiple of tile_n ({tile_n})")
     if K % 256 != 0:
@@ -173,13 +185,28 @@ def flydsl_batched_gemm_mxfp4(
     )
     args = (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
 
+    # flyc.compile bakes tensor sizes, so cache the CompiledFunction per M.
     cf = getattr(launcher, "_cf_cache", {}).get(M)
-    if cf is None:
-        cf = flyc.compile(launcher, *args)
-        launcher._cf_cache = getattr(launcher, "_cf_cache", {})
-        launcher._cf_cache[M] = cf
-    else:
+    if cf is not None:
         cf(*args)
+    else:
+        try:
+            cf = flyc.compile(launcher, *args)  # first call compiles AND executes
+        except Exception:
+            # flyc.compile leaks ir.Context on failure, poisoning subsequent JIT calls;
+            # drain it to isolate the failure (see moe_kernels._run_compiled).
+            try:
+                from flydsl._mlir import ir
+
+                while ir.Context.current is not None:
+                    ir.Context.current.__exit__(None, None, None)
+            except Exception:
+                pass
+            raise
+        cache = getattr(launcher, "_cf_cache", None)
+        if cache is None:
+            cache = launcher._cf_cache = {}
+        cache[M] = cf
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
