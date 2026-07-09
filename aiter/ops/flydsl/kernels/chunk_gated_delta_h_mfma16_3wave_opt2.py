@@ -167,7 +167,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # =False reaches 4 waves/SIMD (VGPR 136->128, LDS 44->35KB) but is ~20%
     # SLOWER (578us vs 480us) because u reverts to 16 scalar buffer_load_ushort
     # -- higher occupancy does NOT compensate the extra VMEM traffic. Keep True.
-    USE_LDS_U = False
+    USE_LDS_U = True
 
     # EXPERIMENT toggle: v_new output store. True = stage to lds_vn [BT,V] then
     # coalesced b128 read-out (independent buffer, ~8.5KB, keeps 3 waves);
@@ -235,7 +235,7 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # best at T5000 (-4.0%) / T10000 (-22.5%); slightly behind 3-wave at T1000
     # (+2.7%, fewest chunks so occupancy edge wins). Benefit scales with NT
     # (per-chunk store latency was the exposed cost). Kept ON as the default.
-    HT_STORE_OVERLAP_GEMM2 = True
+    HT_STORE_OVERLAP_GEMM2 = False
 
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
     # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
@@ -295,12 +295,8 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     # The independent layout is a ~38us (+~8%) REGRESSION (occupancy 3->2); set
     # to True here for direct re-measurement / A/B comparison.
     LDS_HT_INDEPENDENT = False
-    assert (LDS_HT_INDEPENDENT or LDS_HT_ELEMS <= LDS_K_ELEMS), \
-        "aliased lds_ht must fit inside lds_k"
     assert (not W_PF_INTERLEAVE_GEMM1 or W_PF_INTERLEAVE), \
         "W_PF_INTERLEAVE_GEMM1 requires W_PF_INTERLEAVE"
-    assert (not HT_STORE_OVERLAP_GEMM2 or LDS_HT_INDEPENDENT), \
-        "HT_STORE_OVERLAP_GEMM2 requires LDS_HT_INDEPENDENT (lds_ht must survive step1->preGEMM2 unaliased)"
     # EXPERIMENT (vn-b128): transpose buffer for the v_new OUTPUT store. v_new is
     # [B,H,T,V] (V innermost); the MFMA-C layout makes a lane's 4 elems stride
     # along BT (by V) -> 16 scalar buffer_store_short. Stage vn into lds_vn
@@ -325,6 +321,16 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     LDS_U_STRIDE = BV + LDS_U_PAD
     LDS_U_ELEMS = BT * LDS_U_STRIDE
     LDS_U_BYTES = LDS_U_ELEMS * 2
+
+    # Plan B alias assertions (placed after LDS_U_BYTES is defined):
+    if USE_LDS_U and not LDS_HT_INDEPENDENT:
+        assert (LDS_HT_BYTES <= max(LDS_HT_BYTES, LDS_U_BYTES)), \
+            "Plan B: aliased lds_ht must fit inside max(lds_ht, lds_u) allocation"
+    elif not LDS_HT_INDEPENDENT:
+        assert (LDS_HT_ELEMS <= LDS_K_ELEMS), \
+            "aliased lds_ht must fit inside lds_k"
+    assert (not HT_STORE_OVERLAP_GEMM2 or LDS_HT_INDEPENDENT or USE_LDS_U), \
+        "HT_STORE_OVERLAP_GEMM2 requires either LDS_HT_INDEPENDENT or USE_LDS_U (Plan B)"
 
     # NOTE: lds_vn removed -- GEMM2 now feeds v_new (B operand) straight from
     # the vn_frags registers (vn-direct), so there is no gated-v_new LDS
@@ -353,9 +359,23 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_offset + LDS_K_BYTES
-    lds_u_offset = allocator._align(allocator.ptr, 16)
-    if USE_LDS_U:
-        allocator.ptr = lds_u_offset + LDS_U_BYTES  # only reserve when used
+    # Plan B (USE_LDS_U + !LDS_HT_INDEPENDENT): lds_ht ALIASES lds_u.
+    # ht is staged in step 1 and read out before step 2; u is written in step 2
+    # (overwriting ht). Allocation = max(LDS_HT_BYTES, LDS_U_BYTES).
+    # Original: ht aliases lds_k; Plan B: ht aliases lds_u for better pipeline.
+    if USE_LDS_U and not LDS_HT_INDEPENDENT:
+        # Plan B: ht/u share the same space
+        lds_ht_offset = allocator._align(allocator.ptr, 16)
+        _ht_u_alloc = max(LDS_HT_BYTES, LDS_U_BYTES)
+        allocator.ptr = lds_ht_offset + _ht_u_alloc
+        lds_u_offset = lds_ht_offset  # u aliases ht's space
+    elif USE_LDS_U:
+        # LDS_HT_INDEPENDENT + USE_LDS_U: both independent (large LDS)
+        lds_u_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = lds_u_offset + LDS_U_BYTES
+    else:
+        lds_u_offset = allocator._align(allocator.ptr, 16)
+        # u not used, no allocation
     # vn-b128: lds_vn ALIASES lds_w (no extra LDS, 3 waves preserved).
     # lds_w is dead after GEMM1 (step 4); lds_vn is used in step 5b (after
     # GEMM1). A WAR barrier before the stage write guards the cross-wave
@@ -366,13 +386,12 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
     lds_g_offset = allocator._align(allocator.ptr, 16)
     if USE_LDS_G:
         allocator.ptr = lds_g_offset + LDS_G_BYTES  # only reserve when used
-    # h-b128: lds_ht either ALIASES lds_k (default, no extra allocation, keeps
-    # 3 waves) or gets its OWN buffer (LDS_HT_INDEPENDENT=True, HIP-style, ~17KB
-    # extra -> expected 2 waves). See the LDS_HT comment above.
+    # h-b128: lds_ht placement (if not already handled by Plan B above).
     if LDS_HT_INDEPENDENT:
         lds_ht_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = lds_ht_offset + LDS_HT_BYTES
-    else:
+    elif not USE_LDS_U:
+        # Original: ht aliases lds_k (no extra allocation)
         lds_ht_offset = lds_k_offset
 
     # Cooperative load parameters
@@ -674,14 +693,12 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
             #     time-ordering; kept guarded so the aliased mode still has it.)
             # ============================================================
             # B1 (top-of-chunk WAR):
-            #  - aliased lds_ht (LDS_HT_INDEPENDENT=False): guards the prev
-            #    chunk's GEMM2 lds_k reads vs this stage-write (lds_ht aliases
-            #    lds_k).
-            #  - HT_STORE_OVERLAP_GEMM2: the readout is deferred to before GEMM2,
-            #    so this barrier guards the prev chunk's (now late) readout-read
-            #    of lds_ht vs this chunk's stage-write (lds_ht's own cross-chunk
-            #    WAR; rev226 covered it with intervening barriers, but deferring
-            #    the readout removes that coverage).
+            #  - Original (ht alias k): guards prev chunk's GEMM2 lds_k reads
+            #    vs this chunk's lds_ht stage-write (lds_ht aliases lds_k).
+            #  - Plan B (ht alias u, USE_LDS_U): guards prev chunk's step-5
+            #    lds_u reads vs this chunk's lds_ht stage-write (lds_ht aliases
+            #    lds_u). Also guards prev chunk's ht readout if deferred.
+            #  - HT_STORE_OVERLAP_GEMM2: guards prev chunk's deferred readout.
             if const_expr(not LDS_HT_INDEPENDENT or HT_STORE_OVERLAP_GEMM2):
                 gpu.barrier()
 
@@ -693,20 +710,24 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
             # (128 cy) = ~174 cy of overlap hide most of the ~300 cy HBM
             # latency; 3-wave occupancy covers the remaining ~93 cy stall.
             # ============================================================
-            u_pf_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
-            u_prefetch = []
-            for _pf_m in range_constexpr(BT_MTILES):
-                for _pf_e in range_constexpr(4):
-                    _pf_row = (
-                        i_t_i32 * fx.Int32(BT)
-                        + fx.Int32(_pf_m * 16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(_pf_e)
-                    )
-                    _pf_safe = (_pf_row < T_local).select(_pf_row, fx.Int32(0))
-                    u_prefetch.append(
-                        v_[fx.Index(v_base + _pf_safe * stride_v + u_pf_col)]
-                    )
+            if const_expr(not USE_LDS_U):
+                # Scalar u prefetch: each lane loads its own u elements from HBM.
+                # When USE_LDS_U=True, u is cooperatively loaded to lds_u in step 2
+                # and read from LDS in step 5, so this prefetch is skipped.
+                u_pf_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+                u_prefetch = []
+                for _pf_m in range_constexpr(BT_MTILES):
+                    for _pf_e in range_constexpr(4):
+                        _pf_row = (
+                            i_t_i32 * fx.Int32(BT)
+                            + fx.Int32(_pf_m * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(_pf_e)
+                        )
+                        _pf_safe = (_pf_row < T_local).select(_pf_row, fx.Int32(0))
+                        u_prefetch.append(
+                            v_[fx.Index(v_base + _pf_safe * stride_v + u_pf_col)]
+                        )
 
             if const_expr(USE_G and not USE_LDS_G):
                 _pf_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
@@ -910,16 +931,38 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                         )
 
             # ============================================================
-            # 5. v_new = u - b_v  (rev302: consume prefetched u from VGPR)
+            # 5. v_new = u - b_v
+            #    USE_LDS_U=True (Plan B): read u from lds_u (ds_read).
+            #    USE_LDS_U=False (rev302): consume prefetched u from VGPR.
             # ============================================================
             vn_frags = []
-            for m_bt in range_constexpr(BT_MTILES):
-                u_f32_elems = []
-                for elem_i in range_constexpr(4):
-                    u_raw = u_prefetch[m_bt * 4 + elem_i]
-                    u_f32_elems.append(fx.BFloat16(u_raw).to(fx.Float32))
-                u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
-                vn_frags.append(u_f32 - bv_accs[m_bt])
+            if const_expr(USE_LDS_U):
+                # Read u from lds_u: each lane reads its per-element u value.
+                # lds_u layout: [BT, BV] with stride LDS_U_STRIDE, BV innermost.
+                # Each lane's element: row = m_bt*16 + lane_m_base*4 + elem,
+                #                       col = wid*16 + lane_n (V coord).
+                u_lds_col = wid * fx.Int32(16) + lane_n
+                for m_bt in range_constexpr(BT_MTILES):
+                    u_f32_elems = []
+                    for elem_i in range_constexpr(4):
+                        u_row = (
+                            fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        u_lds_idx = u_row * fx.Int32(LDS_U_STRIDE) + u_lds_col
+                        u_raw = lds_u[fx.Index(u_lds_idx)]
+                        u_f32_elems.append(fx.BFloat16(u_raw).to(fx.Float32))
+                    u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
+                    vn_frags.append(u_f32 - bv_accs[m_bt])
+            else:
+                for m_bt in range_constexpr(BT_MTILES):
+                    u_f32_elems = []
+                    for elem_i in range_constexpr(4):
+                        u_raw = u_prefetch[m_bt * 4 + elem_i]
+                        u_f32_elems.append(fx.BFloat16(u_raw).to(fx.Float32))
+                    u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
+                    vn_frags.append(u_f32 - bv_accs[m_bt])
 
             # ============================================================
             # 5b. Store v_new (pre-gating). EXPERIMENT (vn-b128): stage to
