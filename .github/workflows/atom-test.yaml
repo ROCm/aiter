@@ -120,6 +120,12 @@ jobs:
           # buffers get corrupted on gfx950, failing the accuracy gate.
           model_env_overrides = {
               "MiniMax-M2.7-MXFP4": "HSA_NO_SCRATCH_RECLAIM=1",
+              # gpt-oss-120b CK-tile 2-stage MoE decode debugging (Option A): the
+              # [CKTILE-DEBUG] stage1/stage2 tensor stats in aiter/fused_moe.py run
+              # in the Python wrapper, which is skipped during CUDA-graph replay.
+              # Paired with --enforce-eager below so the wrappers execute (and print
+              # real per-decode-step stats) on every generated token.
+              "gpt-oss-120b": "AITER_CKTILE_DEBUG=1",
           }
 
           # Extra CLI args appended (after the ATOM config's extraArgs) for
@@ -131,6 +137,11 @@ jobs:
           # so pin TP2 to match the do-mi350x-2 runner.
           model_extra_args_append = {
               "MiniMax-M2.7-MXFP4": "-tp 2 --enforce-eager --level 0",
+              # gpt-oss-120b (Option A): disable cudagraph capture so the CK-tile
+              # 2-stage MoE decode path runs eagerly and the AITER_CKTILE_DEBUG
+              # prints (enabled via model_env_overrides above) capture real
+              # generation-time numerics instead of warmup-only stats.
+              "gpt-oss-120b": "--enforce-eager",
           }
 
           def prepare_model(model):
