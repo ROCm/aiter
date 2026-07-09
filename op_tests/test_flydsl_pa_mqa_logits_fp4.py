@@ -218,24 +218,6 @@ def ref_mqa_logits_mixed(
     return ref_logits
 
 
-def _torch_ref_step(q_dq_bn, kv_dq, w_bn, next_n=1):
-    """logits[bn,t] = sum_h(relu(Q[bn,h,:] · K[b,t,:]) * w[bn,h]).
-
-    q_dq_bn: [B*NEXT_N, H, D], kv_dq: [B, T, D] (broadcast across NEXT_N),
-    w_bn:    [B*NEXT_N, H]. Returns [B*NEXT_N, T]. (torch matmul baseline.)
-    """
-    if next_n != 1:
-        b_kv, t_kv, d_kv = kv_dq.shape
-        kv_dq = (
-            kv_dq.unsqueeze(1)
-            .expand(-1, next_n, -1, -1)
-            .reshape(b_kv * next_n, t_kv, d_kv)
-        )
-    qk = torch.bmm(q_dq_bn, kv_dq.transpose(1, 2))  # [B*NEXT_N, H, T_max]
-    qk = torch.relu(qk) * w_bn[:, :, None]
-    return qk.sum(dim=1)
-
-
 def _make_varctx(batch, max_ctx, kv_block_size, var_ratio=0.5, seed=0):
     """Per-batch ctx lengths matching aiter bench_deepgemm_attention.py.
 
@@ -251,6 +233,121 @@ def _make_varctx(batch, max_ctx, kv_block_size, var_ratio=0.5, seed=0):
         min(((c + kv_block_size - 1) // kv_block_size) * kv_block_size, max_ctx)
         for c in raw
     ]
+
+
+# ── Gluon FP8 baseline (E2E decode calling convention) ───────────────
+
+
+def _bench_gluon_fp8(
+    q_bf16,  # [B, NEXT_N, H, D] bf16
+    kv_bf16,  # [B, t_max, D] bf16
+    weights,  # [B*NEXT_N, H]
+    context_lens,  # [B] int32
+    block_tables,  # [B, max_blocks_per_seq] int32 (kv_block_size blocks)
+    t_max,
+    num_blocks,
+    kv_block_size,
+    heads,
+    head_dim,
+    next_n,
+    ref_logits,
+    mask,
+    num_iters,
+    num_warmup,
+):
+    """Time the gluon FP8 decode indexer via `deepgemm_fp8_paged_mqa_logits`
+    using EXACTLY the calling convention ATOM's `Indexer._score_topk_decode`
+    uses in end-to-end serving:
+
+        Preshuffle=True, KVBlockSize=kv_block_size(64), ChunkK=256,
+        WavePerEU=2, and NO VarCtxSchedule (non-varctx grid).
+
+    Built from the same dense KV as the flydsl fp4 path so the two numbers
+    are directly comparable. Returns ``(us_fp8, cos_fp8)`` or ``(None, None)``
+    if the gluon path is unavailable.
+    """
+    try:
+        from aiter.ops.triton.attention.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits,
+        )
+        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+        from aiter.ops.shuffle import shuffle_weight
+
+        fp8_dtype = get_fp8_e4m3_dtype()
+        batch_size = q_bf16.shape[0]
+
+        # block_tables is a contiguous arange, so batch b's 64-token block j is
+        # physical block b*max_blocks_per_seq + j == the flattened
+        # [num_blocks, kv_block_size, D] index -> reshape dense KV directly.
+        kv_blocks = kv_bf16.reshape(num_blocks, kv_block_size, 1, head_dim)
+        x_amax = kv_blocks.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
+        sf = x_amax / 240.0
+        x_scaled = (kv_blocks * (1.0 / sf)).to(fp8_dtype)
+
+        # deepgemm layout: [num_blocks, block, 1, D + 4B fp32 scale]. D=128 so
+        # block*D is 16B-aligned -> no extra padding needed.
+        index_dim = head_dim + 4
+        kv_cache_fp8 = torch.empty(
+            (num_blocks, kv_block_size * index_dim), dtype=torch.uint8, device=dev
+        )
+        kv_cache_fp8[:, : kv_block_size * head_dim] = x_scaled.reshape(
+            num_blocks, kv_block_size * head_dim
+        ).view(torch.uint8)
+        kv_cache_fp8[:, kv_block_size * head_dim :] = sf.reshape(
+            num_blocks, kv_block_size
+        ).view(torch.uint8)
+        kv_cache_fp8 = kv_cache_fp8.view(num_blocks, kv_block_size, 1, index_dim)
+
+        # Preshuffle the fp8 data section (E2E Preshuffle=True); scale tail is
+        # left in place.
+        split = kv_cache_fp8.view(num_blocks, kv_block_size * index_dim)
+        data = shuffle_weight(
+            split[:, : kv_block_size * head_dim]
+            .contiguous()
+            .view(num_blocks, kv_block_size, head_dim)
+        )
+        split[:, : kv_block_size * head_dim] = data.reshape(
+            num_blocks, kv_block_size * head_dim
+        )
+
+        q_fp8 = q_bf16.to(fp8_dtype).contiguous()
+        w_fp32 = weights.float().contiguous()
+        out_fp8 = torch.full(
+            (batch_size * next_n, t_max),
+            float("-inf"),
+            dtype=torch.float32,
+            device=dev,
+        )
+
+        def launch_fp8():
+            deepgemm_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                w_fp32,
+                out_fp8,
+                context_lens,
+                block_tables,
+                t_max,
+                ChunkK=256,
+                Preshuffle=True,
+                KVBlockSize=kv_block_size,
+                WavePerEU=2,
+            )
+
+        out_fp8.fill_(float("-inf"))
+        launch_fp8()
+        torch.cuda.synchronize()
+        # cosine vs the same masked ref (scale-invariant, so the separate
+        # weight_scale on the flydsl path does not matter here).
+        vo = out_fp8[mask].double()
+        vr = ref_logits[mask].double()
+        cos_fp8 = (vo * vr).sum() / (vo.norm() * vr.norm() + 1e-12)
+
+        _, us_fp8 = run_perftest(launch_fp8, num_iters=num_iters, num_warmup=num_warmup)
+        return us_fp8, float(cos_fp8.item())
+    except Exception as e:  # noqa: BLE001
+        print(f"  [perf] gluon fp8 path unavailable ({type(e).__name__}: {e})")
+        return None, None
 
 
 # ── Test + Benchmark ─────────────────────────────────────────────────
@@ -448,28 +545,23 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     _, us_fly = run_perftest(launch_flydsl, num_iters=num_iters, num_warmup=num_warmup)
     torch.cuda.synchronize()
 
-    # ---- Perf: torch bf16 baseline (dequant excluded — pure matmul + relu/wsum) ----
-    q_dq_bf16 = (
-        fp4_dequant_e2m1_with_e8m0(
-            q_packed.reshape(-1, head_dim_packed),
-            q_e8m0.reshape(-1, head_dim_scales),
-        )
-        .reshape(batch_size * next_n, heads, head_dim)
-        .to(torch.bfloat16)
-    )
-    kv_dq_bf16 = fp4_dequant_e2m1_with_e8m0(kv_fp4_dense, kv_e8m0_dense).to(
-        torch.bfloat16
-    )
-    w_bf16 = weights.to(torch.bfloat16)
-
-    _, us_bf16 = run_perftest(
-        _torch_ref_step,
-        q_dq_bf16,
-        kv_dq_bf16,
-        w_bf16,
+    # ---- Perf: gluon FP8 baseline (E2E decode calling convention) ----
+    us_fp8, cos_fp8 = _bench_gluon_fp8(
+        q_bf16,
+        kv_bf16,
+        weights,
+        context_lens,
+        block_tables,
+        t_max,
+        num_blocks,
+        kv_block_size,
+        heads,
+        head_dim,
         next_n,
-        num_iters=num_iters,
-        num_warmup=num_warmup,
+        ref_logits,
+        mask,
+        num_iters,
+        num_warmup,
     )
 
     # ---- USEFUL FLOPs / bytes (varctx — based on real ctx_lens, not max) ----
@@ -488,18 +580,20 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         return flops / sec / 1e12, bytes_total / sec / 1e9
 
     tflops_fly, gbps_fly = metrics(us_fly)
-    tflops_bf16, _ = metrics(us_bf16)
 
     print(
-        f"\n  {'':>16} | {'us':>10} | {'TFLOPS':>8} | {'GB/s':>8} | {'vs flydsl':>10}"
+        f"\n  {'':>18} | {'us':>10} | {'TFLOPS':>8} | {'GB/s':>8} | {'vs flydsl':>10}"
     )
     print(
-        f"  {'flydsl-qfp4/kvfp4':>16} | {us_fly:>10.2f} | {tflops_fly:>8.2f} | {gbps_fly:>8.1f} |"
+        f"  {'flydsl-qfp4/kvfp4':>18} | {us_fly:>10.2f} | {tflops_fly:>8.2f} | {gbps_fly:>8.1f} |"
     )
-    print(
-        f"  {'torch-bf16':>16} | {us_bf16:>10.2f} | {tflops_bf16:>8.2f} | {'-':>8} | "
-        f"{us_bf16 / us_fly:>9.2f}x"
-    )
+    if us_fp8 is not None:
+        tflops_fp8, _ = metrics(us_fp8)
+        print(
+            f"  {'gluon-fp8 (E2E)':>18} | {us_fp8:>10.2f} | {tflops_fp8:>8.2f} | {'-':>8} | "
+            f"{us_fp8 / us_fly:>9.2f}x"
+        )
+        print(f"  [accuracy] gluon fp8 vs fp4 ref cos={cos_fp8:.6f}")
     print()
 
     _PERF_SUMMARY.append(
@@ -515,6 +609,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
             us_fly,
             tflops_fly,
             gbps_fly,
+            us_fp8,
         )
     )
 
@@ -525,13 +620,19 @@ def _print_perf_summary():
     print("=" * 96)
     print(
         f"  {'batch':>5} | {'heads':>5} | {'h_dim':>5} | {'ctx_len':>7} | {'next_n':>6} | "
-        f"{'kv_blk':>6} | {'block_k':>7} | {'cos_sim':>8} | {'us':>9} | {'TFLOPS':>7} | {'GB/s':>7}"
+        f"{'kv_blk':>6} | {'block_k':>7} | {'cos_sim':>8} | {'us':>9} | {'TFLOPS':>7} | "
+        f"{'GB/s':>7} | {'fp8_us':>8} | {'fp8/fly':>7}"
     )
-    print("  " + "-" * 103)
-    for b, h, hd, ctx, nn, kvb, blk, cos_v, us, tflops, gbps in _PERF_SUMMARY:
+    print("  " + "-" * 127)
+    for b, h, hd, ctx, nn, kvb, blk, cos_v, us, tflops, gbps, us_fp8 in _PERF_SUMMARY:
+        fp8_us_str = f"{us_fp8:>8.2f}" if us_fp8 is not None else f"{'-':>8}"
+        ratio_str = (
+            f"{us_fp8 / us:>7.2f}" if us_fp8 is not None and us > 0 else f"{'-':>7}"
+        )
         print(
             f"  {b:>5} | {h:>5} | {hd:>5} | {ctx:>7} | {nn:>6} | {kvb:>6} | {blk:>7} | "
-            f"{cos_v:>8.4f} | {us:>9.2f} | {tflops:>7.2f} | {gbps:>7.1f}"
+            f"{cos_v:>8.4f} | {us:>9.2f} | {tflops:>7.2f} | {gbps:>7.1f} | "
+            f"{fp8_us_str} | {ratio_str}"
         )
     print()
 

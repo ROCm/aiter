@@ -416,7 +416,7 @@ def _bench_vs_atom(
                 weights.float(),
                 cu_starts,
                 cu_ends,
-                clean_logits=True,
+                clean_logits=False,
             )
 
         atom_out = atom_logits()
