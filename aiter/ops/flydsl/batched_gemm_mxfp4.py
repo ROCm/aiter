@@ -15,6 +15,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 from .kernels.mxfp4_preshuffle import launch_gemm
+from .kernels.tensor_shim import ptr_arg
 
 SCALE_GROUP_SIZE = 32
 
@@ -30,7 +31,20 @@ _COMPILED: dict = {}
 def _compiled_for(cfg, example):
     cf = _COMPILED.get(cfg)
     if cf is None:
-        cf = flyc.compile(launch_gemm, *example, *cfg)
+        try:
+            cf = flyc.compile(launch_gemm, *example, *cfg)
+        except Exception:
+            # JitFunction.__call__ leaks an ir.Context on compilation failure, which
+            # sends every later JitFunction call down a wrong code path. Drain the leaked
+            # contexts so a failure here stays isolated (mirrors moe_kernels._run_compiled).
+            try:
+                from flydsl._mlir import ir
+
+                while ir.Context.current is not None:
+                    ir.Context.current.__exit__(None, None, None)
+            except Exception:
+                pass
+            raise
         _COMPILED[cfg] = cf
     return cf
 
@@ -148,11 +162,11 @@ def flydsl_batched_gemm_mxfp4(
         out_phys = torch.empty((B, M, N), dtype=dtype, device=x.device)
 
     C_flat = out_phys.view(-1)
-    bias = torch.empty(0, dtype=dtype, device=x.device)
     stream = torch.cuda.current_stream()
 
     # Constexpr config for launch_gemm (M rides i32_m at runtime, not baked; strides <0 = the
-    # contiguous bmn default). Compiled once per cfg, then dispatched via cf(*runtime).
+    # contiguous bmn default). Compiled once per cfg, then dispatched via cf(*runtime). Operands
+    # go in as ptr_arg (raw data_ptr) so each launch skips per-tensor DLPack conversion.
     s = strides
     cfg = (
         N, K, tile_m, tile_n, tile_k, a_dtype, out_dtype, B,
@@ -160,7 +174,10 @@ def flydsl_batched_gemm_mxfp4(
         s.get("sca_row_stride", -1), s.get("sca_batch_stride", -1),
         s.get("c_row_stride", -1), s.get("c_batch_stride", -1), 0,
     )
-    runtime = (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
+    runtime = (
+        ptr_arg(C_flat), ptr_arg(A_flat), ptr_arg(B_flat),
+        ptr_arg(SA_flat), ptr_arg(SB_flat), M, N, stream,
+    )
     _compiled_for(cfg, runtime)(*runtime)
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.

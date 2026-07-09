@@ -59,12 +59,11 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves):
 
 @flyc.jit
 def launch_gemm(
-    arg_c: fx.Tensor,
-    arg_a: fx.Tensor,
-    arg_b: fx.Tensor,
-    arg_scale_a: fx.Tensor,
-    arg_scale_b: fx.Tensor,
-    arg_bias: fx.Tensor,
+    arg_c: fx.Pointer,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     i32_n: fx.Int32,
     stream: fx.Stream,
@@ -84,11 +83,11 @@ def launch_gemm(
     c_batch_stride: Constexpr[int],
     waves_per_eu: Constexpr[int],
 ):
-    """Direct @flyc.jit launcher (flyc caches per Constexpr config; call it directly, no
-    builder). a_dtype fp4/fp6/fp8 A x CK-preshuffled MXFP4 B, e8m0 scales, bias unused.
-    batch>1 = strided-batched over grid.z. The a_/sca_/c_ row/batch strides make A/scale_a/C
-    addressing caller-controlled; each <0 keeps the contiguous [B,M,*] bmn default, all set =
-    the [M,B,*] mbn (deepseek grouped) layout. waves_per_eu<=0 = unset."""
+    """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
+    per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
+    A x CK-preshuffled MXFP4 B, e8m0 scales. batch>1 = strided-batched over grid.z. The
+    a_/sca_/c_ row/batch strides make A/scale_a/C addressing caller-controlled; each <0 keeps
+    the contiguous [B,M,*] bmn default, all set = the [M,B,*] mbn layout. waves_per_eu<=0 = unset."""
     from flydsl.compiler.kernel_function import CompilationContext
 
     CompilationContext.get_current()
@@ -142,12 +141,11 @@ def launch_gemm(
 
     @flyc.kernel
     def kernel_gemm(
-        arg_c: fx.Tensor,
+        arg_c: fx.Int64,
         arg_a: fx.Int64,
         arg_b: fx.Int64,
         arg_scale_a: fx.Int64,
         arg_scale_b: fx.Int64,
-        arg_bias: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -454,7 +452,7 @@ def launch_gemm(
             c_nrec = (
                 fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(c_stride) + fx.Int64(N)
             ) * fx.Int64(2)
-        c_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_c)))
+        c_addr = fx.Int64(arg_c)
         if const_expr(batch > 1):
             c_bstride = (
                 fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
@@ -491,26 +489,23 @@ def launch_gemm(
                     off = (row_m + fx.Int32(ii)) * c_rstride + col
                     fx.copy(c_copy, cf, c_flat[None, off])
 
-    a_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_a)))
-    b_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_b)))
-    sa_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_scale_a)))
-    sb_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_scale_b)))
+    c_addr = fx.Int64(fx.ptrtoint(arg_c))
+    a_addr = fx.Int64(fx.ptrtoint(arg_a))
+    b_addr = fx.Int64(fx.ptrtoint(arg_b))
+    sa_addr = fx.Int64(fx.ptrtoint(arg_scale_a))
+    sb_addr = fx.Int64(fx.ptrtoint(arg_scale_b))
     if const_expr(waves_per_eu > 0):
         wpe = waves_per_eu
     else:
         wpe = None
-    arg_c_2d = fx.Tensor(
-        fx.make_view(fx.get_iter(arg_c), fx.make_layout((65536, N), (N, 1)))
-    )
     gx = (i32_m + (BM - 1)) // BM
     gy = i32_n // BN
     kernel_gemm(
-        arg_c_2d,
+        c_addr,
         a_addr,
         b_addr,
         sa_addr,
         sb_addr,
-        arg_bias,
         i32_m,
         i32_n,
         value_attrs={"rocdl.waves_per_eu": wpe},
