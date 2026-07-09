@@ -302,6 +302,7 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e AITER_LOG_LEVEL=DEBUG \
           -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -383,6 +384,9 @@ jobs:
             atom_aiter_test bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
+          echo ""
+          echo "========== Collecting ATOM server log =========="
+          docker cp atom_aiter_test:/tmp/atom_server.log ./atom_server.log || true
 
       - name: Check accuracy test results
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
@@ -420,6 +424,15 @@ jobs:
           name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_accuracy_output.txt
           path: atom_accuracy_output.txt
           retention-days: 7
+
+      - name: Upload server log
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_server_log
+          path: atom_server.log
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Clean Up
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
