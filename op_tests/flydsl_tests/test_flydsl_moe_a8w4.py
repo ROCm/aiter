@@ -31,7 +31,8 @@ from aiter.ops.quant import (
     per_1x32_f4_quant,
     per_1x32_f8_scale_f8_quant,
 )
-from aiter.ops.shuffle import shuffle_weight_a16w4, shuffle_scale_a16w4
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4
+from aiter.utility.fp4_utils import e8m0_shuffle
 from aiter.test_common import checkAllclose
 
 Q_TYPE = QuantType.per_1x32
@@ -299,3 +300,324 @@ def test_flydsl_e2e_a8w4_gui(inter_dim):
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
+
+
+# ---------------------------------------------------------------------------
+# SiTUv2 activation fused into the FlyDSL MXFP4 MoE stage1 (a8w4 + host ref).
+# Migrated from the former test_flydsl_moe_situv2.py.
+#
+# SiTUv2 (fp32 intermediate, cast back at the end):
+#     situ_g    = beta * tanh(gate / beta) * sigmoid(gate)
+#     up_scaled = linear_beta * tanh(up / linear_beta)
+#     out       = situ_g * up_scaled
+# ---------------------------------------------------------------------------
+SITUV2_BETA = 2.0
+SITUV2_LINEAR_BETA = 1.5
+
+
+def test_situv2_reference():
+    """Verify aiter.fused_moe.situv2 matches the closed-form SiTUv2 in fp32.
+
+    Host-only (no GPU / gfx950 required)."""
+    from aiter.fused_moe import situv2
+
+    torch.manual_seed(0)
+    d = 512
+    passed = True
+    for beta in (0.5, 1.0, 2.0):
+        for linear_beta in (0.5, 1.0, 2.0):
+            gate = torch.randn(4, d) * 3.0
+            up = torch.randn(4, d) * 3.0
+            got = situv2(gate, up, beta=beta, linear_beta=linear_beta)
+            g = gate.float()
+            u = up.float()
+            situ_g = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+            up_scaled = linear_beta * torch.tanh(u / linear_beta)
+            expect = situ_g * up_scaled
+            max_delta = (got.float() - expect).abs().max().item()
+            ok = max_delta < 1e-5
+            passed = passed and ok
+    # Bounded intermediates property (mxfp4-friendly): |out| <= beta*linear_beta.
+    beta, linear_beta = 1.5, 0.8
+    gate = torch.randn(8, d) * 20.0
+    up = torch.randn(8, d) * 20.0
+    out = situv2(gate, up, beta=beta, linear_beta=linear_beta)
+    bound = beta * linear_beta + 1e-4
+    within = bool(out.abs().max().item() <= bound)
+    assert passed and within, "situv2 reference mismatch or bound violated"
+
+
+# (token, model_dim, inter_dim, E, topk, block_m, tile_m, tile_n, tile_k,
+#  gate_mode, out_dtype, seed, situ_beta, situ_linear_beta)
+A8W4_SITUV2_VEC4_CASES = [
+    pytest.param(
+        16,
+        256,
+        128,
+        8,
+        2,
+        32,
+        32,
+        256,
+        256,
+        "separated",
+        "bf16",
+        1,
+        SITUV2_BETA,
+        SITUV2_LINEAR_BETA,
+        id="t16_sep_bf16_default_beta",
+    ),
+    pytest.param(
+        64,
+        512,
+        256,
+        16,
+        4,
+        32,
+        32,
+        256,
+        256,
+        "separated",
+        "bf16",
+        2,
+        SITUV2_BETA,
+        SITUV2_LINEAR_BETA,
+        id="t64_sep_bf16",
+    ),
+    pytest.param(
+        16,
+        256,
+        128,
+        8,
+        2,
+        64,
+        64,
+        128,
+        256,
+        "separated",
+        "bf16",
+        3,
+        SITUV2_BETA,
+        SITUV2_LINEAR_BETA,
+        id="tile64_n128_sep_bf16",
+    ),
+    pytest.param(
+        32,
+        256,
+        128,
+        8,
+        2,
+        32,
+        32,
+        128,
+        256,
+        "separated",
+        "f16",
+        4,
+        SITUV2_BETA,
+        SITUV2_LINEAR_BETA,
+        id="t32_sep_f16",
+    ),
+    pytest.param(
+        16,
+        256,
+        128,
+        8,
+        2,
+        32,
+        32,
+        256,
+        256,
+        "separated",
+        "bf16",
+        5,
+        1.0,
+        1.0,
+        id="t16_sep_bf16_unit_beta",
+    ),
+    pytest.param(
+        16,
+        256,
+        128,
+        8,
+        2,
+        32,
+        32,
+        256,
+        256,
+        "interleave",
+        "bf16",
+        6,
+        SITUV2_BETA,
+        SITUV2_LINEAR_BETA,
+        id="t16_interleave_bf16",
+    ),
+    pytest.param(
+        # non-256-aligned inter_dim (DSV4 TP8); exercises fix-k K-tiling.
+        64,
+        512,
+        640,
+        16,
+        4,
+        32,
+        32,
+        256,
+        256,
+        "interleave",
+        "bf16",
+        7,
+        SITUV2_BETA,
+        SITUV2_LINEAR_BETA,
+        id="t64_i640_interleave_bf16",
+    ),
+]
+
+
+def _make_routes(hidden: torch.Tensor, experts: int, topk: int, block_m: int):
+    score = torch.randn(
+        (hidden.shape[0], experts), dtype=hidden.dtype, device=hidden.device
+    )
+    topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+    sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, experts, hidden.shape[1], hidden.dtype, block_m
+    )
+    return topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids
+
+
+def _generate_a8w4_situv2_vec4_data(
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    E: int,
+    topk: int,
+    block_m: int,
+    *,
+    seed: int = 1,
+    dtype=torch.bfloat16,
+    situ_beta: float = SITUV2_BETA,
+    situ_linear_beta: float = SITUV2_LINEAR_BETA,
+    gate_mode: str = "separated",
+):
+    """a8w4 data for vec4 SiTUv2 epilogue (tile / gate_mode variants)."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 4
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda") / 4
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda") / 4
+    topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = _make_routes(
+        inp, E, topk, block_m
+    )
+
+    a_q, a_scale = per_1x32_f8_scale_f8_quant(
+        inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+    w2_q, _w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+    ref_stage1 = torch_moe_stage1(
+        a_q,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=ActivationType.Situv2,
+        quant_type=Q_TYPE,
+        a1_scale=a_scale,
+        w1_scale=w1_scale,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    a_scale_sort = mxfp4_moe_sort_fwd(
+        a_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        cols=model_dim,
+    )
+
+    w1_q_shuf = shuffle_weight(w1_q, (16, 16))
+    if gate_mode == "interleave":
+        w1_q_shuf = shuffle_weight(w1_q, (16, 16), is_guinterleave=True, gate_up=True)
+
+    return dict(
+        ref_stage1=ref_stage1,
+        a_q=a_q,
+        a_scale_sort=a_scale_sort,
+        w1_q_shuf=w1_q_shuf,
+        w1_scale_shuf=e8m0_shuffle(w1_scale),
+        sorted_ids=sorted_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        topk=topk,
+    )
+
+
+@pytest.mark.parametrize(
+    "token,model_dim,inter_dim,E,topk,block_m,tile_m,tile_n,tile_k,"
+    "gate_mode,out_dtype,seed,situ_beta,situ_linear_beta",
+    A8W4_SITUV2_VEC4_CASES,
+)
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_situv2_a8w4_stage1_vec4(
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    block_m,
+    tile_m,
+    tile_n,
+    tile_k,
+    gate_mode,
+    out_dtype,
+    seed,
+    situ_beta,
+    situ_linear_beta,
+):
+    """a8w4 SiTUv2 stage1 via mixed_moe_gemm_2stage vec4 activation path."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+    torch.set_default_device("cuda")
+    label = (
+        f"a8w4_situv2_vec4 token={token} tile={tile_m}x{tile_n}x{tile_k} "
+        f"gate={gate_mode} out={out_dtype} beta=({situ_beta},{situ_linear_beta})"
+    )
+    data = _generate_a8w4_situv2_vec4_data(
+        token=token,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        E=E,
+        topk=topk,
+        block_m=block_m,
+        seed=seed,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        gate_mode=gate_mode,
+    )
+    out = flydsl_moe_stage1(
+        a=data["a_q"],
+        w1=data["w1_q_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=data["topk"],
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype=out_dtype,
+        act="situv2",
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        w1_scale=data["w1_scale_shuf"],
+        a1_scale=data["a_scale_sort"],
+        gate_mode=gate_mode,
+    )
+    torch.cuda.synchronize()
+    # ref is bf16 while out may be f16 (t32_sep_f16 case); compare in fp32.
+    _check_close(data["ref_stage1"].float(), out.float(), label)

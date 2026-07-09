@@ -509,6 +509,12 @@ def fused_moe_(
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
+        elif activation == ActivationType.Situv2:
+            # SiTUv2 + separated == a16w4 (bf16 activation x mxfp4 weight); keep
+            # the activation in bf16 (no fp4 quant). a4w4 SiTUv2 full 2-stage is
+            # unsupported (no CK situv2 stage2), so separated-mode SiTUv2 always
+            # maps to the mixed_moe a16w4 kernel.
+            q_dtype_a = dtypes.bf16
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -1677,8 +1683,20 @@ def get_2stage_cfgs(
             activation in (ActivationType.Swiglu, ActivationType.Situv2)
             or _flydsl_force
         )
-        and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-        and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+        and (
+            (
+                q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+            )
+            or (
+                # a16w4 bf16/fp16 x mxfp4: routed to the mixed_moe a16w4 kernel
+                # ONLY for SiTUv2. Situv2 uniquely identifies this path, so
+                # GPT-OSS / legacy bf16-Swiglu keep their CK-Tile routing.
+                q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                and q_dtype_w == dtypes.fp4x2
+                and activation == ActivationType.Situv2
+            )
+        )
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -1692,8 +1710,18 @@ def get_2stage_cfgs(
         )
 
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
-        # a-dtype "fp4" => a4w4 fp4/fp4; "fp8" => a8w4 fp8/fp4 FlyDSL family.
-        _a_type = "fp4" if q_dtype_a == dtypes.fp4x2 else "fp8"
+        # a-dtype routing:
+        #   "fp4"         => a4w4 fp4/fp4
+        #   "fp8"         => a8w4 fp8/fp4 (or a8w8 with w=fp8)
+        #   "bf16"/"fp16" => a16w4 bf16/fp16 x mxfp4 (SiTUv2 only; no act scale)
+        if q_dtype_a == dtypes.fp4x2:
+            _a_type = "fp4"
+        elif q_dtype_a == dtypes.fp8:
+            _a_type = "fp8"
+        elif q_dtype_a == dtypes.bf16:
+            _a_type = "bf16"
+        else:
+            _a_type = "fp16"
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
@@ -2004,7 +2032,8 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
@@ -2168,7 +2197,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
+            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
