@@ -1138,6 +1138,107 @@ def test_v4_nm_varlen_ragged_kv_tail_split_guard():
     _run_varlen_point([66, 50, 40, 33])  # all-short
 
 
+@needs_gfx950
+def test_v4_nm_ragged_short_seq_no_corrupt():
+    """A short seq must not be corrupted by over-allocated splits (host ragged
+    split_indptr fix).
+
+    get_meta_param picks a SINGLE num_kv_splits from the batch-AVERAGE kv and
+    (before the fix) built a UNIFORM split_indptr — every seq got num_kv_splits.
+    A seq shorter than num_kv_splits*mgc tokens then gets empty trailing splits
+    whose cyclic-tail garbage the stage2 reduce merges in, silently corrupting
+    THAT seq's own output (~45% off). Only surfaces at bs>=4 where a long seq
+    raises the average enough to push num_kv_splits above the short seq's
+    coverage. The wrapper now builds a RAGGED split_indptr (each seq capped at
+    ceil(kv_i/mgc) splits) so short seqs get no empty splits.
+
+    Regression: per-seq accuracy for gqa=16 ragged batches that trigger the
+    over-allocation, with the short seq at various positions and batch sizes.
+    """
+    device = "cuda"
+    gqa = 16
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    cases = [
+        [384, 256, 127, 384],  # short(127)@2 -> auto 3 splits, seq2 valid=2
+        [127, 384, 256, 384],  # short@0
+        [384, 256, 384, 127],  # short@3
+        [384, 256, 64, 384],  # even shorter (valid=1)
+        [384, 256, 127, 384, 384, 256, 384, 127],  # bs8, two short seqs
+    ]
+    for kv_lens in cases:
+        batch = len(kv_lens)
+        total_kv = sum(kv_lens)
+        torch.manual_seed(0)
+        q_bf16 = torch.randn(batch, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+        kv_bf16 = torch.randn(
+            total_kv,
+            PAGE_SIZE,
+            NUM_KV_HEADS,
+            _QUANT_D,
+            dtype=dtypes.bf16,
+            device=device,
+        )
+        qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor(
+            [0] + torch.tensor(kv_lens).cumsum(0).tolist(),
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_page_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+        kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+        sink = torch.randn(gqa, dtype=torch.float32, device=device) * 10.0
+        qp, qr = _native_to_2buff_for_asm(q_bf16)
+        kp, kr = _native_to_2buff_for_asm(kv_bf16)
+        out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+            qp,
+            qr,
+            kp,
+            kr,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            sm_scale,
+            attn_sink=sink,
+        )
+        output = torch.empty((batch, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+        logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+            q=qp,
+            qrope=qr.contiguous(),
+            kv_buffer=kp,
+            kvrope=kr.contiguous(),
+            output=output,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_page_indices=kv_page_indices,
+            kv_last_page_lens=kv_last_page_lens,
+            split_indptr=None,
+            max_seqlen_q=1,
+            sink=sink,
+            sm_scale=sm_scale,
+            out_16_nosplit=0,
+            num_kv_splits=None,
+        )
+        resolved = logits.shape[1]
+        out = (output if resolved > 1 else logits[:, 0]).float()
+        ref = out_ref.float()
+        bad = [
+            ((out[b] - ref[b]).abs() > 3e-2 + 3e-2 * ref[b].abs()).float().mean().item()
+            for b in range(batch)
+        ]
+        print(
+            f"\n[v4 nm ragged-short] gqa={gqa} kv_lens={kv_lens} resolved_splits="
+            f"{resolved} per-seq bad={['%.1f%%' % (100 * x) for x in bad]}"
+        )
+        worst = max(bad)
+        assert worst < 0.02, (
+            f"ragged short-seq corruption: kv_lens={kv_lens} resolved={resolved} "
+            f"per-seq mismatch={['%.1f%%' % (100 * x) for x in bad]} (>=2%); a "
+            f"short seq got over-allocated splits and its empty-split garbage "
+            f"corrupted its own output."
+        )
+
+
 def _run_cudagraph_bucket_point(
     real_kv_lens, gqa_ratio, pad_kv_len=1, seed=0, attn_sink=True
 ):

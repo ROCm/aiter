@@ -1177,6 +1177,7 @@ def mla_decode_fwd_v4_nm(
     #       could shrink it and desync the buffer shapes). Only synthesize a
     #       uniform split_indptr if the caller didn't pass one.
     total_kv = kv_page_indices.shape[0]
+    split_indptr_synthesized = split_indptr is None
     if num_kv_splits is None or split_indptr is None:
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
         meta_num_kv_splits, meta_split_indptr = get_meta_param(
@@ -1192,6 +1193,33 @@ def mla_decode_fwd_v4_nm(
             num_kv_splits = meta_num_kv_splits
         if split_indptr is None:
             split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
+
+    # ---- Ragged per-seq split allocation (short-seq correctness) -----------
+    # get_meta_param picks a SINGLE num_kv_splits from the batch-average kv and
+    # returns a UNIFORM indptr (every seq gets num_kv_splits). For a seq shorter
+    # than num_kv_splits * BLK tokens that over-allocates splits: the decode
+    # distributes kv cyclically across all num_kv_splits, so the trailing
+    # "empty" splits produce garbage partials that the stage2 reduce then merges
+    # in — silently corrupting THAT seq's own output (~45% off). It only
+    # surfaces when the avg-kv-derived num_kv_splits exceeds a short seq's
+    # coverage (e.g. a long seq in the batch raises the average).
+    #
+    # Fix (host-only; decode already reads per-seq split count from split_indptr
+    # and cleanly exits TGs with tg_idz >= that count): rebuild split_indptr
+    # RAGGED, capping each seq at ceil(kv_i / BLK) so short seqs get no empty
+    # splits. num_kv_splits (the kernarg passes it as the buffer's nsplit_max
+    # stride) is left unchanged — only the per-seq split_indptr becomes ragged;
+    # the partial buffer layout is untouched and short seqs just leave their
+    # tail slots unwritten/unread. BLK mirrors the stage2 reduce's `mgc`. Only
+    # applied to a split_indptr WE synthesized (never override a caller's).
+    if split_indptr_synthesized and num_kv_splits > 1:
+        blk = 64 if (max_seqlen_q == 1 and num_heads in (8, 16)) else 16
+        kv_lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int64)
+        per_seq_splits = torch.clamp(
+            (kv_lens + blk - 1) // blk, min=1, max=num_kv_splits
+        ).to(torch.int32)
+        split_indptr = torch.zeros(num_seqs + 1, dtype=torch.int32, device=q.device)
+        split_indptr[1:] = torch.cumsum(per_seq_splits, dim=0).to(torch.int32)
 
     # ---- Multi-pass requires the FP32 split-output path ----
     if num_kv_splits > 1 and out_16_nosplit != 0:
