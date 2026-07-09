@@ -308,6 +308,36 @@ def gemm_decode_bf16_kernel(
             store_bf16(acc31, rsrc_c,  m3 * fx.Int32(N) + n_base + fx.Int32(1))
 
 
+# ── M=1 specialised kernel: NP=1, MP=1, 60 VGPRs ────────────────────────────
+# For M=1 the grid is already small (N wavefronts). The MP=4 kernel would
+# pad to 4 rows and waste 75% of compute. NP=1 also avoids the 2nd A-load.
+# Fewer VGPRs (60 vs 65) → one more wavefront per SIMD → marginally better.
+
+@flyc.kernel
+def gemm_decode_bf16_kernel_m1(
+    A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
+    K: fx.Constexpr[int], N: fx.Constexpr[int],
+):
+    lane = gpu.thread_idx.x
+    m    = gpu.block_idx.x          # always 0 for M=1
+    n    = xcd_swizzle(gpu.block_idx.y, fx.Int32(N))
+    rsrc_a = buffer_ops.create_buffer_resource(A)
+    rsrc_b = buffer_ops.create_buffer_resource(B)
+    rsrc_c = buffer_ops.create_buffer_resource(C)
+    acc    = _const_f32(0.0)
+    kTileN = 64 * KVEC; num_iter = K // kTileN; nv = KVEC // 4
+    for i in range_constexpr(num_iter):
+        k_elem = fx.Int32(i * kTileN) + lane * fx.Int32(KVEC)
+        av = tuple(Vec(buffer_ops.buffer_load(rsrc_a, m * fx.Int32(K) + k_elem + fx.Int32(j*4), vec_width=4, dtype=T.bf16)) for j in range(nv))
+        bv = tuple(Vec(buffer_ops.buffer_load(rsrc_b, n * fx.Int32(K) + k_elem + fx.Int32(j*4), vec_width=4, dtype=T.bf16, cache_modifier=0x2000)) for j in range(nv))
+        for v in range_constexpr(nv):
+            acc = dot2_f32_bf16(acc, pack_bf16x2(av[v][0], av[v][1]), pack_bf16x2(bv[v][0], bv[v][1]))
+            acc = dot2_f32_bf16(acc, pack_bf16x2(av[v][2], av[v][3]), pack_bf16x2(bv[v][2], bv[v][3]))
+    acc = wavefront_reduce_sum_f32(acc, lane)
+    if lane == fx.Int32(0):
+        store_bf16(acc, rsrc_c, m * fx.Int32(N) + n)
+
+
 # ── JIT launcher ──────────────────────────────────────────────────────────────
 
 @flyc.jit
@@ -320,17 +350,24 @@ def gemm_decode_bf16(
     K: fx.Constexpr[int],
     stream: fx.Stream = fx.Stream(None),
 ):
-    # Round M up to next multiple of MP for the grid.
-    # The kernel clamps row indices and guards stores with (row < M_runtime),
-    # so padding rows are read (duplicated from last valid row) but never written.
-    # This is identical to CK's approach.
-    padded_M = ((M + MP - 1) // MP) * MP
-    gemm_decode_bf16_kernel(A, B, C, K, N, fx.Int32(M)).launch(
-        grid=(padded_M // MP, N // NP, 1),
-        block=(64, 1, 1),
-        stream=stream,
-        value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
-    )
+    if M == 1:
+        # Specialised M=1 kernel: NP=1, MP=1, 60 VGPRs, grid=(1, N, 1)
+        gemm_decode_bf16_kernel_m1(A, B, C, K, N).launch(
+            grid=(1, N, 1),
+            block=(64, 1, 1),
+            stream=stream,
+            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
+        )
+    else:
+        # MP=4 kernel for M>=2: fewer wavefronts, B-reuse across 4 rows,
+        # row clamping handles M not divisible by 4.
+        padded_M = ((M + MP - 1) // MP) * MP
+        gemm_decode_bf16_kernel(A, B, C, K, N, fx.Int32(M)).launch(
+            grid=(padded_M // MP, N // NP, 1),
+            block=(64, 1, 1),
+            stream=stream,
+            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
+        )
 
 
 # ── Production wrapper with CUDA graph + warmup ────────────────────────────────
