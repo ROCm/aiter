@@ -26,6 +26,9 @@ BLOCK_SIZE = 32
 SUB_Q = 256
 SUB_K = 128
 
+# Fixed value used to fill q/k/v when peak-perf mode (--const-qkv) is on.
+CONST_QKV_VALUE = 0.25
+
 
 def align_to_tile(original, tile_size):
     return (original + tile_size - 1) // tile_size * tile_size
@@ -59,7 +62,7 @@ def create_mxfp8_scale_buffer(
     return torch.full((num,), fill_value, dtype=torch.float8_e8m0fnu, device=device)
 
 
-def make_inputs(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
+def make_inputs(batch, nheads, nheads_k, seqlen_q, seqlen_k, d, const_qkv=False):
     """Build fp8 q/k/v as BSHD-shaped views over BHSD memory + e8m0 scales.
 
     Reproduces the real call layout: the MXFP8 kernel consumes bshd-shaped
@@ -70,9 +73,22 @@ def make_inputs(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
     torch.random.manual_seed(0)
     d_v = d
 
-    q_bhsd = torch.randn(batch, nheads, seqlen_q, d, dtype=torch.bfloat16)
-    k_bhsd = torch.randn(batch, nheads_k, seqlen_k, d, dtype=torch.bfloat16)
-    v_bhsd = torch.randn(batch, nheads_k, seqlen_k, d_v, dtype=torch.bfloat16)
+    if const_qkv:
+        # Peak-perf mode: fill q/k/v with a fixed value so the workload is fully
+        # data-independent (no random content, stable timing).
+        q_bhsd = torch.full(
+            (batch, nheads, seqlen_q, d), CONST_QKV_VALUE, dtype=torch.bfloat16
+        )
+        k_bhsd = torch.full(
+            (batch, nheads_k, seqlen_k, d), CONST_QKV_VALUE, dtype=torch.bfloat16
+        )
+        v_bhsd = torch.full(
+            (batch, nheads_k, seqlen_k, d_v), CONST_QKV_VALUE, dtype=torch.bfloat16
+        )
+    else:
+        q_bhsd = torch.randn(batch, nheads, seqlen_q, d, dtype=torch.bfloat16)
+        k_bhsd = torch.randn(batch, nheads_k, seqlen_k, d, dtype=torch.bfloat16)
+        v_bhsd = torch.randn(batch, nheads_k, seqlen_k, d_v, dtype=torch.bfloat16)
 
     q_fp8 = q_bhsd.to(dtypes.fp8)
     k_fp8 = k_bhsd.to(dtypes.fp8)
@@ -105,7 +121,7 @@ def run_torch(q_fp8, k_fp8, v_fp8, causal):
 
 
 @benchmark()
-def test_fmha_fwd_mxfp8(batch, nheads, nheads_k, seqlen, d, causal):
+def test_fmha_fwd_mxfp8(batch, nheads, nheads_k, seqlen, d, causal, const_qkv=False):
     (
         q_in,
         k_in,
@@ -116,7 +132,7 @@ def test_fmha_fwd_mxfp8(batch, nheads, nheads_k, seqlen, d, causal):
         q_fp8,
         k_fp8,
         v_fp8,
-    ) = make_inputs(batch, nheads, nheads_k, seqlen, seqlen, d)
+    ) = make_inputs(batch, nheads, nheads_k, seqlen, seqlen, d, const_qkv=const_qkv)
     d_v = d
 
     ref = run_torch(q_fp8, k_fp8, v_fp8, causal)
@@ -210,13 +226,33 @@ def main():
         default=[False],
         help="causal flags to sweep (kernel currently supports False only)",
     )
+    parser.add_argument(
+        "-cq",
+        "--const_qkv",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[False],
+        help=(
+            "const-qkv flags to sweep: when True, fill q/k/v with a fixed value "
+            "(%.2f) instead of random data for peak-perf measurement" % CONST_QKV_VALUE
+        ),
+    )
     args = parser.parse_args()
 
     df = []
-    for (nheads, nheads_k), batch, seqlen, d, causal in itertools.product(
-        args.hqk, args.batch, args.seqlen, args.head_dim, args.causal
+    for (nheads, nheads_k), batch, seqlen, d, causal, const_qkv in itertools.product(
+        args.hqk,
+        args.batch,
+        args.seqlen,
+        args.head_dim,
+        args.causal,
+        args.const_qkv,
     ):
-        df.append(test_fmha_fwd_mxfp8(batch, nheads, nheads_k, seqlen, d, causal))
+        df.append(
+            test_fmha_fwd_mxfp8(
+                batch, nheads, nheads_k, seqlen, d, causal, const_qkv=const_qkv
+            )
+        )
     df = pd.DataFrame(df)
     aiter.logger.info(f"fmha_fwd_mxfp8 summary:\n{df.to_markdown(index=False)}")
 
