@@ -41,6 +41,7 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    flydsl_kernel_name,
 )
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
 from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -96,6 +97,32 @@ def _a_deq(a1_qt, a1_scale, token, model_dim, adtype):
     return (
         a_vals * fp4_utils.e8m0_to_f32(a1_scale).view(token, model_dim // 32, 1)
     ).view(token, model_dim).to(dtypes.bf16)
+
+
+def _stage2_quant_sort(ref1, sorted_ids, num_valid_ids, token, topk, block_m,
+                       sorted_weights, adtype):
+    """Quantize/sort the stage2 activation in the same dtype the stage2 kernel reads."""
+    quant_sort = (
+        aiter.fused_dynamic_mxfp8_quant_moe_sort
+        if adtype == "fp8" else
+        aiter.fused_dynamic_mxfp4_quant_moe_sort
+    )
+    return quant_sort(
+        ref1.contiguous().view(token * topk, ref1.shape[-1]),
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        topk=topk,
+        block_size=block_m,
+        sorted_weights=sorted_weights,
+    )
+
+
+def _dequant_inter_sorted_quant(row, inter_dim, adtype):
+    """Convert a v2 sorted intermediate row to fp32 for debug/cosine checks."""
+    if adtype == "fp8":
+        return row.view(torch.float8_e4m3fn).float()
+    return fp4_utils.mxfp4_to_f32(row.view(dtypes.fp4x2)).view(inter_dim)
 
 
 def _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype):
@@ -252,17 +279,14 @@ def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
         sorted_ids=sorted_ids, sorted_expert_ids=sorted_expert_ids,
         sorted_weights=sorted_weights, num_valid_ids=num_valid_ids,
     )
-    a2_qt, a2_scale = aiter.fused_dynamic_mxfp8_quant_moe_sort(
-        ref1.contiguous().view(token * topk, inter_dim),
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        topk=topk,
-        block_size=block_m,
-        sorted_weights=sorted_weights,
+    a2_qt, a2_scale = _stage2_quant_sort(
+        ref1, sorted_ids, num_valid_ids, token, topk, block_m, sorted_weights,
+        adtype,
     )
-    base["a2_qt"] = a2_qt.view(token, topk, inter_dim)
+    a2_cols = inter_dim if adtype == "fp8" else inter_dim // 2
+    base["a2_qt"] = a2_qt.view(token, topk, a2_cols)
     base["a2_scale"] = a2_scale
+    base["a2_dtype"] = adtype
 
     # ---- v2 (#753) prep: opus sort + CK a16w4 shuffles + sorted/shuffled a-scale ----
     H, INTER, NE = model_dim, inter_dim, E
@@ -271,7 +295,7 @@ def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
         ref1=ref1, ref2=ref2, topk_ids=topk_ids, topk_weights=topk_weights,
         w1_qt=w1_qt, w1_scale=w1_scale, w2_qt=w2_qt, w2_scale=w2_scale,
         a1_qt=a1_qt, a1_scale=a1_scale,
-        inp=inp, base=base, adtype=adtype,
+        inp=inp, base=base, adtype=adtype, stage2_adtype=adtype,
     )
 
 
@@ -306,7 +330,8 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     asc = d["a1_scale"].view(torch.uint8).view(token, H // 32).contiguous()
     assh = _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=BM_S1)
 
-    inter_cols = INTER  # fp8 out (a8w4)
+    stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
+    inter_cols = INTER if stage2_adtype == "fp8" else INTER // 2
     isq = torch.zeros((max_sorted, inter_cols), device=device, dtype=torch.uint8)
     isc_cols = INTER // 32
     isr = (((max_sorted * ((2 * INTER) // 64) * 4) + isc_cols - 1) // isc_cols + 31) // 32 * 32
@@ -379,6 +404,7 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None, print_outpu
     kn2 = row.get("kernelName2", "")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
     mode = params.get("mode", "atomic")
+    stage2_adtype = b.get("a2_dtype", params.get("a_dtype", b.get("adtype", "fp8")))
     out_shape = (
         (token, model_dim)
         if is_opus2 else
@@ -432,9 +458,9 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None, print_outpu
             tile_m=params["tile_m"],
             tile_n=params["tile_n"],
             tile_k=params["tile_k"],
-            a_dtype="fp8",
-            b_dtype="fp4",
-            out_dtype="bf16",
+            a_dtype=stage2_adtype,
+            b_dtype=params.get("b_dtype", "fp4"),
+            out_dtype=params.get("out_dtype", "bf16"),
             mode=mode,
             w2_scale=b["w2_scale_shuf"].view(dtypes.fp8_e8m0),
             a2_scale=b["a2_scale"],
@@ -470,6 +496,7 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
     ref1 = d["ref1"]  # [token, topk, inter]
     topk_ids = d["topk_ids"]
     n = v["n"]
+    stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
     tok_of = (sti[:n] & 0x00FFFFFF)
     real = (tok_of < token).nonzero(as_tuple=True)[0]
     if real.numel() == 0:
@@ -483,7 +510,7 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
         if slot.numel() == 0:
             continue
         s = int(slot[0].item())
-        vval = isq[r].view(torch.float8_e4m3fn).float()          # [inter]
+        vval = _dequant_inter_sorted_quant(isq[r], inter_dim, stage2_adtype)
         ref = ref1[t, s].float()                                  # [inter]
         vg = vval.view(inter_dim // 32, 32)
         rg = ref.view(inter_dim // 32, 32)
@@ -495,6 +522,7 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
 
 def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wave):
     adtype = d.get("adtype", "fp8")
+    stage2_adtype = d.get("stage2_adtype", adtype)
     def fn():
         return mxfp4_moe_gemm1(
             a_quant=v["aq"], a_scale_sorted_shuffled=v["assh"],
@@ -504,7 +532,7 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
             inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
             n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
             BM=BM_S1, use_nt=use_nt, interleave=True,
-            a_dtype=adtype, out_dtype="fp8", act="silu", swiglu_limit=0.0,
+            a_dtype=adtype, out_dtype=stage2_adtype, act="silu", swiglu_limit=0.0,
             SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
             model_dim_pad=0, inter_dim_pad=0,
         )
@@ -532,7 +560,22 @@ def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
         block_size=BM_S1,
     )
     adtype = d["base"].get("adtype", "fp8")
+    stage2_adtype = d["base"].get("a2_dtype", adtype)
     default_gate = "interleave" if adtype == "fp8" else "separated"
+    gate_mode = params.get("gate_mode", default_gate)
+    if os.environ.get("AITER_LOG_MORE", "0") == "1":
+        _kn1 = flydsl_kernel_name(
+            1, adtype, "fp4", stage2_adtype,
+            params["tile_m"], params["tile_n"], params["tile_k"],
+        )
+        _kw = params.get("k_wave", 1)
+        _bnt = params.get("b_nt", 2)
+        print(
+            f"[gemm1 producer] baseline flydsl_moe_stage1 (v2 layout)  "
+            f"kernel={_kn1}  a_dtype={adtype} b_dtype=fp4 out={stage2_adtype}  "
+            f"gate={gate_mode} k_wave={_kw} b_nt={_bnt}  "
+            f"tile=({params['tile_m']}x{params['tile_n']}x{params['tile_k']})"
+        )
     out, scale = flydsl_moe_stage1(
         a=d["a1_qt"],
         w1=d["base"]["w1_qt_shuf"],
@@ -546,13 +589,13 @@ def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
         tile_k=params["tile_k"],
         a_dtype=adtype,
         b_dtype="fp4",
-        out_dtype="fp8",
+        out_dtype=stage2_adtype,
         w1_scale=d["base"]["w1_scale_shuf"],
         a1_scale=a1_scale_sort,
         sorted_weights=None,
         k_batch=params.get("k_batch", 1),
         waves_per_eu=params.get("waves_per_eu", 3),
-        gate_mode=params.get("gate_mode", default_gate),
+        gate_mode=gate_mode,
         b_nt=params.get("b_nt", 2),
         k_wave=params.get("k_wave", 1),
     )
@@ -579,14 +622,20 @@ def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
         inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
         n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
         BM=BM_S1, use_nt=use_nt, interleave=True,
-        a_dtype=d.get("adtype", "fp8"), out_dtype="fp8", act="silu", swiglu_limit=0.0,
+        a_dtype=d.get("adtype", "fp8"), out_dtype=d.get("stage2_adtype", d.get("adtype", "fp8")),
+        act="silu", swiglu_limit=0.0,
         SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
         model_dim_pad=0, inter_dim_pad=0,
     )
     torch.cuda.synchronize()
 
-    baseline = baseline_isq.view(torch.float8_e4m3fn).float()
-    v2 = v["isq"].view(torch.float8_e4m3fn).float()
+    stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
+    baseline = torch.stack(
+        [_dequant_inter_sorted_quant(row, inter_dim, stage2_adtype) for row in baseline_isq]
+    )
+    v2 = torch.stack(
+        [_dequant_inter_sorted_quant(row, inter_dim, stage2_adtype) for row in v["isq"]]
+    )
     n_valid = v["n"]
     _print_close_stats(
         "gemm1 baseline-v2-layout vs v2 full isq",
@@ -596,13 +645,14 @@ def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
         "gemm1 baseline-v2-layout vs v2 valid isq",
         baseline[:n_valid], v2[:n_valid], atol=0.0, rtol=0.0,
     )
-    _print_tensor("baseline gemm1 v2-layout fp8 output", baseline)
-    _print_tensor("v2 gemm1 sorted fp8 output", v2)
+    _print_tensor(f"baseline gemm1 v2-layout {stage2_adtype} output", baseline)
+    _print_tensor(f"v2 gemm1 sorted {stage2_adtype} output", v2)
 
 
 def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_nt,
                   epilog, persist, BN, k_wave, base_gemm1_params=None,
                   print_output=False):
+    stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
     if os.environ.get("AITER_FMOE_V2", "0") == "1":
         if base_gemm1_params is None:
             raise ValueError("base_gemm1_params is required when AITER_FMOE_V2=1")
@@ -617,7 +667,7 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
             inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
             n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
             BM=BM_S1, use_nt=gemm1_use_nt(E, topk, token, BM_S1), interleave=True,
-            a_dtype=d.get("adtype", "fp8"), out_dtype="fp8", act="silu", swiglu_limit=0.0,
+            a_dtype=d.get("adtype", "fp8"), out_dtype=stage2_adtype, act="silu", swiglu_limit=0.0,
             SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
             model_dim_pad=0, inter_dim_pad=0,
         )
@@ -645,7 +695,7 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
             topk=topk,
             BM=BM_S2,
             use_nt=use_nt,
-            a_dtype="fp8",
+            a_dtype=stage2_adtype,
             epilog=epilog,
             SBM=BM_S1,
             persist=persist,
