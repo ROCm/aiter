@@ -947,6 +947,9 @@ namespace aiter {
             }
         }
 
+        const float hc_scale0 = hc_scale[0];
+        const float hc_base_v = hc_base[lane_id % hc_mult];
+
         if (threadIdx.x < num_rows * hc_mult3) {
             int row_idx = threadIdx.x / hc_mult3;
             int hc_idx = threadIdx.x % hc_mult3;
@@ -969,7 +972,7 @@ namespace aiter {
             float pre_mix_shared_v;
             if (lane_id < num_rows * hc_mult) {
                 pre_mix_shared_v = s_hc_mult3[lane_id / hc_mult * hc_mult3 + lane_id % hc_mult];
-                pre_mix_shared_v = sigmoid(pre_mix_shared_v * hc_scale[0] + hc_base[lane_id % hc_mult]);
+                pre_mix_shared_v = sigmoid(pre_mix_shared_v * hc_scale0 + hc_base_v);
                 pre_mix_shared_v += hc_pre_eps;
             }
             static_assert(warp_size % (num_rows * hc_mult) == 0, "warp_size must be divisible by num_rows * hc_mult");
@@ -1768,6 +1771,10 @@ namespace aiter {
             }
         }
 
+        const int pre_res_hc_id = (threadIdx.x % (pre_thread_num / num_rows)) % hc_mult;
+        const float hc_scale0 = hc_scale[0];
+        const float hc_base_v = hc_base[pre_res_hc_id];
+
         if (threadIdx.x < num_rows * hc_mult3) {
             int row_idx = threadIdx.x / hc_mult3;
             int hc_idx = threadIdx.x % hc_mult3;
@@ -1807,7 +1814,7 @@ namespace aiter {
             float pre_mix_shared_v = 0.0f;
             if (res_row_id < m_oob) {
                 pre_mix_shared_v = s_hc_mult3[res_row_id * hc_mult3 + res_hc_id];
-                pre_mix_shared_v = sigmoid(pre_mix_shared_v * hc_scale[0] + hc_base[res_hc_id]);
+                pre_mix_shared_v = sigmoid(pre_mix_shared_v * hc_scale0 + hc_base_v);
                 pre_mix_shared_v += hc_pre_eps;
             }
             
