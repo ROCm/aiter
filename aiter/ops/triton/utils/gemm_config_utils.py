@@ -51,11 +51,18 @@ def _get_gemm_config_cached(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    backend: str | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
     ``get_gemm_config()`` instead, which returns a defensive deep-copy so
     callers can freely mutate the returned dict without polluting the cache.
+
+    When ``backend`` is given, configs are looked up in the per-backend
+    subdirectory ``gemm/<backend>/`` (e.g. ``gemm/gluon/``); if that backend
+    has no default config file, it falls back to the shared ``gemm/`` directory.
+    ``backend=None`` (the default) keeps the original ``gemm/`` behavior, so
+    existing callers are unaffected.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -71,13 +78,22 @@ def _get_gemm_config_cached(
         _get_gemm_config_cached._config_cache = {}
 
     dev = arch_info.get_arch()
-    cache_key = f"{dev}_{config_name}"
+    cache_key = f"{dev}_{config_name}" + (f"_{backend}" if backend else "")
+
+    # Per-backend config directory, falling back to the shared gemm/ dir if the
+    # backend has no default config file (e.g. triton uses the shared dir).
+    base_dir = f"{AITER_TRITON_CONFIGS_PATH}/gemm"
+    cfg_dir = base_dir
+    if backend is not None:
+        backend_dir = f"{base_dir}/{backend}"
+        if os.path.exists(f"{backend_dir}/{dev}-{config_name}.json"):
+            cfg_dir = backend_dir
 
     if cache_key not in _get_gemm_config_cached._config_cache:
         _get_gemm_config_cached._config_cache[cache_key] = {}
 
         # Load default config (must exist)
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
+        fpath = f"{cfg_dir}/{dev}-{config_name}.json"
         _load_config_file(
             _get_gemm_config_cached._config_cache,
             cache_key,
@@ -92,7 +108,7 @@ def _get_gemm_config_cached(
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
+            fpath = f"{cfg_dir}/{dev}-{config_name}-{specialized_filename}.json"
             if _load_config_file(
                 _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
             ):
@@ -104,9 +120,7 @@ def _get_gemm_config_cached(
         nk_key = f"{N}_{K}"
         if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
             # load specialized config
-            fpath = (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
-            )
+            fpath = f"{cfg_dir}/{dev}-{config_name}-N={N}-K={K}.json"
             if _load_config_file(
                 _get_gemm_config_cached._config_cache, cache_key, fpath, nk_key
             ):
@@ -146,6 +160,7 @@ def get_gemm_config(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    backend: str | None = None,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -172,7 +187,7 @@ def get_gemm_config(
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename
+        config_name, M, N, K, bounds, specialized_filename, backend
     )
     return copy.deepcopy(config), is_tuned
 
@@ -235,3 +250,58 @@ def compute_splitk_params(config: dict, K: int) -> dict:
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
     return config
+
+
+def _padded_size_32_4(n):
+    pad = (n >> 5) << 2
+    if (n & 31) == 0 and pad >= 4:
+        pad -= 4
+    return n + pad
+
+
+def _padded_size_pow2(n, interval, padding):
+    log2_i = (interval - 1).bit_length()
+    log2_p = (padding - 1).bit_length() if padding else 0
+    pad = (n >> log2_i) << log2_p
+    if n % interval == 0 and pad >= padding:
+        pad -= padding
+    return n + pad
+
+
+def _gemm_lds_bytes(
+    block_m, block_n, block_k, bits_a, bits_b, num_stages, use_async_padding
+):
+    elem_a = block_m * block_k
+    elem_b = block_k * block_n
+    if use_async_padding:
+        # Padded shared encoding + N buffers (matches TensorAtlas
+        # _estimate_triton_lds_async_copy / tritonBLAS origami).
+        pa = _padded_size_32_4(elem_a)
+        pb = _padded_size_32_4(elem_b)
+        if block_k & (block_k - 1) == 0:
+            pa = max(pa, _padded_size_pow2(elem_a, block_k, 8))
+        if block_n & (block_n - 1) == 0:
+            pb = max(pb, _padded_size_pow2(elem_b, block_n, 8))
+        return num_stages * (pa * bits_a + pb * bits_b) // 8
+    # Non-async: (N-1) extra buffer pairs beyond the active stage.
+    LDSA = elem_a * bits_a
+    LDSB = elem_b * bits_b
+    if num_stages <= 1:
+        return max(LDSA, LDSB) // 8
+    return (LDSA + LDSB) * (num_stages - 1) // 8
+
+
+def pick_gemm_num_stages(
+    arch, block_m, block_n, block_k, bits_a, bits_b, use_async_padding=False
+):
+    assert min(block_m, block_n, block_k, bits_a, bits_b) > 0
+    # bits_a / bits_b: element bit-widths (8 for fp8, 4 for mxfp4).
+    # use_async_padding: True when the kernel lowers to async direct-to-LDS
+    # with padded shared encoding (e.g. a4w4 on gfx950).
+    cap = arch_info._LDS_CAP_BYTES.get(arch)
+    if cap is None:
+        return 2
+    lds = _gemm_lds_bytes(
+        block_m, block_n, block_k, bits_a, bits_b, 2, use_async_padding
+    )
+    return 2 if lds <= cap else 1

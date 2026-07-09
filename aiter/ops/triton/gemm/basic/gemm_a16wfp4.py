@@ -12,8 +12,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16wfp4 import (
     _gemm_a16wfp4_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
-    _gemm_afp4wfp4_reduce_kernel,
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     get_splitk,
@@ -154,9 +154,10 @@ def gemm_a16wfp4_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_afp4wfp4_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -168,6 +169,10 @@ def gemm_a16wfp4_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
         )
 
     return y
@@ -333,9 +338,10 @@ def gemm_a16wfp4_preshuffle_(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_afp4wfp4_reduce_kernel[grid_reduce](
+        _gemm_splitk_reduce_kernel[grid_reduce](
             y_pp,
             y,
+            None,
             M,
             N,
             y_pp.stride(0),
@@ -347,6 +353,10 @@ def gemm_a16wfp4_preshuffle_(
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
             triton.next_power_of_2(config["NUM_KSPLIT"]),
+            ADD_BIAS=False,
+            activation="",
+            use_activation=False,
+            KERNEL_NAME="_gemm_afp4wfp4_reduce_kernel",
         )
 
     return y

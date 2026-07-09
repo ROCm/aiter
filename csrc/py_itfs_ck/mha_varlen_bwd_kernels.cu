@@ -164,6 +164,17 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         return workspace.data_ptr();
     };
 
+    // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
+    // The returned shared_ptr owns the at::Tensor; aiter holds it alive via a
+    // stream-tail hipLaunchHostFunc keepalive so the buffer is not recycled
+    // while async D2H/H2D copies are still in flight on the stream.
+    auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+        auto t = std::make_shared<at::Tensor>(torch::empty(
+            {static_cast<int64_t>(bytes)},
+            torch::TensorOptions().dtype(at::kByte).pinned_memory(true)));
+        return std::shared_ptr<void>(t, t->data_ptr());
+    };
+
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
         dk_expanded = torch::empty({total_k, num_heads, head_size_q}, opts);
@@ -396,7 +407,8 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 p_dropout,
                                 p_undrop,
                                 drop_seed_offset,
-                                workspace_alloc};
+                                workspace_alloc,
+                                pinned_host_alloc};
         }();
 
         float t = aiter::mha_bwd(args, stream_config);

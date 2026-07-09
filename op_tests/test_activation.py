@@ -220,7 +220,10 @@ def _ref_group_scales_fp4(x: torch.Tensor, group_size: int) -> torch.Tensor:
     xg = x.view(m, n // group_size, group_size).float()
     x_max = torch.amax(torch.abs(xg), dim=-1)
     x_max = torch.maximum(x_max, torch.full_like(x_max, 1e-10))
-    scale_e8m0 = fp4_utils.f32_to_e8m0(x_max * 0.25)
+    # NV ROUND_UP / DSv4 / FlashInfer default: scale = ceil_pow2(amax / 6)
+    # (matches HIP kernel ``aiter::fp4_f32_to_e8m0_scale`` and
+    # silu_and_mul_quant FP4 path).
+    scale_e8m0 = fp4_utils.fp4_f32_to_e8m0_scale(x_max)
     return scale_e8m0.view(torch.uint8)
 
 

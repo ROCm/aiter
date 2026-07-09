@@ -75,7 +75,7 @@ def test_deepgemm(
         w_scale,
     )
 
-    err = checkAllclose(out, ref_out, msg="")
+    err = checkAllclose(out, ref_out, msg="", catastrophic_check=True)
 
     tflops = masked_m.sum() * k * n * 2 / us / 1e6
     size_a = masked_m.sum() * k * x.element_size()

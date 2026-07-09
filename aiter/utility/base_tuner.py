@@ -152,7 +152,11 @@ class TunerCommon:
             "--errRatio",
             type=float,
             default=defaults["errRatio"],
-            help="tolerable error ratio, default 0.05.",
+            help="Tolerable error ratio (default 0.05). During tuning, kernels "
+            "with observed error above this are rejected. During --run_config, "
+            "the effective threshold per shape is max(this value, the observed "
+            "errRatio stored in the tuned CSV), so kernels that were tuned with "
+            "a larger observed error are not falsely flagged.",
         )
         self.parser.add_argument(
             "--batch",
@@ -368,6 +372,8 @@ class TunerCommon:
                 untunedf = untunedf[target_mask]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+                self.tunedf.insert(0, "gfx", gfx)
 
             untunedf_cols = self.untunedf.columns
             mask = (
@@ -387,6 +393,22 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
+        # Backfill columns present in the new results but missing from a legacy
+        # tuned CSV (for example a newly added gfx key column), so that the
+        # key construction and per-column assignment below do not KeyError
+        # during migration. gfx/cu_num default to the running device; any other
+        # missing column defaults to NA.
+        for col in df_updates.columns:
+            if col not in df_old.columns:
+                if col == "gfx":
+                    # Keep gfx as the leading key column (canonical layout)
+                    # rather than appending it at the end when migrating a
+                    # legacy CSV.
+                    df_old.insert(0, col, self.get_gfx())
+                elif col == "cu_num":
+                    df_old[col] = self.get_cu_num()
+                else:
+                    df_old[col] = pd.NA
         # Widen integer columns to object so that float/string updates don't
         # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
         # cannot accept a float like 2.61).
@@ -408,9 +430,11 @@ class TunerCommon:
             "_tmp_key"
         ].tolist()
         for key in matched_keys:
-            df_old.loc[df_old.index[df_old["_tmp_key"] == key][0]] = df_updates.loc[
-                df_updates["_tmp_key"] == key
-            ].values[0]
+            old_idx = df_old.index[df_old["_tmp_key"] == key][0]
+            update_row = df_updates.loc[df_updates["_tmp_key"] == key].iloc[0]
+            # Assign by column name so migrated legacy CSVs with newly inserted
+            # columns (for example gfx) do not corrupt rows by positional shift.
+            df_old.loc[old_idx, df_updates.columns] = update_row
         if unmatched_keys:
             unmatched_rows = df_updates[
                 df_updates["_tmp_key"].isin(unmatched_keys)
@@ -422,6 +446,10 @@ class TunerCommon:
 
     def sortResults(self, tune_file, issorted, values):
         tunedf = _read_csv(tune_file)
+        # Migrate legacy tuned files lacking a gfx column so the gfx-aware
+        # dedup/sort keys below do not KeyError; keep gfx as the leading column.
+        if "gfx" in self.keys and "gfx" not in tunedf.columns:
+            tunedf.insert(0, "gfx", self.get_gfx())
         if issorted:
             tunedf = tunedf.sort_values(by=values)
         dedup_keys = self.keys
@@ -618,6 +646,66 @@ class TunerCommon:
         if not status:
             return "UNKNOWN", ""
         return status.upper(), ""
+
+    # Margin added to CSV observed errRatio to absorb seed/run-to-run variance.
+    _ERR_RATIO_MARGIN = 0.05
+
+    def _get_run_config_err_ratio_limit(self, row, args):
+        """Return ``(threshold, desc)`` for run_config pass/fail.
+
+        Threshold = max(--errRatio, csv_observed_errRatio + margin).
+
+        Tuned CSVs store the observed error ratio at tuning time, which may
+        have been measured with a different random seed. Adding a small margin
+        (default 4%) absorbs the run-to-run variance so that run_config does
+        not falsely flag kernels whose error fluctuates slightly across seeds.
+        """
+        default_limit = float(
+            getattr(args, "errRatio", self.ARG_DEFAULTS.get("errRatio", 0.05))
+        )
+        default_desc = f"--errRatio={default_limit:.6g}"
+        if row is None or not hasattr(row, "get"):
+            return default_limit, default_desc
+
+        csv_label = None
+        csv_value = None
+        for column in ("errRatio", "err_ratio", "err"):
+            value = row.get(column, None)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if not pd.notna(value):
+                continue
+            try:
+                csv_value = float(value)
+            except (TypeError, ValueError):
+                continue
+            csv_label = f"csv {column}"
+            break
+
+        if csv_value is None:
+            stage_limits = []
+            for column in ("err1", "err2"):
+                value = row.get(column, None)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                if not pd.notna(value):
+                    continue
+                try:
+                    stage_limits.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            if stage_limits:
+                csv_value = max(stage_limits)
+                csv_label = "csv max(err1,err2)"
+
+        if csv_value is None:
+            return default_limit, default_desc
+
+        csv_with_margin = csv_value + self._ERR_RATIO_MARGIN
+        csv_part = f"{csv_label}={csv_value:.6g}+{self._ERR_RATIO_MARGIN:.0%}margin"
+        if csv_with_margin > default_limit:
+            return csv_with_margin, f"{csv_part}={csv_with_margin:.6g}"
+        return default_limit, f"{default_desc}, {csv_part} baseline"
 
     def _format_benchmark_keys(self, row):
         parts = []
@@ -1273,6 +1361,9 @@ class TunerCommon:
             tunedf = self.get_tuned_gemm_list(run_config_file)
             if not tunedf.empty and self.keys[0] in tunedf.columns:
                 cu = self.get_cu_num()
+                gfx = self.get_gfx()
+                if "gfx" in tunedf.columns:
+                    tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
@@ -1481,6 +1572,10 @@ class GemmCommonTuner(TunerCommon):
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            # Backfill gfx for legacy tuned CSVs so the key-based skip mask
+            # below does not KeyError when gfx is part of the tuner keys.
+            if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+                self.tunedf.insert(0, "gfx", self.get_gfx())
 
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
