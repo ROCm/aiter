@@ -51,7 +51,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    ptr_rsrc,
+    MOE_KERNARG_PRELOAD,
+    MOE_KERNARG_PRELOAD_COUNT,
+)
 
 BLOCK_THREADS = 256
 
@@ -315,7 +319,7 @@ def build_moe_gather_reduce_module(
 
     launch_moe_gather_reduce.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload": MOE_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
         },
     }
