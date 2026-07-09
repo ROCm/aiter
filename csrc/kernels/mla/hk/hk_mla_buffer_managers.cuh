@@ -1895,10 +1895,3 @@ class OManager32bitsV2
             data_1, out_br, v_offset_vram_st + kVramStOffsetDeltaInBytes, 0, kOffsetInBytes);
     }
 };
-
-// V40 sub-tile-of-8 swizzle [0,2,4,6,1,3,5,7] OManagers.
-//
-// For V40 the K and V LDS regions are written in a *permuted* col layout (sub-tile-of-8
-// perm on bits [5:3] of the col-element index) to dodge Site C ds_write_b128 bank
-// conflicts. The PV mfma therefore produces oaccu in that same permuted col order
-// (V's col axis == O's col axis). These V3 OManagers cover a full 64-col wave-tile

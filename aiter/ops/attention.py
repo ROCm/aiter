@@ -398,7 +398,8 @@ def pa_ps_fwd_asm(
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
 # dequant scales for Q/K/V (distinct from the per-token/per-block scale tensors
 # used by pa_ps_fwd_asm).  GPT-OSS style attention sink (per-Q-head fp32 logits
-# in the kernel's pre-scale raw-logit domain) is always read by the kernel.
+# in the SCALED-logit domain, exp(sink); kernel divides by s_eff internally) is
+# always read by the kernel.
 #
 # Memory-allocation policy: all GPU tensors are allocated on the Python side;
 # the C++ entry point performs only pointer + stride bookkeeping and the kernel
@@ -444,9 +445,9 @@ def pa_decode_bf16_asm(
     kv_indptr: torch.Tensor,
     gqa: int = 8,
     mtp: int = 0,
-    query_scale: float = 1.0,
-    key_scale: float = 1.0,
-    value_scale: float = 1.0,
+    query_scale: Optional[torch.Tensor] = None,
+    key_scale: Optional[torch.Tensor] = None,
+    value_scale: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     work_indptr: Optional[torch.Tensor] = None,
     work_info: Optional[torch.Tensor] = None,
@@ -461,13 +462,15 @@ def pa_decode_bf16_asm(
     Contract details:
       * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
       * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
-        scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
-        folded into `key_scale` before launch (the kernel forms
-        scl_log2e = query_scale * key_scale * log2e).
-      * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
-        pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
-        always reads this slot, so when `sink` is None a -inf buffer is
-        allocated, making the sink a numerical no-op.
+        scales as 1-element fp32 tensors (None means 1.0); the attention
+        `softmax_scale` (typically 1/sqrt(head_dim)) is
+        passed BY VALUE (kernarg 0x60) and the kernel forms
+        scl_log2e = query_scale * key_scale * softmax_scale * log2e.
+      * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
+        domain (exp(sink), Triton/GPT-OSS convention; the kernel divides by
+        s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
+        this slot, so when `sink` is None a -inf buffer is allocated, making the
+        sink a numerical no-op.
     """
     device = Q.device
     kv_head_num = K.shape[1]
@@ -476,12 +479,9 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    q_scale = torch.tensor([query_scale], dtype=torch.float32, device=device)
-    # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
-    k_scale = torch.tensor(
-        [key_scale * softmax_scale], dtype=torch.float32, device=device
-    )
-    v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
+    # query/key/value_scale are 1-element fp32 dequant scales, passed straight to
+    # the kernel. softmax_scale is passed BY VALUE (kernarg 0x60); the kernel
+    # applies it, so do NOT pre-fold it into key_scale.
 
     if sink is None:
         # The kernel is compiled sink-enabled (always reads + merges the sink
@@ -498,9 +498,10 @@ def pa_decode_bf16_asm(
         V,
         kv_indices,
         context_lens,
-        q_scale,
-        k_scale,
-        v_scale,
+        softmax_scale,
+        query_scale,
+        key_scale,
+        value_scale,
         out,
         qo_indptr,
         kv_indptr,

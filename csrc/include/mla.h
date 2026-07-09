@@ -3,11 +3,6 @@
 
 #pragma once
 
-// Torch-free header. Only the shared per-work / per-tile descriptors live here.
-// MLA function declarations (metadata / hk / reduce) are forward-declared
-// directly in their respective pybind TUs, so this header doesn't need to
-// preprocess <torch/all.h>.
-
 #include <cstddef>
 #include <cstdint>
 

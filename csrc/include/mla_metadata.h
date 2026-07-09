@@ -3,10 +3,6 @@
 
 #pragma once
 
-// Metadata entry points. The kernel TUs under csrc/kernels/mla/metadata/ still
-// use heavy torch host-side APIs (TensorOptions, from_blob, std::vector<Tensor>
-// returns, .to(CPU)), so this header keeps <torch/all.h>.
-
 #include <torch/all.h>
 
 enum class MlaVersion : int32_t
