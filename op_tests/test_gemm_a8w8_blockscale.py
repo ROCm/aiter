@@ -13,9 +13,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.utility import fp4_utils
 from einops import rearrange
 from einops import repeat as eirp
 
@@ -30,6 +32,10 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
+    if x_scale.dtype == dtypes.fp8_e8m0:
+        x_scale = fp4_utils.e8m0_to_f32(x_scale)
+    if w_scale.dtype == dtypes.fp8_e8m0:
+        w_scale = fp4_utils.e8m0_to_f32(w_scale)
     x = x.to(x_scale.dtype).view(
         m, k // block_shape[1], block_shape[1]
     ) * x_scale.unsqueeze(-1)
@@ -71,6 +77,15 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    use_flydsl_fp8_scale = get_gfx() == "gfx1250" and ck_preshuffle
+    if use_flydsl_fp8_scale:
+        FP8_E4M3_MAX = 448.0
+        x_scale = fp4_utils.f32_to_mx_e8m0_scale(
+            x_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+        )
+        w_scale = fp4_utils.f32_to_mx_e8m0_scale(
+            w_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+        )
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -86,16 +101,17 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(16, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+    if not use_flydsl_fp8_scale:
+        tag = "asm"
+        weight_asm = shuffle_weight(weight, layout=(16, 16))
+        c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+        err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
+        ret[f"{tag} us"] = avg_c
+        ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+        ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+        ret[f"{tag} err"] = err_asm
+        ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
