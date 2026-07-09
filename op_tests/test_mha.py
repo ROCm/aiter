@@ -10,6 +10,8 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mha import fmha_fwd_hd128_bf16_opus_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
@@ -1099,3 +1101,74 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     torch.testing.assert_close(
         d1, d2, msg="softmax_d differs with sink=None vs omitted"
     )
+
+
+# OPUS gfx950 dense D=128 via flash_attn_func. Cases span the gate (sq==sk):
+# le2 (<=128), pipelined odd/even, partial last tile (n%64), large n; MHA/GQA/MQA.
+_OPUS_CASES = [
+    (2, 64, 8, 2),  # le2 1-tile, GQA
+    (2, 128, 16, 1),  # le2 2-tile, MQA
+    (2, 100, 8, 2),  # partial last tile, GQA
+    (2, 127, 8, 8),  # partial last tile, MHA
+    (2, 129, 32, 8),  # pipelined odd (3 tiles), GQA
+    (1, 200, 16, 16),  # pipelined, MHA
+    (2, 256, 8, 1),  # pipelined even, MQA
+    (2, 512, 8, 2),  # pipelined even, GQA
+    (1, 1000, 8, 8),  # partial large, MHA
+    (2, 1023, 16, 4),  # partial odd, GQA
+    (1, 4096, 8, 2),  # large, GQA
+    (4, 256, 8, 8),  # larger batch, MHA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen,nheads,nheads_k",
+    _OPUS_CASES,
+    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_CASES],
+)
+def test_flash_attn_func_opus(
+    batch_size, seqlen, nheads, nheads_k, causal, monkeypatch
+):
+    """Validate the OPUS D=128 kernel THROUGH flash_attn_func.
+
+    Opus engages only with AITER_ENABLE_FMHA_OPUS=1 + the gate (gfx950, bf16,
+    D=128, dense, sq==sk, inference/no-LSE). The env is monkeypatched scoped to
+    this test so the other cases keep exercising the default v3/CK dispatch.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+
+    torch.manual_seed(0)
+    d = 128
+    q = torch.randn(batch_size, seqlen, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+
+    with torch.no_grad():
+        out = aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=None,  # -> default 1/sqrt(d), matches attention_ref
+            causal=causal,
+            window_size=(-1, -1),
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    out_ref, _ = run_torch(q, k, v, causal=causal)
+    out_pt, _ = run_torch(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    print(f"[opus] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
+    assert (out - out_ref).abs().max().item() <= out_tol
+
+    with torch.no_grad():
+        out_opus = fmha_fwd_hd128_bf16_opus_fwd(
+            q, k, v, softmax_scale=d**-0.5, causal=causal
+        )
+    assert torch.equal(
+        out, out_opus
+    ), "flash_attn_func did not route to the opus kernel (env/gate not engaged)"

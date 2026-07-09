@@ -38,9 +38,9 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
-    _ptr_view_safe,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,

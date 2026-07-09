@@ -9,7 +9,7 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith
+from flydsl.expr import arith, ptrtoint
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -17,6 +17,8 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
+
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
 
 BLOCK_THREADS = 256
 
@@ -26,10 +28,10 @@ def build_moe_route_maps_module():
 
     @flyc.kernel(name="moe_route_maps")
     def route_maps_kernel(
-        topk_ids: fx.Tensor,  # (numel,) int32
-        atomic_buffer: fx.Tensor,  # (E,) int32, init 0
-        topids_to_rows: fx.Tensor,  # (numel,) int32 out: route -> grouped row
-        rows_to_tokens: fx.Tensor,  # (E*max_m,) int32 out: grouped row -> token
+        topk_ids: fx.Pointer,  # (numel,) int32
+        atomic_buffer: fx.Pointer,  # (E,) int32, init 0
+        topids_to_rows: fx.Pointer,  # (numel,) int32 out: route -> grouped row
+        rows_to_tokens: fx.Pointer,  # (E*max_m,) int32 out: grouped row -> token
         numel: Int32,
         topk: Int32,
         max_m: Int32,
@@ -41,13 +43,13 @@ def build_moe_route_maps_module():
         in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if = scf.IfOp(in_range)
         with ir.InsertionPoint(_if.then_block):
-            topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
-            c_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
-            a_rsrc = buffer_ops.create_buffer_resource(rows_to_tokens, max_size=True)
+            topk_rsrc = ptr_rsrc(topk_ids)
+            c_rsrc = ptr_rsrc(topids_to_rows)
+            a_rsrc = ptr_rsrc(rows_to_tokens)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
 
-            base_idx = buffer_ops.extract_base_index(atomic_buffer, address_space=1)
+            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
             e_idx = arith.index_cast(T.index, e)
             addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
             ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
@@ -70,10 +72,10 @@ def build_moe_route_maps_module():
 
     @flyc.jit
     def launch_route_maps(
-        topk_ids: fx.Tensor,
-        atomic_buffer: fx.Tensor,
-        topids_to_rows: fx.Tensor,
-        rows_to_tokens: fx.Tensor,
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        rows_to_tokens: fx.Pointer,
         numel: fx.Int32,
         topk: fx.Int32,
         max_m: fx.Int32,
@@ -85,14 +87,21 @@ def build_moe_route_maps_module():
             pass
 
         gx = arith.index_cast(T.index, grid_blocks)
-        route_maps_kernel(
+        launch = route_maps_kernel(
             topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m
-        ).launch(
+        )
+        launch.launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
+    launch_route_maps.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
     return launch_route_maps
 
 
@@ -101,9 +110,9 @@ def build_moe_topids_to_rows_module():
 
     @flyc.kernel(name="moe_route")
     def route_kernel(
-        topk_ids: fx.Tensor,
-        atomic_buffer: fx.Tensor,
-        topids_to_rows: fx.Tensor,
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
         numel: Int32,
         max_m: Int32,
     ):
@@ -114,11 +123,11 @@ def build_moe_topids_to_rows_module():
         in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if = scf.IfOp(in_range)
         with ir.InsertionPoint(_if.then_block):
-            topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
-            out_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
+            topk_rsrc = ptr_rsrc(topk_ids)
+            out_rsrc = ptr_rsrc(topids_to_rows)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
-            base_idx = buffer_ops.extract_base_index(atomic_buffer, address_space=1)
+            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
             e_idx = arith.index_cast(T.index, e)
             addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
             ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
@@ -137,19 +146,26 @@ def build_moe_topids_to_rows_module():
 
     @flyc.jit
     def launch_topids_to_rows(
-        topk_ids: fx.Tensor,
-        atomic_buffer: fx.Tensor,
-        topids_to_rows: fx.Tensor,
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
         numel: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         gx = arith.index_cast(T.index, grid_blocks)
-        route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m).launch(
+        launch = route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m)
+        launch.launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
+    launch_topids_to_rows.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
     return launch_topids_to_rows
