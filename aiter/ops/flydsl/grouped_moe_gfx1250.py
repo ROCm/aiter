@@ -17,9 +17,11 @@ import torch
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
+
 _GROUPED_CONFIG_CACHE = {}
 _WARNED_NAIVE_EPILOGUE = False
 # Cache the contiguous uint8 view of static MoE weights so a non-contiguous
@@ -1223,10 +1225,10 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     launch = _get_compiled_contiguous_psum()
     launch(
-        masked_m_i32,
-        starts,
-        psum,
-        contiguous_m_t,
+        ptr_arg(masked_m_i32),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(contiguous_m_t),
         experts,
         int(tile_m),
         stream=torch.cuda.current_stream(),
@@ -1251,11 +1253,11 @@ def contiguous_psum_remap(
     topids_flat = topids_to_rows.reshape(-1)
     launch = _get_compiled_contiguous_psum_remap()
     launch(
-        masked_m_i32,
-        topids_flat,
-        starts,
-        psum,
-        contiguous_m_t,
+        ptr_arg(masked_m_i32),
+        ptr_arg(topids_flat),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(contiguous_m_t),
         int(topids_flat.numel()),
         experts,
         int(route_max_m),
@@ -1277,10 +1279,10 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
     grid_blocks = (numel + 255) // 256
     launch = _get_compiled_route_maps()
     launch(
-        topk_ids_i32,
-        atomic_buffer,
-        topids_to_rows,
-        rows_to_tokens,
+        ptr_arg(topk_ids_i32),
+        ptr_arg(atomic_buffer),
+        ptr_arg(topids_to_rows),
+        ptr_arg(rows_to_tokens),
         numel,
         topk,
         max_m,
@@ -1324,10 +1326,10 @@ def flydsl_moe_gather_reduce(
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     launch(
-        grouped_out_flat,
-        topids_to_rows,
-        gather_w,
-        out,
+        ptr_arg(grouped_out_flat),
+        ptr_arg(topids_to_rows),
+        ptr_arg(gather_w),
+        ptr_arg(out),
         token_num,
         slice_stride_dw,
         stream=torch.cuda.current_stream(),
@@ -1368,9 +1370,9 @@ def flydsl_moe_scatter_copy_token(
         grouped_a1 = torch.zeros((E, max_m, Wp), dtype=torch.uint8, device=device)
     launch_p = _get_compiled_scatter_copy(Wp)
     launch_p(
-        a1_payload.contiguous().view(-1, Wp),
-        grouped_a1.view(num_dst, Wp),
-        rows_to_tokens,
+        ptr_arg(a1_payload.contiguous().view(-1, Wp)),
+        ptr_arg(grouped_a1.view(num_dst, Wp)),
+        ptr_arg(rows_to_tokens),
         num_dst,
         stream=torch.cuda.current_stream(),
     )
@@ -1381,9 +1383,9 @@ def flydsl_moe_scatter_copy_token(
             a1_scale_raw = torch.zeros((E, max_m, Ws), dtype=torch.uint8, device=device)
         launch_s = _get_compiled_scatter_copy(Ws)
         launch_s(
-            a1_scale_token_u8.contiguous().view(-1, Ws),
-            a1_scale_raw.view(num_dst, Ws),
-            rows_to_tokens,
+            ptr_arg(a1_scale_token_u8.contiguous().view(-1, Ws)),
+            ptr_arg(a1_scale_raw.view(num_dst, Ws)),
+            ptr_arg(rows_to_tokens),
             num_dst,
             stream=torch.cuda.current_stream(),
         )
@@ -1435,9 +1437,9 @@ def flydsl_moe_scatter_preshuffle_scale(
         Ws, wmma_rep, scale_k_per_tile, True
     )
     launch(
-        a1_scale_token_u8.contiguous().view(-1, Ws),
-        grouped_a1_scale.view(E * (max_m // wmma_rep), Ws * wmma_rep),
-        rows_to_tokens,
+        ptr_arg(a1_scale_token_u8.contiguous().view(-1, Ws)),
+        ptr_arg(grouped_a1_scale.view(E * (max_m // wmma_rep), Ws * wmma_rep)),
+        ptr_arg(rows_to_tokens),
         max_m,
         E,
         tiles_per_expert,
@@ -1473,8 +1475,8 @@ def flydsl_moe_preshuffle_scale(
         Ws, wmma_rep, scale_k_per_tile, False
     )
     launch(
-        scale_grouped_u8.contiguous().view(E * max_m, Ws),
-        out.view(E * (max_m // wmma_rep), Ws * wmma_rep),
+        ptr_arg(scale_grouped_u8.contiguous().view(E * max_m, Ws)),
+        ptr_arg(out.view(E * (max_m // wmma_rep), Ws * wmma_rep)),
         max_m,
         E,
         tiles_per_expert,

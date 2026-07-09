@@ -58,7 +58,9 @@ AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
 if AITER_REBUILD >= 1:
-    subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
+    # Wipe the build dir without a shell: BUILD_DIR is recreated just below.
+    # Avoids shell interpolation of BUILD_DIR (derived from AITER_ROOT_DIR env).
+    shutil.rmtree(BUILD_DIR, ignore_errors=True)
 
 if not os.path.exists(BUILD_DIR):
     os.makedirs(BUILD_DIR, exist_ok=True)
@@ -236,8 +238,9 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}",
-            shell=True,
+            ["make", "build", f"-j{len(sources)}"],
+            cwd=sub_build_dir,
+            shell=False,
             capture_output=AITER_LOG_MORE < 2,
             check=True,
         )

@@ -46,8 +46,10 @@ from aiter import (
 
 BLOCK_SIZE_M = 32
 
-# Default to Opus unless CK sorting is explicitly requested.
+# Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
+# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
+_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -176,6 +178,56 @@ def _moe_sorting_impl(
     return ret
 
 
+def _flydsl_moe_sorting(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+    accumulate=True,
+):
+    """FlyDSL sorting dispatch — called outside torch_compile_guard."""
+    from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
+
+    device = topk_ids.device
+    M, topk = topk_ids.shape
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    # moe_buf shape mirrors _moe_sorting_impl: full [M, model_dim] when stage2
+    # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
+    # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
+    # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
+    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    if (expert_mask is not None) or accumulate:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+
+    flydsl_moe_sorting_fwd(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        int(block_size),
+        expert_mask,
+        num_local_tokens,
+    )
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
+
 def moe_sorting(
     topk_ids,
     topk_weights,
@@ -190,6 +242,25 @@ def moe_sorting(
     accumulate=True,
     flat=False,
 ):
+    if (
+        not _USE_CK_MOE_SORTING
+        and _USE_FLYDSL_MOE_SORTING
+        and is_flydsl_available()
+        and not return_local_topk_ids
+        and not flat
+        and dispatch_policy == 0
+    ):
+        return _flydsl_moe_sorting(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+            accumulate=accumulate,
+        )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
         return _moe_prepare_unsorted_input(
@@ -711,13 +782,18 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            a1_scale = mxfp4_moe_sort_fwd(
-                a1_scale,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                cols=model_dim,
-            )
+            # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
+            # dynamic-quantized to MXFP4 inside the kernel, so there is no host
+            # activation e8m0 scale to pack. Only the (not-yet-enabled) non-flat
+            # pre-quantized fp4 path carries a host scale that needs sorting.
+            if not xbf16:
+                a1_scale = mxfp4_moe_sort_fwd(
+                    a1_scale,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    cols=model_dim,
+                )
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
 
@@ -1142,39 +1218,6 @@ def get_2stage_cfgs(
 
         return primary, fallback
 
-    _flydsl_fallback_cache = {}
-
-    def get_flydsl_fallback_cfgs(tune_file):
-        """Return fallback configs (rows tagged ``flydsl_fallback``)."""
-        if tune_file in _flydsl_fallback_cache:
-            return _flydsl_fallback_cache[tune_file]
-        import pandas as pd
-
-        if not os.path.exists(tune_file):
-            _flydsl_fallback_cache[tune_file] = {}
-            return {}
-        df = pd.read_csv(tune_file)
-        df = _ensure_gfx_column(df)
-        if "_tag" not in df.columns:
-            _flydsl_fallback_cache[tune_file] = {}
-            return {}
-        if "act_type" in df.columns:
-            df["act_type"] = _ACT_TYPE_DISABLED_KEY
-        fb_df = df[df["_tag"] == "flydsl_fallback"]
-        if fb_df.empty:
-            _flydsl_fallback_cache[tune_file] = {}
-            return {}
-        dup_mask = fb_df.duplicated(subset=_INDEX_COLS, keep="first")
-        if dup_mask.any():
-            logger.warning(
-                f"[fused_moe] duplicate fallback rows after disabling act_type in {tune_file}; "
-                f"keeping first match for {int(dup_mask.sum())} rows"
-            )
-            fb_df = fb_df.loc[~dup_mask]
-        result = fb_df.set_index(_INDEX_COLS).to_dict("index")
-        _flydsl_fallback_cache[tune_file] = result
-        return result
-
     global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
@@ -1289,25 +1332,6 @@ def get_2stage_cfgs(
                 cfg = None
                 logger.warning(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
-                    "using default heuristics"
-                )
-    if cfg is not None and not is_flydsl_available():
-        kn1 = str(cfg.get("kernelName1", ""))
-        kn2 = str(cfg.get("kernelName2", ""))
-        if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
-            fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
-            fallback = fallback_cfgs.get(keys, None) or fallback_cfgs.get(
-                keys_disabled, None
-            )
-            if fallback is not None:
-                cfg = fallback
-                logger.info(
-                    f"[fused_moe] flydsl unavailable, using fallback config for {keys}"
-                )
-            else:
-                cfg = None
-                logger.warning(
-                    f"[fused_moe] flydsl unavailable and no fallback for {keys}, "
                     "using default heuristics"
                 )
 
@@ -2026,8 +2050,16 @@ def fused_moe_2stages(
         block_m=block_size_M,
         a1_scale=a1_scale,
         w1_scale=(
+            # Only reinterpret genuinely-packed (e8m0 / 1-byte) weight scales as
+            # fp8_e8m0. PR #3811 broadened this guard from fp4-only to all fp8 to
+            # add mxfp8 (per_1x32, e8m0 scale) support, but that also caught
+            # per_Token fp8 whose scale is fp32 -- reinterpreting fp32 bytes as
+            # e8m0 makes the host stride (eGUQs = stride(0)*sizeof(float)) 4x too
+            # large -> asm _pf stage1 reads weight scales OOB -> MEMORY_VIOLATION.
             w1_scale.view(dtypes.fp8_e8m0)
             if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
+            and w1_scale is not None
+            and w1_scale.element_size() == 1
             else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
@@ -2128,8 +2160,13 @@ def fused_moe_2stages(
         moe_out,
         topk,
         w2_scale=(
+            # See stage1 w1_scale note: only reinterpret packed (e8m0) scales;
+            # per_Token fp8 uses an fp32 scale and must be passed through as-is
+            # (PR #3811 regression fix).
             w2_scale.view(dtypes.fp8_e8m0)
             if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
+            and w2_scale is not None
+            and w2_scale.element_size() == 1
             else w2_scale
         ),
         a2_scale=a2_scale,
