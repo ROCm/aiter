@@ -462,6 +462,68 @@ def test_sage_int8_q_smooth(
     )
 
 
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 256)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_int8_q_smooth_and_hadamard(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    INT8 Sage with q_smooth and hadamard_rotation enabled together.
+
+    Reference baseline is bf16 ``attention_ref`` (same as ``test_sage``).
+    """
+    HEAD_SZ = 128
+    BLOCK_R = 128
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        q_smooth=True,
+        hadamard_rotation=True,
+        BLOCK_R=BLOCK_R,
+    )
+
+    torch_out = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    assert torch_out.shape == triton_out.shape
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
 @pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
