@@ -6,14 +6,7 @@
 Covers out[b] = dequant(x[b]) @ dequant(w[b]).T across two variants and two layouts:
   - variants: a4w4 (MXFP4 A x MXFP4 B), a8w4 (MXFP8 E4M3 A x MXFP4 B)
   - layouts:  bmn ([B,M,*] A/C), mbn ([M,B,*] A/C, deepseek-v4 grouped-output)
-
-Usage:
-    python aiter/ops/flydsl/test_flydsl_batched_gemm_mxfp4.py
-    python aiter/ops/flydsl/test_flydsl_batched_gemm_mxfp4.py --variant a8w4 --layout mbn
 """
-
-import argparse
-import sys
 
 import pytest
 import torch
@@ -90,8 +83,7 @@ def _run(variant, layout, B, M, N, K, dtype):
         tile_k=256,
     )
     assert out.shape == (B, M, N)
-    # Reordered MFMA reduction vs torch.bmm drifts a few low bits; accept <5% element
-    # mismatch at rtol/atol=1e-2 (aiter checkAllclose convention).
+    # Reordered MFMA reduction vs torch.bmm drifts a few low bits; accept <5% mismatch at 1e-2.
     err = checkAllclose(
         ref.float(),
         out.float(),
@@ -112,27 +104,3 @@ def test_flydsl_batched_gemm_mxfp4(variant, layout, B, M, N, K, dtype):
         pytest.skip(f"FlyDSL MXFP preshuffle GEMM requires gfx950, got {get_gfx()}")
     torch.cuda.empty_cache()
     _run(variant, layout, B, M, N, K, dtype)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="FlyDSL batched MXFP GEMM test")
-    parser.add_argument("--variant", choices=["a4w4", "a8w4", "all"], default="all")
-    parser.add_argument("--layout", choices=["bmn", "mbn", "all"], default="all")
-    args = parser.parse_args()
-    if get_gfx() != "gfx950":
-        print(f"[skip] requires gfx950, got {get_gfx()}")
-        return
-    variants = ["a4w4", "a8w4"] if args.variant == "all" else [args.variant]
-    layouts = ["bmn", "mbn"] if args.layout == "all" else [args.layout]
-    for variant in variants:
-        for layout in layouts:
-            for dtype in (torch.bfloat16, torch.float16):
-                for B, M, N, K in SHAPES:
-                    err = _run(variant, layout, B, M, N, K, dtype)
-                    print(
-                        f"[pass] {variant} {layout} {str(dtype):16} B={B} M={M} N={N} K={K} mismatch={err:.4f}"
-                    )
-
-
-if __name__ == "__main__":
-    sys.exit(main())

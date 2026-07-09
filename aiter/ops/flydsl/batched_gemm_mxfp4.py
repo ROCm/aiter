@@ -1,24 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Strided-batched MXFP4/MXFP6/MXFP8 preshuffle GEMM, ported from FlyDSL.
-
-out[b] = dequant(x[b]) @ dequant(w[b]).T  (per-1x32 e8m0 scales folded into a scaled
-16x16x128 MFMA). gfx950 only. The batch index rides grid.z; weights and e8m0 scales are
-CK-preshuffled host-side (aiter shuffle_weight / shuffle_scale) before launch.
-
-Two batched layouts for the A input and C output (weights stay batch-contiguous):
-  - bmn: contiguous [B, M, *] / [B, M, N] (plain per-batch).
-  - mbn: physical [M, B, *] / [M, B, N], the deepseek-v4 grouped-output path. The
-    interleaving + explicit kernel strides are handled here; callers pass logical
-    [B, M, *] data either way and get a logical [B, M, N] result. NOTE: the mbn result
-    is a non-contiguous view (physically [M, B, N]) — call .contiguous() before ops
-    that require contiguity.
-"""
+"""Strided-batched MXFP4/MXFP6/MXFP8 preshuffle GEMM (gfx950): out[b] = dequant(x[b]) @
+dequant(w[b]).T, per-1x32 e8m0 scales folded into a scaled 16x16x128 MFMA. Callers pass
+logical [B,M,*] data; layout 'bmn' = contiguous [B,M,N], 'mbn' = the deepseek-v4
+grouped-output [M,B,N] (returned as a non-contiguous [B,M,N] view)."""
 
 from __future__ import annotations
-
-import functools
 
 import torch
 
@@ -34,32 +22,9 @@ SCALE_GROUP_SIZE = 32
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
 
 
-@functools.lru_cache(maxsize=None)
-def _get_launcher(
-    N, K, tile_m, tile_n, tile_k, a_dtype, out_dtype, use_async_copy, batch, M, strides
-):
-    # M is part of the cache key (not passed to compile): flyc.compile bakes tensor
-    # sizes, so each M needs its own launcher -> its own _run_compiled cache slot.
-    del M
-    return compile_mxfp4_gemm(
-        N=N,
-        K=K,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        a_dtype=a_dtype,
-        out_dtype=out_dtype,
-        use_async_copy=use_async_copy,
-        batch=batch,
-        **dict(strides),
-    )
-
-
 def _shuffled_operands(x, w, x_scales, w_scales, B, M, K):
-    """Per-batch preshuffle: A codes plain (real M rows), B + both scales CK-shuffled via
-    aiter shuffle_weight / shuffle_scale (A-scales padded to M/32; shuffle_scale over-pads
-    rows to 256, so slice back to the real length). Returns lists (a, sa) and the
-    concatenated (B_flat, SB_flat)."""
+    """Per-batch preshuffle: A codes plain, B + both scales CK-shuffled (A-scales padded to
+    M/32, then sliced back). Returns per-batch lists (a, sa) + concatenated (B_flat, SB_flat)."""
     M32 = (M + 31) // 32 * 32
     a_list, sa_list, b_list, sb_list = [], [], [], []
     for b in range(B):
@@ -90,14 +55,12 @@ def flydsl_batched_gemm_mxfp4(
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 256,
-    use_async_copy: bool = False,
 ) -> torch.Tensor:
     """Strided-batched MXFP A x MXFP4 B preshuffle GEMM (gfx950).
 
     a_dtype='fp4' (a4w4): x is (B, M, K//2) uint8 fp4 codes (2 codes/byte).
     a_dtype='fp8' (a8w4): x is (B, M, K) uint8 MXFP8 E4M3 codes (1 byte/code).
-    a_dtype='fp6' (a6w4): x is (B, M, K) uint8 FP8-padded MXFP6 E2M3 codes; the kernel
-        supports it but this entry point is NOT exercised by the test suite (unvalidated).
+    a_dtype='fp6' (a6w4): x is (B, M, K) uint8 FP8-padded MXFP6 E2M3 codes (unvalidated here).
     w:        (B, N, K//2) uint8 fp4 codes (plain [N, K//2], shuffled host-side).
     x_scales: (B, M, K//32) uint8 e8m0; w_scales: (B, N, K//32) uint8 e8m0.
     layout='bmn' -> [B,M,*] A/C; 'mbn' -> [M,B,*] A/C (deepseek grouped-output). The mbn
@@ -119,8 +82,7 @@ def flydsl_batched_gemm_mxfp4(
     N = w.shape[1]
     K = x_scales.shape[-1] * SCALE_GROUP_SIZE
 
-    # tile_m % 16 (m_chunks = BM//16) and tile_n % 64 (num_acc_n = (BN//4)//16) must be
-    # exact or the kernel's chunk counts truncate and silently drop work.
+    # tile_m % 16 / tile_n % 64 must be exact or the kernel's chunk counts silently drop work.
     if tile_m % 16 != 0:
         raise RuntimeError(f"[FlyDSL] tile_m ({tile_m}) must be a multiple of 16")
     if tile_n % 64 != 0:
@@ -176,18 +138,18 @@ def flydsl_batched_gemm_mxfp4(
     bias = torch.empty(0, dtype=dtype, device=x.device)
     stream = torch.cuda.current_stream()
 
-    launcher = _get_launcher(
-        N,
-        K,
-        tile_m,
-        tile_n,
-        tile_k,
-        a_dtype,
-        out_dtype,
-        use_async_copy,
-        B,
-        M,
-        tuple(sorted(strides.items())),
+    # compile_mxfp4_gemm is lru_cached (M-independent: the kernel takes M as a runtime
+    # arg); _run_compiled caches the flyc.compile of the launcher on first use.
+    launcher = compile_mxfp4_gemm(
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        out_dtype=out_dtype,
+        batch=B,
+        **strides,
     )
     _run_compiled(
         launcher, (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
