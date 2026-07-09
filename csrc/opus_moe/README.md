@@ -19,30 +19,15 @@ The `a8w4_decode_k5` metadata family is retained only as a small bring-up
 coverage set for the generalized codegen path; it is not part of the tuned DSV4
 production target set.
 
-Private BF16 route-reduce kernel source is retained for future bring-up, but it
-is not exposed through `fused_moe` or a Python user API in this PR.
+Private BF16/A16W16 stage2 source is retained for future bring-up, but current
+JIT generation does not emit BF16 launchers/TUs and no Python user API exposes it.
 
 ## Kernel Surfaces
 
 ### Private BF16 Stage2 Source
 
-The private BF16 source takes:
-
-- `inter_states [token, topk, inter_dim]`, BF16.
-- `w2 [expert, hidden, inter_dim]`, BF16.
-- CK/Opus MoE sorting metadata: `sorted_token_ids`, `sorted_expert_ids`,
-  `num_valid_ids`, and optional `sorted_weights`.
-- `route_out [token * topk, hidden]`, BF16 scratch.
-- `out [token, hidden]`, BF16 final output.
-
-It writes token-slot route output first, then runs a separate token/topk reduce.
-
-Private BF16 kernel id:
-
-| kid | name | contract |
-|---:|---|---|
-| `-1` | auto | Select current gfx950 BF16 stage2 kid. |
-| `1` | `bf16_gemmstyle256x256x64_token_slot_route_out_no_oob_nfast` | `256 routes x 256 hidden x 64 K`, route-output then reduce, no padded/OOB route rows. |
+The BF16/A16W16 source remains under `include/gfx950/a16w16/` for future bring-up,
+but it is not generated, compiled, or exposed by the current JIT path.
 
 ### A8W4 Decode Stage2
 
@@ -77,16 +62,13 @@ routing.
 |---:|---|---|---|
 | `-1` | auto | selected by host shape/block rules | direct-atomic only |
 | `2000` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2` | `BM16 x BN64`, `sort_block_m=16` | direct atomic; tuner candidate only for `token <= 1024` |
-| `2001` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn2560` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2002` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3008` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2003` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2004` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3136` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2005` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3200` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2006` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3264` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2007` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3328` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2008` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3456` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2009` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2010` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64` | `BM64 x BN256`, `sort_block_m=64` | BF16 route output, then reduce; source retained for explicit use, disabled from tuner because it is not competitive for K3 targets |
+| `2001` | `opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ4_rbn2240` | `BM32 x BN256`, `sort_block_m=32` | MXFP8 route output, tuner candidate for `512 <= token <= 4096` |
+| `2002` | `opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ5_rbn2304` | `BM32 x BN256`, `sort_block_m=32` | MXFP8 route output, tuner candidate for `512 <= token <= 4096` |
+| `2003` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, tuner candidate for `token >= 128` |
+| `2004` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, tuner candidate for `token >= 128` |
+| `2005` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64` | `BM64 x BN256`, `sort_block_m=64` | BF16 route output, then reduce; tuner candidate for `token >= 4096` |
+| `2006` | `opus_moe2_afp8_wfp4_atomic_t16x128x256_sbm16_occ2_cache_b3_ws2` | `BM16 x BN128`, `sort_block_m=16` | direct atomic; tuner candidate only for `token <= 16` |
+| `2007` | `opus_moe2_afp8_wfp4_atomic_t16x128x256_sbm16_occ3_cache_b3_ws2` | `BM16 x BN128`, `sort_block_m=16` | direct atomic; tuner candidate only for `4 <= token <= 16` |
 | `2100` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_occ6_cache_b2_ws2_k5` | `BM16 x BN64`, `sort_block_m=16` | K5 direct atomic bring-up |
 | `2101` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2_k5` | `BM16 x BN64`, `sort_block_m=16` | K5 direct atomic bring-up |
 | `2110` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_k5` | `BM64 x BN256`, `sort_block_m=64` | K5 BF16 route output, then reduce |
@@ -123,9 +105,9 @@ Host and shared code:
 
 gfx950 code:
 
-- `include/gfx950/opus_moe_arch_gfx950.cuh`: gfx950 launch wrappers and BF16
-  generated manifest dispatch.
-- `include/gfx950/opus_moe_stage2_route_output_reduce_gfx950.cuh`: shared
+- `include/gfx950/opus_moe_arch_gfx950.cuh`: gfx950 launch wrappers,
+  route-reduce dispatch, and generated A8W4 manifest dispatch.
+- `include/gfx950/opus_moe_stage2_route_output_reduce_kernel_gfx950.cuh`: shared
   token/topk route-output reduction.
 - `include/gfx950/opus_moe_stage2_utils_gfx950.cuh`: small gfx950 device
   helpers, including BF16 packing/conversion helpers.
@@ -148,17 +130,14 @@ Python/JIT code:
   reduce wrapper.
 - `aiter/ops/opus/moe_stage2_a8w4_fused_adapter.py`: fused MoE CSV parsing and
   stage2 wrapper glue for A8W4.
-- `gen_instances.py`: JIT-time private BF16 and A8W4 manifest generator.
-- `opus_moe_common.py`: private BF16 metadata plus the A8W4 metadata bridge for
-  manifest codegen.
+- `gen_instances.py`: JIT-time A8W4 manifest/instance generator.
+- `opus_moe_common.py`: A8W4 metadata bridge for csrc manifest codegen.
 
 ## Tuning and Dispatch
 
-`gen_instances.py` emits `opus_moe_stage2_manifest.h` and
-`opus_moe_stage2_a8w4_manifest.h` into the JIT build blob. The first generated
-header is consumed by private BF16 dispatch source; the second is consumed by
-the A8W4 dispatch wrapper for
-`kid -> OpusMoeStage2A8W4DecodeShape -> launcher` cases.
+`gen_instances.py` emits `opus_moe_stage2_a8w4_manifest.h` and per-kid A8W4
+host/device TUs into the JIT build blob. The manifest is consumed by the A8W4
+dispatch wrapper for `kid -> OpusMoeStage2A8W4DecodeShape -> launcher` cases.
 
 A8W4 production selection should be done through the fused MoE tuned
 configuration by adding `opus_...` stage2 kernel names only for measured cases
@@ -173,8 +152,7 @@ dumps should stay outside the repository.
 ## Current Limits
 
 - gfx950 only.
-- Private BF16 source assumes no padded/OOB route rows if it is re-enabled in a
-  future change.
+- Private BF16/A16W16 stage2 source is retained but not generated or exposed.
 - A8W4 production tuning currently targets the `a8w4_decode_k3` family:
   `logical_inter_dim=512`, `inter_dim_pad=128`, effective inter dim `384`,
   and runtime `topk`, `hidden`, and `experts`.

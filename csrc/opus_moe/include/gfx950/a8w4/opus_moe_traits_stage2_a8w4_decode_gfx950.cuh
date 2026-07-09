@@ -3,7 +3,15 @@
 #pragma once
 
 #include "../../opus_moe_common.cuh"
+
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
 #include "opus/opus.hpp"
+#endif
+
+namespace opus_moe
+{
+constexpr int kStage2A8W4DecodeGfx950WarpSize = 64;
+}
 
 template<typename Contract = opus_moe::OpusMoeStage2A8W4DefaultContract,
          int BlockM = opus_moe::kStage2A8W4DecodeDefaultBlockM,
@@ -49,9 +57,9 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int MMA_M = opus_moe::kStage2A8W4DecodeMfmaM;
     static constexpr int MMA_N = opus_moe::kStage2A8W4DecodeMfmaN;
     static constexpr int MMA_K = opus_moe::kStage2A8W4DecodeMfmaK;
-    static constexpr int THREADS_K = opus::get_warp_size() / MMA_M;
+    static constexpr int THREADS_K = opus_moe::kStage2A8W4DecodeGfx950WarpSize / MMA_M;
     static constexpr int T_M = IS_BM32_BN256 ? 2 : 1;
-    static constexpr int T_N = (BLOCK_SIZE / opus::get_warp_size()) / T_M;
+    static constexpr int T_N = (BLOCK_SIZE / opus_moe::kStage2A8W4DecodeGfx950WarpSize) / T_M;
 
     static constexpr int DECODE_LOGICAL_INTER_DIM = Contract::DECODE_LOGICAL_INTER_DIM;
     static constexpr int DECODE_INTER_DIM_PAD = Contract::DECODE_INTER_DIM_PAD;
@@ -61,7 +69,7 @@ struct OpusMoeStage2A8W4DecodeShape
     // route_out XCD swizzle (gfx950=8 XCDs).
     static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : 8;
     static constexpr int SWIZZLE_W = 2;
-    static constexpr int SWIZZLE_C = 0;
+    static constexpr int SWIZZLE_C = (!DIRECT_ATOMIC_OUT && IS_BM64_BN256) ? 32 : 0;
     static constexpr bool DECODE_PACE_ROUTE_BLOCKS_TO_POW2 = PaceRouteBlocksToPow2;
     static constexpr int K_TILES = DECODE_EFFECTIVE_INTER_DIM / K_STEP_PACKED;
     static constexpr int A_LDS_STAGES = K_TILES, A_LDS_STAGE_ELEMS = B_M * K_STEP_PACKED;
@@ -85,13 +93,15 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int C_LDS_N = B_N, VEC_C = opus_moe::kStage2A8W4DecodeCVec;
     static constexpr int ELEM_PER_ATOMIC = opus_moe::kStage2A8W4DecodeCValuesPerAtomic;
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
     using D_ACC = opus::fp32_t;
     using D_MFMA_A = opus::fp8_t;
     using D_MFMA_B = opus::fp4_t;
+#endif
 
     static_assert(BYTES_PER_VEC == opus_moe::kStage2A8W4DecodeVectorBytes);
     static_assert(VEC_A * static_cast<int>(sizeof(D_A)) == BYTES_PER_VEC);
-    static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N);
+    static_assert(BLOCK_SIZE / opus_moe::kStage2A8W4DecodeGfx950WarpSize == T_M * T_N);
     static_assert(THREADS_K == K_STEP_PACKED / (2 * VEC_A));
     static_assert(THREADS_K == K_STEP_PACKED / (2 * B_BYTES_PER_VEC));
     static_assert(DECODE_LOGICAL_INTER_DIM % opus_moe::kStage2A8W4DecodeFp4ValuesPerByte == 0);

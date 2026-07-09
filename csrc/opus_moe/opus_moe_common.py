@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import sys
 import importlib.util
-from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -54,33 +53,6 @@ OPUS_A8W4_OUT_MODE_ATOMIC = _a8w4_meta.OPUS_A8W4_OUT_MODE_ATOMIC
 OpusA8W4Stage2Instance = _a8w4_meta.OpusA8W4Stage2Instance
 opus_a8w4_decode_kid = _a8w4_meta.opus_a8w4_decode_kid
 opus_a8w4_shape_family_for_shape = _a8w4_meta.opus_a8w4_shape_family_for_shape
-
-
-@dataclass(frozen=True)
-class OpusMoeStage2Instance:
-    kid: int
-    name: str
-    trait: str
-    block_m: int
-    block_n: int
-    block_k: int
-    dtype: str = "bf16"
-    a2_layout: str = "token_major"
-    output_mode: str = "token_slot_route_output_reduce"
-    launcher: str = "opus_moe_stage2_gemmstyle_launch_gfx950"
-
-
-STAGE2_BF16_KERNELS = {
-    1: OpusMoeStage2Instance(
-        1,
-        "bf16_gemmstyle256x256x64_token_slot_route_out_no_oob_nfast",
-        "OpusMoeStage2Bf16GemmStyle256x256x64TokenSlotRouteOutNoOobNFast",
-        block_m=256,
-        block_n=256,
-        block_k=64,
-        output_mode="token_slot_route_output_reduce",
-    ),
-}
 
 STAGE2_A8W4_KERNELS: dict[int, OpusA8W4Stage2Instance] = dict(OPUS_A8W4_STAGE2_BY_KID)
 STAGE2_A8W4_TUNER_KERNELS: dict[int, OpusA8W4Stage2Instance] = {

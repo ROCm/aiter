@@ -27,6 +27,8 @@ OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC5_RBN2304 = 2002
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072 = 2003
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584 = 2004
 OPUS_A8W4_KID_K3_ROUTE_BF16_BM64_FULL_N7168 = 2005
+OPUS_A8W4_KID_K3_ATOMIC_BM16_BN128_OCC2_B3_WS2 = 2006
+OPUS_A8W4_KID_K3_ATOMIC_BM16_BN128_OCC3_B3_WS2 = 2007
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_OCC6_B2_WS2 = 2100
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_B3_WS2 = 2101
 OPUS_A8W4_KID_K5_ROUTE_BF16_BM64_FULL_N7168 = 2110
@@ -376,6 +378,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         block_m=64,
         sort_block_m=64,
         route_reduce="rbn3072",
+        min_tuner_token=128,
         shape_family=_K3,
         mode_default=True,
     ),
@@ -386,6 +389,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         block_m=64,
         sort_block_m=64,
         route_reduce="rbn3584",
+        min_tuner_token=128,
         shape_family=_K3,
     ),
     _route_stage2_instance(
@@ -398,6 +402,33 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         min_tuner_token=4096,
         shape_family=_K3,
         mode_default=True,
+    ),
+    _atomic_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ATOMIC_BM16_BN128_OCC2_B3_WS2,
+        name="opus_moe2_afp8_wfp4_atomic_t16x128x256_sbm16_occ2_cache_b3_ws2",
+        block_m=16,
+        block_n=128,
+        sort_block_m=16,
+        block_threads=128,
+        min_blocks_per_cu=2,
+        cachectl_b=3,
+        cachectl_wscale=2,
+        max_tuner_token=16,
+        shape_family=_K3,
+    ),
+    _atomic_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ATOMIC_BM16_BN128_OCC3_B3_WS2,
+        name="opus_moe2_afp8_wfp4_atomic_t16x128x256_sbm16_occ3_cache_b3_ws2",
+        block_m=16,
+        block_n=128,
+        sort_block_m=16,
+        block_threads=128,
+        min_blocks_per_cu=3,
+        cachectl_b=3,
+        cachectl_wscale=2,
+        min_tuner_token=4,
+        max_tuner_token=16,
+        shape_family=_K3,
     ),
 )
 
