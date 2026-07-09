@@ -340,14 +340,17 @@ def _compile_preshuffle_to_cache(
         xcd_swizzle=xcd_swizzle,
         lds_stage=lds_stage,
     )
+    # The layout-API launcher uses fx.Tensor args (it builds views via
+    # fx.get_iter/make_view), so pass flat torch tensors directly rather
+    # than raw pointers (pointer args would fail GetIterOp type checks).
     _compile_executable_to_cache(
         exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(scale_a),
-        _ptr_view_safe(scale_b),
-        _ptr_view_safe(bias),
+        out,
+        a,
+        b,
+        scale_a,
+        scale_b,
+        bias,
         m,
         n,
         stream,
