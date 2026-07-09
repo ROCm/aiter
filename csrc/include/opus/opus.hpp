@@ -284,22 +284,20 @@ struct const_subbyte_reference {
 } // namespace impl
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// array, enhanced C like array style.
-// A single 2-parameter definition serves both plain and sub-byte "pack" element types (selected via
-// is_packs_v, no extra template parameter): for a pack type it stores a ceil(N*bits/8)-byte buffer and
-// operator[] hands out a proxy; otherwise it is a plain value_type content[N]. array_layout picks the
-// storage element/count lazily so T::storage is only referenced for packs.
+// array, enhanced C like array style. One 2-parameter definition for both plain and sub-byte "pack"
+// element types (selected via is_packs_v): a pack stores a ceil(N*bits/8)-byte buffer with proxy access,
+// else a plain value_type[N]. array_storage picks the storage type/count lazily (T::storage only for packs).
 namespace impl {
-template<typename V, index_t N, bool = is_packs_v<V>> struct array_layout { using elem = V; static constexpr index_t count = N; };
-template<typename V, index_t N> struct array_layout<V, N, true> { using elem = typename V::storage; static constexpr index_t count = packed_bytes_v<V, N>; };
+template<typename V, index_t N, bool = is_packs_v<V>> struct array_storage { using type = V; static constexpr index_t count = N; };
+template<typename V, index_t N> struct array_storage<V, N, true> { using type = typename V::storage; static constexpr index_t count = packed_bytes_v<V, N>; };
 }
 template <typename T, index_t N>
 struct array {
     using value_type = remove_cvref_t<T>;
     using type = array<value_type, N>;
     static constexpr bool is_packed = is_packs_v<value_type>;
-    using storage = typename impl::array_layout<value_type, N>::elem;              // value_type, or the pack's byte storage
-    static constexpr index_t nstore = impl::array_layout<value_type, N>::count;    // N, or the packed byte count
+    using storage = typename impl::array_storage<value_type, N>::type;             // value_type, or the pack's byte storage
+    static constexpr index_t nstore = impl::array_storage<value_type, N>::count;   // N, or the packed byte count
     using reference       = std::conditional_t<is_packed, impl::subbyte_reference<value_type>, value_type&>;
     using const_reference = std::conditional_t<is_packed, impl::const_subbyte_reference<value_type>, const value_type&>;
 
