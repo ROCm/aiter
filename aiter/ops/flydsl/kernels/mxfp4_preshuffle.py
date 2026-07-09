@@ -5,15 +5,13 @@
 a scaled 16x16x128 fx.gemm; A streams global->LDS via double-buffered async DMA. Layout
 matches CK ``shuffle_weight_w4(.,16)`` + ``shuffle_scale_w4``."""
 
-import functools
-from typing import Optional
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import fly
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     BFloat16,
+    Constexpr,
     Float4E2M1FN,
     Float6E2M3FN,
     Float8E4M3FN,
@@ -59,53 +57,61 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves):
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
-@functools.lru_cache(maxsize=None)
-def compile_mxfp4_gemm(
-    *,
-    N: int,
-    K: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    a_dtype: str = "fp4",
-    out_dtype: str = "bf16",
-    waves_per_eu: Optional[int] = None,
-    batch: int = 1,
-    a_row_stride: Optional[int] = None,
-    a_batch_stride: Optional[int] = None,
-    sca_row_stride: Optional[int] = None,
-    sca_batch_stride: Optional[int] = None,
-    c_row_stride: Optional[int] = None,
-    c_batch_stride: Optional[int] = None,
+@flyc.jit
+def launch_gemm(
+    arg_c: fx.Tensor,
+    arg_a: fx.Tensor,
+    arg_b: fx.Tensor,
+    arg_scale_a: fx.Tensor,
+    arg_scale_b: fx.Tensor,
+    arg_bias: fx.Tensor,
+    i32_m: fx.Int32,
+    i32_n: fx.Int32,
+    stream: fx.Stream,
+    N: Constexpr[int],
+    K: Constexpr[int],
+    tile_m: Constexpr[int],
+    tile_n: Constexpr[int],
+    tile_k: Constexpr[int],
+    a_dtype: Constexpr[str],
+    out_dtype: Constexpr[str],
+    batch: Constexpr[int],
+    a_row_stride: Constexpr[int],
+    a_batch_stride: Constexpr[int],
+    sca_row_stride: Constexpr[int],
+    sca_batch_stride: Constexpr[int],
+    c_row_stride: Constexpr[int],
+    c_batch_stride: Constexpr[int],
+    waves_per_eu: Constexpr[int],
 ):
-    """Compile -> fn(C, A, B, scale_a, scale_b, bias, M, N, stream). a_dtype fp4/fp6/fp8 A x
-    CK-preshuffled MXFP4 B, e8m0 scales, bias unused. batch>1 = strided-batched over grid.z.
-    The a_/sca_/c_ row/batch strides make A/scale_a/C addressing caller-controlled (None =
-    contiguous [B,M,*] bmn default); all set = the [M,B,*] mbn (deepseek grouped) layout."""
-    if a_dtype not in _A_ELEM:
-        raise ValueError(f"a_dtype must be one of {sorted(_A_ELEM)}; got {a_dtype!r}")
+    """Direct @flyc.jit launcher (flyc caches per Constexpr config; call it directly, no
+    builder). a_dtype fp4/fp6/fp8 A x CK-preshuffled MXFP4 B, e8m0 scales, bias unused.
+    batch>1 = strided-batched over grid.z. The a_/sca_/c_ row/batch strides make A/scale_a/C
+    addressing caller-controlled; each <0 keeps the contiguous [B,M,*] bmn default, all set =
+    the [M,B,*] mbn (deepseek grouped) layout. waves_per_eu<=0 = unset."""
+    from flydsl.compiler.kernel_function import CompilationContext
+
+    CompilationContext.get_current()
+
     BM, BN, BK = tile_m, tile_n, tile_k
-    if BK not in (128, 256) or K % BK != 0:
-        raise ValueError(f"tile_k must be 128 or 256 dividing K; got tile_k={BK}, K={K}")
-    if K % 256 != 0:
-        raise ValueError(f"K must be a multiple of 256 (e8m0 scale chunk); got K={K}")
-    out_elem = BFloat16 if out_dtype == "bf16" else Float16
+    if const_expr(out_dtype == "bf16"):
+        out_elem = BFloat16
+    else:
+        out_elem = Float16
 
     # Row sizes + read_a fragment layout (i32 units): fp6/fp8 read two b128 halves -> i32[A_NDW], fp4 one -> i32[4].
-    if a_dtype == "fp8":
-        a_row_bytes, A_ROW_B = K, BK
-        A_GK_I32, A_KH_I32, A_HI_OFF, A_NDW = 4, 32, 16, 8
-    elif a_dtype == "fp6":
-        a_row_bytes, A_ROW_B = K, BK
-        A_GK_I32, A_KH_I32, A_HI_OFF, A_NDW = 8, 32, 4, 6
-    else:  # fp4: 2 codes/byte
+    if const_expr(a_dtype == "fp4"):  # 2 codes/byte
         a_row_bytes, A_ROW_B = K // 2, BK // 2
-        A_GK_I32, A_KH_I32 = 4, 16
+        A_GK_I32, A_KH_I32, A_HI_OFF, A_NDW = 4, 16, 0, 4
+    else:
+        a_row_bytes, A_ROW_B = K, BK
+        if const_expr(a_dtype == "fp8"):
+            A_GK_I32, A_KH_I32, A_HI_OFF, A_NDW = 4, 32, 16, 8
+        else:  # fp6
+            A_GK_I32, A_KH_I32, A_HI_OFF, A_NDW = 8, 32, 4, 6
 
-    # Cooperative LDS A tile (row-major [m][col]), shared by the 4 N-waves.
-    A_LDS_B = BM * A_ROW_B  # bytes per LDS A buffer
+    A_LDS_B = BM * A_ROW_B  # LDS A buffer bytes (row-major [m][col], shared by 4 N-waves)
     A_ROW_I32 = A_ROW_B // 4
-
     K_HALF = K // 2
     KH4 = K_HALF // 4
     K_TILES = K // BK
@@ -116,14 +122,16 @@ def compile_mxfp4_gemm(
     num_acc_n = (BN // 4) // 16  # 16-col n-subblocks per wave
     _scale_chunk_dw = (K // 32 // 4 // 2) * 64  # e8m0 stride (dwords), per shuffle_scale_w4
     _scale_k0_dw = 64
-
     n_coop = A_LDS_B // 256 // 16  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
 
     # Scheduler counts per loop iter: MFMAs, A LDS reads/thread (fp6/fp8 2 per (mi,kh)), gmem loads.
     sched_mfma_total = k_halves * m_chunks * num_acc_n
-    a_ds_per = 2 if a_dtype in ("fp6", "fp8") else 1
+    if const_expr(a_dtype == "fp4"):
+        a_ds_per = 1
+    else:
+        a_ds_per = 2
     sched_num_ds_load = m_chunks * k_halves * a_ds_per
     sched_num_gmem = n_coop + num_acc_n * k_halves + m_pairs + n_pairs
 
@@ -157,17 +165,17 @@ def compile_mxfp4_gemm(
         # Strided-batched: shift each base to batch bid_z (A/scale_a via explicit strides or
         # the contiguous default; B/scale_b stay batch-contiguous). batch==1 emits no batch math.
         if const_expr(batch > 1):
-            a_rstride = fx.Int32(a_row_bytes if a_row_stride is None else a_row_stride)
+            a_rstride = fx.Int32(a_row_bytes if a_row_stride < 0 else a_row_stride)
             sca_rstride = fx.Int32(
-                _scale_chunk_dw if sca_row_stride is None else sca_row_stride
+                _scale_chunk_dw if sca_row_stride < 0 else sca_row_stride
             )
             bz = fx.Int64(bid_z)
-            if const_expr(a_batch_stride is None):
+            if const_expr(a_batch_stride < 0):
                 arg_a = fx.Int64(arg_a) + bz * (fx.Int64(i32_m) * fx.Int64(a_row_bytes))
             else:
                 arg_a = fx.Int64(arg_a) + bz * fx.Int64(a_batch_stride)
             arg_b = fx.Int64(arg_b) + bz * fx.Int64(N * (K // 2))
-            if const_expr(sca_batch_stride is None):
+            if const_expr(sca_batch_stride < 0):
                 sc_bstride = (
                     fx.Int64((i32_m + fx.Int32(31)) // fx.Int32(32))
                     * fx.Int64(_scale_chunk_dw)
@@ -185,7 +193,7 @@ def compile_mxfp4_gemm(
 
         # A source view, bound to the last valid M row (ragged M OOB -> 0).
         _i8g = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=16)
-        if const_expr(batch > 1 and a_row_stride is not None):
+        if const_expr(batch > 1 and a_row_stride >= 0):
             a_nrec = fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(a_rstride) + fx.Int64(
                 a_row_bytes
             )
@@ -281,7 +289,7 @@ def compile_mxfp4_gemm(
         _i32g = fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4)
         _sc_layout = fx.make_layout(1 << 28, 1)
         _a_sc_chunks = (i32_m + fx.Int32(31)) // fx.Int32(32)
-        if const_expr(batch > 1 and sca_row_stride is not None):
+        if const_expr(batch > 1 and sca_row_stride >= 0):
             a_sc_nrec = (
                 fx.Int64(_a_sc_chunks - fx.Int32(1)) * fx.Int64(sca_rstride)
                 + fx.Int64(_scale_chunk_dw)
@@ -439,8 +447,8 @@ def compile_mxfp4_gemm(
 
         # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row m*16+(l//16)*4+ii, col
         # base+l%16), c_stride apart; c_flat bounds ragged-M OOB and honors c_row/batch_stride.
-        c_stride = N if c_row_stride is None else c_row_stride
-        if const_expr(c_row_stride is None):
+        c_stride = N if c_row_stride < 0 else c_row_stride
+        if const_expr(c_row_stride < 0):
             c_nrec = fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
         else:
             c_nrec = (
@@ -450,7 +458,7 @@ def compile_mxfp4_gemm(
         if const_expr(batch > 1):
             c_bstride = (
                 fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
-                if c_batch_stride is None
+                if c_batch_stride < 0
                 else fx.Int64(c_batch_stride)
             )
             c_addr = c_addr + fx.Int64(bid_z) * c_bstride
@@ -483,41 +491,27 @@ def compile_mxfp4_gemm(
                     off = (row_m + fx.Int32(ii)) * c_rstride + col
                     fx.copy(c_copy, cf, c_flat[None, off])
 
-    @flyc.jit
-    def launch_gemm(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
-        arg_bias: fx.Tensor,
-        i32_m: fx.Int32,
-        i32_n: fx.Int32,
-        stream: fx.Stream,
-    ):
-        from flydsl.compiler.kernel_function import CompilationContext
-
-        CompilationContext.get_current()
-        a_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_a)))
-        b_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_b)))
-        sa_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_scale_a)))
-        sb_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_scale_b)))
-        M_max = 65536
-        arg_c_2d = fx.Tensor(
-            fx.make_view(fx.get_iter(arg_c), fx.make_layout((M_max, N), (N, 1)))
-        )
-        gx = (i32_m + (BM - 1)) // BM
-        gy = i32_n // BN
-        kernel_gemm(
-            arg_c_2d,
-            a_addr,
-            b_addr,
-            sa_addr,
-            sb_addr,
-            arg_bias,
-            i32_m,
-            i32_n,
-            value_attrs={"rocdl.waves_per_eu": waves_per_eu},
-        ).launch(grid=(gx, gy, batch), block=(256, 1, 1), stream=stream)
-
-    return launch_gemm
+    a_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_a)))
+    b_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_b)))
+    sa_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_scale_a)))
+    sb_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_scale_b)))
+    if const_expr(waves_per_eu > 0):
+        wpe = waves_per_eu
+    else:
+        wpe = None
+    arg_c_2d = fx.Tensor(
+        fx.make_view(fx.get_iter(arg_c), fx.make_layout((65536, N), (N, 1)))
+    )
+    gx = (i32_m + (BM - 1)) // BM
+    gy = i32_n // BN
+    kernel_gemm(
+        arg_c_2d,
+        a_addr,
+        b_addr,
+        sa_addr,
+        sb_addr,
+        arg_bias,
+        i32_m,
+        i32_n,
+        value_attrs={"rocdl.waves_per_eu": wpe},
+    ).launch(grid=(gx, gy, batch), block=(256, 1, 1), stream=stream)

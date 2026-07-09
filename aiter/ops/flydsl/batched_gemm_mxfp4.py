@@ -8,18 +8,31 @@ grouped-output [M,B,N] (returned as a non-contiguous [B,M,N] view)."""
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
-from .kernels.mxfp4_preshuffle import compile_mxfp4_gemm
-from .moe_kernels import _run_compiled
+from .kernels.mxfp4_preshuffle import launch_gemm
 
 SCALE_GROUP_SIZE = 32
 
 # a_dtype -> A bytes per code (fp4 = 2 codes/byte; fp6/fp8 = 1 byte/code).
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
+
+# Per-config compiled launch_gemm. Calling the @flyc.jit directly rebuilds the arg cache key
+# every launch (~6x the CPU overhead); flyc.compile once + cf(*runtime) reuses the compiled
+# artifact (config baked from the Constexpr args), matching the old _run_compiled fast path.
+_COMPILED: dict = {}
+
+
+def _compiled_for(cfg, example):
+    cf = _COMPILED.get(cfg)
+    if cf is None:
+        cf = flyc.compile(launch_gemm, *example, *cfg)
+        _COMPILED[cfg] = cf
+    return cf
 
 
 def _shuffled_operands(x, w, x_scales, w_scales, B, M, K):
@@ -138,22 +151,17 @@ def flydsl_batched_gemm_mxfp4(
     bias = torch.empty(0, dtype=dtype, device=x.device)
     stream = torch.cuda.current_stream()
 
-    # compile_mxfp4_gemm is lru_cached (M-independent: the kernel takes M as a runtime
-    # arg); _run_compiled caches the flyc.compile of the launcher on first use.
-    launcher = compile_mxfp4_gemm(
-        N=N,
-        K=K,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        a_dtype=a_dtype,
-        out_dtype=out_dtype,
-        batch=B,
-        **strides,
+    # Constexpr config for launch_gemm (M rides i32_m at runtime, not baked; strides <0 = the
+    # contiguous bmn default). Compiled once per cfg, then dispatched via cf(*runtime).
+    s = strides
+    cfg = (
+        N, K, tile_m, tile_n, tile_k, a_dtype, out_dtype, B,
+        s.get("a_row_stride", -1), s.get("a_batch_stride", -1),
+        s.get("sca_row_stride", -1), s.get("sca_batch_stride", -1),
+        s.get("c_row_stride", -1), s.get("c_batch_stride", -1), 0,
     )
-    _run_compiled(
-        launcher, (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
-    )
+    runtime = (C_flat, A_flat, B_flat, SA_flat, SB_flat, bias, M, N, stream)
+    _compiled_for(cfg, runtime)(*runtime)
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
