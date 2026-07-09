@@ -37,9 +37,9 @@ enum class WarpTypeM16x8 : uint8_t
 // + PV GEMM + epilogue, with online-softmax rescale across K-tile iters).
 #if defined(__gfx950__)
 template <WarpTypeM16x8 kWarpType, typename T>
-__device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV40DecodeFwdParams<T>
-                                                                          params,
-                                                                          const uint32_t warp_idx)
+__device__ void
+mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV40DecodeFwdParams<T> params,
+                                                         const uint32_t warp_idx)
 {
     using q_nope_t  = T::q_nope_t;
     using q_rope_t  = T::q_rope_t;
@@ -60,7 +60,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     constexpr bool kPvAtEnd = (kWarpType == WarpTypeM16x8::LoNoPEWarp);
 
     // Run softmax WITHOUT packed-ALU (v_pk_*) ops if false
-    constexpr bool kSoftmaxUsePk = kPvAtEnd;
+    constexpr bool kSoftmaxUsePk      = kPvAtEnd;
     constexpr bool kFinalRescaleUsePk = (kPvAtEnd == false);
 
     constexpr comp_t log2e = 1.4426950408889634;
@@ -86,21 +86,21 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     // Register layout single source of truth (see HkMlaV40Regs at file scope).
     // Re-alias the constants/ranges locally so the body below keeps its existing
     // k_* / *_ranges names; both orchestrators + every stage bind the same regs.
-    using R = HkMlaV40Regs<T>;
-    constexpr uint32_t mfma_tile_sz   = R::mfma_tile_sz;
-    constexpr uint32_t k_o_begin      = R::k_o_begin;
-    constexpr uint32_t k_o_end        = R::k_o_end;
-    constexpr uint32_t k_p_comp_begin = R::k_p_comp_begin;
-    constexpr uint32_t k_p_comp_end   = R::k_p_comp_end;
-    constexpr uint32_t k_p_mfma_begin = R::k_p_mfma_begin;
-    constexpr uint32_t k_p_mfma_end   = R::k_p_mfma_end;
-    constexpr uint32_t k_v0_begin     = R::k_v0_begin;
-    constexpr uint32_t k_v0_end       = R::k_v0_end;
-    constexpr uint32_t k_q_vgpr_begin = R::k_q_vgpr_begin;
-    constexpr uint32_t k_q_vgpr_end   = R::k_q_vgpr_end;
-    constexpr uint32_t k_k0_begin     = R::k_k0_begin;
-    constexpr uint32_t k_k1_begin     = R::k_k1_begin;
-    constexpr uint32_t k_k2_begin     = R::k_k2_begin;
+    using R                            = HkMlaV40Regs<T>;
+    constexpr uint32_t mfma_tile_sz    = R::mfma_tile_sz;
+    constexpr uint32_t k_o_begin       = R::k_o_begin;
+    constexpr uint32_t k_o_end         = R::k_o_end;
+    constexpr uint32_t k_p_comp_begin  = R::k_p_comp_begin;
+    constexpr uint32_t k_p_comp_end    = R::k_p_comp_end;
+    constexpr uint32_t k_p_mfma_begin  = R::k_p_mfma_begin;
+    constexpr uint32_t k_p_mfma_end    = R::k_p_mfma_end;
+    constexpr uint32_t k_v0_begin      = R::k_v0_begin;
+    constexpr uint32_t k_v0_end        = R::k_v0_end;
+    constexpr uint32_t k_q_vgpr_begin  = R::k_q_vgpr_begin;
+    constexpr uint32_t k_q_vgpr_end    = R::k_q_vgpr_end;
+    constexpr uint32_t k_k0_begin      = R::k_k0_begin;
+    constexpr uint32_t k_k1_begin      = R::k_k1_begin;
+    constexpr uint32_t k_k2_begin      = R::k_k2_begin;
     constexpr uint32_t k_q_lds_1_begin = R::k_q_lds_1_begin;
     constexpr uint32_t k_q_lds_0_begin = R::k_q_lds_0_begin;
     constexpr uint32_t k_q_lds_begin   = R::k_q_lds_begin;
@@ -220,8 +220,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     // Sub-tile B raw-fp8 staging (kBlockN=64): 32 rows x 512 packed bytes = 16 KB.
     constexpr uint32_t kSzLdsStage =
         (T::kBlockN == 64) ? (32u * static_cast<uint32_t>(T::kQkPackedNopeBytes)) : 0u;
-    static_assert(kSzLdsQ + kSzLdsKv + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv) + kSzLdsStage
-                      <= 160u * 1024u,
+    static_assert(kSzLdsQ + kSzLdsKv + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv) + kSzLdsStage <=
+                      160u * 1024u,
                   "V4.0 LDS budget exceeds 160 KB at kOccupancy=1.");
     // QManager pre-subtracts up to kLdsHeadPadBytes from p_lds_q in
     // p1_vmem_to_staging_chunk. Placing Q after both KV pongs gives that
@@ -231,9 +231,9 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                   "KV pongs must precede Q LDS with enough bytes to absorb the "
                   "QManager P1 pre-subtract.");
 
-    uintptr_t p_lds_kv_curr = reinterpret_cast<uintptr_t>(p_lds);
-    uintptr_t p_lds_kv_next = p_lds_kv_curr + kSzLdsKv;
-    const uintptr_t p_lds_q = p_lds_kv_next + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv);
+    uintptr_t p_lds_kv_curr        = reinterpret_cast<uintptr_t>(p_lds);
+    uintptr_t p_lds_kv_next        = p_lds_kv_curr + kSzLdsKv;
+    const uintptr_t p_lds_q        = p_lds_kv_next + (kSzLdsO > kSzLdsKv ? kSzLdsO : kSzLdsKv);
     const uintptr_t p_lds_kv_stage = p_lds_q + kSzLdsQ; // B raw-fp8 staging
 
     // ---- Work loop ----
@@ -353,13 +353,13 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         //   band_off = this warp's band token offset (0/16/32/48)
         //   sub_off  = its 32-row sub-tile's LDS base offset (A=0, B=kSubPong)
         // -> ONE resolved KV row per lane (no A/B pair).
-        const int32_t   band_off = static_cast<int32_t>((warp_idx & 3u) * 16u);
-        const uintptr_t sub_off  = static_cast<uintptr_t>(((warp_idx >> 1) & 1u)) * kSubPong;
+        const int32_t band_off  = static_cast<int32_t>((warp_idx & 3u) * 16u);
+        const uintptr_t sub_off = static_cast<uintptr_t>(((warp_idx >> 1) & 1u)) * kSubPong;
 
         // Tile 0's band rows go to the prologue; the next 64-tile's band rows seed the
         // first lambda call. `row_kv_ld_next_next` is a one-deep carry.
-        const int32_t row_kv_ld_first     = resolve_row_kv_ld(kv_start + band_off);
-        int32_t row_kv_ld_next_next       = resolve_row_kv_ld(kv_start + T::kBlockN + band_off);
+        const int32_t row_kv_ld_first = resolve_row_kv_ld(kv_start + band_off);
+        int32_t row_kv_ld_next_next   = resolve_row_kv_ld(kv_start + T::kBlockN + band_off);
 
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
@@ -387,10 +387,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             __builtin_amdgcn_sched_barrier(0);
             constexpr uint32_t q_rope_0_base = k_q_vgpr_begin + 14u * 4u; // 120
             constexpr uint32_t q_rope_1_base = k_q_vgpr_begin + 15u * 4u; // 124
-            using q_rope_0_range = hkdart::split_many_t<
-                hkdart::type_list<hkdart::range<q_rope_0_base, q_rope_0_base + 3u>>, 4>;
+            using q_rope_0_range             = hkdart::split_many_t<
+                hkdart::type_list<hkdart::range<q_rope_0_base, q_rope_0_base + 3u>>,
+                4>;
             using q_rope_1_range = hkdart::split_many_t<
-                hkdart::type_list<hkdart::range<q_rope_1_base, q_rope_1_base + 3u>>, 4>;
+                hkdart::type_list<hkdart::range<q_rope_1_base, q_rope_1_base + 3u>>,
+                4>;
             hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_rope_0_range>
                 q_rope_0;
             hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_rope_1_range>
@@ -407,9 +409,11 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // KV tile into its sub-tile base (curr + sub_off). One boundary check on the
         // band's own rows (row_kv_ld_first == -1 when the whole band is past kv_len).
         // kCheckBoundary=true always (cold path).
-        kv_manager.template async_load_k<true, kIsRopeWarp>(
-            p_lds_kv_curr + sub_off, warp_idx, params.p_kv_buffer, params.p_kv_buffer_rope,
-            row_kv_ld_first);
+        kv_manager.template async_load_k<true, kIsRopeWarp>(p_lds_kv_curr + sub_off,
+                                                            warp_idx,
+                                                            params.p_kv_buffer,
+                                                            params.p_kv_buffer_rope,
+                                                            row_kv_ld_first);
 
         // ---- mla_main lambda (Phase 4g) ----
         //
@@ -439,8 +443,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // Deferred PV: a PV of the PREVIOUS tile runs at call start (block
             // after Phase A) for every Lo call with a not-yet-PV'd prior tile --
             // all but the warp's first compute call and the fully-idle skip call.
-            constexpr bool kHasPv = (!kPvAtEnd) && (!kIsFirstIter) &&
-                                    ((!kSkipCompute) || kDoEpilogue);
+            constexpr bool kHasPv =
+                (!kPvAtEnd) && (!kIsFirstIter) && ((!kSkipCompute) || kDoEpilogue);
             // Lo's deferred first PV takes the accumulate path (the 3-arg init
             // mfma is the Hi/at-end path), so Lo zeroes oaccu once on its first
             // compute call. row_max/row_sum_e are still initialised by the
@@ -485,10 +489,11 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // Staging: buffer_load_lds dst is wave-uniform m0; HW adds laneId*16. Two
             // slots (strip 2 @ +0, strip 3 @ +kStageTileBytes), each per-warp base
             // p_lds_kv_stage + slot*8192 + warp*1024. Read matches at the same base.
-            constexpr uint32_t kStageWarpBytes = 64u * 16u;           // 1024
+            constexpr uint32_t kStageWarpBytes = 64u * 16u;            // 1024
             constexpr uint32_t kStageTileBytes = 8u * kStageWarpBytes; // 8192
-            const uintptr_t stage_t0 = p_lds_kv_stage + warp_idx * kStageWarpBytes;
-            const uintptr_t stage_t1 = p_lds_kv_stage + kStageTileBytes + warp_idx * kStageWarpBytes;
+            const uintptr_t stage_t0           = p_lds_kv_stage + warp_idx * kStageWarpBytes;
+            const uintptr_t stage_t1 =
+                p_lds_kv_stage + kStageTileBytes + warp_idx * kStageWarpBytes;
             uint32_t scale_s0 = 0u;
 
             // ---- Deferred strip-3 consume (lo, non-first calls) ----
@@ -503,8 +508,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 hk::u32x4 dw3, dw4;
                 // skip resolve_row_kv_ld
                 kv_manager.template wait_kv_loads<false, /*kVmCnt=*/1>(warp_idx);
-                const hk::u32x4 s3  = kv_manager.template load_staged_kv_carrier<1u>(stage_t0);
-                const float     sf3 = hk_mla::e8m0_to_f32(s3_scale);
+                const hk::u32x4 s3 = kv_manager.template load_staged_kv_carrier<1u>(stage_t0);
+                const float sf3    = hk_mla::e8m0_to_f32(s3_scale);
                 __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
                 kv_manager.template cvt_kv_tile_step<0>(dw3, s3, sf3);
                 kv_manager.template cvt_kv_tile_step<1>(dw3, s3, sf3);
@@ -524,8 +529,9 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template prefetch_kv_nope<1u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p1);
 
-                kv_manager.template prefetch_kv_nope_lds<2u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
-                    warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t0, scale_s0);
+                kv_manager
+                    .template prefetch_kv_nope_lds<2u, kTile, kCheckBoundaryNext, kIsRopeWarp>(
+                        warp_idx, params.p_kv_buffer, row_kv_ld_next, stage_t0, scale_s0);
                 // Strip 3 (lo only): stage NoPE into slot 1; its scale lands in the
                 // carried s3_scale. The consume is deferred to the NEXT call's top.
                 if constexpr(!kIsRopeWarp)
@@ -591,7 +597,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 constexpr uint32_t kDepth  = 3u;
 
                 auto k_ring_base = [](uint32_t s) constexpr -> uint32_t {
-                    return (s % 3u == 0u) ? R::k_k0_begin
+                    return (s % 3u == 0u)   ? R::k_k0_begin
                            : (s % 3u == 1u) ? R::k_k1_begin
                                             : R::k_k2_begin;
                 };
@@ -599,8 +605,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     constexpr uint32_t c    = S / 4u;
                     constexpr uint32_t rg   = S % 4u;
                     constexpr uint32_t base = k_ring_base(S);
-                    using kr = hkdart::split_many_t<
-                        hkdart::type_list<hkdart::range<base, base + 3u>>, 4>;
+                    using kr =
+                        hkdart::split_many_t<hkdart::type_list<hkdart::range<base, base + 3u>>, 4>;
                     hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kr> kt;
                     // kRowOffset = rg*16 (0/16 = sub-tile A, 32/48 = sub-tile B); the
                     // sub-tile offset is folded into load_k_to_gpr's ds_read imm, so the
@@ -611,39 +617,46 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     constexpr uint32_t c    = S / 4u;
                     constexpr uint32_t rg   = S % 4u;
                     constexpr uint32_t base = k_ring_base(S);
-                    using kr = hkdart::split_many_t<
-                        hkdart::type_list<hkdart::range<base, base + 3u>>, 4>;
+                    using kr =
+                        hkdart::split_many_t<hkdart::type_list<hkdart::range<base, base + 3u>>, 4>;
                     hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kr> kt;
                     constexpr uint32_t qb = k_q_vgpr_begin + c * 4u;
-                    using qr = hkdart::split_many_t<
-                        hkdart::type_list<hkdart::range<qb, qb + 3u>>, 4>;
+                    using qr =
+                        hkdart::split_many_t<hkdart::type_list<hkdart::range<qb, qb + 3u>>, 4>;
                     hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, qr> qt;
                     constexpr bool kInit = (S < 4u); // first touch of N-group rg -> 3-arg init
                     if constexpr(rg == 0u)
                     {
-                        if constexpr(kInit) hk::mma_ABt(p_comp_lo, kt, qt);
-                        else hk::mma_ABt(p_comp_lo, kt, qt, p_comp_lo);
+                        if constexpr(kInit)
+                            hk::mma_ABt(p_comp_lo, kt, qt);
+                        else
+                            hk::mma_ABt(p_comp_lo, kt, qt, p_comp_lo);
                     }
                     else if constexpr(rg == 1u)
                     {
-                        if constexpr(kInit) hk::mma_ABt(p_comp_hi, kt, qt);
-                        else hk::mma_ABt(p_comp_hi, kt, qt, p_comp_hi);
+                        if constexpr(kInit)
+                            hk::mma_ABt(p_comp_hi, kt, qt);
+                        else
+                            hk::mma_ABt(p_comp_hi, kt, qt, p_comp_hi);
                     }
                     else if constexpr(rg == 2u)
                     {
-                        if constexpr(kInit) hk::mma_ABt(p_comp_b_lo, kt, qt);
-                        else hk::mma_ABt(p_comp_b_lo, kt, qt, p_comp_b_lo);
+                        if constexpr(kInit)
+                            hk::mma_ABt(p_comp_b_lo, kt, qt);
+                        else
+                            hk::mma_ABt(p_comp_b_lo, kt, qt, p_comp_b_lo);
                     }
                     else
                     {
-                        if constexpr(kInit) hk::mma_ABt(p_comp_b_hi, kt, qt);
-                        else hk::mma_ABt(p_comp_b_hi, kt, qt, p_comp_b_hi);
+                        if constexpr(kInit)
+                            hk::mma_ABt(p_comp_b_hi, kt, qt);
+                        else
+                            hk::mma_ABt(p_comp_b_hi, kt, qt, p_comp_b_hi);
                     }
                 };
 
                 // Prologue: preload kDepth ds_reads.
-                opus::static_for<kDepth>(
-                    [&](auto p_) { issue_k.template operator()<p_.value>(); });
+                opus::static_for<kDepth>([&](auto p_) { issue_k.template operator()<p_.value>(); });
                 // Steady + drain: wait until sub-tile S is the oldest still queued
                 // (lgkmcnt = min(reads-behind-S, kDepth-1)), mma it, then refill
                 // its slot with S+kDepth.
@@ -698,9 +711,10 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // Staged strip 2 (lo & hi).
                 {
                     kv_manager.template wait_kv_loads<kIsRopeWarp, /*kVmCnt=*/2>(warp_idx);
-                    const hk::u32x4 s2   = kv_manager.template load_staged_kv_carrier<0u>(stage_t0);
-                    const float     sf2  = hk_mla::e8m0_to_f32(scale_s0);
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+                    const hk::u32x4 s2 = kv_manager.template load_staged_kv_carrier<0u>(stage_t0);
+                    const float sf2    = hk_mla::e8m0_to_f32(scale_s0);
+                    __builtin_amdgcn_s_waitcnt(
+                        hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
                     kv_manager.template cvt_kv_tile_step<0>(dw, s2, sf2);
                     kv_manager.template cvt_kv_tile_step<1>(dw, s2, sf2);
                     kv_manager.template store_kv_tile_step<2u, kTile, 0>(next_sub, warp_idx, dw);
@@ -798,8 +812,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                         const comp_t new_row_max = opus::max(local_max, row_max);
                         // row_max is already in log2 units (Q pre-scaled), so no
                         // * log2e here.
-                        rescale  = __builtin_amdgcn_exp2f(row_max - new_row_max);
-                        row_max  = new_row_max;
+                        rescale = __builtin_amdgcn_exp2f(row_max - new_row_max);
+                        row_max = new_row_max;
                     }
                 }
 
@@ -830,7 +844,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             if constexpr(kPvAtEnd && (kSkipCompute == false))
             {
                 // One PV call contracts BOTH KV sub-tiles (kBlockN=64) -> single prologue.
-                hk_mla_v40_pv_stage<kIsFirstIter, T>(kv_manager, p_lds_kv_curr, rescale, do_rescale);
+                hk_mla_v40_pv_stage<kIsFirstIter, T>(
+                    kv_manager, p_lds_kv_curr, rescale, do_rescale);
             }
 
             // ---- Epilogue ----
@@ -871,8 +886,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 {
                     // row_max is in log2 units (Q pre-scaled), attn_sink is a raw
                     // logit, so convert the sink to log2 units before the diff.
-                    const float sink_term =
-                        __builtin_amdgcn_exp2f(attn_sink * log2e - row_max);
+                    const float sink_term = __builtin_amdgcn_exp2f(attn_sink * log2e - row_max);
                     row_sum_e += sink_term;
                 }
 
@@ -891,7 +905,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     });
                 }
 
-                const uintptr_t p_lds_o             = p_lds_kv_next;
+                const uintptr_t p_lds_o = p_lds_kv_next;
                 // Output is 512 cols regardless of kBlockN: each pair writes 16 oaccu
                 // dwords (2x 16x16 = 64 cols). Bind to 64, not 2*kBlockN.
                 constexpr uint32_t kOutPairCols     = 64u;
@@ -938,8 +952,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                         // lse_nat = row_max_nat + ln(sum)
                         //         = row_max_log2*inv_log2e + log2(sum)*inv_log2e
                         //         = (row_max + log2(sum)) * inv_log2e.
-                        const comp_t lse =
-                            (row_max + __builtin_amdgcn_logf(row_sum_e)) * inv_log2e;
+                        const comp_t lse = (row_max + __builtin_amdgcn_logf(row_sum_e)) * inv_log2e;
                         params.p_split_lse[row_idx] = lse;
                     }
                 }
@@ -1276,9 +1289,9 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 template <typename T>
 // scratch budget = HkMlaV40Regs::k_scratch_budget = k_p_comp_begin-12 = 36 for
 // kBlockN=64 (pinned region grows down to v36 to fit the doubled p_comp).
-__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(36)))
-void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
-                                                                                   params)
+__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(
+    36))) void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
+                                                                          params)
 {
     const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
 
@@ -1288,13 +1301,13 @@ void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdPar
     // (warp&3) stays runtime inside each type.
     if(warp_idx < 4u)
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::LoNoPEWarp>(params,
-                                                                                      warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::LoNoPEWarp>(
+            params, warp_idx);
     }
     else
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiRoPEWarp>(params,
-                                                                                      warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiRoPEWarp>(
+            params, warp_idx);
     }
 }
 

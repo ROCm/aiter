@@ -1589,9 +1589,8 @@ class OManager16bitsV1
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         v2ui b16_pair_0;
         v2ui b16_pair_1;
@@ -1699,9 +1698,8 @@ class OManager16bitsV2
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         v2ui b16_pair_0;
         v2ui b16_pair_1;
@@ -1771,9 +1769,8 @@ class OManager32bitsV1
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {
@@ -1868,9 +1865,8 @@ class OManager32bitsV2
         const uint32_t num_records =
             kCheckOOB ? ((qo_end - qo_start) * num_qheads * T::kVoHeadDim * sizeof(out_t))
                       : 0xFFFFFFFFu;
-        const hk::buffer_resource out_br =
-            hk::make_buffer_resource(static_cast<uint64_t>(p_output_batch),
-                                     num_records, 0x00020000);
+        const hk::buffer_resource out_br = hk::make_buffer_resource(
+            static_cast<uint64_t>(p_output_batch), num_records, 0x00020000);
 
         if constexpr(std::is_same_v<out_t, float>)
         {

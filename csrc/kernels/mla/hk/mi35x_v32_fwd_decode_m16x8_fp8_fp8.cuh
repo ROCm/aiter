@@ -901,9 +901,20 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
                     {
                         o_manager.template output_to_vram<oaccu_base, col_off, true>(
-                            params.final_output.raw_ptr, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
-                        o_manager.template output_to_vram<oaccu_base + 8, col_off + T::kBlockK, true>(
-                            params.final_output.raw_ptr, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
+                            params.final_output.raw_ptr,
+                            warp_idx,
+                            qo_start,
+                            qo_end,
+                            p_lds_o,
+                            num_qheads);
+                        o_manager
+                            .template output_to_vram<oaccu_base + 8, col_off + T::kBlockK, true>(
+                                params.final_output.raw_ptr,
+                                warp_idx,
+                                qo_start,
+                                qo_end,
+                                p_lds_o,
+                                num_qheads);
                     }
                     else
                     {

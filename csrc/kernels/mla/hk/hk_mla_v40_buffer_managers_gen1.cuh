@@ -107,8 +107,10 @@ class QManager8to16bitsV1
     static_assert(T::kQkNopeHeadDim == 448, "QManager8to16bitsV1: NOPE width must be 448.");
     static_assert(T::kQkRopeHeadDim == 64, "QManager8to16bitsV1: ROPE width must be 64.");
     static_assert(T::kQkHeadDim == 512, "QManager8to16bitsV1: kQkHeadDim must be 512 (NOPE+ROPE).");
-    static_assert(T::kBlockM == 128 || T::kBlockM == 64, "QManager8to16bitsV1: kBlockM must be 128 or 64.");
-    static_assert(T::kNumWarps == 8 || T::kNumWarps == 4, "QManager8to16bitsV1: requires 8 or 4 warps.");
+    static_assert(T::kBlockM == 128 || T::kBlockM == 64,
+                  "QManager8to16bitsV1: kBlockM must be 128 or 64.");
+    static_assert(T::kNumWarps == 8 || T::kNumWarps == 4,
+                  "QManager8to16bitsV1: requires 8 or 4 warps.");
     static_assert(T::kTileM == 16, "QManager8to16bitsV1: kTileM must be 16.");
 
     public:
@@ -135,7 +137,7 @@ class QManager8to16bitsV1
     static constexpr uint32_t kP1MaxChunks = T::kQkNopeHeadDim / kP1ChunkCols; // 7
 
     static constexpr uint32_t kP1StagingBytesPerWarp =
-        T::kTileM * kP1ChunkCols * sizeof(q_nope_t);   // 1024
+        T::kTileM * kP1ChunkCols * sizeof(q_nope_t);    // 1024
     static constexpr uint32_t kP1NumStagingBuffers = 2; // double-buffer
     static constexpr uint32_t kP1StagingBytesPerWarpTotal =
         kP1NumStagingBuffers * kP1StagingBytesPerWarp; // 2048
@@ -153,9 +155,9 @@ class QManager8to16bitsV1
     static constexpr uint32_t kRopeColTileLo = 0u;
     static constexpr uint32_t kRopeColTileHi = 1u;
 
-    static constexpr uint32_t kFinalLdsRows     = T::kBlockM;                        // 128
-    static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows;     // 8
-    static constexpr uint32_t kFinalLdsColTiles = kLdsHalfRopeCols / kSubBlockCols;  // 2 (RoPE only)
+    static constexpr uint32_t kFinalLdsRows     = T::kBlockM;                       // 128
+    static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows;    // 8
+    static constexpr uint32_t kFinalLdsColTiles = kLdsHalfRopeCols / kSubBlockCols; // 2 (RoPE only)
     static constexpr uint32_t kWarpFinalBytes   = kFinalLdsColTiles * kSubBlockBytes; // 2048
     static constexpr uint32_t kFinalLdsBytes    = T::kNumWarps * kWarpFinalBytes;     // 16 KB
     // Wave-major: each wave owns kWarpFinalBytes exclusively (no inter-wave barrier
@@ -243,8 +245,8 @@ class QManager8to16bitsV1
         // [32,64) of the chunk). Tile T's dup pair lives at bytes [448+2T, +2T+1].
         constexpr uint32_t kScaleByteInRec = kScaleBaseOff + 2u * kChunkIdx; // 448 + 2*kChunkIdx
 
-        uint32_t lane_idx    = opus::lane_id();
-        asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx));          // break-CSE: shorten lane-derived live ranges
         const uint32_t row_in_warp = lane_idx >> 2; // 0..15
         const uint32_t col_quad    = lane_idx & 3u; // 0..3
         // Swizzle: 16x64 chunk tiled into 4x4 sub-tiles (4 rows x 16 cols).
@@ -280,8 +282,7 @@ class QManager8to16bitsV1
         // LDS dst to cancel its contribution there. Requires
         // kLdsHeadPadBytes of pad before p_lds_q so warp 0's dst stays
         // >= 0 (static_assert in kernel body).
-        auto g_q_nope =
-            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
+        auto g_q_nope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
         __builtin_amdgcn_raw_ptr_buffer_load_lds(
             g_q_nope.cached_rsrc,
             (hk::as3_uint32_ptr)(p_lds_warp_staging + kStagingI - kColInRecord),
@@ -312,10 +313,8 @@ class QManager8to16bitsV1
     // earlier (no waitcnt in between is fine; this helper drains vmcnt first
     // to ensure the staging bytes and scale dwords are valid before the cvt).
     template <uint32_t kChunkIdx, uint32_t kBufIdx, uint32_t GPR_NOPE_VGPR_START>
-    __device__ __forceinline__ static void
-    p1_staging_to_vgpr_chunk(const uintptr_t p_lds_warp_staging,
-                             const uint32_t s_dw,
-                             const float q_scale_log2)
+    __device__ __forceinline__ static void p1_staging_to_vgpr_chunk(
+        const uintptr_t p_lds_warp_staging, const uint32_t s_dw, const float q_scale_log2)
     {
         static_assert(kChunkIdx < 7u, "p1_staging_to_vgpr_chunk: bad kChunkIdx (0..6).");
         static_assert(kBufIdx < kP1NumStagingBuffers, "p1_staging_to_vgpr_chunk: bad kBufIdx.");
@@ -323,8 +322,8 @@ class QManager8to16bitsV1
         constexpr uint32_t kStagingI      = kBufIdx * kP1StagingBytesPerWarp;
         constexpr uint32_t kVgprChunkBase = GPR_NOPE_VGPR_START + 8u * kChunkIdx;
 
-        uint32_t lane_idx    = opus::lane_id();
-        asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx));           // break-CSE: shorten lane-derived live ranges
         const uint32_t row_in_warp = lane_idx & 15u; // 0..15 (= row in warp tile)
 
         // Swizzle-aware addressing (mirror of p1_vmem_to_staging_chunk writer).
@@ -437,8 +436,8 @@ class QManager8to16bitsV1
         constexpr uint32_t kColTileLo = kRopeColTileLo; // 0 when all NoPE in VGPR
         constexpr uint32_t kColTileHi = kRopeColTileHi; // 1 when all NoPE in VGPR
 
-        uint32_t lane_idx    = opus::lane_id();
-        asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx));          // break-CSE: shorten lane-derived live ranges
         const uint32_t row_in_warp = lane_idx >> 2; // 0..15
         const uint32_t col_quad    = lane_idx & 3u; // 0..3
 
@@ -464,11 +463,9 @@ class QManager8to16bitsV1
         // touching the next, so only one u32x4 + its fp32 temps are live at a
         // time. Byte-addressed gmem (uint8) so v_off_lo / the +16 stay in bytes;
         // load<16> pulls 16 B.
-        auto g_q_rope =
-            opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_rope_warp));
+        auto g_q_rope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_rope_warp));
         auto scale_and_store = [&](uint32_t s_os, uintptr_t p_dst) {
-            hk::u32x4 v =
-                __builtin_bit_cast(hk::u32x4, g_q_rope.template load<16>(v_off_lo, s_os));
+            hk::u32x4 v = __builtin_bit_cast(hk::u32x4, g_q_rope.template load<16>(v_off_lo, s_os));
             opus::static_for<4>(
                 [&](auto i) { v[i.value] = scale_bf16_pair(v[i.value], q_scale_log2); });
             hkm::ds_write_b128(v, static_cast<uint32_t>(p_dst), 0);
@@ -615,8 +612,8 @@ class QManager8to16bitsV1
 
         uint32_t lane_idx = opus::lane_id();
         asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
-        const uint32_t row      = lane_idx % kMfmaRows;
-        const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uint32_t row = lane_idx % kMfmaRows;
+        const uint32_t col = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
 
         // Site C bank-conflict swizzle (reader side): XOR byte-in-sub-block
         // by 32 on sub-tile-rows 1 & 3 (rows 4..7 and 12..15 of the 16-row
@@ -637,7 +634,6 @@ class QManager8to16bitsV1
         const uintptr_t p_lds_q_lane = p_lds_q + warp_idx * kWarpFinalBytes + in_sb_byte;
         hkm::ds_read_b128<range_type::lo>(static_cast<uint32_t>(p_lds_q_lane), kColTileBytes);
     }
-
 };
 
 // V4.0 KV manager: per-token VMEM layout = NoPE 448 B FP8 + dup-E8M0 16 B
@@ -705,7 +701,9 @@ class KvManager8to16bitsV1
     static_assert(T::kQkRopeHeadDim == 64, "KvManager8to16bitsV1: ROPE width must be 64.");
     static_assert(T::kQkHeadDim == 512,
                   "KvManager8to16bitsV1: kQkHeadDim must be 512 (NOPE+ROPE).");
-    static_assert(T::kNumWarps == 8 || T::kNumWarps == 4, "KvManager8to16bitsV1: requires 8 or 4 warps (m16x4 passes warp_idx 0..7 via the +kNumWarps col-strip).");
+    static_assert(T::kNumWarps == 8 || T::kNumWarps == 4,
+                  "KvManager8to16bitsV1: requires 8 or 4 warps (m16x4 passes warp_idx 0..7 via the "
+                  "+kNumWarps col-strip).");
 
     public:
     // ---- Sub-block geometry ------------------------------------------------
@@ -713,8 +711,8 @@ class KvManager8to16bitsV1
     static constexpr uint32_t kSubBlockRows    = 16;
     static constexpr uint32_t kSubBlockCols    = 32;
     static constexpr uint32_t kSubBlockBytes   = kSubBlockRows * kSubBlockCols * sizeof(hk::bf16);
-    static constexpr uint32_t kNumRowTiles     = kLoadBlockN / kSubBlockRows;       // 2 (32-row tile)
-    static constexpr uint32_t kNumColTiles     = T::kQkHeadDim / kSubBlockCols;     // 16
+    static constexpr uint32_t kNumRowTiles     = kLoadBlockN / kSubBlockRows;   // 2 (32-row tile)
+    static constexpr uint32_t kNumColTiles     = T::kQkHeadDim / kSubBlockCols; // 16
     static constexpr uint32_t kNumColTilesNope = T::kQkNopeHeadDim / kSubBlockCols; // 14
     static constexpr uint32_t kNumColTilesRope =
         (T::kQkHeadDim - T::kQkNopeHeadDim) / kSubBlockCols; // 2
@@ -821,7 +819,7 @@ class KvManager8to16bitsV1
                       "prefetch_kv_nope: kColOffset must be 0 or kTileCols (=256).");
 
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
-        constexpr bool kIsNoPEPath = (kTileIdx == 0u) || (kIsRopeWarp == false);
+        constexpr bool kIsNoPEPath  = (kTileIdx == 0u) || (kIsRopeWarp == false);
 
         uint32_t lane_idx = opus::lane_id();
         asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
@@ -903,16 +901,17 @@ class KvManager8to16bitsV1
     //   (mirrors QManager P1). Phase B reconstructs the carrier via ds_read at
     //   p_lds_stage_tile + lane*16 -> identical nope_dw -> cvt_kv_tile_step reused.
     template <uint32_t kColOffset, bool kCheckBoundary, bool kIsRopeWarp>
-    __device__ __forceinline__ static void
-    prefetch_kv_nope_lds(const uint32_t warp_idx, const kv_nope_t* p_kv_buf_nope,
-                         const int32_t row_kv_ld, const uintptr_t p_lds_stage_tile,
-                         uint32_t& scale_out)
+    __device__ __forceinline__ static void prefetch_kv_nope_lds(const uint32_t warp_idx,
+                                                                const kv_nope_t* p_kv_buf_nope,
+                                                                const int32_t row_kv_ld,
+                                                                const uintptr_t p_lds_stage_tile,
+                                                                uint32_t& scale_out)
     {
         static_assert((kColOffset % kTileCols == 0u) && (kColOffset < T::kQkHeadDim),
                       "prefetch_kv_nope_lds: kColOffset must be 0 or kTileCols (=256).");
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
-        constexpr bool kIsNoPEPath = (kTileIdx == 0u) || (kIsRopeWarp == false);
-        scale_out = 0u;
+        constexpr bool kIsNoPEPath  = (kTileIdx == 0u) || (kIsRopeWarp == false);
+        scale_out                   = 0u;
         if constexpr(kIsNoPEPath)
         {
             uint32_t lane_idx = opus::lane_id();
@@ -922,7 +921,7 @@ class KvManager8to16bitsV1
             const bool in_bounds            = (kCheckBoundary == false) || (row_kv_ld >= 0);
 
             constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
-            const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
+            const uint32_t col_group_swz     = col_group ^ (((lane_idx >> 4) & 1u) << 1);
             const uint32_t v_off_nope =
                 in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
                           : 0u;
@@ -933,12 +932,19 @@ class KvManager8to16bitsV1
 
             // fp8 16B/lane -> staging LDS. rsrc same config (0x00020000) as VGPR path.
             const __amdgpu_buffer_rsrc_t rsrc_lds = __builtin_amdgcn_make_buffer_rsrc(
-                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)), 0, 0xffffffff, 0x00020000);
+                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)),
+                0,
+                0xffffffff,
+                0x00020000);
             if(in_bounds)
             {
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(
-                    rsrc_lds, (hk::as3_uint32_ptr)(p_lds_stage_tile),
-                    /*size=*/16, v_off_nope, /*s_off=*/s_off_nope, /*i_off=*/0, /*aux=*/0);
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(rsrc_lds,
+                                                         (hk::as3_uint32_ptr)(p_lds_stage_tile),
+                                                         /*size=*/16,
+                                                         v_off_nope,
+                                                         /*s_off=*/s_off_nope,
+                                                         /*i_off=*/0,
+                                                         /*aux=*/0);
             }
 
             // Scale byte (same addressing as prefetch_kv_nope), held in VGPR.
@@ -961,12 +967,12 @@ class KvManager8to16bitsV1
     // (hidden under QK), the tiny scale is reloaded fresh where it's consumed
     // (Phase B) rather than held across QK (holding it corrupted it).
     template <uint32_t kColOffset, bool kCheckBoundary, bool kIsRopeWarp>
-    __device__ __forceinline__ static uint32_t
-    prefetch_kv_scale(const uint32_t warp_idx, const kv_nope_t* p_kv_buf_nope,
-                      const int32_t row_kv_ld)
+    __device__ __forceinline__ static uint32_t prefetch_kv_scale(const uint32_t warp_idx,
+                                                                 const kv_nope_t* p_kv_buf_nope,
+                                                                 const int32_t row_kv_ld)
     {
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
-        constexpr bool kIsNoPEPath = (kTileIdx == 0u) || (kIsRopeWarp == false);
+        constexpr bool kIsNoPEPath  = (kTileIdx == 0u) || (kIsRopeWarp == false);
         if constexpr(!kIsNoPEPath)
         {
             return 0u;
@@ -975,8 +981,8 @@ class KvManager8to16bitsV1
         {
             uint32_t lane_idx = opus::lane_id();
             asm volatile("" : "+v"(lane_idx));
-            const uint32_t col_tile_in_tile = wave_col_tile_in_tile(warp_idx);
-            const bool in_bounds = (kCheckBoundary == false) || (row_kv_ld >= 0);
+            const uint32_t col_tile_in_tile  = wave_col_tile_in_tile(warp_idx);
+            const bool in_bounds             = (kCheckBoundary == false) || (row_kv_ld >= 0);
             constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t);
             const uint64_t as_u64 =
                 static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
@@ -1022,7 +1028,7 @@ class KvManager8to16bitsV1
                       "prefetch_kv_rope: kColOffset must be 0 or kTileCols (=256).");
 
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
-        constexpr bool kIsRoPEPath = (kTileIdx == 1u) && kIsRopeWarp;
+        constexpr bool kIsRoPEPath  = (kTileIdx == 1u) && kIsRopeWarp;
 
         const uint32_t lane_idx  = opus::lane_id();
         const uint32_t col_group = lane_idx & 3u; // 0..3
@@ -1089,16 +1095,22 @@ class KvManager8to16bitsV1
                 const uintptr_t p_dst_hi_adj =
                     p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) - 16u;
 
-                auto g_kv_rope = opus::make_gmem<uint8_t>(
-                    reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(
-                    g_kv_rope.cached_rsrc,
-                    (hk::as3_uint32_ptr)(p_dst_lo),
-                    /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/0, /*aux=*/0);
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(
-                    g_kv_rope.cached_rsrc,
-                    (hk::as3_uint32_ptr)(p_dst_hi_adj),
-                    /*size=*/16, v_off_lo, /*s_off=*/0u, /*i_off=*/16, /*aux=*/0);
+                auto g_kv_rope =
+                    opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
+                                                         (hk::as3_uint32_ptr)(p_dst_lo),
+                                                         /*size=*/16,
+                                                         v_off_lo,
+                                                         /*s_off=*/0u,
+                                                         /*i_off=*/0,
+                                                         /*aux=*/0);
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
+                                                         (hk::as3_uint32_ptr)(p_dst_hi_adj),
+                                                         /*size=*/16,
+                                                         v_off_lo,
+                                                         /*s_off=*/0u,
+                                                         /*i_off=*/16,
+                                                         /*aux=*/0);
             }
             else
             {
@@ -1188,7 +1200,10 @@ class KvManager8to16bitsV1
     // kStep in {0,1}: 0 -> store lo (offset 0), 1 -> store hi (offset 2048).
     // kExtraImmOff: extra compile-time byte offset folded into the ds_write imm
     // (kSubPong for sub-tile B). kExtraImmOff + kStep*2048 must stay < 65536.
-    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t kStep, bool kIsRopeWarp,
+    template <uint32_t kRowOffset,
+              uint32_t kColOffset,
+              uint32_t kStep,
+              bool kIsRopeWarp,
               uint32_t kExtraImmOff = 0u>
     __device__ __forceinline__ static void
     store_kv_tile_step(const uintptr_t p_lds_kv, const uint32_t warp_idx, const hk::u32x4& dw)
@@ -1238,7 +1253,8 @@ class KvManager8to16bitsV1
                                                         const int32_t row_kv_ld)
     {
         KvTilePrefetch p0, p1;
-        prefetch_kv_nope<0u, 0u, kCheckBoundary, kIsRopeWarp>(warp_idx, p_kv_buf_nope, row_kv_ld, p0);
+        prefetch_kv_nope<0u, 0u, kCheckBoundary, kIsRopeWarp>(
+            warp_idx, p_kv_buf_nope, row_kv_ld, p0);
         prefetch_kv_nope<0u, kTileCols, kCheckBoundary, kIsRopeWarp>(
             warp_idx, p_kv_buf_nope, row_kv_ld, p1);
         prefetch_kv_rope<0u, kTileCols, kCheckBoundary, kIsRopeWarp>(
@@ -1314,8 +1330,8 @@ class KvManager8to16bitsV1
         // Constexpr sub-block selector (compiles to immediate offset); the sub-tile
         // (A/B) contributes kSubIdx*kSubPongBytes so the base ptr stays p_lds_kv.
         constexpr uint32_t kFixedOffset =
-            sub_block_byte_offset(kRowInSub / kSubBlockRows, kColOffset / kSubBlockCols)
-            + kSubIdx * kSubPongBytes;
+            sub_block_byte_offset(kRowInSub / kSubBlockRows, kColOffset / kSubBlockCols) +
+            kSubIdx * kSubPongBytes;
 
         // RT must hold a single 4-vgpr range (16 bf16 mfma A-tile = 4 vgprs/lane).
         using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
@@ -1368,8 +1384,8 @@ class KvManager8to16bitsV1
             (kColOffset % 16u == 0u) && (kColOffset < T::kVoHeadDim),
             "load_transposed_v_to_gpr: kColOffset must be a multiple of 16, < kVoHeadDim.");
 
-        constexpr uint32_t kSubIdx       = kRowOffset / kLoadBlockN;   // 0 (A) or 1 (B)
-        constexpr uint32_t kRowInSub     = kRowOffset % kLoadBlockN;   // 0 or 16
+        constexpr uint32_t kSubIdx       = kRowOffset / kLoadBlockN; // 0 (A) or 1 (B)
+        constexpr uint32_t kRowInSub     = kRowOffset % kLoadBlockN; // 0 or 16
         constexpr uint32_t kSubPongBytes = kLoadBlockN * T::kQkHeadDim * sizeof(hk::bf16);
         constexpr uint32_t kRowTile      = kRowInSub / kSubBlockRows;  // 0 or 1
         constexpr uint32_t kColTile      = kColOffset / kSubBlockCols; // 0..15
@@ -1409,8 +1425,8 @@ class KvManager8to16bitsV1
 // ---- m16x8 band-remapped KV manager -------------------------------------------
 // Each warp owns ONE 16-row band x one 256-col tile (16x256 patch = 4 dwordx4/lane):
 //   band = warp & 3 (rows [band*16, +16)); tile = warp >> 2 (0 = cols 0-255, 1 = 256-511)
-//   sub-tile A = bands {0,1} (rows 0-31 -> pong[0]); B = bands {2,3} (rows 32-63 -> pong[+kSubPong])
-//   row_tile (16-row sub-block half within the 32-row sub-tile) = warp & 1
+//   sub-tile A = bands {0,1} (rows 0-31 -> pong[0]); B = bands {2,3} (rows 32-63 ->
+//   pong[+kSubPong]) row_tile (16-row sub-block half within the 32-row sub-tile) = warp & 1
 // vs. V1 (each warp loads part of BOTH sub-tiles): now ONE row index per lane, and
 // warps 0-3 = pure NoPE (tile 0), warps 4-7 = NoPE+RoPE (tile 1) -> 2 warp types.
 //
@@ -1430,14 +1446,14 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
 
     public:
     using KvTilePrefetch = typename Base::KvTilePrefetch;
+    using Base::cvt_kv_tile_step;
     using Base::kColTilesPerTile;
     using Base::kNumRowTiles;
     using Base::kSubBlockBytes;
     using Base::kSubBlockCols;
     using Base::kTileCols;
-    using Base::kWaveTileCols;
-    using Base::cvt_kv_tile_step;
     using Base::kv_tile_scale_f;
+    using Base::kWaveTileCols;
     using Base::sub_block_byte_offset;
 
     // A tile's 256 cols = 4 col-strips of 64. tile-1 strip 3 (cols 448-511) is RoPE.
@@ -1448,7 +1464,10 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
     // Row within the warp's 16-row band; the band token offset (band*16) is folded
     // into kv_tile_start by the caller's resolve, so this is warp-independent.
     __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
-    { (void)warp_idx; return opus::lane_id() >> 2; }
+    {
+        (void)warp_idx;
+        return opus::lane_id() >> 2;
+    }
 
     // 16-row sub-block half within the warp's 32-row sub-tile.
     __device__ __forceinline__ static constexpr uint32_t wave_row_tile(const uint32_t warp_idx)
@@ -1477,21 +1496,21 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
             const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
 
             constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
-            const uint64_t as_u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
+            const uint64_t as_u64 =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
             const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
             const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
             const uint32_t v_off_nope =
                 in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
                           : 0u;
-            const uint32_t s_off_nope = kColStrip * kWaveTileCols;             // strip*64
-            constexpr int i_off_nope  = static_cast<int>(kTile * kTileCols);   // tile*256
+            const uint32_t s_off_nope = kColStrip * kWaveTileCols;           // strip*64
+            constexpr int i_off_nope  = static_cast<int>(kTile * kTileCols); // tile*256
 
             constexpr uint32_t kScaleBaseOff = 448u;
             const uint32_t v_off_scale =
                 in_bounds ? static_cast<uint32_t>(row_kv_ld) * kPackedStride : 0u;
             const uint32_t s_off_scale = kColStrip * 2u;
-            constexpr int i_off_scale =
-                static_cast<int>(kScaleBaseOff + kTile * kColTilesPerTile);
+            constexpr int i_off_scale  = static_cast<int>(kScaleBaseOff + kTile * kColTilesPerTile);
 
             prefetch_out.nope_dw =
                 in_bounds ? hkm::buffer_load_dwordx4(br, v_off_nope, s_off_nope, i_off_nope)
@@ -1503,15 +1522,16 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
 
     // ---- Phase A: NoPE prefetch -> staging LDS (one col-strip) ----
     template <uint32_t kColStrip, uint32_t kTile, bool kCheckBoundary, bool kIsRopeWarp>
-    __device__ __forceinline__ static void
-    prefetch_kv_nope_lds(const uint32_t warp_idx, const kv_nope_t* p_kv_buf_nope,
-                         const int32_t row_kv_ld, const uintptr_t p_lds_stage_tile,
-                         uint32_t& scale_out)
+    __device__ __forceinline__ static void prefetch_kv_nope_lds(const uint32_t warp_idx,
+                                                                const kv_nope_t* p_kv_buf_nope,
+                                                                const int32_t row_kv_ld,
+                                                                const uintptr_t p_lds_stage_tile,
+                                                                uint32_t& scale_out)
     {
         static_assert(kColStrip < 4u, "prefetch_kv_nope_lds: kColStrip must be 0..3.");
         static_assert(kTile < 2u, "prefetch_kv_nope_lds: kTile must be 0 or 1.");
         (void)warp_idx;
-        scale_out = 0u;
+        scale_out                  = 0u;
         constexpr bool kIsNoPEPath = is_nope_strip(kTile, kColStrip);
         if constexpr(kIsNoPEPath)
         {
@@ -1521,7 +1541,7 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
             const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
 
             constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
-            const uint32_t col_group_swz = col_group ^ (((lane_idx >> 4) & 1u) << 1);
+            const uint32_t col_group_swz     = col_group ^ (((lane_idx >> 4) & 1u) << 1);
             const uint32_t v_off_nope =
                 in_bounds ? (static_cast<uint32_t>(row_kv_ld) * kPackedStride + col_group_swz * 16u)
                           : 0u;
@@ -1530,22 +1550,29 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
             const uint32_t s_off_nope = kColStrip * kWaveTileCols + kTile * kTileCols;
 
             const __amdgpu_buffer_rsrc_t rsrc_lds = __builtin_amdgcn_make_buffer_rsrc(
-                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)), 0, 0xffffffff, 0x00020000);
+                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)),
+                0,
+                0xffffffff,
+                0x00020000);
             if(in_bounds)
             {
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(
-                    rsrc_lds, (hk::as3_uint32_ptr)(p_lds_stage_tile),
-                    /*size=*/16, v_off_nope, /*s_off=*/s_off_nope, /*i_off=*/0, /*aux=*/0);
+                __builtin_amdgcn_raw_ptr_buffer_load_lds(rsrc_lds,
+                                                         (hk::as3_uint32_ptr)(p_lds_stage_tile),
+                                                         /*size=*/16,
+                                                         v_off_nope,
+                                                         /*s_off=*/s_off_nope,
+                                                         /*i_off=*/0,
+                                                         /*aux=*/0);
             }
 
-            const uint64_t as_u64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
+            const uint64_t as_u64 =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_kv_buf_nope));
             const hk::buffer_resource br = hk::make_buffer_resource(as_u64, 0xffffffff, 0x00020000);
             constexpr uint32_t kScaleBaseOff = 448u;
             const uint32_t v_off_scale =
                 in_bounds ? static_cast<uint32_t>(row_kv_ld) * kPackedStride : 0u;
             const uint32_t s_off_scale = kColStrip * 2u;
-            constexpr int i_off_scale =
-                static_cast<int>(kScaleBaseOff + kTile * kColTilesPerTile);
+            constexpr int i_off_scale  = static_cast<int>(kScaleBaseOff + kTile * kColTilesPerTile);
             scale_out =
                 in_bounds ? hkm::buffer_load_ubyte(br, v_off_scale, s_off_scale, i_off_scale) : 0u;
         }
@@ -1560,7 +1587,7 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
     load_staged_kv_carrier(const uintptr_t p_lds_stage_base)
     {
         constexpr uint32_t kImmOffset = kSlot * kStageSlotBytes;
-        uint32_t lane_idx = opus::lane_id();
+        uint32_t lane_idx             = opus::lane_id();
         asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten staged-read lane live range
         return hkm::ds_read_b128<hk::u32x4>(
             static_cast<uint32_t>(p_lds_stage_base + lane_idx * 16u), kImmOffset);
@@ -1581,10 +1608,10 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
         const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
         if constexpr(kIsRopeWarp)
         {
-            constexpr uint32_t kRopeStride    = T::kQkRopeHeadDim * sizeof(hk::bf16);   // 128
-            constexpr uint32_t kRopeColTileLo = T::kQkNopeHeadDim / kSubBlockCols;      // 14
-            constexpr uint32_t kRopeColTileHi = kRopeColTileLo + 1u;                    // 15
-            constexpr uint32_t kVStride       = kSubBlockCols * sizeof(hk::bf16);       // 64
+            constexpr uint32_t kRopeStride    = T::kQkRopeHeadDim * sizeof(hk::bf16); // 128
+            constexpr uint32_t kRopeColTileLo = T::kQkNopeHeadDim / kSubBlockCols;    // 14
+            constexpr uint32_t kRopeColTileHi = kRopeColTileLo + 1u;                  // 15
+            constexpr uint32_t kVStride       = kSubBlockCols * sizeof(hk::bf16);     // 64
             const uint32_t row_tile           = wave_row_tile(warp_idx);
             if(in_bounds)
             {
@@ -1599,10 +1626,18 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
                     opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
                 __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
                                                          (hk::as3_uint32_ptr)(p_dst_lo),
-                                                         /*size=*/16, v_off_lo, 0u, 0, 0);
+                                                         /*size=*/16,
+                                                         v_off_lo,
+                                                         0u,
+                                                         0,
+                                                         0);
                 __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
                                                          (hk::as3_uint32_ptr)(p_dst_hi_adj),
-                                                         /*size=*/16, v_off_lo, 0u, 16, 0);
+                                                         /*size=*/16,
+                                                         v_off_lo,
+                                                         0u,
+                                                         16,
+                                                         0);
                 (void)kVStride;
             }
             else
@@ -1637,15 +1672,14 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
         // then carries only the runtime row_tile + per-lane terms (frees the col-tile
         // scaling from the held address, easing VGPR pressure across the loop).
         constexpr uint32_t kColTileGlobalLo = kTile * kColTilesPerTile + kColStrip * 2u;
-        const uint32_t byte_in_sb  = col_group << 4;
+        const uint32_t byte_in_sb           = col_group << 4;
         const uintptr_t p_dst_lane = p_lds_kv + row_tile * kSubBlockBytes +
                                      row_in_tile * (kSubBlockCols * sizeof(hk::bf16)) + byte_in_sb;
         const uint32_t addr        = static_cast<uint32_t>(p_dst_lane);
         // sub_block(rt, ct) = (ct*kNumRowTiles + rt)*kSubBlockBytes; rt is in the addr,
         // ct + kStep (both compile-time, each +1 col-tile = kNumRowTiles*kSubBlockBytes)
         // go in the imm. Max (14+1)*2048 = 30720 < 65536.
-        constexpr uint32_t kImmOff =
-            (kColTileGlobalLo + kStep) * (kNumRowTiles * kSubBlockBytes);
+        constexpr uint32_t kImmOff = (kColTileGlobalLo + kStep) * (kNumRowTiles * kSubBlockBytes);
         hkm::ds_write_b128(dw, addr, kImmOff);
     }
 
@@ -1756,7 +1790,7 @@ class OManager16bitsV4Gen1Swizzle
                       "kWaveTileColOff must be a multiple of 64");
         constexpr uint32_t kOffsetInBytes = kWaveTileColOff * sizeof(out_t);
 
-        uint32_t lane_idx    = opus::lane_id();
+        uint32_t lane_idx = opus::lane_id();
         asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
         const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
 
@@ -1895,7 +1929,7 @@ class OManager32bitsV4Gen1Swizzle
                       "kWaveTileColOff must be a multiple of 64");
         constexpr uint32_t kOffsetInBytes = kWaveTileColOff * sizeof(out_t);
 
-        uint32_t lane_idx    = opus::lane_id();
+        uint32_t lane_idx = opus::lane_id();
         asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
         const uintptr_t p_lds_warp = p_lds + warp_idx * get_lds_size_per_warp_in_byte();
 

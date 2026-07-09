@@ -333,9 +333,7 @@ constexpr int encode_s_waitcnt(int lgkmcnt, int vmcnt, int expcnt = -1)
 
 template <int kImm>
 __device__ __forceinline__ void s_nop()
-{
-    asm volatile("s_nop %0" ::"i"(kImm));
-}
+{ asm volatile("s_nop %0" ::"i"(kImm)); }
 
 // Single-stride lane swap helpers. Inline asm is used (rather than the LLVM
 // builtin __builtin_amdgcn_permlane{32,16}_swap) because the builtin form,
@@ -606,7 +604,7 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
             __builtin_amdgcn_sched_barrier(0);
             // OOB: page_phys=0 (hardware clamps), raw = intra_page. Caller fixup -> -1.
             const int32_t page_phys = __builtin_amdgcn_raw_buffer_load_b32(rsrc, page_off, 0, 0);
-            row_kv_ld = page_phys * kPageSize + static_cast<int32_t>(intra_page);
+            row_kv_ld               = page_phys * kPageSize + static_cast<int32_t>(intra_page);
         }
     }
     else
@@ -618,11 +616,14 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
         else
         {
             const __amdgpu_buffer_rsrc_t rsrc = __builtin_amdgcn_make_buffer_rsrc(
-                const_cast<void*>(static_cast<const void*>(p_kv_indices)), 0, 0xffffffff, 0x00020000);
+                const_cast<void*>(static_cast<const void*>(p_kv_indices)),
+                0,
+                0xffffffff,
+                0x00020000);
             if constexpr(kPageSize == 1)
             {
-                row_kv_ld =
-                    __builtin_amdgcn_raw_buffer_load_b32(rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
+                row_kv_ld = __builtin_amdgcn_raw_buffer_load_b32(
+                    rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
             }
             else
             {
