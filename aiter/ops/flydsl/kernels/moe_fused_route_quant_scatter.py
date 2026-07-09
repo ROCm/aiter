@@ -453,6 +453,8 @@ def build_moe_fused_route_quant_scatter_module(
     *,
     use_expert_row_base: bool = True,
     max_m: int = 0,
+    use_g2l: bool = False,
+    weight_dtype: str = "bf16",
 ):
     """Return a JIT launcher for the fused route+quant+scatter+preshuffle kernel.
 
@@ -522,14 +524,15 @@ def build_moe_fused_route_quant_scatter_module(
     topk_shift = topk.bit_length() - 1 if topk_is_pow2 else 0
 
     base_tag = "baseptr" if use_expert_row_base else f"basem{max_m}"
+    g2l_tag = f"_g2l_{weight_dtype}" if use_g2l else ""
     module_name = (
         f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{base_tag}"
+        f"_{quant_mode}_{L.native_tag}_{base_tag}{g2l_tag}"
     )
 
     @flyc.kernel(name=module_name)
     def fused_kernel(
-        topk_ids: fx.Pointer,  # (numel,) int32
+        topk_ids: fx.Pointer,  # (numel,) int32 (GLOBAL expert ids when use_g2l)
         counter: fx.Pointer,  # (E,) int32, init 0
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         hidden: fx.Pointer,  # (token_num*model_dim,) bf16
@@ -537,9 +540,14 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,  # preshuffled e8m0 out
         expert_row_base: fx.Pointer,  # (E,) int32 per-expert dst row base
         numel: Int32,
+        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local, sentinel=n_buckets
+        weight_in: fx.Pointer,  # (numel,) f32 route weights in (used iff use_g2l)
+        gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
+        n_buckets: Int32,  # sentinel value (== dropped) / local expert count
     ):
         i32 = T.i32
         f32 = T.f32
+        wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
 
         c0_i32 = arith.constant(0, type=i32)
         c1_i32 = arith.constant(1, type=i32)
@@ -578,6 +586,33 @@ def build_moe_fused_route_quant_scatter_module(
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
+
+            # EP global->local remap (warp-uniform). Dropped (non-local) routes
+            # fold into bucket 0 -- matching the prior host behaviour, so they
+            # still take a unique atomic slot and never collide with a real row --
+            # and their gather weight is zeroed so the final reduce ignores them.
+            # Replaces the host cumsum/index/eq/where/masked_fill chain.
+            if const_expr(use_g2l):
+                g2l_rsrc = ptr_rsrc(g2l_lut)
+                le = buffer_ops.buffer_load(
+                    g2l_rsrc, expert, vec_width=1, dtype=i32
+                )
+                is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
+                expert = ArithValue(arith.select(is_drop, c0_i32, le))
+                # Fused weight cast+mask (warp-uniform: every lane writes the same
+                # value to gather_w[route], redundant but race-free). Reads f32
+                # weight_in and writes weight_dtype (kept -> cast, dropped -> 0),
+                # folding the host topk_weight.to(bf16) copy + masked_fill.
+                wi_rsrc = ptr_rsrc(weight_in)
+                gather_w_rsrc = ptr_rsrc(gather_w)
+                w_f32 = buffer_ops.buffer_load(
+                    wi_rsrc, route, vec_width=1, dtype=f32
+                )
+                w_cast = arith.trunc_f(wdt, w_f32)
+                w_out = arith.select(
+                    is_drop, arith.constant(0.0, type=wdt), w_cast
+                )
+                buffer_ops.buffer_store(w_out, gather_w_rsrc, route)
 
             # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
             # it to the warp. Single-token pow2 cases use the dedicated st_ksplit
@@ -705,6 +740,10 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
+        g2l_lut: fx.Pointer,
+        weight_in: fx.Pointer,
+        gather_w: fx.Pointer,
+        n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -722,6 +761,10 @@ def build_moe_fused_route_quant_scatter_module(
             grouped_scale,
             expert_row_base,
             numel,
+            g2l_lut,
+            weight_in,
+            gather_w,
+            n_buckets,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_THREADS, 1, 1),

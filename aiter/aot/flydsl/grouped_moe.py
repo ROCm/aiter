@@ -204,6 +204,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     i32 = torch.int32
     u8 = torch.uint8
     bf16 = torch.bfloat16
+    f32 = torch.float32
     E = job["experts"]
     topk = job["topk"]
     model_dim = job["model_dim"]
@@ -324,7 +325,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 use_expert_row_base=False,
                 max_m=max_m,
             )
-            launch(
+            launch_args = [
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
@@ -333,9 +334,16 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 ptr_arg(torch.empty(0, dtype=u8, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 numel,
-                grid,
-                stream=0,
-            )
+            ]
+            if not use_st_ksplit:
+                # Generic path carries the (unused-by-default) EP g2l fusion ABI.
+                launch_args += [
+                    ptr_arg(torch.empty(0, dtype=i32, device=dev)),  # g2l_lut
+                    ptr_arg(torch.empty(0, dtype=f32, device=dev)),  # weight_in
+                    ptr_arg(torch.empty(0, dtype=bf16, device=dev)),  # gather_w
+                    0,  # n_buckets
+                ]
+            launch(*launch_args, grid, stream=0)
         a2_out_e, a2_out_m = E, max_m
 
     # --- Stage2 activation prep (a2): fused grouped quant + preshuffle ---
