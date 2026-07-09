@@ -52,6 +52,24 @@ torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def _parse_num_expert_activated():
+    raw = os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0")
+    try:
+        val = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer, got {raw!r}"
+        )
+    if val < 0:
+        raise ValueError(
+            f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}"
+        )
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = _parse_num_expert_activated()
 
 
 @benchmark()
@@ -78,7 +96,6 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     reference_intermediate_pad=0,
-    ref_dtype="bf16",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -109,7 +126,22 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
-    if AITER_MOE_EXPERT_BALANCE:
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other E-n experts are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > E or n_act > token * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
+                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+            )
+        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        slot = torch.arange(token * topk) % n_act  # round-robin over active set
+        rows = torch.arange(token).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
         end_col = topk
@@ -320,13 +352,6 @@ def test_fmoe(
                 # Fused Swiglu MXFP4 quantizes the f32 activation directly.
                 # Keep the torch reference at f32 until the quantization step.
                 stage1_ref_dtype = dtypes.fp32
-
-    # --ref-dtype fp32: keep the reference intermediate in fp32 so the a2 mxfp4
-    # amax is taken over fp32 (not bf16). This mirrors the fused asm kernel, which
-    # computes amax on the in-register fp32 silu result (no bf16 round-trip that
-    # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
-    if ref_dtype == "fp32":
-        stage1_ref_dtype = dtypes.fp32
 
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -664,15 +689,6 @@ parser.add_argument(
     alone, excluding input prep) and report them as us_stage1 / us_stage2.
     Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
     n/a.""",
-)
-parser.add_argument(
-    "--ref-dtype",
-    choices=["bf16", "fp32"],
-    default="bf16",
-    help="Precision of the torch reference stage-1 intermediate. 'fp32' keeps it "
-    "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
-    "kernel, which computes amax on the in-register fp32 silu result, instead "
-    "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
 )
 
 args = parser.parse_args()
@@ -1032,9 +1048,7 @@ for kwargs, extras in case_iter:
             run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
         with aot_guard:
-            ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
-            )
+            ret = test_fmoe(**kwargs, kernel_bench=args.kernel)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
