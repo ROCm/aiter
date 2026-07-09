@@ -390,7 +390,8 @@ def _v4_dequant_nope_bpad8(
 
 
 def torch_mla_extend_v4_silver(
-    # Q (per-token, kernel layout): NOPE 448 FP8 + dup-scale 16 + zero pad 112
+    # Q (per-token, kernel layout): NOPE 448 FP8 + dup-E8M0 scale 14 + unused
+    # trailing pad 50 = 512 bytes/token (kernel never reads bytes [462, 512)).
     q_packed,  # [total_q, nhead, 512]              FP8
     q_rope_bf16,  # [total_q, nhead, 64]               BF16
     # KV (paged, kernel layout)

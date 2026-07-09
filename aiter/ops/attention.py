@@ -1389,7 +1389,41 @@ def mla_reduce_v1(
     num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-) -> None: ...
+) -> None:
+    """
+    Cross-split (flash-style) reduction for split-KV MLA decode.
+
+    The decode kernel splits each (batch, head) sequence into KV tiles and
+    writes one *partial* attention output + log-sum-exp per split. This op
+    combines the partials belonging to the same query tile into the final
+    output using the standard online-softmax combine
+    (``out = sum_k exp(lse_k - lse*) * out_k``), then normalizes.
+
+    Args:
+        partial_output: [max(reduce_partial_map)+s, h, dv] fp32. Per-split
+            partial attention outputs (unnormalized numerators) to merge.
+        partial_lse: [max(reduce_partial_map)+s, h] fp32. Per-split
+            log-sum-exp denominators paired with ``partial_output``.
+        reduce_indptr: [#reduce_tiles + 1] int32. Group boundaries into
+            ``reduce_partial_map``: the partials for reduce tile ``i`` are
+            ``reduce_partial_map[reduce_indptr[i] : reduce_indptr[i+1]]``.
+        reduce_final_map: optional [#reduce_tiles, 2] int32. The final-output
+            location of each merged group. ``None`` means the reduce tiles
+            map to final rows in order (no indirection).
+        reduce_partial_map: [reduce_indptr[-1]] int32. Locations in the
+            partial buffer of the tiles waiting to be reduced.
+        max_seqlen_q: max query length (tokens) per decode step.
+        num_kv_splits: sizing hint for the reducer's per-split LDS scratch
+            (``max_splits = max(device_cu_count, num_kv_splits)``).
+            **``0`` means auto** — size to the device CU count. Pass a value
+            larger than the CU count only to force a bigger split budget;
+            values <= CU count (incl. 0) are clamped up to it.
+        final_output: [bs, h, dv]. Combined, normalized output (written
+            in-place).
+        final_lse: optional [bs, h] fp32. Combined LSE; written only when
+            provided.
+    """
+    ...
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
