@@ -271,7 +271,7 @@ def _moe_gemm_a16w4(
         warps_per_cta=[num_warps, 1],
         order=[1, 0]
     )
-    
+
     # X / gather offsets
     X_base = X
     if GatherIndx is None:
@@ -354,7 +354,8 @@ def _moe_gemm_a16w4(
             .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
             .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
         )
-        # scaled_upcast requires scale.layout == output layout; the only loop convert.
+        # scaled_upcast requires scale.layout == output layout; gluon can't thread a
+        # linear layout (#linear2) through the unswizzle, so keep one cheap convert.
         w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
 
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
@@ -403,6 +404,7 @@ def _moe_gemm_a16w4(
         out = out * gammas[:, None]
 
     # Store Y (output N is OUT_BLOCK_N / yN after the activation reduction).
+    # Hardware buffer store directly in out's MFMA layout -- no convert_layout.
     offs_y_m = offs_out_m
     offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
         0, OUT_BLOCK_N, gl.SliceLayout(0, GLOBAL_STORE_LAYOUT_Y)
@@ -410,8 +412,10 @@ def _moe_gemm_a16w4(
     mask_m = offs_y_m < M
     mask_n = offs_y_n < yN
     Y += start_m * stride_y_m
-    YPtrs = Y + (offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n)
-    gl.store(YPtrs, out.to(Y.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+    y_offsets = offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n
+    gl.amd.cdna3.buffer_store(
+        out.to(Y.dtype.element_ty), Y, y_offsets, mask=mask_m[:, None] & mask_n[None, :]
+    )
     
 
 
