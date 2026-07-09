@@ -183,7 +183,11 @@ def pipeline_fence_wait(use_cluster=False):
 
 
 def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
-    """Emit one or more TDM loads, optionally one descriptor per loader wave."""
+    """Emit one or more TDM loads, optionally one descriptor per loader wave.
+
+    A descriptor may carry a ``cache_policy`` attribute (CPOL immediate); it
+    defaults to 0 for descriptors that don't set one (unchanged behavior).
+    """
     if wave_specialized:
         if wave_id is None:
             wave_id = rocdl.wave_id()
@@ -195,12 +199,14 @@ def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
             )
             if_op = scf.IfOp(is_loader_wave)
             with ir.InsertionPoint(if_op.then_block):
-                tdm_ops.tensor_load_2d(desc)
+                tdm_ops.tensor_load_2d(
+                    desc, cache_policy=getattr(desc, "cache_policy", 0)
+                )
                 scf.YieldOp([])
         return
 
     for desc in descs:
-        tdm_ops.tensor_load_2d(desc)
+        tdm_ops.tensor_load_2d(desc, cache_policy=getattr(desc, "cache_policy", 0))
 
 
 def store_acc_vec8_to_lds(memref, base_elem_off, imm_elem_off, acc_vec8, out_elem=None):
