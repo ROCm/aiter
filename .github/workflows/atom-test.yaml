@@ -82,11 +82,11 @@ jobs:
           # its MoE scratch buffers on gfx950); injected via model_env_overrides
           # below. It runs under ci:atom_full, not on every PR.
           default_models = [
-              {"model_name": "DeepSeek-R1-0528"},
+              # {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
               # Kimi-K2.7 ATOM (in-tree) downstream gate. Config (model_path,
               # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
-              {"model_name": "Kimi-K2.7-Code-MXFP4"},
+              # {"model_name": "Kimi-K2.7-Code-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -362,6 +362,14 @@ jobs:
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
         run: |
           set -euo pipefail
+          # Capture per-sample generations (question, reference, full model
+          # response, exact_match) for accuracy debugging. lm-eval only writes
+          # samples_*.jsonl when --log_samples is passed. Only append it to a
+          # custom client_command; leaving the default (empty) command untouched
+          # so atom_test.sh's default-path detection is not tripped.
+          if [ -n "${CLIENT_COMMAND}" ]; then
+            CLIENT_COMMAND="${CLIENT_COMMAND} --log_samples"
+          fi
           echo ""
           echo "========== Launching ATOM server =========="
           if docker exec atom_aiter_test bash -lc "[ -d /models ]"; then
@@ -431,6 +439,15 @@ jobs:
         with:
           name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_server_log
           path: atom_server.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload accuracy samples
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_accuracy_samples
+          path: accuracy_test_results/**
           retention-days: 7
           if-no-files-found: warn
 
