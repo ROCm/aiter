@@ -116,7 +116,7 @@ def _moe_sorting_impl(
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # moe_buf shape depends on the downstream stage2 path:
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
