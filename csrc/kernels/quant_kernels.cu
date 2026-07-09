@@ -56,10 +56,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int64_t row_offset       = static_cast<int64_t>(blockIdx.x) * block_size;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
-    // Shuffle tiles e8m0 bytes 8-wide along scaleN regardless of element
-    // dtype, so the padding applies to any e8m0-scale path (fp4 always,
-    // fp8 only when emit_e8m0_scale).
-    int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale)
+    // Shuffle tiles e8m0 bytes 8-wide along scaleN for the MX hardware
+    // scale-load layout (group_size == 32 only); group_size == 128 shuffle
+    // is a plain transpose and needs no padding.
+    int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale && group_size == 32)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
     int64_t x                = groupId / scaleN_pad;
@@ -132,7 +132,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
             if constexpr(shuffle_scale)
             {
-                groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
+                if constexpr(group_size == 32)
+                    groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
+                else
+                    groupId = y * ori_rows + x;
             }
             tmp[groupId] = exponent;
         }
@@ -886,12 +889,12 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
             // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
-            // regardless of element dtype; non-shuffle / fp32-scale paths
-            // use exactly `rows * scaleN` slots.
+            // for the MX hw layout (_GS == 32 only); group_size == 128
+            // shuffle is a plain transpose, no padding.
             int num_group;
             if constexpr(ee)
             {
-                num_group = ss ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
+                num_group = (ss && _GS == 32) ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
             }
             else
             {
