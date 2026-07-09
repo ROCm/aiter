@@ -267,7 +267,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4 / a8w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -646,6 +646,13 @@ parser.add_argument(
     help="Skip validating flydsl shapes from tuned fmoe CSVs.",
 )
 parser.add_argument(
+    "--csv-filter",
+    nargs="*",
+    default=None,
+    help="Only run CSV rows whose kernelName1/2 contain any of these substrings "
+    "(e.g. --csv-filter abf16_wbf16 to validate just bf16-dense flydsl rows).",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -773,6 +780,10 @@ def _iter_csv_cases():
         kernel_name2 = str(row.get("kernelName2", "") or "")
         if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
             continue
+        if args.csv_filter:
+            _kn = kernel_name1 + " " + kernel_name2
+            if not any(sub in _kn for sub in args.csv_filter):
+                continue
         try:
             kwargs = _row_to_kwargs(row)
         except Exception as e:
@@ -808,7 +819,9 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        kwargs["check_aot_cache"] = True
+        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
+        # configs have no pre-registered AOT cache entry).
+        kwargs["check_aot_cache"] = args.csv_filter is None
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -823,6 +836,9 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
+    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
+    # property (not a tuned-config key); request INTERLEAVE here for them.
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
