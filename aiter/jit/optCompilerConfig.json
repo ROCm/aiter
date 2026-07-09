@@ -1709,5 +1709,23 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_gdn_chunk_prepare": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_chunk_prepare.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/opus_gdn_chunk_prepare_launch.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/opus_gdn_chunk_prepare_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "'-std=c++20'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }

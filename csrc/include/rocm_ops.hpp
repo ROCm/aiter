@@ -2414,3 +2414,16 @@ namespace py = pybind11;
           py::arg("split_output"),      \
           py::arg("split_lse"),         \
           py::arg("final_output"));
+
+// Fused intra-chunk GDN prefill preparation
+// (chunk_local_cumsum + chunk_scaled_dot_kkt_fwd + solve_tril + recompute_w_u_fwd)
+#define GDN_CHUNK_PREPARE_PYBIND               \
+    m.def("gdn_chunk_prepare_fwd",             \
+          &gdn_chunk_prepare_fwd,              \
+          py::arg("k"),                        \
+          py::arg("v"),                        \
+          py::arg("g"),                        \
+          py::arg("beta"),                     \
+          py::arg("w_bar"),                    \
+          py::arg("u_bar"),                    \
+          py::arg("g_cumsum"));
