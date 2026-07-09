@@ -220,9 +220,13 @@ def compile_moe_gemm1(
     # For groupwise scale, weight scale is applied per-group in the K loop,
     # so epilogue can skip weight scale multiplication (uses 1.0 for sw).
 
-    _is_gfx950 = "gfx95" in get_hip_arch()
-    _has_cvt_off_f32_i4 = hasattr(rocdl, "cvt_off_f32_i4")
-    use_gfx950_cvt = is_int4_bf16 and _is_gfx950 and _has_cvt_off_f32_i4
+    _is_gfx950 = "gfx95" in gpu_arch
+    if is_nvfp4_bf16 and gpu_arch != "gfx942" and gpu_arch != "gfx950":
+        raise ValueError(
+            "FlyDSL nvfp4_bf16 MoE kernels are supported only on gfx942/gfx950, "
+            f"got {gpu_arch}."
+        )
+    use_gfx950_cvt = (is_int4_bf16 or is_nvfp4_bf16) and _is_gfx950
 
     # Split-K validation
     _is_splitk = k_batch > 1
@@ -1252,14 +1256,22 @@ def compile_moe_gemm1(
                                     acc_idx = mi * num_acc_n + ni
                                     packed_g, sc_g = b_gate_raw[ni]
                                     bg0, bg1 = unpack_b_nvfp4(
-                                        packed_g, sc_g, arith, vector
+                                        packed_g,
+                                        sc_g,
+                                        arith,
+                                        vector,
+                                        use_gfx950_cvt=use_gfx950_cvt,
                                     )
                                     gate_list[acc_idx] = mfma_k64(
                                         gate_list[acc_idx], a0, a1, bg0, bg1
                                     )
                                     packed_u, sc_u = b_up_raw[ni]
                                     bu0, bu1 = unpack_b_nvfp4(
-                                        packed_u, sc_u, arith, vector
+                                        packed_u,
+                                        sc_u,
+                                        arith,
+                                        vector,
+                                        use_gfx950_cvt=use_gfx950_cvt,
                                     )
                                     up_list[acc_idx] = mfma_k64(
                                         up_list[acc_idx], a0, a1, bu0, bu1
@@ -1603,7 +1615,7 @@ def compile_moe_gemm1(
 
                 # When defer_scale16 was used, the x16 correction for v_cvt_off_f32_i4
                 # was omitted from the hot loop.  Fold it into the epilogue scale.
-                if const_expr(use_gfx950_cvt):
+                if const_expr(is_int4_bf16 and use_gfx950_cvt):
                     _c16 = fx.Float32(16.0)
                     sw_gate_vals = [v * _c16 for v in sw_gate_vals]
                     sw_up_vals = [v * _c16 for v in sw_up_vals]
@@ -2268,9 +2280,13 @@ def compile_moe_gemm2(
     _scale_is_bf16 = scale_is_bf16 and use_groupwise_scale
     experts * model_dim * num_groups
 
-    _is_gfx950 = "gfx95" in get_hip_arch()
-    _has_cvt_off_f32_i4 = hasattr(rocdl, "cvt_off_f32_i4")
-    use_gfx950_cvt = is_int4_bf16 and _is_gfx950 and _has_cvt_off_f32_i4
+    _is_gfx950 = "gfx95" in gpu_arch
+    if is_nvfp4_bf16 and gpu_arch != "gfx942" and gpu_arch != "gfx950":
+        raise ValueError(
+            "FlyDSL nvfp4_bf16 MoE kernels are supported only on gfx942/gfx950, "
+            f"got {gpu_arch!r}."
+        )
+    use_gfx950_cvt = (is_int4_bf16 or is_nvfp4_bf16) and _is_gfx950
 
     mfma_i32_k32 = None
     if is_int8:
@@ -3215,7 +3231,11 @@ def compile_moe_gemm2(
                                     acc_idx = mi * num_acc_n + ni
                                     packed, sc = b_raw[ni]
                                     b0, b1 = unpack_b_nvfp4(
-                                        packed, sc, arith, vector
+                                        packed,
+                                        sc,
+                                        arith,
+                                        vector,
+                                        use_gfx950_cvt=use_gfx950_cvt,
                                     )
                                     acc_list[acc_idx] = mfma_k64(
                                         acc_list[acc_idx], a0, a1, b0, b1
@@ -3565,7 +3585,7 @@ def compile_moe_gemm2(
 
                 # When defer_scale16 was used, the x16 correction for v_cvt_off_f32_i4
                 # was omitted from the hot loop.  Fold it into the epilogue scale.
-                if const_expr(use_gfx950_cvt):
+                if const_expr(is_int4_bf16 and use_gfx950_cvt):
                     _c16 = fx.Float32(16.0)
                     sw_vals = [v * _c16 for v in sw_vals]
 

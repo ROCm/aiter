@@ -1017,19 +1017,25 @@ def load_b_raw_nvfp4_groupwise(
     return packed32, scale
 
 
-def unpack_b_nvfp4(packed32, scale_i8, arith, vector):
-    """Dequantize packed fp4 to two bf16x4 i64 fragments for BF16 MFMA.
+def pack_bf16x4_to_i64(elems, arith, vector):
+    v_i16x4 = vector.from_elements(
+        T.i16x4, [arith.bitcast(T.i16, elem) for elem in elems]
+    )
+    v_i32x2 = vector.bitcast(T.vec(2, T.i32), v_i16x4)
+    v_i64x1 = vector.bitcast(T.vec(1, T.i64), v_i32x2)
+    return vector.extract(v_i64x1, static_position=[0], dynamic_position=[])
 
-    The fp8 block scale is applied here. The global f32 scale is intentionally
-    left for the epilogue so accumulation remains in f32 before global scaling.
-    """
-    scale_f32 = rocdl.cvt_f32_fp8(T.f32, arith.extui(T.i32, scale_i8), 0)
+
+def _unpack_b_nvfp4_gfx950(packed32, scale_f32, arith, vector):
     unity = arith.constant(1.0, type=T.f32)
     bf16x2_ty = T.vec(2, T.bf16)
 
     def fp4_bytes_to_i64(sel_a: int, sel_b: int, block_scale):
         elems = []
         for byte_sel in (sel_a, sel_b):
+            # Use hardware v_cvt_scalef32_pk_bf16_fp4 with scale=1.0
+            # (f32 1.0 has exponent bits 0x7F=127, so E8M0 factor = 2^(127-127) = 1)
+            # for pure FP4->bf16 conversion, then scale separately in bf16.
             pair = cvt_scalef32_pk_bf16_fp4(bf16x2_ty, packed32, unity, byte_sel)
             for elem_idx in range(2):
                 v = vector.extract(
@@ -1037,13 +1043,85 @@ def unpack_b_nvfp4(packed32, scale_i8, arith, vector):
                 )
                 v_f32 = arith.extf(T.f32, v)
                 elems.append(arith.truncf(T.bf16, v_f32 * block_scale))
-        v_i16x4 = vector.from_elements(
-            T.i16x4, [arith.bitcast(T.i16, elem) for elem in elems]
-        )
-        v_i32x2 = vector.bitcast(T.vec(2, T.i32), v_i16x4)
-        v_i64x1 = vector.bitcast(T.vec(1, T.i64), v_i32x2)
-        return vector.extract(v_i64x1, static_position=[0], dynamic_position=[])
+        return pack_bf16x4_to_i64(elems, arith, vector)
 
     b0 = fp4_bytes_to_i64(0, 1, scale_f32)
     b1 = fp4_bytes_to_i64(2, 3, scale_f32)
     return b0, b1
+
+def _unpack_b_nvfp4_gfx942(packed32, scale_f32, arith, vector):
+    def decode_e2m1_to_f32(nibble_i32):
+        magnitude = arith.andi(nibble_i32, arith.constant(0x07, type=T.i32))
+        sign_bit = arith.andi(
+            arith.shrui(nibble_i32, arith.constant(3, type=T.i32)),
+            arith.constant(1, type=T.i32),
+        )
+        fp32_bits = arith.addi(
+            arith.constant(0x3F000000, type=T.i32),
+            arith.shli(magnitude, arith.constant(22, type=T.i32)),
+        )
+        val = arith.bitcast(T.f32, fp32_bits)
+        is_zero = arith.cmpi(
+            CmpIPredicate.eq, magnitude, arith.constant(0, type=T.i32)
+        )
+        val = arith.select(is_zero, arith.constant(0.0, type=T.f32), val)
+        is_one = arith.cmpi(
+            CmpIPredicate.eq, magnitude, arith.constant(1, type=T.i32)
+        )
+        val = arith.select(is_one, arith.constant(0.5, type=T.f32), val)
+        neg_val = arith.negf(val)
+        is_negative = arith.cmpi(
+            CmpIPredicate.ne, sign_bit, arith.constant(0, type=T.i32)
+        )
+        return arith.select(is_negative, neg_val, val)
+
+    # NVFP4 block scales are stored as OCP e4m3fn. On gfx942, v_cvt_f32_fp8
+    # decodes the same byte as AMD e4m3fnuz (bias 8), which is half the OCP
+    # value (bias 7). Compensate in the software FP4 fallback.
+    scale_f32 = scale_f32 * fx.Float32(2.0)
+    packed_vec = vector.bitcast(
+        T.vec(4, T.i8), vector.from_elements(T.vec(1, T.i32), [packed32])
+    )
+
+    def fp4_bytes_to_i64(sel_a: int, sel_b: int, block_scale):
+        elems = []
+        for byte_sel in (sel_a, sel_b):
+            raw_byte = vector.extract(
+                packed_vec, static_position=[byte_sel], dynamic_position=[]
+            )
+            raw_byte_i32 = arith.extui(T.i32, raw_byte)
+
+            low_nibble = arith.andi(raw_byte_i32, arith.constant(0x0F, type=T.i32))
+            low_bf16 = arith.truncf(
+                T.bf16, arith.mulf(decode_e2m1_to_f32(low_nibble), block_scale)
+            )
+
+            high_nibble = arith.andi(
+                arith.shrui(raw_byte_i32, arith.constant(4, type=T.i32)),
+                arith.constant(0x0F, type=T.i32),
+            )
+            high_bf16 = arith.truncf(
+                T.bf16, arith.mulf(decode_e2m1_to_f32(high_nibble), block_scale)
+            )
+
+            elems.append(low_bf16)
+            elems.append(high_bf16)
+        return pack_bf16x4_to_i64(elems, arith, vector)
+
+    b0 = fp4_bytes_to_i64(0, 1, scale_f32)
+    b1 = fp4_bytes_to_i64(2, 3, scale_f32)
+    return b0, b1
+
+
+def unpack_b_nvfp4(packed32, scale_i8, arith, vector, use_gfx950_cvt=False):
+    """Dequantize packed fp4 to two bf16x4 i64 fragments for BF16 MFMA.
+
+    The fp8 block scale is applied here. The global f32 scale is intentionally
+    left for the epilogue so accumulation remains in f32 before global scaling.
+    """
+    scale_f32 = rocdl.cvt_f32_fp8(T.f32, arith.extui(T.i32, scale_i8), 0)
+
+    if use_gfx950_cvt:
+        return _unpack_b_nvfp4_gfx950(packed32, scale_f32, arith, vector)
+    else:
+        return _unpack_b_nvfp4_gfx942(packed32, scale_f32, arith, vector)

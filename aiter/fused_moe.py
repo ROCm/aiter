@@ -825,17 +825,24 @@ def _get_default_bf16_nvfp4_fused_moe_params(
 ) -> dict[str, int | str]:
     """Return AITER's fallback FlyDSL params for BF16 x NVFP4 fused MoE."""
     from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+    from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
 
     tile_m = (
         get_block_size_M(token, topk, expert, inter_dim)
         if block_m is None
         else int(block_m)
     )
-    stage1_tile_k = (
-        256 if model_dim % 256 == 0 else 128 if model_dim % 128 == 0 else 64
+    arch = get_gfx()
+    lds_cap_bytes = _LDS_CAP_BYTES[arch]
+    stage1_tile_k = next(
+        tk
+        for tk in (256, 128, 64)
+        if model_dim % tk == 0 and 2 * int(tile_m) * int(tk) * 2 <= lds_cap_bytes
     )
-    stage2_tile_k = (
-        256 if inter_dim % 256 == 0 else 128 if inter_dim % 128 == 0 else 64
+    stage2_tile_k = next(
+        tk
+        for tk in (256, 128, 64)
+        if inter_dim % tk == 0 and 2 * int(tile_m) * int(tk) * 2 <= lds_cap_bytes
     )
 
     kernelName1 = flydsl_kernel_name(
@@ -1473,7 +1480,7 @@ def get_2stage_cfgs(
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys}{', performance may be suboptimal. Consider using AITER_ONLINE_TUNE=1 to tune AITER fused MOE online, or use AITER csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py offline"' if cfg is None else ''}."
+        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys}{', performance may be suboptimal. Consider using AITER_ONLINE_TUNE=1 to tune AITER fused MOE online, or use AITER csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py offline' if cfg is None else ''}."
     )
 
     def get_block_m() -> int:
