@@ -48,6 +48,8 @@ def _fwd_kernel_stage2_asm(
     cur_qo_start = tl.load(qo_indptr + cur_batch)
     cur_qo_end = tl.load(qo_indptr + cur_batch + 1)
     cur_split_start = tl.load(num_kv_splits_indptr + cur_batch)
+    cur_split_end = tl.load(num_kv_splits_indptr + cur_batch + 1)
+    num_max_kv_splits = tl.load(num_kv_splits_indptr + BATCH_NUM)
     cur_kv_start = tl.load(kv_indptr + cur_batch)
     cur_kv_end = tl.load(kv_indptr + cur_batch + 1)
     cur_kv_seq_len = cur_kv_end - cur_kv_start
@@ -56,8 +58,6 @@ def _fwd_kernel_stage2_asm(
         cur_kv_seq_len = (cur_kv_page_count - 1) * page_size + tl.load(
             kv_last_page_lens + cur_batch
         )
-    num_max_kv_splits = tl.load(num_kv_splits_indptr + BATCH_NUM)
-    cur_kv_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
 

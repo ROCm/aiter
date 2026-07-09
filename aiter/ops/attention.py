@@ -418,6 +418,7 @@ def _pa_decode_bf16_asm(
     V: torch.Tensor,
     kv_indices: torch.Tensor,
     context_lens: torch.Tensor,
+    softmax_scale: float,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
@@ -524,9 +525,12 @@ def pa_reduce_v1(
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
-    num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
+    # num_kv_splits is trailing+optional so the ATOM call site (which passes 8
+    # positional args, no split count) stays aligned. The kernel uses
+    # max(SM_count, num_kv_splits), so the default 0 means "auto" (SM_count).
+    num_kv_splits: int = 0,
 ) -> None:
     mla_reduce_v1(
         partial_output,
@@ -606,7 +610,6 @@ def pa_persistent_fwd(
         reduce_final_map,
         reduce_partial_map,
         max_qlen,
-        0,
         output,
         final_lse,
     )
