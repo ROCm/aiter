@@ -15,7 +15,6 @@ from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
@@ -31,11 +30,8 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
-
-def _raw(v):
-    if not isinstance(v, ir.Value) and hasattr(v, "ir_value"):
-        return v.ir_value()
-    return v
+# Canonical ArithValue/Numeric -> raw ir.Value unwrap (same helper tdm_ops aliases).
+_raw = arith._to_raw
 
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
