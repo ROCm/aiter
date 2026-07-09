@@ -318,6 +318,9 @@ def sage_quant(
     smooth_k=True,
     q_smoothing=False,
     return_lse=False,
+    hadamard_rotation=False,
+    R=None,
+    BLOCK_R=None,
 ):
     """
     Quantize Q and K tensors to INT8 with per-block scaling.
@@ -336,6 +339,9 @@ def sage_quant(
         q_smoothing: Whether to center Q per block and return delta_s correction (default: False)
         return_lse: If True, additionally return a per-query-row LSE correction
             term that compensates for K smoothing (default: False)
+        hadamard_rotation: Apply normalized Hadamard rotation to Q/K before INT8 quant
+        R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
+        BLOCK_R: Hadamard tile size; required when hadamard_rotation=True and R is None
     Returns:
         q_int8: Quantized Q tensor
         q_scale: Per-block scales for Q
@@ -374,7 +380,46 @@ def sage_quant(
 
     delta_s = None
     k_mean = None
-    if q_smoothing:
+    if hadamard_rotation:
+        if R is None:
+            assert (
+                BLOCK_R is not None
+            ), "if using hadamard rotation, BLOCK_R must be provided when R is None"
+            R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+                BLOCK_R**0.5
+            )
+        else:
+            BLOCK_R = R.shape[-1]
+        if head_dim % BLOCK_R != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by BLOCK_R ({BLOCK_R})"
+            )
+
+        if return_lse and smooth_k:
+            k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+
+        q, k, _ = rotation_smooth_qk(
+            q,
+            k,
+            BLKQ,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=False,
+            sm_scale=None,
+            layout=layout,
+            smooth_k=False,
+        )
+        if q_smoothing:
+            if smooth_k:
+                if k_mean is None:
+                    k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+                k = k - k_mean
+            q, delta_s = _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale)
+        elif smooth_k:
+            if k_mean is None:
+                k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+            k = k - k_mean
+    elif q_smoothing:
         if smooth_k:
             k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
             k = k - k_mean

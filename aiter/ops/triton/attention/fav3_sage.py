@@ -101,6 +101,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         smooth_k: bool = True,
         q_smooth: bool = False,
+        hadamard_rotation: bool = False,
+        R: Optional[torch.Tensor] = None,
+        BLOCK_R: Optional[int] = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -159,6 +162,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             smooth_k=smooth_k,
             q_smoothing=q_smooth,
             return_lse=return_lse,
+            hadamard_rotation=hadamard_rotation,
+            R=R,
+            BLOCK_R=BLOCK_R,
         )
         q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sq_result[:6]
         rest = sq_result[6:]
@@ -238,6 +244,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # block_lut
             None,  # smooth_k
             None,  # q_smooth
+            None,  # hadamard_rotation
+            None,  # R
+            None,  # BLOCK_R
         )
 
 
@@ -258,6 +267,9 @@ def fav3_sage_wrapper_func(
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     smooth_k: bool = True,
     q_smooth: bool = False,
+    hadamard_rotation: bool = False,
+    R: Optional[torch.Tensor] = None,
+    BLOCK_R: Optional[int] = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -290,6 +302,9 @@ def fav3_sage_wrapper_func(
                 When None, dense attention is used.
         smooth_k: Whether to apply k-smoothing to the K tensor (default: True)
         q_smooth: Apply per-block Q centering with delta_s bias correction (default: False)
+        hadamard_rotation: Apply normalized Hadamard rotation to Q/K before INT8 quant
+        R: Optional pre-built Hadamard matrix (BLOCK_R x BLOCK_R)
+        BLOCK_R: Hadamard tile size when hadamard_rotation=True and R is None
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -338,6 +353,9 @@ def fav3_sage_wrapper_func(
         block_lut,
         smooth_k,
         q_smooth,
+        hadamard_rotation,
+        R,
+        BLOCK_R,
     )
 
 
