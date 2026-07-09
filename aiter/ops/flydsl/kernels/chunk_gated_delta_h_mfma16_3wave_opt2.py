@@ -703,17 +703,38 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                 gpu.barrier()
 
             # ============================================================
-            # 0. PREFETCH u + g BEFORE step 1 (HIP-aligned, rev302):
-            # Issue all scalar HBM loads for u (16 bf16) and g (1 g_last +
-            # 16 g_row = 17 f32) NOW, right after B1. The intervening LDS
-            # writes (step 1-3, ~16 cy) + B3 barrier (~30 cy) + GEMM1
-            # (128 cy) = ~174 cy of overlap hide most of the ~300 cy HBM
-            # latency; 3-wave occupancy covers the remaining ~93 cy stall.
+            # 0. UNIFIED PLAN: Issue u/g HBM loads EARLY (opt 3), then
+            # interleave ht store with w ds_write (opt 1). This:
+            #   - Gives u/g ~200+ cy latency hiding before B3 (was ~60 cy)
+            #   - Spreads ht stores with ds_write gaps (max burst 1, was 4)
             # ============================================================
+
+            # 0a. Issue u cooperative HBM loads FIRST (before ht stage).
+            # The ht_ds_write + B2 barrier + ht readout (~100 cy) all happen
+            # before B3, hiding u/g HBM latency without any vmcnt stall.
+            if const_expr(USE_LDS_U):
+                _u_vecs = []
+                for batch in range_constexpr(NUM_LOAD_BATCHES_U):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_U) + u_load_row_in_batch
+                    abs_row = i_t_i32 * fx.Int32(BT) + row
+                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                    u_g_off = (
+                        v_base + safe_row * stride_v
+                        + i_v * fx.Int32(BV) + u_load_col_base
+                    )
+                    _u_vecs.append(v_.vec_load((fx.Index(u_g_off),), LOAD_VEC_WIDTH))
+
+            # 0b. Issue g HBM load EARLY (same rationale as u).
+            if const_expr(USE_G and USE_LDS_G):
+                g_stage_row = tid % fx.Int32(BT)
+                g_stage_abs = i_t_i32 * fx.Int32(BT) + g_stage_row
+                g_stage_in_bounds = g_stage_abs < T_local
+                g_stage_safe = g_stage_in_bounds.select(g_stage_abs, fx.Int32(0))
+                g_stage_off = i_h * T_flat + (bos + g_stage_safe)
+                g_stage_val = g_[fx.Index(g_stage_off)]
+                g_stage_val = g_stage_in_bounds.select(g_stage_val, fx.Float32(0.0))
+
             if const_expr(not USE_LDS_U):
-                # Scalar u prefetch: each lane loads its own u elements from HBM.
-                # When USE_LDS_U=True, u is cooperatively loaded to lds_u in step 2
-                # and read from LDS in step 5, so this prefetch is skipped.
                 u_pf_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
                 u_prefetch = []
                 for _pf_m in range_constexpr(BT_MTILES):
@@ -751,6 +772,9 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                             _pf_ib,
                         ))
 
+            # ============================================================
+            # 1. h snapshot -> lds_ht (ds_write only, hides u/g HBM latency)
+            # ============================================================
             ht_v_col = wid * fx.Int32(16) + lane_n
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(K_SUB_PER_BLOCK):
@@ -765,94 +789,76 @@ def compile_chunk_gated_delta_h_mfma16_3wave_opt2(
                     lds_ht.vec_store((fx.Index(ht_idx),), ht_vec, 4)
 
             if const_expr(not HT_STORE_OVERLAP_GEMM2):
-                # rev226: B2 + coalesced b128 read-out at the TOP of the chunk.
-                # V*K = BV*K elems; each thread reads 8 contiguous K (one b128).
-                # Groups = BV*(K/8); iters = groups/BLOCK.
+                # 1b. B2 barrier + ht readout with interleaved w ds_write.
+                # Each ht store is separated by w ds_writes (pure LDS, no VMEM)
+                # to prevent store buffer burst (max consecutive store = 1).
                 gpu.barrier()
                 HT_K8 = K // 8
                 HT_GROUPS = BV * HT_K8
                 HT_ITERS = HT_GROUPS // BLOCK_THREADS
-                for it in range_constexpr(HT_ITERS):
-                    grp = fx.Int32(it * BLOCK_THREADS) + tid
-                    v_loc = grp // fx.Int32(HT_K8)
-                    k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
-                    ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
-                    tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
-                    v_global = i_v * fx.Int32(BV) + v_loc
-                    h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
-                    h_.vec_store((fx.Index(h_off),), tile8, 8)
-            # else (HT_STORE_OVERLAP_GEMM2): readout+store deferred to before
-            # GEMM2 (step 8) so GEMM2's MFMA hides the HBM store latency.
+                if const_expr(W_PF_INTERLEAVE):
+                    # Interleave: ht_store[i] then w_ds_write[2*i : 2*i+2]
+                    # NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64 = 2*2 = 4
+                    # HT_ITERS = 4, so 1 w_ds_write per ht_store iteration.
+                    _NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+                    _W_PER_HT = _NUM_W_LOADS // HT_ITERS  # should be 1
+                    for it in range_constexpr(HT_ITERS):
+                        grp = fx.Int32(it * BLOCK_THREADS) + tid
+                        v_loc = grp // fx.Int32(HT_K8)
+                        k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
+                        ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
+                        tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
+                        v_global = i_v * fx.Int32(BV) + v_loc
+                        h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
+                        h_.vec_store((fx.Index(h_off),), tile8, 8)
+                        # Interleave w ds_write (pure LDS, drains store buffer)
+                        for _wi in range_constexpr(_W_PER_HT):
+                            _w_idx = it * _W_PER_HT + _wi
+                            _kb_w = _w_idx // NUM_LOAD_BATCHES_64
+                            _batch_w = _w_idx % NUM_LOAD_BATCHES_64
+                            lds_w.vec_store(
+                                (fx.Index(_w_lds_off(_kb_w, _batch_w)),),
+                                w_pf[_w_idx], LOAD_VEC_WIDTH
+                            )
+                else:
+                    for it in range_constexpr(HT_ITERS):
+                        grp = fx.Int32(it * BLOCK_THREADS) + tid
+                        v_loc = grp // fx.Int32(HT_K8)
+                        k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
+                        ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
+                        tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
+                        v_global = i_v * fx.Int32(BV) + v_loc
+                        h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
+                        h_.vec_store((fx.Index(h_off),), tile8, 8)
+                    # w load + store (non-prefetch path)
+                    for kb in range_constexpr(NUM_K_BLOCKS):
+                        for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                            row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                            abs_row = i_t_i32 * fx.Int32(BT) + row
+                            safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                            w_g_off = (
+                                w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                            )
+                            w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
+                            col = fx.Int32(kb * 64) + load_col_base
+                            w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
+                            lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
 
-            # NOTE: no barrier here. readout reads lds_ht(=lds_k); step 2 writes
-            # the independent lds_w/lds_u (no conflict), and step 3's lds_k
-            # overwrite is guarded by the barrier after the u-load below. Adding
-            # a barrier here would be redundant (and costs occupancy-sensitive
-            # sync time over the full NT-chunk loop).
+            # 2a. Remaining w ds_write (if W_PF but HT_STORE_OVERLAP path
+            # skipped the interleave above -- only for non-overlap + prefetch
+            # which is the active configuration).
 
-            # ============================================================
-            # 2. Load w -> lds_w (NO prefetch; load now, use after barrier)
-            # ============================================================
-            # Pad-based bank-conflict avoidance (no XOR swizzle): the column is the
-            # plain logical column; the row pad in LDS_W_STRIDE offsets the banks.
-            # GEMM1 read mirrors this.
-            if const_expr(W_PF_INTERLEAVE):
-                # w already in registers (prefetched in prev chunk's GEMM2 /
-                # prologue) -- store-only, no HBM load here.
-                i_wp = 0
-                for kb in range_constexpr(NUM_K_BLOCKS):
-                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                        lds_w.vec_store(
-                            (fx.Index(_w_lds_off(kb, batch)),), w_pf[i_wp], LOAD_VEC_WIDTH
-                        )
-                        i_wp += 1
-            else:
-                for kb in range_constexpr(NUM_K_BLOCKS):
-                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                        row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                        abs_row = i_t_i32 * fx.Int32(BT) + row
-                        safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                        w_g_off = (
-                            w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                        )
-                        w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
-                        col = fx.Int32(kb * 64) + load_col_base
-                        w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
-                        lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
-
-            # EXPERIMENT (u-prefetch): cooperatively load u [BT, BV] -> lds_u,
-            # mirroring the w-load (u is V-contiguous in HBM, BV=64 per row =
-            # same decomposition as the 64-wide w rows). Replaces the 16 scalar
-            # buffer_load_ushort that were the #2 VMEM-wait hotspot. Published
-            # on the SAME barrier below as w (no extra barrier).
+            # 2b. u ds_write: store the previously-loaded u vectors to lds_u.
+            # By now u HBM loads have had ~160+ cy to complete (ht_stage 40 +
+            # barrier 40 + ht_readout 40 + w_interleave 40).
             if const_expr(USE_LDS_U):
-              for batch in range_constexpr(NUM_LOAD_BATCHES_U):
-                row = fx.Int32(batch * ROWS_PER_BATCH_U) + u_load_row_in_batch
-                abs_row = i_t_i32 * fx.Int32(BT) + row
-                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                u_g_off = (
-                    v_base + safe_row * stride_v
-                    + i_v * fx.Int32(BV) + u_load_col_base
-                )
-                u_vec = v_.vec_load((fx.Index(u_g_off),), LOAD_VEC_WIDTH)
-                u_lds_off = row * fx.Int32(LDS_U_STRIDE) + u_load_col_base
-                lds_u.vec_store((fx.Index(u_lds_off),), u_vec, LOAD_VEC_WIDTH)
+                for batch in range_constexpr(NUM_LOAD_BATCHES_U):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_U) + u_load_row_in_batch
+                    u_lds_off = row * fx.Int32(LDS_U_STRIDE) + u_load_col_base
+                    lds_u.vec_store((fx.Index(u_lds_off),), _u_vecs[batch], LOAD_VEC_WIDTH)
 
-            # OPT-C(g) (PHASE-4): cooperatively stage this chunk's per-row g into
-            # lds_g. BRANCHLESS: every thread maps to a row via ``tid % BT`` and
-            # stores that slot unconditionally (threads mapping to the same slot
-            # write the SAME value -> benign race). No ``if tid < BT`` -> no
-            # scf.if in the dynamic chunk loop. The w-barrier below publishes it;
-            # gating then reads g from LDS instead of ~17 scalar HBM loads/lane.
-            # Gated by USE_LDS_G: when False, gating reads g inline from HBM.
+            # 2c. g ds_write: store the previously-loaded g value to lds_g.
             if const_expr(USE_G and USE_LDS_G):
-                g_stage_row = tid % fx.Int32(BT)
-                g_stage_abs = i_t_i32 * fx.Int32(BT) + g_stage_row
-                g_stage_in_bounds = g_stage_abs < T_local
-                g_stage_safe = g_stage_in_bounds.select(g_stage_abs, fx.Int32(0))
-                g_stage_off = i_h * T_flat + (bos + g_stage_safe)
-                g_stage_val = g_[fx.Index(g_stage_off)]
-                g_stage_val = g_stage_in_bounds.select(g_stage_val, fx.Float32(0.0))
                 lds_g[fx.Index(g_stage_row)] = g_stage_val
 
             # ============================================================
