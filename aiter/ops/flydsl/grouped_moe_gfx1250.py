@@ -288,6 +288,28 @@ def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
+def _ep_remap_topk_ids(
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor,
+    E: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map global expert ids -> local [0, E); masked-out ids -> dump id E.
+
+    ``expert_mask`` is the global-sized (E_global,) 0/1 tensor; the i-th local
+    weight row corresponds to the i-th globally-enabled expert (mask==1), which
+    is exactly ``cumsum(mask) - 1`` at that position. Non-local routes are sent
+    to the dump bucket ``E`` and reported in ``drop_mask``.
+
+    Returns ``(local_topk_ids int32, drop_mask bool)`` (both topk_ids-shaped).
+    """
+    mask_bool = expert_mask.to(torch.bool)
+    g2l = expert_mask.to(torch.int64).cumsum(0) - 1
+    g2l = torch.where(mask_bool, g2l, torch.full_like(g2l, E))
+    local = g2l[topk_ids.to(torch.int64)]
+    drop = local == E
+    return local.to(torch.int32), drop
+
+
 def _maybe_grouped_gfx1250_a8w4_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -375,9 +397,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("AITER_DISABLE_GROUPED_A8W4 enabled; skip grouped mode")
         return None
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "default"
-    if expert_mask is not None or bias1 is not None or bias2 is not None:
-        _grouped_dbg("bias1 and bias not none")
-        # return None
+    _is_ep = expert_mask is not None
+    if _is_ep:
+        _grouped_dbg(f"EP enabled: expert_mask numel={expert_mask.numel()}, E={E}")
     if hidden_pad != 0 or intermediate_pad != 0:
         hidden_pad = 0
         intermediate_pad = 0
@@ -464,6 +486,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
+    if _is_ep:
+        # Remap global expert ids -> local; dropped (non-local) routes go to the
+        # dump id E for now. Their gather weight is zeroed so they contribute 0.
+        # ``local_topk_ids`` / ``n_route_buckets`` are finalized per routing
+        # variant once we know whether the contiguous scheduler is used.
+        _ep_local_full, _ep_drop = _ep_remap_topk_ids(topk_ids, expert_mask, E)
+        gather_weight = topk_weight.clone()
+        gather_weight[_ep_drop] = 0
+    else:
+        _ep_local_full = None
+        _ep_drop = None
+        gather_weight = topk_weight
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
@@ -583,7 +617,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
-    flat_experts = topk_ids.reshape(-1)
+    n_route_buckets = E
+    if _is_ep:
+        # Fold dropped (non-local) routes into bucket 0; their gather weight is
+        # 0, so they contribute nothing. Using a real bucket rather than an
+        # extra E+1 "dump" bucket keeps every grouped buffer at exactly
+        # (E, max_m, ..) -- required by the masked GEMM launcher's shape check
+        # and numerically clean on the contiguous scheduler too.
+        local_topk_ids = torch.where(
+            _ep_drop, torch.zeros_like(_ep_local_full), _ep_local_full
+        )
+    else:
+        local_topk_ids = topk_ids
+
+    flat_experts = local_topk_ids.reshape(-1)
 
     _grouped_sync_dbg = (
         os.environ.get("AITER_GROUPED_DEBUG", "0")
@@ -597,8 +644,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
 
     if _grouped_sync_dbg:
-        if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-            raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
+        if torch.any(flat_experts < 0) or torch.any(flat_experts >= n_route_buckets):
+            raise ValueError(
+                "grouped a8w4 path expects local expert ids in [0, n_route_buckets)"
+            )
     counts = None
 
     if grouped_contiguous_m:
@@ -606,6 +655,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         raw_max_m = max(_cfg_max_m, token_num * topk)
     else:
         raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
+        if _is_ep:
+            # Dropped routes fold into bucket 0, so a single bucket can hold up
+            # to every route; size per-bucket capacity for that worst case so
+            # the scatter never runs off max_m.
+            raw_max_m = max(raw_max_m, token_num * topk)
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
@@ -620,7 +674,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
-    route_E = E
+    route_E = n_route_buckets
     route_max_m = max_m
     effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
 
@@ -638,11 +692,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     if _use_naive:
         if counts is None:
-            counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
+            counts = torch.bincount(
+                flat_experts.to(torch.long), minlength=n_route_buckets
+            )
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
-            topk_ids, E, max_m
+            local_topk_ids, n_route_buckets, max_m
         )
-        route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
+        route_tokens = rows_to_tokens.view(route_E, max_m).to(torch.long)
         if data_format == "fp4":
             from aiter.ops.quant import per_1x32_f4_quant
 
@@ -654,30 +710,32 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             a1_payload = a1_quant.view(torch.uint8).contiguous()
             a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
             grouped_a1 = torch.empty(
-                (E, max_m, model_dim // 2), dtype=torch.uint8, device=device
+                (route_E, max_m, model_dim // 2), dtype=torch.uint8, device=device
             )
         else:
             a1_payload, a1_scale_token_u8 = _quantize_mxfp8_payload(
                 hidden_states, model_dim
             )
             grouped_a1 = torch.empty(
-                (E, max_m, model_dim), dtype=torch.uint8, device=device
+                (route_E, max_m, model_dim), dtype=torch.uint8, device=device
             )
         a1_scale_raw = torch.empty(
-            (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
+            (route_E, max_m, model_dim // 32), dtype=torch.uint8, device=device
         )
 
         _grouped_dbg("start route gather (naive)")
         flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
         flat_tokens = flat_routes // topk
         flat_rows = topids_to_rows.reshape(-1).to(torch.long)
-        grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
+        grouped_a1.view(route_E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
         if a1_scale_token_u8 is not None:
-            a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
-        route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-        route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
-            route_weights.dtype
-        )
+            a1_scale_raw.view(route_E * max_m, -1)[flat_rows] = a1_scale_token_u8[
+                flat_tokens
+            ]
+        route_weights = torch.zeros((route_E, max_m), dtype=dtype, device=device)
+        route_weights.view(-1)[topids_to_rows.reshape(-1)] = gather_weight.reshape(
+            -1
+        ).to(route_weights.dtype)
         grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
             a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
@@ -705,7 +763,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 flydsl_moe_topids_to_rows,
             )
 
-            ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
+            ub = int(token_num) * int(topk) + int(n_route_buckets) * (int(tile_m) - 1)
             contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
             route_E = 1
             route_max_m = int(contiguous_m)
@@ -715,13 +773,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 masked_m,
                 topids_to_rows,
             ) = flydsl_moe_topids_to_rows(
-                topk_ids,
-                E,
+                local_topk_ids,
+                n_route_buckets,
                 max_m,
             )
             _grouped_dbg("route done, start psum+remap")
             _starts_t, psum_t, _ = contiguous_psum_remap(
-                masked_m, topids_to_rows, E, max_m, tile_m
+                masked_m, topids_to_rows, n_route_buckets, max_m, tile_m
             )
             m_tile_map = psum_t
             rows_to_tokens = None
@@ -754,8 +812,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 topids_to_rows,
             ) = flydsl_moe_fused_route_quant_scatter(
                 hidden_states,
-                topk_ids,
-                E,
+                local_topk_ids,
+                n_route_buckets,
                 max_m,
                 wmma_rep=warp_tile_m // 16,
                 quant_mode=fused_quant_mode,
@@ -900,18 +958,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
             _grouped_dbg("start a2 fp4 quant (naive)")
             a2_quant, a2_scale_token = _a2_f4_quant(
-                grouped_a2.view(E * max_m, inter_dim),
+                grouped_a2.view(route_E * max_m, inter_dim),
                 quant_dtype=dtypes.fp4x2,
                 shuffle=False,
             )
             _grouped_dbg("a2 fp4 quant done")
             grouped_a2_payload = (
-                a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
+                a2_quant.view(torch.uint8)
+                .contiguous()
+                .view(route_E, max_m, inter_dim // 2)
             )
             a2_scale_raw = (
                 a2_scale_token.view(torch.uint8)
                 .contiguous()
-                .view(E, max_m, inter_dim // 32)
+                .view(route_E, max_m, inter_dim // 32)
             )
         else:
             # a8w4 stage2 input also needs per-block-32 MXFP8 scale; SiLU outputs
@@ -943,7 +1003,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fused quant+preshuffle sync OK")
     _grouped_dbg("a2 scale layout done")
-    grouped_out = torch.empty(
+    _grouped_out_alloc = torch.zeros if _is_ep else torch.empty
+    grouped_out = _grouped_out_alloc(
         (route_E, route_max_m, model_dim), dtype=dtype, device=device
     )
     stage2_compiler = (
@@ -1076,7 +1137,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         gather_w = (
             torch.ones((token_num, topk), dtype=dtype, device=device)
             if doweight_stage1
-            else topk_weight.to(dtype)
+            else gather_weight.to(dtype)
         )
         flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
         _grouped_dbg("gather-reduce output done")
