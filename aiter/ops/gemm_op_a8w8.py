@@ -508,6 +508,9 @@ def get_GEMM_config_with_quant_type(
     return config
 
 
+_flydsl_compile_failed = False
+
+
 def _select_flydsl_preshuffle_kernel(m: int, n: int, k: int):
     """Select a default FlyDSL preshuffle kernel instance for the given shape.
 
@@ -625,8 +628,10 @@ def gemm_a8w8_CK(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
+    global _flydsl_compile_failed
     if (
-        is_flydsl_available()
+        not _flydsl_compile_failed
+        and is_flydsl_available()
         and WQ.dtype in [dtypes.fp8, dtypes.i8]
         and dtype in [dtypes.bf16, dtypes.fp16]
         and bias is None
@@ -637,10 +642,17 @@ def gemm_a8w8_CK(
 
             Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
             WQ_shuffled = shuffle_weight(WQ, layout=(16, 16))
-            return gemm_a8w8_bpreshuffle_flydsl(
-                XQ, WQ_shuffled, x_scale, w_scale, Y,
-                {"kernelName": ki.name},
-            )
+            try:
+                return gemm_a8w8_bpreshuffle_flydsl(
+                    XQ, WQ_shuffled, x_scale, w_scale, Y,
+                    {"kernelName": ki.name},
+                )
+            except Exception as e:
+                _flydsl_compile_failed = True
+                logger.warning(
+                    f"[FlyDSL] preshuffle kernel compilation failed: {e}; "
+                    "disabling FlyDSL for this session, falling back to CK"
+                )
 
     q_dtype_w = WQ.dtype if WQ.dtype in [dtypes.fp8, dtypes.i8] else dtypes.i8
     ck_config = get_GEMM_config_with_quant_type(
@@ -687,6 +699,7 @@ def gemm_a8w8_bpreshuffle(
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    global _flydsl_compile_failed
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -732,12 +745,22 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl" and is_flydsl_available() and not _flydsl_compile_failed:
+            xq_cfg = XQ
             if w_k > k:
-                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+                xq_cfg = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+            try:
+                return gemm_a8w8_bpreshuffle_flydsl(
+                    xq_cfg, WQ, x_scale, w_scale, Y, config
+                )
+            except Exception as e:
+                _flydsl_compile_failed = True
+                logger.warning(
+                    f"[FlyDSL] preshuffle kernel compilation failed: {e}; "
+                    "disabling FlyDSL for this session, falling back"
+                )
 
-    if is_flydsl_available():
+    if is_flydsl_available() and not _flydsl_compile_failed:
         gfx = get_gfx()
         if gfx == "gfx1250":
             from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
@@ -771,11 +794,18 @@ def gemm_a8w8_bpreshuffle(
                     f"[FlyDSL] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
                     f"falling back to flydsl kernel '{ki.name}'."
                 )
+                xq_pad = XQ
                 if w_k > k:
-                    XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-                return gemm_a8w8_bpreshuffle_flydsl(
-                    XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
-                )
+                    xq_pad = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+                try:
+                    return gemm_a8w8_bpreshuffle_flydsl(
+                        xq_pad, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+                    )
+                except Exception as e:
+                    logger.info(
+                        f"[FlyDSL] gemm_a8w8_bpreshuffle flydsl failed for "
+                        f"M={m}, N={n}, K={k}: {e}; falling back to CK"
+                    )
 
     try:
         if w_k > k:
