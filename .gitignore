@@ -17,8 +17,12 @@ aiter/install_mode
 *.gch
 *.pch
 
+# Local Claude Code settings (per-user, not for VCS)
+.claude/
+
 # Compiled Dynamic libraries
 *.so
+*.so.*
 *.dylib
 *.dll
 build

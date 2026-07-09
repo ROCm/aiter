@@ -27,3 +27,6 @@ void opus_gemm_a16w16_tune(aiter_tensor_t& XQ,
                            std::optional<aiter_tensor_t> bias,
                            int kernelId,
                            int splitK);
+
+// Per-stream splitk workspace init. See opus_gemm.cu for rationale.
+void opus_gemm_workspace_init();

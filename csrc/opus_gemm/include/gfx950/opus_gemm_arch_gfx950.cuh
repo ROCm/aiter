@@ -186,6 +186,24 @@ opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch, bool has_bia
         return it->func;
     }
     (void)batch;  // heuristic does not currently use batch.
+    // 4 GiB buffer-resource guard. The heuristic returns one of
+    // HEURISTIC_DEFAULT_KIDS, all of which are legacy (non-4g_safe) and
+    // build a single AMDGPU buffer-resource over the whole A/B/C tensors;
+    // 32-bit num_records wraps when any A/B/C bytes exceed UINT32_MAX,
+    // producing silent OOB. Refuse fallback for >4 GiB shapes -- the
+    // caller must register a tuned CSV entry mapping the shape to a
+    // 4g_safe kid (5000-series / 6000-series).
+    constexpr uint64_t U32_MAX_BYTES = (1ULL << 32) - 1;
+    const uint64_t a_bytes = (uint64_t)M * (uint64_t)K * sizeof(bf16_t);
+    const uint64_t b_bytes = (uint64_t)N * (uint64_t)K * sizeof(bf16_t);
+    const uint64_t c_bytes = (uint64_t)M * (uint64_t)N * sizeof(bf16_t);
+    AITER_CHECK(a_bytes <= U32_MAX_BYTES && b_bytes <= U32_MAX_BYTES
+                    && c_bytes <= U32_MAX_BYTES,
+                "opus a16w16 heuristic fallback refuses >4 GiB shape (M=",
+                M, " N=", N, " K=", K,
+                "): legacy kids wrap buffer-resource num_records. "
+                "Add a tuned CSV entry mapping this shape to a 4g_safe kid "
+                "(5000-series for split-barrier / 6000-series for mono_tile).");
     // has_bias forces the heuristic to skip persistent kids (which
     // do not yet implement HAS_BIAS=true) and return a splitk kid instead.
     const int kid = opus_a16w16_heuristic_kid_gfx950(M, N, K, has_bias);
@@ -210,6 +228,19 @@ opus_dispatch_a16w16_gfx950<fp32_t>(int M, int N, int K, int batch, bool has_bia
         return it->func;
     }
     (void)batch;
+    // 4 GiB buffer-resource guard (see <bf16_t> overload for rationale).
+    // C is fp32 here so the bound is 4 bytes/element.
+    constexpr uint64_t U32_MAX_BYTES = (1ULL << 32) - 1;
+    const uint64_t a_bytes = (uint64_t)M * (uint64_t)K * sizeof(bf16_t);
+    const uint64_t b_bytes = (uint64_t)N * (uint64_t)K * sizeof(bf16_t);
+    const uint64_t c_bytes = (uint64_t)M * (uint64_t)N * sizeof(fp32_t);
+    AITER_CHECK(a_bytes <= U32_MAX_BYTES && b_bytes <= U32_MAX_BYTES
+                    && c_bytes <= U32_MAX_BYTES,
+                "opus a16w16 heuristic fallback refuses >4 GiB shape (M=",
+                M, " N=", N, " K=", K,
+                "): legacy kids wrap buffer-resource num_records. "
+                "Add a tuned CSV entry mapping this shape to a 4g_safe kid "
+                "(5000-series for split-barrier / 6000-series for mono_tile).");
     const int kid = opus_a16w16_heuristic_kid_gfx950(M, N, K, has_bias);
     // splitk kids only have <fp32_t> in the tune table; non-splitk kids
     // have an <fp32_t> entry in the fp32 lookup, so the branch is uniform.

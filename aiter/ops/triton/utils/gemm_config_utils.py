@@ -51,11 +51,18 @@ def _get_gemm_config_cached(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    backend: str | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
     ``get_gemm_config()`` instead, which returns a defensive deep-copy so
     callers can freely mutate the returned dict without polluting the cache.
+
+    When ``backend`` is given, configs are looked up in the per-backend
+    subdirectory ``gemm/<backend>/`` (e.g. ``gemm/gluon/``); if that backend
+    has no default config file, it falls back to the shared ``gemm/`` directory.
+    ``backend=None`` (the default) keeps the original ``gemm/`` behavior, so
+    existing callers are unaffected.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -71,13 +78,22 @@ def _get_gemm_config_cached(
         _get_gemm_config_cached._config_cache = {}
 
     dev = arch_info.get_arch()
-    cache_key = f"{dev}_{config_name}"
+    cache_key = f"{dev}_{config_name}" + (f"_{backend}" if backend else "")
+
+    # Per-backend config directory, falling back to the shared gemm/ dir if the
+    # backend has no default config file (e.g. triton uses the shared dir).
+    base_dir = f"{AITER_TRITON_CONFIGS_PATH}/gemm"
+    cfg_dir = base_dir
+    if backend is not None:
+        backend_dir = f"{base_dir}/{backend}"
+        if os.path.exists(f"{backend_dir}/{dev}-{config_name}.json"):
+            cfg_dir = backend_dir
 
     if cache_key not in _get_gemm_config_cached._config_cache:
         _get_gemm_config_cached._config_cache[cache_key] = {}
 
         # Load default config (must exist)
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
+        fpath = f"{cfg_dir}/{dev}-{config_name}.json"
         _load_config_file(
             _get_gemm_config_cached._config_cache,
             cache_key,
@@ -92,7 +108,7 @@ def _get_gemm_config_cached(
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
+            fpath = f"{cfg_dir}/{dev}-{config_name}-{specialized_filename}.json"
             if _load_config_file(
                 _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
             ):
@@ -104,9 +120,7 @@ def _get_gemm_config_cached(
         nk_key = f"{N}_{K}"
         if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
             # load specialized config
-            fpath = (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
-            )
+            fpath = f"{cfg_dir}/{dev}-{config_name}-N={N}-K={K}.json"
             if _load_config_file(
                 _get_gemm_config_cached._config_cache, cache_key, fpath, nk_key
             ):
@@ -146,6 +160,7 @@ def get_gemm_config(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    backend: str | None = None,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -172,7 +187,7 @@ def get_gemm_config(
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename
+        config_name, M, N, K, bounds, specialized_filename, backend
     )
     return copy.deepcopy(config), is_tuned
 
