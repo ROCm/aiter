@@ -43,6 +43,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_kernel_params,
     flydsl_kernel_name,
 )
+from aiter.fused_moe import is_v2_gemm2_kernel, parse_v2_gemm2_kernel
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
 from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
     mxfp4_moe_gemm1,
@@ -790,6 +791,11 @@ def main():
         sort_bm = params1["tile_m"]
 
         kn2 = r.get("kernelName2", "")
+        # A gemm2 row can pin itself to the v2 kernel via a mxfp4_moe2_* name in
+        # kernelName2. When it does (and we're benching gemm2), the v2 config is
+        # read from the name and the baseline flydsl/opus side is skipped for
+        # that row -- the CSV row IS the "use v2 for moe2" decision.
+        v2_g2 = parse_v2_gemm2_kernel(kn2) if args.stage == "gemm2" else None
         is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
         params2 = get_flydsl_kernel_params(kn2) or {}
         params2.setdefault("tile_m", bm_csv)
@@ -803,17 +809,23 @@ def main():
 
         d = gen(token, args.model_dim, args.inter_dim, args.experts, args.topk, sort_bm,
                 adtype=args.adtype)
-        try:
-            if args.stage == "gemm1":
-                base_us, base_ok = time_baseline(d, token, args.topk, params1)
-            else:
-                base_us, base_ok = time_baseline_gemm2(
-                    d, token, args.model_dim, args.topk, params2, row=r,
-                    print_output=args.print_output or args.print_baseline_output
-                )
-        except Exception as e:
+        if v2_g2 is not None:
+            # v2-pinned gemm2 row: the CSV's chosen gemm2 IS the v2 kernel, so
+            # the baseline side is that same v2 kernel. Time it below (after the
+            # v2 config + inputs are built) so both columns measure it and match.
             base_us, base_ok = float("nan"), -1
-            print(f"{token:>7} {bm_csv:>4} | baseline FAIL: {str(e)[:70]}")
+        else:
+            try:
+                if args.stage == "gemm1":
+                    base_us, base_ok = time_baseline(d, token, args.topk, params1)
+                else:
+                    base_us, base_ok = time_baseline_gemm2(
+                        d, token, args.model_dim, args.topk, params2, row=r,
+                        print_output=args.print_output or args.print_baseline_output
+                    )
+            except Exception as e:
+                base_us, base_ok = float("nan"), -1
+                print(f"{token:>7} {bm_csv:>4} | baseline FAIL: {str(e)[:70]}")
 
         if args.same_tile:
             # match the baseline tuned tile: BM, k_wave, nt; map baseline tile_n -> v2 BN.
@@ -860,6 +872,21 @@ def main():
                 use_nt = gemm1_use_nt(args.experts, args.topk, token, BM_S1)
             else:
                 use_nt = gemm2_use_nt(args.experts, args.topk, token, BM_v2)
+
+        if v2_g2 is not None:
+            # Override the v2 gemm2 config with the CSV-pinned kernel name.
+            # BN_v2/KW_v2 stay from select_pipe_config -- they only shape the
+            # gemm1 producer that fills the intermediate, not the timed gemm2.
+            BM_v2 = v2_g2["tile_m"]
+            epilog = v2_g2["epilog"]
+            persist = v2_g2["persist"]
+            use_nt = v2_g2["use_nt"]
+            BM_S1 = v2_g2["sort_block_m"] or BM_S1
+            if os.environ.get("AITER_FMOE_V2", "0") == "1":
+                # Producer is baseline gemm1; align sort unit to its tile.
+                BM_S1 = sort_bm
+            if BM_S1 % BM_v2 != 0:
+                BM_S1 = BM_v2
         try:
             v = build_v2_inputs(d, token, args.model_dim, args.inter_dim,
                                 args.experts, args.topk, BM_S1)
@@ -881,6 +908,15 @@ def main():
                     BN_v2, KW_v2, base_gemm1_params=params1,
                     print_output=args.print_output
                 )
+                if v2_g2 is not None:
+                    # The CSV's chosen gemm2 is this same v2 kernel, so the
+                    # baseline column re-times it independently -- both sides
+                    # measure the identical kernel and should match.
+                    base_us, base_ok = time_v2_gemm2(
+                        d, v, token, args.model_dim, args.inter_dim,
+                        args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog,
+                        persist, BN_v2, KW_v2, base_gemm1_params=params1,
+                    )
         except Exception as e:
             v2_us, v2_nz = float("nan"), -1
             print(f"{token:>7} {bm_csv:>4} | v2 FAIL: {str(e)[:80]}")

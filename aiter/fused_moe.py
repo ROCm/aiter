@@ -316,6 +316,9 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         return parsed is not None and parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
+    if func is _mxfp4_v2_stage2_wrapper:
+        cfg = parse_v2_gemm2_kernel(kernel_name)
+        return cfg is not None and cfg.get("epilog") == "reduce"
     return False
 
 
@@ -1127,6 +1130,107 @@ def _flydsl_stage2_wrapper(
     )
 
 
+_V2_GEMM2_PREFIX = "mxfp4_moe2_"
+_V2_GEMM2_RE = re.compile(
+    r"^mxfp4_moe2_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
+    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
+    r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
+)
+
+
+def is_v2_gemm2_kernel(name):
+    return bool(name) and name.startswith(_V2_GEMM2_PREFIX)
+
+
+def parse_v2_gemm2_kernel(name):
+    m = _V2_GEMM2_RE.match(name or "")
+    if not m:
+        return None
+    return {
+        "a_dtype": m.group("a"),
+        "b_dtype": m.group("b"),
+        "out_dtype": m.group("out"),
+        "tile_m": int(m.group("tm")),
+        "tile_n": int(m.group("tn")),
+        "tile_k": int(m.group("tk")),
+        "epilog": m.group("epilog"),
+        "persist": bool(m.group("persist")),
+        "use_nt": bool(m.group("nt")),
+        "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
+    }
+
+
+def _mxfp4_v2_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    model_dim=0,
+    inter_dim=0,
+    num_experts=0,
+    w2_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    bias2=None,
+    inter_dim_pad: int = 0,
+    model_dim_pad: int = 0,
+    block_m=None,
+    **_kwargs,
+):
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    cfg = parse_v2_gemm2_kernel(kernelName)
+    if cfg is None:
+        raise ValueError(f"Invalid v2 gemm2 kernel name: {kernelName}")
+
+    bm = cfg["tile_m"]
+    sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
+    epilog = cfg["epilog"]
+    max_sorted = inter_states.shape[0]
+    n_sorted_padded = int(num_valid_ids[0].item())
+
+    def _u8(t):
+        return (
+            t.view(torch.uint8)
+            if t is not None and t.element_size() == 1 and t.dtype != torch.uint8
+            else t
+        )
+
+    if epilog != "reduce":
+        out.zero_()
+    return mxfp4_moe_gemm2(
+        inter_sorted_quant=_u8(inter_states),
+        inter_sorted_shuffled_scale=_u8(a2_scale),
+        w2_u8=_u8(w2),
+        w2_scale_u8=_u8(w2_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        sorted_token_ids=sorted_token_ids,
+        sorted_weights=sorted_weights,
+        out=out,
+        M_logical=out.shape[0],
+        max_sorted=max_sorted,
+        NE=num_experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        BM=bm,
+        use_nt=cfg["use_nt"],
+        a_dtype=cfg["a_dtype"],
+        epilog=epilog,
+        SBM=sbm,
+        persist=cfg["persist"],
+        n_sorted_padded=n_sorted_padded,
+        inter_dim_pad=inter_dim_pad,
+        model_dim_pad=model_dim_pad,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -1507,7 +1611,8 @@ def get_2stage_cfgs(
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
-    if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+    is_v2_2 = is_v2_gemm2_kernel(kernelName2)
+    if (is_flydsl1 or is_flydsl2 or is_v2_2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
@@ -1531,7 +1636,17 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
-        if is_flydsl2:
+        if is_v2_2:
+            stage2_func = functools.partial(
+                _mxfp4_v2_stage2_wrapper,
+                kernelName=kernelName2,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                num_experts=expert,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            )
+        elif is_flydsl2:
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
@@ -1572,6 +1687,7 @@ def get_2stage_cfgs(
             has_bias=enable_bias and is_flydsl1,
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and is_flydsl2,
+            skip_inter_quant=is_v2_2,
             **route_bucket_metadata,
         )
     if (
@@ -2120,7 +2236,9 @@ def fused_moe_2stages(
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
-    if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
+    if metadata.skip_inter_quant and isinstance(a2, tuple):
+        a2, a2_scale = a2[0], a2[1]
+    elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
         a2 = (
