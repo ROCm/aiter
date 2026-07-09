@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
+import os
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
@@ -16,6 +17,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 
 _LOGGER = AiterTritonLogger()
+_FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
 
 
 def gemm_a8w8_blockscale(
@@ -246,6 +248,9 @@ def gemm_a8w8_blockscale_preshuffle(
     assert (
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
     ), "GROUP_K must equal BLOCK_SIZE_K"
+
+    if _FORCE_GFX1250_EX:
+        config["BLOCK_SIZE_K"] = 64
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
