@@ -57,19 +57,23 @@ def mp_lock(
     Using FileBaton for multiprocessing.
     """
     baton = FileBaton(lockPath)
-    if baton.try_acquire():
-        try:
-            ret = MainFunc()
-        finally:
-            if FinalFunc is not None:
-                FinalFunc()
-            baton.release()
-    else:
-        baton.wait()
-        if WaitFunc is not None:
-            ret = WaitFunc()
-        ret = None
-    return ret
+    while True:
+        if baton.try_acquire():
+            try:
+                ret = MainFunc()
+            finally:
+                if FinalFunc is not None:
+                    FinalFunc()
+                baton.release()
+            return ret
+        # Could not acquire: another process holds the lock. Wait for it.
+        # wait() returns True if the holder released normally (work done),
+        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # in which case we loop and try to acquire + build ourselves.
+        if baton.wait():
+            if WaitFunc is not None:
+                return WaitFunc()
+            return None
 
 
 logger = logging.getLogger("aiter")
@@ -855,7 +859,7 @@ def build_module(
             f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
         if not AITER_DISABLE_KERNARG_PRELOAD:
-            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=16"]
+            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=32"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
@@ -1066,7 +1070,6 @@ def _get_ck_exclude_modules():
     ck_modules |= {
         "module_activation",
         "module_cache",
-        "module_custom_all_reduce",
         "module_fused_qk_norm_mrope_cache_quant_shuffle",
         "module_fused_qk_norm_rope_cache_quant_shuffle",
         "module_mla_metadata",

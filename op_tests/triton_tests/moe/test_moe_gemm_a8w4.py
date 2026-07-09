@@ -14,6 +14,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_torch,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -192,6 +193,8 @@ class Case:
             Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
+            Case(64, 4096, 4096, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
+            Case(64, 4096, 2048, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
             # smaller tests for gfx1250 ffm
             Case(16, 512, 512, "float8_e4m3fn", 32, 2),
             Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
@@ -213,6 +216,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("preshuffled", [False, True])
 def test_op(
     m,
     n,
@@ -222,6 +226,7 @@ def test_op(
     has_y_gammas,
     apply_swiglu,
     fused_quant,
+    preshuffled,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -232,14 +237,27 @@ def test_op(
     if get_arch() != "gfx950" and get_arch() != "gfx1250":
         pytest.skip("Kernel not supported on this GPU.")
 
+    if preshuffled and get_arch() != "gfx1250":
+        pytest.skip("Preshuffled weights are only supported on gfx1250.")
+
+    if preshuffled and ((k // 2) % 32 != 0 or n % 16 != 0):
+        pytest.skip(
+            f"Preshuffle requires (k//2) divisible by 32 and N divisible by 16, "
+            f"got k//2={k // 2}, N={n}."
+        )
+
     if get_arch() == "gfx1250":
         # if act_dtype_str == "mxfloat8_e4m3fn":
         #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
+        # temporary
+        if (
+            do_gather
+            and (m * n_expts_act) > 1024
+            and act_dtype_str == "mxfloat8_e4m3fn"
+        ):
+            pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
-        # temporary
-        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot > 32:
-            pytest.skip("Test will take too long time on FFM")
 
     if hbm_swizzling:
         if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
@@ -284,6 +302,8 @@ def test_op(
     # downcast to mxfp
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    if preshuffled:
+        w_tri = shuffle_weight_gfx1250(w_tri)
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
@@ -336,6 +356,7 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        preshuffled=preshuffled,
     )
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
