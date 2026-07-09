@@ -160,6 +160,8 @@ def shuffle_scale_moe(
     preshuffle_factor: int = 32,
     scale_kwidth: int = 8,
     return_layout: bool = False,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
 ):
     """Arch-aware MoE scale shuffle (a8w4 / a8w8 / a16w4 / a4w4 family).
 
@@ -169,7 +171,20 @@ def shuffle_scale_moe(
     label ("GFX1250_SCALE" for gfx1250, "CDNA4_SCALE" for gfx950) as
     ``(scale, label)``, so callers stay arch-agnostic; otherwise returns just
     the shuffled scale tensor.
+
+    When ``is_guinterleave and gate_up``, the gate/up axis (``data``'s last dim,
+    the N/output-feature axis) is assumed to hold gate/up as contiguous halves
+    ``[gate | up]`` and is interleaved to ``[g0, u0, g1, u1, ...]`` before the
+    tile-permute -- folding in the gate/up reorder callers previously did by hand.
+    Requires an even last dim. ``is_guinterleave`` without ``gate_up`` is rejected.
     """
+    if is_guinterleave and not gate_up:
+        raise ValueError("is_guinterleave=True requires gate_up=True")
+    if is_guinterleave and gate_up:
+        *lead, N = data.shape
+        assert N % 2 == 0, f"gate/up interleave needs even last dim, got {N}"
+        data = data.reshape(*lead, 2, N // 2).transpose(-2, -1).reshape(*lead, N)
+
     arch = arch or get_arch()
     if arch == "gfx1250":
         tiled = _shuffle_scale_tile_gfx1250(
