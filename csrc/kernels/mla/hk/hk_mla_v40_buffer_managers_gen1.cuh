@@ -272,25 +272,13 @@ class QManager8to16bitsV1
         const uint32_t scale_row   = lane_idx & 15u;
         const uint32_t v_off_scale = scale_row * kPackedNopeStride;
 
-        // Call __builtin_amdgcn_raw_ptr_buffer_load_lds directly so we
-        // can (a) use opus' cached_rsrc (__amdgpu_buffer_rsrc_t) without
-        // any cast and (b) pass a non-zero i_off. Opus' async_load
-        // wrapper hardcodes i_off=0; HK's hk::llvm_amdgcn_raw_buffer_load_lds
-        // exposes i_off but takes hk::i32x4 (forcing a separate rsrc
-        // setup or a reinterpret_cast that spills). The imm offset adds
-        // to BOTH gmem and LDS, so pre-subtract kColInRecord from the
-        // LDS dst to cancel its contribution there. Requires
-        // kLdsHeadPadBytes of pad before p_lds_q so warp 0's dst stays
-        // >= 0 (static_assert in kernel body).
+        // async_load's imm offset (i_os) adds to BOTH gmem and LDS, so
+        // pre-subtract kColInRecord from the LDS dst to cancel it there.
         auto g_q_nope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
-        __builtin_amdgcn_raw_ptr_buffer_load_lds(
-            g_q_nope.cached_rsrc,
-            (hk::as3_uint32_ptr)(p_lds_warp_staging + kStagingI - kColInRecord),
-            /*size=*/16,
-            v_off,
-            /*s_off=*/0u,
-            /*i_off=*/static_cast<int>(kColInRecord),
-            /*aux=*/0);
+        g_q_nope.template async_load<16u, kColInRecord>(
+            reinterpret_cast<void*>(p_lds_warp_staging + kStagingI - kColInRecord),
+            /*v_os=*/static_cast<int>(v_off),
+            /*s_os=*/0);
 
         // Scale: 1 byte/lane via opus' load<1, uint8>. Stored as uint32_t so
         // e8m0_to_f32's asm volatile consumer has the v-class operand it needs.
@@ -930,21 +918,13 @@ class KvManager8to16bitsV1
             // imm offset would otherwise also shift the LDS dst -> tile-1 mislands).
             const uint32_t s_off_nope = col_tile_in_tile * kWaveTileCols + kTileIdx * kTileCols;
 
-            // fp8 16B/lane -> staging LDS. rsrc same config (0x00020000) as VGPR path.
-            const __amdgpu_buffer_rsrc_t rsrc_lds = __builtin_amdgcn_make_buffer_rsrc(
-                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)),
-                0,
-                0xffffffff,
-                0x00020000);
             if(in_bounds)
             {
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(rsrc_lds,
-                                                         (hk::as3_uint32_ptr)(p_lds_stage_tile),
-                                                         /*size=*/16,
-                                                         v_off_nope,
-                                                         /*s_off=*/s_off_nope,
-                                                         /*i_off=*/0,
-                                                         /*aux=*/0);
+                auto g_kv_nope =
+                    opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_nope));
+                g_kv_nope.template async_load<16u>(reinterpret_cast<void*>(p_lds_stage_tile),
+                                                   static_cast<int>(v_off_nope),
+                                                   static_cast<int>(s_off_nope));
             }
 
             // Scale byte (same addressing as prefetch_kv_nope), held in VGPR.
@@ -1097,20 +1077,10 @@ class KvManager8to16bitsV1
 
                 auto g_kv_rope =
                     opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
-                                                         (hk::as3_uint32_ptr)(p_dst_lo),
-                                                         /*size=*/16,
-                                                         v_off_lo,
-                                                         /*s_off=*/0u,
-                                                         /*i_off=*/0,
-                                                         /*aux=*/0);
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
-                                                         (hk::as3_uint32_ptr)(p_dst_hi_adj),
-                                                         /*size=*/16,
-                                                         v_off_lo,
-                                                         /*s_off=*/0u,
-                                                         /*i_off=*/16,
-                                                         /*aux=*/0);
+                g_kv_rope.template async_load<16u, 0u>(
+                    reinterpret_cast<void*>(p_dst_lo), static_cast<int>(v_off_lo), 0);
+                g_kv_rope.template async_load<16u, 16u>(
+                    reinterpret_cast<void*>(p_dst_hi_adj), static_cast<int>(v_off_lo), 0);
             }
             else
             {
@@ -1549,20 +1519,13 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
             // exactly p_lds_stage_tile + lane*16 (imm offset would shift LDS too).
             const uint32_t s_off_nope = kColStrip * kWaveTileCols + kTile * kTileCols;
 
-            const __amdgpu_buffer_rsrc_t rsrc_lds = __builtin_amdgcn_make_buffer_rsrc(
-                const_cast<void*>(static_cast<const void*>(p_kv_buf_nope)),
-                0,
-                0xffffffff,
-                0x00020000);
             if(in_bounds)
             {
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(rsrc_lds,
-                                                         (hk::as3_uint32_ptr)(p_lds_stage_tile),
-                                                         /*size=*/16,
-                                                         v_off_nope,
-                                                         /*s_off=*/s_off_nope,
-                                                         /*i_off=*/0,
-                                                         /*aux=*/0);
+                auto g_kv_nope =
+                    opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_nope));
+                g_kv_nope.template async_load<16u>(reinterpret_cast<void*>(p_lds_stage_tile),
+                                                   static_cast<int>(v_off_nope),
+                                                   static_cast<int>(s_off_nope));
             }
 
             const uint64_t as_u64 =
@@ -1624,20 +1587,10 @@ class KvManager8to16bitsV2 : public KvManager8to16bitsV1<T>
                     p_lds_kv + sub_block_byte_offset(row_tile, kRopeColTileHi) - 16u;
                 auto g_kv_rope =
                     opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_kv_buf_rope));
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
-                                                         (hk::as3_uint32_ptr)(p_dst_lo),
-                                                         /*size=*/16,
-                                                         v_off_lo,
-                                                         0u,
-                                                         0,
-                                                         0);
-                __builtin_amdgcn_raw_ptr_buffer_load_lds(g_kv_rope.cached_rsrc,
-                                                         (hk::as3_uint32_ptr)(p_dst_hi_adj),
-                                                         /*size=*/16,
-                                                         v_off_lo,
-                                                         0u,
-                                                         16,
-                                                         0);
+                g_kv_rope.template async_load<16u, 0u>(
+                    reinterpret_cast<void*>(p_dst_lo), static_cast<int>(v_off_lo), 0);
+                g_kv_rope.template async_load<16u, 16u>(
+                    reinterpret_cast<void*>(p_dst_hi_adj), static_cast<int>(v_off_lo), 0);
                 (void)kVStride;
             }
             else
