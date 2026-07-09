@@ -26,8 +26,8 @@ from flydsl.expr.typing import T, Int32
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_rsrc,
-    MOE_KERNARG_PRELOAD,
-    MOE_KERNARG_PRELOAD_COUNT,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
 BLOCK_THREADS = 256
@@ -183,8 +183,8 @@ def build_moe_m_tile_map_module():
 
     launch_m_tile_map.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": MOE_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 

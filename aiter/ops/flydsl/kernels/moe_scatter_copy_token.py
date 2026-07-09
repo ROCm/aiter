@@ -46,8 +46,8 @@ from flydsl.expr import buffer_ops
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_rsrc,
-    MOE_KERNARG_PRELOAD,
-    MOE_KERNARG_PRELOAD_COUNT,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
 BLOCK_THREADS = 256
@@ -168,8 +168,8 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
 
     launch_scatter_copy.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": MOE_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 

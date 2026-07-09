@@ -17,12 +17,16 @@ from flydsl.expr.typing import T
 from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
 
 
-# Global toggle for the amdgpu-kernarg-preload compile hint used by the MoE
-# flydsl kernels. Enabled by default; set AITER_MOE_KERNARG_PRELOAD=0 to disable
-# it globally for all kernels. AITER_MOE_KERNARG_PRELOAD_COUNT overrides the
+# Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
+# kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
+# globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
 # number of kernel arguments to preload.
-MOE_KERNARG_PRELOAD = bool(int(os.environ.get("AITER_MOE_KERNARG_PRELOAD", "1")))
-MOE_KERNARG_PRELOAD_COUNT = int(os.environ.get("AITER_MOE_KERNARG_PRELOAD_COUNT", "16"))
+AITER_FLYDSL_KERNARG_PRELOAD = bool(
+    int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1"))
+)
+AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
+    os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
+)
 
 
 def ptr_rsrc(ptr):
