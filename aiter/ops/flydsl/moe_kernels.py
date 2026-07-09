@@ -370,6 +370,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype in ("fp4", "fp8"):
@@ -401,6 +402,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
+            v2_output_layout=v2_output_layout,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1173,13 +1175,31 @@ def flydsl_moe_stage1(
     _is_splitk = k_batch > 1
     gate_up_interleave = gate_mode == "interleave"
 
+    _v2_output_layout = (
+        _fuse_any_quant
+        and not _is_splitk
+        and os.environ.get("AITER_FMOE_V2", "0") == "1"
+    )
+
     dev = a.device
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
     _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
-        if _need_fp4 or (_gui_sk_fused and _need_fp4):
+        if _v2_output_layout:
+            _sorted_rows = max(
+                sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * tile_m
+            )
+            if _need_fp4:
+                out = torch.empty(
+                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
+                )
+            else:
+                out = torch.empty(
+                    (_sorted_rows, inter_dim), dtype=dtypes.fp8, device=dev
+                )
+        elif _need_fp4 or (_gui_sk_fused and _need_fp4):
             out = torch.empty(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
@@ -1318,6 +1338,7 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        v2_output_layout=_v2_output_layout,
     )
     _run_compiled(exe, args)
 

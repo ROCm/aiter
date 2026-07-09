@@ -96,6 +96,7 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     gpu_arch = get_hip_arch()
@@ -215,9 +216,10 @@ def compile_mixed_moe_gemm1(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    v2out_tag = "_v2out" if v2_output_layout else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{v2out_tag}_v32"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -2214,7 +2216,11 @@ def compile_mixed_moe_gemm1(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    row_byte_base = out_base_idx + ts_idx * arith.constant(
+                    if const_expr(v2_output_layout):
+                        payload_row_idx = row
+                    else:
+                        payload_row_idx = ts_idx
+                    row_byte_base = out_base_idx + payload_row_idx * arith.constant(
                         out_row_stride, index=True
                     )
                     return ((fused2, row_byte_base), row_valid)
@@ -2826,6 +2832,7 @@ def compile_mixed_moe_gemm1(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
+        v2_output_layout,
     )
 
     @flyc.jit

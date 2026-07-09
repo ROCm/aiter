@@ -27,7 +27,11 @@ import torch
 import aiter  # noqa: F401
 from aiter import dtypes, QuantType, ActivationType
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_weight,
+    shuffle_weight_a16w4,
+    shuffle_scale_a16w4,
+)
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_f4_quant
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import e8m0_shuffle, moe_mxfp4_sort
@@ -62,8 +66,35 @@ def quant_a_fp8(x):
     )
 
 
+def quant_a_fp4(x):
+    return per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+
+def quant_a(x, adtype):
+    """Quantize stage1 activation per --adtype: fp8 (a8w4) or fp4 (a4w4)."""
+    return quant_a_fp8(x) if adtype == "fp8" else quant_a_fp4(x)
+
+
 def quant_w_fp4(w):
     return per_1x32_f4_quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+
+def _a_deq(a1_qt, a1_scale, token, model_dim, adtype):
+    """Dequant the SAME quantized activation the kernels read (fp8 raw / fp4 e2m1)."""
+    if adtype == "fp8":
+        a_vals = a1_qt.float().view(token, model_dim // 32, 32)
+    else:
+        a_vals = fp4_utils.mxfp4_to_f32(a1_qt).view(token, model_dim // 32, 32)
+    return (
+        a_vals * fp4_utils.e8m0_to_f32(a1_scale).view(token, model_dim // 32, 1)
+    ).view(token, model_dim).to(dtypes.bf16)
+
+
+def _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype):
+    """Per-adtype baseline stage1 w1/w1_scale preshuffle (a8w4 a16w4 / a4w4 CK)."""
+    if adtype == "fp8":
+        return shuffle_weight_a16w4(w1_qt, 16, True), shuffle_scale_a16w4(w1_scale, E, True)
+    return shuffle_weight(w1_qt, (16, 16)), e8m0_shuffle(w1_scale)
 
 
 # --- v2 (#753) CK a16w4 layout helpers (ported verbatim from the PR test) ----
@@ -152,21 +183,18 @@ def _u8v(t):
 
 
 # --- shared input build ------------------------------------------------------
-def gen(token, model_dim, inter_dim, E, topk, block_m):
+def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
     torch.manual_seed(0)
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
     score = balanced_score(token, E, topk, dtypes.bf16)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
-    w1_qt, w1_scale = quant_w_fp4(w1)   # fp4x2 weights + e8m0 scale
-    a1_qt, a1_scale = quant_a_fp8(inp)  # fp8 activations + e8m0 scale
+    w1_qt, w1_scale = quant_w_fp4(w1)      # fp4x2 weights + e8m0 scale
+    a1_qt, a1_scale = quant_a(inp, adtype)  # fp8 (a8w4) or fp4 (a4w4) activations
 
     # torch reference stage1 (dequant the SAME quantized operands the kernels read)
-    a_deq = (
-        a1_qt.float().view(token, model_dim // 32, 32)
-        * fp4_utils.e8m0_to_f32(a1_scale).view(token, model_dim // 32, 1)
-    ).view(token, model_dim).to(dtypes.bf16)
+    a_deq = _a_deq(a1_qt, a1_scale, token, model_dim, adtype)
     w1_deq = (
         fp4_utils.mxfp4_to_f32(w1_qt).view(E, inter_dim * 2, model_dim // 32, 32)
         * fp4_utils.e8m0_to_f32(w1_scale).view(E, inter_dim * 2, model_dim // 32, 1)
@@ -181,10 +209,13 @@ def gen(token, model_dim, inter_dim, E, topk, block_m):
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m
     )
+    # w1/w1_scale preshuffle depends on the activation dtype (a8w4 vs a4w4).
+    w1_qt_shuf, w1_scale_shuf = _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype)
     base = dict(
         a1_qt=a1_qt,
-        w1_qt_shuf=shuffle_weight(w1_qt, (16, 16)),
-        w1_scale_shuf=e8m0_shuffle(w1_scale),
+        adtype=adtype,
+        w1_qt_shuf=w1_qt_shuf,
+        w1_scale_shuf=w1_scale_shuf,
         a1_scale_sort=moe_mxfp4_sort(
             a1_scale[:token, :].view(token, 1, -1), sorted_ids=sorted_ids,
             num_valid_ids=num_valid_ids, token_num=token, block_size=block_m,
@@ -199,7 +230,7 @@ def gen(token, model_dim, inter_dim, E, topk, block_m):
     return dict(
         ref1=ref1, topk_ids=topk_ids, topk_weights=topk_weights,
         w1_qt=w1_qt, w1_scale=w1_scale, a1_qt=a1_qt, a1_scale=a1_scale,
-        inp=inp, base=base,
+        inp=inp, base=base, adtype=adtype,
     )
 
 
@@ -225,7 +256,10 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     cumsum = nv
     n = int(cumsum[0].item())
 
-    aq = d["a1_qt"].view(torch.uint8).view(token, H).contiguous()
+    # fp8 activation is 1 byte/elem; fp4x2 packs 2 elems/byte -> half-width payload.
+    adtype = d.get("adtype", "fp8")
+    a_row_bytes = H if adtype == "fp8" else H // 2
+    aq = d["a1_qt"].view(torch.uint8).view(token, a_row_bytes).contiguous()
     asc = d["a1_scale"].view(torch.uint8).view(token, H // 32).contiguous()
     assh = _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=BM_S1)
 
@@ -242,6 +276,8 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
 
 def time_baseline(d, token, topk, params):
     b = d["base"]
+    adtype = b.get("adtype", "fp8")
+    default_gate = "interleave" if adtype == "fp8" else "separated"
     def fn():
         return flydsl_moe_stage1(
             a=b["a1_qt"], w1=b["w1_qt_shuf"],
@@ -249,12 +285,12 @@ def time_baseline(d, token, topk, params):
             sorted_expert_ids=b["sorted_expert_ids"],
             num_valid_ids=b["num_valid_ids"], topk=topk,
             tile_m=params["tile_m"], tile_n=params["tile_n"], tile_k=params["tile_k"],
-            a_dtype="fp8", b_dtype="fp4", out_dtype="bf16",
+            a_dtype=adtype, b_dtype="fp4", out_dtype="bf16",
             w1_scale=b["w1_scale_shuf"], a1_scale=b["a1_scale_sort"],
             sorted_weights=None,
             k_batch=params.get("k_batch", 1),
             waves_per_eu=params.get("waves_per_eu", 3),
-            gate_mode=params.get("gate_mode", "interleave"),
+            gate_mode=params.get("gate_mode", default_gate),
             b_nt=params.get("b_nt", 2),
             k_wave=params.get("k_wave", 1),
         )
@@ -301,6 +337,7 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
 
 
 def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wave):
+    adtype = d.get("adtype", "fp8")
     def fn():
         return mxfp4_moe_gemm1(
             a_quant=v["aq"], a_scale_sorted_shuffled=v["assh"],
@@ -310,7 +347,7 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
             inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
             n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
             BM=BM_S1, use_nt=use_nt, interleave=True,
-            a_dtype="fp8", out_dtype="fp8", act="silu", swiglu_limit=0.0,
+            a_dtype=adtype, out_dtype="fp8", act="silu", swiglu_limit=0.0,
             SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
             model_dim_pad=0, inter_dim_pad=0,
         )
@@ -324,6 +361,9 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--adtype", choices=("fp8", "fp4"), default="fp8",
+                   help="stage1 activation dtype: fp8 (a8w4, default) or fp4 (a4w4). "
+                        "Selects the matching a-quant + w1 preshuffle + kernel a_dtype.")
     p.add_argument("--csv", default="aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv")
     p.add_argument("--model-dim", type=int, default=7168)
     p.add_argument("--inter-dim", type=int, default=512)
@@ -361,7 +401,8 @@ def main():
         print("no matching CSV rows for shape")
         return
 
-    print(f"dsv4 a8w4 gemm1  md={args.model_dim} id={args.inter_dim} "
+    _qtag = "a8w4" if args.adtype == "fp8" else "a4w4"
+    print(f"dsv4 {_qtag} gemm1  md={args.model_dim} id={args.inter_dim} "
           f"E={args.experts} topk={args.topk}  (BALANCED, launch-only)")
     print(f"baseline = flydsl mixed_moe stage1 (CSV kernelName1) | v2 = FlyDSL#753 mxfp4_moe_gemm1\n")
     hdr = f"{'M':>7} {'blk':>4} | {'base us':>9} {'ok%':>5} | {'v2 us':>9} {'cos%':>5} {'v2 cfg':>18} | {'delta%':>7}"
@@ -378,7 +419,8 @@ def main():
         params.setdefault("tile_n", 64)
         params.setdefault("tile_k", 256)
 
-        d = gen(token, args.model_dim, args.inter_dim, args.experts, args.topk, params["tile_m"])
+        d = gen(token, args.model_dim, args.inter_dim, args.experts, args.topk,
+                params["tile_m"], adtype=args.adtype)
         try:
             base_us, base_ok = time_baseline(d, token, args.topk, params)
         except Exception as e:

@@ -25,13 +25,14 @@ Usage:
 
 import argparse
 import csv as _csv
+import os
 
 import torch
 
 import aiter
 from aiter import dtypes, QuantType, ActivationType
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_f4_quant
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import e8m0_shuffle, moe_mxfp4_sort
@@ -73,8 +74,42 @@ def quant_a_fp8(x):
     )
 
 
+def quant_a_fp4(x):
+    return per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+
+def quant_a(x, adtype):
+    """Quantize stage1 activation per --adtype: fp8 (a8w4) or fp4 (a4w4)."""
+    return quant_a_fp8(x) if adtype == "fp8" else quant_a_fp4(x)
+
+
 def quant_w_fp4(w):
     return per_1x32_f4_quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
+
+
+def _a_deq(a1_qt, a1_scale, token, model_dim, adtype):
+    """Dequant the SAME quantized activation the kernels read (fp8 raw / fp4 e2m1)."""
+    if adtype == "fp8":
+        a_vals = a1_qt.float().view(token, model_dim // 32, 32)
+    else:
+        a_vals = fp4_utils.mxfp4_to_f32(a1_qt).view(token, model_dim // 32, 32)
+    return (
+        a_vals * fp4_utils.e8m0_to_f32(a1_scale).view(token, model_dim // 32, 1)
+    ).view(token, model_dim).to(dtypes.bf16)
+
+
+def _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype):
+    """Per-adtype baseline stage1 w1/w1_scale preshuffle.
+
+    a8w4 (fp8 activation, gate/up interleave kernel): a16w4 gate-up-interleave
+      shuffle -- shuffle_weight_a16w4 / shuffle_scale_a16w4 (matches
+      test_moe_2stage.py -q7 and the flydsl_moe_stage1 docstring).
+    a4w4 (fp4 activation): CK (16,16) weight shuffle + e8m0 scale shuffle
+      (matches test_flydsl_moe_a4w4.py / test_moe_2stage.py preshuffle path).
+    """
+    if adtype == "fp8":
+        return shuffle_weight_a16w4(w1_qt, 16, True), shuffle_scale_a16w4(w1_scale, E, True)
+    return shuffle_weight(w1_qt, (16, 16)), e8m0_shuffle(w1_scale)
 
 
 # --- v2 (#753) CK a16w4 layout helpers (ported verbatim from the PR test) ----
@@ -163,7 +198,7 @@ def _u8v(t):
 
 
 # --- shared input build ------------------------------------------------------
-def gen(token, model_dim, inter_dim, E, topk, block_m):
+def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
     torch.manual_seed(0)
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
@@ -171,15 +206,12 @@ def gen(token, model_dim, inter_dim, E, topk, block_m):
     score = balanced_score(token, E, topk, dtypes.bf16)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
-    w1_qt, w1_scale = quant_w_fp4(w1)   # fp4x2 weights + e8m0 scale
-    w2_qt, w2_scale = quant_w_fp4(w2)   # fp4x2 weights + e8m0 scale
-    a1_qt, a1_scale = quant_a_fp8(inp)  # fp8 activations + e8m0 scale
+    w1_qt, w1_scale = quant_w_fp4(w1)      # fp4x2 weights + e8m0 scale
+    w2_qt, w2_scale = quant_w_fp4(w2)      # fp4x2 weights + e8m0 scale
+    a1_qt, a1_scale = quant_a(inp, adtype)  # fp8 (a8w4) or fp4 (a4w4) activations
 
     # torch reference stage1 (dequant the SAME quantized operands the kernels read)
-    a_deq = (
-        a1_qt.float().view(token, model_dim // 32, 32)
-        * fp4_utils.e8m0_to_f32(a1_scale).view(token, model_dim // 32, 1)
-    ).view(token, model_dim).to(dtypes.bf16)
+    a_deq = _a_deq(a1_qt, a1_scale, token, model_dim, adtype)
     w1_deq = (
         fp4_utils.mxfp4_to_f32(w1_qt).view(E, inter_dim * 2, model_dim // 32, 32)
         * fp4_utils.e8m0_to_f32(w1_scale).view(E, inter_dim * 2, model_dim // 32, 1)
@@ -201,10 +233,14 @@ def gen(token, model_dim, inter_dim, E, topk, block_m):
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m
     )
+    # w1/w1_scale preshuffle depends on the activation dtype (a8w4 vs a4w4);
+    # see _baseline_w1_shuffle. w2 always uses the a16w4 down-proj layout.
+    w1_qt_shuf, w1_scale_shuf = _baseline_w1_shuffle(w1_qt, w1_scale, E, adtype)
     base = dict(
         a1_qt=a1_qt,
-        w1_qt_shuf=shuffle_weight(w1_qt, (16, 16)),
-        w1_scale_shuf=e8m0_shuffle(w1_scale),
+        adtype=adtype,
+        w1_qt_shuf=w1_qt_shuf,
+        w1_scale_shuf=w1_scale_shuf,
         w2_qt_shuf=_mxfp4_shuffle_weight_a16w4(w2_qt, gate_up=False),
         w2_scale_shuf=_mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False),
         a1_scale_sort=moe_mxfp4_sort(
@@ -235,7 +271,7 @@ def gen(token, model_dim, inter_dim, E, topk, block_m):
         ref1=ref1, ref2=ref2, topk_ids=topk_ids, topk_weights=topk_weights,
         w1_qt=w1_qt, w1_scale=w1_scale, w2_qt=w2_qt, w2_scale=w2_scale,
         a1_qt=a1_qt, a1_scale=a1_scale,
-        inp=inp, base=base,
+        inp=inp, base=base, adtype=adtype,
     )
 
 
@@ -263,7 +299,10 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
     cumsum = nv
     n = int(cumsum[0].item())
 
-    aq = d["a1_qt"].view(torch.uint8).view(token, H).contiguous()
+    # fp8 activation is 1 byte/elem; fp4x2 packs 2 elems/byte -> half-width payload.
+    adtype = d.get("adtype", "fp8")
+    a_row_bytes = H if adtype == "fp8" else H // 2
+    aq = d["a1_qt"].view(torch.uint8).view(token, a_row_bytes).contiguous()
     asc = d["a1_scale"].view(torch.uint8).view(token, H // 32).contiguous()
     assh = _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=BM_S1)
 
@@ -281,6 +320,8 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
 
 def time_baseline(d, token, topk, params):
     b = d["base"]
+    adtype = b.get("adtype", "fp8")
+    default_gate = "interleave" if adtype == "fp8" else "separated"
     def fn():
         return flydsl_moe_stage1(
             a=b["a1_qt"], w1=b["w1_qt_shuf"],
@@ -288,12 +329,12 @@ def time_baseline(d, token, topk, params):
             sorted_expert_ids=b["sorted_expert_ids"],
             num_valid_ids=b["num_valid_ids"], topk=topk,
             tile_m=params["tile_m"], tile_n=params["tile_n"], tile_k=params["tile_k"],
-            a_dtype="fp8", b_dtype="fp4", out_dtype="bf16",
+            a_dtype=adtype, b_dtype="fp4", out_dtype="bf16",
             w1_scale=b["w1_scale_shuf"], a1_scale=b["a1_scale_sort"],
             sorted_weights=None,
             k_batch=params.get("k_batch", 1),
             waves_per_eu=params.get("waves_per_eu", 3),
-            gate_mode=params.get("gate_mode", "interleave"),
+            gate_mode=params.get("gate_mode", default_gate),
             b_nt=params.get("b_nt", 2),
             k_wave=params.get("k_wave", 1),
         )
@@ -314,7 +355,25 @@ def _stage2_out_for_check(out, mode, token, topk, model_dim):
     return out
 
 
-def time_baseline_gemm2(d, token, model_dim, topk, params, row=None):
+def _print_tensor(name, tensor):
+    torch.cuda.synchronize()
+    print(f"\n{name}:")
+    print(tensor.detach().cpu())
+
+
+def _print_close_stats(name, ref, got, atol=1.0, rtol=0.05):
+    ref_f = ref.float()
+    got_f = got.float()
+    diff = (ref_f - got_f).abs()
+    close = torch.isclose(ref_f, got_f, atol=atol, rtol=rtol).float().mean().item() * 100
+    print(
+        f"\n{name} diff stats: "
+        f"close={close:.2f}% atol={atol} rtol={rtol} "
+        f"max_abs={diff.max().item():.6g} mean_abs={diff.mean().item():.6g}"
+    )
+
+
+def time_baseline_gemm2(d, token, model_dim, topk, params, row=None, print_output=False):
     b = d["base"]
     row = row or {}
     kn2 = row.get("kernelName2", "")
@@ -353,6 +412,10 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None):
         torch.cuda.synchronize()
         ref = d["ref2"].float()
         got = out.float()
+        if print_output:
+            _print_close_stats("gemm2 baseline vs torch ref", ref, got)
+            _print_tensor("torch ref gemm2 output", ref)
+            _print_tensor("baseline gemm2 output", got)
         ok = torch.isclose(ref, got, atol=1.0, rtol=0.05).float().mean().item() * 100
         _, us = run_perftest(fn, num_warmup=WARMUP, num_iters=ITERS)
         return us, ok
@@ -390,6 +453,10 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None):
     torch.cuda.synchronize()
     ref = d["ref2"].float()
     got = _stage2_out_for_check(out, mode, token, topk, model_dim).float()
+    if print_output:
+        _print_close_stats("gemm2 baseline vs torch ref", ref, got)
+        _print_tensor("torch ref gemm2 output", ref)
+        _print_tensor("baseline gemm2 output", got)
     ok = torch.isclose(ref, got, atol=1.0, rtol=0.05).float().mean().item() * 100
     _, us = run_perftest(fn, num_warmup=WARMUP, num_iters=ITERS)
     return us, ok
@@ -427,6 +494,7 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
 
 
 def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wave):
+    adtype = d.get("adtype", "fp8")
     def fn():
         return mxfp4_moe_gemm1(
             a_quant=v["aq"], a_scale_sorted_shuffled=v["assh"],
@@ -436,7 +504,7 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
             inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
             n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
             BM=BM_S1, use_nt=use_nt, interleave=True,
-            a_dtype="fp8", out_dtype="fp8", act="silu", swiglu_limit=0.0,
+            a_dtype=adtype, out_dtype="fp8", act="silu", swiglu_limit=0.0,
             SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
             model_dim_pad=0, inter_dim_pad=0,
         )
@@ -448,9 +516,61 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
     return us, ok
 
 
-def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_nt,
-                  epilog, persist, BN, k_wave):
-    # Populate the sorted fp8 intermediate exactly as v2 production gemm2 consumes it.
+def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
+    """Run baseline gemm1 (AITER_FMOE_V2 layout) into v2's sorted-row fp8 buffers.
+
+    With AITER_FMOE_V2=1 the baseline flydsl gemm1 writes its fused-quant payload
+    by sorted row and its e8m0 scale in the v2 layout, so the outputs can drive
+    the v2 gemm2 directly -- letting --stage gemm2 compare v2 gemm2 on a BASELINE
+    gemm1 producer instead of the v2 gemm1 producer.
+    """
+    a1_scale_sort = moe_mxfp4_sort(
+        d["a1_scale"][:token, :].view(token, 1, -1),
+        sorted_ids=v["sti"],
+        num_valid_ids=v["cumsum"],
+        token_num=token,
+        block_size=BM_S1,
+    )
+    adtype = d["base"].get("adtype", "fp8")
+    default_gate = "interleave" if adtype == "fp8" else "separated"
+    out, scale = flydsl_moe_stage1(
+        a=d["a1_qt"],
+        w1=d["base"]["w1_qt_shuf"],
+        out=v["isq"],
+        sorted_token_ids=v["sti"],
+        sorted_expert_ids=v["sei"],
+        num_valid_ids=v["cumsum"],
+        topk=topk,
+        tile_m=params["tile_m"],
+        tile_n=params["tile_n"],
+        tile_k=params["tile_k"],
+        a_dtype=adtype,
+        b_dtype="fp4",
+        out_dtype="fp8",
+        w1_scale=d["base"]["w1_scale_shuf"],
+        a1_scale=a1_scale_sort,
+        sorted_weights=None,
+        k_batch=params.get("k_batch", 1),
+        waves_per_eu=params.get("waves_per_eu", 3),
+        gate_mode=params.get("gate_mode", default_gate),
+        b_nt=params.get("b_nt", 2),
+        k_wave=params.get("k_wave", 1),
+    )
+    v["isq"] = out.view(torch.uint8).view_as(v["isq"])
+    v["iss"] = scale.view(torch.uint8)
+    torch.cuda.synchronize()
+
+
+def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
+                                  BM_S1, use_nt, BN, k_wave, base_gemm1_params):
+    if os.environ.get("AITER_FMOE_V2", "0") != "1":
+        print("\nwarning: gemm1 v2-layout compare expects AITER_FMOE_V2=1")
+
+    populate_baseline_v2_intermediate(d, v, token, topk, base_gemm1_params, BM_S1)
+    baseline_isq = v["isq"].clone()
+
+    v["isq"].zero_()
+    v["iss"].zero_()
     mxfp4_moe_gemm1(
         a_quant=v["aq"], a_scale_sorted_shuffled=v["assh"],
         w1_u8=v["w1u8"], w1_scale_u8=v["w1sc"],
@@ -458,12 +578,50 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
         sorted_token_ids=v["sti"], inter_sorted_quant=v["isq"],
         inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
         n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
-        BM=BM_S1, use_nt=gemm1_use_nt(E, topk, token, BM_S1), interleave=True,
-        a_dtype="fp8", out_dtype="fp8", act="silu", swiglu_limit=0.0,
+        BM=BM_S1, use_nt=use_nt, interleave=True,
+        a_dtype=d.get("adtype", "fp8"), out_dtype="fp8", act="silu", swiglu_limit=0.0,
         SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
         model_dim_pad=0, inter_dim_pad=0,
     )
     torch.cuda.synchronize()
+
+    baseline = baseline_isq.view(torch.float8_e4m3fn).float()
+    v2 = v["isq"].view(torch.float8_e4m3fn).float()
+    n_valid = v["n"]
+    _print_close_stats(
+        "gemm1 baseline-v2-layout vs v2 full isq",
+        baseline, v2, atol=0.0, rtol=0.0,
+    )
+    _print_close_stats(
+        "gemm1 baseline-v2-layout vs v2 valid isq",
+        baseline[:n_valid], v2[:n_valid], atol=0.0, rtol=0.0,
+    )
+    _print_tensor("baseline gemm1 v2-layout fp8 output", baseline)
+    _print_tensor("v2 gemm1 sorted fp8 output", v2)
+
+
+def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_nt,
+                  epilog, persist, BN, k_wave, base_gemm1_params=None,
+                  print_output=False):
+    if os.environ.get("AITER_FMOE_V2", "0") == "1":
+        if base_gemm1_params is None:
+            raise ValueError("base_gemm1_params is required when AITER_FMOE_V2=1")
+        populate_baseline_v2_intermediate(d, v, token, topk, base_gemm1_params, BM_S1)
+    else:
+        # Populate the sorted fp8 intermediate exactly as v2 production gemm2 consumes it.
+        mxfp4_moe_gemm1(
+            a_quant=v["aq"], a_scale_sorted_shuffled=v["assh"],
+            w1_u8=v["w1u8"], w1_scale_u8=v["w1sc"],
+            sorted_expert_ids=v["sei"], cumsum_tensor=v["cumsum"],
+            sorted_token_ids=v["sti"], inter_sorted_quant=v["isq"],
+            inter_sorted_shuffled_scale=v["iss"], hidden_states=v["hidden"],
+            n_tokens=token, NE=E, D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk,
+            BM=BM_S1, use_nt=gemm1_use_nt(E, topk, token, BM_S1), interleave=True,
+            a_dtype=d.get("adtype", "fp8"), out_dtype="fp8", act="silu", swiglu_limit=0.0,
+            SBM=BM_S1, k_wave=k_wave, BN=BN, n_sorted_padded=v["n"],
+            model_dim_pad=0, inter_dim_pad=0,
+        )
+        torch.cuda.synchronize()
 
     out_shape = (token, topk, model_dim) if epilog == "reduce" else (token, model_dim)
     out = torch.empty(out_shape, dtype=dtypes.bf16, device="cuda")
@@ -502,6 +660,9 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
     torch.cuda.synchronize()
     ref = d["ref2"].float()
     got = _stage2_out_for_check(out, epilog, token, topk, model_dim).float()
+    if print_output:
+        _print_close_stats("gemm2 v2 vs torch ref", ref, got)
+        _print_tensor("v2 gemm2 output", got)
     ok = torch.isclose(ref, got, atol=1.0, rtol=0.05).float().mean().item() * 100
     _, us = run_perftest(fn, num_warmup=WARMUP, num_iters=ITERS)
     return us, ok
@@ -510,6 +671,9 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", choices=("gemm1", "gemm2"), default="gemm1")
+    p.add_argument("--adtype", choices=("fp8", "fp4"), default="fp8",
+                   help="stage1 activation dtype: fp8 (a8w4, default) or fp4 (a4w4). "
+                        "Selects the matching a-quant + w1 preshuffle + kernel a_dtype.")
     p.add_argument("--csv", default="aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv")
     p.add_argument("--model-dim", type=int, default=7168)
     p.add_argument("--inter-dim", type=int, default=512)
@@ -521,6 +685,10 @@ def main():
                    help="force v2 onto the baseline's tile config (BM=tile_m, k_wave, "
                         "use_nt=b_nt==2, BN=64 if k_wave>1 else 256) instead of v2's "
                         "own select_pipe_config -- isolates kernel-vs-kernel.")
+    p.add_argument("--print-output", action="store_true",
+                   help="print output tensors for the selected stage")
+    p.add_argument("--print-baseline-output", action="store_true",
+                   help="print the baseline gemm2 output tensor")
     args = p.parse_args()
 
     # gather tuned (token, block_m, kernelName1) for the requested shape
@@ -547,7 +715,8 @@ def main():
         print("no matching CSV rows for shape")
         return
 
-    print(f"dsv4 a8w4 {args.stage}  md={args.model_dim} id={args.inter_dim} "
+    _qtag = "a8w4" if args.adtype == "fp8" else "a4w4"
+    print(f"dsv4 {_qtag} {args.stage}  md={args.model_dim} id={args.inter_dim} "
           f"E={args.experts} topk={args.topk}  (BALANCED, launch-only)")
     if args.stage == "gemm1":
         print("baseline = flydsl mixed_moe stage1 (CSV kernelName1) | "
@@ -582,13 +751,15 @@ def main():
             params2["tile_m"] = int(opus_values["stage2_block_m"])
             params2["mode"] = "opus-route" if bool(opus_values["route_out"]) else "opus-atomic"
 
-        d = gen(token, args.model_dim, args.inter_dim, args.experts, args.topk, sort_bm)
+        d = gen(token, args.model_dim, args.inter_dim, args.experts, args.topk, sort_bm,
+                adtype=args.adtype)
         try:
             if args.stage == "gemm1":
                 base_us, base_ok = time_baseline(d, token, args.topk, params1)
             else:
                 base_us, base_ok = time_baseline_gemm2(
-                    d, token, args.model_dim, args.topk, params2, row=r
+                    d, token, args.model_dim, args.topk, params2, row=r,
+                    print_output=args.print_output or args.print_baseline_output
                 )
         except Exception as e:
             base_us, base_ok = float("nan"), -1
@@ -627,6 +798,9 @@ def main():
             BM_v2, epilog, BM_S1, persist, BN_v2, KW_v2 = select_pipe_config(
                 args.model_dim, args.inter_dim, args.experts, args.topk, token
             )
+            if args.stage == "gemm2" and os.environ.get("AITER_FMOE_V2", "0") == "1":
+                # The producer is baseline gemm1, so use its sort padding unit.
+                BM_S1 = sort_bm
             if args.stage == "gemm2" and BM_S1 % BM_v2 != 0:
                 # gemm2 consumes an SBM-strided sorted stream and requires SBM
                 # to be a multiple of its BM. Tiny-M gemm1 may choose BM16, so
@@ -640,6 +814,12 @@ def main():
             v = build_v2_inputs(d, token, args.model_dim, args.inter_dim,
                                 args.experts, args.topk, BM_S1)
             if args.stage == "gemm1":
+                if args.print_output:
+                    print_gemm1_v2_layout_compare(
+                        d, v, token, args.model_dim, args.inter_dim,
+                        args.experts, args.topk, BM_S1, use_nt, BN_v2, KW_v2,
+                        params1,
+                    )
                 v2_us, v2_nz = time_v2(
                     d, v, token, args.model_dim, args.inter_dim,
                     args.experts, args.topk, BM_S1, use_nt, BN_v2, KW_v2
@@ -648,7 +828,8 @@ def main():
                 v2_us, v2_nz = time_v2_gemm2(
                     d, v, token, args.model_dim, args.inter_dim,
                     args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog, persist,
-                    BN_v2, KW_v2
+                    BN_v2, KW_v2, base_gemm1_params=params1,
+                    print_output=args.print_output
                 )
         except Exception as e:
             v2_us, v2_nz = float("nan"), -1
