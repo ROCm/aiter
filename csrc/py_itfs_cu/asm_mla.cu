@@ -712,6 +712,8 @@ void mla_decode_stage1_asm_fwd(
     int stride_Q       = Q->stride(0) * Q->element_size() * max_seqlen_q;
     int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
+    auto q_dtype = Q->dtype();
+    auto kv_dtype = KV->dtype();
 
     KernelArgs args = {};
     size_t arg_size  = sizeof(args);
@@ -725,6 +727,12 @@ void mla_decode_stage1_asm_fwd(
     args.ptr_QTP     = qo_indptr->data_ptr();
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio * max_seqlen_q;
+    if(num_heads == 32 && max_seqlen_q == 4 && nhead_kv == 1 &&
+       q_dtype == AITER_DTYPE_fp8 && kv_dtype == AITER_DTYPE_fp8)
+    {
+        // qh32/qseqlen4 kernels already encode qlen in the folded layout.
+        args.s_MQA = gqa_ratio;
+    }
     args.s_kv_split  = kv_split;
     args.s_Q_Bs      =  stride_Q;
     args.s_Bs        = stride_Page;
@@ -804,9 +812,6 @@ void mla_decode_stage1_asm_fwd(
 
     AITER_CHECK(Q->is_contiguous(), __func__, ":only support Q.is_contiguous() for now");
     AITER_CHECK(num_kv_heads == 1, __func__, ":only support num_kv_heads==1 for now");
-
-    auto q_dtype = Q->dtype();
-    auto kv_dtype = KV->dtype();
 
     if (kv_dtype != AITER_DTYPE_i8 && kv_dtype != AITER_DTYPE_u8) {
         AITER_CHECK(head_size == KV->size(3), __func__, ":only support head_size == KV.size(3) for now");

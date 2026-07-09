@@ -1627,6 +1627,189 @@ def test_mla(
     return ret
 
 
+def _make_qh32_qseqlen4_regression_inputs(batch_size: int, kv_len: int, seed: int = 3380):
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+
+    q_len = 4
+    nhead = 32
+    nhead_kv = 1
+    qk_head_dim = 576
+    total_q = batch_size * q_len
+    total_kv = batch_size * kv_len
+
+    q_bf16 = torch.randn(
+        (total_q, nhead, qk_head_dim),
+        dtype=torch.bfloat16,
+        generator=generator,
+        device="cpu",
+    )
+    kv_bf16 = torch.randn(
+        (total_kv, 1, nhead_kv, qk_head_dim),
+        dtype=torch.bfloat16,
+        generator=generator,
+        device="cpu",
+    )
+
+    qo_indptr = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32)
+    kv_indptr = torch.arange(0, (batch_size + 1) * kv_len, kv_len, dtype=torch.int32)
+    kv_indices = torch.arange(total_kv, dtype=torch.int32)
+    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int32)
+
+    return {
+        "q": q_bf16.to(dtypes.fp8).cuda(),
+        "kv_buffer": kv_bf16.to(dtypes.fp8).cuda(),
+        "qo_indptr": qo_indptr.cuda(),
+        "kv_indptr": kv_indptr.cuda(),
+        "kv_indices": kv_indices.cuda(),
+        "kv_last_page_lens": kv_last_page_lens.cuda(),
+        "q_scale": torch.ones((), dtype=torch.float32, device="cuda"),
+        "kv_scale": torch.ones((), dtype=torch.float32, device="cuda"),
+        "sm_scale": 1.0 / math.sqrt(qk_head_dim),
+    }
+
+
+def _qh32_qseqlen4_reference(inputs):
+    q_len = 4
+    nhead = 32
+    v_head_dim = 512
+    q = inputs["q"].float()
+    kv = inputs["kv_buffer"].view(-1, 1, 576).float()
+    qo_indptr = inputs["qo_indptr"].cpu().tolist()
+    kv_indptr = inputs["kv_indptr"].cpu().tolist()
+
+    outs = []
+    for batch_idx in range(len(qo_indptr) - 1):
+        q_start, q_end = qo_indptr[batch_idx], qo_indptr[batch_idx + 1]
+        kv_start, kv_end = kv_indptr[batch_idx], kv_indptr[batch_idx + 1]
+        cur_q = q[q_start:q_end]
+        cur_kv = kv[kv_start:kv_end]
+        cur_k = cur_kv.expand(-1, nhead, -1)
+        cur_v = cur_k[..., :v_head_dim]
+
+        attn = torch.einsum("qhd,khd->hqk", cur_q, cur_k) * inputs["sm_scale"]
+        causal_mask = torch.ones(
+            q_len,
+            cur_k.shape[0],
+            dtype=torch.bool,
+            device=cur_q.device,
+        ).tril(diagonal=cur_k.shape[0] - q_len)
+        attn = attn.masked_fill(~causal_mask[None, :, :], float("-inf"))
+        probs = torch.softmax(attn, dim=-1)
+        out = torch.einsum("hqk,khd->qhd", probs, cur_v)
+        outs.append(out.to(torch.bfloat16))
+    return torch.cat(outs, dim=0)
+
+
+def _check_qh32_qseqlen4_regression_close(ref, actual, *, atol=0.05):
+    torch.testing.assert_close(actual.float(), ref.float(), atol=atol, rtol=0)
+
+    row_nonzero = actual.reshape(actual.shape[0], -1).ne(0).sum(dim=1)
+    ref_row_nonzero = ref.reshape(ref.shape[0], -1).ne(0).sum(dim=1)
+    missing = torch.nonzero((ref_row_nonzero > 0) & (row_nonzero == 0)).flatten()
+    assert missing.numel() == 0, f"missing output rows: {missing.cpu().tolist()}"
+
+
+def run_qh32_qseqlen4_regression():
+    if get_gfx() != "gfx950":
+        aiter.logger.info("Skipping qh32/qseqlen4 regression on non-gfx950 GPU")
+        return
+
+    q_len = 4
+    nhead = 32
+    nhead_kv = 1
+    page_size = 1
+
+    for kv_len in (41, 256):
+        inputs = _make_qh32_qseqlen4_regression_inputs(batch_size=32, kv_len=kv_len)
+        ref = _qh32_qseqlen4_reference(inputs)
+        out = torch.empty_like(ref)
+
+        (
+            (work_meta_data_shape, work_meta_data_dtype),
+            (work_indptr_shape, work_indptr_dtype),
+            (work_info_set_shape, work_info_set_dtype),
+            (reduce_indptr_shape, reduce_indptr_dtype),
+            (reduce_final_map_shape, reduce_final_map_dtype),
+            (reduce_partial_map_shape, reduce_partial_map_dtype),
+        ) = aiter.get_mla_metadata_info_v1(
+            32,
+            q_len,
+            nhead,
+            dtypes.fp8,
+            dtypes.fp8,
+            False,
+            fast_mode=True,
+            num_kv_splits=32,
+            intra_batch_mode=False,
+        )
+
+        work_meta_data = torch.empty(
+            work_meta_data_shape, dtype=work_meta_data_dtype, device="cuda"
+        )
+        work_indptr = torch.empty(work_indptr_shape, dtype=work_indptr_dtype, device="cuda")
+        work_info_set = torch.empty(
+            work_info_set_shape, dtype=work_info_set_dtype, device="cuda"
+        )
+        reduce_indptr = torch.empty(
+            reduce_indptr_shape, dtype=reduce_indptr_dtype, device="cuda"
+        )
+        reduce_final_map = torch.empty(
+            reduce_final_map_shape, dtype=reduce_final_map_dtype, device="cuda"
+        )
+        reduce_partial_map = torch.empty(
+            reduce_partial_map_shape, dtype=reduce_partial_map_dtype, device="cuda"
+        )
+
+        aiter.get_mla_metadata_v1(
+            inputs["qo_indptr"],
+            inputs["kv_indptr"],
+            inputs["kv_last_page_lens"],
+            nhead // nhead_kv,
+            nhead_kv,
+            False,
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            page_size=page_size,
+            kv_granularity=16,
+            max_seqlen_qo=q_len,
+            uni_seqlen_qo=q_len,
+            fast_mode=True,
+            dtype_q=dtypes.fp8,
+            dtype_kv=dtypes.fp8,
+        )
+
+        aiter.mla.mla_decode_fwd(
+            inputs["q"],
+            inputs["kv_buffer"],
+            out,
+            inputs["qo_indptr"],
+            inputs["kv_indptr"],
+            inputs["kv_indices"],
+            inputs["kv_last_page_lens"],
+            q_len,
+            page_size,
+            nhead_kv,
+            inputs["sm_scale"],
+            num_kv_splits=32,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            q_scale=inputs["q_scale"],
+            kv_scale=inputs["kv_scale"],
+        )
+        torch.cuda.synchronize()
+        _check_qh32_qseqlen4_regression_close(ref, out)
+        aiter.logger.info("qh32/qseqlen4 regression passed for kv_len=%s", kv_len)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1769,7 +1952,16 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
+parser.add_argument(
+    "--run_qh32_qseqlen4_regression",
+    action="store_true",
+    help="Run the focused gfx950 fp8/fp8 qh32/qseqlen4 persistent MLA regression.",
+)
 args = parser.parse_args()
+if args.run_qh32_qseqlen4_regression:
+    run_qh32_qseqlen4_regression()
+    raise SystemExit(0)
+
 for nhead, decode_qlen in args.nhead:
     df = []
     for dtype, kvtype, ctx_len, batch_size, max_split_per_batch in itertools.product(
