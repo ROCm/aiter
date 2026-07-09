@@ -287,26 +287,76 @@ def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
-def _ep_remap_topk_ids(
-    topk_ids: torch.Tensor,
-    expert_mask: torch.Tensor,
-    E: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map global expert ids -> local [0, E); masked-out ids -> dump id E.
+@functools.cache
+def _get_compiled_g2l_lut():
+    """Compile and cache the single-block FlyDSL g2l-LUT builder."""
+    from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 
-    ``expert_mask`` is the global-sized (E_global,) 0/1 tensor; the i-th local
-    weight row corresponds to the i-th globally-enabled expert (mask==1), which
-    is exactly ``cumsum(mask) - 1`` at that position. Non-local routes are sent
-    to the dump bucket ``E`` and reported in ``drop_mask``.
+    return build_moe_g2l_lut_module()
 
-    Returns ``(local_topk_ids int32, drop_mask bool)`` (both topk_ids-shaped).
+
+# Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
+# masks fall back to the torch chain.
+_G2L_MAX_N = 512
+
+
+def _build_g2l_lut(
+    expert_mask: torch.Tensor, E: int, device
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build the EP global->local expert LUT (and zero the route counter).
+
+    Returns ``(g2l_lut, counter)`` where ``counter`` is the zero-inited ``(E,)``
+    per-bucket route counter produced by the fused kernel, or ``None`` on the
+    torch fallback (callers then allocate/zero it themselves).
+
+    ``g2l_lut[global_id]`` gives the local bucket in [0, E) for enabled experts
+    or the sentinel ``E`` for dropped (non-local) routes. Result is int32 on
+    ``device``.
+
+    Fast path: a single FlyDSL kernel (``moe_g2l_lut``) does ``ne + cumsum + sub
+    + where`` in one pass -- one launch instead of ~6 elementwise/scan kernels,
+    and on the same compiler/runtime as the rest of the gfx1250 grouped path
+    (no Triton in the decode hot path). This depends only on ``expert_mask``
+    (static per rank) but cannot be memoised here: ``fused_moe`` is dispatched
+    through ``torch.ops.aiter.*``, so the op layer hands this function a fresh
+    copy of ``expert_mask`` (new object *and* storage) on essentially every call,
+    so neither object- nor data_ptr-keyed caching hits. Collapsing the chain into
+    one kernel is the portable win; fully removing it would require precomputing
+    the LUT at ``expert_mask`` creation and threading it through the op schema.
     """
-    mask_bool = expert_mask.to(torch.bool)
-    g2l = expert_mask.to(torch.int64).cumsum(0) - 1
-    g2l = torch.where(mask_bool, g2l, torch.full_like(g2l, E))
-    local = g2l[topk_ids.to(torch.int64)]
-    drop = local == E
-    return local.to(torch.int32), drop
+    n = expert_mask.numel()
+    if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
+        try:
+            mask = (
+                expert_mask.to(device=device, dtype=torch.int32).reshape(-1).contiguous()
+            )
+            lut = torch.empty(n, dtype=torch.int32, device=device)
+            # The kernel also zero-inits this per-bucket route counter (folds the
+            # separate host torch.zeros(E) that moe_route_g2l increments).
+            counter = torch.empty(E, dtype=torch.int32, device=device)
+            _get_compiled_g2l_lut()(
+                ptr_arg(mask),
+                ptr_arg(lut),
+                ptr_arg(counter),
+                int(n),
+                int(E),
+                stream=torch.cuda.current_stream(),
+            )
+            return lut, counter
+        except Exception as exc:  # pragma: no cover - fallback on any kernel issue
+            logger.debug(
+                "[grouped_a8w4] flydsl g2l build unavailable (%s); "
+                "falling back to torch",
+                exc,
+            )
+    mask_bool = expert_mask.to(device=device).reshape(-1) != 0
+    lut = torch.cumsum(mask_bool.to(torch.int32), 0) - 1
+    lut = (
+        torch.where(mask_bool, lut, torch.full_like(lut, E))
+        .to(torch.int32)
+        .contiguous()
+    )
+    return lut, None
 
 
 def _maybe_grouped_gfx1250_a8w4_moe(
@@ -485,18 +535,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    if _is_ep:
-        # Remap global expert ids -> local; dropped (non-local) routes go to the
-        # dump id E for now. Their gather weight is zeroed so they contribute 0.
-        # ``local_topk_ids`` / ``n_route_buckets`` are finalized per routing
-        # variant once we know whether the contiguous scheduler is used.
-        _ep_local_full, _ep_drop = _ep_remap_topk_ids(topk_ids, expert_mask, E)
-        gather_weight = topk_weight.clone()
-        gather_weight[_ep_drop] = 0
-    else:
-        _ep_local_full = None
-        _ep_drop = None
-        gather_weight = topk_weight
+    # EP global->local LUT (sentinel ``E`` marks dropped/non-local routes). The
+    # contiguous fast path builds it on-device inside the single-block fused route
+    # kernel (moe_route_g2l_fused), so it is only materialised standalone for the
+    # masked fast path and the naive debug fallback. Deferred until the route
+    # path is known (see below).
+    _g2l_lut = None
+    _g2l_counter = None
+    gather_weight = topk_weight
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
@@ -617,16 +663,32 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
     n_route_buckets = E
-    if _is_ep:
-        # Fold dropped (non-local) routes into bucket 0; their gather weight is
-        # 0, so they contribute nothing. Using a real bucket rather than an
-        # extra E+1 "dump" bucket keeps every grouped buffer at exactly
-        # (E, max_m, ..) -- required by the masked GEMM launcher's shape check
-        # and numerically clean on the contiguous scheduler too.
+    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
+    # The contiguous fast path folds the LUT build into moe_route_g2l_fused; every
+    # other EP path (masked fast path, naive fallback, or E_global > single-block
+    # scan ceiling) needs a standalone LUT + zeroed counter built here.
+    _use_fused_route_g2l = (
+        _is_ep
+        and grouped_contiguous_m
+        and (not _use_naive)
+        and expert_mask.numel() <= _G2L_MAX_N
+    )
+    if _is_ep and not _use_fused_route_g2l:
+        _g2l_lut, _g2l_counter = _build_g2l_lut(expert_mask, E, device)
+    if _is_ep and _use_naive:
+        # Naive fallback keeps the host remap: fold dropped (non-local) routes
+        # into bucket 0 (gather weight 0) so it stays numerically identical to
+        # the fused kernels while remaining pure-torch for debugging.
+        _g2l_full = _g2l_lut[topk_ids.reshape(-1).long()].view_as(topk_ids)
+        _ep_drop = _g2l_full >= n_route_buckets
         local_topk_ids = torch.where(
-            _ep_drop, torch.zeros_like(_ep_local_full), _ep_local_full
+            _ep_drop, torch.zeros_like(_g2l_full), _g2l_full
         )
+        gather_weight = topk_weight.clone()
+        gather_weight[_ep_drop] = 0
     else:
+        # Fast paths pass GLOBAL ids + g2l_lut into the route kernels, which
+        # remap to local buckets and zero dropped weights on-device.
         local_topk_ids = topk_ids
 
     flat_experts = local_topk_ids.reshape(-1)
@@ -642,7 +704,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and not torch.cuda.is_current_stream_capturing()
     )
 
-    if _grouped_sync_dbg:
+    if _grouped_sync_dbg and not (_is_ep and not _use_naive):
+        # On the fused EP fast path ``flat_experts`` holds GLOBAL ids (remapped
+        # on-device), so the local-range invariant only applies to naive/non-EP.
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= n_route_buckets):
             raise ValueError(
                 "grouped a8w4 path expects local expert ids in [0, n_route_buckets)"
@@ -666,7 +730,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg(f"routing max_m={max_m}")
 
     # Fast path: fused route+quant+scatter; naive path: torch fallback for debug.
-    _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
     fused_quant_mode = "fp4" if data_format == "fp4" else "fp8"
     grouped_a1 = None
     grouped_a1_scale = None
@@ -676,6 +739,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     route_E = n_route_buckets
     route_max_m = max_m
     effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
+    # Shared gather-weight buffer for the fused EP fast path. The route kernel
+    # writes every entry from the f32 route weights (kept -> cast to weight_dtype,
+    # dropped -> 0); the same buffer is then read by the final gather-reduce. This
+    # folds the host topk_weight.to(bf16) copy + masked_fill into the route pass,
+    # so the buffer is left uninitialised here (every entry is kernel-written).
+    _gather_w_buf = (
+        torch.empty((token_num, topk), dtype=dtype, device=device)
+        if (_is_ep and not _use_naive and dtype in (dtypes.bf16, dtypes.fp16))
+        else None
+    )
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
@@ -771,8 +844,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             route_E = 1
             route_max_m = int(contiguous_m)
 
+            # fused_route_psum_remap (PR #3851) is not g2l-aware, so it can only
+            # be used off the EP path; EP always routes through the g2l-aware
+            # flydsl_moe_topids_to_rows below.
             _use_fused_route_psum = (
-                int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
+                not _is_ep
+                and int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
                 and int(n_route_buckets) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
             )
             if _use_fused_route_psum:
@@ -792,6 +869,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                     local_topk_ids,
                     n_route_buckets,
                     max_m,
+                    g2l_lut=_g2l_lut,
+                    expert_mask=(expert_mask if _use_fused_route_g2l else None),
+                    gather_w=_gather_w_buf,
+                    weight_in=gather_weight,
+                    counter=_g2l_counter,
                 )
                 _grouped_dbg("route done, start psum+remap")
                 _starts_t, psum_t, _ = contiguous_psum_remap(
@@ -836,6 +918,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 expert_row_base=None,
                 out_E=route_E,
                 out_max_m=route_max_m,
+                g2l_lut=_g2l_lut,
+                gather_w=_gather_w_buf,
+                weight_in=gather_weight,
+                counter=_g2l_counter,
             )
             rows_to_tokens = None
             _grouped_dbg("fused route+quant+scatter done")
@@ -1063,8 +1149,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fused quant+preshuffle sync OK")
     _grouped_dbg("a2 scale layout done")
-    _grouped_out_alloc = torch.zeros if _is_ep else torch.empty
-    grouped_out = _grouped_out_alloc(
+    # Stage2 grouped output: the masked / contiguous GEMM only writes the rows
+    # the gather-reduce later reads (per-expert [0, masked_m) in the masked
+    # layout, or the tile-covered prefix range in the contiguous layout), so
+    # padding / dropped-route rows are never read. This holds for EP too --
+    # verified by a NaN-fill probe across the DSv4 shape/token sweep -- so we
+    # allocate uninitialized and skip the full-buffer zero-fill (previously the
+    # single largest small-kernel cost on the EP path, ~50us/iter for a 7168-wide
+    # output). DeepGEMM relies on the same masked_m-driven "write only valid
+    # rows" guarantee instead of zeroing the output.
+    grouped_out = torch.empty(
         (route_E, route_max_m, model_dim), dtype=dtype, device=device
     )
     stage2_compiler = (
@@ -1202,7 +1296,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         gather_w = (
             torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
             if doweight_stage1
-            else gather_weight.contiguous()
+            else (
+                _gather_w_buf
+                if _gather_w_buf is not None
+                else gather_weight.contiguous()
+            )
         )
         flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
         _grouped_dbg("gather-reduce output done")
@@ -1263,21 +1361,6 @@ def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
     out_dwords = int(model_dim) // 2
     n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
     return 4 if int(token_num) * n_iters_v4 >= 256 else 2
-
-
-def build_topids_to_rows(
-    topk_ids: torch.Tensor,  # (token_num, topk) local expert ids in [0, E)
-    max_m: int,
-    E: int,
-) -> torch.Tensor:
-    """Argsort-free per-token gather map: topids_to_rows[t,k] = expert*max_m + slot."""
-    import torch.nn.functional as F
-
-    token_num, topk = topk_ids.shape
-    flat_e = topk_ids.reshape(-1).to(torch.long)
-    # slot[r] = (# earlier routes to the same expert) = running count - 1
-    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
-    return (flat_e * max_m + slot).view(token_num, topk).to(torch.int32)
 
 
 @functools.cache
