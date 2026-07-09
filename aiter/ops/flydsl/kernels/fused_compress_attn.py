@@ -2990,12 +2990,7 @@ def flydsl_fused_compress_attn(
     if (
         k_split_num_waves is None
         and has_bt
-        and (
-            _is_csa_main
-            or _is_csa_indexer
-            or _is_csa_indexer_fp4
-            or _is_csa_main_nm
-        )
+        and (_is_csa_main or _is_csa_indexer or _is_csa_indexer_fp4 or _is_csa_main_nm)
     ):
         nw_eff = csa_ksplit_num_waves(plan_capacity)
     else:
