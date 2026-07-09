@@ -62,8 +62,8 @@ _raw_gemm_a8w8_blockscale = _load_kernel()
 
 
 def gemm_a8w8_blockscale(*args, **kwargs):
-    # Unit-test default: 3 buffers (manual variant requires >=3). An explicit
-    # num_buffers in a test (e.g. the num_buffers sweep) still overrides this.
+    # Unit-test default: 3 buffers. An explicit num_buffers in a test
+    # (e.g. the num_buffers sweep) still overrides this.
     kwargs.setdefault("num_buffers", 3)
     return _raw_gemm_a8w8_blockscale(*args, **kwargs)
 
@@ -382,153 +382,6 @@ def test_gemm_a8w8_blockscale_tdm_store_preallocated_output(M, N, K):
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
-def _experimental_supported(
-    M,
-    N,
-    K,
-    tile_n=128,
-    n_warp=4,
-    scale_block_k=SCALE_BLOCK_K,
-    scale_block_n=SCALE_BLOCK_N,
-):
-    warp_tile_n = tile_n // n_warp
-    scale_k = (K + scale_block_k - 1) // scale_block_k
-    return warp_tile_n <= scale_block_n and scale_k <= 32
-
-
-_EXPERIMENTAL_BASIC_SHAPES = [
-    s for s in get_basic_shapes() if _experimental_supported(*s)
-]
-_EXPERIMENTAL_TDM_SHAPES = [
-    s for s in get_tdm_store_shapes() if _experimental_supported(*s)
-]
-
-
-@pytest.mark.parametrize("M, N, K", _EXPERIMENTAL_BASIC_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("variant", ["manual"])
-def test_gemm_a8w8_blockscale_experimental_basic(variant, M, N, K, dtype):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=dtype,
-        variant=variant,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize("M, N, K", [(128, 256, 256), (256, 512, 512)])
-@pytest.mark.parametrize("num_buffers", [2, 3, 4])
-@pytest.mark.parametrize("variant", ["manual"])
-def test_gemm_a8w8_blockscale_experimental_num_buffers(variant, M, N, K, num_buffers):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K, num_buffers=num_buffers)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=torch.bfloat16,
-        num_buffers=num_buffers,
-        variant=variant,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize("M, N, K", _EXPERIMENTAL_TDM_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("variant", ["manual"])
-def test_gemm_a8w8_blockscale_experimental_tdm_store(variant, M, N, K, dtype):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=dtype,
-        variant=variant,
-        use_tdm_store=True,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize(
-    "M, N, K",
-    [
-        (128, 256, 256),
-        (128, 128, 512),
-        (1024, 1024, 1024),
-    ],
-)
-@pytest.mark.parametrize("variant", ["manual"])
-def test_gemm_a8w8_blockscale_experimental_scales_per_tile(variant, M, N, K):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K, tile_k=256)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=torch.bfloat16,
-        tile_k=256,
-        variant=variant,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize(
-    "M, N, K",
-    [
-        (128, 256, 4224),
-        (128, 256, 8192),
-        (128, 256, 12288),
-    ],
-)
-@pytest.mark.parametrize("variant", ["manual"])
-def test_gemm_a8w8_blockscale_experimental_multi_chunk(variant, M, N, K):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=torch.bfloat16,
-        variant=variant,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-M", type=int, default=128)
@@ -550,7 +403,7 @@ if __name__ == "__main__":
         "--variant",
         type=str,
         default="reg_preload",
-        choices=["reg_preload", "manual"],
+        choices=["reg_preload"],
     )
     args = parser.parse_args()
 
