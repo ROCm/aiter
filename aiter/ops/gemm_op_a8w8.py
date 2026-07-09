@@ -508,6 +508,27 @@ def get_GEMM_config_with_quant_type(
     return config
 
 
+def _select_flydsl_preshuffle_kernel(m: int, n: int, k: int):
+    """Select a default FlyDSL preshuffle kernel instance for the given shape.
+
+    Returns a kernelInstance whose tile_n divides N and tile_k divides K,
+    with tile_m chosen to best match M.  Returns None if no kernel fits.
+    """
+    try:
+        from .flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            default_kernels_dict,
+        )
+    except ImportError:
+        return None
+
+    fits = [ki for ki in default_kernels_dict.values()
+            if n % ki.tile_n == 0 and k % ki.tile_k == 0]
+    if not fits:
+        return None
+    want_tm = min(256, max(16, 1 << (m - 1).bit_length())) if m > 0 else 16
+    return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
+
+
 def gemm_a8w8_fake(
     XQ: Tensor,
     WQ: Tensor,
@@ -600,13 +621,26 @@ def gemm_a8w8_CK(
     dtype: torch.dtype = dtypes.bf16,
     splitK: Optional[int] = None,
 ) -> Tensor:
-    # assert dtype in [
-    #     dtypes.bf16,
-    #     dtypes.fp16,
-    # ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
+
+    if (
+        is_flydsl_available()
+        and WQ.dtype in [dtypes.fp8, dtypes.i8]
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and bias is None
+    ):
+        ki = _select_flydsl_preshuffle_kernel(m, n, k)
+        if ki is not None:
+            from .shuffle import shuffle_weight
+
+            Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+            WQ_shuffled = shuffle_weight(WQ, layout=(16, 16))
+            return gemm_a8w8_bpreshuffle_flydsl(
+                XQ, WQ_shuffled, x_scale, w_scale, Y,
+                {"kernelName": ki.name},
+            )
 
     q_dtype_w = WQ.dtype if WQ.dtype in [dtypes.fp8, dtypes.i8] else dtypes.i8
     ck_config = get_GEMM_config_with_quant_type(
@@ -703,27 +737,46 @@ def gemm_a8w8_bpreshuffle(
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
-    if get_gfx() == "gfx1250" and is_flydsl_available():
-        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
-            kernel_fits_shape,
-            kernels_list,
-        )
+    if is_flydsl_available():
+        gfx = get_gfx()
+        if gfx == "gfx1250":
+            from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+                kernel_fits_shape,
+                kernels_list,
+            )
 
-        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
-        if fits:
-            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
-            ki = min(
-                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
-            )
-            logger.warning(
-                f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
-                f"falling back to flydsl kernel '{ki.name}'."
-            )
-            if w_k > k:
-                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-            return gemm_a8w8_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
-            )
+            fits = [
+                ki for ki in kernels_list.values()
+                if kernel_fits_shape(ki, m, n, k)
+            ]
+            if fits:
+                want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+                ki = min(
+                    fits,
+                    key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k),
+                )
+                logger.warning(
+                    f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
+                    f"falling back to flydsl kernel '{ki.name}'."
+                )
+                if w_k > k:
+                    XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+                return gemm_a8w8_bpreshuffle_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+                )
+        else:
+            ki = _select_flydsl_preshuffle_kernel(m, n, k)
+            if ki is not None:
+                logger.warning(
+                    f"[FlyDSL] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
+                    f"falling back to flydsl kernel '{ki.name}'."
+                )
+                if w_k > k:
+                    XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+                return gemm_a8w8_bpreshuffle_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+                )
+
     try:
         if w_k > k:
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
