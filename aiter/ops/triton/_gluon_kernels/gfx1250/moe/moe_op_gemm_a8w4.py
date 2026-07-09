@@ -199,8 +199,10 @@ def _moe_gemm_a8w4_decode(
         return
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
-    M = gl.load(ExptHist + expt_id)
-    start_m = gl.load(ExptOffs + expt_id)
+    #M = gl.load(ExptHist + expt_id)
+    #start_m = gl.load(ExptOffs + expt_id)
+    start_m = gl.load(ExptData + grid_m + pid_m)
+    M = gl.load(ExptData + grid_m * 2 + pid_m)
     # expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
     # start_m = start_m.to(index_type)
     # pid_n = pid_n.to(index_type)

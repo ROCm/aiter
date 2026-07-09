@@ -59,11 +59,17 @@ def _expt_data_compute_stage1(
             tl.store(
                 MDTileInfo + block_offs, 0xFFFFFFFF, mask=block_offs < max_num_tiles
             )
+            tl.store(
+                MDTileInfo + max_num_tiles + block_offs, 0xFFFFFFFF, mask=block_offs < max_num_tiles
+            )
+            tl.store(
+                MDTileInfo + max_num_tiles * 2 + block_offs, 0xFFFFFFFF, mask=block_offs < max_num_tiles
+            )
 
 
 @triton.jit
 def _expt_data_compute_stage2(
-    pid, Hist, TileStart, TileInfo, tile_dim_log2: tl.constexpr
+    pid, Hist, TokenStart, TileStart, TileInfo, max_num_tiles, tile_dim_log2: tl.constexpr
 ):
 
     expt_id = pid
@@ -73,13 +79,18 @@ def _expt_data_compute_stage2(
         return
     BLOCK: tl.constexpr = 8
     n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
+    start_m = tl.load(TokenStart + expt_id)
     TileInfo += tl.load(TileStart + expt_id)
+    TileInfo_start_m = TileInfo + max_num_tiles
+    TileInfo_M = TileInfo_start_m + max_num_tiles
 
     n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
     block_offs = tl.arange(0, BLOCK)
     for i in range(0, n_blocks, BLOCK):
         data = (block_offs << 16) + expt_id
         tl.store(TileInfo + block_offs, data, mask=block_offs < n_blocks)
+        tl.store(TileInfo_start_m + block_offs, start_m, mask=block_offs < n_blocks)
+        tl.store(TileInfo_M + block_offs, n_tokens, mask=block_offs < n_blocks)
         block_offs += BLOCK
 
 

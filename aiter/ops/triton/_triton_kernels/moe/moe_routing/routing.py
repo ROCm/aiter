@@ -226,7 +226,7 @@ def _combined_routing(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(pid, ExpertHist, TokenStart, TileStart, MDTileInfo, max_num_tiles, tile_dim_log2)
     else:
         pid -= blocks1a
         _routing_compute_indx(

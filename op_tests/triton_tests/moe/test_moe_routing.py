@@ -108,13 +108,13 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
     return logits
 
 
-n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
+n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192, 98304]
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
 @pytest.mark.parametrize(
     "n_expts_tot, n_expts_act",
-    [(128, 4), (128, 6), (128, 32), (1500, 8), (256, 8), (8, 2)],
+    [(128, 4), (128, 6), (128, 32), (1500, 8), (256, 8), (8, 2), (384, 6)],
 )
 @pytest.mark.parametrize("sm_first", [True, False])
 def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):

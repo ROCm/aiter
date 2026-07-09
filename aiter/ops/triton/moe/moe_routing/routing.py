@@ -130,7 +130,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         token_offs_pad,  #
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[1],  #
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
@@ -254,7 +254,7 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
     token_offs_pad = token_offs_combined[1][: n_expts_tot + 1]
 
     # block_pid_map = torch.empty((pad(max_n_tiles),), dtype=dtype, device=device)
-    block_pid_map = torch.empty((max_n_tiles,), dtype=dtype, device=device)
+    block_pid_map = torch.empty((3, max_n_tiles), dtype=dtype, device=device)
     # block_pid_map = block_pid_map[:max_n_tiles]
 
     blocks1 = n_expts_tot
@@ -509,11 +509,13 @@ def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     token_offs_pad = torch.cat((torch.zeros(1, device=device), token_offs_pad))
     token_offs_pad = token_offs_pad.int()
     # compute data required to drive ragged batch matmul
-    block_pid_map = -torch.ones(max_n_tiles, device=device)
+    block_pid_map = -torch.ones((3, max_n_tiles), device=device)
     for e in range(n_expts_tot):
         offset = token_offs_pad[e]
         for b in range(n_tiles[e]):
-            block_pid_map[offset + b] = (b << 16) + e
+            block_pid_map[0, offset + b] = (b << 16) + e
+            block_pid_map[1, offset + b] = token_offs_raw[e]
+            block_pid_map[2, offset + b] = hist[e]
     block_pid_map = block_pid_map.int()
     return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
 
