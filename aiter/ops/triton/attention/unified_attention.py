@@ -88,7 +88,8 @@ def select_2d_config(
     if not all_decode:
         if head_size >= 512 and not arch.is_rdna:
             BLOCK_M = max(16, triton.next_power_of_2(num_queries_per_kv))
-            num_warps, num_stages_2d = 4, 1
+            num_warps, num_stages_2d = 4, 2
+            TILE_SIZE = 16
         elif head_size >= 256 and not arch.is_rdna:
             num_warps, num_stages_2d = 2, 2
             TILE_SIZE = 32
@@ -286,6 +287,9 @@ def use_2d_kernel(
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
         return (sliding_window > 0) or (not all_decode)
+
+    if head_size >= 512 and not get_arch().is_rdna and not all_decode:
+        return True
 
     return (
         (sliding_window > 0)
