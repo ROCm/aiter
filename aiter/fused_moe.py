@@ -110,6 +110,9 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    # Round up to full block so the last workgroup's global_load_dword
+    # doesn't read past the buffer (asm kernels load block_size entries per WG).
+    max_num_tokens_padded = max_num_m_blocks * block_size
     # Pre-fill with topk_ids.numel() (>= token_cnt) so padded slots fail the
     # kernel's exec-mask guard (token_id < token_cnt), preventing OOB atomics.
     sorted_ids = torch.full((max_num_tokens_padded,), topk_ids.numel(), dtype=dtypes.i32, device=device)
