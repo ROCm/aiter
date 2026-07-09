@@ -1,17 +1,28 @@
-"""Standalone stage1-only perf comparison: asm sparse decode kernel vs ATOM's
-gfx1250 gluon `pa_decode_sparse` stage1 (bf16).
+"""Standalone perf comparison: asm sparse decode kernel vs ATOM's gfx1250 gluon
+`pa_decode_sparse`, with pa invoked EXACTLY the way ATOM invokes it.
 
-- asm stage1 = the `..._sparse` .co kernel (fp8, its native dtype), timed alone.
-- pa  stage1 = aiter `pa_decode_sparse(..., skip_reduce=True)` with kv_splits>1,
-               which launches ONLY the split (stage1) gluon kernel (no reduce).
+- asm       = the `..._sparse` .co kernel (fp8, native), num_kv_splits=1 so it
+              produces its final output directly; we report its stage1 device time
+              (there is no real stage2 at split=1).
+- pa (full) = `pa_decode_sparse(...)` called the ATOM way (see ATOM
+              model_ops/v4_kernels/paged_decode.py gfx1250 path): NO kv_splits (so
+              it is auto-inferred) and NO skip_reduce (so stage1 split-K + stage2
+              reduce BOTH run when the inferred split > 1). This is what ATOM
+              actually pays. The inferred split is printed as `pa_split`.
+- pa (s1)   = the same call forced with skip_reduce=True at the same inferred
+              split -> ONLY the stage1 split kernel (kept for context, so the
+              stage2 reduce cost = pa_full_us - pa_s1_us is visible).
 
-Only stage1 GPU device-time is compared. NOT bit-exact / not memory-fair: pa is
-bf16 while asm is fp8, and D=512 here (MLA QK is really 576-wide, so pa QK is
-~11% under-counted). Perf only.
+NOT bit-exact / not memory-fair: pa is bf16 while asm is fp8, and D=512 here
+(MLA QK is really 576-wide, so pa QK is ~11% under-counted). Perf only.
+asm stays at split=1 (its natural fast path; the poc's asm stage2 merge is
+pure-torch and unrepresentative), so the pa_full/asm ratio is "ATOM's real
+full-pipeline cost vs asm's single-pass cost".
 
 Usage:
   ENABLE_CK=0 python op_tests/_stage1_bench_pa.py            # default sweep
-  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 128 2048 4 # one combo
+  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512     # one combo: batch ctx
+  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512 128 # batch ctx gqa
 """
 import sys
 sys.path.insert(0, "op_tests")
@@ -27,18 +38,38 @@ from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 Q = 1
 SINK = True
 
-# Mirror test_mla_v4_kargpreld.py sweep grids + active kernel variants.
+# gqa + ctx mirror the kargpreld sweep; batch spans small->large so the
+# auto-inferred pa split covers ATOM's large-split (stage2) and split=1 ends.
 _GQA_LIST = [64, 128]
 _CTX_LENS = [256, 512, 1024]
 _BATCH_SIZES = [64]
-_SPLITS = [1]
+
+# gfx1250/gluon constants used by pa_decode_sparse's kv_splits auto-infer.
+_PA_BLOCK_K = 16
+_PA_MAX_NUM_WG = 1024
 
 # Perf iteration counts for run_perftest (mirrors test_mla_v4_kargpreld.py's
 # _PERF usage). Kept as module constants so both bench fns share them.
 _PERF = {"num_iters": 50, "num_warmup": 2}
 
 
-def bench_asm_stage1(batch, ctx, split, gqa):
+def _next_pow2(x):
+    return 1 << (int(x) - 1).bit_length() if x > 1 else 1
+
+
+def _infer_kv_splits(n_tokens, n_heads, n_indices):
+    """Replicate pa_decode_sparse's gfx1250 kv_splits auto-inference (so we can
+    force the same split for the stage1-only timing and print it)."""
+    block_h = max(_next_pow2(min(n_heads, 16)), 16)
+    n_head_blocks = -(-n_heads // block_h)  # ceil
+    max_kv_splits = max(1, -(-n_indices // _PA_BLOCK_K))
+    ks = max(1, _PA_MAX_NUM_WG // max(1, n_tokens * n_head_blocks))
+    ks = min(max_kv_splits, ks)
+    return _next_pow2(ks)
+
+
+def bench_asm(batch, ctx, gqa):
+    split = 1  # asm natural fast path: single pass produces the final output.
     inp = T._build_bf16_inputs(batch=batch, kv_seq_lens=ctx, q_seq_logical=Q,
                                seed=0, gqa_ratio=gqa, attn_sink=SINK)
     sm = 1.0 / (T._QUANT_D ** 0.5)
@@ -71,7 +102,9 @@ def bench_asm_stage1(batch, ctx, split, gqa):
     return s1_us
 
 
-def bench_pa_stage1(batch, ctx, split, gqa):
+def bench_pa(batch, ctx, gqa):
+    """Time pa the ATOM way (auto split, full stage1+stage2) and, for context,
+    the same call forced to stage1-only. Returns (pa_s1_us, pa_full_us, split)."""
     dev = "cuda"
     D = T.V_HEAD_DIM  # 512
     Tn = batch
@@ -84,24 +117,47 @@ def bench_pa_stage1(batch, ctx, split, gqa):
     attn_sink = torch.randn((H,), dtype=torch.float32, device=dev)
     sm = 1.0 / (D ** 0.5)
 
-    # skip_reduce=True + kv_splits>1 => only the stage1 (split) kernel runs.
-    _, us = run_perftest(
+    split = _infer_kv_splits(Tn, H, kv_indices.numel())
+
+    # pa full: EXACTLY ATOM's gfx1250 call — no kv_splits (auto-inferred to
+    # `split`), no skip_reduce => stage1 split + stage2 reduce both run.
+    _, full_us = run_perftest(
+        pa_decode_sparse,
+        q, unified_kv, kv_indices, kv_indptr, attn_sink, sm,
+        has_invalid=False,
+        num_iters=_PERF["num_iters"],
+        num_warmup=_PERF["num_warmup"],
+    )
+    # pa stage1-only: same split but skip_reduce=True => only the split kernel
+    # (skip_reduce is a no-op when the inferred split==1, so s1==full there).
+    _, s1_us = run_perftest(
         pa_decode_sparse,
         q, unified_kv, kv_indices, kv_indptr, attn_sink, sm,
         kv_splits=split, has_invalid=False, skip_reduce=True,
         num_iters=_PERF["num_iters"],
         num_warmup=_PERF["num_warmup"],
     )
-    return us
+    return s1_us, full_us, split
 
 
 import itertools
 
-print(f"{'gqa':>4} {'batch':>6} {'ctx':>6} {'split':>6} | {'asm_stage1_us':>14} {'pa_stage1_us':>13} {'pa/asm':>8}")
-print("-" * 74)
+print(f"{'gqa':>4} {'batch':>6} {'ctx':>6} {'pa_split':>8} | "
+      f"{'asm_us':>9} {'pa_s1_us':>9} {'pa_full_us':>11} {'pa_full/asm':>12}")
+print("-" * 82)
+
+if len(sys.argv) > 1:
+    batch = int(sys.argv[1])
+    ctx = int(sys.argv[2]) if len(sys.argv) > 2 else 512
+    gqa = int(sys.argv[3]) if len(sys.argv) > 3 else 64
+    combos = [(gqa, batch, ctx)]
+else:
+    combos = list(itertools.product(_GQA_LIST, _BATCH_SIZES, _CTX_LENS))
+
 # gqa outermost so rows mirror the kargpreld summary-table grouping.
-for gqa, batch, ctx, split in itertools.product(_GQA_LIST, _BATCH_SIZES, _CTX_LENS, _SPLITS):
-    asm_us = bench_asm_stage1(batch, ctx, split, gqa)
-    pa_us = bench_pa_stage1(batch, ctx, split, gqa)
-    ratio = pa_us / asm_us if asm_us > 0 else float("nan")
-    print(f"{gqa:>4} {batch:>6} {ctx:>6} {split:>6} | {asm_us:>14.2f} {pa_us:>13.2f} {ratio:>7.2f}x")
+for gqa, batch, ctx in combos:
+    asm_us = bench_asm(batch, ctx, gqa)
+    pa_s1_us, pa_full_us, split = bench_pa(batch, ctx, gqa)
+    ratio = pa_full_us / asm_us if asm_us > 0 else float("nan")
+    print(f"{gqa:>4} {batch:>6} {ctx:>6} {split:>8} | "
+          f"{asm_us:>9.2f} {pa_s1_us:>9.2f} {pa_full_us:>11.2f} {ratio:>11.2f}x")
