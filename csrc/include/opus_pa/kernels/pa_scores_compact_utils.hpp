@@ -48,7 +48,8 @@ __device__ __forceinline__ void scores_sparse_to_lane_regs(const float s_sparse[
                                                            int tile_kv,
                                                            float s_lane[kSRegSize]) {
     constexpr int kNumJ = SUB_KV / 64;
-    const int kv_pi_base = kv_offset + pi * (SUB_KV / 2);
+    (void)kv_offset;  // s_sparse is per-tile; use LOCAL kv indices.
+    const int kv_pi_base = pi * (SUB_KV / 2);
     const int lane = lane_id();
     const int wave = wave_id();
 
@@ -83,7 +84,8 @@ __device__ __forceinline__ void scores_compact_regs_to_dense_pi(const float s_la
     const int wave = wave_id();
     const int col = lane & 15;
     const int row_group = lane >> 4;
-    const int kv_pi_base = kv_offset + pi * (SUB_KV / 2);
+    (void)kv_offset;  // s_dense is per-tile; use LOCAL kv indices.
+    const int kv_pi_base = pi * (SUB_KV / 2);
     constexpr int kRowsPerGroup = 4;
 
     if (row_group >= (GQA + kRowsPerGroup - 1) / kRowsPerGroup) {

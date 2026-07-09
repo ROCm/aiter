@@ -28,6 +28,27 @@ __device__ __forceinline__ int v_shuffled_page_offset(int in_blk, int d, int blo
     return d * block_size + in_blk;
 }
 
+// Raw FP8 K byte at [kv, d] in the shuffled paged cache (mirrors gather_k_tile_linear_offset).
+template<int HEAD_DIM, int BLOCK_SIZE>
+__device__ __forceinline__ uint8_t k_hbm_tile_byte(const uint8_t* k_pool,
+                                                   const uint32_t* page_ids,
+                                                   int valid_blks,
+                                                   uint32_t stride_blk,
+                                                   uint32_t stride_kvhead,
+                                                   int kv_head_idx,
+                                                   int kv,
+                                                   int d) {
+    const int blk = kv / BLOCK_SIZE;
+    const int in_blk = kv % BLOCK_SIZE;
+    if (blk >= valid_blks) {
+        return 0;
+    }
+    const uint32_t page = page_ids[blk];
+    const uint8_t* page_base = k_pool + static_cast<size_t>(page) * stride_blk +
+                               static_cast<size_t>(kv_head_idx) * static_cast<size_t>(stride_kvhead);
+    return page_base[k_shuffled_page_offset<HEAD_DIM, BLOCK_SIZE>(in_blk, d)];
+}
+
 // sp3 scale layout: [num_blocks, num_kv_heads, block_size] (see KVQ_load_addr_offs_gen).
 __device__ __forceinline__ float kv_scale_at(const float* scale_pool,
                                              uint32_t page_id,

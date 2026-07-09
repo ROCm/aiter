@@ -46,39 +46,68 @@ __device__ __forceinline__ void load_kv_scale_pi(const float* kq_base,
     __syncthreads();
 }
 
-// sp3 cl_gemm0(cl_p, pi): j in [0, SUB_KV/64), vK_off = pi*sz_vK + j*sz_vK/4.
-// S sparse cols at pi*(SUB_KV/2) + j*64 + col (j=0..3 -> kv +0,+64,+128,+192).
-template<int GQA, int SUB_KV, int HEAD_DIM, int KV_REG_DWORDS>
-__device__ __forceinline__ void build_scores_mfma_pi(const uint32_t* q_regs,
-                                                     const uint32_t* k_regs,
+__device__ __forceinline__ uint64_t pack_u64_bytes(const uint8_t b[8]) {
+    const uint32_t lo = static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) |
+                        (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
+    const uint32_t hi = static_cast<uint32_t>(b[4]) | (static_cast<uint32_t>(b[5]) << 8) |
+                        (static_cast<uint32_t>(b[6]) << 16) | (static_cast<uint32_t>(b[7]) << 24);
+    return pack_u64(lo, hi);
+}
+
+// GEMM0 S = Q @ K^T via fp8 MFMA, built from gathered operands (probe-verified layout):
+//   A = Q  -> A[m][k]: m = query (lane%16),        k = head = kk*32 + 8*(lane/16) + i
+//   B = K  -> B[k][n]: n = kv-within-16 (lane%16), k = head
+// D[m=query][n=kv] matches mfma_scatter_scores_slice (row=query, col=kv). Raw fp8 dot;
+// q_deq/k_scale applied afterwards by scores_apply_qk_dequant.
+template<int GQA, int SUB_KV, int HEAD_DIM, int BLOCK_SIZE>
+__device__ __forceinline__ void build_scores_mfma_pi(const uint8_t* q_fp8_tile,
+                                                     const uint8_t* k_pool,
+                                                     const uint32_t* page_ids,
+                                                     int valid_blks,
+                                                     uint32_t stride_blk,
+                                                     uint32_t stride_kvhead,
+                                                     int kv_head_idx,
                                                      int pi,
                                                      int kv_offset,
                                                      int tile_kv,
                                                      float s_out[GQA][SUB_KV]) {
-    constexpr int kNumJ = SUB_KV / 64;  // sp3: SUB_KV/64 = 4 MFMA N-blocks per pi
-    constexpr int kNumK = HEAD_DIM / 32;
-    constexpr int kSzVkQuarter = kSzVk / 4;  // sp3: sz_vK/4 = 8 dwords
+    constexpr int kNumJ = SUB_KV / 64;   // 4 MFMA N-blocks per pi
+    constexpr int kNumK = HEAD_DIM / 32; // 4 K-steps (head chunks of 32)
 
     const int lane = lane_id();
     const int wave = wave_id();
-    const int query_base = 0;
-    const int kv_pi_base = kv_offset + pi * (SUB_KV / 2);
+    const int query = lane & 15;
+    const int g = lane >> 4;
+    // page_ids and s_out are per-tile; use LOCAL kv indices (kv_offset is the global
+    // tile base, only needed by the tail mask for ctx_len comparison).
+    (void)kv_offset;
+    const int kv_pi_base = pi * (SUB_KV / 2);
+    const int bound = tile_kv;
 
 #pragma unroll
     for (int j = 0; j < kNumJ; ++j) {
         const int kv_base = kv_pi_base + j * 64;
+        const int kv_lane = kv_base + (wave << 4) + query;  // this lane's kv (n = lane%16)
         mfma_acc4 acc{};
 #if defined(__gfx942__) || defined(__gfx950__)
 #pragma unroll
         for (int kk = 0; kk < kNumK; ++kk) {
-            const int vK_off = j * kSzVkQuarter + kk * kVsAb;
-            const uint64_t k_pk = pack_u64(k_regs[vK_off + 0], k_regs[vK_off + 1]);
-            const uint64_t q_pk = pack_u64(q_regs[kk * kVsAb + 0], q_regs[kk * kVsAb + 1]);
-            acc = mfma_fp8_fp8_step(acc, k_pk, q_pk, kk == 0);
+            uint8_t qb[8];
+            uint8_t kb[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int head = kk * 32 + g * 8 + i;
+                qb[i] = (query < GQA) ? q_fp8_tile[query * HEAD_DIM + head] : 0;
+                kb[i] = (kv_lane < bound)
+                            ? k_hbm_tile_byte<HEAD_DIM, BLOCK_SIZE>(k_pool, page_ids, valid_blks,
+                                                                    stride_blk, stride_kvhead,
+                                                                    kv_head_idx, kv_lane, head)
+                            : static_cast<uint8_t>(0);
+            }
+            acc = mfma_fp8_fp8_step(acc, pack_u64_bytes(qb), pack_u64_bytes(kb), kk == 0);
         }
 #endif
-        mfma_scatter_scores_slice<GQA, SUB_KV>(acc, lane, wave, query_base, kv_base,
-                                               kv_offset + tile_kv, s_out);
+        mfma_scatter_scores_slice<GQA, SUB_KV>(acc, lane, wave, 0, kv_base, bound, s_out);
     }
     __syncthreads();
 }
@@ -188,7 +217,7 @@ __device__ __forceinline__ void gemm1_mfma_pi(const uint8_t (*p_fp8)[SUB_KV],
 #if defined(PA_GEMM1_VGATHER)
             v_mfma_gather_b_pair<SUB_KV, HEAD_DIM, BLOCK_SIZE>(
                 v_pool, page_ids, valid_blks, stride_blk, stride_kvhead, kv_head_idx, block_size,
-                tile_kv, kv_base, head_base, lane, v_lo, v_hi);
+                tile_kv, kv_base, head_base, lane, wave, v_lo, v_hi);
 #else
             const int vV_off = vV_base + kk * kVsAb;
             v_lo = v_regs[vV_off + 0];
@@ -362,11 +391,15 @@ __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV]
 #endif
 
     constexpr int kHalf = SUB_KV / 2;
-    uint32_t v_regs[KV_REG_DWORDS * kPiCount];
+    uint32_t v_regs[KV_REG_DWORDS * kPiCount] = {};
+#if !defined(PA_GEMM1_VGATHER)
+    // With VGATHER the V operand is gathered from HBM; the sp3 V register global-load
+    // port is disabled (its OOB reads could fault).
     load_v_regs_tile<SUB_KV, HEAD_DIM, BLOCK_SIZE, KV_REG_DWORDS, NUM_PAIRS, LOAD_INSTS,
                      IMM_STRIDE>(
         v_pool, page_ids, valid_blks, stride_blk, stride_kvhead, lane, wave, tg_idx, bt_slots,
         v_regs);
+#endif
 
 #if defined(PA_GEMM1_BISECT)
     for (int idx = threadIdx.x; idx < GQA * HEAD_DIM; idx += blockDim.x) {

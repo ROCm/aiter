@@ -373,6 +373,11 @@ __device__ __forceinline__ void pa_fuse_quant_p_rows(float (*s_vq)[SUB_KV],
             const float pn = s_vq[g][kv] * row_dyn_scale[g];
             p_fp8[g][kv] = float_to_fp8_e4m3_bias8(pn);
         }
+        // Pad the tail [tile_kv, SUB_KV) with fp8 zero. The MFMA P-gather reads the
+        // full SUB_KV width; stale smem here would decode as fp8-NaN and poison MFMA.
+        for (int kv = tile_kv + threadIdx.x; kv < SUB_KV; kv += blockDim.x) {
+            p_fp8[g][kv] = static_cast<uint8_t>(0);
+        }
         __syncthreads();
     }
 }
@@ -480,25 +485,23 @@ __device__ __forceinline__ void pa_fuse_alu_tile(float (*s_scores)[SUB_KV],
     __syncthreads();
 }
 
+// MFMA A-operand pack for P@V GEMM1: A[m][k], m = lane%16 (query), k = 8*(lane/16)+byte_i (kv).
 template<int GQA, int SUB_KV, int P_SLICE>
 __device__ __forceinline__ void p_fp8_gather_lane_packed(const uint8_t p_fp8[GQA][SUB_KV],
                                                          int kv_base,
                                                          int lane,
                                                          int wave,
                                                          uint32_t packed[2]) {
-    constexpr int kRowsPerGroup = 4;
-    const int col = lane & 15;
-    const int row_group = lane >> 4;
+    (void)wave;
+    const int query = lane & 15;
+    const int g = lane >> 4;
 
     uint8_t bytes[8];
 #pragma unroll
-    for (int reg_k = 0; reg_k < 8; ++reg_k) {
-        const int j = reg_k >> 2;
-        const int inner_k = reg_k & 3;
-        const int qi = row_group * kRowsPerGroup + inner_k;
-        const int ki = kv_base + j * 64 + mfma_wave_n_offset(wave) + col;
-        bytes[reg_k] = (qi < GQA && ki < kv_base + P_SLICE) ? p_fp8[qi][ki]
-                                                            : static_cast<uint8_t>(0);
+    for (int i = 0; i < 8; ++i) {
+        const int ki = kv_base + g * 8 + i;
+        bytes[i] = (query < GQA && (g * 8 + i) < P_SLICE) ? p_fp8[query][ki]
+                                                          : static_cast<uint8_t>(0);
     }
     packed[0] = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
                 (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);

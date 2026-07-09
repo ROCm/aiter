@@ -81,14 +81,9 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
         kq_base, vq_base, page_ids, valid_blks, kv_nheads, kv_head_idx, 1, k_scale_pi1,
         v_scale_pi1);
 
-#if defined(PA_SP3_MFMA_GEMM0)
-    load_k_regs_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE, Traits::KV_REG_DWORDS,
-                     4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
-        static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, lane, wave, kv_head_idx, bt_slots, k_regs);
-#else
+    // GEMM0 MFMA builds A/B via gather (build_scores_mfma_pi); the sp3 K register
+    // global-load port is disabled (its OOB reads could fault alongside the V-reg load).
     (void)k_regs;
-#endif
 
 #if defined(PA_V_REGS_BISECT)
     v_regs_bisect_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE,
@@ -122,8 +117,9 @@ __device__ __forceinline__ void core_loop_tile_sp3_pi(int cl_p,
     // sp3 core_loop: for pi in 0..1: cl_gemm0 -> dequant -> compact -> pa_fuse_alu(pi)
     for (int pi = 0; pi < kPiCount; ++pi) {
         build_scores_mfma_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
-                             Traits::KV_REG_DWORDS>(
-            q_mfma_regs, k_regs + pi * Traits::KV_REG_DWORDS, pi, kv_offset, tile_kv, s_sparse);
+                             Traits::BLOCK_SIZE>(
+            q_fp8_tile, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks, stride_blk,
+            kargs.stride_kvhead, kv_head_idx, pi, kv_offset, tile_kv, s_sparse);
         scores_apply_qk_dequant_pi<Traits::GQA_RATIO, Traits::SUB_KV>(
             s_sparse, pi, tile_kv, q_deq_scales, (pi == 0) ? k_scale_pi0 : k_scale_pi1);
         scores_compact_mfma_pi<Traits::GQA_RATIO, Traits::SUB_KV>(s_sparse, pi, kv_offset, tile_kv,
@@ -265,14 +261,9 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
         kq_base, vq_base, page_ids, valid_blks, kv_nheads, kv_head_idx, 1, k_scale_pi1,
         v_scale_pi1);
 
-#if defined(PA_SP3_MFMA_GEMM0)
-    load_k_regs_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE, Traits::KV_REG_DWORDS,
-                     4, Traits::KV_LOAD_INSTS, Traits::KV_IMM_STRIDE>(
-        static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks, stride_blk,
-        kargs.stride_kvhead, lane, wave, kv_head_idx, bt_slots, k_regs);
-#else
+    // GEMM0 MFMA builds A/B via gather (build_scores_mfma_pi); the sp3 K register
+    // global-load port is disabled (its OOB reads could fault alongside the V-reg load).
     (void)k_regs;
-#endif
 
 #if defined(PA_V_REGS_BISECT)
     v_regs_bisect_tile<Traits::SUB_KV, Traits::HEAD_DIM, Traits::BLOCK_SIZE,
@@ -296,18 +287,19 @@ __device__ __forceinline__ void core_loop_tile(int cl_p,
         stride_blk, kargs.stride_kvhead, kv_head_idx, kv_nheads, kq_base, Traits::BLOCK_SIZE,
         tile_kv, k_tile, s_dense);
 #elif defined(PA_SP3_MFMA_GEMM0)
+    (void)s_sparse;
     for (int idx = threadIdx.x; idx < Traits::GQA_RATIO * Traits::SUB_KV; idx += blockDim.x) {
-        s_sparse[idx / Traits::SUB_KV][idx % Traits::SUB_KV] = 0.f;
+        s_dense[idx / Traits::SUB_KV][idx % Traits::SUB_KV] = 0.f;
     }
     __syncthreads();
 
-    for (int pi = 0; pi < kPiCount; ++pi) {
-        build_scores_mfma_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
-                             Traits::KV_REG_DWORDS>(
-            q_mfma_regs, k_regs + pi * Traits::KV_REG_DWORDS, pi, kv_offset, tile_kv, s_sparse);
-    }
-    scores_compact_mfma_tile<Traits::GQA_RATIO, Traits::SUB_KV>(s_sparse, kv_offset, tile_kv,
-                                                                s_dense, true);
+    // MFMA D[query][kv] is already the dense score layout; scatter straight into s_dense
+    // (one pi call with kNumJ=SUB_KV/64 covers the full KV width). The old sparse + DPP
+    // row_shr8 compaction double-counted the pi=1 half for full tiles.
+    build_scores_mfma_pi<Traits::GQA_RATIO, Traits::SUB_KV, Traits::HEAD_DIM,
+                         Traits::BLOCK_SIZE>(
+        q_fp8_tile, static_cast<const uint8_t*>(kargs.ptr_K), page_ids, valid_blks, stride_blk,
+        kargs.stride_kvhead, kv_head_idx, 0, kv_offset, tile_kv, s_dense);
 
     if (tile_kv < Traits::SUB_KV) {
         pa_tail_mask_dense<Traits::GQA_RATIO, Traits::SUB_KV>(s_dense, kv_offset, tile_kv,

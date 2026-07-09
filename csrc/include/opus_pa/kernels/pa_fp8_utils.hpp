@@ -12,10 +12,15 @@ static constexpr uint32_t kBf8Fmt = 0u;  // BF8_FMT
 static constexpr bool kFp8Bias = true;   // fp8_bias=true in pa.exe / gen_pa_buffers
 static constexpr float kFp8QuantDenoBias8 = 240.0f;
 
-// poc_kl quant() uses C abs(float) → int truncation (common_helper.h).
+// Per-row dynamic-quant absmax for Q (fp8 MFMA path).
 __device__ __forceinline__ float poc_kl_quant_row_abs(float x) {
-    const int ix = static_cast<int>(x);
-    return static_cast<float>(ix >= 0 ? ix : -ix);
+    // Per-row dynamic-quant absmax for Q. Must be the true floating-point |x|:
+    // truncating to int (static_cast<int>) collapses all |q|<1 values to 0, so the
+    // row absmax degenerates to ~1e-6, the fp8 scale explodes (240/1e-6) and Q
+    // overflows fp8 to NaN/saturation -> NaN scores -> softmax collapse -> zero/NaN
+    // output. Only the fp8-Q MFMA path uses this, which is why the bf16 reference
+    // path was unaffected.
+    return fabsf(x);
 }
 
 __device__ __forceinline__ uint32_t fp8_sign(uint8_t x) { return (x >> 7) & 1u; }

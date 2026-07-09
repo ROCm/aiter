@@ -543,8 +543,7 @@
             "'-DPA_MFMA_MAIN_PATH=1'",
             "'-DPA_SP3_MFMA_GEMM0=1'",
             "'-DPA_SP3_MFMA_GEMM1=1'",
-            "'-DPA_USE_SP3_PI=1'",
-            "'-DPA_GEMM1_LEGACY_PRESHAPE=1'"
+            "'-DPA_GEMM1_VGATHER=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [

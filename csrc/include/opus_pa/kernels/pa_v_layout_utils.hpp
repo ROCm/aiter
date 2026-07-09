@@ -200,7 +200,9 @@ __device__ __forceinline__ bool v_brute_decode_from_hbm(const uint8_t* v_pool,
     return false;
 }
 
-// Gather one MFMA B-operand pair (V[kv,d] tile) from HBM for P@V MFMA (GEMM1 layout).
+// Gather one MFMA B-operand pair (V[kv,d]) for P@V GEMM1.
+// fp8 16x16x32 B[k][n]: n = lane%16, k = 8*(lane/16) + byte_i. Here n = head column
+// (head = head_base + wave*16 + lane%16), k = kv contraction (kv = kv_base + 8*(lane/16) + i).
 template<int SUB_KV, int HEAD_DIM, int BLOCK_SIZE>
 __device__ __forceinline__ void v_mfma_gather_b_pair(const uint8_t* v_pool,
                                                      const uint32_t* page_ids,
@@ -213,23 +215,21 @@ __device__ __forceinline__ void v_mfma_gather_b_pair(const uint8_t* v_pool,
                                                      int kv_base,
                                                      int head_base,
                                                      int lane,
+                                                     int wave,
                                                      uint32_t& lo,
                                                      uint32_t& hi) {
-    constexpr int kRowsPerGroup = 4;
     const int col = lane & 15;
-    const int row_group = lane >> 4;
+    const int g = lane >> 4;
+    const int d = head_base + (wave << 4) + col;
 
     uint8_t bytes[8];
 #pragma unroll
-    for (int reg_k = 0; reg_k < 8; ++reg_k) {
-        const int j = reg_k >> 2;
-        const int inner_k = reg_k & 3;
-        const int kv = kv_base + j * 64 + col;
-        const int d = head_base + row_group * kRowsPerGroup + inner_k;
-        bytes[reg_k] = (kv < tile_kv && d < HEAD_DIM)
-                           ? v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk,
-                                             stride_kvhead, kv_head_idx, block_size, kv, d)
-                           : static_cast<uint8_t>(0);
+    for (int i = 0; i < 8; ++i) {
+        const int kv = kv_base + g * 8 + i;
+        bytes[i] = (kv < tile_kv && d < HEAD_DIM)
+                       ? v_hbm_tile_byte(v_pool, page_ids, valid_blks, stride_blk, stride_kvhead,
+                                         kv_head_idx, block_size, kv, d)
+                       : static_cast<uint8_t>(0);
     }
     lo = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
          (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
