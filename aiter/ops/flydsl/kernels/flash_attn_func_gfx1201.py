@@ -3,21 +3,21 @@
 
 """Combined Flash Attention kernel for gfx1201 with optimizations:
 
-1. BLOCK_N=32 (reduced tile, fewer iterations, better occupancy; 121->100ms)
-2. rocdl.exp2 (native ISA exp2 intrinsic, bypasses arith lowering)
+1. BLOCK_N=32 (reduced tile, fewer iterations, better occupancy).
+2. rocdl.exp2 (native ISA exp2 intrinsic, bypasses arith lowering).
 3. Software-pipelined GEMM2: preload next V pack while current WMMA executes,
-   hiding LDS read latency behind matrix compute (100->96ms).
+   hiding LDS read latency behind matrix compute.
 4. Overlapped V global load: pre-issue next iteration's V global loads at end
    of current iteration, so V data is in flight during loop back-edge, barrier,
-   and K cooperative load of the next iteration (96->91ms).
+   and K cooperative load of the next iteration.
 
 Note: V interleaved storage (ds_read_b32) was tested but the element-wise
 scatter store overhead negates read savings at BN=32. Row-major V with
 software-pipelined scalar reads is faster.
 
 Note: V pre-transpose (scatter store to col-major LDS, vec8 GEMM2 read) was
-tested but the 16 scalar stores per thread during coop_store_v add +8.8%
-regression vs baseline (102.7ms vs 94.3ms).
+tested but the extra scalar stores per thread during coop_store_v regress
+versus the row-major layout.
 
 WMMA 16x16x16 register layout (wave32):
   - A/B operand: v8bf16 per lane (lane16 = row/col, klane*8 = K-offset)
@@ -54,7 +54,6 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
 
-KERNEL_NAME = "flash_attn_func_gfx1201_c_exp_a_k_noswizzle_kernel"
 _LOG2E = host_math.log2(host_math.e)
 
 
@@ -83,7 +82,7 @@ def _pointer_store(value: ir.Value, ptr: ir.Value):
     return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
 
-def build_flash_attn_func_module_primary(
+def build_flash_attn_func_module(
     num_heads,
     head_dim,
     causal=True,
@@ -93,10 +92,11 @@ def build_flash_attn_func_module_primary(
     flat_work_group_size=None,
     block_m=None,
     block_n=None,
+    tail_mask=False,
+    cross_attn=False,
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
-    path_tag="auto",
 ):
     """Build gfx1201 flash_attn_func (BN=32 + rocdl.exp2 + pipelined GEMM2 + overlapped V load)."""
 
@@ -153,7 +153,20 @@ def build_flash_attn_func_module_primary(
     NUM_HEADS = num_heads
     HEAD_DIM = head_dim
     CAUSAL = causal
+    TAIL_MASK = tail_mask
+    CROSS_ATTN = cross_attn
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
+
+    # Descriptive per-variant symbol name (shows up in profiles / ISA dumps).
+    _name_flags = (
+        f"{'_causal' if causal else ''}"
+        f"{'_cross' if cross_attn else ''}"
+        f"{'_tail' if tail_mask else ''}"
+    )
+    KERNEL_NAME = (
+        f"flash_attn_func_gfx1201_{dtype_str}"
+        f"_h{num_heads}_d{head_dim}_m{BLOCK_M}n{BLOCK_N}{_name_flags}"
+    )
 
     # LDS layout -- K uses padding instead of XOR swizzle; V row-major with padding
     K_STRIDE = HEAD_DIM + 4  # padding to reduce bank conflicts (no swizzle)
@@ -199,6 +212,8 @@ def build_flash_attn_func_module_primary(
         V: fx.Pointer,
         O: fx.Pointer,  # noqa: E741
         seq_len: fx.Int32,
+        seq_len_real: fx.Int32,
+        seq_len_kv: fx.Int32,
     ):
         elem_type = dtype_to_elem_type(dtype_str)
         elem_dtype = elem_numeric_cls
@@ -236,6 +251,14 @@ def build_flash_attn_func_module_primary(
             return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
         seq_len_v = fx.Index(seq_len)
+        seq_len_real_v = fx.Index(seq_len_real)
+        if const_expr(CROSS_ATTN):
+            seq_len_kv_v = fx.Index(seq_len_kv)
+        else:
+            # Self-attn: K/V share Q's sequence length. Aliasing to seq_len_v (not
+            # the seq_len_kv arg) leaves the addressing math unchanged, so the
+            # self-attn path pays nothing for the cross-attn arg.
+            seq_len_kv_v = seq_len_v
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
@@ -262,7 +285,14 @@ def build_flash_attn_func_module_primary(
         load_col_base = load_lane_in_row * VEC_WIDTH
 
         def global_idx(token_idx, col):
+            # Q + O addressing (Q sequence length).
             token = batch_idx * seq_len_v + token_idx
+            return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+
+        def kv_global_idx(token_idx, col):
+            # K + V addressing (KV sequence length). For self-attn seq_len_kv_v is
+            # seq_len_v, so this is identical to global_idx.
+            token = batch_idx * seq_len_kv_v + token_idx
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         def _load_global_half_vec(ptr, base_idx, vec_type):
@@ -318,13 +348,13 @@ def build_flash_attn_func_module_primary(
                 if const_expr(KV_NEEDS_GUARD):
                     row_valid = load_row_in_batch < fx.Index(BLOCK_N)
                     if row_valid:
-                        g_idx = global_idx(row_idx, load_col_base)
+                        g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_row = load_row_in_batch + row_offset
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = load_global_f16xN(k_ptr, g_idx)
                         Vec(vec).store(lds_kv, [lds_idx])
                 else:
-                    g_idx = global_idx(row_idx, load_col_base)
+                    g_idx = kv_global_idx(row_idx, load_col_base)
                     lds_row = load_row_in_batch + row_offset
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     vec = load_global_f16xN(k_ptr, g_idx)
@@ -338,8 +368,16 @@ def build_flash_attn_func_module_primary(
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_in_batch + row_offset
-                g_idx = global_idx(row_idx, load_col_base)
+                if const_expr(KV_NEEDS_GUARD):
+                    # Guard OOB global read: with BLOCK_SIZE>256 the extra load
+                    # threads would read past the tile and fault at the last KV
+                    # tile (no allocation slack). Wrap into the valid in-tile row
+                    # range; the value is discarded by the guarded LDS store.
+                    safe_row = load_row_in_batch % fx.Index(BLOCK_N)
+                    row_idx = tile_start + safe_row + row_offset
+                else:
+                    row_idx = tile_start + load_row_in_batch + row_offset
+                g_idx = kv_global_idx(row_idx, load_col_base)
                 vecs.append(load_global_f16xN(v_ptr, g_idx))
             return vecs
 
@@ -391,7 +429,7 @@ def build_flash_attn_func_module_primary(
                 ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
             )
         else:
-            kv_upper = seq_len_v
+            kv_upper = seq_len_real_v
 
         # ---- Opt4: Pre-issue first V global load before loop ----
         _v_vecs_init = coop_load_v_global(fx.Index(0))
@@ -455,89 +493,30 @@ def build_flash_attn_func_module_primary(
                 for r in range_constexpr(8):
                     s_raw.append(Vec(s_accs[st])[r])
 
-            if const_expr(CAUSAL):
+            if const_expr(CAUSAL or TAIL_MASK):
+                # Straight-line per-column masking (no runtime scf.if). Each
+                # s_raw[idx] is one f32 scalar for KV column
+                #   col = kv_start + acc*16 + r + klane*8
+                # (acc bases 0,16,32,... generalize the BN=32 {0,16} pair to any
+                # NUM_S_ACCS). CAUSAL masks col > q_row; TAIL_MASK masks padded
+                # cols col >= seq_len_real. The two are mutually exclusive
+                # (causal never loads a padded col past the last real q_row).
+                # Unconditional selects: cheap VALU, no list-capture through the
+                # if-rewriter, and both flags are false on the aligned non-causal
+                # prod hot path -> this block is not emitted at all.
                 kv_start_i32 = fx.Int32(kv_block_start)
-                klane_i32 = fx.Int32(klane)
-                q_start_i32 = fx.Int32(q_start)
-                max_kv_col_i32 = kv_start_i32 + fx.Int32(BLOCK_N - 1)
-                tile_needs_mask = max_kv_col_i32 > q_start_i32
-
-                # SSA-style restructure (PR #462 pattern, lines 700-870):
-                # FlyDSL's `if` rewriter requires each loop-carried/conditional
-                # state variable to be a single MLIR Value, not a list. Unfold
-                # `s_raw[0..NUM_S_VALS-1]` into NUM_S_VALS named scalars, then
-                # reassign each one inside the `if tile_needs_mask:` branch.
-                # NUM_S_VALS == NUM_S_ACCS * 8 == 16 for BLOCK_N=32.
-                s_v0 = s_raw[0]
-                s_v1 = s_raw[1]
-                s_v2 = s_raw[2]
-                s_v3 = s_raw[3]
-                s_v4 = s_raw[4]
-                s_v5 = s_raw[5]
-                s_v6 = s_raw[6]
-                s_v7 = s_raw[7]
-                s_v8 = s_raw[8]
-                s_v9 = s_raw[9]
-                s_v10 = s_raw[10]
-                s_v11 = s_raw[11]
-                s_v12 = s_raw[12]
-                s_v13 = s_raw[13]
-                s_v14 = s_raw[14]
-                s_v15 = s_raw[15]
-                if tile_needs_mask:
-                    klane_off_i32 = klane_i32 * fx.Int32(8)
-                    # st=0
-                    _b0 = kv_start_i32 + fx.Int32(0) + klane_off_i32
-                    s_v0 = ArithValue(_b0 > q_row_i32).select(c_neg_inf, s_v0)
-                    _b1 = kv_start_i32 + fx.Int32(1) + klane_off_i32
-                    s_v1 = ArithValue(_b1 > q_row_i32).select(c_neg_inf, s_v1)
-                    _b2 = kv_start_i32 + fx.Int32(2) + klane_off_i32
-                    s_v2 = ArithValue(_b2 > q_row_i32).select(c_neg_inf, s_v2)
-                    _b3 = kv_start_i32 + fx.Int32(3) + klane_off_i32
-                    s_v3 = ArithValue(_b3 > q_row_i32).select(c_neg_inf, s_v3)
-                    _b4 = kv_start_i32 + fx.Int32(4) + klane_off_i32
-                    s_v4 = ArithValue(_b4 > q_row_i32).select(c_neg_inf, s_v4)
-                    _b5 = kv_start_i32 + fx.Int32(5) + klane_off_i32
-                    s_v5 = ArithValue(_b5 > q_row_i32).select(c_neg_inf, s_v5)
-                    _b6 = kv_start_i32 + fx.Int32(6) + klane_off_i32
-                    s_v6 = ArithValue(_b6 > q_row_i32).select(c_neg_inf, s_v6)
-                    _b7 = kv_start_i32 + fx.Int32(7) + klane_off_i32
-                    s_v7 = ArithValue(_b7 > q_row_i32).select(c_neg_inf, s_v7)
-                    # st=1 (st_base=16)
-                    _b8 = kv_start_i32 + fx.Int32(16) + klane_off_i32
-                    s_v8 = ArithValue(_b8 > q_row_i32).select(c_neg_inf, s_v8)
-                    _b9 = kv_start_i32 + fx.Int32(17) + klane_off_i32
-                    s_v9 = ArithValue(_b9 > q_row_i32).select(c_neg_inf, s_v9)
-                    _b10 = kv_start_i32 + fx.Int32(18) + klane_off_i32
-                    s_v10 = ArithValue(_b10 > q_row_i32).select(c_neg_inf, s_v10)
-                    _b11 = kv_start_i32 + fx.Int32(19) + klane_off_i32
-                    s_v11 = ArithValue(_b11 > q_row_i32).select(c_neg_inf, s_v11)
-                    _b12 = kv_start_i32 + fx.Int32(20) + klane_off_i32
-                    s_v12 = ArithValue(_b12 > q_row_i32).select(c_neg_inf, s_v12)
-                    _b13 = kv_start_i32 + fx.Int32(21) + klane_off_i32
-                    s_v13 = ArithValue(_b13 > q_row_i32).select(c_neg_inf, s_v13)
-                    _b14 = kv_start_i32 + fx.Int32(22) + klane_off_i32
-                    s_v14 = ArithValue(_b14 > q_row_i32).select(c_neg_inf, s_v14)
-                    _b15 = kv_start_i32 + fx.Int32(23) + klane_off_i32
-                    s_v15 = ArithValue(_b15 > q_row_i32).select(c_neg_inf, s_v15)
-                s_raw = [
-                    s_v0,
-                    s_v1,
-                    s_v2,
-                    s_v3,
-                    s_v4,
-                    s_v5,
-                    s_v6,
-                    s_v7,
-                    s_v8,
-                    s_v9,
-                    s_v10,
-                    s_v11,
-                    s_v12,
-                    s_v13,
-                    s_v14,
-                    s_v15,
-                ]
+                klane_off_i32 = fx.Int32(klane) * fx.Int32(8)
+                masked = []
+                for acc in range_constexpr(NUM_S_ACCS):
+                    for r in range_constexpr(8):
+                        idx = acc * 8 + r
+                        col_i32 = kv_start_i32 + fx.Int32(acc * 16 + r) + klane_off_i32
+                        if const_expr(CAUSAL):
+                            pred = ArithValue(col_i32 > q_row_i32)
+                        else:
+                            pred = ArithValue(col_i32 >= seq_len_real)
+                        masked.append(pred.select(c_neg_inf, s_raw[idx]))
+                s_raw = masked
 
             local_max = s_raw[0]
             for r in range_constexpr(NUM_S_VALS - 1):
@@ -677,6 +656,8 @@ def build_flash_attn_func_module_primary(
         O: fx.Pointer,  # noqa: E741
         batch_size: fx.Int32,
         seq_len: fx.Int32,
+        seq_len_real: fx.Int32,
+        seq_len_kv: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -686,7 +667,8 @@ def build_flash_attn_func_module_primary(
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 
-        launcher = flash_attn_func_kernel(Q, K, V, O, seq_len)
+        flash_attn_func_kernel._func.__name__ = KERNEL_NAME
+        launcher = flash_attn_func_kernel(Q, K, V, O, seq_len, seq_len_real, seq_len_kv)
 
         if const_expr(waves_per_eu is not None):
             _wpe = int(waves_per_eu)
@@ -770,7 +752,17 @@ def build_flash_attn_func_module_primary(
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
-    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
+    def _compile(
+        Q,
+        K,
+        V,
+        O,  # noqa: E741
+        batch_size,
+        seq_len,
+        seq_len_real,
+        seq_len_kv,
+        stream=None,
+    ):
         return flyc.compile(
             launch_flash_attn_func,
             _ptr_arg(Q),
@@ -779,11 +771,10 @@ def build_flash_attn_func_module_primary(
             _ptr_arg(O),
             batch_size,
             seq_len,
+            seq_len_real,
+            seq_len_kv,
             fx.Stream(stream),
         )
 
     _launch.compile = _compile
     return _launch
-
-
-build_flash_attn_func_module = build_flash_attn_func_module_primary
