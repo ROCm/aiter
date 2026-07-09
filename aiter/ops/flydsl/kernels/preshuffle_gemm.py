@@ -10,7 +10,16 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl, vector
-from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, Float32, Int8, Int32, T
+from flydsl.expr.typing import (
+    BFloat16,
+    Float8E4M3FN,
+    Float8E4M3FNUZ,
+    Float16,
+    Float32,
+    Int8,
+    Int32,
+    T,
+)
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
@@ -102,7 +111,9 @@ _TILE_PRELOAD_DEFAULT = (0, 0)
 
 def _get_preload(tile_m, tile_n, tile_k):
     """Look up (dsrd_preload, dvmem_preload) from the tile table."""
-    return _TILE_PRELOAD_TABLE.get((int(tile_m), int(tile_n), int(tile_k)), _TILE_PRELOAD_DEFAULT)
+    return _TILE_PRELOAD_TABLE.get(
+        (int(tile_m), int(tile_n), int(tile_k)), _TILE_PRELOAD_DEFAULT
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -129,9 +140,13 @@ def compile_preshuffle_gemm(
     if in_dtype not in ("fp8", "int8", "fp16", "bf16"):
         raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16, got {in_dtype!r}")
     if tile_k <= 0 or K % tile_k != 0:
-        raise ValueError(f"tile_k must be a positive divisor of K; got tile_k={tile_k}, K={K}")
+        raise ValueError(
+            f"tile_k must be a positive divisor of K; got tile_k={tile_k}, K={K}"
+        )
     if epilogue not in ("none", "bias", "bias_relu", "bias_silu", "bias_gelu"):
-        raise ValueError(f"epilogue must be none/bias/bias_relu/bias_silu/bias_gelu, got {epilogue!r}")
+        raise ValueError(
+            f"epilogue must be none/bias/bias_relu/bias_silu/bias_gelu, got {epilogue!r}"
+        )
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
     _has_epilogue = epilogue != "none"
@@ -226,7 +241,9 @@ def compile_preshuffle_gemm(
             bid_x, bid_y = Int32(_bx), Int32(_by)
 
         if const_expr(use_mfma_scale_128):
-            _scale_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem))
+            _scale_atom = fx.make_mma_atom(
+                fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem)
+            )
             tiled_mma = fx.make_tiled_mma(
                 _scale_atom,
                 fx.make_layout((1, 4, 1), (0, 1, 0)),
@@ -240,11 +257,15 @@ def compile_preshuffle_gemm(
         # instead of faulting / writing past the allocation. B and scales are
         # exact-multiple in N and stay max_size.
         gA = fx.rocdl.make_buffer_tensor(
-            arg_a, max_size=False, num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes)
+            arg_a,
+            max_size=False,
+            num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
         )
         gB = fx.rocdl.make_buffer_tensor(arg_b)
         gC = fx.rocdl.make_buffer_tensor(
-            arg_c, max_size=False, num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
+            arg_c,
+            max_size=False,
+            num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
         )
 
         tA = fx.flat_divide(gA, fx.make_tile(tile_m, tile_k))[None, None, bid_x, None]
@@ -297,7 +318,10 @@ def compile_preshuffle_gemm(
         frag_copy_A = fx.make_fragment_like(pA_s_stages[0][None, None, None])
         frag_A = thr_mma.make_fragment_A(sA_stages[0])
         frag_B_single_layout = thr_mma.partition_B(tB).layout(None, None, None, 0)
-        frag_B_stages = [fx.make_fragment_like(frag_B_single_layout, layout_elem.ir_type) for _ in range(2)]
+        frag_B_stages = [
+            fx.make_fragment_like(frag_B_single_layout, layout_elem.ir_type)
+            for _ in range(2)
+        ]
         frag_C = thr_mma.make_fragment_C(tC)
         frag_A_retile = thr_s2r.retile(frag_A)
         frag_B_retile_stages = [thr_g2r_B.retile(b) for b in frag_B_stages]
@@ -313,7 +337,9 @@ def compile_preshuffle_gemm(
             # Bound to the real M extent (like the sync gA) so ragged-M blocks DMA-read
             # OOB rows as 0 instead of faulting past the allocation.
             gA_flat = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(fx.get_iter(arg_a), fx.make_layout(65536 * K, 1))),
+                fx.Tensor(
+                    fx.make_view(fx.get_iter(arg_a), fx.make_layout(65536 * K, 1))
+                ),
                 max_size=False,
                 num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
             )
@@ -329,7 +355,9 @@ def compile_preshuffle_gemm(
             elems_per_16b = 16 // elem_bytes
 
             def dma_a_to_lds(k_tile_val, stage):
-                wave_off = rocdl.readfirstlane(fx.Int32.ir_type, wave_id * wave_stride_bytes)
+                wave_off = rocdl.readfirstlane(
+                    fx.Int32.ir_type, wave_id * wave_stride_bytes
+                )
                 lds_ptr = fx.add_offset(sA_i8_ptr[stage], wave_off)
                 base_k = k_tile_val * tile_k
                 for i in range_constexpr(num_a_loads):
@@ -415,9 +443,9 @@ def compile_preshuffle_gemm(
                 vmem_remaining = num_gmem_loads - dvmem_preload_eff
                 dsrd_remaining = num_ds_load - dsrd_preload_eff
                 if const_expr(vmem_remaining > 0 and vmem_remaining < mfma_total):
-                    vmem_schedule = build_scheduler(vmem_remaining, vmem_remaining) + [0] * (
-                        mfma_total - vmem_remaining
-                    )
+                    vmem_schedule = build_scheduler(vmem_remaining, vmem_remaining) + [
+                        0
+                    ] * (mfma_total - vmem_remaining)
                 else:
                     vmem_schedule = build_scheduler(vmem_remaining, mfma_total)
                 dsrd_schedule = build_scheduler(dsrd_remaining, mfma_total)
@@ -450,7 +478,11 @@ def compile_preshuffle_gemm(
                         if const_expr(n_vmem):
                             rocdl.sched_vmem(n_vmem)
                             idx_gmem_load += n_vmem
-                    if const_expr((not use_async_copy) and (idx_ds_write < dswr_tail) and (mfma_idx >= dswr_start)):
+                    if const_expr(
+                        (not use_async_copy)
+                        and (idx_ds_write < dswr_tail)
+                        and (mfma_idx >= dswr_start)
+                    ):
                         rocdl.sched_dswr(1)
                         idx_ds_write += 1
                 if const_expr((not use_async_copy) and idx_ds_write < num_a_loads):
@@ -461,9 +493,19 @@ def compile_preshuffle_gemm(
         # ── Pipeline stage (double-buffered B via split fragments) ─
         def mma_kloop(a_stage, cur_frag_B):
             for ki in range_constexpr(k_iters):
-                fx.copy(uni_copy, pA_s2r_stages[a_stage][None, None, ki], frag_A_retile[None, None, ki])
+                fx.copy(
+                    uni_copy,
+                    pA_s2r_stages[a_stage][None, None, ki],
+                    frag_A_retile[None, None, ki],
+                )
                 k_coord = ki if (use_mfma_scale_128 or use_mfma_k32) else (None, ki)
-                fx.gemm(tiled_mma, frag_C, frag_A[None, None, k_coord], cur_frag_B[None, None, k_coord], frag_C)
+                fx.gemm(
+                    tiled_mma,
+                    frag_C,
+                    frag_A[None, None, k_coord],
+                    cur_frag_B[None, None, k_coord],
+                    frag_C,
+                )
 
         def pipeline_2stage(read_stage, next_k_val=None, read_next=True):
             write_stage = read_stage ^ 1
@@ -474,7 +516,11 @@ def compile_preshuffle_gemm(
             if const_expr(use_async_copy):
                 if const_expr(do_next):
                     dma_a_to_lds(next_k_val, a_write)
-                    fx.copy(buf_copy, pB_g[None, None, None, next_k_val], frag_B_retile_stages[write_stage])
+                    fx.copy(
+                        buf_copy,
+                        pB_g[None, None, None, next_k_val],
+                        frag_B_retile_stages[write_stage],
+                    )
                 mma_kloop(a_read, cur_frag_B)
                 if const_expr(enable_scheduler):
                     hot_loop_scheduler()
@@ -484,7 +530,11 @@ def compile_preshuffle_gemm(
                 return
             if const_expr(do_next):
                 fx.copy(buf_copy, pA_g[None, None, None, next_k_val], frag_copy_A)
-                fx.copy(buf_copy, pB_g[None, None, None, next_k_val], frag_B_retile_stages[write_stage])
+                fx.copy(
+                    buf_copy,
+                    pB_g[None, None, None, next_k_val],
+                    frag_B_retile_stages[write_stage],
+                )
             mma_kloop(a_read, cur_frag_B)
             if const_expr(do_next):
                 fx.copy(uni_copy, frag_copy_A, pA_s_stages[a_write][None, None, None])
@@ -494,7 +544,11 @@ def compile_preshuffle_gemm(
                 gpu.barrier()
 
         # ── Prologue ──────────────────────────────────────────────
-        acc_zero = Vec.filled(acc_size, 0, Int32) if const_expr(is_int8) else Vec.filled(acc_size, 0.0, Float32)
+        acc_zero = (
+            Vec.filled(acc_size, 0, Int32)
+            if const_expr(is_int8)
+            else Vec.filled(acc_size, 0.0, Float32)
+        )
         if const_expr(use_async_copy):
             dma_a_to_lds(fx.Int32(0), 0)
             fx.copy(buf_copy, pB_g[None, None, None, 0], frag_B_retile_stages[0])
@@ -553,7 +607,9 @@ def compile_preshuffle_gemm(
                 frag_C.store(results)
             k_tail0 = num_tiles - tail  # first tile handled by the peeled tail
             for j in range_constexpr(tail - 1):
-                pipeline_2stage(read_stage=(k_tail0 + j) % 2, next_k_val=fx.Int32(k_tail0 + j + 1))
+                pipeline_2stage(
+                    read_stage=(k_tail0 + j) % 2, next_k_val=fx.Int32(k_tail0 + j + 1)
+                )
 
         # ── Epilogue-operand preloads (scale_a / scale_b / bias) ─────────
         bx_m = bid_x * tile_m
@@ -567,7 +623,9 @@ def compile_preshuffle_gemm(
             s_a = s_b = bias = None
             if const_expr(is_8bit):
                 # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
-                scale_b_rsrc = fx.buffer_ops.create_buffer_resource(arg_scale_b, max_size=True)
+                scale_b_rsrc = fx.buffer_ops.create_buffer_resource(
+                    arg_scale_b, max_size=True
+                )
                 s_b = [
                     fx.buffer_ops.buffer_load(
                         scale_b_rsrc,
@@ -577,24 +635,33 @@ def compile_preshuffle_gemm(
                     )
                     for ni in range_constexpr(num_acc_n)
                 ]
-                scale_a_rsrc = fx.buffer_ops.create_buffer_resource(arg_scale_a, max_size=True)
+                scale_a_rsrc = fx.buffer_ops.create_buffer_resource(
+                    arg_scale_a, max_size=True
+                )
                 s_a = [
                     Vec(
                         fx.buffer_ops.buffer_load(
-                            scale_a_rsrc, fx.Int32(bx_m + mi * 16 + lane_div_16 * 4), vec_width=4, dtype=T.f32
+                            scale_a_rsrc,
+                            fx.Int32(bx_m + mi * 16 + lane_div_16 * 4),
+                            vec_width=4,
+                            dtype=T.f32,
                         )
                     ).bitcast(fx.Float32)
                     for mi in range_constexpr(m_repeat)
                 ]
             if const_expr(_has_bias):
                 # Per-column bias (out_dtype), one scalar per N-block, shared across rows.
-                bias_rsrc = fx.buffer_ops.create_buffer_resource(arg_bias, max_size=True)
+                bias_rsrc = fx.buffer_ops.create_buffer_resource(
+                    arg_bias, max_size=True
+                )
                 bias_elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
                 bias = [
                     fx.Float32(
                         fx.buffer_ops.buffer_load(
                             bias_rsrc,
-                            fx.Int32(by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16),
+                            fx.Int32(
+                                by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16
+                            ),
                             vec_width=1,
                             dtype=bias_elem_ty,
                         )
@@ -603,7 +670,9 @@ def compile_preshuffle_gemm(
                 ]
             return s_a, s_b, bias
 
-        overlap_epi_load = acc_size <= 64  # small enough accumulator to keep operands live over the MMA
+        overlap_epi_load = (
+            acc_size <= 64
+        )  # small enough accumulator to keep operands live over the MMA
         s_a_vals = s_b_vals = bias_vals = None
         if const_expr(overlap_epi_load):
             s_a_vals, s_b_vals, bias_vals = load_epi_operands()
@@ -662,7 +731,9 @@ def compile_preshuffle_gemm(
                 val_s = apply_activation(val_s)
                 out_elems.append(val_s.to(out_elem_cls))
 
-            out_vec = vector.from_elements(T.vec(acc_size, out_elem_cls.ir_type), out_elems)
+            out_vec = vector.from_elements(
+                T.vec(acc_size, out_elem_cls.ir_type), out_elems
+            )
             frag_C_out.store(out_vec)
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
 
@@ -728,14 +799,20 @@ def compile_preshuffle_gemm(
         preshuffle_B = fx.Tensor(
             fx.make_view(
                 fx.get_iter(arg_b),
-                fx.make_layout(((16, n0), (kp_elems, 4, k0)), ((s_nlane, s_n0), (1, s_klane, s_k0))),
+                fx.make_layout(
+                    ((16, n0), (kp_elems, 4, k0)), ((s_nlane, s_n0), (1, s_klane, s_k0))
+                ),
             )
         )
 
         # Reshape A and C to 2D
         M_max = 65536
-        arg_a_2d = fx.Tensor(fx.make_view(fx.get_iter(arg_a), fx.make_layout((M_max, K), (K, 1))))
-        arg_c_2d = fx.Tensor(fx.make_view(fx.get_iter(arg_c), fx.make_layout((M_max, N), (N, 1))))
+        arg_a_2d = fx.Tensor(
+            fx.make_view(fx.get_iter(arg_a), fx.make_layout((M_max, K), (K, 1)))
+        )
+        arg_c_2d = fx.Tensor(
+            fx.make_view(fx.get_iter(arg_c), fx.make_layout((M_max, N), (N, 1)))
+        )
 
         gx = (i32_m + (tile_m - 1)) // tile_m
         gy = i32_n // tile_n

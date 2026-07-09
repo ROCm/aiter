@@ -141,7 +141,9 @@ def preshuffle_gemm_estimated_lds_bytes(
     a_tile_bytes = int(tile_m) * int(tile_k) * elem_bytes
 
     # lds_stage A-tile buffers, each finalized to a 128B-aligned smem global.
-    return _smem_finalize_size(_smem_align(a_tile_bytes)) * (2 if int(lds_stage) == 2 else 1)
+    return _smem_finalize_size(_smem_align(a_tile_bytes)) * (
+        2 if int(lds_stage) == 2 else 1
+    )
 
 
 def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
