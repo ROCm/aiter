@@ -51,6 +51,9 @@ from .kernels.chunk_gated_delta_h_mfma16_3wave_opt2 import (
 from .kernels.chunk_gated_delta_h_mfma16_2wave_opt1 import (
     compile_chunk_gated_delta_h_mfma16_2wave_opt1,
 )
+from .kernels.chunk_gated_delta_h_mfma32_vk import (
+    compile_chunk_gated_delta_h_mfma32_vk,
+)
 try:
     from .kernels.chunk_gated_delta_h_hipport import (
         compile_chunk_gated_delta_h_hipport,
@@ -874,6 +877,22 @@ def _get_or_compile_mfma16_2wave_opt1(
 
 
 @functools.lru_cache(maxsize=None)
+def _get_or_compile_mfma32_vk(
+    K, V, BT, BV, H, Hg, use_g, use_gk, use_h0, store_fs, save_vn,
+    is_varlen, wu_contig, state_bf16=False, g_log2_scaled=False,
+):
+    """编译 mfma32 VK 基础版 K5 kernel。"""
+    return compile_chunk_gated_delta_h_mfma32_vk(
+        K=K, V=V, BT=BT, BV=BV, H=H, Hg=Hg,
+        USE_G=use_g, USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0, STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn, IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig, STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
 def _get_or_compile_naive(
     K,
     V,
@@ -980,7 +999,7 @@ def _resolve_state_dtype(initial_state, state_dtype):
 # maps to its own compiled kernel + cache namespace (see the dispatch in the
 # wrapper body). ``None`` (not listed here) means the baseline kernel.
 _K5_FORKS = frozenset(
-    {"kv", "mfma16_hip", "mfma16_2wave_opt1", "mfma16_3wave_opt2", "naive", "naive_opt", "hipport"}
+    {"kv", "mfma16_hip", "mfma16_2wave_opt1", "mfma16_3wave_opt2", "mfma32_vk", "naive", "naive_opt", "hipport"}
 )
 
 
@@ -1093,6 +1112,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # contiguous). This is now their REQUIRED input layout -- the caller
     # (upstream / tests) owns the transpose, the host does NOT permute. Every
     # other fork keeps the original token-major [B, T_flat, Hg, K] layout.
+    # mfma32_vk 用 token-major k（与 Triton VK 一致），不需要 pre-transpose
     _kv_k_pretransposed = _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2")
     if _kv_k_pretransposed:
         B, Hg, K, T = k.shape
@@ -1147,7 +1167,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # baseline kernel -- the baseline expects token-major k, which would
     # mis-read the [B, Hg, K, T] layout the KV forks require. V must be a
     # multiple of 64 for this to be legal.
-    if _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2"):
+    if _fork == "mfma32_vk":
+        BV = 64
+        if V % BV != 0:
+            raise ValueError(
+                f"FlyDSL K5 mfma32_vk: requires V % 64 == 0; got V={V}."
+            )
+    elif _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2"):
         # ``kv`` is still BV=64-only. ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``
         # are VWARP-parameterized (BV = NUM_WARPS*16, NUM_WARPS in {1,2,4}), so
         # they accept BV in {16,32,64}; override with FLYDSL_K5_KVNAIVE_BV for
@@ -1183,15 +1209,19 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     _mfma16_3wave_opt2_gate = BV in (16, 32, 64)
     _mfma16_3wave_opt2_active = (_fork == "mfma16_3wave_opt2") and _mfma16_3wave_opt2_gate
     _hipport_active = (_fork == "hipport") and _vwarp_gate
+    _mfma32_vk_active = (_fork == "mfma32_vk") and (BV == 64)
     _naive_active = _fork == "naive"
     _naive_opt_active = _fork == "naive_opt"
     # KV-class forks (h stored [..., K, V] -> host transposes to VK).
     # NOTE: mfma16_2wave_opt1 now writes the public VK layout [..., V, K] directly
     # (h-b128 coalesced store via lds_ht), so it is NOT in the transpose set --
     # only the optimized ``kv`` fork still writes [..., K, V] and needs the view.
+    # mfma32_vk 也直接写 VK layout，且 k 是 token-major（不需要 pre-transpose）。
     _kv_active = _kv_opt_active or _mfma16_2wave_opt1_active or _mfma16_3wave_opt2_active
     _kv_needs_transpose = _kv_opt_active
-    if _kv_opt_active:
+    if _mfma32_vk_active:
+        _compile_fn = _get_or_compile_mfma32_vk
+    elif _kv_opt_active:
         _compile_fn = _get_or_compile_kv
     elif _mfma16_2wave_opt1_active:
         _compile_fn = _get_or_compile_mfma16_2wave_opt1
@@ -1451,6 +1481,40 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
         _fork="mfma16_3wave_opt2",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma32_vk(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """mfma32 VK 基础版 K5 kernel。k 使用 token-major [B, T, Hg, K]（不需要 pre-transpose）。
+    h 直接写 VK layout [V, K]。BV=64 固定。"""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k, w, u,
+        g=g, gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="mfma32_vk",
     )
 
 
