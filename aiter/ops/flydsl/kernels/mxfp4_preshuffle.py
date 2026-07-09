@@ -91,12 +91,34 @@ def compile_mxfp4_gemm(
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
     batch: int = 1,
+    a_row_stride: Optional[int] = None,
+    a_batch_stride: Optional[int] = None,
+    sca_row_stride: Optional[int] = None,
+    sca_batch_stride: Optional[int] = None,
+    c_row_stride: Optional[int] = None,
+    c_batch_stride: Optional[int] = None,
 ):
     """Compile MXFP4/MXFP6/MXFP8 preshuffle GEMM -> fn(C, A, B, scale_a, scale_b, bias, M, N, stream).
 
     a_dtype 'fp4'/'fp6'/'fp8' = MXFP4 (2 codes/byte) / MXFP6 (FP8-padded, gfx950) /
     MXFP8 E4M3 (1 byte/code, gfx950). B is CK-preshuffled MXFP4; scales are e8m0; bias
     unused. batch>1 = strided-batched over grid.z (batch=1 emits no batch math).
+
+    Batched A / scale_a layout is caller-controlled via the explicit compile-time strides
+    `a_row_stride`, `a_batch_stride` (bytes) and `sca_row_stride` (dwords),
+    `sca_batch_stride` (bytes); each None keeps the contiguous [B,M,K] /
+    [B,ceil(M/32),chunk] default (batch offset derived from runtime M). a_row_stride /
+    sca_row_stride are the intra-batch M-row / 32-row-chunk strides; a_batch_stride /
+    sca_batch_stride are the per-batch offsets. For an [M,B,K] / [ceil(M/32),B,chunk]
+    layout pass a_row_stride=batch*a_row_bytes, a_batch_stride=a_row_bytes,
+    sca_row_stride=batch*_scale_chunk_dw, sca_batch_stride=_scale_chunk_dw*4 (a_row_bytes =
+    K for fp8/fp6, K//2 for fp4). B / scale_b stay batch-contiguous.
+
+    C output is likewise caller-controlled via `c_row_stride` (elements between M-rows,
+    default N) and `c_batch_stride` (bytes per batch, default M*N*out_bytes); each None
+    keeps the contiguous [B,M,N] default (byte-identical). For an [M,B,N] output pass
+    c_row_stride=batch*N, c_batch_stride=N*out_bytes. A/scale_a and C all in the [M,B,*]
+    form is the mbn (deepseek-v4 grouped-output) layout; all-None is bmn.
     """
     if a_dtype not in _A_ELEM:
         raise ValueError(f"a_dtype must be one of {sorted(_A_ELEM)}; got {a_dtype!r}")
@@ -197,28 +219,53 @@ def compile_mxfp4_gemm(
         bx_m = bid_x * fx.Int32(BM)
         by_n = bid_y * fx.Int32(BN)
 
-        # Strided-batched: shift each operand base to batch bid_z (per-batch num_records
-        # below keep ragged-M OOB correct within each batch).
+        # Strided-batched: shift each operand base to batch bid_z. A and scale_a honor the
+        # compile-time explicit strides (so [B,M,K] vs [M,B,K]-style layouts both work); a
+        # None stride keeps the contiguous default (batch offset derived from runtime M).
+        # a_rstride (bytes) / sca_rstride (dwords) are the intra-batch M-row / 32-row-chunk
+        # strides used by the addressing below. B / scale_b stay batch-contiguous. batch==1
+        # keeps compile-const addressing (byte-identical codegen). Per-batch num_records keep
+        # ragged-M OOB correct within each batch.
         if const_expr(batch > 1):
-            bz = fx.Int64(bid_z)
-            arg_a = fx.Int64(arg_a) + bz * (fx.Int64(i32_m) * fx.Int64(a_row_bytes))
-            arg_b = fx.Int64(arg_b) + bz * fx.Int64(N * (K // 2))
-            a_sc_stride = (
-                fx.Int64((i32_m + fx.Int32(31)) // fx.Int32(32))
-                * fx.Int64(_scale_chunk_dw)
-                * fx.Int64(4)
+            a_rstride = fx.Int32(a_row_bytes if a_row_stride is None else a_row_stride)
+            sca_rstride = fx.Int32(
+                _scale_chunk_dw if sca_row_stride is None else sca_row_stride
             )
-            arg_scale_a = fx.Int64(arg_scale_a) + bz * a_sc_stride
+            bz = fx.Int64(bid_z)
+            if const_expr(a_batch_stride is None):
+                arg_a = fx.Int64(arg_a) + bz * (fx.Int64(i32_m) * fx.Int64(a_row_bytes))
+            else:
+                arg_a = fx.Int64(arg_a) + bz * fx.Int64(a_batch_stride)
+            arg_b = fx.Int64(arg_b) + bz * fx.Int64(N * (K // 2))
+            if const_expr(sca_batch_stride is None):
+                sc_bstride = (
+                    fx.Int64((i32_m + fx.Int32(31)) // fx.Int32(32))
+                    * fx.Int64(_scale_chunk_dw)
+                    * fx.Int64(4)
+                )
+                arg_scale_a = fx.Int64(arg_scale_a) + bz * sc_bstride
+            else:
+                arg_scale_a = fx.Int64(arg_scale_a) + bz * fx.Int64(sca_batch_stride)
             arg_scale_b = fx.Int64(arg_scale_b) + bz * fx.Int64(
                 (N // 32) * _scale_chunk_dw * 4
             )
+        else:
+            a_rstride = fx.Int32(a_row_bytes)
+            sca_rstride = fx.Int32(_scale_chunk_dw)
 
         # A: cooperative gmem->LDS then ds_read, bound to real M rows (ragged M OOB -> 0).
         a_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
         _i8g = fx.PointerType.get(
             T.i8, address_space=fx.AddressSpace.Global, alignment=16
         )
-        a_nrec = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
+        # Bound to the last valid M row: (M-1) strides + one full K-row of bytes. The
+        # contiguous default keeps the exact M * a_row_bytes form (byte-identical codegen).
+        if const_expr(batch > 1 and a_row_stride is not None):
+            a_nrec = fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(a_rstride) + fx.Int64(
+                a_row_bytes
+            )
+        else:
+            a_nrec = fx.Int64(i32_m) * fx.Int64(a_row_bytes)
         a_flat = fx.rocdl.make_buffer_tensor(
             fx.Tensor(
                 fx.make_view(
@@ -257,7 +304,7 @@ def compile_mxfp4_gemm(
                 lin = (fx.Int32(i * 256) + fx.Int32(tid)) * fx.Int32(16)
                 row = lin // fx.Int32(A_ROW_B)
                 col = lin % fx.Int32(A_ROW_B)
-                gmem_byte = (bx_m + row) * fx.Int32(a_row_bytes) + base_k_byte + col
+                gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
                 reg = fx.make_rmem_tensor(4, Int32)
                 fx.copy_atom_call(a_copy, a_flat_div[None, gmem_byte], reg)
                 fx.copy(
@@ -282,7 +329,7 @@ def compile_mxfp4_gemm(
                 lin = (fx.Int32(i * 256) + fx.Int32(tid)) * fx.Int32(16)
                 row = lin // fx.Int32(A_ROW_B)
                 col = lin % fx.Int32(A_ROW_B)
-                gmem_byte = (bx_m + row) * fx.Int32(a_row_bytes) + base_k_byte + col
+                gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 src = fx.slice(a_flat_div, (None, gmem_byte))
                 fx.copy(dma_atom, src, dst)
@@ -333,11 +380,17 @@ def compile_mxfp4_gemm(
             T.i32, address_space=fx.AddressSpace.Global, alignment=4
         )
         _sc_layout = fx.make_layout(1 << 28, 1)
-        a_sc_nrec = (
-            fx.Int64((i32_m + fx.Int32(31)) // fx.Int32(32))
-            * fx.Int64(_scale_chunk_dw)
-            * fx.Int64(4)
-        )
+        # scale_a: bound to the last valid 32-row chunk, (ceil(M/32)-1) chunk strides + one
+        # chunk of dwords, x4 bytes. Contiguous default keeps the exact ceil(M/32) *
+        # _scale_chunk_dw * 4 form (byte-identical codegen).
+        _a_sc_chunks = (i32_m + fx.Int32(31)) // fx.Int32(32)
+        if const_expr(batch > 1 and sca_row_stride is not None):
+            a_sc_nrec = (
+                fx.Int64(_a_sc_chunks - fx.Int32(1)) * fx.Int64(sca_rstride)
+                + fx.Int64(_scale_chunk_dw)
+            ) * fx.Int64(4)
+        else:
+            a_sc_nrec = fx.Int64(_a_sc_chunks) * fx.Int64(_scale_chunk_dw) * fx.Int64(4)
         b_sc_nrec = fx.Int64((N // 32) * _scale_chunk_dw * 4)
         sa_flat = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
@@ -360,7 +413,7 @@ def compile_mxfp4_gemm(
             fx.make_layout(1, 1),
         )
         a_sc_base = [
-            (bx_m // fx.Int32(32) + fx.Int32(mp)) * fx.Int32(_scale_chunk_dw)
+            (bx_m // fx.Int32(32) + fx.Int32(mp)) * sca_rstride
             for mp in range_constexpr(m_pairs)
         ]
         nsb = by_n // fx.Int32(32) + wave * fx.Int32(BN // 128)
@@ -565,10 +618,23 @@ def compile_mxfp4_gemm(
 
         # Epilogue: manual C store (MFMA 16x16 C: lane l -> col base+l%16, row m*16+
         # (l//16)*4+ii). MX scale already folded in. Bound to actual M rows (ragged M).
-        c_nrec = fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
+        # C honors explicit c_row_stride (elements) / c_batch_stride (bytes) for [M,B,N]
+        # layouts; None keeps the contiguous [B,M,N] default (byte-identical codegen).
+        if const_expr(c_row_stride is None):
+            c_rstride = fx.Int32(N)
+            c_nrec = fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
+        else:
+            c_rstride = fx.Int32(c_row_stride)
+            c_nrec = (
+                fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(c_rstride) + fx.Int64(N)
+            ) * fx.Int64(2)
         if const_expr(batch > 1):
+            if const_expr(c_batch_stride is None):
+                c_bstride = fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2)
+            else:
+                c_bstride = fx.Int64(c_batch_stride)
             c_addr = (
-                fx.Int64(fx.ptrtoint(fx.get_iter(arg_c))) + fx.Int64(bid_z) * c_nrec
+                fx.Int64(fx.ptrtoint(fx.get_iter(arg_c))) + fx.Int64(bid_z) * c_bstride
             )
             c_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 c_addr, num_records_bytes=c_nrec
@@ -585,7 +651,7 @@ def compile_mxfp4_gemm(
                 acc = Vec(accs[mi * num_acc_n + ni])
                 for ii in range_constexpr(4):
                     val = acc[ii].to(out_elem)
-                    off = (row_m + fx.Int32(ii)) * fx.Int32(N) + col
+                    off = (row_m + fx.Int32(ii)) * c_rstride + col
                     buffer_ops.buffer_store(val.ir_value(), c_rsrc, off)
 
     @flyc.jit

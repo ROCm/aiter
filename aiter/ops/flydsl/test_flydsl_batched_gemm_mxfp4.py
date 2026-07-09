@@ -3,9 +3,9 @@
 
 """Unit tests for the FlyDSL strided-batched MXFP preshuffle GEMM (gfx950).
 
-Covers two variants of out[b] = dequant(x[b]) @ dequant(w[b]).T:
-  - a4w4: MXFP4 (E2M1) A x MXFP4 (E2M1) B
-  - a8w4: MXFP8 (E4M3) A x MXFP4 (E2M1) B
+Covers out[b] = dequant(x[b]) @ dequant(w[b]).T across two variants and two layouts:
+  - variants: a4w4 (MXFP4 A x MXFP4 B), a8w4 (MXFP8 E4M3 A x MXFP4 B)
+  - layouts:  bmn ([B,M,*] A/C), mbn ([M,B,*] A/C, deepseek-v4 grouped-output)
 
 Usage:
     python aiter/ops/flydsl/test_flydsl_batched_gemm_mxfp4.py
@@ -106,7 +106,7 @@ def gen_inputs(variant, B, M, N, K, dtype):
     return x, w, x_scales, w_scales, ref
 
 
-def _run(variant, B, M, N, K, dtype):
+def _run(variant, layout, B, M, N, K, dtype):
     a_dtype = "fp8" if variant == "a8w4" else "fp4"
     x, w, x_scales, w_scales, ref = gen_inputs(variant, B, M, N, K, dtype)
     out = flydsl_batched_gemm_mxfp4(
@@ -116,6 +116,7 @@ def _run(variant, B, M, N, K, dtype):
         w_scales,
         dtype,
         a_dtype=a_dtype,
+        layout=layout,
         tile_m=128,
         tile_n=128,
         tile_k=256,
@@ -128,37 +129,41 @@ def _run(variant, B, M, N, K, dtype):
         out.float(),
         rtol=1e-2,
         atol=1e-2,
-        msg=f"flydsl {variant} {B}x{M}x{N}x{K}",
+        msg=f"flydsl {variant} {layout} {B}x{M}x{N}x{K}",
     )
-    assert err < 0.05, f"flydsl {variant} mismatch ratio {err:.4f}"
+    assert err < 0.05, f"flydsl {variant} {layout} mismatch ratio {err:.4f}"
     return err
 
 
 @pytest.mark.parametrize("B, M, N, K", SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["bmn", "mbn"])
 @pytest.mark.parametrize("variant", ["a4w4", "a8w4"])
-def test_flydsl_batched_gemm_mxfp4(variant, B, M, N, K, dtype):
+def test_flydsl_batched_gemm_mxfp4(variant, layout, B, M, N, K, dtype):
     if get_gfx() != "gfx950":
         pytest.skip(f"FlyDSL MXFP preshuffle GEMM requires gfx950, got {get_gfx()}")
     torch.cuda.empty_cache()
-    _run(variant, B, M, N, K, dtype)
+    _run(variant, layout, B, M, N, K, dtype)
 
 
 def main():
     parser = argparse.ArgumentParser(description="FlyDSL batched MXFP GEMM test")
     parser.add_argument("--variant", choices=["a4w4", "a8w4", "all"], default="all")
+    parser.add_argument("--layout", choices=["bmn", "mbn", "all"], default="all")
     args = parser.parse_args()
     if get_gfx() != "gfx950":
         print(f"[skip] requires gfx950, got {get_gfx()}")
         return
     variants = ["a4w4", "a8w4"] if args.variant == "all" else [args.variant]
+    layouts = ["bmn", "mbn"] if args.layout == "all" else [args.layout]
     for variant in variants:
-        for dtype in (torch.bfloat16, torch.float16):
-            for B, M, N, K in SHAPES:
-                err = _run(variant, B, M, N, K, dtype)
-                print(
-                    f"[pass] {variant} {str(dtype):16} B={B} M={M} N={N} K={K} mismatch={err:.4f}"
-                )
+        for layout in layouts:
+            for dtype in (torch.bfloat16, torch.float16):
+                for B, M, N, K in SHAPES:
+                    err = _run(variant, layout, B, M, N, K, dtype)
+                    print(
+                        f"[pass] {variant} {layout} {str(dtype):16} B={B} M={M} N={N} K={K} mismatch={err:.4f}"
+                    )
 
 
 if __name__ == "__main__":
