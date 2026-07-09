@@ -617,7 +617,7 @@ void gemm_a16w16_em3en4_lds1_pgr2_sk_kernel(opus_gemm_splitk_kargs kargs) {
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_a)
                          + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start,
                          ((kargs.m - row) * kargs.stride_a - k_start) * sizeof(D_B));
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
+    auto g_c = make_gmem(opus_splitk_ws_ptr<D_C>(kargs.ws_handle)
                          + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
                          + (size_t)batch_id * kargs.stride_ws_batch
                          + (size_t)row * kargs.stride_ws

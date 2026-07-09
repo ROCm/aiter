@@ -82,29 +82,6 @@ from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
-_STATIC_ADAPTOR_CACHE = {}
-_STATIC_ADAPTOR_CACHE_MAX = 64
-
-
-def _cached_from_dlpack(t: torch.Tensor):
-    key = (
-        int(t.data_ptr()),
-        str(t.device),
-        str(t.dtype),
-        tuple(t.shape),
-        tuple(t.stride()),
-        int(t.storage_offset()),
-    )
-    cached = _STATIC_ADAPTOR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    if len(_STATIC_ADAPTOR_CACHE) >= _STATIC_ADAPTOR_CACHE_MAX:
-        _STATIC_ADAPTOR_CACHE.clear()
-    adaptor = flyc.from_dlpack(t)
-    _STATIC_ADAPTOR_CACHE[key] = adaptor
-    return adaptor
-
-
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
 
@@ -170,29 +147,38 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
     g_out.store(my_off, bf16v, vec_size=vec)
 
 
-def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec):
-    """Pack VEC fp32 -> VEC fp8 (e4m3fnuz) via cvt_pk_fp8_f32 and store.
+def _store_fp8_packed(
+    vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
+):
+    """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store.
 
     Emits one ``buffer_store_dwordx2`` per thread (VEC=8 -> 2 dwords = 8 bytes).
 
     Workaround for the e4m3fnuz NaN encoding 0x80: cvt_pk_fp8_f32 returns
     0x80 (NaN) for inputs that round to negative zero, which propagates
-    through downstream attention as NaN. Clamp v ? (-2^-8, 0) to +0 first.
+    through downstream attention as NaN. Clamp v in (-2^-8, 0) to +0 first.
+
+    On gfx950+ (OCP e4m3fn), 0x80 encodes -0 (not NaN), so the clamp is
+    unnecessary.  Pass ``skip_fnuz_clamp=True`` to elide it and save ~4
+    ALU ops per element.
     """
     f32 = T.f32
     i32 = T.i32
-    c0 = arith.constant(0.0, type=f32)
-    c_neg_uf = arith.constant(-(2.0**-8), type=f32)
     c8 = arith.constant(8, type=i32)
 
-    safe = []
-    for v in vals_list:
-        vv = v.ir_value() if hasattr(v, "ir_value") else v
-        is_tn = arith.andi(
-            arith.cmpf(CmpFPredicate.OLT, vv, c0),
-            arith.cmpf(CmpFPredicate.OGT, vv, c_neg_uf),
-        )
-        safe.append(arith.select(is_tn, c0, vv))
+    if skip_fnuz_clamp:
+        safe = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
+    else:
+        c0 = arith.constant(0.0, type=f32)
+        c_neg_uf = arith.constant(-(2.0**-8), type=f32)
+        safe = []
+        for v in vals_list:
+            vv = v.ir_value() if hasattr(v, "ir_value") else v
+            is_tn = arith.andi(
+                arith.cmpf(CmpFPredicate.OLT, vv, c0),
+                arith.cmpf(CmpFPredicate.OGT, vv, c_neg_uf),
+            )
+            safe.append(arith.select(is_tn, c0, vv))
 
     # Pack each pair (s[2i], s[2i+1]) into a packed-fp8 i32, then
     # combine 4 fp8 into one i32 via cvt_pk_fp8_f32 (lane 0 + lane 1).
@@ -298,7 +284,8 @@ def _build_kernel(
     # The HW FP8 element dtype follows the arch (matches ``_fp8_const``):
     # gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448).
     # ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
-    _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3
+    _is_fnuz = _fp8_const()["dtype"] == torch.float8_e4m3fnuz
+    _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if _is_fnuz else _D.FP8_E4M3
 
     # Kernel name: only include flags that affect the compiled binary.
     # Default (not quant, not q_weighted) -> "qk_norm_rope_H16_D512_RD64_flydsl"
@@ -329,7 +316,7 @@ def _build_kernel(
         kv_in_row_stride: Int32,  # KV row stride in bf16 elements
         swa_kv: fx.Pointer,  # [num_slots, cache_size, D] bf16 (dummy if not kv_write)
         state_slot_mapping: fx.Pointer,  # [bs] i32 (dummy if not kv_write)
-        batch_id_per_token: fx.Pointer,  # [T] i64, -1 sentinel (dummy if not kv_write)
+        batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
         swa_cache_size: Int32,  # ring slot count
@@ -495,80 +482,67 @@ def _build_kernel(
                     else:
                         buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
 
+            # ---- Common: scale-multiply for ALL threads (hoisted) ----
+            # This computation was previously duplicated inside both the
+            # ROPE and NOPE branches.  Hoisting it eliminates ~VEC ALU ops
+            # of redundant work in the divergent NOPE path.
+            scaled = []
+            for vi in range_constexpr(VEC):
+                xi = x_f32_vec[vi]
+                if const_expr(weighted):
+                    xi = xi * w_f32_vec[vi]
+                if const_expr(quant):
+                    scaled.append(xi * factor)
+                else:
+                    scaled.append(xi * rstd)
+
+            # ---- Store scaled to rmem for cross-branch value passing ----
+            out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
+            scaled_raw = [_to_raw(s) for s in scaled]
+            scaled_vec = vector.from_elements(T.vec(VEC, f32), scaled_raw)
+            fx.memref_store_vec(scaled_vec, out_rmem)
+
+            # ---- ROPE branch: load from rmem, rotate, store back ----
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
             if is_rope:
-                # ---- ROPE path: 8 elements in this thread = 4 GPT-J pairs ----
                 rope_rel = tid - fx.Int32(ROPE_THREAD_LO)
                 cos_vec = load_vec(cos_div, rope_rel, layout=rope_lay, atom=rope_atom)
                 sin_vec = load_vec(sin_div, rope_rel, layout=rope_lay, atom=rope_atom)
                 cos_f32 = cos_vec.to(fx.Float32)
                 sin_f32 = sin_vec.to(fx.Float32)
 
-                # pre-rotate values: x * factor (fp8) or x * rstd (bf16),
-                # with optional kv weight.
-                pe = []
-                for vi in range_constexpr(VEC):
-                    xi = x_f32_vec[vi]
-                    if const_expr(weighted):
-                        xi = xi * w_f32_vec[vi]
-                    if const_expr(quant):
-                        pe.append(xi * factor)
-                    else:
-                        pe.append(xi * rstd)
-
-                # GPT-J pair rotate: new_2k = e*c - o*s; new_2k+1 = e*s + o*c
-                rope_out = []
+                cur = fx.memref_load_vec(out_rmem)
+                rope_elems = []
                 for k in range_constexpr(PAIRS_PER_THREAD):
-                    e = pe[2 * k]
-                    o = pe[2 * k + 1]
+                    e = cur[2 * k]
+                    o = cur[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
-                    rope_out.append(e * c - o * s)
-                    rope_out.append(e * s + o * c)
+                    rope_elems.append(_to_raw(e * c - o * s))
+                    rope_elems.append(_to_raw(e * s + o * c))
+                rotated_vec = vector.from_elements(T.vec(VEC, f32), rope_elems)
+                fx.memref_store_vec(rotated_vec, out_rmem)
 
-                if const_expr(quant):
-                    rsrc, row_base = fp8_out_rsrc
-                    _store_fp8_packed(rope_out, rsrc, row_base, tid, VEC)
-                else:
-                    _store_bf16_vec_g(rope_out, bf16_out_g, bf16_out_row_off, tid, VEC)
-                    if const_expr(kv_write):
-                        # Fused SWA scatter: same post-norm/rope bf16 row also
-                        # lands in swa_kv[slot, pos%cache_size, :]. swa_out_g
-                        # base is already shifted to that ring slot. Predicate
-                        # on do_swa (batch_id >= 0) to skip CG-pad tokens.
-                        if do_swa:
-                            _store_bf16_vec_g(
-                                rope_out,
-                                swa_out_g,
-                                arith.constant(0, type=i32),
-                                tid,
-                                VEC,
-                            )
+            # ---- Unified store: all threads read from rmem and write ----
+            final = fx.memref_load_vec(out_rmem)
+            final_list = [final[i] for i in range(VEC)]
+
+            if const_expr(quant):
+                rsrc, row_base = fp8_out_rsrc
+                _store_fp8_packed(
+                    final_list, rsrc, row_base, tid, VEC, skip_fnuz_clamp=not _is_fnuz
+                )
             else:
-                # ---- NOPE path: direct scaled store ----
-                scaled = []
-                for vi in range_constexpr(VEC):
-                    xi = x_f32_vec[vi]
-                    if const_expr(weighted):
-                        xi = xi * w_f32_vec[vi]
-                    if const_expr(quant):
-                        scaled.append(xi * factor)
-                    else:
-                        scaled.append(xi * rstd)
-                if const_expr(quant):
-                    rsrc, row_base = fp8_out_rsrc
-                    _store_fp8_packed(scaled, rsrc, row_base, tid, VEC)
-                else:
-                    _store_bf16_vec_g(scaled, bf16_out_g, bf16_out_row_off, tid, VEC)
-                    if const_expr(kv_write):
-                        if do_swa:
-                            _store_bf16_vec_g(
-                                scaled,
-                                swa_out_g,
-                                arith.constant(0, type=i32),
-                                tid,
-                                VEC,
-                            )
+                _store_bf16_vec_g(final_list, bf16_out_g, bf16_out_row_off, tid, VEC)
+                if const_expr(kv_write):
+                    if do_swa:
+                        _store_bf16_vec_g(
+                            final_list,
+                            swa_out_g,
+                            arith.constant(0, type=i32),
+                            tid,
+                            VEC,
+                        )
 
         # ============ runtime dispatch on bid_x < H ============
         # Per-token byte offsets fold ``bid_t`` into the buffer descriptor
@@ -740,17 +714,16 @@ def _build_kernel(
                 # ---- Fused SWA scatter setup (kv_write only) ----
                 # Target swa_kv[slot, pos % cache_size, :] where
                 # slot = state_slot_mapping[batch_id_per_token[bid_t]].
-                # batch_id is i64 with -1 sentinel on CG-pad tokens; clamp it
-                # to 0 for the (predicated-off) slot load to keep the load
-                # in-bounds, and gate the actual store on do_swa = batch_id>=0.
+                # batch_id is i32 with -1 sentinel on CG-pad tokens; clamp it to
+                # 0 for the (predicated-off) slot load to keep the load in-bounds,
+                # and gate the actual store on do_swa = batch_id>=0.
                 swa_out_g = None
                 do_swa = None
                 if const_expr(kv_write):
                     bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
-                    bid_i64 = buffer_ops.buffer_load(
-                        bid_rsrc, bid_t, vec_width=1, dtype=T.i64
+                    bid_i32 = buffer_ops.buffer_load(
+                        bid_rsrc, bid_t, vec_width=1, dtype=i32
                     )
-                    bid_i32 = arith.trunci(i32, bid_i64)
                     do_swa = bid_i32 >= fx.Int32(0)
                     bid_safe = arith.maxsi(bid_i32, arith.constant(0, type=i32))
                     slot_rsrc = _ptr_buffer_resource(state_slot_mapping)
@@ -968,9 +941,9 @@ def flydsl_qk_norm_rope_quant(
             ``swa_kv[slot, pos % cache_size, :] = kv_out[t]`` in the same
             launch (``slot = state_slot_mapping[batch_id_per_token[t]]``),
             fusing the standalone ``swa_write``.
-        state_slot_mapping: ``[bs]`` int32 — per-seq SWA ring slot. Required
+        state_slot_mapping: ``[bs]`` int32 -- per-seq SWA ring slot. Required
             when ``swa_kv`` is set.
-        batch_id_per_token: ``[T]`` int64, ``-1`` on CG-pad tokens — token→seq
+        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens -- token->seq
             map for the fused SWA scatter (store gated off on ``-1``). Required
             when ``swa_kv`` is set.
 
@@ -978,6 +951,36 @@ def flydsl_qk_norm_rope_quant(
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
         Scales are ``None`` when ``quant=False``.
     """
+    # ---- gfx1250 dispatch (wave32) ----
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    if _get_gfx() == "gfx1250":
+        from .qk_norm_rope_quant_gfx1250 import flydsl_qk_norm_rope_quant_gfx1250
+
+        return flydsl_qk_norm_rope_quant_gfx1250(
+            q=q,
+            kv=kv,
+            kv_weight=kv_weight,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            positions=positions,
+            num_q_heads=num_q_heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            q_weight=q_weight,
+            quant=quant,
+            quant_group_size=quant_group_size,
+            scale_dtype=scale_dtype,
+            q_out=q_out,
+            kv_out=kv_out,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            swa_kv=swa_kv,
+            state_slot_mapping=state_slot_mapping,
+            batch_id_per_token=batch_id_per_token,
+            stream=stream,
+        )
+
     # Validate user-facing inputs with raise (not assert) so the checks are
     # not stripped under ``python -O``. Internal codegen invariants inside
     # _build_kernel/_store_*_vec_g remain as asserts on purpose.
@@ -1021,7 +1024,7 @@ def flydsl_qk_norm_rope_quant(
     # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
         if q.shape[1] != H * D:
-            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H*D}]")
+            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H * D}]")
         if not q.is_contiguous():
             raise ValueError("2D q must be contiguous to .view as [T,H,D]")
         q_view = q.view(T_tok, H, D)
@@ -1098,8 +1101,8 @@ def flydsl_qk_norm_rope_quant(
             raise ValueError("swa_kv must be contiguous")
         if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
             raise TypeError("state_slot_mapping must be 1-D int32")
-        if batch_id_per_token.dim() != 1 or batch_id_per_token.dtype != torch.int64:
-            raise TypeError("batch_id_per_token must be 1-D int64")
+        if batch_id_per_token.dim() != 1 or batch_id_per_token.dtype != torch.int32:
+            raise TypeError("batch_id_per_token must be 1-D int32")
         if batch_id_per_token.shape[0] < T_tok:
             raise ValueError(
                 f"batch_id_per_token len {batch_id_per_token.shape[0]} < T={T_tok}"
@@ -1117,7 +1120,7 @@ def flydsl_qk_norm_rope_quant(
         swa_cache_size = 1
         swa_kv_arg = kv_out  # bf16 dummy
         ssm_arg = q.new_empty(1, dtype=torch.int32)
-        bid_arg = q.new_empty(1, dtype=torch.int64)
+        bid_arg = q.new_empty(1, dtype=torch.int32)
 
     launcher = compile_flydsl_qk_norm_rope_quant(
         num_q_heads=H,
@@ -1132,24 +1135,10 @@ def flydsl_qk_norm_rope_quant(
 
     if stream is None:
         stream = torch.cuda.current_stream()
-
-    def _has_direct_state():
-        return getattr(launcher, "_direct_call_state", None) is not None
+    fx_stream = Stream(stream)
 
     def _ptr_arg(t):
-        if _has_direct_state():
-            return int(t.data_ptr())
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-    def _stream_arg():
-        if _has_direct_state():
-            return stream
-        return Stream(stream)
-
-    q_weight_static = _cached_from_dlpack(q_weight_arg)
-    kv_weight_static = _cached_from_dlpack(kv_weight)
-    cos_static = _cached_from_dlpack(cos_2d)
-    sin_static = _cached_from_dlpack(sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
@@ -1168,10 +1157,10 @@ def flydsl_qk_norm_rope_quant(
         args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
-            q_weight_static,
-            kv_weight_static,
-            cos_static,
-            sin_static,
+            q_weight_arg,
+            kv_weight,
+            cos_2d,
+            sin_2d,
             _ptr_arg(positions[start:end]),
             _ptr_arg(q_out[start:end]),
             _ptr_arg(kv_out[start:end]),
@@ -1188,7 +1177,7 @@ def flydsl_qk_norm_rope_quant(
             swa_pos_stride,
             swa_cache_size,
             n,
-            _stream_arg(),
+            fx_stream,
         )
         _run_compiled(launcher, *args)
 

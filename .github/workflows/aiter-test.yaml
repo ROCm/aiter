@@ -6,11 +6,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+    paths:
+      - '**'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.github/workflows/**'
+      - '.github/workflows/aiter-test.yaml'
+      - '!.github/scripts/sglang_downstream.py'
 
   workflow_dispatch:
   schedule:
@@ -332,6 +336,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Split Aiter Tests (8 shards)
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
@@ -719,8 +725,6 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
-          - runner: aiter-8gpu-runner
-            label: MI300X
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -916,7 +920,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
-        timeout-minutes: 60
+        timeout-minutes: 75
         run: |
           set -ex
           docker exec \

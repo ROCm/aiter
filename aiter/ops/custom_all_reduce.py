@@ -8,6 +8,8 @@ import torch
 from ..jit.core import compile_ops
 
 MD_NAME = "module_custom_all_reduce"
+GFX1250_MD_NAME = "module_custom_all_reduce_gfx1250"
+FUSED_AR_MHC_MD_NAME = "module_fused_ar_mhc"
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
@@ -80,6 +82,7 @@ def fused_allreduce_rmsnorm(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -95,6 +98,7 @@ def fused_allreduce_rmsnorm_pad(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -111,6 +115,8 @@ def fused_allreduce_rmsnorm_quant(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    gemma_norm: bool = False,
+    bf16_out_ptr: int = 0,
 ) -> None: ...
 
 
@@ -165,6 +171,25 @@ def fused_qknorm_allreduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def fused_qknorm_allreduce_rope(
+    _fa: int,
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def dispose(_fa: int) -> None: ...
 
 
@@ -208,3 +233,248 @@ def free_meta_buffer(ptr: int) -> None: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def get_meta_buffer_ipc_handle(inp_ptr: int, out_handle_ptr: int) -> None: ...
+
+
+# ---- gfx1250 (MI450) dedicated module ----
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_custom_ar", develop=True)
+def init_custom_ar_gfx1250(
+    meta_ptr: int,
+    rank_data_ptr: int,
+    rank_data_sz: int,
+    all_meta_ptrs: List[int],
+    rank: int,
+    fully_connected: bool,
+) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="all_reduce", develop=True)
+def all_reduce_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    use_new: bool,
+    open_fp8_quant: bool,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="reduce_scatter", develop=True)
+def reduce_scatter_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    split_dim: int,
+    reg_ptr: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="all_gather", develop=True)
+def all_gather_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    dim: int,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
+def p2p_bw_test_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    unroll: int,
+    threads: int,
+    blocks: int,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="dispose", develop=True)
+def dispose_gfx1250(_fa: int) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="meta_size", develop=True)
+def meta_size_gfx1250() -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)
+def register_input_buffer_gfx1250(
+    _fa: int, self_ptr: int, all_ptrs: List[int]
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_output_buffer", develop=True)
+def register_output_buffer_gfx1250(
+    _fa: int, self_ptr: int, all_ptrs: List[int]
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="get_graph_buffer_count", develop=True)
+def get_graph_buffer_count_gfx1250(_fa: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="get_graph_buffer_ptrs", develop=True)
+def get_graph_buffer_ptrs_gfx1250(_fa: int, ptrs_out: int) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers", develop=True)
+def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: List[int]) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="start_sync_latency", develop=True)
+def start_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="end_sync_latency", develop=True)
+def end_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="two_sync_latency", develop=True)
+def two_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
+
+
+@compile_ops(FUSED_AR_MHC_MD_NAME)
+def fused_allreduce_mhc_post_only(
+    _fa: int,
+    inp: torch.Tensor,
+    next_residual: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+@compile_ops(FUSED_AR_MHC_MD_NAME)
+def fused_allreduce_mhc_post_one_stage(
+    _fa: int,
+    inp: torch.Tensor,
+    next_residual: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+@compile_ops(FUSED_AR_MHC_MD_NAME)
+def fused_allreduce_mhc_post_split(
+    _fa: int,
+    inp: torch.Tensor,
+    next_residual: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+def _launch_fused_allreduce_mhc_post(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    *,
+    next_residual: torch.Tensor | None = None,
+    split_path: bool = False,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> torch.Tensor:
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    if next_residual is None:
+        next_residual = torch.empty_like(residual_in)
+    launch_fn = (
+        fused_allreduce_mhc_post_split if split_path else fused_allreduce_mhc_post_only
+    )
+    launch_fn(
+        _fa,
+        inp,
+        next_residual,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        use_new,
+        open_fp8_quant,
+        reg_ptr,
+        reg_bytes,
+    )
+    return next_residual
+
+
+def launch_fused_allreduce_mhc_post_only(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    *,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> torch.Tensor:
+    """Launch fused custom AllReduce + MHC post (no pre / RMSNorm)."""
+    return _launch_fused_allreduce_mhc_post(
+        _fa,
+        inp,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        split_path=False,
+        use_new=use_new,
+        open_fp8_quant=open_fp8_quant,
+        reg_ptr=reg_ptr,
+        reg_bytes=reg_bytes,
+    )
+
+
+def launch_fused_allreduce_mhc_post_split(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    *,
+    next_residual: torch.Tensor | None = None,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> torch.Tensor:
+    """Launch 2-stage split AR + MHC post (large-M optimized path)."""
+    return _launch_fused_allreduce_mhc_post(
+        _fa,
+        inp,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        next_residual=next_residual,
+        split_path=True,
+        use_new=use_new,
+        open_fp8_quant=open_fp8_quant,
+        reg_ptr=reg_ptr,
+        reg_bytes=reg_bytes,
+    )
