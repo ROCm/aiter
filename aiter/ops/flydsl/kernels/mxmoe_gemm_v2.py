@@ -1237,10 +1237,6 @@ def gemm2_body_v2(
                     i0=2 * sub,
                 )
 
-    # Step 2: N-half B split (straight-line K2 only; BM64 -> not is_bm16). One N-half's B (J in
-    # {2*half_n, 2*half_n+1} -> 4 frags = 16 regs) + its single B-scale word are loaded and consumed
-    # before the other half loads, halving the peak B live set (32 -> 16). accm[i][J] keys on absolute
-    # J so J stays absolute; bqf is a length-4 list with only this half's two J-slots populated.
     def stream_b_half(kt_rt, half_n):
         bqf = [None, None, None, None]
         for j in (2 * half_n, 2 * half_n + 1):
@@ -1252,7 +1248,6 @@ def gemm2_body_v2(
         return bqf, bsf
 
     def mfma_cluster_half(bqf, bsf, sa, half_n):
-        # Both J in this half share mni==half_n -> one B-scale word (sb) for the pair.
         sb = _raw(Vec(bsf.load())[0])
         for j in (2 * half_n, 2 * half_n + 1):
             in_b = j % 2
@@ -1284,20 +1279,12 @@ def gemm2_body_v2(
                 n += 1
         return n
 
-    # Step 1: shape-gated, fully-unrolled K_TILES=2 straight-line mainloop (a8w4 reduce / bf16 LDS, BM64).
-    # When the compile cap INTER_MAX//BK == 2 the runtime trip is 1 or 2, so we drop the scf.for entirely
-    # and emit two straight-line tile bodies. This removes the C/B loop-carry (load_c_carry/store_c_carry,
-    # cur/nxt B double-buffer, A-scale carry): each tile's B fragments die before the next stream_b_tile,
-    # so cur+nxt B are never simultaneously live -> lower VGPR. A is fully prologue-staged into both slots
-    # (kStages==2, aStages==2, no in-loop A prefetch). When runtime inter_dim spans only 1 tile
-    # (K_TILES_RT==1) tile-1's A/B/A-scale buffer loads clamp OOB->0, a zero MFMA contribution -> correct.
     straight_line_k2 = is_f8_a and use_reduce and g2_bf16_lds and (BM == 64) and (K_TILES_MAX == 2)
     if const_expr(straight_line_k2):
-        gpu.barrier()  # A prologue vmem->LDS (both slots) visible before ds-reads
+        gpu.barrier()
         for kt in range_constexpr(2):
-            issue_a_ds_read(fx.Int32(kt))  # const slot 0/1 (no runtime mod)
+            issue_a_ds_read(fx.Int32(kt))
             sa = load_a_scale_tile(fx.Int32(kt))
-            # Step 2: process each N-half's B just-in-time so its 4 frags die before the other half loads.
             for half_n in range_constexpr(2):
                 bqf, bsf = stream_b_half(fx.Int32(kt), half_n)
                 rocdl.sched_barrier(0)
@@ -1490,9 +1477,6 @@ def atomic_bf16_epilog(
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
     lds_base_fptr = lds_typed_ptr(lds_acc_base, T.f32)
-    # bf16 cshuffle LDS: half the C tile footprint (BM*BN*2). Weight is folded in f32 during the
-    # write phase and the tile is truncated to bf16 before the LDS store (single rounding, as old
-    # FlyDSL); readback then loads the already-weighted bf16 pair and stores it straight to out.
     lds_base_bf16 = lds_typed_ptr(lds_acc_base, T.bf16, align=2) if const_expr(g2_bf16_lds) else None
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
@@ -1515,12 +1499,9 @@ def atomic_bf16_epilog(
     gpu.barrier()
 
     # write accm -> lds_acc cshuffle. f32 path: scalar f32 stores (weight applied on readback).
-    # bf16 path: fold the route weight in f32 (per block-row from sorted_weights) then truncate to
-    # bf16 so LDS holds the final weighted output tile.
     if const_expr(g2_bf16_lds):
         for i in range_constexpr(kMChunks):
             row_base = fx.Int32(i * 16) + lane_div_16 * 4
-            # one f32 route-weight per write-phase block row (row_base+v); sorted_weights is padded.
             w_row = [
                 llvm.load(T.f32, gep1(sweights_base, (m_row + row_base + v) * 4), invariant=True)
                 for v in range_constexpr(4)
@@ -1566,7 +1547,6 @@ def atomic_bf16_epilog(
             # adjacent ee=0,1 contiguous -> one 2-wide load.
             idx0 = row_in_block * BN + col_start + s * 64
             if const_expr(g2_bf16_lds):
-                # LDS already holds the weighted bf16 pair (4B = 2xbf16): load + store straight through.
                 pk = Vec(lds_vec_load(lds_acc_base, idx0 * 2, Vec.make_type(2, fx.BFloat16), fx.BFloat16, align=4))
             else:
                 v2 = Vec(lds_vec_load(lds_acc_base, idx0 * 4, Vec.make_type(2, fx.Float32), fx.Float32, align=8))

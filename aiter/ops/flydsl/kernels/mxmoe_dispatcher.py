@@ -661,17 +661,11 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
-    # g2_bf16_lds: store the cshuffle C tile as bf16 (BM*BN*2) instead of f32 (BM*BN*4) so the
-    # kernel occupies more CTA slots (Opus/old-FlyDSL style). Reduce-only for now (atomic keeps the
-    # f32 LDS + bf16 atomic-fadd path); the down-projection out is bf16, so weight is applied then
-    # truncated to bf16 before the LDS store. Enabled by default only for the a8w4 reduce route.
     if g2_bf16_lds is None:
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and use_reduce and is_f8
     g2_bf16_lds = bool(g2_bf16_lds) and use_reduce
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
-    # bf16 C LDS shrinks the output tile to BM*BN*2; with only K_TILES<=2 for the reduce shapes the
-    # A stream is fully prologue-loaded (kStages==2, no in-loop prefetch), so 2 A slots don't alias.
     aStages = 2 if g2_bf16_lds else 3
     c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
@@ -1065,7 +1059,6 @@ def get_g2(
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    # bf16 cshuffle LDS: reduce-only, a8w4 default (byte-identical for all other routes).
     g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and epilog == "reduce" and a_dtype == "fp8"
     key = (
         BM,
@@ -1246,8 +1239,6 @@ def mxfp4_moe_gemm2(
         raise AssertionError(f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}")
     if D_HIDDEN > HIDDEN_MAX_DEFAULT:
         raise AssertionError(f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX_DEFAULT})")
-    # INTER_MAX caps compile-time B-view / A-scale-LDS bounds; env override lets shapes with small
-    # inter_dim compile a tighter cap (e.g. 512 -> K_TILES_MAX==2) to unlock the straight-line K2 gemm2.
     inter_max = int(os.environ.get("MXFP4_G2_INTER_MAX", str(INTER_MAX_DEFAULT)))
     launch = get_g2(
         BM,
