@@ -129,6 +129,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import MoriAll2AllManager
 
                 self._all2all_manager = MoriAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "flydsl":
+                from .all2all import FlyDSLAll2AllManager
+
+                self._all2all_manager = FlyDSLAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "flashinfer_all2allv":
                 from .all2all import FlashInferAllToAllManager
 

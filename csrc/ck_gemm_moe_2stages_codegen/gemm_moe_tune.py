@@ -25,10 +25,17 @@ from aiter.fused_moe import (
     torch_moe,
     cktile_moe_stage1,
     cktile_moe_stage2,
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_a4w4_stage2_fw,
+)
+from aiter.ops.flydsl.mxfp4_kname import (
+    _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
+    shuffle_scale,
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
     pack_int8_to_packed_int4,
@@ -205,6 +212,12 @@ class FmoeTuner(TunerCommon):
             action="store_true",
             required=False,
             help="On gfx1250, tune the FlyDSL grouped-GEMM MoE path instead of the normal fmoe tuner.",
+        )
+        self.parser.add_argument(
+            "--mxfp4-flydsl",
+            action="store_true",
+            required=False,
+            help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
         )
 
     @staticmethod
@@ -4767,6 +4780,369 @@ class GroupedFmoeTuner(FmoeTuner):
         resultdf.to_csv(file, index=False)
 
 
+class Mxfp4FlydslTuner(FmoeTuner):
+    """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
+    unit.
+    """
+
+    ARG_DEFAULTS = {
+        **FmoeTuner.ARG_DEFAULTS,
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_untuned_fmoe.csv",
+        "tune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv",
+        "config_env_name": "AITER_CONFIG_FMOE",
+    }
+
+    @staticmethod
+    def _g1_kname(bm, use_nt, inline_quant):
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
+        if inline_quant:
+            name += "_f16in"
+        if use_nt:
+            name += "_nt"
+        return name
+
+    @staticmethod
+    def _g2_kname(bm, use_nt, epilog):
+        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle].
+        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
+        if epilog == "atomic":
+            name += "_atomic" + ("_nt" if use_nt else "")
+        elif epilog == "nonatomic_mxfp4":
+            name += "_f4out"
+        elif epilog == "nonatomic_cshuffle":
+            name += "_cshuffle"
+        return name
+
+    def _candidate_row(self, row, bm, kn1, kn2):
+        cand = {k: row[k] for k in self.keys}
+        cand.update(
+            {
+                "block_m": bm,
+                "ksplit": 0,
+                "us1": 0,
+                "kernelName1": kn1,
+                "err1": 0,
+                "us2": 0,
+                "kernelName2": kn2,
+                "err2": 0,
+                "us": 0,
+                "run_1stage": 0,
+                "xbf16": 0,
+                "flat": 0,
+                "tflops": 0,
+                "bw": 0,
+            }
+        )
+        return cand
+
+    def _candidate_rows(self, row):
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
+
+        cands = []
+        for bm in sorted({v[0] for v in G1} & {v[0] for v in G2}):
+            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
+                kn1 = self._g1_kname(bm, n1, iq1)
+                for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                    cands.append(
+                        self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep))
+                    )
+        return cands
+
+    @staticmethod
+    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
+        data = FmoeTuner.generate_data(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            dtype,
+            dtypes.fp4x2,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            16,
+            device="cuda",
+        )
+        # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
+        # so prepare weights/scales with is_guinterleave=False. The interleaved
+        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
+        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
+        data["w1_a16"] = shuffle_weight(
+            data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
+        )
+        data["w1s_a16"] = shuffle_scale(
+            data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+        )
+        data["w2_a16"] = shuffle_weight(
+            data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
+        )
+        data["w2s_a16"] = shuffle_scale(
+            data["w2_scale"], expert, is_guinterleave=False, gate_up=False
+        )
+        return data
+
+    @staticmethod
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+        BM = _parse_mxfp4_g2_kname(kn2)["BM"]
+        atomic = _parse_mxfp4_g2_kname(kn2)["atomic"]
+        BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
+        M = data["input"].shape[0]
+        sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
+            data["topk_ids"],
+            data["topk_weights"],
+            ne,
+            h,
+            dtype,
+            block_size=BM,
+            accumulate=atomic,
+            output_aux=True,
+        )
+        moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            data["input"],
+            data["w1_a16"],
+            data["w2_a16"],
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=BM1,
+            w1_scale=data["w1s_a16"],
+            kernelName1=kn1,
+            m_indices=m_indices,
+            moe_buf=moe_buf,
+        )
+        return _mxfp4_a4w4_stage2_fw(
+            inter_q,
+            data["w1_a16"],
+            data["w2_a16"],
+            sti,
+            sei,
+            nvi,
+            moe_out,
+            topk,
+            w2_scale=data["w2s_a16"],
+            a2_scale=inter_s,
+            block_m=BM,
+            sorted_weights=sw,
+            kernelName2=kn2,
+            reverse_sorted=reverse_sorted,
+        )
+
+    @staticmethod
+    def _torch_ref(data, topk, dtype, activation):
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            data["a1_qt"],
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            data["a1_scale"],
+            data["w1_scale"],
+            dtype=dtype,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+            topk=topk,
+        )
+        return FmoeTuner.run_torch_moe_stage2(
+            ref1,
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            a2_scale=None,
+            w2_scale=data["w2_scale"],
+            dtype=dtype,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+        )
+
+    def _run_candidate(self, row, candidate, args):
+        from aiter.test_common import run_perftest
+
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        dtype = dtypes.bf16
+        kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
+        activation = (
+            ActivationType.Swiglu
+            if str(row["act_type"]).endswith("Swiglu")
+            else ActivationType.Silu
+        )
+        data = self._prepare_case(token, h, e, ne, topk, dtype)
+        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
+        ref = self._torch_ref(data, topk, dtype, activation)
+        err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
+        if err is None or float(err) > args.errRatio:
+            raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
+        _, us = run_perftest(
+            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            num_warmup=int(args.warmup),
+            num_iters=int(args.iters),
+        )
+        us = round(float(us), 4)
+        candidate.update(
+            {
+                "us1": us,
+                "us": us,
+                "err1": round(float(err), 6),
+                "err2": round(float(err), 6),
+            }
+        )
+        return us
+
+    def _tune_one_shape(self, row, args):
+        """Sweep all (g1, g2) candidates for one shape; return the best row dict.
+
+        --timeout (if > 0) bounds each candidate via SIGALRM. This runs on the
+        main thread of whichever process owns the shape, so it works for both the
+        sequential path and each per-shape worker in the --mp parallel path. A
+        true GPU hang only aborts once control returns to Python; slow/looping
+        candidates are caught reliably.
+        """
+        import signal
+
+        timeout = int(getattr(args, "timeout", 0) or 0)
+
+        class _CandidateTimeout(Exception):
+            pass
+
+        def _on_alarm(signum, frame):
+            raise _CandidateTimeout(f"exceeded {timeout}s timeout")
+
+        if timeout > 0:
+            try:
+                signal.signal(signal.SIGALRM, _on_alarm)
+            except ValueError:
+                timeout = 0  # not on the main thread; cannot arm SIGALRM
+
+        best, failures = None, []
+        for candidate in self._candidate_rows(row):
+            if timeout > 0:
+                signal.alarm(timeout)
+            try:
+                us = self._run_candidate(row, candidate, args)
+                print(
+                    f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
+                    f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
+                    flush=True,
+                )
+                if best is None or us < float(best["us"]):
+                    best = candidate
+            except Exception as exc:
+                failures.append(
+                    f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
+                )
+                print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
+            finally:
+                if timeout > 0:
+                    signal.alarm(0)
+        if best is None:
+            best = self._candidate_rows(row)[0]
+            best["us"] = self.INVALID_TIME
+            best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
+            print(
+                f"[mxfp4-port] all candidates failed for "
+                f"{tuple(row[k] for k in self.keys)}",
+                flush=True,
+            )
+        return best
+
+    def tune(self, untunedf, tunedf, args):
+        del tunedf
+        rows = [row.to_dict() for _, row in untunedf.iterrows()]
+
+        mp_num = int(getattr(args, "mp", 1) or 1)
+        try:
+            ngpu = torch.cuda.device_count()
+        except Exception:
+            ngpu = 1
+        mp_num = max(1, min(mp_num, ngpu, len(rows)))
+
+        if mp_num <= 1:
+            return [self._tune_one_shape(row, args) for row in rows]
+
+        # One fresh process per shape (memory fully released between shapes),
+        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
+        # the mp_num concurrent workers never collide on the same device.
+        import multiprocessing as _mp
+
+        print(
+            f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
+        )
+        ctx = _mp.get_context("spawn")
+        mgr = ctx.Manager()
+        gpu_q = mgr.Queue()
+        for g in range(mp_num):
+            gpu_q.put(g)
+        payloads = [(self.keys, row, args, gpu_q) for row in rows]
+        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
+            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
+            # the worker is torn down after every shape (memory fully released,
+            # and one process never spans multiple GPUs via the shared queue).
+            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
+        return results
+
+    def post_process(self, results, args, topk=-1, fast_mode=False):
+        del args, topk, fast_mode
+        return pd.DataFrame(results, columns=self.columns)
+
+    def result_to_csv(self, results, file, concat=False):
+        del concat
+        old_tunedf = self.get_tuned_gemm_list(file, self.columns)
+        for col in self.columns:
+            if col not in old_tunedf.columns:
+                if col == "gfx" and "cu_num" in old_tunedf.columns:
+                    old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
+                else:
+                    old_tunedf[col] = ""
+        valid = results[
+            (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
+        ]
+        invalid = results[
+            (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
+        ]
+        resultdf = self.update_tunedf(old_tunedf, valid)
+        self.success = pd.concat([self.success, valid], ignore_index=True)
+        self.failed = pd.concat([self.failed, invalid], ignore_index=True)
+        resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
+        resultdf.to_csv(file, index=False)
+
+
+def _mxfp4_tune_shape_worker(payload):
+    """Spawned worker: tune one shape on a queue-assigned GPU (for --mxfp4-flydsl
+    --mp). Rebuilds a minimal tuner since the instance need only carry ``keys``."""
+    keys, row, args, gpu_q = payload
+    gpu = gpu_q.get()
+    try:
+        torch.cuda.set_device(gpu)
+        tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+        tuner.keys = keys
+        print(
+            f"[mxfp4-port] shape token={row['token']} inter={row['inter_dim']} "
+            f"expert={row['expert']} topk={row['topk']} -> GPU{gpu}",
+            flush=True,
+        )
+        return tuner._tune_one_shape(row, args)
+    except Exception as exc:
+        # Catastrophic (non per-candidate) failure: record as a failed shape so
+        # the pool keeps going instead of aborting the whole run.
+        best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+        best.keys = keys
+        cand = best._candidate_rows(row)[0]
+        cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
+        cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
+        print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
+        return cand
+    finally:
+        gpu_q.put(gpu)
+
+
 if __name__ == "__main__":
     key = [
         "gfx",
@@ -4820,6 +5196,7 @@ if __name__ == "__main__":
         "bw",
     ]
     use_grouped = "--grouped-gemm" in sys.argv
+    use_mxfp4_flydsl = "--mxfp4-flydsl" in sys.argv
     if use_grouped:
         if get_gfx() != "gfx1250":
             raise SystemExit("--grouped-gemm is only supported on gfx1250")
@@ -4828,6 +5205,10 @@ if __name__ == "__main__":
             grouped_key,
             grouped_result_list,
             "grouped fmoe tuner",
+        )
+    elif use_mxfp4_flydsl:
+        tuner = Mxfp4FlydslTuner(
+            "mxfp4FlydslTuner", key, resultList, "mxfp4 a4w4 flydsl port fmoe tuner"
         )
     else:
         tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
