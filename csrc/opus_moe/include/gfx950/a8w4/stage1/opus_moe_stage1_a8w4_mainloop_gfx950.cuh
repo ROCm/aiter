@@ -108,7 +108,7 @@ inline __device__ int a_reg_lds_offset(int pair_buffer,
     constexpr int kStageBytes = a_reg_lds_stage_bytes<Traits>();
     const int stage_base =
         (pair_buffer * Traits::SCALE_K_PACK + kk) * kStageBytes;
-    if constexpr(Traits::B_M >= 128)
+    if constexpr(Traits::ASYNC_A_REG_LDS)
     {
         return stage_base +
                ((mi * 2 + half) * Traits::WAVE_SIZE + lane_id) *
@@ -145,7 +145,7 @@ inline __device__ void stage_a_reg_kstep_to_lds(
         a_reg_lds_offset<Traits>(pair_buffer, kk, mi, lane_id, 0);
     const int smem_hi =
         a_reg_lds_offset<Traits>(pair_buffer, kk, mi, lane_id, 1);
-    if constexpr(Traits::B_M >= 128)
+    if constexpr(Traits::ASYNC_A_REG_LDS)
     {
         const int a_offset_i32 = static_cast<int>(a_offset);
         hidden_gmem.template async_load<Traits::BYTES_PER_VEC>(
@@ -240,7 +240,7 @@ inline __device__ void stage_a_reg_kpair_4mi_to_lds(
 template<typename Traits>
 inline __device__ void wait_a_reg_kpair_to_lds()
 {
-    if constexpr(Traits::B_M >= 128)
+    if constexpr(Traits::ASYNC_A_REG_LDS)
         opus::s_waitcnt_vmcnt(opus::number<0>{});
 }
 
@@ -302,12 +302,21 @@ inline __device__ void reduce_single_group_kwave(int wave_id,
         for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
         {
             const int store_idx =
-                (((wave_k * Traits::KWAVE_BASE_WAVES + base_wave) *
-                      Traits::M_MFMA_PER_WAVE +
-                  mi) *
+                ((((wave_k * Traits::KWAVE_BASE_WAVES + base_wave) *
+                       Traits::M_MFMA_PER_WAVE +
+                   mi) *
+                      Traits::ACC_SCALE_GROUPS_PER_TILE) *
                      Traits::WAVE_SIZE +
                  lane_id);
-            smem_c[store_idx] = rc[mi][0];
+            #pragma unroll
+            for(int acc_group = 0;
+                acc_group < Traits::ACC_SCALE_GROUPS_PER_TILE;
+                ++acc_group)
+            {
+                smem_c[store_idx +
+                       acc_group * Traits::WAVE_SIZE] =
+                    rc[mi][acc_group];
+            }
         }
         __syncthreads();
 
@@ -316,23 +325,33 @@ inline __device__ void reduce_single_group_kwave(int wave_id,
             #pragma unroll
             for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
             {
-                const int base_idx =
-                    ((base_wave * Traits::M_MFMA_PER_WAVE + mi) *
-                         Traits::WAVE_SIZE +
-                     lane_id);
-                CReg sum = smem_c[base_idx];
                 #pragma unroll
-                for(int kw = 1; kw < Traits::K_WAVE; ++kw)
+                for(int acc_group = 0;
+                    acc_group < Traits::ACC_SCALE_GROUPS_PER_TILE;
+                    ++acc_group)
                 {
-                    const int load_idx =
-                        (((kw * Traits::KWAVE_BASE_WAVES + base_wave) *
-                              Traits::M_MFMA_PER_WAVE +
-                          mi) *
+                    const int base_idx =
+                        (((base_wave * Traits::M_MFMA_PER_WAVE + mi) *
+                              Traits::ACC_SCALE_GROUPS_PER_TILE +
+                          acc_group) *
                              Traits::WAVE_SIZE +
                          lane_id);
-                    sum = sum + smem_c[load_idx];
+                    CReg sum = smem_c[base_idx];
+                    #pragma unroll
+                    for(int kw = 1; kw < Traits::K_WAVE; ++kw)
+                    {
+                        const int load_idx =
+                            ((((kw * Traits::KWAVE_BASE_WAVES + base_wave) *
+                                   Traits::M_MFMA_PER_WAVE +
+                               mi) *
+                                  Traits::ACC_SCALE_GROUPS_PER_TILE +
+                              acc_group) *
+                                 Traits::WAVE_SIZE +
+                             lane_id);
+                        sum = sum + smem_c[load_idx];
+                    }
+                    rc[mi][acc_group] = sum;
                 }
-                rc[mi][0] = sum;
             }
         }
         __syncthreads();
@@ -408,6 +427,38 @@ inline __device__ void accumulate_loaded_a_with_b_split_b(
         mma, ra, rb, rc, safe_a_scale, b_scale, selector_a);
 }
 
+template<typename Traits, typename Mma, int SelectorB>
+inline __device__ void accumulate_group_split_loaded_b_split_b(
+    Mma& mma,
+    const typename Mma::mfma_type::vtype_a (&ra)[Traits::M_MFMA_PER_WAVE],
+    const typename Mma::mfma_type::vtype_b& rb,
+    typename Mma::vtype_c (&rc)[Traits::M_MFMA_PER_WAVE]
+                              [Traits::ACC_SCALE_GROUPS_PER_TILE],
+    int acc_group,
+    const Tile<Traits>& tile,
+    const bool (&route_valid)[Traits::M_MFMA_PER_WAVE],
+    const int (&a_scale)[Traits::M_SCALE_PACKS],
+    int k_step,
+    int b_scale)
+{
+    #pragma unroll
+    for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+    {
+        const bool scale_route_valid =
+            Traits::SKIP_INVALID_A_SCALE_GUARD ? true : route_valid[mi];
+        accumulate_loaded_a_with_b_split_b<Traits, Mma, SelectorB>(
+            mma,
+            ra[mi],
+            rb,
+            rc[mi][acc_group],
+            mi + tile.route_base / Traits::MMA_M,
+            scale_route_valid,
+            a_scale[mi / Traits::SCALE_MN_PACK],
+            k_step,
+            b_scale);
+    }
+}
+
 template<typename Traits, typename Mma, typename LayoutA, typename LayoutB>
 inline __device__ void mainloop_single_group_direct_a(
     Mma& mma,
@@ -435,7 +486,8 @@ inline __device__ void mainloop_single_group_direct_a(
 
     const int base_wave = wave_id % Traits::KWAVE_BASE_WAVES;
     const int wave_k = wave_id / Traits::KWAVE_BASE_WAVES;
-    const int out_half = base_wave / 2;
+    const int out_half =
+        Traits::PAIR_GATE_UP_SINGLE_GROUP ? base_wave : base_wave / 2;
     const int gate_up = base_wave & 1;
 
     int ga[Traits::M_MFMA_PER_WAVE];
@@ -473,9 +525,23 @@ inline __device__ void mainloop_single_group_direct_a(
 
     const int output_col_base =
         tile.out_col_base + out_half * Traits::MMA_N;
-    const int64_t b_payload_base =
-        w1_payload_group_base_byte_offset<Traits>(
-            tile.expert_id, output_col_base, gate_up, gb, kargs.stride_w1_e);
+    int64_t b_payload_base = 0;
+    int64_t b_payload_base_gate = 0;
+    int64_t b_payload_base_up = 0;
+    if constexpr(Traits::PAIR_GATE_UP_SINGLE_GROUP)
+    {
+        b_payload_base_gate =
+            w1_payload_group_base_byte_offset<Traits>(
+                tile.expert_id, output_col_base, 0, gb, kargs.stride_w1_e);
+        b_payload_base_up =
+            b_payload_base_gate + Traits::MFMA_K_STEPS * kW1KStepBytes;
+    }
+    else
+    {
+        b_payload_base =
+            w1_payload_group_base_byte_offset<Traits>(
+                tile.expert_id, output_col_base, gate_up, gb, kargs.stride_w1_e);
+    }
     const int b_scale_base =
         w1_scale_base_byte_offset<Traits>(
             tile.expert_id, output_col_base, gb);
@@ -507,78 +573,212 @@ inline __device__ void mainloop_single_group_direct_a(
                 kargs.w1_scale_e8m0 + b_scale_base +
                 a_scale_step_offset));
 
-        const stage1_u32x4_t b_raw_kk0 =
-            *reinterpret_cast<const stage1_u32x4_t*>(
+        stage1_u32x4_t b_raw_kk0{};
+        stage1_u32x4_t b_gate_kk0{};
+        stage1_u32x4_t b_up_kk0{};
+        if constexpr(Traits::PAIR_GATE_UP_SINGLE_GROUP)
+        {
+            b_gate_kk0 = *reinterpret_cast<const stage1_u32x4_t*>(
+                kargs.w1_fp4 + b_payload_base_gate +
+                static_cast<int64_t>(k_pair) * kW1KStepBytes);
+            b_up_kk0 = *reinterpret_cast<const stage1_u32x4_t*>(
+                kargs.w1_fp4 + b_payload_base_up +
+                static_cast<int64_t>(k_pair) * kW1KStepBytes);
+        }
+        else
+        {
+            b_raw_kk0 = *reinterpret_cast<const stage1_u32x4_t*>(
                 kargs.w1_fp4 + b_payload_base +
                 static_cast<int64_t>(k_pair) * kW1KStepBytes);
+        }
 
         #pragma unroll
         for(int kk = 0; kk < Traits::SCALE_K_PACK; ++kk)
         {
             const int k_step = k_pair + kk;
-            stage1_u32x4_t b_raw = b_raw_kk0;
-            if(kk != 0)
+            if constexpr(Traits::PAIR_GATE_UP_SINGLE_GROUP)
             {
-                b_raw = *reinterpret_cast<const stage1_u32x4_t*>(
-                    kargs.w1_fp4 + b_payload_base +
-                    static_cast<int64_t>(k_step) * kW1KStepBytes);
-            }
-
-            V_B rb{};
-            unpack_b_mfma_reg(b_raw, rb);
-            const int selector_b =
-                (k_step & 1) * Traits::SCALE_MN_PACK + gate_up;
-
-            #pragma unroll
-            for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
-            {
-                V_A ra{};
-                load_a_mfma_reg_direct<Traits, Mma>(
-                    kargs, ra, route_valid[mi], a_payload_base[mi], k_step);
-                if constexpr(Traits::SPLIT_SELECTOR_B)
+                stage1_u32x4_t b_gate = b_gate_kk0;
+                stage1_u32x4_t b_up = b_up_kk0;
+                if(kk != 0)
                 {
-                    if(selector_b == 0)
+                    b_gate = *reinterpret_cast<const stage1_u32x4_t*>(
+                        kargs.w1_fp4 + b_payload_base_gate +
+                        static_cast<int64_t>(k_step) * kW1KStepBytes);
+                    b_up = *reinterpret_cast<const stage1_u32x4_t*>(
+                        kargs.w1_fp4 + b_payload_base_up +
+                        static_cast<int64_t>(k_step) * kW1KStepBytes);
+                }
+
+                V_B rb_gate{};
+                V_B rb_up{};
+                unpack_b_mfma_reg(b_gate, rb_gate);
+                unpack_b_mfma_reg(b_up, rb_up);
+
+                #pragma unroll
+                for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+                {
+                    V_A ra{};
+                    load_a_mfma_reg_direct<Traits, Mma>(
+                        kargs, ra, route_valid[mi], a_payload_base[mi], k_step);
+                    const int selector_gate =
+                        (k_step & 1) * Traits::SCALE_MN_PACK;
+                    const int selector_up = selector_gate + 1;
+                    if constexpr(Traits::SPLIT_SELECTOR_B)
                     {
-                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 0>(
-                            mma,
-                            ra,
-                            rb,
-                            rc[mi][0],
-                            mi + tile.route_base / Traits::MMA_M,
-                            route_valid[mi],
-                            a_scale[mi / Traits::SCALE_MN_PACK],
-                            k_step,
-                            b_scale);
-                    }
-                    else if(selector_b == 1)
-                    {
-                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 1>(
-                            mma,
-                            ra,
-                            rb,
-                            rc[mi][0],
-                            mi + tile.route_base / Traits::MMA_M,
-                            route_valid[mi],
-                            a_scale[mi / Traits::SCALE_MN_PACK],
-                            k_step,
-                            b_scale);
-                    }
-                    else if(selector_b == 2)
-                    {
-                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 2>(
-                            mma,
-                            ra,
-                            rb,
-                            rc[mi][0],
-                            mi + tile.route_base / Traits::MMA_M,
-                            route_valid[mi],
-                            a_scale[mi / Traits::SCALE_MN_PACK],
-                            k_step,
-                            b_scale);
+                        if(selector_gate == 0)
+                        {
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 0>(
+                                mma,
+                                ra,
+                                rb_gate,
+                                rc[mi][0],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 1>(
+                                mma,
+                                ra,
+                                rb_up,
+                                rc[mi][1],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                        }
+                        else
+                        {
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 2>(
+                                mma,
+                                ra,
+                                rb_gate,
+                                rc[mi][0],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 3>(
+                                mma,
+                                ra,
+                                rb_up,
+                                rc[mi][1],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                        }
                     }
                     else
                     {
-                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 3>(
+                        accumulate_loaded_a_with_b<Traits, Mma>(
+                            mma,
+                            ra,
+                            rb_gate,
+                            rc[mi][0],
+                            mi + tile.route_base / Traits::MMA_M,
+                            route_valid[mi],
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            selector_gate,
+                            b_scale);
+                        accumulate_loaded_a_with_b<Traits, Mma>(
+                            mma,
+                            ra,
+                            rb_up,
+                            rc[mi][1],
+                            mi + tile.route_base / Traits::MMA_M,
+                            route_valid[mi],
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            selector_up,
+                            b_scale);
+                    }
+                }
+            }
+            else
+            {
+                stage1_u32x4_t b_raw = b_raw_kk0;
+                if(kk != 0)
+                {
+                    b_raw = *reinterpret_cast<const stage1_u32x4_t*>(
+                        kargs.w1_fp4 + b_payload_base +
+                        static_cast<int64_t>(k_step) * kW1KStepBytes);
+                }
+
+                V_B rb{};
+                unpack_b_mfma_reg(b_raw, rb);
+                const int selector_b =
+                    (k_step & 1) * Traits::SCALE_MN_PACK + gate_up;
+
+                #pragma unroll
+                for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+                {
+                    V_A ra{};
+                    load_a_mfma_reg_direct<Traits, Mma>(
+                        kargs, ra, route_valid[mi], a_payload_base[mi], k_step);
+                    if constexpr(Traits::SPLIT_SELECTOR_B)
+                    {
+                        if(selector_b == 0)
+                        {
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 0>(
+                                mma,
+                                ra,
+                                rb,
+                                rc[mi][0],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                        }
+                        else if(selector_b == 1)
+                        {
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 1>(
+                                mma,
+                                ra,
+                                rb,
+                                rc[mi][0],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                        }
+                        else if(selector_b == 2)
+                        {
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 2>(
+                                mma,
+                                ra,
+                                rb,
+                                rc[mi][0],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                        }
+                        else
+                        {
+                            accumulate_loaded_a_with_b_split_b<Traits, Mma, 3>(
+                                mma,
+                                ra,
+                                rb,
+                                rc[mi][0],
+                                mi + tile.route_base / Traits::MMA_M,
+                                route_valid[mi],
+                                a_scale[mi / Traits::SCALE_MN_PACK],
+                                k_step,
+                                b_scale);
+                        }
+                    }
+                    else
+                    {
+                        accumulate_loaded_a_with_b<Traits, Mma>(
                             mma,
                             ra,
                             rb,
@@ -587,22 +787,9 @@ inline __device__ void mainloop_single_group_direct_a(
                             route_valid[mi],
                             a_scale[mi / Traits::SCALE_MN_PACK],
                             k_step,
+                            selector_b,
                             b_scale);
                     }
-                }
-                else
-                {
-                    accumulate_loaded_a_with_b<Traits, Mma>(
-                        mma,
-                        ra,
-                        rb,
-                        rc[mi][0],
-                        mi + tile.route_base / Traits::MMA_M,
-                        route_valid[mi],
-                        a_scale[mi / Traits::SCALE_MN_PACK],
-                        k_step,
-                        selector_b,
-                        b_scale);
                 }
             }
         }
@@ -1031,15 +1218,30 @@ inline __device__ void mainloop_gate_up_group_split(
         {
             if constexpr(Traits::M_MFMA_PER_WAVE >= 8)
             {
-                stage_a_reg_kpair_4mi_to_lds<Traits, 0>(
-                    kargs,
-                    wave_id,
-                    lane_id,
-                    next_k_pair,
-                    pair_buffer ^ 1,
-                    route_valid,
-                    a_payload_base,
-                    smem_a_reg);
+                if constexpr(Traits::FULL_NEXT_A_REG_PREFETCH)
+                {
+                    stage_a_reg_kpair_to_lds<Traits>(
+                        kargs,
+                        wave_id,
+                        lane_id,
+                        next_k_pair,
+                        pair_buffer ^ 1,
+                        route_valid,
+                        a_payload_base,
+                        smem_a_reg);
+                }
+                else
+                {
+                    stage_a_reg_kpair_4mi_to_lds<Traits, 0>(
+                        kargs,
+                        wave_id,
+                        lane_id,
+                        next_k_pair,
+                        pair_buffer ^ 1,
+                        route_valid,
+                        a_payload_base,
+                        smem_a_reg);
+                }
             }
             else
             {
@@ -1104,42 +1306,117 @@ inline __device__ void mainloop_gate_up_group_split(
             {
                 V_B rb_gate{};
                 unpack_b_mfma_reg(b_gate[local_group], rb_gate);
-                #pragma unroll
-                for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+                if constexpr(Traits::SPLIT_SELECTOR_B)
                 {
-                    accumulate_loaded_a_with_b<Traits, Mma>(
-                        mma,
-                        ra[mi],
-                        rb_gate,
-                        rc[mi][local_group],
-                        mi + tile.route_base / Traits::MMA_M,
-                        route_valid[mi],
-                        a_scale[mi / Traits::SCALE_MN_PACK],
-                        k_step,
-                        selector_gate,
-                        b_scale[local_group]);
+                    if(selector_gate == 0)
+                    {
+                        accumulate_group_split_loaded_b_split_b<Traits, Mma, 0>(
+                            mma,
+                            ra,
+                            rb_gate,
+                            rc,
+                            local_group,
+                            tile,
+                            route_valid,
+                            a_scale,
+                            k_step,
+                            b_scale[local_group]);
+                    }
+                    else
+                    {
+                        accumulate_group_split_loaded_b_split_b<Traits, Mma, 2>(
+                            mma,
+                            ra,
+                            rb_gate,
+                            rc,
+                            local_group,
+                            tile,
+                            route_valid,
+                            a_scale,
+                            k_step,
+                            b_scale[local_group]);
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+                    {
+                        const bool scale_route_valid =
+                            Traits::SKIP_INVALID_A_SCALE_GUARD ? true :
+                                                                  route_valid[mi];
+                        accumulate_loaded_a_with_b<Traits, Mma>(
+                            mma,
+                            ra[mi],
+                            rb_gate,
+                            rc[mi][local_group],
+                            mi + tile.route_base / Traits::MMA_M,
+                            scale_route_valid,
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            selector_gate,
+                            b_scale[local_group]);
+                    }
                 }
 
                 V_B rb_up{};
                 unpack_b_mfma_reg(b_up[local_group], rb_up);
-                #pragma unroll
-                for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+                if constexpr(Traits::SPLIT_SELECTOR_B)
                 {
-                    accumulate_loaded_a_with_b<Traits, Mma>(
-                        mma,
-                        ra[mi],
-                        rb_up,
-                        rc[mi][local_group + kGroupsPerWave],
-                        mi + tile.route_base / Traits::MMA_M,
-                        route_valid[mi],
-                        a_scale[mi / Traits::SCALE_MN_PACK],
-                        k_step,
-                        selector_up,
-                        b_scale[local_group]);
+                    if(selector_gate == 0)
+                    {
+                        accumulate_group_split_loaded_b_split_b<Traits, Mma, 1>(
+                            mma,
+                            ra,
+                            rb_up,
+                            rc,
+                            local_group + kGroupsPerWave,
+                            tile,
+                            route_valid,
+                            a_scale,
+                            k_step,
+                            b_scale[local_group]);
+                    }
+                    else
+                    {
+                        accumulate_group_split_loaded_b_split_b<Traits, Mma, 3>(
+                            mma,
+                            ra,
+                            rb_up,
+                            rc,
+                            local_group + kGroupsPerWave,
+                            tile,
+                            route_valid,
+                            a_scale,
+                            k_step,
+                            b_scale[local_group]);
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+                    {
+                        const bool scale_route_valid =
+                            Traits::SKIP_INVALID_A_SCALE_GUARD ? true :
+                                                                  route_valid[mi];
+                        accumulate_loaded_a_with_b<Traits, Mma>(
+                            mma,
+                            ra[mi],
+                            rb_up,
+                            rc[mi][local_group + kGroupsPerWave],
+                            mi + tile.route_base / Traits::MMA_M,
+                            scale_route_valid,
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            selector_up,
+                            b_scale[local_group]);
+                    }
                 }
             }
 
-            if constexpr(Traits::M_MFMA_PER_WAVE >= 8)
+            if constexpr(Traits::M_MFMA_PER_WAVE >= 8 &&
+                         !Traits::FULL_NEXT_A_REG_PREFETCH)
             {
                 if(kk == 0 && next_k_pair < Traits::MFMA_K_STEPS)
                 {

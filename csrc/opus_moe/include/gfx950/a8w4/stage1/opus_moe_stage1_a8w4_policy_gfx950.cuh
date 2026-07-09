@@ -288,7 +288,7 @@ inline __device__ int activated_smem_offset(int smem_row,
                                             int local_col)
 {
     if constexpr(Traits::GATE_UP_GROUP_SPLIT && Traits::B_M == 64 &&
-                 Traits::B_N == 256)
+                 (Traits::B_N == 256 || Traits::B_N == 384))
     {
         local_col ^= (smem_row & 7) << 2;
     }
@@ -386,13 +386,15 @@ inline __device__ bool route_is_valid_fast(const OpusMoeStage1A8W4Kargs& kargs,
                                            int& token,
                                            int& slot)
 {
-    if(!tile_full_valid)
-        return route_is_valid<Traits>(kargs, route_row, token, slot);
+    if(tile_full_valid)
+    {
+        const int32_t packed = kargs.sorted_token_ids[route_row];
+        token = token_id(packed);
+        slot = topk_slot(packed);
+        return token < kargs.token_num && slot < kargs.topk;
+    }
 
-    const int32_t packed = kargs.sorted_token_ids[route_row];
-    token = token_id(packed);
-    slot = topk_slot(packed);
-    return token < kargs.token_num && slot < kargs.topk;
+    return route_is_valid<Traits>(kargs, route_row, token, slot);
 }
 
 template<typename Traits>
@@ -403,6 +405,28 @@ inline __device__ bool load_route_metadata_to_smem(
     int* __restrict__ smem_slot,
     uint8_t* __restrict__ smem_route_valid)
 {
+    if constexpr(Traits::ROW_ZERO_METADATA_ONLY)
+    {
+        if(tile.tid < Traits::B_M)
+        {
+            smem_token[tile.tid] = 0;
+            smem_slot[tile.tid] = 0;
+            smem_route_valid[tile.tid] = 0;
+        }
+        if(tile.tid == 0)
+        {
+            int token = 0;
+            int slot = 0;
+            const bool valid = route_is_valid<Traits>(
+                kargs, tile.route_base, token, slot);
+            smem_token[0] = token;
+            smem_slot[0] = slot;
+            smem_route_valid[0] = valid ? 1 : 0;
+        }
+        __syncthreads();
+        return smem_route_valid[0] != 0;
+    }
+
     const bool tile_full_valid =
         tile.route_base + Traits::B_M <= tile.valid_rows;
     int has_route = 0;
@@ -414,14 +438,26 @@ inline __device__ bool load_route_metadata_to_smem(
         int token = 0;
         int slot = 0;
         const bool valid = route_is_valid_fast<Traits>(
-            kargs, tile_full_valid, tile.route_base + local_m, token, slot);
+            kargs,
+            tile_full_valid,
+            tile.route_base + local_m,
+            token,
+            slot);
         smem_token[local_m] = token;
         smem_slot[local_m] = slot;
         smem_route_valid[local_m] = valid ? 1 : 0;
         has_route |= valid ? 1 : 0;
     }
 
-    return __syncthreads_or(has_route) != 0;
+    if constexpr(Traits::ASSUME_ROUTE_TILE_HAS_ROUTE)
+    {
+        __syncthreads();
+        return true;
+    }
+    else
+    {
+        return __syncthreads_or(has_route) != 0;
+    }
 }
 
 inline __device__ bool route_from_smem(int local_m,

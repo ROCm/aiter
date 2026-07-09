@@ -201,7 +201,8 @@ inline __device__ void epilogue_store_row_pass(
             return;
     }
     const int epilogue_wave = wave_id % Traits::KWAVE_BASE_WAVES;
-    const int out_half = epilogue_wave / 2;
+    const int out_half =
+        Traits::PAIR_GATE_UP_SINGLE_GROUP ? epilogue_wave : epilogue_wave / 2;
     const int gate_up = epilogue_wave & 1;
 
     #pragma unroll
@@ -210,14 +211,36 @@ inline __device__ void epilogue_store_row_pass(
         #pragma unroll
         for(int group = 0; group < Traits::OUTPUT_SCALE_GROUPS_PER_TILE; ++group)
         {
-            store_group_accum_to_smem<Traits>(
-                smem_gate_up,
-                rc[mi][group],
-                ga[mi],
-                group,
-                gate_up,
-                out_half,
-                row_pass_base);
+            if constexpr(Traits::PAIR_GATE_UP_SINGLE_GROUP)
+            {
+                store_group_accum_to_smem<Traits>(
+                    smem_gate_up,
+                    rc[mi][0],
+                    ga[mi],
+                    group,
+                    0,
+                    out_half,
+                    row_pass_base);
+                store_group_accum_to_smem<Traits>(
+                    smem_gate_up,
+                    rc[mi][1],
+                    ga[mi],
+                    group,
+                    1,
+                    out_half,
+                    row_pass_base);
+            }
+            else
+            {
+                store_group_accum_to_smem<Traits>(
+                    smem_gate_up,
+                    rc[mi][group],
+                    ga[mi],
+                    group,
+                    gate_up,
+                    out_half,
+                    row_pass_base);
+            }
         }
     }
 }
@@ -329,12 +352,19 @@ inline __device__ void epilogue_quantize_activated_row_pass(
         Traits::EPILOGUE_THREADS * 2 == Traits::BLOCK_SIZE;
     constexpr bool kSplitQuantGroupBlocks3 =
         Traits::GATE_UP_GROUP_SPLIT &&
-        Traits::B_M == 32 &&
+        (Traits::B_M == 32 || Traits::B_M == 64) &&
+        Traits::EPILOGUE_ROW_SPLIT == 2 &&
         Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 6 &&
         Traits::EPILOGUE_THREADS * 3 <= Traits::BLOCK_SIZE;
+    constexpr bool kSplitQuantGroupBlocks6x2 =
+        Traits::GATE_UP_GROUP_SPLIT &&
+        Traits::B_M == 128 &&
+        Traits::EPILOGUE_ROW_SPLIT == 2 &&
+        Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 6 &&
+        Traits::EPILOGUE_THREADS * 2 <= Traits::BLOCK_SIZE;
 
     int smem_m = tile.tid >> 1;
-    if constexpr(kSplitQuantGroupBlocks2)
+    if constexpr(kSplitQuantGroupBlocks2 || kSplitQuantGroupBlocks6x2)
         smem_m = tile.tid >> 2;
     if constexpr(kSplitQuantGroupBlocks3)
         smem_m = tile.tid / 6;
@@ -343,7 +373,7 @@ inline __device__ void epilogue_quantize_activated_row_pass(
     const int local_col_base = half * (Traits::SCALE_GROUP_LOGICAL_K / 2);
     const int route_row = tile.route_base + local_m;
     bool epilogue_active = tile.tid < Traits::EPILOGUE_THREADS;
-    if constexpr(kSplitQuantGroupBlocks2)
+    if constexpr(kSplitQuantGroupBlocks2 || kSplitQuantGroupBlocks6x2)
         epilogue_active = tile.tid < Traits::EPILOGUE_THREADS * 2;
     if constexpr(kSplitQuantGroupBlocks3)
         epilogue_active = tile.tid < Traits::EPILOGUE_THREADS * 3;
@@ -359,11 +389,14 @@ inline __device__ void epilogue_quantize_activated_row_pass(
 
     constexpr int kGroupsPerThread =
         kSplitQuantGroupBlocks2 ? 2 :
+        kSplitQuantGroupBlocks6x2 ? 3 :
         kSplitQuantGroupBlocks3 ? 2 :
         Traits::OUTPUT_SCALE_GROUPS_PER_TILE;
     int group_base = 0;
     if constexpr(kSplitQuantGroupBlocks2)
         group_base = ((tile.tid >> 1) & 1) * 2;
+    if constexpr(kSplitQuantGroupBlocks6x2)
+        group_base = ((tile.tid >> 1) & 1) * 3;
     if constexpr(kSplitQuantGroupBlocks3)
         group_base = ((tile.tid >> 1) % 3) * 2;
     for(int local_group = 0; local_group < kGroupsPerThread; ++local_group)

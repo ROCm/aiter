@@ -60,6 +60,10 @@ constexpr int kMfmaK = 128;
 constexpr int kDefaultCtaThreads = 256;
 constexpr int kMinBlocksPerCu = 2;
 
+// Shape aliases pass tuning flags positionally. Keep the trailing flag order as:
+// MinBlocksPerCuOverride, CapRouteTilesToExpertBlocks, SkipInvalidAScaleGuard,
+// AssumeRouteTileHasRoute, RowZeroMetadataOnly, PairGateUpSingleGroup,
+// AsyncARegLds, FullNextARegPrefetch.
 template<int BlockM,
          int BlockN,
          int BlockK,
@@ -72,7 +76,13 @@ template<int BlockM,
          bool ClampOutputFp8 = true,
          bool SplitSelectorB = false,
          int MinBlocksPerCuOverride = 0,
-         bool CapRouteTilesToExpertBlocks = false>
+         bool CapRouteTilesToExpertBlocks = false,
+         bool SkipInvalidAScaleGuard = false,
+         bool AssumeRouteTileHasRoute = false,
+         bool RowZeroMetadataOnly = false,
+         bool PairGateUpSingleGroup = false,
+         bool AsyncARegLds = false,
+         bool FullNextARegPrefetch = false>
 struct OpusMoeStage1A8W4Shape
 {
     static constexpr int B_M = BlockM;
@@ -95,7 +105,10 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int A_LDS_STAGE_ELEMS = B_M * B_K_LOGICAL;
     static constexpr int WAVE_SIZE = opus::get_warp_size();
     static constexpr int K_WAVE = KWave;
-    static constexpr int KWAVE_BASE_WAVES = 4;
+    static constexpr bool PAIR_GATE_UP_SINGLE_GROUP = PairGateUpSingleGroup;
+    static constexpr bool ASYNC_A_REG_LDS = AsyncARegLds || B_M >= 128;
+    static constexpr int KWAVE_BASE_WAVES =
+        PAIR_GATE_UP_SINGLE_GROUP ? 2 : 4;
     static constexpr int BLOCK_SIZE =
         K_WAVE == 1 ? kDefaultCtaThreads : KWAVE_BASE_WAVES * K_WAVE * WAVE_SIZE;
     static constexpr int MIN_BLOCKS_PER_CU =
@@ -124,7 +137,7 @@ struct OpusMoeStage1A8W4Shape
             OutputScaleGroupsOverride :
             DEFAULT_OUTPUT_SCALE_GROUPS_PER_TILE;
     static constexpr int ACC_SCALE_GROUPS_PER_TILE =
-        OUTPUT_SCALE_GROUPS_PER_TILE;
+        PAIR_GATE_UP_SINGLE_GROUP ? 2 : OUTPUT_SCALE_GROUPS_PER_TILE;
     static constexpr int OUTPUT_COLS_PER_TILE =
         OUTPUT_SCALE_GROUPS_PER_TILE * kScaleGroupLogicalK;
     static constexpr int SCALE_MN_PACK = 2;
@@ -144,7 +157,7 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int KWAVE_REDUCE_BYTES =
         K_WAVE == 1 ? 0 : K_WAVE * KWAVE_BASE_WAVES *
                               M_MFMA_PER_WAVE *
-                              OUTPUT_SCALE_GROUPS_PER_TILE * WAVE_SIZE *
+                              ACC_SCALE_GROUPS_PER_TILE * WAVE_SIZE *
                               static_cast<int>(sizeof(float)) * 4;
     static constexpr int MAINLOOP_SCRATCH_BYTES =
         A_REG_LDS_BYTES > KWAVE_REDUCE_BYTES ? A_REG_LDS_BYTES :
@@ -160,6 +173,14 @@ struct OpusMoeStage1A8W4Shape
     static constexpr bool SPLIT_SELECTOR_B = SplitSelectorB;
     static constexpr bool CAP_ROUTE_TILES_TO_EXPERT_BLOCKS =
         CapRouteTilesToExpertBlocks;
+    static constexpr bool SKIP_INVALID_A_SCALE_GUARD =
+        SkipInvalidAScaleGuard;
+    static constexpr bool ASSUME_ROUTE_TILE_HAS_ROUTE =
+        AssumeRouteTileHasRoute;
+    static constexpr bool ROW_ZERO_METADATA_ONLY =
+        RowZeroMetadataOnly;
+    static constexpr bool FULL_NEXT_A_REG_PREFETCH =
+        FullNextARegPrefetch;
     static constexpr int GATE_UP_GROUP_SPLIT_GROUPS =
         OUTPUT_SCALE_GROUPS_PER_TILE / 2;
 
@@ -221,6 +242,15 @@ struct OpusMoeStage1A8W4Shape
     static_assert(OUTPUT_COLS_PER_TILE % SCALE_GROUP_LOGICAL_K == 0);
     static_assert(HIDDEN_SCALE_GROUPS % static_cast<int>(sizeof(uint32_t)) == 0);
     static_assert(!CAP_ROUTE_TILES_TO_ROUTED_BLOCKS || SORT_BLOCK_M % B_M == 0);
+    static_assert(!ASSUME_ROUTE_TILE_HAS_ROUTE ||
+                  CAP_ROUTE_TILES_TO_ROUTED_BLOCKS ||
+                  CAP_ROUTE_TILES_TO_EXPERT_BLOCKS);
+    static_assert(!ROW_ZERO_METADATA_ONLY ||
+                  (B_M == 16 && SORT_BLOCK_M == 16 &&
+                   CAP_ROUTE_TILES_TO_ROUTED_BLOCKS));
+    static_assert(!PAIR_GATE_UP_SINGLE_GROUP ||
+                  (!GATE_UP_GROUP_SPLIT &&
+                   OUTPUT_SCALE_GROUPS_PER_TILE == 1));
 };
 
 using OpusMoeStage1A8W4P0Bm32Bn384AReuse =
@@ -245,6 +275,18 @@ using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2NoClampSplitSelectorBAReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, false, false, true>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2AReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 2>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin1AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 1>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin1PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 1, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 2, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2AssumeRouteAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 2, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin1Row0MetaAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 1, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2Row0MetaAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 2, false, false, false, true>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4AReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4NoClampAReuse =
@@ -253,6 +295,22 @@ using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4NoClampSplitSelectorBAReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, false, false, true>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBAReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBMin1PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, true, 1, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBMin2PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, true, 2, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBMin3PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, true, 3, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBMin4PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, true, 4, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampMin1PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, false, 1, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampMin2PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, false, 2, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampMin3PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, false, 3, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampMin4PairGateUpAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, false, 4, false, false, false, false, true>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesAReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true>;
 using OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1AReuse =
@@ -267,10 +325,39 @@ using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096Min1 =
     OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, false, true, false, 1>;
 using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1 =
     OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, false, false, false, 1>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1AsyncA =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, false, false, false, 1, false, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1AsyncACapRoutesAssumeRoute =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, true, false, false, 1, false, false, true, false, false, true>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1AsyncACapRoutesAssumeRouteSplitB =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, true, false, true, 1, false, false, true, false, false, true>;
 using OpusMoeStage1A8W4P0Bm64Bn256GateUpGroupSplit =
     OpusMoeStage1A8W4Shape<64, 256, 256, 64, 2, true>;
 using OpusMoeStage1A8W4P0Bm128Bn256GateUpGroupSplit =
     OpusMoeStage1A8W4Shape<128, 256, 256, 128, 2, true>;
-
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin1 =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 1>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin2 =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin1NoScaleGuard =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 1, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin2NoScaleGuard =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 0, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin3NoScaleGuardSplitB =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, true, 3, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin4NoScaleGuardSplitB =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, true, 4, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin1NoScaleGuardFullNextA =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 1, false, true, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin1NoScaleGuardFullNextASplitB =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, true, 1, false, true, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin2NoScaleGuardFullNextA =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 0, false, true, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin2NoScaleGuardFullNextASplitB =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, true, 0, false, true, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin3NoScaleGuardFullNextA =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 3, false, true, false, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin4NoScaleGuardFullNextA =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 4, false, true, false, false, false, false, true>;
 } // namespace stage1_a8w4
 } // namespace opus_moe
