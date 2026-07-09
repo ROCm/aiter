@@ -2727,7 +2727,21 @@ def cktile_moe_stage1(
     else:
         tmp_out = out
     bias1 = _normalize_bias_for_kernel(bias1)
-    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
+    if os.environ.get("AITER_CKTILE_DEBUG", "0") == "1":
+        print(
+            "[CKTILE-DEBUG] stage1 gemm1"
+            f" kind={'gemm1_split_k' if split_k > 1 else 'gemm1_gate_up'}"
+            f" M(tokens)={token_num} topk={topk} experts={w1.shape[0]}"
+            f" N={w1.shape[1]} K={hidden_states.shape[1]}"
+            f" split_k(k_batch)={split_k} block_m={block_m}"
+            f" act={activation} has_bias={bias1 is not None}"
+            f" a_dtype={hidden_states.dtype} w_dtype={w1.dtype} out_dtype={dtype}"
+            f" post_act={needs_post_activation}"
+            f" post_act_layout={post_activation_layout}"
+            f" n_pad_zeros={n_pad_zeros} k_pad_zeros={k_pad_zeros}"
+            f" kernel_name='{kernel_name}'",
+            flush=True,
+        )
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -2839,7 +2853,17 @@ def cktile_moe_stage2(
     kernel_name="",
 ):
     bias2 = _normalize_bias_for_kernel(bias2)
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    if os.environ.get("AITER_CKTILE_DEBUG", "0") == "1":
+        print(
+            "[CKTILE-DEBUG] stage2 gemm2"
+            f" M(tokens*topk)={a2.shape[0] * a2.shape[1]} topk={topk} experts={w2.shape[0]}"
+            f" N={w2.shape[1]} K={a2.shape[2]}"
+            f" block_m={block_m} act={activation} has_bias={bias2 is not None}"
+            f" a_dtype={a2.dtype} w_dtype={w2.dtype} out_dtype={out.dtype}"
+            f" n_pad_zeros={n_pad_zeros} k_pad_zeros={k_pad_zeros}"
+            f" kernel_name='{kernel_name}'",
+            flush=True,
+        )
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,
