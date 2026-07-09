@@ -126,6 +126,11 @@ def assert_hgemm_wmma_kernel(
         assert BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
     WARP_M = WARP_M_STEPS * WARP_ATOM_M
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
+
+    # NOTE: threshold for tuning
+    assert WARP_M_STEPS <= 4
+    assert WARP_N_STEPS <= 4
+
     if IS_HT:
         assert HALF_BLOCK_M == BLOCK_M_WARPS * WARP_M
         assert HALF_BLOCK_N == BLOCK_N_WARPS * WARP_N
@@ -1909,13 +1914,25 @@ def _hgemm_config_tile_iou(m, n, k, config):
     )
 
 
+def _hgemm_has_smaller_supported_split_k(config, supported_split_k, m, n):
+    bm = _ceil_div(m, config["TILE_M"])
+    bn = _ceil_div(n, config["TILE_N"])
+    block_count = bm * bn * config["SPLIT_K"]
+    if block_count <= 1024:
+        return False
+    return any(
+        smaller_split_k < config["SPLIT_K"] and bm * bn * smaller_split_k > 1024
+        for smaller_split_k in supported_split_k
+    )
+
+
 def hgemm_get_configs(dtype_str, m, n, k):
     selections = {
         "TILE_M": [16, 32, 48, 64, 80, 96, 128, 256],
         "TILE_N": [64, 80, 96, 128, 256],
         "TILE_K": [64, 128, 256],
-        "STAGES": [i for i in range(2, 9)],
-        "SPLIT_K": [i for i in range(1, 14)],
+        "STAGES": [i for i in range(2, 10)],
+        "SPLIT_K": [i for i in range(1, 10)],
         "BLOCK_M_WARPS": [1, 2, 4],
         "BLOCK_N_WARPS": [1, 2, 4],
         "BLOCK_K_WARPS": [1, 2],
@@ -1924,11 +1941,19 @@ def hgemm_get_configs(dtype_str, m, n, k):
     }
     keep_ratio = 0.95
     if m is not None and n is not None and k is not None:
-        if m <= 128:
+        if m <= 256:
             selections["GROUP_M"] = [
                 0,
             ]
-            keep_ratio = 0.90
+            selections["USE_HALF_TILE_INTERLEAVED"] = [
+                False,
+            ]
+            if m <= 32:
+                selections["TILE_M"] = [16, 32]
+                keep_ratio = 0.75
+            elif m <= 128:
+                selections["TILE_M"] = [16, 32, 48, 64, 80, 96, 128]
+                keep_ratio = 0.85
         selections["SPLIT_K"] = [ks for ks in selections["SPLIT_K"] if k % ks == 0]
     keys = selections.keys()
     values = selections.values()
@@ -1940,7 +1965,10 @@ def hgemm_get_configs(dtype_str, m, n, k):
         configs = [
             config
             for config in configs
-            if _hgemm_config_tile_iou(m, n, k, config) >= tile_iou_threshold
+            if not _hgemm_has_smaller_supported_split_k(
+                config, selections["SPLIT_K"], m, n
+            )
+            and _hgemm_config_tile_iou(m, n, k, config) >= tile_iou_threshold
             and hgemm_validate(dtype_str, m, n, k, config)
         ]
     return configs
