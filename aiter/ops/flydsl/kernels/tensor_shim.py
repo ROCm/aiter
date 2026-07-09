@@ -16,7 +16,6 @@ from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
 
-
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
 # globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
