@@ -1039,7 +1039,7 @@ allreduce_prototype_twoshot(T const* A,
                            rank,                                                            \
                            dbuffer_list,                                                    \
                            data_offset,                                                     \
-                           flag_color,                                                      \
+                           d_flag_color,                                                    \
                            this->kMaxProblemSize);                                          \
     }                                                                                       \
     else                                                                                    \
