@@ -7,8 +7,6 @@
 #include <bit>
 #include <cstdint>
 
-namespace gqa_d128 {
-
 using opus::operator""_I;
 
 constexpr int MFMA_MASK = 0x08;
@@ -248,16 +246,10 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_
     );
 }
 
-// Mask score columns of a KV tile to -inf where the column's global key position
-// exceeds `ref_pos` (attn_mask_vec2_imm masks a column when rel = ref_pos - k_pos
-// < THR). This single helper unifies the two masking uses, which have identical
-// bodies and differ only in `ref_pos`:
-//   * causal masking: ref_pos = q_pos (= q_start_pos + lane's query row) -> masks
-//     future keys (k_pos > q_pos).
-//   * OOB masking: ref_pos = N - 1 -> masks padding keys past the valid sequence
-//     (k_pos >= N), for arbitrary (non KV_TILE aligned) sequence lengths.
-// `rel` is int->u32 compared via signed `v_cmp_lt_i32`, so negative
-// (ref_pos - k_pos) stays correct. `lane_id` is passed in (used for lane_group).
+// Mask a KV tile's score columns to -inf where global key pos > ref_pos
+// (attn_mask_vec2_imm masks when rel = ref_pos - k_pos < THR). Unifies causal
+// (ref_pos = q_pos) and OOB (ref_pos = N-1) masking. `rel` is int->u32 compared
+// signed (v_cmp_lt_i32), so a negative ref_pos - k_pos stays correct.
 template<typename T, typename V>
 __device__ inline void attn_mask_tile(V& v_s, int ref_pos, int kv_tile_idx, opus::u32_t neg_inf_v, int lane_id) {
     using D_ACC = typename T::D_ACC;
@@ -298,8 +290,6 @@ __device__ inline void attn_mask_tile(V& v_s, int ref_pos, int kv_tile_idx, opus
     });
 }
 
-} // namespace gqa_d128
-
 // Sub-variant toggle: build with -DGQA_D128_DRAIN_NOINLINE=1 to force the drain helper
 // to NOT inline (one drain frame live at runtime); default (0) lets AMDGPU inline it.
 #ifndef GQA_D128_DRAIN_NOINLINE
@@ -311,15 +301,12 @@ __device__ inline void attn_mask_tile(V& v_s, int ref_pos, int kv_tile_idx, opus
 #define GQA_D128_DRAIN_ATTR
 #endif
 
-// ─── Simple path for the tiny case (num_kv_tiles <= 2). Faithfully mirrors the
-// pipelined path's prologue + per-tile cluster discipline (same async_load ->
-// s_waitcnt -> s_barrier ordering, same half-split exp, v_o pins, sched_barrier
-// fences and full mma1), just without the steady-state loop. Avoids padding 1-2
-// tiles up to the >=3/4-tile pipeline minimum. Used for causal & non-causal.
+// Simple path for the tiny case (num_kv_tiles <= 2): same prologue + cluster
+// discipline as the pipelined path but no steady-state loop, avoiding padding 1-2
+// tiles up to the pipeline minimum. Causal & non-causal.
 template<class Traits>
 GQA_D128_DRAIN_ATTR __device__ void gqa_d128_le2_tiles(opus_gqa_kargs kargs, char* smem_buf) {
     using namespace opus;
-    using namespace gqa_d128;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -518,14 +505,12 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_le2_tiles(opus_gqa_kargs kargs, cha
     store<T::VEC_O>(g_o, v_o_bf16, u_o);
 }
 
-// ─── GQA accumulation helper (prefill-style runtime dispatch): one instantiation per
-// tile-count parity, selected at runtime by gqa_d128_kernel below. Each instantiation
-// compiles exactly ONE drain via `if constexpr (OddTail)`. Unlike the host two-kernel
-// scheme this also covers CAUSAL (per-block parity varies within a launch).
+// Pipelined accumulation: one instantiation per tile-count parity (OddTail),
+// each compiling exactly one drain via `if constexpr`. Runtime-dispatched by
+// gqa_d128_kernel; covers causal (per-block parity varies within a launch).
 template<class Traits, bool OddTail>
 GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, char* smem_buf) {
     using namespace opus;
-    using namespace gqa_d128;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -629,21 +614,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
         const int causal_num_tiles = ceil_div(q_block_end, T::KV_TILE_SIZE);
         max_num_tiles = causal_num_tiles < max_num_tiles ? causal_num_tiles : max_num_tiles;
     }
-    // The fixed prologue/epilogue schedule traverses every tile exactly once only
-    // when the tile count is even and >= 4. For short / non-aligned N we pad up;
-    // the extra tiles read OOB (-> 0 via buffer bounds) and are -inf masked below,
-    // so they contribute nothing. Causal tile counts are already multiples of 4,
-    // so this padding never affects the aligned causal fast path.
-    //
-    // NOTE: an OddTail-specialized drain (mirroring pa_sparse_prefill) was
-    // prototyped to avoid padding odd tile counts, but it materially regressed
-    // this register-bound kernel (VGPR spills 0 -> 26-147, and odd-shape wall
-    // time 0.319 -> 0.369 ms) because duplicating the drain inflates register
-    // pressure past the occupancy-2 budget. The padded approach is faster and
-    // simpler, so it is retained. See the task report for the A/B data.
-    // True tile count (no even-padding); the parity matches the OddTail instantiation
-    // chosen by the dispatcher. Pipeline minimum is 3 tiles (odd) or 4 (even); the
-    // min-pad preserves parity so it stays consistent with the dispatcher's choice.
+
     if constexpr (OddTail) {
         if (max_num_tiles < 3) max_num_tiles = 3;
     } else {
@@ -655,23 +626,6 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
     [[maybe_unused]] const int q_start_pos = q_block_start + warp_id * T::Q_TILE_SIZE;
     [[maybe_unused]] const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
 
-    // Out-of-bound KV masking: mask any score column whose global kv index is
-    // >= N to -inf before the softmax (the final KV tile is partial when N is not
-    // a multiple of KV_TILE; its OOB columns read 0 via the buffer-resource bounds
-    // and must not enter the softmax). The internal (kv+1)*KV_TILE > N gate makes
-    // this a no-op unless the tile is actually partial.
-    //
-    // *** INVARIANT (correctness) — OOB mask on the FINAL tile only ***
-    // This lambda is now called on the FINAL KV tile ONLY (even-drain max-1,
-    // odd-drain p+2, and the two le2 last-tile sites). That is valid ONLY because
-    //   max_num_tiles == num_kv_tiles  (NO padding):
-    // the `eff <= 2` dispatch routes tiny tile counts to gqa_d128_le2_tiles, so
-    // the `< 3 / < 4` min-pad above is DEAD CODE in this pipelined path and only
-    // the last real tile can ever be OOB. Interior/prologue tiles are always full,
-    // so their OOB masks were removed (they were runtime-gated no-ops anyway).
-    // If even-padding is EVER reintroduced, the removed sites (prologue tile 0,
-    // even-drain max-3 / max-2, odd-drain p+1) MUST be restored — padded trailing
-    // tiles would be OOB and, unmasked, corrupt the softmax (wrong results).
     auto mask_oob_kv = [&](auto& v_s_tile, int kv_tile_idx) {
         if ((kv_tile_idx + 1) * T::KV_TILE_SIZE > kargs.N) {
             attn_mask_tile<T>(v_s_tile, kargs.N - 1, kv_tile_idx, neg_inf_v, lane_id);
@@ -709,8 +663,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
             attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), 0, neg_inf_v, lane_id);
         }
     }
-    // [OOB last-tile-only] prologue tile 0 is always full here (pipelined path has
-    // num_kv_tiles >= 3); no OOB mask. See mask_oob_kv invariant above.
+
     m_row = attn_row_max<T>(v_s[0]);
     attn_sub_row<T>(v_s[0], m_row);
     asm volatile("" : "+v"(v_s[0]) ::);
@@ -722,9 +675,6 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
 
     async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, kv_tile(2));
 
-    // Main loop (steady state): 2 KV tiles per iteration. Shared by both tile-count
-    // parities (kept as a single copy so the hot path's register pressure is
-    // unchanged — duplicating it would spill VGPRs and slow every tile).
     for (int j = 3; j < max_num_tiles - 1; j += 2) {
         // Cluster 0:
         async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, kv_tile(j - 2));
@@ -882,8 +832,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
             attn_mask_tile<T>(v_s[1], q_start_pos + (lane_id % T::W_M), max_num_tiles - 3, neg_inf_v, lane_id);
         }
     }
-    // [OOB last-tile-only] interior tile (max-3) is always full; OOB mask runs
-    // only on the final tile (max-1). See mask_oob_kv invariant above.
+
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -941,8 +890,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
             attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), max_num_tiles - 2, neg_inf_v, lane_id);
         }
     }
-    // [OOB last-tile-only] interior tile (max-2) is always full; OOB mask runs
-    // only on the final tile (max-1). See mask_oob_kv invariant above.
+
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -999,8 +947,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
             attn_mask_tile<T>(v_s[1], q_start_pos + (lane_id % T::W_M), max_num_tiles - 1, neg_inf_v, lane_id);
         }
     }
-    // Final KV tile (max-1): the only tile that can be partial/OOB (see the
-    // mask_oob_kv invariant above) — keep the OOB mask here.
+
     mask_oob_kv(v_s[1], max_num_tiles - 1);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(0_I);
@@ -1073,8 +1020,6 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
             attn_mask_tile<T>(v_s[1], q_start_pos + (lane_id % T::W_M), p + 1, neg_inf_v, lane_id);
         }
     }
-    // [OOB last-tile-only] non-final tile (p+1) is always full; OOB mask runs only
-    // on the final tile (p+2). See mask_oob_kv invariant above.
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_sched_barrier(0);
@@ -1128,8 +1073,6 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
             attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), p + 2, neg_inf_v, lane_id);
         }
     }
-    // Final KV tile (p+2): the only tile that can be partial/OOB (see the
-    // mask_oob_kv invariant above) — keep the OOB mask here.
     mask_oob_kv(v_s[0], p + 2);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(0_I);
