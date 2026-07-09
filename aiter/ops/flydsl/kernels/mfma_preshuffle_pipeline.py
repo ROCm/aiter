@@ -96,7 +96,12 @@ def _buffer_load_vec(
 class PreshuffleScaleLayout:
     """Container returned by `make_preshuffle_scale_layout`.
 
-    The scale layout is ``(c_mn1, c_k1, 4, 16) : (stride_n0, stride_k0, stride_klane, 1)``.
+    Default layout:
+        ``(c_mn1, c_k1, KLane=4, NLane=16) : (stride_n0, stride_k0, stride_klane, 1)``
+
+    KLane-inner layout (``klane_inner=True``):
+        ``(c_mn1, c_k1, NLane=16, KLane=4) : (stride_n0, stride_k0, stride_nlane, 1)``
+
     Callers compute flat index directly with plain arith::
 
         idx = mni * stride_n0 + ku * stride_k0 + k_lane * stride_klane + n_lane
@@ -106,6 +111,7 @@ class PreshuffleScaleLayout:
     stride_n0: object
     stride_k0: object
     stride_klane: object
+    stride_nlane: object = None
 
 
 def make_preshuffle_scale_layout(
@@ -117,11 +123,16 @@ def make_preshuffle_scale_layout(
     k_pack: int = 2,
     elem_bytes: int = 4,
     scale_block_size: int = 32,
+    klane_inner: bool = False,
 ) -> PreshuffleScaleLayout:
     """Build scale layout matching aiter/CK preshuffle for FP4/FP8 microscale.
 
     Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
     ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
+
+    When *klane_inner* is True the KLane dimension is innermost (stride 1)
+    and NLane has stride 4, matching the ``(c_mn1, c_k1, NLane=16, KLane=4)``
+    layout used by the klane-inner preshuffle permutation.
     """
     c16 = fx.Index(16)
     c4 = fx.Index(4)
@@ -134,26 +145,41 @@ def make_preshuffle_scale_layout(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
         )
 
-    stride_klane = c16
-    stride_k0 = c4 * stride_klane
-    stride_n0 = c_k1 * stride_k0
+    if klane_inner:
+        stride_klane = fx.Index(1)       # KLane innermost
+        stride_nlane = c4                 # c4 = fx.Index(4)
+        stride_k0 = c16 * c4             # = 64
+        stride_n0 = c_k1 * stride_k0
+    else:
+        stride_klane = c16               # KLane at stride 16
+        stride_nlane = fx.Index(1)       # NLane innermost
+        stride_k0 = c4 * stride_klane    # = 64
+        stride_n0 = c_k1 * stride_k0
 
     c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
     c_k1_i32 = arith.index_cast(T.i32, c_k1)
     stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
     stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
     stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+    stride_nlane_i32 = arith.index_cast(T.i32, stride_nlane)
 
-    layout_scale = fx.make_layout(
-        (c_mn1_i32, c_k1_i32, 4, 16),
-        stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
-    )
+    if klane_inner:
+        layout_scale = fx.make_layout(
+            (c_mn1_i32, c_k1_i32, 16, 4),   # NLane=16, KLane=4
+            stride=(stride_n0_i32, stride_k0_i32, stride_nlane_i32, stride_klane_i32),
+        )
+    else:
+        layout_scale = fx.make_layout(
+            (c_mn1_i32, c_k1_i32, 4, 16),   # KLane=4, NLane=16
+            stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
+        )
 
     return PreshuffleScaleLayout(
         layout_scale=layout_scale,
         stride_n0=stride_n0,
         stride_k0=stride_k0,
         stride_klane=stride_klane,
+        stride_nlane=stride_nlane,
     )
 
 
@@ -173,12 +199,19 @@ def make_preshuffle_b_layout(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     k_major: bool = False,
+    klane_inner: bool = False,
 ) -> PreshuffleBLayout:
     """Build B layout matching aiter/CK preshuffle for A8 MFMA kernels.
 
     When *k_major* is True the block-level order is K-major (``k_blk`` outermost),
     matching the ``(0,3,1,4,2,5)`` shuffle permutation.  The default N-major
     order (``k_major=False``) matches the legacy ``(0,1,3,4,2,5)`` permutation.
+
+    When *klane_inner* is True the KLane dwords are contiguous within each
+    16-byte KPack, producing shape ``(N0, K0, L_sub=4, NLane=16, 16)`` with
+    strides ``(n0, 1024, 16, 64, 1)``.  This matches the klane-inner
+    preshuffle permutation where the shuffle+layout changes place KLane
+    innermost for dwordx4 loads.
     """
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
@@ -196,6 +229,38 @@ def make_preshuffle_b_layout(
         if elem_bytes == 1
         else (c_kpack // arith.constant(int(elem_bytes), index=True))
     )
+
+    if klane_inner:
+        # KLane-inner layout: (N0, K0, L_sub=4, NLane=16, kpack)
+        # Strides:            (n0,  1024,       16,       64,    1)
+        #
+        # KLane dwords are contiguous within each 16-byte KPack.
+        # dim2 (L_sub) has stride kpack (16); dim3 (NLane) has stride
+        # L_sub_extent * kpack (4*16 = 64); K0 stride = NLane_extent *
+        # stride_nlane (16*64 = 1024).
+        c64 = fx.Index(64)
+        c4 = fx.Index(4)
+        c_k0 = c_k_bytes // c64
+        klane_dim = 4
+
+        stride_dim2 = c_kpack_elems              # L_sub stride = kpack (16)
+        stride_dim3 = c4 * c_kpack_elems          # NLane stride = 4*16 = 64
+        stride_k0 = c16 * stride_dim3             # K0 stride = 16*64 = 1024
+        stride_n0 = c_k0 * stride_k0
+
+        kpack_elems_static = kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
+        n0_i32 = arith.index_cast(T.i32, n0)
+        c_k0_i32 = arith.index_cast(T.i32, c_k0)
+        stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
+        stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
+        stride_dim2_i32 = arith.index_cast(T.i32, stride_dim2)
+        stride_dim3_i32 = arith.index_cast(T.i32, stride_dim3)
+
+        stride_b = (stride_n0_i32, stride_k0_i32, stride_dim2_i32, stride_dim3_i32, 1)
+        layout_b = fx.make_layout(
+            (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
+        )
+        return PreshuffleBLayout(layout_b=layout_b, kpack_bytes=kpack_bytes)
 
     stride_nlane = c_kpack_elems
 

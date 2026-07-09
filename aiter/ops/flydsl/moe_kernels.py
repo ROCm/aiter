@@ -438,7 +438,7 @@ def compile_flydsl_moe_stage1(
         # Supports SEPARATED and INTERLEAVE gate modes.
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
-        _use_cshuffle = None if k_batch > 1 else False
+        _use_cshuffle = None
         return compile_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,

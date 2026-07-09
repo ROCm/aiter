@@ -46,6 +46,7 @@ from flydsl.expr.typing import T
 
 
 from .mfma_preshuffle_pipeline import (
+    _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
@@ -347,9 +348,9 @@ def compile_moe_gemm1(
         )
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
     # Split-K uses f32 atomic CShuffle regardless of out_dtype, so skip this check.
-    if out_dtype != "f16" and use_cshuffle_epilog and not _is_splitk:
+    if out_dtype not in ("f16", "bf16") and use_cshuffle_epilog and not _is_splitk:
         raise ValueError(
-            "stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')"
+            "stage1 cshuffle epilog currently supports only f16/bf16 output"
         )
 
     # INTERLEAVE gate mode: gate and up weights are packed at alternating N positions.
@@ -357,6 +358,7 @@ def compile_moe_gemm1(
     # gate/up columns so a single B-tile covers both. For other dtypes, gate and up are
     # loaded from separate row ranges (SEPARATED).
     gate_up_interleave = is_fp4_bf16 and gate_mode == "interleave"
+    _use_klane_inner = is_fp4_bf16 and gate_up_interleave
     if gate_up_interleave and not is_fp4_bf16:
         raise ValueError(
             "gate_mode='interleave' is only supported for in_dtype='fp4_bf16'"
@@ -376,7 +378,7 @@ def compile_moe_gemm1(
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}{_act_tag}"
-        f"_abi7"
+        f"_abi10"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -391,9 +393,13 @@ def compile_moe_gemm1(
     # Other dtypes keep f32 for precision.
     _splitk_use_bf16 = _is_splitk and is_bf16
     _cshuffle_elem_bytes = 2 if (not _is_splitk or _splitk_use_bf16) else 4
+    _cshuffle_frag_elem_is_bf16 = is_bf16
+    _cshuffle_tile_n = tile_n // 2 if gate_up_interleave else tile_n
+    _cshuffle_e_vec = 2 if gate_up_interleave else 4
+    _cshuffle_nlane = min(32, _cshuffle_tile_n // _cshuffle_e_vec)
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = (
-        _cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+        _cshuffle_elem_bytes * int(tile_m) * int(_cshuffle_tile_n) if _use_cshuffle_epilog else 0
     )
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes)
     lds_total_elems = lds_total_bytes if elem_bytes == 1 else (lds_total_bytes // 2)
@@ -519,6 +525,7 @@ def compile_moe_gemm1(
                 c_k=c_k_for_b,
                 kpack_bytes=kpack_bytes,
                 elem_bytes=w_elem_bytes,
+                klane_inner=_use_klane_inner,
             )
             layout_b = b_layout.layout_b
             (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
@@ -636,15 +643,17 @@ def compile_moe_gemm1(
                         k_pack=2,
                         elem_bytes=4,
                         scale_block_size=32,
+                        klane_inner=_use_klane_inner,
                     )
 
                     def _mxfp4_load_scale_i32(scale_ku_idx, mni_val, scale_klane=None):
                         _klane = scale_klane if scale_klane is not None else lane_div_16
+                        _snl = layout_b_scale.stride_nlane if layout_b_scale.stride_nlane is not None else fx.Index(1)
                         idx = (
                             mni_val * layout_b_scale.stride_n0
                             + scale_ku_idx * layout_b_scale.stride_k0
                             + _klane * layout_b_scale.stride_klane
-                            + lane_mod_16
+                            + lane_mod_16 * _snl
                         )
                         return buffer_ops.buffer_load(
                             sw_rsrc, idx, vec_width=1, dtype=T.i32
@@ -656,12 +665,40 @@ def compile_moe_gemm1(
                         scale_bits = arith.shli(byte_i32, fx.Int32(23))
                         return arith.bitcast(T.f32, scale_bits)
 
+                    def _mxfp4_load_scale_vec4(scale_ku_idx, mni_val):
+                        idx = (
+                            mni_val * layout_b_scale.stride_n0
+                            + scale_ku_idx * layout_b_scale.stride_k0
+                            + lane_mod_16 * layout_b_scale.stride_nlane
+                        )
+                        return buffer_ops.buffer_load(
+                            sw_rsrc, idx, vec_width=4, dtype=T.i32
+                        )
+
+                    def _mxfp4_resolve_scale_f32(
+                        scale_vec4, ku, k_pack_sub_rt, n_pack_sub_val
+                    ):
+                        klane_hw = ku % 4
+                        packed_i32 = vector.extract(
+                            scale_vec4,
+                            static_position=[klane_hw],
+                            dynamic_position=[],
+                        )
+                        byte_pos_even = k_pack_sub_rt * fx.Index(2)
+                        byte_pos_odd = byte_pos_even + fx.Index(1)
+                        scale_even = _mxfp4_extract_e8m0_f32(packed_i32, byte_pos_even)
+                        scale_odd = _mxfp4_extract_e8m0_f32(packed_i32, byte_pos_odd)
+                        n_pack_is_zero = arith.cmpi(
+                            arith.CmpIPredicate.eq,
+                            arith.index_cast(T.i32, n_pack_sub_val),
+                            fx.Int32(0),
+                        )
+                        return arith.select(n_pack_is_zero, scale_even, scale_odd)
+
                     def _mxfp4_get_scale_f32(
                         base_k, ku, ni, mni_list, n_pack_list, scale_cache
                     ):
                         _k0_blk = ku // 4
-                        # Scale K-Lane is determined by the weight K-Lane being loaded (ku % 4),
-                        # NOT by lane_div_16 (which is a thread-lane index within KPack).
                         _klane_hw = ku % 4
                         adj_ku = (
                             base_k // fx.Index(32)
@@ -929,7 +966,10 @@ def compile_moe_gemm1(
                 # VMEM loads per load_b_tile call — used for precise s_waitcnt at barrier.
                 # fp4_bf16: k_unroll scale loads (dword) + k_unroll weight loads (dwordx4) per ni.
                 # Other quantised: k_unroll weight loads per ni (+ scale if groupwise).
-                if const_expr(is_fp4_bf16):
+                if const_expr(is_fp4_bf16 and _use_klane_inner):
+                    _n_k0_blks = max(1, k_unroll // 4)
+                    _b_vmem_per_tile = k_unroll * num_acc_n + _n_k0_blks * num_acc_n
+                elif const_expr(is_fp4_bf16):
                     _b_vmem_per_tile = k_unroll * num_acc_n * 2
                 elif const_expr(is_int4_bf16_groupwise):
                     _b_vmem_per_tile = k_unroll * num_acc_n * 2
@@ -996,6 +1036,60 @@ def compile_moe_gemm1(
                                     scale_dtype=scale_dtype,
                                 )
                                 raw_ku.append((packed32, scale_val))
+                            raw_data.append(raw_ku)
+                        return raw_data
+                    elif const_expr(is_fp4_bf16 and _use_klane_inner):
+                        _is_gate_side = id(blk_list) == id(n_blk_gate)
+                        _mni_list = (
+                            _mxfp4_scale_mni_gate
+                            if _is_gate_side
+                            else _mxfp4_scale_mni_up
+                        )
+                        _npk_list = (
+                            _mxfp4_scale_n_pack_gate
+                            if _is_gate_side
+                            else _mxfp4_scale_n_pack_up
+                        )
+                        raw_data = []
+                        _sc_vec4_cache = {}
+                        c128_ki = fx.Index(128)
+                        c4_ki = fx.Index(4)
+                        for ku in range_constexpr(k_unroll):
+                            raw_ku = []
+                            _k0_blk = ku // 4
+                            _klane_hw = ku % 4
+                            adj_ku = (
+                                base_k // fx.Index(32)
+                                + arith.index(_k0_blk * 4)
+                                + arith.index(_klane_hw)
+                            )
+                            k_pack_sub_rt = (adj_ku // fx.Index(4)) % fx.Index(2)
+                            s_ku = adj_ku // fx.Index(8)
+                            k0_val = base_k // c128_ki + fx.Index(_k0_blk)
+                            byte_off_klane = arith.index(_klane_hw) * c4_ki
+                            for ni in range_constexpr(num_acc_n):
+                                coord_ki = (blk_list[ni], k0_val, lane_div_16, intra_list[ni], fx.Index(0))
+                                idx_ki = crd2idx(coord_ki, layout_b)
+                                idx_bytes_ki = idx_ki + byte_off_klane
+                                b4 = _buffer_load_vec(
+                                    buffer_ops, vector, w_rsrc, idx_bytes_ki,
+                                    elem_type=w_elem, vec_elems=4, elem_bytes=1,
+                                    offset_in_bytes=True,
+                                )
+                                raw_i32 = vector.extract(
+                                    vector.bitcast(T.vec(1, T.i32), b4),
+                                    static_position=[0], dynamic_position=[],
+                                )
+                                vec4_key = (_k0_blk, ni, id(_mni_list))
+                                if vec4_key not in _sc_vec4_cache:
+                                    _sc_vec4_cache[vec4_key] = _mxfp4_load_scale_vec4(
+                                        s_ku, _mni_list[ni]
+                                    )
+                                scale_f32 = _mxfp4_resolve_scale_f32(
+                                    _sc_vec4_cache[vec4_key], ku,
+                                    k_pack_sub_rt, _npk_list[ni],
+                                )
+                                raw_ku.append((raw_i32, scale_f32))
                             raw_data.append(raw_ku)
                         return raw_data
                     elif const_expr(is_fp4_bf16):
@@ -2146,14 +2240,13 @@ def compile_moe_gemm1(
                                 sorted_w_rsrc, row, vec_width=1, dtype=T.f32
                             )
 
+                        _sep_out_ty = out_mlir()
                         if const_expr(gate_up_interleave):
-                            # INTERLEAVE: acc_gate[2p] = gate for pair p,
-                            # acc_up[2p+1] = up for pair p. Output col = p*16.
                             _gui_pairs = num_acc_n // 2
                             for p in range_constexpr(_gui_pairs):
                                 g_idx = mi * num_acc_n + p * 2
                                 u_idx = mi * num_acc_n + p * 2 + 1
-                                col_local = col_base_local // 2 + p * 16
+                                col_local = col_base_local + p * 16
                                 vg = vector.extract(
                                     acc_gate[g_idx],
                                     static_position=[ii],
@@ -2170,9 +2263,9 @@ def compile_moe_gemm1(
                                     y = silu(vg * sx) * (vu * sx)
                                 if const_expr(doweight_stage1):
                                     y = y * tw
-                                y16 = arith.trunc_f(T.f16, y)
+                                y16 = arith.trunc_f(_sep_out_ty, y)
                                 lds_idx = row_base_lds + col_local
-                                v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                                v1 = vector.from_elements(T.vec(1, _sep_out_ty), [y16])
                                 vector.store(v1, lds_out, [lds_idx], alignment=2)
                         else:
                             for ni in range_constexpr(num_acc_n):
@@ -2204,10 +2297,10 @@ def compile_moe_gemm1(
                                     y = silu(vg) * vu
                                 if const_expr(doweight_stage1):
                                     y = y * tw
-                                y16 = arith.trunc_f(T.f16, y)
+                                y16 = arith.trunc_f(_sep_out_ty, y)
 
                                 lds_idx = row_base_lds + col_local
-                                v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                                v1 = vector.from_elements(T.vec(1, _sep_out_ty), [y16])
                                 vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                     def precompute_row(*, row_local, row):
@@ -2234,6 +2327,16 @@ def compile_moe_gemm1(
                             # Vectorized fp16 store (EVec=4).
                             buffer_ops.buffer_store(frag, out_rsrc, idx_out)
 
+                    _cs_by_n = (
+                        by_n // arith.index(2)
+                        if gate_up_interleave
+                        else by_n
+                    )
+                    _cs_n_tile_base = (
+                        n_tile_base // arith.index(2)
+                        if gate_up_interleave
+                        else n_tile_base
+                    )
                     mfma_epilog(
                         use_cshuffle=True,
                         arith=arith,
@@ -2242,17 +2345,19 @@ def compile_moe_gemm1(
                         scf=scf,
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
-                        tile_n=tile_n,
-                        e_vec=4,
+                        tile_n=_cshuffle_tile_n,
+                        e_vec=_cshuffle_e_vec,
+                        cshuffle_nlane=_cshuffle_nlane,
                         m_repeat=m_repeat,
                         num_acc_n=num_acc_n,
                         tx=tx,
                         lane_div_16=lane_div_16,
                         lane_mod_16=lane_mod_16,
                         bx_m=bx_m,
-                        by_n=by_n,
-                        n_tile_base=n_tile_base,
+                        by_n=_cs_by_n,
+                        n_tile_base=_cs_n_tile_base,
                         lds_out=lds_out,
+                        frag_elem_type=(T.bf16 if is_bf16 else T.f16),
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
