@@ -97,19 +97,27 @@ int64_t qr_max_size() {
     template struct AllReduceTwoshot<T, Codec<T, 4>, cast_bf2half>;          \
     template struct AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;          \
 
+  // INT3 (CodecQ3) is restricted to TP2 only, so we only instantiate the
+  // world_size == 2 kernel for it.
+  #define INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(T, Codec, cast_bf2half)                \
+    template struct AllReduceTwoshot<T, Codec<T, 2>, cast_bf2half>;
+
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ6, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP8, false)
+INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(__hip_bfloat16, CodecQ3, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP, true)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, true)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ6, true)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP8, true)
+INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(__hip_bfloat16, CodecQ3, true)
 
 INSTANTIATE_FOR_WORLDSIZE(half, CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(half, CodecQ4, false)
 INSTANTIATE_FOR_WORLDSIZE(half, CodecQ6, false)
 INSTANTIATE_FOR_WORLDSIZE(half, CodecFP8, false)
+INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(half, CodecQ3, false)
 
 #endif  // USE_ROCM
 } // namespace aiter
