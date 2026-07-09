@@ -24,7 +24,18 @@ for gfx950 (MI350). It implements *causal-free* per-token attention for the
 DeepSeek-style MLA layout: one shared latent KV cache (one head) is read by
 many query heads, with a small RoPE tail concatenated to a larger NoPE body.
 
-Key numbers:
+There are **two partitions** of the same Gen.1 design, picked by the total
+per-workgroup work $W = H \cdot \mathrm{mtp}$:
+
+- **m16x8** ($W = 128$): 8 ptiles / workgroup, occupancy 1. Uses the newer
+  `KvManager8to16bitsV2` KV pipeline (this doc's primary subject).
+- **m16x4** ($W = 64$): 4 ptiles / workgroup, occupancy 2, `kBlockN = 32`.
+  Uses the older `KvManager8to16bitsV1` pipeline (the V1-era layout most of
+  Ch. 8's history describes).
+
+This doc primarily specifies **m16x8**; m16x4 is called out where it diverges.
+
+Key numbers (m16x8):
 
 | Property | Value |
 |---|---|
@@ -32,18 +43,40 @@ Key numbers:
 | Tile name | **m16x8** — 8 ptiles per workgroup, each with m=16 rows |
 | Ptile = | 1 wave (Gen.1 convention) |
 | Total work per workgroup | $H \cdot \mathrm{mtp} = 128$ items |
+| KV tile (`kBlockN`) | **64** rows = two 32-row sub-tiles A, B |
 | $D_{\mathrm{NoPE}}$ | 448 elements, fp8 (one E8M0 scale per 64 elements) |
 | $D_{\mathrm{RoPE}}$ | 64 elements, bf16 |
 | $D_{\mathrm{QK}} = D_V$ | 512 ($= D_{\mathrm{NoPE}} + D_{\mathrm{RoPE}}$) |
 | Q residency | half pinned-VGPR (Phase A), half LDS (Phase B) |
-| KV residency | LDS, double-buffered |
+| KV residency | LDS, double-buffered (pong = 64 KiB) |
 | Output residency | LDS bounce + VRAM (OManager V3 / V3NoStage) |
-| Compiler scratch budget | `__attribute__((amdgpu_num_vgpr(64)))` — v0..v63 |
+| Compiler scratch budget | m16x8: `amdgpu_num_vgpr(36)`; m16x4: `(44)` |
 
-The wrapper file `csrc/kernels/mla/hk_v40_decode_fwd.cu` dispatches to this
-kernel for the $H{=}128, \mathrm{mtp}{=}1$ case on gfx950; other valid
-m16x8 configurations ($H{=}64/\mathrm{mtp}{=}2$, etc. — see Ch. 2) are
-not yet wired but ride the same kernel template.
+The router `aiter/mla.py::mla_v40_decode_fwd` dispatches to
+`hk_mla_v40_decode_fwd`, which picks **m16x8** when
+$H \cdot \mathrm{mtp} = 128$ and **m16x4** when $= 64$ (gfx950, fp8 Q/KV,
+bf16 RoPE, page_size ∈ {1, 64}, experimental enabled). All valid $(H,
+\mathrm{mtp})$ splits within a partition ride the same `mla_main` template.
+
+### Perf state (v1.1, decode kernel only)
+
+Measured decode-kernel-only (the `mla_reduce_v1` combine pass excluded),
+gfx950, HIP 7.2.53211 / clang roc-7.2.2. Short = `b=4 c=4096`, long =
+`b=33 c=63333`.
+
+| partition | workload | page_size | µs | TFLOPS |
+|---|---|---:|---:|---:|
+| m16x8 (128,1) | short | 1  |  ~24.0 | ~179 |
+| m16x8 (128,1) | short | 64 | ~194.3 |  ~22 |
+| m16x8 (128,1) | long  | 1  | ~499.6 | ~1097 |
+| m16x8 (128,1) | long  | 64 | ~615.3 |  ~890 |
+| m16x4 (64,1)  | short | 1  |  ~17.9 | ~120 |
+| m16x4 (64,1)  | long  | 1  | ~328.6 |  ~834 |
+
+`page_size = 64` is markedly slower than `page_size = 1` — same ISA path
+(one extra div/mod per row lookup), the gap is the metadata planner's
+work distribution under page-size 64. v1.1 is ~1.3× faster than the v1
+(kBlockN=32) baseline on the m16x8 path.
 
 ---
 
@@ -143,11 +176,12 @@ as long as $H \cdot \mathrm{mtp} = 128$ and each ptile still owns
 | 32 | 4 | 128 | 16 | ✓ (same kernel template) |
 | 16 | 8 | 128 | 16 | ✓ (same kernel template) |
 
-Today the host wrapper (`hk_v40_decode_fwd.cu`) only invokes the kernel
-when `num_head * max_seqlen_q == 128`; the case it dispatches in
-practice is $H{=}128, \mathrm{mtp}{=}1$. The other valid combinations
-ride the same `mla_main` template and would Just Work once the wrapper
-is taught to pick them.
+The router dispatches m16x8 whenever `num_head * max_seqlen_q == 128`; all
+four splits above are exercised by the test sweep. The sibling **m16x4**
+partition ($W = H \cdot \mathrm{mtp} = 64$, 4 ptiles / workgroup) covers
+$(64,1)$, $(32,2)$, $(16,4)$ — $(8,8)$ is rejected by the metadata planner's
+supported-shape set. m16x4 runs the same `mla_main` shape at 4 waves /
+occupancy 2 on the V1 KV pipeline with `kBlockN = 32`.
 
 ### 2.4 How the m=16 rows map to work items
 
@@ -180,8 +214,15 @@ the exact mapping is set by the host layout of the $Q$ tensor.
 | $p$ | ptile index | $p \in [0, 8)$; in Gen.1, $p = w$ |
 | $t$ | thread index inside the workgroup | $t = 64 w + \ell$ |
 | $i$ | KV chunk (tile) index in the main loop | $i \in [0, \lceil N_{kv}/N_{\mathrm{block}} \rceil)$ |
-| $N_{\mathrm{block}}$ | KV tile size along the $N$ dim | 32 (`kBlockN`) |
+| $N_{\mathrm{block}}$ | KV tile size along the $N$ dim | **64** (`kBlockN`) = two 32-row sub-tiles A, B |
 | $m \in [0,16)$ | row in this ptile's mfma accumulator | one row = one work item |
+
+> **kBlockN = 64 (m16x8).** m16x8 processes a 64-row KV tile per main-loop
+> iter, internally two 32-row sub-tiles (A at LDS offset 0, B at `+kSubPong`).
+> This halves the barrier / softmax / loop overhead per KV row vs the original
+> kBlockN=32. **m16x4 stays at kBlockN=32** on the V1 pipeline. Where the older
+> text below says "32", read it as "one 32-row sub-tile" (m16x8) or the literal
+> tile (m16x4).
 
 Note: "warp" and "wave" mean the same thing on AMD; we say *warp* by
 default and *wave* when the surrounding text is talking about HW
@@ -226,33 +267,35 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
               │   (Phase 1 + 2 of QMgr)                 │
               ▼                    ▼                    │
    ┌────────────────────┐  ┌──────────────────────┐     │
-   │  Q-LDS (LDS half = │  │  KV-LDS, DOUBLE pong │     │
-   │  Q[:, 256:512])    │  │  (32x512 bf16 each)  │◀────┘
-   │  + Phase-1 staging │  │  buf_A / buf_B swap  │
+   │  Q-LDS (LDS half = │  │ KV-LDS, DOUBLE pong  │     │
+   │  Q[:, 256:512])    │  │ 64x512 bf16 = 64 KiB │◀────┘
+   │  + Phase-1 staging │  │ (two 32-row sub A/B) │
+   │  + KV raw-fp8 stage│  │ buf_A / buf_B swap   │
    └─────────┬──────────┘  └──────────┬───────────┘
              │                        │
              │ ds_read_b128            │ ds_read_b128 (K side)
              │                        │ ds_read_b64_tr_b16 (V side, transpose)
              ▼                        ▼
    ┌────────────────────┐  ┌──────────────────────┐
-   │ q_vgpr  v72-v103   │  │ kv     v112-v119     │
-   │ (Q[:, 0:256])      │  │ kv_alt v104-v111     │
-   │ q_lds   v64-v71    │  │ (pair-fused QK)      │
+   │ q_vgpr  v64-v127   │  │ k0/k1/k2  v36-v47    │
+   │ (Q[:,0:256] Ph.A;  │  │ (KV mfma operands,   │
+   │  q_lds window Ph.B)│  │  3 tiles for N=64)   │
    └─────────┬──────────┘  └──────────┬───────────┘
              │                        │
              └─── v_mfma_f32_16x16x32_fp8_fp8 ───┘   ← QK
                               │
                               ▼
                   ┌─────────────────────┐
-                  │ S tile (16x32 fp32) │   compiler scratch v0..v63
+                  │ S tile (16x32 fp32) │   compiler scratch v0..v35
                   └─────────┬───────────┘
                             │ softmax (online)
                             │   v_max3 / warp_reduce(Max)
                             │   v_exp_f32 / warp_reduce(Add)
+                            │   (hi warps: de-packed softmax, no v_pk_*)
                             ▼
                   ┌─────────────────────┐
-                  │ p_comp  v120-v127   │  (fp32, 16x32, 8 reg/lane)
-                  │ p_mfma  v120-v123   │  (bf16 overlay, low half)
+                  │ p_comp  v48-v63     │  (fp32, 16xN/4, N/4 reg/lane)
+                  │ p_mfma  v48-v55     │  (bf16 overlay, low half)
                   │   ↑ v_cvt_pk_bf16_f32 (pinned-DST)
                   └─────────┬───────────┘
                             │   ── reuses KV-LDS pong as V via transpose-read
@@ -264,7 +307,9 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
                   │ oaccu   v128-v255   │  (fp32, 16x512, all pinned)
                   └─────────┬───────────┘
                             │  epilogue:
-                            │   1) hk::mul_vgpr(oaccu, oaccu, 1/row_sum_e)
+                            │   1) normalize by 1/row_sum_e:
+                            │      hi warps  → hk::mul_vgpr (v_pk_mul_f32)
+                            │      lo warps  → v_mul_f32_e32 sweep (de-packed)
                             │   2) OMgr V3 / V3NoStage
                             ▼
                   ┌─────────────────────┐
@@ -290,62 +335,84 @@ The KV "double buffer" is the only inter-iteration LDS resident — every
 iter writes the *next* tile into the *other* buffer while reading the
 *current* tile out of the active one. See Ch. 8.
 
-### 3.3 Phase A vs Phase B (D-axis split, not a warp swap)
+### 3.3 "Phase A / Phase B" — the KV-pipeline D-axis split
 
-QK is computed in **two phases** that differ in where $Q$ comes from. This
-is a split along the $D_{\mathrm{NoPE}} = 512$ reduction dimension, not a
-warp-role swap — every warp goes through both phases on every iteration.
+> **Terminology shift vs V1.** In the original V1 design, "Phase A/B" meant a
+> $Q$-source split (half $Q$ in VGPR, half in LDS). The current m16x8 pins
+> **all** of $Q$ in `q_vgpr` (`kQkGemmTiles = 16`, `kRopeInVgpr = true`), so
+> QK reads every col-tile from VGPR and there is no Phase-B-Q-from-LDS. The
+> `p_lds_q` region is now used only during the **Q prologue** load (Ch. 6-7).
 
-| Phase | $Q$ source | $Q$ slice | mfma cols | Notes |
-|---|---|---|---|---|
-| Phase A | pinned VGPR `q_vgpr` (v72..v103) | $Q[:, 0{:}256]$ | 256 / 32 = 8 mfma tiles | 32 vgprs/lane carry the bf16 A-operand in mfma layout |
-| Phase B | LDS `p_lds_q` via `q_lds` (v64..v71) | $Q[:, 256{:}512]$ | 256 / 32 = 8 mfma tiles | LDS read happens just-in-time; q_lds holds 2 paired tiles at a time |
+In the current kernel, **Phase A / Phase B** name the two halves of the
+**KV double-buffer pipeline**, run every iter by every warp:
 
-Why split:
+| Phase | Work | LDS effect |
+|---|---|---|
+| **Phase A** | prefetch this warp's band of the *next* KV tile: 2 NoPE carriers → VGPR (`p0/p1`); staged strips → raw-fp8 staging LDS via `buffer_load_lds`; issue the index resolve for tile $i{+}2$ | writes staging LDS + VGPR carriers (no pong write yet) |
+| **Phase B** | after QK: cvt+scale the carriers + staged strips fp8 → bf16 and `ds_write` them into `p_lds_kv_next`; hi warps DMA the RoPE tail directly | writes `p_lds_kv_next` (consumed next iter after the swap) |
 
-- $Q$ as a whole would be $16 \cdot 512 \cdot 2~\text{B} = 16$ KiB / ptile
-  in bf16 — too big to fully pin. Pinning the first half (8 KiB) leaves
-  budget for the other state in v64..v255.
-- The LDS-resident half (Phase B) frees `q_vgpr` for *the next iter's*
-  use too — same physical VGPRs, reused naturally because Phase B reads
-  occur after Phase A has consumed them.
-- Phase B's `q_lds` is split into two 4-vgpr slots so two adjacent
-  Phase-B mfma tiles can pair-fuse exactly like the Phase-A pairs do.
+Why the KV split: it lets the vmem latency of Phase A overlap the barrier +
+QK, while Phase B's cvt+store overlaps softmax/PV. $Q$ is fully pinned, so
+the reduction-axis work is entirely on the KV side now.
+
+There is still no inter-warp swap of $Q$ ownership: each ptile keeps its own
+16 rows in its own VGPRs. The KV side is what's shared across ptiles.
 
 There is no inter-warp swap of $Q$ ownership: each ptile keeps its own 16
 rows in its own VGPRs/LDS. The KV side is what's shared across ptiles.
 
-### 3.4 KV tile timing (one iter)
+### 3.4 KV tile timing (one iter, m16x8 V2)
 
-For iter $i$, ptile $p$ (= warp $w$), the stages are:
+A m16x8 iter processes one 64-row KV tile (sub-tiles A, B). Each warp owns
+one 16-row **band** of that tile × one 256-col **tile** (Lo = tile 0,
+Hi = tile 1 — see 3.5). Per warp per iter:
 
 | Step | Work | Notes |
 |---:|---|---|
-| 1 | softmax + write `p_comp` | $S$ from prev tile |
-| 2 | QK Phase A on tile $i$ | fused with ds_read of next KV from buf$_{(i+1)\bmod 2}$ AND `prefetch_kv_tile` of tile $i{+}2$ into buf$_{i\bmod 2}$ |
-| 3 | QK Phase B on tile $i$ | Q from LDS |
-| 4 | PV mfma on tile $i{-}1$ | prev `p_comp`; KV from buf$_{(i-1)\bmod 2}$ (already drained by step 2's reads) |
-| 5 | `oaccu` rescale | $4 \times$ `v_mul_f32` interleaved between PV mfmas |
+| 0 | **deferred strip-3 consume** (lo only, non-first iter) | cvt+store the prev iter's staged strip 3 into the *current* pong before QK (Ch. 8) |
+| 1 | Phase A: prefetch **next** band | 2 NoPE carriers → VGPR (`p0/p1`), strips 2,3 (lo) / strip 2 (hi) → staging LDS via `buffer_load_lds`; index resolve for tile $i{+}2$ |
+| 2 | deferred PV of the **previous** tile (hi warps: `kHasPv`) | reads `p_lds_kv_next` |
+| 3 | `s_barrier` + QK on tile $i$ | all 16 Q col-tiles from `q_vgpr` (kQkGemmTiles=16), K from `p_lds_kv_curr` |
+| 4 | Phase B: cvt+store carriers + own staged strips → `p_lds_kv_next`; hi RoPE DMA | strip 3 (lo) is deferred to next iter's step 0 |
+| 5 | softmax + pack `p_comp → p_mfma` | **hi** warps de-packed softmax (no `v_pk_*`); lo packed |
+| 6 | PV of tile $i$ (lo warps: `kPvAtEnd`) | one `hk_mla_v40_pv_stage` contracts **both** sub-tiles A+B (single prologue) |
+| 7 | epilogue only: normalize `oaccu` by `1/row_sum_e` | **lo** warps de-packed (`v_mul_f32_e32` sweep); hi packed (`v_pk_mul_f32`) |
 
-The KV bound is the LDS double-buffer, not VMEM — loads are hidden
-under compute by the prefetch chain in step 2.
+The KV bound is the LDS double-buffer; loads are hidden under QK/PV by the
+carrier + staging prefetch. The packed-ALU port is spread across the two warp
+groups by *phase*: lo = packed softmax + de-packed oaccu-normalize; hi =
+de-packed softmax + packed oaccu-normalize (they share a SIMD).
 
-### 3.5 Who owns what
+### 3.5 Who owns what (m16x8)
+
+Two compile-time warp types (`enum WarpTypeM16x8`), 4 warps each:
+
+| Warp type | Warps | Owns (of the 64×512 tile) | PV | softmax |
+|---|---|---|---|---|
+| `LoNoPEWarp` | 0–3 | band `w&3` × **tile 0** (cols 0–255, pure NoPE) | at call end (`kPvAtEnd`) | packed (`v_pk_*`) |
+| `HiRoPEWarp` | 4–7 | band `w&3` × **tile 1** (cols 256–511, NoPE + RoPE tail) | deferred (`kHasPv`) | de-packed |
+
+`band = w & 3` (rows `[band·16, +16)`); `sub_off = ((w>>1)&1)·kSubPong`
+(sub-tile A/B); `row_tile = w & 1`. Warp $i$ and $i{+}4$ share the same
+band/rows/`sub_off`/`row_tile`, differing only in tile — this is what lets
+the deferred strip-3 store land in the right pong slot (Ch. 8).
 
 | Resource | Owner / manager | Lifetime |
 |---|---|---|
-| `q_vgpr` v72..v103 | `QManager8to16bitsV1::load_q` | Phase A of every iter |
-| `q_lds` v64..v71 | `QManager8to16bitsV1::load_q_lds_pair` | within Phase B of one iter |
-| Q-LDS region | `QManager8to16bitsV1` Phase 2 stages it | Phase B reads (whole loop) |
-| KV-LDS buf_A / buf_B | `KvManager8to16bitsV1` | one iter (then recycled) |
-| `kv` / `kv_alt` v104..v119 | `KvManager8to16bitsV1::load_k_to_gpr` | inside one Phase A/B mfma pair |
-| `p_comp` v120..v127 | softmax (`hk_mla_softmax.cuh`) | between softmax and PV of one iter |
-| `p_mfma` v120..v123 | PV gemm | reads from p_comp overlay |
+| `q_vgpr` v64..v127 (Q[:,0:256] Ph.A + `q_lds` window Ph.B) | `QManager…::load_q` | Phase A / Phase B of every iter |
+| Q-LDS region (`p_lds_q`) | QManager Phase 2 | Phase B reads (whole loop) |
+| KV-LDS pong (`p_lds_kv_curr/next`, 64 KiB each) | `KvManager8to16bitsV2` | one iter (then swapped) |
+| KV raw-fp8 staging LDS | `KvManager8to16bitsV2` (strips 2,3) | within one iter (strip 3 spans to next) |
+| `k0/k1/k2` v36..v47 | `KvManager8to16bitsV2::load_k_to_gpr` | inside one QK mfma pair |
+| `p_comp` v48..v63 | softmax (`hk_mla_softmax.cuh`) | softmax → PV of one iter |
+| `p_mfma` v48..v55 | PV gemm | overlay on p_comp |
 | `oaccu` v128..v255 | PV gemm | whole loop |
-| OMgr bounce LDS | `OManager16bitsV4Gen1Swizzle` / `OManager32bitsV4Gen1Swizzle*` | epilogue only |
+| `s3_scale` (1 vgpr) | carried strip-3 e8m0 scale | across one iter (Ch. 8 deferred strip-3) |
+| OMgr bounce LDS | `OManager…V4Gen1Swizzle*` | epilogue only |
 
-The pinned VGPR layout is fixed by `__attribute__((amdgpu_num_vgpr(64)))`
-on the `__global__` plus inline-asm hex names — see Ch. 5.
+The pinned VGPR layout is fixed by `amdgpu_num_vgpr(36)` (m16x8) on the
+`__global__` plus inline-asm hex names — see Ch. 5. (m16x4 uses V1 managers,
+`kBlockN=32`, and `amdgpu_num_vgpr(44)`.)
 
 ## Chapter 4 — LDS budget & layout
 
@@ -356,52 +423,50 @@ time, so the entire 160 KiB of LDS is available. The total budget at
 that occupancy is bounded by
 
 $$
-\mathrm{kSzLdsQ} \,+\, \mathrm{kSzLdsKv} \,+\, \max(\mathrm{kSzLdsO},\, \mathrm{kSzLdsKv}) \le 160 \text{ KiB}
+\mathrm{kSzLdsKv} \,+\, \max(\mathrm{kSzLdsO},\, \mathrm{kSzLdsKv}) \,+\, \mathrm{kSzLdsQ} \,+\, \mathrm{kSzLdsStage} \le 160 \text{ KiB}
 $$
 
-(enforced by a `static_assert` in the kernel).
+(enforced by a `static_assert` in the kernel). The first pong holds `curr`;
+the second pong region holds `next` **and** is overlaid by the O bounce at
+epilogue, so it is budgeted at $\max(\mathrm{kSzLdsO}, \mathrm{kSzLdsKv})$.
 
-Concretely (from the manager `get_lds_size_in_byte()` accessors):
+Concretely (m16x8, kBlockN=64; from `get_lds_size_in_byte()` accessors):
 
 | Region | Size | Owner | Source |
 |---|---:|---|---|
-| `kSzLdsKv` (one KV pong) | 32 KiB | `KvManager8to16bitsV1` | $\mathrm{kBlockN} \cdot D_{\mathrm{QK}} \cdot \mathrm{sizeof(bf16)} = 32 \cdot 512 \cdot 2 = 32{,}768$ B (NoPE 448 + RoPE 64 = 512 bf16 cols per row, see Ch. 8) |
-| `kSzLdsQ` (Q final + Phase-1 staging overlay) | 64 KiB | `QManager8to16bitsV1` | `kFinalLdsBytes` |
-| `kSzLdsO` (OMgr V3 bf16 bounce) | 16,896 B (~16.5 KiB) | `OManager16bitsV4Gen1Swizzle` | $8 \text{ warps} \cdot 2112~\text{B}$ |
-| `kSzLdsO` (OMgr V3 fp32 split bounce) | 34,816 B (~34 KiB) | `OManager32bitsV4Gen1Swizzle` | $8 \text{ warps} \cdot 4352~\text{B}$ |
+| `kSzLdsKv` (one KV pong) | **64 KiB** | `KvManager8to16bitsV2` | $\mathrm{kBlockN} \cdot D_{\mathrm{QK}} \cdot \mathrm{sizeof(bf16)} = 64 \cdot 512 \cdot 2 = 65{,}536$ B (two 32-row sub-tiles A@0, B@`kSubPong`=32 KiB) |
+| `kSzLdsStage` (KV raw-fp8 staging, sub-tile B) | **16 KiB** | `KvManager8to16bitsV2` | $32 \cdot \mathrm{kQkPackedNopeBytes} = 32 \cdot 512$; per-warp strips 2/3 slots |
+| `kSzLdsQ` (Q final + Phase-1 staging overlay) | ≤ 64 KiB | `QManager8to16bitsV1` | `kFinalLdsBytes` |
+| `kSzLdsO` (OMgr V3 bf16 bounce) | 16,896 B | `OManager16bitsV4Gen1Swizzle` | $8 \cdot 2112~\text{B}$ |
+| `kSzLdsO` (OMgr V3 fp32 split bounce) | 34,816 B | `OManager32bitsV4Gen1Swizzle` | $8 \cdot 4352~\text{B}$ |
 | `kSzLdsO` (V3NoStage variant) | 0 | `OManager32bitsV4Gen1SwNoStage` | direct VRAM, no bounce |
 
-Two epilogue managers are sized; the kernel picks `max(V3, V3NoStage)` —
-the **V3** path (with bounce) is taken when the output is bf16 final and
-the **V3NoStage** path when writing fp32 split output.
+(m16x4 keeps the V1 pong at 32 KiB and has no `kSzLdsStage`.)
 
-Total at the wired config:
-$32 + 32 + \max(34, 32) = \mathbf{98}$ **KiB** active LDS, well under 160 KiB.
-
-### 4.2 Layout (one snapshot)
+### 4.2 Layout (one snapshot, m16x8)
 
 ```
 LDS address (bytes, low → high):
 
-+0                           p_lds_kv_curr   ← KV pong A (32 KiB)
-+0x8000  (32 KiB)            p_lds_kv_next   ← KV pong B (32 KiB)
++0                           p_lds_kv_curr   ← KV pong A (64 KiB, sub A@0 / B@32K)
++0x10000 (64 KiB)            p_lds_kv_next   ← KV pong B (64 KiB)
                                               ─ during epilogue:
                                                 OVERLAID by OMgr bounce
                                                 (V3 bf16 or V3 fp32)
-+0x10000 (64 KiB)            p_lds_q         ← Q final + Phase-1 staging
-                                              (64 KiB total)
-+0x20000 (128 KiB)           — unused —
++p_lds_q  (after max(KV,O))  p_lds_q         ← Q final + Phase-1 staging
++p_lds_kv_stage (after Q)    p_lds_kv_stage  ← KV raw-fp8 staging (16 KiB)
 ```
 
 `p_lds_kv_curr` and `p_lds_kv_next` swap pointers every iteration:
 
 | Iter | `p_lds_kv_curr` points to | `p_lds_kv_next` points to |
 |---|---|---|
-| $i$ even | LDS base | LDS base + 32 KiB |
-| $i$ odd | LDS base + 32 KiB | LDS base |
+| $i$ even | LDS base | LDS base + 64 KiB |
+| $i$ odd | LDS base + 64 KiB | LDS base |
 
 So at any moment one pong is being *read* (QK / PV mfma sources) and the
-other is being *written* (prefetch + cvt for the next KV tile).
+other is being *written* (prefetch + cvt for the next KV tile). The
+raw-fp8 staging region is separate and per-warp private (not swapped).
 
 ### 4.3 Why O bounce overlays `p_lds_kv_next`, not `p_lds_q`
 
@@ -457,95 +522,89 @@ OMgrV32). The **writer**-side sub-tile-of-8 swizzle for Q-LDS and KV-LDS
 
 HK kernels reserve VGPRs by **two complementary mechanisms**:
 
-1. `__attribute__((amdgpu_num_vgpr(64)))` on the `__global__` constrains the
-   LLVM register allocator to use only `v0..v63` for its own scratch.
-2. Inline asm that names registers in **hex form** (`v[0x73]`,
-   `v[0x77:0x78]`) reserves `v64..v255` for hand-pinned data. The compiler
-   cannot rename these.
+1. `__attribute__((amdgpu_num_vgpr(N)))` on the `__global__` constrains the
+   LLVM register allocator to use only `v0..v(N-1)` for its own scratch.
+   **m16x8: N = 36** (`k_scratch_budget` at kBlockN=64); **m16x4: N = 44**
+   (kBlockN=32).
+2. Inline asm that names registers in **hex form** (`v[0x40]`, `v[0x80:0x81]`)
+   reserves `v(N)..v255` for hand-pinned data. The compiler cannot rename these.
 
-If (1) is missing, the compiler may emit a decimal operand like `v100`
-that silently overlaps with hand-pinned data — corruption with no diagnostic.
-The auto-memory entry `[[check-unpinned-reg-usage]]` describes the audit
-script (`.claude/skills/check-unpinned-reg-usage`) that catches this by
-scanning the post-`-save-temps` `.s` file for decimal `v ≥ 64` in any
-kernel body. **Run this audit after every nontrivial change to the V40
-kernel** — current state is `budget=64 / spill=0 / free=0`, so there is
-zero headroom.
+The whole map is generated from `HkMlaV40Regs<T>` in
+`hk_mla_v40_fwd_decode_gen1_common.cuh` (the single source of truth,
+parameterized by `kBlockN`); the kernel re-aliases the `k_*` constants
+locally. If (1) is missing, the compiler may emit a decimal operand ≥ N that
+silently overlaps hand-pinned data — corruption with no diagnostic. The audit
+`[[check-unpinned-reg-usage]]` scans the post-`--save-temps` `.s` for decimal
+`v ≥ N` and for `vgpr_spill_count > 0`. **Run it after every nontrivial
+change.**
 
-### 5.2 The full map
+### 5.2 The full map (m16x8, kBlockN=64)
 
-Total per-lane pinned VGPR count: **192** (v64..v255). Compiler scratch:
-**64** (v0..v63). Sum: 256, the per-lane register file.
+Compiler scratch: **36** (v0..v35). Hand-pinned: **220** (v36..v255).
 
-| Range | Bytes/lane | Role | Owner / writer | Reader | Lifetime |
-|---|---:|---|---|---|---|
-| `v[0x00..0x3F]`<br/>v0..v63 | 256 | Compiler scratch (cvt staging, scale dwords, `ds_read_b64_tr` buffers, address arithmetic) | LLVM register allocator | LLVM | whole kernel; **budget=64, spill=0** |
-| `v[0x40..0x47]`<br/>v64..v71 | 32 | `q_lds` — Phase-B Q-from-LDS scratch (2 paired tiles: q_k0 + q_k1, 4 vgprs each) | `QManager::load_q_lds_pair` (in-loop) | Phase-B QK mfma (A-operand) | per-iter inside Phase B |
-| `v[0x48..0x67]`<br/>v72..v103 | 128 | `q_vgpr` — Q[:, 0:256] in mfma A-operand layout, 8 base tiles of 16×32 bf16 | `QManager::load_q` (prologue) | Phase-A QK mfma (A-operand) | whole loop (read-only after prologue) [^q-ro] |
-| `v[0x68..0x6F]`<br/>v104..v111 | 32 | `pv_v_aux` — second V-tile staging during PV gemm; **overlaid as `kv_alt`** during QK Phase A | KvManager (QK), PV gemm (PV) | PV mfma (B-operand) | role-toggled each phase |
-| `v[0x70..0x77]`<br/>v112..v119 | 32 | `kv` — single 32×16 KV tile carrier (top half + bot half), no `kv_alt` shadow | `KvManager::load_k_to_gpr` | QK mfma (B-operand) | inside one mfma pair |
-| `v[0x78..0x7B]`<br/>v120..v123 | 16 | `p_mfma` — bf16 P operand for PV, **overlaid on the low half of `p_comp`** | softmax cvt (bf16) | PV mfma (A-operand) | between softmax and PV of one iter |
-| `v[0x78..0x7F]`<br/>v120..v127 | 32 | `p_comp` — fp32 softmax output, 8 fp32/lane covering 16×32 P-tile | softmax | softmax (rescale next iter), PV (via p_mfma overlay) | until PV consumes it |
-| `v[0x80..0xFF]`<br/>v128..v255 | 512 | `oaccu` — fp32 output accumulator, 128 fp32/lane covering 16×512 | PV mfma (C/D-operand) | epilogue (OManager) | whole loop |
+| Range | Role | Owner / writer | Reader | Lifetime |
+|---|---|---|---|---|
+| v0..v35 | Compiler scratch: address arithmetic, fp8→bf16 cvt staging, e8m0 scale dwords, `ds_read`/`tr` buffers, **carried `s3_scale`** + the `row_kv_ld_next` cse-break hold | LLVM | LLVM | whole kernel; **budget=36, spill=0** |
+| v36..v47 | `k_0 / k_1 / k_2` — three 16×32 KV mfma operand tiles (4 vgprs each). Doubles as the PV V-tile staging (`v_1`) during PV | `KvManager…::load_k_to_gpr` / `load_transposed_v_to_gpr` | QK / PV mfma (B / A operand) | inside one mfma pair |
+| v48..v63 | `p_comp` — fp32 softmax output, `kBlockN/4 = 16` fp32/lane covering the 16×64 P-tile. **Overlaid**: `p_mfma` (bf16 P for PV) on v48..v55; the QK V-operand `v_0` on v60..v63 | softmax / PV cvt | softmax (rescale), PV | softmax → PV of one iter |
+| v64..v127 | `q_vgpr` — **full** Q (all 512 cols) in mfma A-operand layout, `kQkGemmTiles=16` tiles; a small `q_lds` window at the top is prologue scratch | `QManager::load_q` (prologue) | QK mfma (A-operand), all col-tiles | whole loop (read-only after prologue) [^q-ro] |
+| v128..v255 | `oaccu` — fp32 output accumulator, 128 fp32/lane covering 16×512 | PV mfma (C/D-operand) | epilogue (OManager) | whole loop |
 
-[^q-ro]: Confirmed read-only after Phase 1 prologue — see auto-memory
-`[[v40-pinned-q-read-only-confirmed]]`. This matters when debugging a
-mismatch: any V40 bug that looks like "Q got corrupted mid-loop" is
-**not** a Q-VGPR clobber; look downstream.
+Note the tight overlap in v48..v63: `p_comp`, its bf16 `p_mfma` overlay, and
+the QK `v_0` operand all share that 16-vgpr window at different points in the
+iter. `k_0` similarly doubles as a PV V-tile carrier.
+
+[^q-ro]: Confirmed read-only after the prologue — see auto-memory
+`[[v40-pinned-q-read-only-confirmed]]`. Any V40 bug that looks like "Q got
+corrupted mid-loop" is **not** a Q-VGPR clobber; look downstream.
 
 ### 5.3 Why the layout is shaped this way
 
-Going low → high (toward v255), the rationale per range:
+Going low → high (toward v255), the rationale per range (m16x8):
 
-- **v0..v63 (compiler scratch).** Bounded by `amdgpu_num_vgpr(64)`. Holds
-  the per-iter dynamic state: address arithmetic for `buffer_load_lds`,
-  `ds_read_b64_tr` destination dwords, softmax intermediates, e8m0 scale
-  dwords. **Zero free VGPRs and zero spill** is the current measurement —
-  any new pinned data must come out of v64..v255, not here.
-- **q_lds (v64..v71).** Phase B reads Q from LDS *into* these on every
-  iter. Split into two 4-vgpr halves (`q_k0`, `q_k1`) so two adjacent
-  Phase-B mfma tiles can issue back-to-back with one `ds_read` chain
-  feeding both — same pair-fusion pattern as Phase A.
-- **q_vgpr (v72..v103).** Phase A reads from these for the whole loop.
-  Holds $Q[:, 0{:}256]$ in mfma A-operand layout = $(16 \text{ rows}) \cdot (256 \text{ cols}) / 64 \text{ lanes} / 2 \text{ elems/vgpr}$
-  $= 32$ vgprs/lane. Placed adjacent to `q_lds` for symmetry.
-- **pv_v_aux / kv_alt (v104..v111).** Dual-role: during QK Phase A,
-  holds the *next* KV tile's V-side (called `kv_alt`) for pair-fused
-  mfma; during PV, holds the staging V data for the second mfma B-operand.
-  The dual role is safe because the QK→PV transition has an `s_waitcnt`
-  barrier in between.
-- **kv (v112..v119).** Single 32×16 KV carrier. There's no `kv_alt`
-  shadow at this address — the alternate-tile carrier reuses pv_v_aux
-  as noted above. Spec §4.2 explains the reasoning: one extra 8-vgpr
-  shadow at this address would push p_comp past v127 and break the
-  oaccu start address.
-- **p_mfma / p_comp (v120..v127).** Overlay: `p_mfma` (bf16, 4 vgprs)
-  occupies the **low half** of `p_comp` (fp32, 8 vgprs). The overlay is
-  safe because softmax-to-PV is `low-to-high pack`: softmax writes
-  high → low in the fp32 layout, then the cvt to bf16 packs the result
-  back into the low half exactly where PV expects to read it. See
-  the pinned-DST cvt helper `pack_2f32_to_bf16_pair_pinned` in
-  `hk_mla_utils.cuh` (gotcha: don't use the runtime-arg
-  `float_2_bf16_pair` form here — see Ch. 13).
-- **oaccu (v128..v255).** The biggest single block, 128 vgprs. Lives at
-  the top of the register file so its base address is a round
-  `0x80` — simplifies the inline-asm offset arithmetic in the OManager
-  epilogue. Holds $(16 \text{ rows}) \cdot (512 \text{ cols}) / 64 \text{ lanes}$
-  $= 128$ fp32/lane.
+- **v0..v35 (compiler scratch).** Bounded by `amdgpu_num_vgpr(36)`. Holds
+  per-iter dynamic state: address arithmetic for `buffer_load_lds`,
+  `ds_read`/`tr` destination dwords, softmax intermediates, e8m0 scale
+  dwords, and the two cross-iter scalars introduced this line of work — the
+  carried `s3_scale` (deferred strip-3, Ch. 8) and the `row_kv_ld_next`
+  cse-break hold (Ch. 13). **Zero spill** is the current measurement; new
+  pinned data must come out of v36..v255, not here. Growing pinned data
+  shrinks this window, so the deferred-strip-3 / cse-break carries are the
+  minimum the scratch region can afford.
+- **k_0 / k_1 / k_2 (v36..v47).** Three 16×32 KV mfma operand tiles. Three
+  (not two) because kBlockN=64 contracts two 32-row sub-tiles per PV call;
+  `k_0` also serves as a PV V-tile carrier (role-toggled across the QK→PV
+  `s_waitcnt`).
+- **p_comp / p_mfma / v_0 (v48..v63).** The 16-vgpr softmax window, triple-
+  overlaid: `p_comp` (fp32, kBlockN/4), the `p_mfma` bf16 overlay on the low
+  half (v48..v55), and the QK `v_0` operand on the high half (v60..v63). The
+  overlay is safe because softmax→PV uses `low-to-high pack`
+  (`pack_2f32_to_bf16_pair_pinned` in `hk_mla_utils.cuh`; gotcha: not the
+  runtime-arg form — see Ch. 13). **Softmax: lo warps packed (`kSoftmaxUsePk
+  = kPvAtEnd`), hi de-packed.**
+- **q_vgpr (v64..v127).** Full Q, all 512 cols, in mfma A-operand layout
+  (`kQkGemmTiles=16`, `kRopeInVgpr`). Read-only for the whole loop. A small
+  `q_lds` window at the high end is prologue staging scratch only.
+- **oaccu (v128..v255).** The biggest block, 128 vgprs, at the top so its
+  base is a round `0x80` — simplifies the OManager offset arithmetic. Holds
+  $16 \cdot 512 / 64 = 128$ fp32/lane. Normalized at epilogue by
+  `1/row_sum_e`: hi warps via `hk::mul_vgpr` (`v_pk_mul_f32`), lo warps via a
+  de-packed `v_mul_f32_e32` sweep (Ch. 10).
 
 ### 5.4 Compiler-scratch budget audit
 
 The audit script reports three numbers:
 
-| Number | Meaning | Current value |
+| Number | Meaning | Current value (m16x8) |
 |---|---|---:|
-| budget | `N` from `amdgpu_num_vgpr(N)` | 64 |
+| budget | `N` from `amdgpu_num_vgpr(N)` | 36 |
 | spill | `.vgpr_spill_count` in the kernel metadata | 0 |
-| free gprs | `N - max_observed_decimal_v - 1` | 0 (max observed v63) |
+| free gprs | `N - max_observed_decimal_v - 1` | tight (v0..v35) |
 
-Zero free + zero spill = "fits exactly." Any new pinned data, new
-inline-asm clobber, or wider unroll could push the compiler over budget
-into spill. Always re-run the audit after touching:
+Zero spill is the invariant to protect. Any new pinned data, new inline-asm
+clobber, or wider unroll could push the compiler over the 36-reg scratch
+budget into spill (and into the pinned range — the classic clobber bug).
+Always re-run the audit after touching:
 
 - inline asm clobber lists in the managers
 - `static_for` unroll factors in the kernel body
@@ -555,9 +614,18 @@ See `.claude/skills/check-unpinned-reg-usage/` for the script.
 
 ## Chapter 6 — QManager Phase 1 (vmem → staging LDS → pinned q_vgpr)
 
-Phase 1 fills the **VGPR half** of $Q$: $Q[:, 0{:}256]$ (the first 256 of
-the 448 NoPE elements) into pinned `q_vgpr` v72..v103. It runs once at
-the prologue, before the main loop.
+> **Full-Q-in-VGPR update.** The current m16x8 pins **all** of $Q$ (512 cols,
+> NoPE + RoPE) in `q_vgpr` v64..v127 (`kQkGemmTiles=16`, `kRopeInVgpr=true`).
+> The "VGPR half / LDS half" framing in Ch. 6-7 is V1 history: the prologue
+> still stages $Q$ through LDS (Phase 1 NoPE, Phase 2 sb8-perm + RoPE) but
+> everything lands in `q_vgpr`, and the QK loop reads Q only from VGPR. Read
+> the mechanics below as "how the prologue lands each chunk in q_vgpr"; ignore
+> references to a persistent Phase-B Q-LDS. Register ranges cited as v72.. are
+> now v64.. (see Ch. 5.2).
+
+Phase 1 fills the leading chunks of $Q$: $Q[:, 0{:}256]$ (the first 256 of
+the 448 NoPE elements) into pinned `q_vgpr`. It runs once at the prologue,
+before the main loop.
 
 ### 6.1 Geometry
 
@@ -664,8 +732,9 @@ This is identical to V32's known trick — fewer VGPRs in the inner loop.
 **Hazard:** if $\mathrm{staging} < \mathrm{kColInRecord}_\mathrm{max} = 192$, the
 LDS pointer underflows mod $2^{32}$ and the store silently drops. Warp 0
 is the only warp where $\mathrm{staging} = \mathit{pLdsQ}$ exactly,
-so the kernel places Q **after** the 32 KiB KV pongs + the O bounce —
-giving warp 0's staging at least 192 B of preceding LDS to absorb the
+so the kernel places Q **after** the KV pongs + the O bounce (m16x8:
+`kSzLdsKv` + `max(O, kSzLdsKv)`) — giving warp 0's staging at least 192 B
+of preceding LDS to absorb the
 subtract. The encoded `kLdsHeadPadBytes = 192` and the static assert in
 the kernel guarantee this.
 
@@ -1020,109 +1089,103 @@ D-axis (Ch. 8) so QK accumulation is correct.
 
 ## Chapter 8 — KvManager double-buffered pipeline
 
-KV is the dominant bandwidth consumer (one new 32-row tile per iter,
-$32 \cdot 512$ B fp8 + $32 \cdot 128$ B bf16 RoPE = ~20 KiB / iter)
-and the only inter-iteration LDS resident. The KvManager hides VMEM
-latency via a **double-buffer pong** scheme: while iter $i$'s compute
-reads from the *current* pong, iter $i+1$'s cvt+store fills the
-*next* pong, and iter $i+2$'s prefetch issues into either pong's
-in-flight slot.
+KV is the dominant bandwidth consumer and the only inter-iteration LDS
+resident. The KvManager hides VMEM latency via a **double-buffer pong**
+scheme: while iter $i$'s QK/PV reads the *current* pong, Phase A prefetches
+the *next* tile (into VGPR carriers + raw-fp8 staging LDS) and Phase B
+cvt+stores it into the *next* pong.
 
-### 8.1 Geometry and pong layout
+> **V2 vs V1.** m16x8 uses `KvManager8to16bitsV2` (this section). m16x4 uses
+> `KvManager8to16bitsV1` — the "Option 2" wave→tile map, kBlockN=32, single
+> per-lane carrier — which the earlier revisions of this chapter described.
+> V2 is derived from V1 (`class …V2 : public …V1`) and changes: (1) kBlockN=64
+> double-tile, (2) a **band-per-warp** remap (each warp owns one 16-row band ×
+> one 256-col tile → **one** `row_kv_ld` per lane, 2 warp types), (3) a
+> **staging** path (strips 2,3 go vmem→raw-fp8-LDS via `buffer_load_lds`,
+> converted later), and (4) **deferred strip-3** (§8.13).
+
+### 8.1 Geometry and pong layout (V2, kBlockN=64)
 
 | Symbol | Value | Source |
 |---|---:|---|
-| `kBlockN` | 32 | rows per KV tile |
-| `kQkNopeHeadDim` | 448 | fp8 NoPE cols per token |
-| `kQkRopeHeadDim` | 64 | bf16 RoPE cols per token |
-| `kQkHeadDim` | 512 | $= D_{\mathrm{QK}}$ — total bf16 cols per row in LDS |
-| `kSubBlockRows × kSubBlockCols` | 16 × 32 bf16 | one sub-block (= one QK A-tile) |
-| `kSubBlockBytes` | 1024 | |
-| `kNumRowTiles` | 2 | row-halves per KV tile |
-| `kNumColTiles` | 16 | col-tiles per KV tile (= 512/32) |
-| `kNumColTilesNope` | 14 | NoPE cols span col-tiles [0..14) |
-| `kNumColTilesRope` | 2 | RoPE cols are col-tiles {14, 15} |
-| `kTileCols` | 256 | one *half* of a KV tile along D (= 512/2) |
-| `kColTilesPerTile` | 8 | col-tiles in one half |
-| `kWaveColTilesPerWaveTile` | 2 | each wave owns 2 col-tiles (= 64 bf16 cols) |
-| `kWaveTileCols` | 64 | per-wave col-tile width |
-| **One pong** | $32 \cdot 512 \cdot 2 = $ **32 KiB** | full $\mathrm{kBlockN} \cdot D_{\mathrm{QK}}$ in bf16 |
+| `kBlockN` | **64** | rows per KV tile = two 32-row sub-tiles A, B |
+| `kSubPong` | 32768 | bytes of one 32-row sub-tile in a pong (B at `+kSubPong`) |
+| `kQkNopeHeadDim` / `kQkRopeHeadDim` | 448 / 64 | fp8 NoPE / bf16 RoPE cols per token |
+| `kQkHeadDim` | 512 | $= D_{\mathrm{QK}}$ bf16 cols per row in LDS |
+| `kSubBlockRows × kSubBlockCols` | 16 × 32 bf16 | one sub-block (= one QK A-tile), 1024 B |
+| `kTileCols` / `kColTilesPerTile` | 256 / 8 | one 256-col **tile**; col-tiles within it |
+| `kWaveTileCols` | 64 | per-strip col width (a warp's band = 4 strips × 64) |
+| **One pong** | $64 \cdot 512 \cdot 2 = $ **64 KiB** | full $\mathrm{kBlockN} \cdot D_{\mathrm{QK}}$ in bf16 |
 
-Per pong, the 32×512 bf16 region is viewed as $2 \cdot 16 = 32$
-sub-blocks of $16 \times 32$ bf16 each, stored in **col-major sub-block
-order**:
+Each 32-row sub-tile is stored col-major-sub-block exactly as V1
+($\mathit{subBlockByteOffset}(r_{\mathrm{tile}}, c_{\mathrm{tile}}) =
+(c_{\mathrm{tile}}\cdot 2 + r_{\mathrm{tile}})\cdot 1024$); sub-tile B is the
+same layout at `+kSubPong`.
 
-$$
-\mathit{subBlockByteOffset}(r_{\mathrm{tile}}, c_{\mathrm{tile}}) = (c_{\mathrm{tile}} \cdot 2 + r_{\mathrm{tile}}) \cdot 1024
-$$
+### 8.2 Warp → band map (V2)
 
-with $r_{\mathrm{tile}} \in \{0, 1\}$ (which 16-row half) and
-$c_{\mathrm{tile}} \in [0, 16)$ (which 32-col strip). Strips 0..13 are
-NoPE; strips 14..15 are RoPE.
+Each of the 8 warps owns **one 16-row band × one 256-col tile** of the
+64×512 KV tile (contrast V1, where a warp owned a 16×64 wave-tile in *both*
+column halves and thus needed two row indices). With `band = w & 3`:
 
-### 8.2 Wave → tile map (Option 2, branchless)
+| quantity | expr | meaning |
+|---|---|---|
+| `band` | `w & 3` | rows `[band·16, +16)` of the 64-row tile |
+| `tile` | `w >> 2` | 0 = cols 0–255 (Lo, pure NoPE); 1 = cols 256–511 (Hi, NoPE+RoPE) |
+| `sub_off` | `((w>>1)&1)·kSubPong` | which 32-row sub-tile (A/B) this band lands in |
+| `row_tile` | `w & 1` | 16-row half within the sub-tile |
+| `row_kv_ld` base | `lane>>2` | the lane's row inside its band (0..15) |
 
-The 8 waves of the workgroup partition the 32×512 KV tile into 4×4 grid
-of $16 \times 64$ wave-tiles, with each wave owning one wave-tile per
-half-tile (`kTileIdx ∈ {0,1}`):
+A warp's 16×256 band = **4 col-strips of 16×64** = 4 dwordx4/lane (fp8).
+Lo warps (0–3, tile 0) are pure NoPE. Hi warps (4–7, tile 1) are
+NoPE(strips 0–2) + RoPE(strip 3, cols 448–511). `wave_is_rope_owner(w) =
+(w >= 4)`.
 
-$$
-r_{\mathrm{tile}}(w) = (w \gg 1)  \mathbin{\mathrm{and}}  1, \qquad
-c_{tileInHalf}(w) = ((w \gg 1)  \mathbin{\mathrm{and}}  2) \,|\, (w  \mathbin{\mathrm{and}}  1)
-$$
-
-resulting in:
-
-| wave $w$ | $r_{\mathrm{tile}}$ | $c_{tileInHalf}$ | rows | cols in tile-0 | cols in tile-1 |
-|---:|---:|---:|---|---|---|
-| 0 | 0 | 0 | 0..15 | [0,64) | [256, 320) |
-| 1 | 0 | 1 | 0..15 | [64,128) | [320, 384) |
-| 2 | 1 | 0 | 16..31 | [0,64) | [256, 320) |
-| 3 | 1 | 1 | 16..31 | [64,128) | [320, 384) |
-| 4 | 0 | 2 | 0..15 | [128,192) | [384, 448) |
-| 5 | 0 | 3 | 0..15 | [192,256) | **[448, 512) = RoPE** |
-| 6 | 1 | 2 | 16..31 | [128,192) | [384, 448) |
-| 7 | 1 | 3 | 16..31 | [192,256) | **[448, 512) = RoPE** |
-
-For half-tile 1 (`kTileIdx == 1`), waves 5 and 7 land on
-$c_{tileInHalf} = 3$, which corresponds to global col-tiles
-{14, 15} = the RoPE region. Those two waves take the **RoPE path**
-(direct vmem→LDS via `buffer_load_lds`, no cvt — RoPE is already bf16).
-All other (wave, tile) combinations take the **NoPE path** (vmem fp8 →
-VGPR → cvt → ds_write bf16).
-
-`wave_is_rope_owner(w) = (w == 5) || (w == 7)`.
+**The key invariant:** warp $i$ and warp $i{+}4$ share `band`, `sub_off`,
+`row_tile` and hence the *same* `row_kv_ld` — they differ only in `tile`.
+This is what lets deferred / borrowed strip stores land in the correct pong
+sub-block (§8.13).
 
 ### 8.3 The pong swap
 
-Two LDS pointers, swapped each iter:
+Two LDS pointers, swapped each iter (`std::swap`, no data movement):
 
 | Iter $i$ parity | `p_lds_kv_curr` | `p_lds_kv_next` |
 |---|---|---|
-| even | LDS base + 0 | LDS base + 32 KiB |
-| odd | LDS base + 32 KiB | LDS base + 0 |
+| even | LDS base + 0 | LDS base + 64 KiB |
+| odd | LDS base + 64 KiB | LDS base + 0 |
 
-At the entry of iter $i$, `p_lds_kv_curr` holds the **already-finished**
-tile to compute on; `p_lds_kv_next` is the slot that the **prefetch +
-cvt+store** of the *next* tile writes into. The pointers are swapped
-at the bottom of the iter — no LDS data movement, just pointer math.
+At iter $i$ entry, `p_lds_kv_curr` holds the finished tile to compute on;
+`p_lds_kv_next` receives this iter's Phase B cvt+store. Swapped at iter end.
 
-### 8.4 Prefetch / store / consume timeline
+### 8.4 Carrier / staging / consume timeline (V2)
 
-The KvManager splits each pong fill into 3 routines so the main loop
-can interleave them with QK mfmas:
+Each warp's 4 band strips split by transport:
 
-| Routine | What it does | Latency hidden behind |
-|---|---|---|
-| `prefetch_kv_tile<kRowOffset, kColOffset, kCheckBoundary>` | issues `buffer_load_dwordx4` (16 fp8) + `buffer_load_ubyte` (E8M0 scale) per lane → `KvTilePrefetch` carrier; or `buffer_load_lds` direct for RoPE | vmem latency hidden by the QK mfmas that follow |
-| `wait_kv_loads<kRowOffset, kColOffset, kVmCnt=0>` | drains vmcnt to the requested level + `sched_barrier(0)` | (just a wait, no compute) |
-| `cvt_kv_tile_step<kStep>` × 4 + `store_kv_tile_step<R,C,kStep>` × 2 | 4 cvts to bf16 dwords + 2× `ds_write_b128` per tile | cvt and store latencies overlap with mfma slots in the QK loop |
-| `kv_tile_scale_f(prefetch)` | one ALU op: e8m0 → fp32 scale | hoisted once per tile |
+| strips | transport | landing | consumed |
+|---|---|---|---|
+| 0, 1 | `prefetch_kv_nope` → VGPR **carriers** `p0/p1` (`buffer_load_dwordx4` + `ubyte` scale) | pinned VGPR | Phase B: cvt+store to pong |
+| 2 (both), 3 (lo) | `prefetch_kv_nope_lds` → **raw-fp8 staging LDS** via `buffer_load_lds` (+ ubyte scale) | staging LDS | Phase B: `load_staged_kv_carrier` → cvt+store |
+| 3 (hi) | `prefetch_kv_rope` → **direct** vmem→pong LDS | pong (bf16 already) | — (no cvt) |
 
-For the prologue (cold start) the convenience wrapper `async_load_k` does
-all of this non-overlapped: prefetch both half-tiles → wait → cvt+store
-both. The main loop uses the split form to interleave with mfmas — see
-the iteration timeline in §3.4.
+Phase A issues carriers + staging before the pre-QK `s_barrier` so their
+vmem latency overlaps the barrier + QK. Phase B, after QK, drains them with
+graduated `wait_kv_loads<kIsRopeWarp, kVmCnt>` (vmcnt 6/4/2/0), converts
+fp8→bf16 (`cvt_kv_tile_step`), and `store_kv_tile_step`s into
+`p_lds_kv_next`. Lo warp strip 3 is **deferred** to the next iter (§8.13).
+
+The prologue wrapper `async_load_k` does all four strips non-overlapped
+directly into the current pong (no staging, no deferral) — this is why the
+warp's first compute iter needs no deferred strip-3.
+
+> **§8.5-8.12 note.** These sub-sections detail the shared V1 address
+> primitives — the vmem address split, the Method-2 bank-conflict swizzle,
+> `get_kv_ld_row`, `load_k_to_gpr`, RoPE DMA, the boundary carry. V2 reuses
+> all of them; it only changes *which* strips go through carriers vs staging
+> and adds deferred strip-3 (§8.13). The `prefetch_kv_tile` name below is the
+> V1 entry; V2's `prefetch_kv_nope` / `prefetch_kv_nope_lds` are the same
+> address math specialized by `<kColStrip, kTile>` template args, landing in a
+> VGPR carrier or the staging LDS respectively.
 
 ### 8.5 NoPE prefetch — `prefetch_kv_tile` (NoPE branch)
 
@@ -1334,12 +1397,56 @@ Similarly, `store_kv_tile_step<…, kTileIdx=1>` early-returns for those
 two waves — their RoPE path has no `ds_write`, only the direct
 vmem→LDS that prefetch already issued.
 
+### 8.13 Deferred strip-3 (V2, lo warps) — cross-iter software pipeline
+
+Lo warps stage **two** NoPE strips (2 and 3) into raw-fp8 LDS in Phase A.
+Converting both in the same iter's Phase B crowds the (already busy) cvt+store
+block. So strip 3's **consume** (ds_read staging → cvt → store to pong) is
+deferred by one iteration:
+
+- **Iter N Phase A** issues the strip-3 `buffer_load_lds` (into staging slot 1)
+  and its e8m0 scale into the *carried* VGPR `s3_scale`. Iter N Phase B
+  cvt+stores strips 0,1,2 only — strip 3's two loads stay in flight.
+- **Iter N+1 top**, *before* Phase A re-stages slot 1: `wait_kv_loads<…,0>` →
+  `load_staged_kv_carrier<1>` → cvt (using `s3_scale`) → `store_kv_tile_step
+  <3, tile0>` into `p_lds_kv_curr` (the tile this iter's QK is about to read,
+  already swapped in). The store is drained by the existing pre-QK
+  `lgkmcnt(0)` before the `s_barrier`, so QK sees a complete tile.
+
+Why it's correct:
+
+- **Only the scale carries in a VGPR.** The bulk NoPE data stays in private
+  staging LDS (per-warp, warp-invariant address) — nothing else is hoisted.
+- **Destination is `p_lds_kv_curr`.** Iter N staged the tile that becomes
+  `curr` after iter N's swap; strip 3 completes that same tile.
+- **Gate is `!kIsRopeWarp && !kIsFirstIter`.** The first compute iter's
+  tile-0 strip 3 came from the prologue (`async_load_k`), so nothing is
+  pending; every later iter (including the last/skip/epilogue iter) has a
+  pending strip 3 from its predecessor and must flush it for its own QK.
+- **WAR safety.** The iter N+1 consume ds_reads slot 1 and completes its
+  `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
+  `buffer_load_lds` into the same slot — program order guarantees no clobber.
+
+Net effect: strip 3's vmem load gets a full extra iteration to retire (fully
+hidden), and its cvt+store moves off Phase B onto the lighter iter-top window.
+
 ## Chapter 9 — Softmax
 
 Online (Flash-style) softmax runs **once per KV tile**, between QK and PV.
-It updates two per-row running scalars ($m$, $\ell$) and produces the
-fp32 P-tile in `p_comp` (v120..v127), then packs it into bf16 `p_mfma`
-(v120..v123 overlay) for PV.
+It updates two per-row running scalars ($m$, $\ell$) and produces the fp32
+P-tile in `p_comp` (v48..v63, **16 fp32/lane** at kBlockN=64 — a 16×64 tile),
+then packs it into bf16 `p_mfma` (v48..v55 overlay) for PV.
+
+> **kBlockN=64 + `kUsePk` update (m16x8).** With kBlockN=64 the P-tile is 16×64,
+> so `p_comp` = `kBlockN/4 = 16` fp32/lane and the packed `p_mfma` = `kBlockN/8
+> = 8` dwords/lane. The kernel uses the `_16`-width routines
+> (`softmax_mask_p`, `softmax_p1_prescaled_16`, `max_16`), and each takes a
+> `kUsePk` template arg. In softmax, `kSoftmaxUsePk = kPvAtEnd`, so **lo warps
+> run packed** (`v_pk_*`) and **hi warps run de-packed** (`v_add_f32_e32` /
+> `v_mov_b32` / `v_exp_f32` scalars). (The oaccu-normalize at epilogue is the
+> opposite — `kFinalRescaleUsePk = !kPvAtEnd`, lo de-packed / hi packed, §10 —
+> so each warp group carries exactly one packed phase.) Where the older text
+> says "8 fp32 / 16×32" read "16 fp32 / 16×64"; where it says v120.. read v48..
 
 ### 9.1 The online recurrence
 
@@ -1409,69 +1516,72 @@ optimization (every tile rescales).
 |---|---|---|
 | $m$ (per row, this lane's share) | `float row_max;` local | 1 fp32/lane, persists across iters |
 | $\ell$ (per row, this lane's share) | `float row_sum_e;` local | 1 fp32/lane, persists across iters |
-| $S^{(i)}$ / $P^{(i)}$ | `p_comp` v120..v127 | 8 fp32/lane, 16×32 tile per warp |
-| $P^{(i)}$ in bf16 for PV | `p_mfma` v120..v123 (overlay on p_comp low half) | 4 bf16x2 dwords/lane |
+| $S^{(i)}$ / $P^{(i)}$ | `p_comp` v48..v63 | 16 fp32/lane, 16×64 tile per warp |
+| $P^{(i)}$ in bf16 for PV | `p_mfma` v48..v55 (overlay on p_comp low half) | 8 bf16x2 dwords/lane |
 | $\alpha$ (rescale for this iter) | `float rescale;` local | 1 fp32/lane, lives only within this iter |
 
-These compiler-scratch fp32 scalars sit in v0..v63 and are recreated
+These compiler-scratch fp32 scalars sit in v0..v35 and are recreated
 each iter (LLVM is free to choose where).
 
-### 9.3 The three softmax routines
+### 9.3 The softmax routines (m16x8, `_16` + `kUsePk`)
 
-The kernel uses three helpers from `hk_mla_softmax.cuh`:
+From `hk_mla_softmax.cuh` (all `_16`-width; each takes `kUsePk`):
 
 | Routine | Inputs / Outputs | What it does |
 |---|---|---|
-| `softmax_scale_p<kCheckBoundary, GPR>(col_start_idx, kv_end, softmax_scale)` | reads p_comp, writes p_comp | Element-wise multiply by `softmax_scale` ($= 1/\sqrt{D_{\mathrm{QK}}}$). On boundary tiles (`kCheckBoundary=true`), out-of-range cols are set to a very negative value so the upcoming exp produces 0. |
-| `softmax_p0<kIsFirstIter, kCheckBoundary, GPR>(...)` | reads p_comp, writes row_max, rescale | Computes local row max (v_max3 ladder + warp_reduce), updates running $m$, computes $\alpha$. |
-| `softmax_p1<kIsFirstIter, GPR>(...)` | reads p_comp + new_row_max + rescale, writes p_comp, row_sum_e | In-place exp: `p_comp ← exp_2((p_comp − new_row_max) · log2e)`. Then warp-reduces row sum and updates running $\ell$. |
+| `softmax_mask_p<kCheckBoundary, GPR, kUsePk>(...)` | reads p_comp, writes p_comp | Applies the prescaled softmax scale and, on boundary tiles, fills out-of-range cols with −inf (via `set_ninf1/2<kUsePk>`) so exp → 0. De-packed when `kUsePk=false`. |
+| `max_16<…>` + `warp_reduce` (inlined) | reads p_comp, writes row_max, rescale | Local row max (v_max3 ladder over 16, no `v_pk`) + cross-lane reduce; updates $m$, computes $\alpha$ (deferred-rescale threshold, §9.1.1). |
+| `softmax_p1_prescaled_16<kIsFirstIter, k_p_comp_begin, comp_t, kUsePk>(...)` | reads p_comp + new_row_max + rescale, writes p_comp, row_sum_e | In-place `exp_2`, then row-sum reduce → running $\ell$. Packed or de-packed per `kUsePk` (§9.5). |
 
-The kernel does NOT call `softmax_p0` directly — it inlines the row-max
-+ rescale logic and uses `max_8<…>` + `warp_reduce` directly. This is
-equivalent and lets the kernel hoist `kCheckBoundary` into a runtime
-branch around just the `softmax_scale_p` call. See lines 720–760 of the
-kernel.
+`kSoftmaxUsePk = kPvAtEnd` (true for lo warps): **lo = packed, hi =
+de-packed** for the softmax block. The kernel inlines the row-max branch so
+`kCheckBoundary` is a runtime branch around just `softmax_mask_p`.
 
 ### 9.4 The v_max3 ladder
 
-The per-lane local max over 8 fp32 values reduces to **4 instructions**
-(2× `v_max3_f32` + 1× `v_max_f32` + 1× `v_max3_f32`), the gfx950-minimum
-for 8 inputs:
+At kBlockN=64, `max_16` reduces the per-lane local max over **16** fp32
+values with a `v_max3_f32` tree (each `v_max3` folds 3 inputs), the
+gfx950-minimum for 16 inputs. The kBlockN=32 form over 8 values was 4
+instructions:
 
 $$
 \mathit{localMax} = \max\big(\max_3(\mathit{p0}, \mathit{p1}, \mathit{p2}), \max_3(\mathit{p4}, \mathit{p5}, \mathit{p6}), \max(\mathit{p3}, \mathit{p7})\big)
 $$
 
-`max_8<>` in `hk_mla_utils.cuh` ships this ladder; the kernel inlines
-the same shape. After the per-lane reduce, `warp_reduce<MaxFunctor>`
+`max_16<>` (m16x8) / `max_8<>` (m16x4) in `hk_mla_utils.cuh` ship this
+ladder; the kernel inlines the same shape. After the per-lane reduce,
+`warp_reduce<MaxFunctor>`
 reduces across the 4 lanes per row-group via DPP / cross-lane permutes
 — the mfma A-operand layout puts 16 rows × 4 lanes/row, so the
 reduction window is 4 lanes wide.
 
-### 9.5 The 8× exp + 4× pk_add in `softmax_p1`
+### 9.5 The exp + add/mul block in `softmax_p1_prescaled_16` (+ `kUsePk`)
 
-`softmax_p1` emits one big inline-asm block:
+`softmax_p1_prescaled_16<…, kUsePk>` emits the add/mul/exp block over the
+16 fp32 lanes. `kUsePk = kSoftmaxUsePk = kPvAtEnd` selects the ALU port:
 
-1. `v_pk_add_f32` × 4: `p_comp[i:i+1] += {-m, -m}` (pair-add) for $i \in \{0,2,4,6\}$.
-2. `v_pk_mul_f32` × 4: `p_comp[i:i+1] *= log2e_pk`.
-3. `v_exp_f32` × 8: `p_comp[i] = v_exp_f32(p_comp[i])` for $i \in [0, 8)$.
+- **`kUsePk = true` (lo warps):** packed — `v_pk_add_f32` (subtract `m`) +
+  `v_pk_mul_f32` (× log2e) over 8 pairs, then `v_exp_f32` × 16, then a
+  `v_pk`-based reduction tree to `local_sum_e`.
+- **`kUsePk = false` (hi warps):** fully de-packed — `v_add_f32_e32` × 16,
+  `v_exp_f32` × 16, then a scalar binary reduction tree. Helpers `set_ninf1`
+  / `set_ninf2<kUsePk>` (in `hk_mla_softmax.cuh`) pick `v_mov_b32` vs
+  `v_pk_mov_b32` for the boundary −inf fills; `softmax_mask_p<…, kUsePk>`
+  is de-packed the same way. `max_16` has no `v_pk` and is shared.
 
-Then 3 pair-adds reduce `p_comp[0..7]` to a scalar `local_sum_e`, which
-warp-reduces to `row_sum_e`.
-
-The fused asm is one block (not multiple smaller blocks) because the
-compiler otherwise scatters the v_exp issues across the inline-asm
-boundaries, breaking the back-to-back issue pattern that hides exp
-latency.
+Both paths warp-reduce `local_sum_e` → `row_sum_e` through a shared tail.
+The fused asm stays one block so the compiler doesn't scatter the `v_exp`
+issues across inline-asm boundaries and break the back-to-back issue that
+hides exp latency.
 
 ### 9.6 Pack to bf16 for PV: `pack_2f32_to_bf16_pair_pinned`
 
-After `softmax_p1`, `p_comp` holds 8 fp32 / lane. PV's mfma needs bf16,
-so the kernel issues **4** `v_cvt_pk_bf16_f32`s via
+After `softmax_p1_prescaled_16`, `p_comp` holds 16 fp32 / lane. PV's mfma
+needs bf16, so the kernel issues **8** `v_cvt_pk_bf16_f32`s via
 `pack_2f32_to_bf16_pair_pinned<DST, SRC>()`, with destinations
-`p_mfma[0..3]` and sources `p_comp[0,2,4,6]`. With
-`k_p_mfma_begin = k_p_comp_begin = 120`, the destination
-`p_mfma[0..3]` **overlays the low half of `p_comp[0..7]`** — the
+`p_mfma[0..7]` and sources `p_comp[0,2,…,14]`. With
+`k_p_mfma_begin = k_p_comp_begin = 48`, the destination
+`p_mfma[0..7]` **overlays the low half of `p_comp[0..15]`** — the
 cvt reads sources before writing dst, and low-to-high pack order
 ensures no instruction reads a vgpr that an earlier pack has
 overwritten.
@@ -1496,8 +1606,8 @@ ladder — see Ch. 10.7.
 
 After softmax + pack completes:
 
-- `p_mfma` v120..v123 holds $P^{(i)}$ in bf16, ready for PV mfma.
-- `p_comp` v120..v127 still holds the same data (low half bf16-overlay,
+- `p_mfma` v48..v55 holds $P^{(i)}$ in bf16, ready for PV mfma.
+- `p_comp` v48..v63 still holds the same data (low half bf16-overlay,
   high half stale fp32 — but PV only reads the low half via p_mfma).
 - `row_max` and `row_sum_e` are updated; `rescale` ($= \alpha$) is in
   a local fp32 and is **the value passed to PV** to rescale `oaccu`
@@ -1505,12 +1615,19 @@ After softmax + pack completes:
 
 ### 9.9 Final normalization (after the loop)
 
-At the end of the main loop (in the epilogue branch of `mla_main`),
-each row's `oaccu` is divided by its final `row_sum_e` via a single
-`hk::mul_vgpr(oaccu, oaccu, 1.0f / row_sum_e)` over the full
-128-vgpr `oaccu` tile — one `v_mul_f32` per vgpr. The OManager
-epilogue routines then write the normalized `oaccu` to VRAM
-unchanged.
+At the end of the main loop (epilogue branch of `mla_main`), each row's
+`oaccu` is divided by its final `row_sum_e`. The op is split by warp group
+(`kFinalRescaleUsePk = !kPvAtEnd`):
+
+- **hi warps** (`kFinalRescaleUsePk = true`): `hk::mul_vgpr(oaccu, oaccu,
+  1/row_sum_e)` → packed `v_pk_mul_f32` over the 128-vgpr tile.
+- **lo warps** (`false`): a `static_for<k_o_sz>` sweep of `v_mul_f32_e32`
+  (de-packed), keeping lo off the packed-ALU port.
+
+(`hk::mul` can't be used for the de-packed sweep — its scalar op uses an `"i"`
+immediate constraint, invalid for the runtime `1/row_sum_e`; hence the
+explicit `v_mul_f32_e32` inline-asm sweep.) The OManager epilogue then writes
+the normalized `oaccu` to VRAM. See Ch. 10.9.
 
 ## Chapter 10 — PV gemm + oaccu rescale
 
@@ -1545,9 +1662,24 @@ $$
 (16 \times 32) \cdot (32 \times 16) \to (16 \times 16)
 $$
 
-producing a 16×16 fp32 output tile. With `kBlockN = 32` and
-`kVoHeadDim = 512`, PV runs in **16 iters** (each iter covers 32 V-cols
-= 2 mfma A-tiles = 2 base tiles of `kv`).
+producing a 16×16 fp32 output tile.
+
+> **Merged PV over both sub-tiles (m16x8, kBlockN=64).** One
+> `hk_mla_v40_pv_stage` call now contracts **both** 32-row sub-tiles A+B in a
+> single invocation — one prologue, `num_pv_iter = kNumKvSub · kDIters =
+> 2 · 16 = 32` iters (`kDIters = kVoHeadDim/(2·kTileM) = 16`), `row_base =
+> (iter/16)·32` selecting sub-tile A vs B. This replaced the earlier
+> two-call form (one prologue per sub-tile), removing a wasted second
+> prologue. m16x4 (kBlockN=32) keeps the 16-iter single-sub-tile form.
+>
+> **Who runs PV when.** `kPvAtEnd = (kWarpType == LoNoPEWarp)`: **lo warps**
+> run PV at the *end* of the call (after softmax); **hi warps** *defer* PV by
+> one tile (`kHasPv`), running the previous tile's PV at the *start* of the
+> call (its V is still alive in `p_lds_kv_next`). The epilogue drains any
+> pending deferred PV.
+
+With `kVoHeadDim = 512` and `kBlockN = 64`, each sub-tile's PV is 16 iters
+(each iter covers 32 V-cols = 2 mfma A-tiles of `kv`); two sub-tiles = 32.
 
 ### 10.2 V from LDS via transpose-read: `load_transposed_v_to_gpr`
 
@@ -1569,8 +1701,9 @@ issues one `ds_read_b64_tr_b16` per call, producing 2 dwords/lane in
 | 3 | 0 | `iter*32 + 16` | `kv[k_kv_begin + 4..5]` |
 | 4 | 16 | `iter*32 + 16` | `kv[k_kv_begin + 6..7]` |
 
-After 4 reads, `kv` (v112..v119) holds 2 mfma A-tiles' worth of
-$V^\top$ data — 8 vgprs/lane = `kv_top` (4 vgprs) + `kv_bot` (4 vgprs).
+After 4 reads, the KV carriers (`k0/k1/k2`, v36..v47 — the same range used
+for QK K operands, role-toggled) hold 2 mfma A-tiles' worth of $V^\top$
+data. (In V1/m16x4 this was `kv` at v112..v119.)
 
 ### 10.3 The interleaved PV iter (canonical pattern)
 
@@ -1596,8 +1729,11 @@ So per PV iter:
 - 2× `s_waitcnt`
 
 Total rescale per iter = 8 `v_mul_f32`. Over 16 iters = 128 `v_mul_f32`,
-which is exactly the count needed to multiply the full 128-vgpr `oaccu`
-by `rescale` once.
+exactly the count to multiply the full 128-vgpr `oaccu` by `rescale` once.
+In the **merged** 32-iter PV (kBlockN=64), the rescale is guarded to the
+first sub-tile's iters (`row_base == 0`), so it still fires exactly 128
+multiplies total across the merged call — sub-tile B accumulates onto the
+already-rescaled `oaccu` with no further rescale.
 
 ### 10.4 First-iter and last-iter special cases
 
@@ -1909,10 +2045,16 @@ Two static_asserts enforce sanity:
 | `kSkipCompute && kIsFirstIter` | A skip warp has no prior compute → "first iter" makes no sense. |
 | `kIsGlobalLast && kCheckBoundaryNext` | Global-last means no next tile to load → no boundary check applies. |
 
+> **Two derived flags added in V2 (m16x8).** `kHasPv = (!kPvAtEnd) &&
+> (!kIsFirstIter) && ((!kSkipCompute) || kDoEpilogue)` selects the **deferred
+> PV** of the previous tile at call start (hi warps). The **deferred strip-3**
+> consume (§8.13) runs on `(!kIsRopeWarp) && (!kIsFirstIter)`. Both piggyback
+> on the same four template params — no new template args.
+
 ### 12.2 Iter classification
 
 For each warp, the host wrapper walks `[kv_start, kv_end)` in steps of
-`kBlockN = 32` and classifies each iter:
+`kBlockN` (**64** for m16x8, 32 for m16x4) and classifies each iter:
 
 | Iter class | $(\text{kIsFirstIter}, \text{kSkipCompute}, \text{kEpilogueType}, \text{kCheckBoundaryNext})$ |
 |---|---|
@@ -2039,6 +2181,8 @@ ISA inspection + careful diff are good at; raw "add a printf" is not.
 | 1 | `v_cvt_scalef32_pk_bf16_fp8 v[N]` with `N` as inline-asm template int silently produces garbage (consumer MFMA reads stale data). | The pinned-DST form IS correct, but the compiler can't see VALU→MFMA RAW hazard across the opaque inline-asm boundary. Without a manual `s_nop`, the cvt's writeback misses the MFMA's read window. | Use the `cvt_scalef32_pk_bf16_fp8_pinned` wrapper from `hk_mla_utils.cuh` which emits the `s_nop` (or use the `v_mov` trampoline form). |
 | 2 | `e8m0_to_f32` returning wrong scale on V40 KV path — ~88 % output mismatch under `att`. | The pure-C++ form `bit_cast<float>(b << 23)` is SSA. LLVM's machine-sink/LICM hoists it cross-BB past the matching `s_waitcnt` to the original `buffer_load_ubyte` def site — racing the load. `sched_barrier(0)` is *intra-BB only*; cross-BB sinks ignore it. | `asm volatile("v_lshlrev_b32 …")`. `asm volatile` is the only cross-BB ordering construct LLVM honors against asm-volatile loads. |
 | 3 | `PROBE_*_ITER` macros appear to "default to whatever the source says" but actually evaluate to 0 regardless. | `aiter/jit/optCompilerConfig.json` force-defines them via env var on the compile command line; source `#ifndef` defaults never fire. | Comment out the entry in `optCompilerConfig.json` for local debugging, then restore. |
+| 9 | (m16x8/slim) An `s_waitcnt vmcnt(0)` appears between the `v_bitop3` col swizzle and the prefetch `buffer_load` in the KV-tile loop — a full vmem drain that kills carrier/staging overlap. | The prefetch address is `row_kv_ld << 9 + …`, and `row_kv_ld` comes from a `buffer_load_dword` in `get_kv_ld_row`. The compiler **rematerializes** that index load inline right before the address, so using the loaded value as a load *address* forces a `vmcnt(0)`. | Pin the already-resolved index in a VGPR so it can't be rematerialized: `asm volatile("" : "+v"(row_kv_ld_next));` right after `row_kv_ld_next = row_kv_ld_next_next;`. Costs 1 scratch VGPR (see Ch. 5.2). |
+| 10 | (m16x8) De-packing the epilogue `oaccu` normalize with `hk::mul(oaccu, oaccu, 1/row_sum_e)` fails to compile (`invalid operand for inline asm constraint 'i'`). | `macros::mul`'s scalar op uses an `"i"` (immediate) constraint — valid only for a compile-time-constant scalar, not the runtime `1/row_sum_e`. `hk::mul_vgpr` uses `"v"` (packed). | For the de-packed sweep, emit `v_mul_f32_e32 v[%0], %1, v[%0]` with a `"v"` operand in a `static_for` over `k_o_sz` (Ch. 9.9 / 10). |
 
 ### 13.2 Memory-permutation / layout gotchas
 
@@ -2053,19 +2197,25 @@ ISA inspection + careful diff are good at; raw "add a printf" is not.
 | # | Symptom | Root cause | Fix |
 |---:|---|---|---|
 | 7 | Stochastic NaN in V40 output at `b ≥ 4`. `-ms` (max-splits) flag has no effect on perf or correctness. | `csrc/kernels/mla/metadata/v1_2_device.cuh:141` has a leftover debug override: `int32_t remain_payload = 0x7fffffff;` (was `= payload`). With splitting disabled, all works pile on `WG=0`; the epilogue's `p_lds_o` reads race the *next* work's `load_q` writes (intra-WG work-loop hazard). | Revert to `= payload`. |
+| 11 | (host) After trimming branch-only changes back toward main, `module_mla_metadata` fails to build (`number of argument annotations does not match`), or `aiter.MlaVersion` is missing at runtime. | The `MLA_METADATA_PYBIND` macro in `rocm_ops.hpp` was reverted to main's arg list (no `MlaVersion` enum, `dtype_q/dtype_kv` instead of the four `dtype_*_nope/rope` + `mla_version`), but the C++ `get_mla_metadata_v1` still has the V40 signature → pybind arg-count mismatch. | Keep the V40 `MLA_METADATA_PYBIND` (enum + `mla_version` + `dtype_{q,kv}_{nope,rope}`) whenever the C++ signature has them. |
+
+**Deferred strip-3 WAR (m16x8, §8.13).** Not a bug today, but the invariant
+to preserve: the iter N+1 deferred consume must ds_read staging slot 1 and
+complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
+`buffer_load_lds` into that slot. Reorder at your peril.
 
 ### 13.4 Confirmed-not-a-bug
 
 | # | What was suspected | What's actually true |
 |---:|---|---|
-| 8 | The pinned Q VGPRs (v72..v103) might be getting clobbered mid-loop (any V40 numerical mismatch). | Phase A's pinned-q region is **read-only** after Phase 1 prologue. Proven by ISA scan + runtime probe ([[v40-pinned-q-read-only-confirmed]]). When a V40 mismatch is being debugged, eliminate Q as suspect first — look downstream (K/V load, sb8 perm, OMgr un-perm). |
+| 8 | The pinned Q VGPRs (v64..v127) might be getting clobbered mid-loop (any V40 numerical mismatch). | The pinned-q region is **read-only** after the prologue. Proven by ISA scan + runtime probe ([[v40-pinned-q-read-only-confirmed]]). When a V40 mismatch is being debugged, eliminate Q as suspect first — look downstream (K/V load, sb8 perm, OMgr un-perm). |
 
 ### 13.5 Tools to reach for
 
 - `check-unpinned-reg-usage` skill (`.claude/skills/check-unpinned-reg-usage/`)
-  — scans the post-`-save-temps` `.s` file for decimal `v ≥ 64` and
-  spill > 0. Run after every nontrivial change. Current state:
-  `budget=64 / spill=0 / free=0`. Zero headroom.
+  — scans the post-`--save-temps` `.s` file for decimal `v ≥ N` (the scratch
+  budget) and spill > 0. Run after every nontrivial change. Current state:
+  m16x8 `budget=36 / spill=0`; m16x4 `budget=44 / spill=0`.
 - ISA inspection (`-save-temps` + read the `.s` file) is the only way
   to catch compiler-hoist / inline-asm hazards above. Standard
   printf-debugging will not find them.
@@ -2079,11 +2229,13 @@ ISA inspection + careful diff are good at; raw "add a printf" is not.
 
 | File | What it contains |
 |---|---|
-| `csrc/kernels/mla/hk_v40_decode_fwd.cu` | Host wrapper. Dispatches to the kernel for the wired `(H=128, mtp=1)` case on gfx950. |
-| `csrc/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh` | Main kernel: persistent work loop, `mla_main` lambda + dispatch ladder, pinned-VGPR & LDS layout, QK Phase A/B fusion, softmax, PV gemm + oaccu rescale, epilogue. |
-| `csrc/kernels/mla/hk/hk_mla_v40_buffer_managers_gen1.cuh` | V40-only managers: `QManager8to16bitsV1`, `KvManager8to16bitsV1`, `OManager16bitsV4Gen1Swizzle`, `OManager32bitsV4Gen1Swizzle`, `OManager32bitsV4Gen1SwNoStage`. Also the sb8 perm helpers (`sb8_perm_col_elems`, `sb8_inv_perm_col_elems`). |
-| `csrc/kernels/mla/hk/hk_mla_softmax.cuh` | Online-softmax helpers: `softmax_scale_p`, `softmax_p0`, `softmax_p1`, `softmax_p1_16`. Free functions, no class state. |
-| `csrc/kernels/mla/hk/hk_mla_utils.cuh` | Shared with V32: traits (`HkMlaV40DecodeFwdTraits`, `HkMlaV32DecodeFwdTraits`), enums (`PvGemmEpilogueType`), and helpers under `namespace hk_mla`: `e8m0_to_f32`, `encode_s_waitcnt`, `max_8`, `sum_8`, `warp_reduce`, `cvt_scalef32_pk_bf16_fp8_pinned`, `pack_2f32_to_bf16_pair_pinned`, `float_2_bf16_pair`, `get_kv_ld_row`. |
+| `aiter/mla.py::mla_v40_decode_fwd` | Python router → `hk_mla_v40_decode_fwd` (decode) + `mla_reduce_v1` (reduce). Picks m16x8 (`H·mtp=128`) or m16x4 (`=64`). |
+| `csrc/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh` | **m16x8** kernel (kBlockN=64, V2 KV pipeline): persistent work loop, `mla_main` lambda + dispatch ladder, pinned-VGPR & LDS layout, KV Phase A/B, deferred strip-3, softmax (kUsePk), merged PV (`hk_mla_v40_pv_stage`), epilogue (oaccu de-pack normalize). |
+| `csrc/kernels/mla/hk/mi35x_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1.cuh` | **m16x4** kernel (kBlockN=32, V1 KV pipeline, occupancy 2). |
+| `csrc/kernels/mla/hk/hk_mla_v40_fwd_decode_gen1_common.cuh` | `HkMlaV40Regs<T>` — the single source of truth for the pinned-VGPR map + `hk_mla_v40_pv_stage`/`hk_mla_v40_pv_gemm` (shared by both partitions). |
+| `csrc/kernels/mla/hk/hk_mla_v40_buffer_managers_gen1.cuh` | V40-only managers: `QManager8to16bitsV1`, `KvManager8to16bitsV1`, **`KvManager8to16bitsV2` (: public V1)**, `OManager16bitsV4Gen1Swizzle`, `OManager32bitsV4Gen1Swizzle`, `OManager32bitsV4Gen1SwNoStage`. Also the sb8 perm helpers. |
+| `csrc/kernels/mla/hk/hk_mla_softmax.cuh` | Online-softmax helpers, all `kUsePk`-templated: `softmax_mask_p`, `softmax_p1_prescaled_16`, `set_ninf1/2`. |
+| `csrc/kernels/mla/hk/hk_mla_utils.cuh` | Shared with V32: traits, enums (`PvGemmEpilogueType`), and `namespace hk_mla` helpers: `e8m0_to_f32`, `encode_s_waitcnt`, `max_16`, `warp_reduce`, `cvt_scalef32_pk_bf16_fp8_pinned`, `pack_2f32_to_bf16_pair_pinned`, `get_kv_ld_row`. |
 
 ### 14.2 Adjacent (not V40 Gen.1 but referenced)
 
@@ -2100,7 +2252,7 @@ ISA inspection + careful diff are good at; raw "add a printf" is not.
 
 | Path | Purpose |
 |---|---|
-| `.claude/skills/check-unpinned-reg-usage/` | ISA audit script — scans the post-`-save-temps` `.s` for decimal `v ≥ 64` and `spill > 0`. Run after every nontrivial change to this kernel. Current budget: 64 / spill: 0 / free: 0. |
+| `.claude/skills/check-unpinned-reg-usage/` | ISA audit script — scans the post-`--save-temps` `.s` for decimal `v ≥ N` (scratch budget) and `spill > 0`. Run after every nontrivial change. Budgets: m16x8 = 36, m16x4 = 44; spill 0. |
 
 ## Chapter 15 — Glossary & cross-refs
 
@@ -2110,13 +2262,16 @@ ISA inspection + careful diff are good at; raw "add a printf" is not.
 |---|---|
 | **D**, $D_{\mathrm{NoPE}}$, $D_{\mathrm{RoPE}}$, $D_{\mathrm{QK}}$, $D_V$ | Head dims: 448 fp8 NoPE, 64 bf16 RoPE, 512 = 448 + 64 (= $D_V$ in V4 since PV consumes the full bf16-cast slice). |
 | **Gen.1** | This kernel family: one wave per ptile, m=16, 8 ptiles per WG. A Gen.2 is anticipated (m=32, 2 waves/ptile, 4 ptiles/WG); the `_gen1` postfix reserves room. |
-| **m16x8** | Naming convention: "m=16 mfma rows per ptile, 8 ptiles per WG." |
+| **m16x8** | Naming convention: "m=16 mfma rows per ptile, 8 ptiles per WG." `W = H·mtp = 128`, kBlockN=64, V2 KV pipeline, occupancy 1. |
+| **m16x4** | The `W = 64` sibling: 4 ptiles per WG, kBlockN=32, V1 KV pipeline, occupancy 2. |
+| **LoNoPEWarp / HiRoPEWarp** | The two m16x8 warp types (4 warps each). Lo = tile 0 (cols 0–255, pure NoPE), PV-at-end, packed softmax, de-packed oaccu-normalize. Hi = tile 1 (cols 256–511, NoPE+RoPE), deferred PV, de-packed softmax, packed oaccu-normalize. |
+| **deferred strip-3** | m16x8 lo-warp cross-iter pipeline: strip 3's cvt+store is moved to the next iter's top (§8.13). |
 | **MTP** | Multi-token-prediction. Number of query tokens predicted per decode step. Different $(H, \mathrm{mtp})$ combos all satisfying $H \cdot \mathrm{mtp} = 128$ ride the same kernel template (Ch. 2.3). |
 | **NoPE / RoPE** | Non-positional (fp8, scaled by E8M0) vs RoPE tail (bf16). The two halves of $D$ are loaded and laid out by different paths (Ch. 7, Ch. 8). |
 | **oaccu** | The fp32 output accumulator. 16 rows × 512 cols, lives entirely in pinned `v128..v255` (128 vgprs/lane). |
-| **p_comp / p_mfma** | Softmax output: `p_comp` = fp32 (v120..v127, 8/lane), `p_mfma` = bf16 (v120..v123, 4/lane, overlay on p_comp's low half). |
+| **p_comp / p_mfma** | Softmax output (m16x8): `p_comp` = fp32 (v48..v63, 16/lane), `p_mfma` = bf16 (v48..v55, 8/lane, overlay on p_comp's low half). |
 | **Phase A / Phase B** | A **D-axis split** of QK: Phase A reads Q from pinned VGPR (Q[:, 0:256]), Phase B reads Q from LDS (Q[:, 256:512]). Not a warp-role swap. |
-| **pong** | One of two 32 KiB LDS slots holding a KV tile. Swap each iter. |
+| **pong** | One of two LDS slots holding a KV tile (m16x8: 64 KiB; m16x4: 32 KiB). Swap each iter. |
 | **prefetch chain** | The KvManager's `prefetch → cvt+store → wait` 3-routine split that lets vmem latency hide under QK mfma. |
 | **ptile** | One processing tile = one group's worth of work. Gen.1: ptile = 1 wave. The term is local to this doc; the AMD term "Compute Unit" means something different. |
 | **sb8 perm** | Sub-tile-of-8 permutation $[0,2,4,6,1,3,5,7]$ applied to a 64-col wave-tile's D-axis. Reorders 8 sub-tiles of 8 elements each; equivalent to swapping bits [3] and [5] of the col-element index. Eliminates the 2-way `ds_write_b128` writer-side bank conflict. Applied identically to Q and K (Ch. 7.2.4). |
