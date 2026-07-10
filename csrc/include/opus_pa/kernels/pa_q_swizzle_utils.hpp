@@ -1,4 +1,4 @@
-// sp3 Q_lds_rd / Q_scale / Q_dyn_qt / Q_reshape — Phase 4.
+// asm Q_lds_rd / Q_scale / Q_dyn_qt / Q_reshape — Phase 4.
 #pragma once
 
 #include <cmath>
@@ -18,7 +18,7 @@ static constexpr int kDynRspDwords = 768;  // Q reshape uses <=704 dwords per wa
 
 __device__ __forceinline__ float bf16_to_float(bf16_t v) { return static_cast<float>(v); }
 
-// sp3 Q_lds_rd_addr_gen
+// asm Q_lds_rd_addr_gen
 __device__ __forceinline__ uint32_t q_lds_rd_byte_offset(int lane, int wave) {
     const int h_id = lane >> 4;
     const int r_id = lane & 0xf;
@@ -26,7 +26,7 @@ __device__ __forceinline__ uint32_t q_lds_rd_byte_offset(int lane, int wave) {
     return static_cast<uint32_t>(dw_off * 4 + wave * 32);
 }
 
-// sp3 Q_lds_rd(0, 2): two ds_read_b64 per lane
+// asm Q_lds_rd(0, 2): two ds_read_b64 per lane
 __device__ __forceinline__ void q_lds_rd(const bf16_t* q_lds,
                                          int lane,
                                          int wave,
@@ -41,7 +41,7 @@ __device__ __forceinline__ void q_lds_rd(const bf16_t* q_lds,
     q_regs[7] = 0;
 }
 
-// sp3 Q_scale for BF16 (Q_FP16 == 0): unpack packed bf16 dwords to fp32 lanes
+// asm Q_scale for BF16 (Q_FP16 == 0): unpack packed bf16 dwords to fp32 lanes
 __device__ __forceinline__ void q_scale_bf16(uint32_t q_regs[kQRegDwords]) {
     for (int k = 0; k < kQRegDwords; k += 4) {
         const uint32_t w0 = q_regs[k + 0];
@@ -99,7 +99,7 @@ __device__ __forceinline__ float dyn_qt_wave_absmax(float* dyn_max_lds, int lane
     return dyn_max_lds[wave_base] + 1e-6f;
 }
 
-// sp3 Q_dyn_qt — per-lane fp32 regs -> fp8-packed dwords in q_regs[0..1]
+// asm Q_dyn_qt — per-lane fp32 regs -> fp8-packed dwords in q_regs[0..1]
 __device__ __forceinline__ void q_dyn_qt_lane(uint32_t q_regs[kQRegDwords],
                                             float& q_deq_scale,
                                             int lane,
@@ -133,7 +133,7 @@ __device__ __forceinline__ void q_dyn_qt_lane(uint32_t q_regs[kQRegDwords],
     }
 }
 
-// sp3 Dyn_qnt_resp_lds_wr_addr_gen
+// asm Dyn_qnt_resp_lds_wr_addr_gen
 __device__ __forceinline__ uint32_t q_reshape_wr_dword_offset(int lane, int wave) {
     const int h_id = lane >> 5;
     const int r_id = lane & 0x1f;
@@ -142,14 +142,14 @@ __device__ __forceinline__ uint32_t q_reshape_wr_dword_offset(int lane, int wave
     return static_cast<uint32_t>(h_id * 32 + p_id + q_id * 2 + wave * 64);
 }
 
-// sp3 Q_reshape_wr + Q_reshape_rd
+// asm Q_reshape_wr + Q_reshape_rd
 __device__ __forceinline__ void q_reshape(uint32_t q_regs[kQRegDwords], uint32_t* dyn_resp_lds, int lane, int wave) {
     const uint32_t wr_base = q_reshape_wr_dword_offset(lane, wave);
     dyn_resp_lds[wr_base + 0] = q_regs[0];
     dyn_resp_lds[wr_base + 256] = q_regs[1];
     __syncthreads();
 
-    // sp3 Q_reshape_rd / Dyn_qnt_resp_lds_rd_addr_gen
+    // asm Q_reshape_rd / Dyn_qnt_resp_lds_rd_addr_gen
     const int h_id = lane >> 4;
     const int q_id = lane & 0xf;
     const uint32_t rd_base = static_cast<uint32_t>(h_id * 64 + q_id * 2);
@@ -164,7 +164,7 @@ __device__ __forceinline__ void q_reshape(uint32_t q_regs[kQRegDwords], uint32_t
     }
 }
 
-// Full sp3 Q path: lds_rd -> scale -> dyn_qt -> reshape
+// Full asm Q path: lds_rd -> scale -> dyn_qt -> reshape
 template<int HEAD_DIM>
 __device__ __forceinline__ void q_swizzle_pipeline(const bf16_t* q_lds,
                                                    int lane,
@@ -228,12 +228,12 @@ __device__ __forceinline__ void q_swizzle_pipeline_legacy(const bf16_t* q_lds,
     q_swizzle_pipeline<HEAD_DIM>(q_lds, lane, wave, q_mfma_regs, dyn_resp_lds, q_deq_scale);
 }
 
-// sp3 _v_unPack: row_shl:[8] bound_ctrl on 0xffffffff -> lanes (r*16+0..7) keep, (+8..15) zero.
+// asm _v_unPack: row_shl:[8] bound_ctrl on 0xffffffff -> lanes (r*16+0..7) keep, (+8..15) zero.
 __device__ __forceinline__ float q_deq_unpack_lane_mask(int lane) {
     return ((lane & 15) < 8) ? 1.f : 0.f;
 }
 
-// sp3 row_shr:[8] broadcast on _v_Q_deQ + collect per-query scales (lane groups 0..3).
+// asm row_shr:[8] broadcast on _v_Q_deQ + collect per-query scales (lane groups 0..3).
 template<int GQA>
 __device__ __forceinline__ void q_deq_broadcast_and_collect(float lane_deq,
                                                             float q_deq_scales[GQA]) {

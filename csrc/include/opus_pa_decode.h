@@ -6,7 +6,7 @@
 
 #include <optional>
 
-// Opus-based paged attention decode (BF16 Q + FP8 KV, sp3 MFMA path).
+// Opus-based paged attention decode (BF16 Q + FP8 KV, asm MFMA path).
 // API mirrors pa_fwd_asm / asm_pa.cu.
 void pa_opus_fwd(aiter_tensor_t& Q,
                  aiter_tensor_t& K,

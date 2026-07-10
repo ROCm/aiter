@@ -1,4 +1,4 @@
-// sp3 cl_gemm0 — full MFMA GEMM0 register layout (Phase 4).
+// asm cl_gemm0 — full MFMA GEMM0 register layout (Phase 4).
 #pragma once
 
 #include <cstdint>
@@ -29,7 +29,7 @@ __device__ __forceinline__ mfma_acc4 mfma_fp8_fp8_step(mfma_acc4 acc,
     return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(a, b, acc, 0, 0, 0);
 }
 
-// sp3 cl_gemm1 asm: v_mfma v_R, v_V, v_S. Default (P,V) matches HIP R=P@V packing;
+// asm cl_gemm1 asm: v_mfma v_R, v_V, v_S. Default (P,V) matches HIP R=P@V packing;
 // PA_GEMM1_SWAP_AB=1 uses asm operand order (V,P).
 __device__ __forceinline__ mfma_acc4 mfma_fp8_fp8_gemm1_step(mfma_acc4 acc,
                                                              uint64_t p_packed,
@@ -47,7 +47,7 @@ __device__ __forceinline__ uint64_t pack_u64(uint32_t lo, uint32_t hi) {
     return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
 }
 
-// sp3 cl_gemm0(cl_p, pi): j in [0, SUB_KV/64), k in [0, HEAD_DIM/32)
+// asm cl_gemm0(cl_p, pi): j in [0, SUB_KV/64), k in [0, HEAD_DIM/32)
 template<int SUB_KV, int HEAD_DIM, int KV_REG_DWORDS>
 __device__ __forceinline__ void cl_gemm0_fp8(const uint32_t* k_regs,
                                              const uint32_t* q_regs,

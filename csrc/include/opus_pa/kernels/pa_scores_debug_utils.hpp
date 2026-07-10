@@ -10,7 +10,7 @@
 
 namespace pa_decode {
 
-// sp3 MFMA scatter indices: kv = pi*(SUB_KV/2) + j*64 + col, j in [0, SUB_KV/64).
+// asm MFMA scatter indices: kv = pi*(SUB_KV/2) + j*64 + col, j in [0, SUB_KV/64).
 template<int SUB_KV>
 __device__ __forceinline__ int mfma_sparse_kv_index(int pi, int j, int col) {
     return pi * (SUB_KV / 2) + j * 64 + col;

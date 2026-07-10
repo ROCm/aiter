@@ -226,7 +226,7 @@ __device__ __forceinline__ uint8_t float_to_fp8_e4m3_bias8(float x) {
 #endif
 }
 
-// Pack four fp32 into one dword (sp3 v_cvt_pk_fp8_f32 x2).
+// Pack four fp32 into one dword (asm v_cvt_pk_fp8_f32 x2).
 __device__ __forceinline__ uint32_t float4_to_fp8_pk(float a, float b, float c, float d) {
 #if defined(__gfx942__) || defined(__gfx950__)
     uint32_t w = 0;

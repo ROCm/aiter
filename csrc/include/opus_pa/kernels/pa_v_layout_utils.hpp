@@ -11,7 +11,7 @@
 
 namespace pa_decode {
 
-// sp3 prologue: V_buf += tg_idx * stride_kvhead + wave_id * 256 (K only gets tg offset).
+// asm prologue: V_buf += tg_idx * stride_kvhead + wave_id * 256 (K only gets tg offset).
 __device__ __forceinline__ uint32_t v_pool_lane_base_offset(int lane, int wave, int tg_idx,
                                                             uint32_t stride_kvhead) {
     return v_lane_byte_offset(lane) + static_cast<uint32_t>(tg_idx) * stride_kvhead +

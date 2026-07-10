@@ -1,4 +1,4 @@
-// MFMA tile GEMM0/1 main path (sp3 cl_gemm0/cl_gemm1 + pi ping-pong).
+// MFMA tile GEMM0/1 main path (asm cl_gemm0/cl_gemm1 + pi ping-pong).
 #pragma once
 
 #include <cstdint>
@@ -168,7 +168,7 @@ __device__ __forceinline__ void load_v_regs_tile(const uint8_t* v_pool,
 }
 
 // Accumulate MFMA GEMM1 head slice into O (multiply by per-query p_deq after MFMA).
-// sp3 cl_gemm1(pi): vV_off = pi*sz_vV + j*sz_vV/2 + k*vs_AB, k in [0, 128/32).
+// asm cl_gemm1(pi): vV_off = pi*sz_vV + j*sz_vV/2 + k*vs_AB, k in [0, 128/32).
 template<int GQA, int SUB_KV, int HEAD_DIM, int BLOCK_SIZE, int KV_REG_DWORDS>
 __device__ __forceinline__ void gemm1_mfma_pi(const uint8_t (*p_fp8)[SUB_KV],
                                               const uint32_t* v_regs,
@@ -189,7 +189,7 @@ __device__ __forceinline__ void gemm1_mfma_pi(const uint8_t (*p_fp8)[SUB_KV],
                                               int wave) {
     constexpr int kHalf = SUB_KV / 2;
     constexpr int kNumJ = HEAD_DIM / 64;
-    constexpr int kNumK = kHalf / 32;  // sp3: 128/32 per pi
+    constexpr int kNumK = kHalf / 32;  // asm: 128/32 per pi
     constexpr int kPiKvSlice = 32;
 
     const int kv_pi_base = pi * kHalf;
@@ -266,7 +266,7 @@ __device__ __forceinline__ void gemm1_prepare_p_merged(
     }
 }
 
-// Bisect path: one-shot sp3 cl_gemm1 (8 K-steps) with merged P + full V register tile.
+// Bisect path: one-shot asm cl_gemm1 (8 K-steps) with merged P + full V register tile.
 template<int GQA, int SUB_KV, int HEAD_DIM, int BLOCK_SIZE, int KV_REG_DWORDS, int NUM_PAIRS,
          int LOAD_INSTS, int IMM_STRIDE>
 __device__ __forceinline__ void gemm1_clgemm1_tile(const uint8_t p_fp8[GQA][SUB_KV],
@@ -393,7 +393,7 @@ __device__ __forceinline__ void gemm1_mfma_tile(const uint8_t p_fp8[GQA][SUB_KV]
     constexpr int kHalf = SUB_KV / 2;
     uint32_t v_regs[KV_REG_DWORDS * kPiCount] = {};
 #if !defined(PA_GEMM1_VGATHER)
-    // With VGATHER the V operand is gathered from HBM; the sp3 V register global-load
+    // With VGATHER the V operand is gathered from HBM; the asm V register global-load
     // port is disabled (its OOB reads could fault).
     load_v_regs_tile<SUB_KV, HEAD_DIM, BLOCK_SIZE, KV_REG_DWORDS, NUM_PAIRS, LOAD_INSTS,
                      IMM_STRIDE>(

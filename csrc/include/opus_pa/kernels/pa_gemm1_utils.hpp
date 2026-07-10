@@ -1,4 +1,4 @@
-// sp3 cl_gemm1 + R_div_L (Phase 5 smoke).
+// asm cl_gemm1 + R_div_L (Phase 5 smoke).
 #pragma once
 
 #include <cstdint>
@@ -15,10 +15,10 @@
 namespace pa_decode {
 
 static constexpr int kSzVv = 32;  // sz_vV
-static constexpr int kSzVvHalf = kSzVv / 2;  // sp3: j*sz_vV/2 — 16 dwords per 64-dim head slice
-static constexpr int kPiKSteps = 128 / 32;   // sp3 per-pi: 128/32 = 4 MFMA K steps
+static constexpr int kSzVvHalf = kSzVv / 2;  // asm: j*sz_vV/2 — 16 dwords per 64-dim head slice
+static constexpr int kPiKSteps = 128 / 32;   // asm per-pi: 128/32 = 4 MFMA K steps
 
-// sp3 cl_gemm1: R = P @ V, P is FP8 [16 x SUB_KV], V is FP8 [SUB_KV x HEAD_DIM].
+// asm cl_gemm1: R = P @ V, P is FP8 [16 x SUB_KV], V is FP8 [SUB_KV x HEAD_DIM].
 template<int SUB_KV, int HEAD_DIM, int KV_REG_DWORDS>
 __device__ __forceinline__ void cl_gemm1_fp8(const uint32_t* v_regs,
                                              const uint32_t* p_regs,
@@ -49,7 +49,7 @@ __device__ __forceinline__ void cl_gemm1_fp8(const uint32_t* v_regs,
     }
 }
 
-// sp3 R_div_L (single-tile smoke): normalize MFMA R accumulator by softmax row sum L.
+// asm R_div_L (single-tile smoke): normalize MFMA R accumulator by softmax row sum L.
 template<int GQA>
 __device__ __forceinline__ float r_div_l_smoke(const mfma_acc4 r_mfma[2],
                                                const float L_acc[GQA],

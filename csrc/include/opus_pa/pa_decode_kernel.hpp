@@ -12,7 +12,7 @@
 // Grid: (num_kv_heads, batch, 1)  Block: (BLOCK_THREADS = 256, 4 warps)
 // MFMA: fp8 16×16×32 on gfx942/gfx950.
 //
-// Build flags (module_pa_opus): PA_MFMA_MAIN_PATH=1 PA_SP3_MFMA_GEMM1=1 PA_USE_SP3_PI=1
+// Build flags (module_pa_opus): PA_MFMA_MAIN_PATH=1 PA_MFMA_GEMM0=1 PA_MFMA_GEMM1=1 PA_GEMM1_VGATHER=1
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -51,7 +51,7 @@ __device__ __forceinline__ int wave_id() { return threadIdx.x / 64; }
 
 } // namespace pa_opus
 
-// sp3 structural body (self-contained under opus_pa/kernels/).
+// MFMA structural body (self-contained under opus_pa/kernels/).
 #include "opus_pa/kernels/pa_decode_body.hpp"
 
 // ===========================================================================

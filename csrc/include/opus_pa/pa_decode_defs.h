@@ -4,7 +4,7 @@
 // Opus PA decode kernel — shared types, kargs, traits.
 //
 // `pa_opus_fwd` fuses paged-attention decode (BF16 Q, FP8 KV, GQA8) into one
-// sp3-structural HIP kernel:
+// asm-structural HIP kernel:
 //   prologue -> core_loop(cl_p) per wave-group -> tail -> R_div_L -> write_out
 //
 // Target: gfx942 (MI300X) / gfx950 (MI350), MFMA fp8 16×16×32.

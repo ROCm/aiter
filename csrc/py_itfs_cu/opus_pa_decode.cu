@@ -2,7 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // PA decode kernel instantiation (A16W8 / FP8 KV / GQA8 / head=128 / block=16).
-// Host TU: stub declaration; device TU: opus_pa/kernels sp3 body.
+// Host TU: stub declaration; device TU: opus_pa/kernels asm body.
 #include <hip/hip_runtime.h>
 
 #include "opus_pa/pa_decode_defs.h"

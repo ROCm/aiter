@@ -61,7 +61,7 @@ def pa_fwd_opus(
     high_precision: int = 1,
 ) -> torch.Tensor:
     """
-    Opus-based paged attention decode (sp3 MFMA path, self-contained in opus_pa/).
+    Opus-based paged attention decode (asm MFMA path, self-contained in opus_pa/).
 
     API mirrors pa_fwd_asm. Initial support: bf16 Q, fp8 KV, head_dim=128,
     block_size=16, gqa=8|1.

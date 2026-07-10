@@ -49,7 +49,7 @@ __device__ __forceinline__ uint8_t k_hbm_tile_byte(const uint8_t* k_pool,
     return page_base[k_shuffled_page_offset<HEAD_DIM, BLOCK_SIZE>(in_blk, d)];
 }
 
-// sp3 scale layout: [num_blocks, num_kv_heads, block_size] (see KVQ_load_addr_offs_gen).
+// asm scale layout: [num_blocks, num_kv_heads, block_size] (see KVQ_load_addr_offs_gen).
 __device__ __forceinline__ float kv_scale_at(const float* scale_pool,
                                              uint32_t page_id,
                                              int in_blk,
@@ -276,7 +276,7 @@ __device__ __forceinline__ void gemm0_qk_reference(const uint8_t* q_fp8,
     __syncthreads();
 }
 
-// Gather row-major Q fp8 from post-reshape MFMA Q registers (sp3 v0-v7 layout).
+// Gather row-major Q fp8 from post-reshape MFMA Q registers (asm v0-v7 layout).
 // Each lane holds 32 fp8 (q_regs[0..7]); lanes qi, qi+16, qi+32, qi+48 cover 128 dims.
 template<int GQA, int HEAD_DIM>
 __device__ __forceinline__ void q_fp8_gather_from_mfma_regs(const uint32_t q_regs[8],

@@ -1,4 +1,4 @@
-// sp3 pa_R_procss + R_write_out (Phase 6 smoke).
+// asm pa_R_procss + R_write_out (Phase 6 smoke).
 #pragma once
 
 #include <cstdint>
@@ -10,7 +10,7 @@
 
 namespace pa_decode {
 
-// sp3 pa_R_procss(part=0): rescale accumulated O by online softmax delta before new tile GEMM1.
+// asm pa_R_procss(part=0): rescale accumulated O by online softmax delta before new tile GEMM1.
 template<int GQA, int HEAD_DIM>
 __device__ __forceinline__ void pa_r_procss_rescale(float (*o_acc)[HEAD_DIM],
                                                     const float* delta_scale) {
@@ -33,7 +33,7 @@ __device__ __forceinline__ void o_acc_add_tile(float (*o_acc)[HEAD_DIM],
     __syncthreads();
 }
 
-// sp3 R_div_L + R_write_out: normalize by L and store BF16 O (row-major GQA x HEAD_DIM).
+// asm R_div_L + R_write_out: normalize by L and store BF16 O (row-major GQA x HEAD_DIM).
 template<int GQA, int HEAD_DIM>
 __device__ __forceinline__ void r_write_out_bf16(const float (*o_acc)[HEAD_DIM],
                                                  const float* L_acc,

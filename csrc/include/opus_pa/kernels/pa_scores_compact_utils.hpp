@@ -1,4 +1,4 @@
-// sp3 pa_fuse_alu step0: compact S via row_shr:[8] (DPP simulation).
+// asm pa_fuse_alu step0: compact S via row_shr:[8] (DPP simulation).
 #pragma once
 
 #include <cstdint>
@@ -28,7 +28,7 @@ __device__ __forceinline__ float scores_compact_merge_row_shr8(float lo, float h
     return lo + dpp_row_shr8(hi);
 }
 
-// sp3 pa_fuse step0 compact on _v_S[0..15] -> dense _v_S[0..7].
+// asm pa_fuse step0 compact on _v_S[0..15] -> dense _v_S[0..7].
 __device__ __forceinline__ void scores_compact_lane_regs(float s_lane[kSRegSize]) {
     float upper[kSHalfRegSize];
     for (int k = 0; k < kSHalfRegSize; ++k) {

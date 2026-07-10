@@ -1,4 +1,4 @@
-// sp3 pa_fuse_alu — scale(S) + online softmax + dyn_quant(P) for GEMM1.
+// asm pa_fuse_alu — scale(S) + online softmax + dyn_quant(P) for GEMM1.
 #pragma once
 
 #include <cmath>
@@ -19,7 +19,7 @@ static constexpr float kNegInf = -1.0e30f;
 // AMD v_exp_f32 computes 2^x (log2 domain softmax).
 __device__ __forceinline__ float pa_exp2_scaled(float x) { return exp2f(x); }
 
-// sp3 LDS_DYN_MAX layout: slot = wave*64 + threadIdx, 16 rows x 16 slots.
+// asm LDS_DYN_MAX layout: slot = wave*64 + threadIdx, 16 rows x 16 slots.
 static constexpr int kLdsDynMaxSlots = 256;
 
 __device__ __forceinline__ uint32_t lds_dyn_max_wr_byte_offset(int thread_idx, int wave) {
@@ -108,7 +108,7 @@ __device__ __forceinline__ void scores_apply_qk_dequant_pi(float (*s_scores)[SUB
     __syncthreads();
 }
 
-// Per-pi slice absmax for P quant (sp3 pa_fuse step6.6 on pi slice only).
+// Per-pi slice absmax for P quant (asm pa_fuse step6.6 on pi slice only).
 template<int GQA, int SUB_KV>
 __device__ __forceinline__ void pa_fuse_compute_row_dyn_scales_slice(float (*s_vq)[SUB_KV],
                                                                      int kv_base,
@@ -179,7 +179,7 @@ __device__ __forceinline__ void pa_fuse_quant_p_slice(float (*s_vq)[SUB_KV],
     __syncthreads();
 }
 
-// Apply sp3 step2/2.5 dequant on raw MFMA GEMM0 scores (full tile).
+// Apply asm step2/2.5 dequant on raw MFMA GEMM0 scores (full tile).
 template<int GQA, int SUB_KV>
 __device__ __forceinline__ void scores_apply_qk_dequant(float (*s_scores)[SUB_KV],
                                                         int tile_kv,
@@ -196,7 +196,7 @@ __device__ __forceinline__ void scores_apply_qk_dequant(float (*s_scores)[SUB_KV
     __syncthreads();
 }
 
-// sp3 pa_fuse step3: per-lane partial row max -> LDS -> read 16 slots -> full row max.
+// asm pa_fuse step3: per-lane partial row max -> LDS -> read 16 slots -> full row max.
 template<int GQA>
 __device__ __forceinline__ void pa_fuse_row_max_lds(const float s_lane_partial[kSHalfRegSize],
                                                   float* lds_dyn_max,
@@ -317,7 +317,7 @@ __device__ __forceinline__ void pa_fuse_alu_slice(float (*s_scores)[SUB_KV],
     __syncthreads();
 }
 
-// sp3 core_loop per-pi: fuse slice + per-slice P quant + p_deq for cl_gemm1(pi).
+// asm core_loop per-pi: fuse slice + per-slice P quant + p_deq for cl_gemm1(pi).
 template<int GQA, int SUB_KV>
 __device__ __forceinline__ void pa_fuse_alu_pi_tile(float (*s_scores)[SUB_KV],
                                                     int pi,
@@ -340,7 +340,7 @@ __device__ __forceinline__ void pa_fuse_alu_pi_tile(float (*s_scores)[SUB_KV],
     pa_fuse_quant_p_slice<GQA, SUB_KV>(s_scores, kv_base, kHalf, tile_kv, p_fp8, row_dyn_scale);
 }
 
-// Rescale unnormalized O accumulator with the same online-softmax delta as L (sp3 step6).
+// Rescale unnormalized O accumulator with the same online-softmax delta as L (asm step6).
 template<int GQA, int HEAD_DIM>
 __device__ __forceinline__ void pa_fuse_rescale_o_acc(float (*o_acc)[HEAD_DIM],
                                                       const float* delta_scale) {
@@ -509,7 +509,7 @@ __device__ __forceinline__ void p_fp8_gather_lane_packed(const uint8_t p_fp8[GQA
                 (static_cast<uint32_t>(bytes[6]) << 16) | (static_cast<uint32_t>(bytes[7]) << 24);
 }
 
-// Gather FP8 P for GEMM1 MFMA A-operand (sp3 cl_gemm1): kv index has no wave offset.
+// Gather FP8 P for GEMM1 MFMA A-operand (asm cl_gemm1): kv index has no wave offset.
 template<int GQA, int SUB_KV, int P_SLICE>
 __device__ __forceinline__ void p_fp8_gather_lane_packed_gemm1(const uint8_t p_fp8[GQA][SUB_KV],
                                                                int kv_base,
@@ -591,7 +591,7 @@ __device__ __forceinline__ void p_fp8_to_compact_regs(const uint8_t* p_fp8_row,
     p_fp8_to_compact_regs_slice<SUB_KV>(p_fp8_row, 0, lane, p_compact);
 }
 
-// sp3 step9: DPP row_shl:[8] on 32-bit P fp8 packs.
+// asm step9: DPP row_shl:[8] on 32-bit P fp8 packs.
 __device__ __forceinline__ uint32_t dpp_row_shl8_u32(uint32_t v) {
 #if defined(__gfx942__) || defined(__gfx950__)
     const int bits = __builtin_amdgcn_mov_dpp(static_cast<int>(v), 0x114, 0xf, 0xf, true);
@@ -602,8 +602,8 @@ __device__ __forceinline__ uint32_t dpp_row_shl8_u32(uint32_t v) {
 #endif
 }
 
-// sp3 prologue: row_shl:[8] bound_ctrl on 0xffffffff -> _v_unPack (lanes 0..7 keep, 8..15 zero).
-__device__ __forceinline__ uint32_t p_sp3_unpack_mask_u32(int lane) {
+// asm prologue: row_shl:[8] bound_ctrl on 0xffffffff -> _v_unPack (lanes 0..7 keep, 8..15 zero).
+__device__ __forceinline__ uint32_t p_unpack_mask_u32(int lane) {
 #if defined(__gfx942__) || defined(__gfx950__)
     (void)lane;
     return dpp_row_shl8_u32(0xffffffffu);
@@ -612,8 +612,8 @@ __device__ __forceinline__ uint32_t p_sp3_unpack_mask_u32(int lane) {
 #endif
 }
 
-// sp3 pa_fuse step8 (S-reshape wr/rd) + step9 (row_shl decompact) -> _v_S[0..15] for cl_gemm1.
-__device__ __forceinline__ void p_reshape_sp3_step8_9(const uint32_t p_compact[2],
+// asm pa_fuse step8 (S-reshape wr/rd) + step9 (row_shl decompact) -> _v_S[0..15] for cl_gemm1.
+__device__ __forceinline__ void p_reshape_step8_9(const uint32_t p_compact[2],
                                                       uint32_t* dyn_resp_lds,
                                                       int lane,
                                                       int wave,
@@ -643,7 +643,7 @@ __device__ __forceinline__ void p_reshape_sp3_step8_9(const uint32_t p_compact[2
     }
 
     // step9: v_S[8+k] = row_shl v_S[k]; v_S[k] &= _v_unPack.
-    const uint32_t unpack = p_sp3_unpack_mask_u32(lane);
+    const uint32_t unpack = p_unpack_mask_u32(lane);
 #pragma unroll
     for (int k = 0; k < kSHalfRegSize; ++k) {
         p_regs[k + kSHalfRegSize] = dpp_row_shl8_u32(s_lane[k]);
@@ -656,7 +656,7 @@ __device__ __forceinline__ void p_reshape_for_gemm1(const uint32_t p_compact[2],
                                                     int lane,
                                                     int wave,
                                                     uint32_t p_regs[16]) {
-    p_reshape_sp3_step8_9(p_compact, dyn_resp_lds, lane, wave, p_regs);
+    p_reshape_step8_9(p_compact, dyn_resp_lds, lane, wave, p_regs);
 }
 
 template<int GQA, int SUB_KV, int P_SLICE>

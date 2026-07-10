@@ -15,7 +15,7 @@ __device__ __forceinline__ void mfma16_lane_to_mn(int lane, int k, int& row, int
     row = ((lane >> 4) << 2) + k;
 }
 
-// sp3: 4 waves × 16 cols = 64-wide N tile (R_write_out / GEMM1 head slice).
+// asm: 4 waves × 16 cols = 64-wide N tile (R_write_out / GEMM1 head slice).
 __device__ __forceinline__ int mfma_wave_n_offset(int wave) { return wave << 4; }
 
 // Scatter one wave's MFMA GEMM0 slice (16x16) into S[query_base + row][kv_base + wave*16 + col].

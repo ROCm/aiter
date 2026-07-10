@@ -1,4 +1,4 @@
-// Device-side helpers ported from PA_A16W8_Q8_2TG_4W_16mx1_64nx4.sp3
+// Device-side helpers ported from PA_A16W8_Q8_2TG_4W_16mx1_64nx4
 #pragma once
 
 #include <cstdint>
@@ -37,7 +37,7 @@ __device__ __forceinline__ const uint8_t* u64_to_ptr(U64 a) {
     return reinterpret_cast<const uint8_t*>(static_cast<unsigned long long>(a.hi) << 32 | a.lo);
 }
 
-// sp3: K_mem_va_upd / V_mem_va_upd — page_id * stride_blk + (buf_base + lane_base)
+// asm: K_mem_va_upd / V_mem_va_upd — page_id * stride_blk + (buf_base + lane_base)
 __device__ __forceinline__ U64 paged_byte_address(uint32_t page_id,
                                                   uint32_t stride_blk,
                                                   U64 combined_base) {
@@ -48,7 +48,7 @@ __device__ __forceinline__ int lane_id() { return threadIdx.x & 63; }
 
 __device__ __forceinline__ int wave_id() { return threadIdx.x >> 6; }
 
-// sp3 BT_mem_load_addr_gen: per-lane dword index into block table for first prefetch
+// asm BT_mem_load_addr_gen: per-lane dword index into block table for first prefetch
 __device__ __forceinline__ uint32_t block_table_lane_index(int lane, int wave) {
     const int m_id = lane & 3;
     const int q_id = lane & 0xc;
@@ -63,7 +63,7 @@ __device__ __forceinline__ uint32_t block_table_lane_index(int lane, int wave) {
     return idx;
 }
 
-// sp3: v_lshlrev 4 on lane for K, (lane&0xf)<<4 for V — byte offset within page tile
+// asm: v_lshlrev 4 on lane for K, (lane&0xf)<<4 for V — byte offset within page tile
 __device__ __forceinline__ uint32_t k_lane_byte_offset(int lane) {
     return static_cast<uint32_t>(lane) << 4;
 }
@@ -72,7 +72,7 @@ __device__ __forceinline__ uint32_t v_lane_byte_offset(int lane) {
     return static_cast<uint32_t>(lane & 0xf) << 4;
 }
 
-// sp3 KVQ_mem_load_addr_gen — byte offset for KQ/VQ buffer_load
+// asm KVQ_mem_load_addr_gen — byte offset for KQ/VQ buffer_load
 __device__ __forceinline__ uint32_t kvq_load_byte_offset(int lane) {
     const int h_id = lane >> 4;
     const int r_id = lane & 0xf;
@@ -81,7 +81,7 @@ __device__ __forceinline__ uint32_t kvq_load_byte_offset(int lane) {
     return static_cast<uint32_t>((h_id << 2) + (p_id << 6) + q_id) << 2;
 }
 
-// sp3 row_newbcast [0,4,8,12] for K and [1,5,9,13] for V — map pair j -> BT slot
+// asm row_newbcast [0,4,8,12] for K and [1,5,9,13] for V — map pair j -> BT slot
 __device__ __forceinline__ uint32_t page_id_for_va_pair(const uint32_t* page_ids,
                                                         int lane,
                                                         int wave,
@@ -98,7 +98,7 @@ __device__ __forceinline__ uint32_t page_id_for_va_pair(const uint32_t* page_ids
     return page_ids[bt_idx];
 }
 
-// sp3 K_mem_va_upd(f_idx) — four 64-bit absolute addresses per lane
+// asm K_mem_va_upd(f_idx) — four 64-bit absolute addresses per lane
 template<int NUM_PAIRS>
 __device__ __forceinline__ void k_mem_va_upd(U64 out_addrs[NUM_PAIRS],
                                              U64 combined_base,
@@ -132,7 +132,7 @@ __device__ __forceinline__ void v_mem_va_upd(U64 out_addrs[NUM_PAIRS],
     }
 }
 
-// sp3 global_load_dwordx4 — 16-byte global load into 4 dwords (sp3: global_load_dwordx4 ... off)
+// asm global_load_dwordx4 — 16-byte global load into 4 dwords (asm: global_load_dwordx4 ... off)
 __device__ __forceinline__ void global_load_dwordx4(uint32_t* dst4, U64 addr) {
     const uint32_t* dw = reinterpret_cast<const uint32_t*>(u64_to_ptr(addr));
 #pragma unroll
@@ -141,7 +141,7 @@ __device__ __forceinline__ void global_load_dwordx4(uint32_t* dst4, U64 addr) {
     }
 }
 
-// sp3 K_mem_load(fch_idx, s, n)
+// asm K_mem_load(fch_idx, s, n)
 template<int LOAD_INSTS, int REG_DWORDS, int IMM_STRIDE>
 __device__ __forceinline__ void k_mem_load(uint32_t* k_regs,
                                            const U64 k_addrs[4],
@@ -157,7 +157,7 @@ __device__ __forceinline__ void k_mem_load(uint32_t* k_regs,
     }
 }
 
-// sp3 V_mem_load(fch_idx, s, n) — uses (i_idx/4)*IMM and address pair (i_idx&3)
+// asm V_mem_load(fch_idx, s, n) — uses (i_idx/4)*IMM and address pair (i_idx&3)
 template<int LOAD_INSTS, int REG_DWORDS, int IMM_STRIDE>
 __device__ __forceinline__ void v_mem_load(uint32_t* v_regs,
                                            const U64 v_addrs[4],
@@ -173,7 +173,7 @@ __device__ __forceinline__ void v_mem_load(uint32_t* v_regs,
     }
 }
 
-// sp3 KQ_mem_va_upd + buffer_load_dword for per-token scale (f_idx = 0 for first tile)
+// asm KQ_mem_va_upd + buffer_load_dword for per-token scale (f_idx = 0 for first tile)
 __device__ __forceinline__ float kvq_mem_load_scale(const float* kq_base,
                                                     int tg_idx,
                                                     int lane,
@@ -188,14 +188,14 @@ __device__ __forceinline__ float kvq_mem_load_scale(const float* kq_base,
 }
 
 __device__ __forceinline__ uint32_t kvq_bt_slot_for_scale(int lane, int wave) {
-    // sp3 quad_perm:[0,0,0,0] broadcast of BT[f_idx] within quad
+    // asm quad_perm:[0,0,0,0] broadcast of BT[f_idx] within quad
     const int quad_lane = lane & ~3;
     return block_table_lane_index(quad_lane, wave);
 }
 
 __device__ __forceinline__ uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 
-// sp3 core_loop BT update: load page ids for KV range [kv_offset, kv_offset+SUB_KV).
+// asm core_loop BT update: load page ids for KV range [kv_offset, kv_offset+SUB_KV).
 template<int SUB_KV, int BLOCK_SIZE>
 __device__ __forceinline__ void load_block_table_tile_offset(const uint32_t* block_table,
                                                              int batch,
