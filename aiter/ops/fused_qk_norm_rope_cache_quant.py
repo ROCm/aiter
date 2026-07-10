@@ -407,7 +407,7 @@ def fused_qk_norm_rope_group_quant(
     ``k_nope_scale_buff`` -- per (token, kv_head), 512 bytes (head_dim=512):
         [0   : 448)  K-nope fp8                                            (448 B)
         [448 : 462)  e8m0 scale, 2*(nope_dim/64)=14 B, each tile-scale x2  (s0,s0,..,s6,s6)
-        [462 : 512)  pad (zero-initialised)                                (50 B)
+        [462 : 512)  pad (uninitialised -- never read by the asm reader)    (50 B)
       The asm reader reads each tile scale TWICE consecutively, hence the x2 duplication.
 
     ``k_rope_buff`` -- per (token, kv_head), rotated K-PE bf16 [rot_dim]    (128 B).
@@ -447,15 +447,12 @@ def fused_qk_norm_rope_group_quant(
             "NoPE size (head_dim - rot_dim) must be divisible by quant_group_size"
         )
     if q_nope_scale_buff is None:
-        # fp8: nope+scale (zeros for the pad); bf16: plain [.,H,512] rotated Q.
-        q_nope_scale_buff = (
-            torch.zeros(
-                (num_tokens, num_heads, head_dim), dtype=dtypes.fp8, device=q.device
-            )
-            if q_is_fp8
-            else torch.empty(
-                (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
-            )
+        # dtype = q_out_dtype covers both cases: when q_is_fp8 the buffer is None
+        # so q_is_fp8 == (q_out_dtype == fp8), i.e. q_out_dtype is already fp8
+        # (nope+scale, pad left uninitialised -- asm reader ignores it); otherwise
+        # it is the plain [.,H,512] rotated bf16 Q.
+        q_nope_scale_buff = torch.empty(
+            (num_tokens, num_heads, head_dim), dtype=q_out_dtype, device=q.device
         )
     if q_is_fp8 and q_rope_buff is None:
         q_rope_buff = torch.empty(
@@ -466,9 +463,9 @@ def fused_qk_norm_rope_group_quant(
             None  # bf16 Q: PE stays in q_nope_scale_buff, no separate rope buffer
         )
     if k_nope_scale_buff is None:
-        # zeros: the kernel writes nope[0:nope) + 14 scale bytes; the trailing pad must
-        # read back as zero for the asm reader, so zero-initialise it here.
-        k_nope_scale_buff = torch.zeros(
+        # The kernel writes nope[0:nope) + 14 scale bytes; the trailing pad is
+        # never read by the asm reader, so no zero-init is needed.
+        k_nope_scale_buff = torch.empty(
             (num_tokens, num_kv_heads, k_entry_bytes), dtype=dtypes.fp8, device=q.device
         )
     if k_rope_buff is None:
@@ -637,6 +634,116 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
 
 @compile_ops(
     "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_norm_rope_1way_fp8_perhead_quant",
+    develop=True,
+)
+def _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    q_fp8: Tensor,
+    k_fp8: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    q_unquantized: Tensor,
+    k_unquantized: Tensor,
+) -> None: ...
+
+
+def fused_qk_norm_rope_1way_fp8_perhead_quant(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q: Optional[Tensor] = None,
+    out_k: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Z-Image single-stream fused RoPE+RMSNorm with per-(batch, head) FP8 Q/K."""
+    want_bf16 = out_q is not None or out_k is not None
+    fp8_dtype = get_dtype_fp8()
+
+    q_fp8 = torch.empty(
+        (batch_size, num_tokens, num_heads_q, head_size),
+        dtype=fp8_dtype,
+        device=q.device,
+    )
+    k_fp8 = torch.empty(
+        (batch_size, num_tokens, num_heads_k, head_size),
+        dtype=fp8_dtype,
+        device=k.device,
+    )
+    q_descale = torch.empty(
+        (batch_size, num_heads_q), dtype=torch.float32, device=q.device
+    )
+    k_descale = torch.empty(
+        (batch_size, num_heads_k), dtype=torch.float32, device=k.device
+    )
+    q_unquantized = (
+        out_q
+        if out_q is not None
+        else torch.empty(
+            (batch_size, num_tokens, num_heads_q, head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
+    )
+    k_unquantized = (
+        out_k
+        if out_k is not None
+        else torch.empty(
+            (batch_size, num_tokens, num_heads_k, head_size),
+            dtype=k.dtype,
+            device=k.device,
+        )
+    )
+
+    _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+        q_fp8,
+        k_fp8,
+        q_descale,
+        k_descale,
+        q_unquantized,
+        k_unquantized,
+    )
+
+    if not want_bf16:
+        q_unquantized = torch.empty(0, dtype=q.dtype, device=q.device)
+        k_unquantized = torch.empty(0, dtype=k.dtype, device=k.device)
+
+    return q_fp8, k_fp8, q_descale, k_descale, q_unquantized, k_unquantized
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
     fc_name="fused_kv_norm_rope_group_quant",
     develop=True,
 )
@@ -780,4 +887,35 @@ def v_2way_per_head_fp8_quant(v0: Tensor, v1: Tensor) -> tuple[Tensor, Tensor]:
         (batch_size, num_heads), dtype=torch.float32, device=v0.device
     )
     _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale)
+    return v_fp8, v_descale
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="v_1way_per_head_fp8_quant",
+    develop=True,
+)
+def _v_1way_per_head_fp8_quant_kernel(
+    v: Tensor,
+    v_fp8: Tensor,
+    v_descale: Tensor,
+) -> None: ...
+
+
+def v_1way_per_head_fp8_quant(v: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-(batch, head) FP8 quant for single-stream V [B, T, H, D]."""
+    batch_size = v.size(0)
+    num_heads = v.size(2)
+    head_size = v.size(3)
+    num_tokens = v.size(1)
+    fp8_dtype = get_dtype_fp8()
+    v_fp8 = torch.empty(
+        (batch_size, num_tokens, num_heads, head_size),
+        dtype=fp8_dtype,
+        device=v.device,
+    )
+    v_descale = torch.empty(
+        (batch_size, num_heads), dtype=torch.float32, device=v.device
+    )
+    _v_1way_per_head_fp8_quant_kernel(v, v_fp8, v_descale)
     return v_fp8, v_descale
