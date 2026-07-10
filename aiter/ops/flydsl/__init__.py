@@ -37,7 +37,7 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
-    from .fmha_kernels import flydsl_flash_attn_func
+    from .fmha_kernels import flydsl_flash_attn_func, flydsl_fp8_quant
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .kernels.mqa_logits.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
@@ -72,6 +72,7 @@ if is_flydsl_available():
         "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_fp8_quant",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
