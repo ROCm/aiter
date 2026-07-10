@@ -12,9 +12,11 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-triton = pytest.importorskip("triton")
-import triton.language as tl  # noqa: E402
-from aiter.ops.flydsl import is_flydsl_available, flydsl_flash_attn_func  # noqa: E402
+from aiter.ops.flydsl import (  # noqa: E402
+    is_flydsl_available,
+    flydsl_flash_attn_func,
+    flydsl_fp8_quant,
+)
 
 if not is_flydsl_available():
     pytest.skip("flydsl is not available", allow_module_level=True)
@@ -67,84 +69,6 @@ def _make_qkv(
     k = torch.randn(shape, generator=g, dtype=dtype, device=device)
     v = torch.randn(shape, generator=g, dtype=dtype, device=device)
     return q, k, v
-
-
-_FP8_MAX = 448.0
-_FP8_DTYPE = torch.float8_e4m3fn
-_QBLOCK = 8192
-
-
-@triton.jit
-def _amax3(q, k, v, aq, ak, av, n, BLOCK: tl.constexpr):
-    """Fused per-tensor amax over q/k/v in a single launch (atomic-max)."""
-    pid = tl.program_id(0)
-    nb = tl.cdiv(n, BLOCK)
-    t = pid // nb
-    b = pid % nb
-    off = b * BLOCK + tl.arange(0, BLOCK)
-    m = off < n
-    p = tl.where(t == 0, q, tl.where(t == 1, k, v))
-    val = tl.max(tl.abs(tl.load(p + off, mask=m, other=0.0)).to(tl.float32))
-    o = tl.where(t == 0, aq, tl.where(t == 1, ak, av))
-    tl.atomic_max(o, val)
-
-
-@triton.jit
-def _sc3(q, k, v, yq, yk, yv, sq, sk, sv, n, BLOCK: tl.constexpr):
-    """Fused scale+clamp+cast of q/k/v to fp8 in a single launch."""
-    pid = tl.program_id(0)
-    nb = tl.cdiv(n, BLOCK)
-    t = pid // nb
-    b = pid % nb
-    off = b * BLOCK + tl.arange(0, BLOCK)
-    m = off < n
-    p = tl.where(t == 0, q, tl.where(t == 1, k, v))
-    yp = tl.where(t == 0, yq, tl.where(t == 1, yk, yv))
-    sp = tl.where(t == 0, sq, tl.where(t == 1, sk, sv))
-    inv = 1.0 / tl.load(sp)
-    x = tl.load(p + off, mask=m, other=0.0).to(tl.float32) * inv
-    # fp8 e4m3 max (448.0) inlined; triton @jit can't read module globals.
-    x = tl.minimum(tl.maximum(x, -448.0), 448.0)
-    tl.store(yp + off, x.to(yp.dtype.element_ty), mask=m)
-
-
-def _quant_one(x):
-    """Single-tensor per-tensor fp8 quant (correctness fallback for the cross-attn
-    case where q and k/v differ in size). real = fp8 * descale."""
-    amax = x.abs().max().to(torch.float32)
-    s = (amax / _FP8_MAX).clamp(min=1e-12).reshape(1)
-    xq = (x.to(torch.float32) / s).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
-    return xq, s
-
-
-def _fp8_quant_fused(q, k, v):
-    """Per-tensor fp8 (e4m3) quant. Descales are 1-element fp32 device tensors
-    following the wrapper contract: real = fp8 * descale. Returns
-    (q8, k8, v8, sq, sk, sv).
-
-    Self-attn (q/k/v same size) uses the fused amax3 + sc3 (two launches for all
-    three) -- the same path the perf test uses. Cross-attn (q vs k/v differ)
-    can't share one grid, so it falls back to per-tensor quant."""
-    if not (q.numel() == k.numel() == v.numel()):
-        q8, sq = _quant_one(q)
-        k8, sk = _quant_one(k)
-        v8, sv = _quant_one(v)
-        return q8, k8, v8, sq, sk, sv
-
-    n = q.numel()
-    grid = (3 * triton.cdiv(n, _QBLOCK),)
-    aq = torch.zeros(1, dtype=torch.float32, device=q.device)
-    ak = torch.zeros(1, dtype=torch.float32, device=q.device)
-    av = torch.zeros(1, dtype=torch.float32, device=q.device)
-    _amax3[grid](q, k, v, aq, ak, av, n, BLOCK=_QBLOCK)
-    sq = (aq / _FP8_MAX).clamp(min=1e-12)
-    sk = (ak / _FP8_MAX).clamp(min=1e-12)
-    sv = (av / _FP8_MAX).clamp(min=1e-12)
-    q8 = torch.empty_like(q, dtype=_FP8_DTYPE)
-    k8 = torch.empty_like(k, dtype=_FP8_DTYPE)
-    v8 = torch.empty_like(v, dtype=_FP8_DTYPE)
-    _sc3[grid](q, k, v, q8, k8, v8, sq, sk, sv, n, BLOCK=_QBLOCK)
-    return q8, k8, v8, sq, sk, sv
 
 
 @pytest.mark.parametrize(
@@ -262,7 +186,7 @@ def test_flydsl_fmha_correctness_fp8_cross_attention(
         batch, seq_kv, num_heads, head_dim, generator=g,
         dtype=torch.bfloat16, device="cuda",
     )
-    qq, kk, vv, sq, sk, sv = _fp8_quant_fused(q, k, v)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v)
     out = flydsl_flash_attn_func(
         qq, kk, vv, causal=False, q_descale=sq, k_descale=sk, v_descale=sv
     )
@@ -477,7 +401,7 @@ def test_flydsl_fmha_correctness_fp8(batch, seq_len, num_heads, head_dim):
     ~0.9986 cluster (min >=0.9926) across these shapes; the bounds below leave a
     safe margin while still catching real numerical regressions."""
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    qq, kk, vv, sq, sk, sv = _fp8_quant_fused(q, k, v)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v)
     out = flydsl_flash_attn_func(
         qq, kk, vv, causal=False, q_descale=sq, k_descale=sk, v_descale=sv
     )
@@ -497,7 +421,7 @@ def test_flydsl_fmha_correctness_fp8(batch, seq_len, num_heads, head_dim):
 def test_flydsl_fmha_missing_fp8_descale_raises():
     """FP8 inputs without descales must raise (they are required)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
-    qq, kk, vv, *_ = _fp8_quant_fused(q, k, v)
+    qq, kk, vv, *_ = flydsl_fp8_quant(q, k, v)
     with pytest.raises(ValueError, match="descale"):
         flydsl_flash_attn_func(qq, kk, vv, causal=False)
 
@@ -546,7 +470,7 @@ def test_flydsl_fmha_fp8_out_buffer_and_softmax_scale():
     fp8 input dtype."""
     batch, seq_len, num_heads, head_dim = 1, 4096, 24, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    qq, kk, vv, sq, sk, sv = _fp8_quant_fused(q, k, v)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v)
     scale = 0.05
     out = torch.empty(
         batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
