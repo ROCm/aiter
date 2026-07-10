@@ -1,0 +1,9 @@
+# Local-only artifacts — not for the branch
+snapshots/
+__pycache__/
+*.pyc
+*.log
+# IR dumps (regenerable via dump_ir.py)
+ir_*.ttgir
+ir_*.llir
+ir_*.amdgcn

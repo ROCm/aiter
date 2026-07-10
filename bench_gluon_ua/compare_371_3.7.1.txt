@@ -1,0 +1,6 @@
+triton 3.7.1  (forced BlockedLayout path, decode nb=2 double-buffered)
+PREFILL b1 8k 64/8: gluon 826 TFLOP/s (1.10x vs triton 747)
+DECODE C64 ctx8192 64/8: gluon 5795 GB/s (1.01x vs triton 5758)  xc1e-04
+DECODE C128 ctx8192 64/8: gluon 5713 GB/s (0.99x vs triton 5751)  xc1e-04
+DECODE C32 ctx8192 8/1: gluon 3266 GB/s (0.85x vs triton 3820)  xc1e-04
+DECODE C16 ctx8192 8/1: gluon 2713 GB/s (0.87x vs triton 3107)  xc1e-04
