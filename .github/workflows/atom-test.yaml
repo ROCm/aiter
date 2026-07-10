@@ -125,7 +125,11 @@ jobs:
               # in the Python wrapper, which is skipped during CUDA-graph replay.
               # Paired with --enforce-eager below so the wrappers execute (and print
               # real per-decode-step stats) on every generated token.
-              "gpt-oss-120b": "AITER_CKTILE_DEBUG=1",
+              # HSA_NO_SCRATCH_RECLAIM=1: MiniMax MoE hit the same class of bug
+              # (MoE scratch buffers corrupted on gfx950 -> accuracy gate fail);
+              # setting it here is a high-signal probe for on-chip memory-reuse
+              # corruption in the CK-tile 2-stage MoE path.
+              "gpt-oss-120b": "AITER_CKTILE_DEBUG=1\nHSA_NO_SCRATCH_RECLAIM=1",
           }
 
           # Extra CLI args appended (after the ATOM config's extraArgs) for
@@ -144,6 +148,16 @@ jobs:
               "gpt-oss-120b": "--enforce-eager",
           }
 
+          # Extra tokens appended to the model's ATOM client_command (the lm_eval
+          # invocation). gpt-oss runs eagerly (--enforce-eager) for debug, which
+          # is ~10-50x slower per token; the full 1319-sample gsm8k run then
+          # blows past wait_infer_drain.sh's 30 min MAX_MIN (exit 4) before
+          # producing a score. --limit shrinks the run so it finishes AND still
+          # yields real decode-time [CKTILE-DEBUG] stats (not warmup-only).
+          model_client_command_append = {
+              "gpt-oss-120b": "--limit 200",
+          }
+
           def prepare_model(model):
               model = dict(model)
               model["runner"] = runner_overrides.get(model["runner"], model["runner"])
@@ -158,6 +172,13 @@ jobs:
               if extra_args:
                   base_args = str(model.get("extraArgs", "")).strip()
                   model["extraArgs"] = f"{base_args} {extra_args}".strip()
+              extra_client = model_client_command_append.get(model["model_name"])
+              if extra_client:
+                  base_client = str(model.get("client_command", "")).strip()
+                  # Only append when the model already defines a client_command;
+                  # --limit alone (no lm_eval base command) would be a no-op.
+                  if base_client:
+                      model["client_command"] = f"{base_client} {extra_client}".strip()
               model["label"] = model.get("runner", "")
               model["display_name"] = model.get("display_name", model["model_name"])
               model["accuracy_test_threshold"] = str(model.get("accuracy_threshold", 0))
