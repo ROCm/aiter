@@ -1304,7 +1304,7 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
-    scale: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
     group_size: Optional[int] = None,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
@@ -1323,10 +1323,10 @@ def rope_rotate_activation(
     RoPE (plus any quantization) is applied.
     """
     if out.dtype == dtypes.fp4x2:
-        assert scale is not None, "fp4 rope_rotate_activation requires `scale`"
+        assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
         _rope_rotate_activation_fp4quant(
             out,
-            scale,
+            out_scale,
             input,
             cos,
             sin,
@@ -1337,10 +1337,10 @@ def rope_rotate_activation(
             do_rotate_act=do_rotate_act,
         )
     elif out.dtype == dtypes.fp8:
-        assert scale is not None, "fp8 rope_rotate_activation requires `scale`"
+        assert out_scale is not None, "fp8 rope_rotate_activation requires `out_scale`"
         _rope_rotate_activation_fp8quant(
             out,
-            scale,
+            out_scale,
             input,
             cos,
             sin,
