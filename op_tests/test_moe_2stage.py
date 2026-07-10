@@ -54,6 +54,21 @@ AITER_MOE_EXPERT_BALANCE = (
 )
 
 
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def parse_num_expert_activated():
+    try:
+        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+    except ValueError:
+        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+    if val < 0:
+        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
+
+
 @benchmark()
 def test_fmoe(
     dtype,
@@ -109,7 +124,22 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
-    if AITER_MOE_EXPERT_BALANCE:
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other E-n experts are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > E or n_act > token * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
+                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+            )
+        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        slot = torch.arange(token * topk) % n_act  # round-robin over active set
+        rows = torch.arange(token).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
         end_col = topk
