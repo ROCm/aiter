@@ -21,6 +21,34 @@ def _get_dtypes():
     return dtypes
 
 
+@functools.lru_cache(maxsize=256)
+def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int):
+    """Emit a one-time (deduped) warning when a requested tile is force-changed.
+
+    Deduped by (axis, inter_dim, requested, resolved) so it fires once per shape
+    during tuning/serving instead of every launch.
+    """
+    try:
+        from aiter import logger
+    except Exception:  # pragma: no cover - logging must never break the kernel
+        import logging
+
+        logger = logging.getLogger("aiter")
+    logger.warning(
+        "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
+        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
+        "config naming tile=%d here actually runs %d.",
+        axis,
+        requested,
+        inter_dim,
+        axis,
+        resolved,
+        requested,
+        requested,
+        resolved,
+    )
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
@@ -68,25 +96,44 @@ def pick_flydsl_stage1_tile_n(inter_dim: int) -> int:
 
 
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
-    """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value."""
+    """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
+
+    For non-256-aligned ``inter_dim`` (e.g. DSV4 ``inter=640``) the stage2 K axis
+    cannot be tiled with ``tile_k=256`` (OOB reads), so this forces the largest
+    legal tile (``pick_flydsl_stage2_tile_k`` -> 128). The downgrade is silent by
+    default but logs a one-time warning, because it means ``tile_k=256`` is NOT
+    tunable for such shapes: a tuned config that names a 256 kernel here actually
+    runs 128. Tuners should not offer 256 candidates for non-256 ``inter_dim``.
+    """
     inter_dim = int(inter_dim)
     tile_k = int(tile_k)
     if inter_dim % tile_k == 0:
         return tile_k
     auto = pick_flydsl_stage2_tile_k(inter_dim)
     if inter_dim % auto == 0:
+        _warn_tile_override("tile_k", inter_dim, tile_k, auto)
         return auto
     return tile_k
 
 
 def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
-    """Return a ``tile_n`` that divides ``inter_dim``, preferring the caller value."""
+    """Return a ``tile_n`` that divides ``inter_dim``, preferring the caller value.
+
+    For non-256-aligned ``inter_dim`` (e.g. MiniMax TP4 ``inter=384``) the stage1
+    gate/up (N) axis cannot be tiled with ``tile_n=256`` (OOB reads -> wrong output
+    or memfault), so this forces the largest legal tile
+    (``pick_flydsl_stage1_tile_n`` -> 128). The downgrade is silent by default but
+    logs a one-time warning, because it means ``tile_n=256`` is NOT tunable for
+    such shapes: a tuned config that names a 256 kernel here actually runs 128.
+    Tuners should not offer 256 candidates for non-256 ``inter_dim``.
+    """
     inter_dim = int(inter_dim)
     tile_n = int(tile_n)
     if inter_dim % tile_n == 0:
         return tile_n
     auto = pick_flydsl_stage1_tile_n(inter_dim)
     if inter_dim % auto == 0:
+        _warn_tile_override("tile_n", inter_dim, tile_n, auto)
         return auto
     return tile_n
 

@@ -705,10 +705,15 @@ def _generate_a8w4_situv2_e2e_data(
         token_num=token,
         cols=model_dim,
     )
+    # Interleave uses the a16w4-style GUI shuffle (shuffle_weight_a16w4 gate_up
+    # + shuffle_scale_a16w4). The shuffle_weight(is_guinterleave=...) variant is
+    # only approximately correct at stage1 and corrupts stage2 (~25% E2E error).
     if gate_mode == "interleave":
-        w1_shuf = shuffle_weight(w1_q, (16, 16), is_guinterleave=True, gate_up=True)
+        w1_shuf = shuffle_weight_a16w4(w1_q, 16, True)
+        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
     else:
         w1_shuf = shuffle_weight(w1_q, (16, 16))
+        w1_scale_shuf = e8m0_shuffle(w1_scale)
     return dict(
         token=token,
         inter_dim=inter_dim,
@@ -716,7 +721,7 @@ def _generate_a8w4_situv2_e2e_data(
         a_q=a_q,
         a_scale_sort=a_scale_sort,
         w1_shuf=w1_shuf,
-        w1_scale_shuf=e8m0_shuffle(w1_scale),
+        w1_scale_shuf=w1_scale_shuf,
         w2_shuf=shuffle_weight_a16w4(w2_q, 16, False),
         w2_scale_shuf=shuffle_scale_a16w4(w2_scale, E, False),
         sorted_ids=sorted_ids,
@@ -728,12 +733,11 @@ def _generate_a8w4_situv2_e2e_data(
     )
 
 
-# NOTE: gate_mode is SEPARATED only. a8w4 (fp8 activation) + SiTUv2 always maps
-# to separated in production (fused_moe routes SiTUv2 -> q_dtype_a=bf16=a16w4;
-# fp8-activation SiTUv2 only reachable via direct kernel calls, always separated).
-# a8w4 INTERLEAVE E2E is exercised via swiglu in test_flydsl_e2e_a8w4_gui
-# (inter=256/384/640). a16w4 SiTUv2 interleave E2E is covered in the a16wfp4 suite.
-@pytest.mark.parametrize("gate_mode", ["separated"])
+# Both gate_modes. Separated is the production/customer SiTUv2 path (fused_moe
+# routes SiTUv2 -> separated). Interleave uses the a16w4-style GUI weight shuffle
+# (see generator); the earlier shuffle_weight(is_guinterleave) recipe corrupted
+# stage2, which is a test-recipe issue, not a kernel bug.
+@pytest.mark.parametrize("gate_mode", ["separated", "interleave"])
 @pytest.mark.parametrize(
     "inter_dim,seed",
     [
