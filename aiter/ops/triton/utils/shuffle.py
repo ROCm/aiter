@@ -69,6 +69,26 @@ def shuffle_weight(
     )
 
 
+def moe_weight_gfx1250_decode_view(w: torch.Tensor) -> torch.Tensor:
+    """Reinterpret a FlyDSL (16x16) preshuffled MoE weight as the gfx1250 a8w4
+    decode preshuffle layout ``(E, K*16, N//16)`` -- **zero-copy**.
+
+    The FlyDSL 16x16 weight shuffle and the gfx1250 WMMA preshuffle produce the
+    same byte ordering, so a weight already shuffled for the FlyDSL (prefill)
+    path can be fed to the gfx1250 gluon a8w4 decode kernel by a pure
+    reshape/transpose. Unlike ``_shuffle_weight_gfx1250`` (which permutes +
+    ``contiguous()`` and thus allocates a second copy), this shares storage with
+    the input, so prefill and decode reference the same weight bytes rather than
+    doubling weight memory.
+
+    Input: ``(E, N, K)`` (K byte-packed for mxfp4). Output shares storage.
+    """
+    w_u8 = w if w.dtype == torch.uint8 else w.view(torch.uint8)
+    E, N, K = w_u8.shape
+    assert N % 16 == 0, f"N={N} must be divisible by 16"
+    return w_u8.view(E, N // 16, K * 16).transpose(-1, -2)
+
+
 # =============================================================================
 # SCALES
 # =============================================================================
