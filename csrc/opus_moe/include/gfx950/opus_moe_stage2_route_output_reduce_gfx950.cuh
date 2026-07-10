@@ -53,6 +53,9 @@ opus_moe_stage2_route_reduce_pack_bf16x4(const float* acc, int base)
         opus_moe_gfx950_cvt_pk_bf16_f32(acc[base + 2], acc[base + 3]);
     return static_cast<uint64_t>(packed01) | (static_cast<uint64_t>(packed23) << 32);
 }
+
+typedef uint32_t opus_moe_stage2_route_reduce_u32x4_t
+    __attribute__((ext_vector_type(4)));
 #endif
 
 // ROUTE_FP8 selects the packed MXFP8 path at compile time. Unlike decode, this
@@ -124,10 +127,10 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
             const uint32_t p67 = opus_moe_gfx950_cvt_pk_bf16_f32(acc[3][0], acc[3][1]);
             hip_bfloat16* op = kargs.out_bf16 +
                                static_cast<int64_t>(token) * kargs.stride_o_t + col;
-            reinterpret_cast<uint64_t*>(op)[0] =
-                static_cast<uint64_t>(p01) | (static_cast<uint64_t>(p23) << 32);
-            reinterpret_cast<uint64_t*>(op)[1] =
-                static_cast<uint64_t>(p45) | (static_cast<uint64_t>(p67) << 32);
+            const opus_moe_stage2_route_reduce_u32x4_t packed_out{p01, p23, p45, p67};
+            __builtin_nontemporal_store(
+                packed_out,
+                reinterpret_cast<opus_moe_stage2_route_reduce_u32x4_t*>(op));
         }
         return;
     }

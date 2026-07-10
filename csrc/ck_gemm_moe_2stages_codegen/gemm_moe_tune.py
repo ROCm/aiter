@@ -695,7 +695,6 @@ class FmoeTuner(TunerCommon):
                 f"topk={topk}, block_n={kparams.get('kernel_block_n')}"
             )
         kid = kparams["kid"]
-        kbm = kparams["kernel_block_m"]
         reduce_block_n = kparams.get("reduce_block_n")
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
@@ -715,7 +714,7 @@ class FmoeTuner(TunerCommon):
                 sorted_weights,
                 sorted_expert_ids,
                 num_valid_ids,
-                block_m=kbm,
+                block_m=blockM,
                 kernel_id=kid,
                 inter_dim_pad=shape_family.inter_dim_pad,
                 return_per_slot=True,
@@ -741,7 +740,7 @@ class FmoeTuner(TunerCommon):
             sorted_expert_ids,
             num_valid_ids,
             out=moe_buf,
-            block_m=kbm,
+            block_m=blockM,
             kernel_id=kid,
             inter_dim_pad=shape_family.inter_dim_pad,
         )

@@ -14,11 +14,13 @@ template<typename Contract = opus_moe::OpusMoeStage2A8W4DefaultContract,
          int BlockThreadsOverride = 0,
          int MinBlocksPerCuOverride = 0,
          int CachectlBOverride = 0,
-         int CachectlWScaleOverride = 0>
+         int CachectlWScaleOverride = 0,
+         bool AssumeSortedRowsValid = false>
 struct OpusMoeStage2A8W4DecodeShape
 {
     // Atomic vs MXFP8 route-out is a structural compile-time choice.
     static constexpr bool DIRECT_ATOMIC_OUT = DirectAtomicOut;
+    static constexpr bool ASSUME_SORTED_ROWS_VALID = AssumeSortedRowsValid;
     static constexpr bool IS_BM16 = BlockM == opus_moe::kStage2A8W4DecodeBlockM16;
     static constexpr bool IS_BM32_BN256 =
         BlockM == opus_moe::kStage2A8W4DecodeBlockM32 && BlockN == opus_moe::kStage2A8W4DecodeBlockN256;

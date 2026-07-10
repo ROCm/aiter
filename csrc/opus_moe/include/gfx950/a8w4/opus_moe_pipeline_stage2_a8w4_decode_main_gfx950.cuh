@@ -138,7 +138,9 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
             const int32_t packed = kargs.sorted_token_ids[row];
             const int token = opus_moe_token_id(packed);
             const int slot = opus_moe_topk_slot(packed);
-            const bool valid_route = token < token_num && slot < topk;
+            const bool valid_route =
+                T::ASSUME_SORTED_ROWS_VALID ? true :
+                                               (token < token_num && slot < topk);
             if(valid_route)
             {
                 a_base = static_cast<int32_t>(
@@ -159,6 +161,12 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
     if constexpr(T::DIRECT_ATOMIC_OUT)
     {
+        if(route_base + T::B_M <= sorted_rows)
+        {
+            __syncthreads();
+            full_route_tile = true;
+            return true;
+        }
         full_route_tile = false;
         return __syncthreads_or(has_route) != 0;
     }
@@ -638,7 +646,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
 #endif
 }
 
-template<typename T, typename CAcc>
+template<typename T, bool FullRouteTile, typename CAcc>
 inline __device__ void opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem(
     CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
@@ -655,7 +663,18 @@ inline __device__ void opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem(
     static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
         static_for<T::VEC_C>([&](auto ii) {
             const int local_m = c_layout.acc_local_m(mi.value, ii.value);
-            if(smem_route_base[local_m] >= 0)
+            if constexpr(FullRouteTile)
+            {
+                const float weight = smem_weight[local_m];
+                static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
+                    const int local_col = c_layout.acc_local_col(ni.value);
+                    smem_c_bf16[c_layout.smem_scalar_index(local_m, local_col)] =
+                        opus_moe_gfx950_cvt_bf16_f32(
+                            static_cast<float>(v_c[mi.value][ni.value][ii.value]) *
+                            weight);
+                });
+            }
+            else if(smem_route_base[local_m] >= 0)
             {
                 const float weight = smem_weight[local_m];
                 static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
@@ -698,7 +717,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem(
     });
 }
 
-template<typename T>
+template<typename T, bool FullRouteTile>
 inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
     const uint32_t* __restrict__ smem_c_pair,
     const int32_t* __restrict__ smem_route_base,
@@ -725,7 +744,22 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
     for(int mr = 0; mr < T::B_M / CSHUFFLE_MLANE; ++mr)
     {
         const int local_m = c_layout.atomic_local_m(mr);
-        if(smem_route_base[local_m] >= 0)
+        if constexpr(FullRouteTile)
+        {
+            const int token = smem_route_base[local_m];
+            const int pair_base = c_layout.smem_pair_index(local_m, col0);
+            const int byte_offset =
+                c_layout.output_byte_offset(token, output_row_stride, col_base, col0);
+            opus::static_for<ATOMIC_GROUPS>([&](auto group) {
+                constexpr int pair_delta = group.value * CSHUFFLE_NLANE;
+                constexpr int byte_delta = pair_delta * static_cast<int>(sizeof(uint32_t));
+                const auto data = __builtin_bit_cast(
+                    opus::bf16x2_t, smem_c_pair[pair_base + pair_delta]);
+                opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
+                    data, out_rsrc, byte_offset + byte_delta);
+            });
+        }
+        else if(smem_route_base[local_m] >= 0)
         {
             const int token = smem_route_base[local_m];
             const int pair_base = c_layout.smem_pair_index(local_m, col0);
@@ -891,7 +925,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     }
 }
 
-template<typename T, typename CAcc>
+template<typename T, bool FullRouteTile, typename CAcc>
 inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
@@ -908,7 +942,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     static_assert(T::B_N == T::C_LDS_N);
     static_assert(T::DIRECT_ATOMIC_OUT);
 
-    opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem<T>(
+    opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem<T, FullRouteTile>(
         v_c,
         c_layout,
         smem_route_base,
@@ -916,7 +950,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
         smem_c_pair);
     s_waitcnt_lgkmcnt(0_I);
     __syncthreads();
-    opus_moe_stage2_a8w4_decode_atomic_smem_to_out<T>(
+    opus_moe_stage2_a8w4_decode_atomic_smem_to_out<T, FullRouteTile>(
         smem_c_pair,
         smem_route_base,
         c_layout,
@@ -1100,15 +1134,30 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
                              0xffffu),
             static_cast<int>(output_size_bytes),
             static_cast<int>(opus::buffer_default_config())};
-        opus_moe_stage2_a8w4_decode_direct_epilogue<T>(
-            v_c,
-            u_c,
-            smem_route_base,
-            smem_weight,
-            smem_c_pair,
-            col_base,
-            kargs.stride_o_t,
-            output_rsrc);
+        if(full_route_tile)
+        {
+            opus_moe_stage2_a8w4_decode_direct_epilogue<T, true>(
+                v_c,
+                u_c,
+                smem_route_base,
+                smem_weight,
+                smem_c_pair,
+                col_base,
+                kargs.stride_o_t,
+                output_rsrc);
+        }
+        else
+        {
+            opus_moe_stage2_a8w4_decode_direct_epilogue<T, false>(
+                v_c,
+                u_c,
+                smem_route_base,
+                smem_weight,
+                smem_c_pair,
+                col_base,
+                kargs.stride_o_t,
+                output_rsrc);
+        }
     }
     else if(kargs.route_out_fp8)
     {

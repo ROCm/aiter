@@ -17,6 +17,7 @@ from .moe_stage2_a8w4_meta import (
     opus_a8w4_kid_block_m,
     opus_a8w4_kid_is_fp8,
     opus_a8w4_kid_name,
+    opus_a8w4_kid_sort_block_m,
     opus_a8w4_kid_uses_route,
     opus_a8w4_shape_family_for_shape,
 )
@@ -170,6 +171,19 @@ def opus_moe_stage2_a8w4_decode_fwd(
     route_out = bool(return_per_slot)
     route_out_fp8 = False
     if kernel_id != -1:
+        kid_block_m = opus_a8w4_kid_block_m(kernel_id)
+        kid_sort_block_m = opus_a8w4_kid_sort_block_m(kernel_id)
+        if block_m != kid_sort_block_m:
+            raise ValueError(
+                f"kernel_id={kernel_id} ({opus_a8w4_kid_name(kernel_id)}) "
+                f"expects sorted block_m={kid_sort_block_m}, got {block_m}"
+            )
+        if block_m % kid_block_m != 0:
+            raise ValueError(
+                f"kernel_id={kernel_id} ({opus_a8w4_kid_name(kernel_id)}) "
+                f"uses kernel block_m={kid_block_m}, which must divide sorted "
+                f"block_m={block_m}"
+            )
         kid_route_out = opus_a8w4_kid_uses_route(kernel_id)
         if return_per_slot and not kid_route_out:
             raise ValueError(

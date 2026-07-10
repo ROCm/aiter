@@ -82,24 +82,9 @@ class OpusA8W4Stage1Instance:
     tuner_max_token: Optional[int] = None
 
     def supports_token(self, token: Optional[int]) -> bool:
-        if token is None:
-            return self.tuner_candidate
-        if not self.tuner_candidate:
-            return False
-        token = int(token)
-        if self.tuner_tokens and token in self.tuner_tokens:
-            return True
-        if (
-            self.tuner_tokens
-            and self.tuner_min_token is None
-            and self.tuner_max_token is None
-        ):
-            return False
-        if self.tuner_min_token is not None and token < self.tuner_min_token:
-            return False
-        if self.tuner_max_token is not None and token > self.tuner_max_token:
-            return False
-        return True
+        # Keep formal tuning open across token counts; token lists are historical
+        # hints, not hard candidate filters.
+        return self.tuner_candidate
 
     def tuner_params(self) -> dict[str, object]:
         return {

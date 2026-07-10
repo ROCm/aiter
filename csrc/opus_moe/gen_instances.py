@@ -188,7 +188,8 @@ def _emit_a8w4_meta_header() -> str:
             "unsupported Opus A8W4 kernel contract(s): "
             + ", ".join(unsupported_kernel_contracts)
         )
-    block_ms = sorted({inst.block_m for inst in a8w4_kernels})
+    kernel_block_ms = sorted({inst.block_m for inst in a8w4_kernels})
+    sort_block_ms = sorted({inst.sort_block_m for inst in a8w4_kernels})
     block_ns = sorted({inst.block_n for inst in a8w4_kernels})
     mode_default_keys = [
         (inst.shape_family, inst.out_mode, inst.block_m)
@@ -275,7 +276,7 @@ def _emit_a8w4_meta_header() -> str:
             "OpusMoeStage2A8W4DefaultContract::DECODE_INTER_DIM_PAD;\n",
         ]
     )
-    for block_m in block_ms:
+    for block_m in kernel_block_ms:
         lines.append(f"constexpr int kStage2A8W4DecodeBlockM{block_m} = {block_m};\n")
     for block_n in block_ns:
         lines.append(f"constexpr int kStage2A8W4DecodeBlockN{block_n} = {block_n};\n")
@@ -350,7 +351,7 @@ def _emit_a8w4_meta_header() -> str:
     lines.append(
         "constexpr bool stage2_a8w4_block_m_is_valid(int block_m)\n{\n    switch(block_m)\n    {\n"
     )
-    for block_m in block_ms:
+    for block_m in sort_block_ms:
         lines.append(f"    case {block_m}:\n")
     lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
 
@@ -440,7 +441,7 @@ def _emit_a8w4_meta_header() -> str:
             "        switch(block_m)\n"
             "        {\n"
         )
-        for block_m in block_ms:
+        for block_m in sort_block_ms:
             try:
                 kid = opus_a8w4_decode_kid(
                     OPUS_A8W4_OUT_MODE_ATOMIC,
@@ -483,7 +484,8 @@ def _emit_a8w4_manifest_header() -> str:
             f"{inst.block_threads}, "
             f"{inst.min_blocks_per_cu}, "
             f"{inst.cachectl_b}, "
-            f"{inst.cachectl_wscale}"
+            f"{inst.cachectl_wscale}, "
+            f"{_cpp_bool(inst.assume_sorted_rows_valid)}"
             ">>(kargs, stream);" + suffix
         )
     lines.append("\n")

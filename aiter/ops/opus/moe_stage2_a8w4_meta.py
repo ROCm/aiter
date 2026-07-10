@@ -30,6 +30,9 @@ OPUS_A8W4_KID_K3_ROUTE_BF16_BM64_FULL_N7168 = 2005
 OPUS_A8W4_KID_K3_ATOMIC_BM32_BN128_OCC1_B3_WS2 = 2006
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072_B3 = 2007
 OPUS_A8W4_KID_K3_ROUTE_BF16_BM32_FULL_N7168_SMALL = 2008
+OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_SORT128_RBN3072 = 2009
+OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_SORT128_RBN3584 = 2010
+OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584_VALIDROWS = 2011
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_OCC6_B2_WS2 = 2100
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_B3_WS2 = 2101
 OPUS_A8W4_KID_K5_ROUTE_BF16_BM64_FULL_N7168 = 2110
@@ -106,6 +109,7 @@ class OpusA8W4Stage2Instance:
     min_blocks_per_cu: int = 0
     cachectl_b: int = 0
     cachectl_wscale: int = 0
+    assume_sorted_rows_valid: bool = False
     route_reduce: Optional[str] = None
     tuner_candidate: bool = True
     min_tuner_token: Optional[int] = None
@@ -148,13 +152,8 @@ class OpusA8W4Stage2Instance:
         return params
 
     def supports_tuner_token(self, token: Optional[int]) -> bool:
-        if token is None:
-            return True
-        token = int(token)
-        if self.min_tuner_token is not None and token < self.min_tuner_token:
-            return False
-        if self.max_tuner_token is not None and token > self.max_tuner_token:
-            return False
+        # Keep formal tuning open across token counts; min/max token fields are
+        # historical hints, not hard candidate filters.
         return True
 
 
@@ -308,6 +307,7 @@ def _route_stage2_instance(
     route_reduce: str,
     min_blocks_per_cu: int = 0,
     cachectl_b: int = 0,
+    assume_sorted_rows_valid: bool = False,
     tuner_candidate: bool = True,
     min_tuner_token: Optional[int] = None,
     max_tuner_token: Optional[int] = None,
@@ -324,6 +324,7 @@ def _route_stage2_instance(
         direct_atomic=False,
         min_blocks_per_cu=min_blocks_per_cu,
         cachectl_b=cachectl_b,
+        assume_sorted_rows_valid=assume_sorted_rows_valid,
         route_reduce=route_reduce,
         tuner_candidate=tuner_candidate,
         min_tuner_token=min_tuner_token,
@@ -442,6 +443,37 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         max_tuner_token=64,
         shape_family=_K3,
     ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_SORT128_RBN3072,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm128",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=128,
+        route_reduce="rbn3072",
+        min_tuner_token=2048,
+        shape_family=_K3,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_SORT128_RBN3584,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm128",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=128,
+        route_reduce="rbn3584",
+        min_tuner_token=2048,
+        shape_family=_K3,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584_VALIDROWS,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_validrows",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn3584",
+        assume_sorted_rows_valid=True,
+        min_tuner_token=2048,
+        shape_family=_K3,
+    ),
 )
 
 OPUS_A8W4_K5_STAGE2_INSTANCES = (
@@ -516,6 +548,9 @@ OPUS_A8W4_TUNER_INSTANCES = tuple(
 )
 OPUS_A8W4_SUPPORTED_BLOCK_MS = tuple(
     sorted({inst.block_m for inst in OPUS_A8W4_STAGE2_INSTANCES})
+)
+OPUS_A8W4_SUPPORTED_SORT_BLOCK_MS = tuple(
+    sorted({inst.sort_block_m for inst in OPUS_A8W4_STAGE2_INSTANCES})
 )
 
 
@@ -641,6 +676,10 @@ def opus_a8w4_kid_block_m(kid: int) -> int:
     return _require_a8w4_stage2_instance(kid).block_m
 
 
+def opus_a8w4_kid_sort_block_m(kid: int) -> int:
+    return _require_a8w4_stage2_instance(kid).sort_block_m
+
+
 def opus_a8w4_kid_reduce_block_n(kid: int) -> Optional[int]:
     route_reduce = opus_a8w4_route_reduce(
         _require_a8w4_stage2_instance(kid).route_reduce
@@ -650,6 +689,10 @@ def opus_a8w4_kid_reduce_block_n(kid: int) -> Optional[int]:
 
 def opus_a8w4_supported_block_ms() -> tuple[int, ...]:
     return OPUS_A8W4_SUPPORTED_BLOCK_MS
+
+
+def opus_a8w4_supported_sort_block_ms() -> tuple[int, ...]:
+    return OPUS_A8W4_SUPPORTED_SORT_BLOCK_MS
 
 
 def opus_a8w4_best_atomic_kid(

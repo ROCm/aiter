@@ -81,6 +81,7 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
         opus_a8w4_kid_block_m,
         opus_a8w4_kid_from_name,
         opus_a8w4_kid_reduce_block_n,
+        opus_a8w4_kid_sort_block_m,
         opus_a8w4_reduce_block_n_from_name,
         opus_a8w4_kid_uses_route,
     )
@@ -97,6 +98,7 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
         return {
             "kernel_id": kid,
             "stage2_block_m": opus_a8w4_kid_block_m(kid),
+            "stage2_sort_block_m": opus_a8w4_kid_sort_block_m(kid),
             "route_out": opus_a8w4_kid_uses_route(kid),
             "stage2_reduce_block_n": reduce_block_n,
         }
@@ -114,6 +116,7 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
         return {
             "kernel_id": kernel_id,
             "stage2_block_m": opus_a8w4_kid_block_m(kernel_id),
+            "stage2_sort_block_m": opus_a8w4_kid_sort_block_m(kernel_id),
             "route_out": opus_a8w4_kid_uses_route(kernel_id),
             "stage2_reduce_block_n": reduce_block_n,
         }
@@ -123,6 +126,7 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
             _cfg_first(cfg, "stage2_block_m", "opus_block_m", "kernel_block_m"),
             sort_block_m,
         ),
+        "stage2_sort_block_m": sort_block_m,
         "route_out": _cfg_bool(
             _cfg_first(cfg, "stage2_route_out", "route_out", "return_per_slot"),
             False,
@@ -157,12 +161,24 @@ def cfg_is_supported(
     except ValueError as exc:
         return False, str(exc)
     kernel_block_m = int(values["stage2_block_m"])
+    expected_sort_block_m = int(values["stage2_sort_block_m"])
     from .moe_stage2_a8w4_meta import opus_a8w4_supported_block_ms
 
     supported_block_ms = opus_a8w4_supported_block_ms()
     if kernel_block_m not in supported_block_ms:
         supported = "/".join(str(v) for v in supported_block_ms)
         return False, f"requires stage2_block_m {supported}, got {kernel_block_m}"
+    if expected_sort_block_m != sort_block_m:
+        return (
+            False,
+            f"requires sorted block_m={expected_sort_block_m}, got {sort_block_m}",
+        )
+    if sort_block_m % kernel_block_m != 0:
+        return (
+            False,
+            f"requires sorted block_m={sort_block_m} to be a multiple of "
+            f"stage2_block_m={kernel_block_m}",
+        )
     if int(values["kernel_id"]) == -1:
         route_out = bool(values["route_out"])
         if route_out and kernel_block_m != 64:
@@ -235,7 +251,13 @@ def opus_a8w4_stage2_wrapper(
     if not is_opus_a8w4_stage2_kernel(kernelName):
         raise ValueError(f"Invalid Opus A8W4 stage2 kernel name: {kernelName}")
     route_out_mode = bool(route_out)
+    sort_block_m = int(block_m)
     kernel_block_m = int(stage2_block_m or block_m)
+    if sort_block_m % kernel_block_m != 0:
+        raise ValueError(
+            f"Opus A8W4 stage2 requires sorted block_m={sort_block_m} to be "
+            f"a multiple of stage2_block_m={kernel_block_m}"
+        )
     if bias2 is not None:
         raise ValueError("Opus A8W4 stage2 does not support bias2")
     if expert_mask is not None or topk_ids is not None:
@@ -302,7 +324,7 @@ def opus_a8w4_stage2_wrapper(
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
-            block_m=kernel_block_m,
+            block_m=sort_block_m,
             kernel_id=int(kernel_id),
             inter_dim_pad=shape_family.inter_dim_pad,
             return_per_slot=True,
@@ -328,7 +350,7 @@ def opus_a8w4_stage2_wrapper(
         sorted_expert_ids,
         num_valid_ids,
         out=out,
-        block_m=kernel_block_m,
+        block_m=sort_block_m,
         kernel_id=int(kernel_id),
         inter_dim_pad=shape_family.inter_dim_pad,
     )
