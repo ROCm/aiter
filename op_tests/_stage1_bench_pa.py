@@ -20,9 +20,13 @@ pure-torch and unrepresentative), so the pa_full/asm ratio is "ATOM's real
 full-pipeline cost vs asm's single-pass cost".
 
 Usage:
-  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py            # default sweep
-  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512     # one combo: batch ctx
-  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512 128 # batch ctx gqa
+  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py              # default sweep
+  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512       # one combo: batch ctx
+  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512 128   # batch ctx gqa
+  ENABLE_CK=0 python op_tests/_stage1_bench_pa.py 64 512 128 4 # batch ctx gqa asm_split
+
+The asm_split only sets the asm pass's num_kv_splits (sweep the default list via
+_ASM_SPLITS). pa's split is always auto-inferred the ATOM way and is unaffected.
 """
 import sys
 sys.path.insert(0, "op_tests")
@@ -41,8 +45,13 @@ SINK = True
 # gqa + ctx mirror the kargpreld sweep; batch spans small->large so the
 # auto-inferred pa split covers ATOM's large-split (stage2) and split=1 ends.
 _GQA_LIST = [64, 128]
-_CTX_LENS = [256, 512, 1024]
+#_CTX_LENS = [256, 512, 1024]
+#_BATCH_SIZES = [64]
+#_ASM_SPLITS = [1]
+
+_CTX_LENS = [1024]
 _BATCH_SIZES = [64]
+_ASM_SPLITS = [1, 2, 4]
 
 # gfx1250/gluon constants used by pa_decode_sparse's kv_splits auto-infer.
 _PA_BLOCK_K = 16
@@ -68,8 +77,9 @@ def _infer_kv_splits(n_tokens, n_heads, n_indices):
     return _next_pow2(ks)
 
 
-def bench_asm(batch, ctx, gqa):
-    split = 1  # asm natural fast path: single pass produces the final output.
+def bench_asm(batch, ctx, gqa, split=1):
+    # split=1 is asm's natural fast path (single pass produces the final output);
+    # split>1 exercises the split-K stage1 + torch stage2 merge.
     inp = T._build_bf16_inputs(batch=batch, kv_seq_lens=ctx, q_seq_logical=Q,
                                seed=0, gqa_ratio=gqa, attn_sink=SINK)
     sm = 1.0 / (T._QUANT_D ** 0.5)
@@ -90,16 +100,15 @@ def bench_asm(batch, ctx, gqa):
         split_indptr=sidx, max_seqlen_q=inp["max_seqlen_q"], sink=inp["sink"],
         sm_scale=sm, out_16_nosplit=0, num_kv_splits=split, logits=lb, attn_lse=eb,
     )
-    # asm mla_decode_fwd_v4_nm launches stage1 (sparse) + stage2 (merge). Match
-    # test_mla_v4_kargpreld.py's stage1_us: profile and keep ONLY the stage1
-    # "sparse" kernel's device time (drop stage2), so this column lines up with
-    # the kargpreld summary table.
-    s1_us, _s2_us = T._profile_stage_times(
+    # asm mla_decode_fwd_v4_nm launches stage1 (sparse) + stage2 (merge). Profile
+    # both device times separately so we can report stage1 / stage2 / total and
+    # compare each against pa. (stage1 still lines up with the kargpreld table.)
+    s1_us, s2_us = T._profile_stage_times(
         lambda: aiter.mla.mla_decode_fwd_v4_nm(**kw),
         iters=_PERF["num_iters"],
         warmup=_PERF["num_warmup"],
     )
-    return s1_us
+    return s1_us, s2_us
 
 
 def bench_pa(batch, ctx, gqa):
@@ -142,22 +151,33 @@ def bench_pa(batch, ctx, gqa):
 
 import itertools
 
-print(f"{'gqa':>4} {'batch':>6} {'ctx':>6} {'pa_split':>8} | "
-      f"{'asm_us':>9} {'pa_s1_us':>9} {'pa_full_us':>11} {'pa_full/asm':>12}")
-print("-" * 82)
+def _ratio(pa, asm):
+    return pa / asm if asm > 0 else float("nan")
+
+
+# Three side-by-side comparisons: stage1, stage2, and total (asm s1+s2 vs pa full).
+print(f"{'gqa':>4} {'batch':>6} {'ctx':>6} {'asm_split':>9} {'pa_split':>8} | "
+      f"{'asm_s1':>8} {'pa_s1':>8} {'s1 pa/asm':>10} | "
+      f"{'asm_s2':>8} {'pa_s2':>8} {'s2 pa/asm':>10} | "
+      f"{'asm_tot':>8} {'pa_tot':>8} {'tot pa/asm':>11}")
+print("-" * 128)
 
 if len(sys.argv) > 1:
     batch = int(sys.argv[1])
     ctx = int(sys.argv[2]) if len(sys.argv) > 2 else 512
     gqa = int(sys.argv[3]) if len(sys.argv) > 3 else 64
-    combos = [(gqa, batch, ctx)]
+    asm_split = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+    combos = [(gqa, batch, ctx, asm_split)]
 else:
-    combos = list(itertools.product(_GQA_LIST, _BATCH_SIZES, _CTX_LENS))
+    combos = list(itertools.product(_GQA_LIST, _BATCH_SIZES, _CTX_LENS, _ASM_SPLITS))
 
 # gqa outermost so rows mirror the kargpreld summary-table grouping.
-for gqa, batch, ctx in combos:
-    asm_us = bench_asm(batch, ctx, gqa)
+for gqa, batch, ctx, asm_split in combos:
+    asm_s1, asm_s2 = bench_asm(batch, ctx, gqa, asm_split)
     pa_s1_us, pa_full_us, split = bench_pa(batch, ctx, gqa)
-    ratio = pa_full_us / asm_us if asm_us > 0 else float("nan")
-    print(f"{gqa:>4} {batch:>6} {ctx:>6} {split:>8} | "
-          f"{asm_us:>9.2f} {pa_s1_us:>9.2f} {pa_full_us:>11.2f} {ratio:>11.2f}x")
+    asm_tot = asm_s1 + asm_s2
+    pa_s2_us = pa_full_us - pa_s1_us  # pa stage2 reduce = full - stage1
+    print(f"{gqa:>4} {batch:>6} {ctx:>6} {asm_split:>9} {split:>8} | "
+          f"{asm_s1:>8.2f} {pa_s1_us:>8.2f} {_ratio(pa_s1_us, asm_s1):>9.2f}x | "
+          f"{asm_s2:>8.2f} {pa_s2_us:>8.2f} {_ratio(pa_s2_us, asm_s2):>9.2f}x | "
+          f"{asm_tot:>8.2f} {pa_full_us:>8.2f} {_ratio(pa_full_us, asm_tot):>10.2f}x")

@@ -12,7 +12,7 @@
 set -euo pipefail
 
 CONTAINER="${CONTAINER:-ff_mla}"
-AITER_DIR="${AITER_DIR:-/home/amd/feifei/aiter}"
+AITER_DIR="${AITER_DIR:-/home/carhuang/feifei/aiter}"
 
 # ensure container is running
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
