@@ -520,7 +520,7 @@ def compile_moe_gemm1(
                 c_k=c_k_for_b,
                 kpack_bytes=kpack_bytes,
                 elem_bytes=w_elem_bytes,
-                klane_inner=(is_fp4_bf16 and not gate_up_interleave),
+                klane_inner=is_fp4_bf16,
             )
             layout_b = b_layout.layout_b
             (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
@@ -630,7 +630,7 @@ def compile_moe_gemm1(
 
                 # MXFP4 E8M0 scale layout + helpers
                 if const_expr(is_fp4_bf16):
-                    _scale_klane_inner = is_fp4_bf16 and not gate_up_interleave
+                    _scale_klane_inner = is_fp4_bf16
                     layout_b_scale = make_preshuffle_scale_layout(
                         arith,
                         c_mn=c_n_total,
@@ -2871,7 +2871,7 @@ def compile_moe_gemm2(
                 c_k=c_k_for_b,
                 kpack_bytes=kpack_bytes,
                 elem_bytes=w_elem_bytes,
-                klane_inner=False,
+                klane_inner=is_fp4_bf16,
             )
             layout_b = b_layout.layout_b
             (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
@@ -3140,7 +3140,7 @@ def compile_moe_gemm2(
 
                 # MXFP4 E8M0 scale layout + helpers (stage2: N=model_dim, K=inter_dim)
                 if const_expr(is_fp4_bf16):
-                    _scale_klane_inner = False
+                    _scale_klane_inner = True
                     layout_b_scale = make_preshuffle_scale_layout(
                         arith,
                         c_mn=c_n_total,
