@@ -82,34 +82,12 @@ struct pa_a16w8_gqa8_2tg_traits {
     static constexpr int HEAD_DIM = HEAD_DIM_;
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
-    static constexpr int NUM_TG = NUM_TG_;
-    static constexpr int QUERIES_PER_TG = GQA_RATIO_ / NUM_TG_;
-    static constexpr bool KV_FP8 = KV_FP8_;
 
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_THREADS = NUM_WARPS * WARP_SIZE;
 
-    using D_Q = bf16_t;
-    using D_ACC = float;
-
-    static constexpr int Q_TILE = SUB_Q;
-    static constexpr int KV_TILE = SUB_KV;
-    static constexpr int MFMA_M = 16;
-    static constexpr int MFMA_N = 64;
-
     static constexpr int Q_LDS_ROWS = 16;
     static constexpr int Q_LDS_ROW_ELEMS = HEAD_DIM_ + 4;
-
-    static constexpr int KV_LOAD_INSTS = 8;
-    static constexpr int KV_REG_DWORDS = 32;
-    static constexpr int KV_IMM_STRIDE = 1024;
-
-    static constexpr int GEMM0_KV_SLICE = 64;
-    static constexpr int GEMM0_K_DIM_MFMA_STEPS = HEAD_DIM_ / 32;
-    static constexpr int Q_REG_DWORDS = 8;
-    static constexpr int P_REG_DWORDS = 16;
-    static constexpr int R_REG_MFMA_SLICES = HEAD_DIM_ / 64;
-    static constexpr int S_REG_MFMA_SLICES = SUB_KV_ / 64;
 };
 
 using pa_default_traits = pa_a16w8_gqa8_2tg_traits<>;
