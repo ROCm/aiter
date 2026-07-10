@@ -1,0 +1,345 @@
+name: SGLang MI355X DSV4Pro FP8 1P1D
+
+on:
+  schedule:
+    - cron: "43 18 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - ".github/workflows/sglang-mi355x-dsv4pro-fp8-1p1d.yaml"
+      - ".github/scripts/sglang_mi355x_disagg.py"
+  workflow_dispatch:
+    inputs:
+      sglang_repository:
+        description: "SGLang repository containing the MI355X disagg launcher"
+        required: false
+        type: string
+        default: "Lzy17/sglang"
+      sglang_ref:
+        description: "SGLang ref to test; default tracks sgl-project/sglang#29084"
+        required: false
+        type: string
+        default: "amd-mi355x-disagg-nightly"
+      image:
+        description: "Optional SGLang ROCm image override. Empty uses the recipe default."
+        required: false
+        type: string
+        default: ""
+      model_path:
+        description: "DeepSeek-V4-Pro-FP8 path visible on the Spur compute nodes"
+        required: false
+        type: string
+        default: "/data/models2/DeepSeek-V4-Pro-FP8"
+      model_mount_roots:
+        description: "Space-separated host roots to mount read-only into SGLang containers"
+        required: false
+        type: string
+        default: "/it-share /data /models"
+      shared_workspace_root:
+        description: "Shared workspace root visible from the Spur submit and compute nodes"
+        required: false
+        type: string
+        default: "/data/xinhuang/sglang-aiter-ci"
+      slurm_nodelist:
+        description: "Comma-separated two-node override. Set to auto to let Slurm allocate."
+        required: false
+        type: string
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14"
+      slurm_partition:
+        description: "Optional Slurm partition. Empty omits -p."
+        required: false
+        type: string
+        default: ""
+      slurm_exclusive:
+        description: "Set to 1 to request exclusive nodes, 0 to disable."
+        required: false
+        type: choice
+        options: ["1", "0"]
+        default: "1"
+      conc_list:
+        description: "bench_serving max-concurrency sweep"
+        required: false
+        type: string
+        default: "1,8,16,32,64,128,256"
+      run_accuracy:
+        description: "Run the GSM8K correctness gate before the perf sweep"
+        required: false
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      time_limit:
+        description: "Slurm allocation time limit"
+        required: false
+        type: string
+        default: "02:30:00"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  SGLANG_REPOSITORY_DEFAULT: Lzy17/sglang
+  SGLANG_REF_DEFAULT: amd-mi355x-disagg-nightly
+  IMAGE_OVERRIDE_DEFAULT: ""
+  MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
+  MODEL_MOUNT_ROOTS_DEFAULT: /it-share /data /models
+  SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
+  SLURM_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
+  SLURM_PARTITION_DEFAULT: ""
+  SLURM_EXCLUSIVE_DEFAULT: "1"
+  CONC_LIST_DEFAULT: "1,8,16,32,64,128,256"
+  RUN_ACCURACY_DEFAULT: "true"
+  TIME_LIMIT_DEFAULT: "02:30:00"
+
+jobs:
+  sglang-dsv4pro-fp8-1p1d:
+    runs-on: [self-hosted, aiter-di-ci-spur-login]
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout aiter under test
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply workflow inputs
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              event = json.load(f)
+
+          inputs = event.get("inputs") or {}
+
+          def value(name: str, default_env: str) -> str:
+              raw = inputs.get(name, "")
+              default = os.environ[default_env]
+              return raw if raw not in ("", None) else default
+
+          pairs = {
+              "SGLANG_REPOSITORY": value("sglang_repository", "SGLANG_REPOSITORY_DEFAULT"),
+              "SGLANG_REF": value("sglang_ref", "SGLANG_REF_DEFAULT"),
+              "IMAGE_OVERRIDE": value("image", "IMAGE_OVERRIDE_DEFAULT"),
+              "MODEL_PATH_OVERRIDE": value("model_path", "MODEL_PATH_DEFAULT"),
+              "MODEL_MOUNT_ROOTS": value("model_mount_roots", "MODEL_MOUNT_ROOTS_DEFAULT"),
+              "SHARED_WORKSPACE_ROOT": value(
+                  "shared_workspace_root", "SHARED_WORKSPACE_ROOT_DEFAULT"
+              ),
+              "SLURM_NODELIST_OVERRIDE": value("slurm_nodelist", "SLURM_NODELIST_DEFAULT"),
+              "SLURM_PARTITION_OVERRIDE": value("slurm_partition", "SLURM_PARTITION_DEFAULT"),
+              "SLURM_EXCLUSIVE_OVERRIDE": value("slurm_exclusive", "SLURM_EXCLUSIVE_DEFAULT"),
+              "CONC_LIST": value("conc_list", "CONC_LIST_DEFAULT"),
+              "RUN_ACCURACY": value("run_accuracy", "RUN_ACCURACY_DEFAULT"),
+              "TIME_LIMIT_OVERRIDE": value("time_limit", "TIME_LIMIT_DEFAULT"),
+          }
+          if pairs["SLURM_NODELIST_OVERRIDE"].strip().lower() == "auto":
+              pairs["SLURM_NODELIST_OVERRIDE"] = ""
+          for key, val in pairs.items():
+              print(f"{key}={val}")
+          PY
+
+      - name: Show runner and Slurm state
+        run: |
+          set -euo pipefail
+          hostname
+          whoami
+          pwd
+          command -v salloc
+          salloc --help | head -80 || true
+          command -v squeue
+          squeue --help | head -80 || true
+          command -v scancel
+          command -v spur && spur --help | head -120 || true
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_PASSWORD:-}" ]; then
+            echo "DOCKER_PASSWORD is empty; skipping docker login"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+
+      - name: Prepare SGLang and shared aiter source
+        run: |
+          set -euo pipefail
+          python3 -m pip install pyyaml -q
+
+          SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-mi355x-disagg"
+          rm -rf "${SGLANG_WORKSPACE}"
+          git clone --depth 1 --branch "${SGLANG_REF}" \
+            "https://github.com/${SGLANG_REPOSITORY}.git" "${SGLANG_WORKSPACE}"
+          test -f "${SGLANG_WORKSPACE}/scripts/ci/slurm/launch_mi355x.sh"
+          test -f "${SGLANG_WORKSPACE}/scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml"
+
+          python3 .github/scripts/sglang_mi355x_disagg.py patch-launcher "${SGLANG_WORKSPACE}"
+          python3 .github/scripts/sglang_mi355x_disagg.py configure-recipe \
+            "${SGLANG_WORKSPACE}" \
+            --concurrency-list "${CONC_LIST}" \
+            --accuracy-enabled "${RUN_ACCURACY}"
+
+          SHARED_ROOT="${SHARED_WORKSPACE_ROOT%/}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
+          AITER_SOURCE_DIR="${SHARED_ROOT}/aiter-source"
+          SHARED_WORKDIR_ROOT="${SHARED_ROOT}/mi355x-ci"
+          rm -rf "${SHARED_ROOT}"
+          mkdir -p "${AITER_SOURCE_DIR}" "${SHARED_WORKDIR_ROOT}"
+          tar --exclude=.git -C "${GITHUB_WORKSPACE}" -cf - . | tar -C "${AITER_SOURCE_DIR}" -xf -
+
+          {
+            echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}"
+            echo "AITER_SOURCE_DIR=${AITER_SOURCE_DIR}"
+            echo "SHARED_WORKDIR_ROOT=${SHARED_WORKDIR_ROOT}"
+          } >> "${GITHUB_ENV}"
+
+          {
+            echo "### SGLang MI355X DSV4Pro FP8 1P1D setup"
+            echo "- SGLang: \`${SGLANG_REPOSITORY}@${SGLANG_REF}\`"
+            echo "- Model path: \`${MODEL_PATH_OVERRIDE}\`"
+            echo "- Slurm nodes: \`${SLURM_NODELIST_OVERRIDE:-scheduler allocated}\`"
+            echo "- Shared workspace: \`${SHARED_ROOT}\`"
+            echo "- Concurrency list: \`${CONC_LIST}\`"
+            echo "- GSM8K gate: \`${RUN_ACCURACY}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Clean up prior Slurm jobs from this runner
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_NAME:-}" ]; then
+            echo "RUNNER_NAME unset; skipping stale cleanup"
+            exit 0
+          fi
+          STALE_JOBS="$(
+            squeue --me --noheader --format="%i %200j" \
+              | grep -F "mi355x-ci-${RUNNER_NAME}-" \
+              | awk '{print $1}' || true
+          )"
+          if [ -n "${STALE_JOBS}" ]; then
+            echo "Cancelling stale jobs for ${RUNNER_NAME}: ${STALE_JOBS}"
+            scancel ${STALE_JOBS}
+          fi
+
+      - name: Launch SGLang DSV4Pro FP8 1P1D benchmark
+        id: benchmark
+        continue-on-error: true
+        timeout-minutes: 200
+        run: |
+          set -euo pipefail
+          cd "${SGLANG_WORKSPACE}"
+          export FRAMEWORK=sglang
+          export HW=mi355x
+          export MODEL=sgl-project/DeepSeek-V4-Pro-FP8
+          export MODEL_PREFIX=dsv4pro
+          export PRECISION=fp8
+          export ISL=1024
+          export OSL=1024
+          export CONFIG_FILE=scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml
+          export RESULT_FILENAME=mi355x-dsv4pro-fp8-1p1d
+          export MATRIX_CONFIG_NAME=dsv4pro-fp8-mi355x-sglang
+          export MODEL_PATH="${MODEL_PATH_OVERRIDE}"
+          export MODEL_MOUNT_ROOTS="${MODEL_MOUNT_ROOTS}"
+          export IMAGE_OVERRIDE="${IMAGE_OVERRIDE}"
+          export SLURM_NODELIST="${SLURM_NODELIST_OVERRIDE}"
+          export SLURM_PARTITION="${SLURM_PARTITION_OVERRIDE}"
+          export SLURM_EXCLUSIVE="${SLURM_EXCLUSIVE_OVERRIDE}"
+          export TIME_LIMIT="${TIME_LIMIT_OVERRIDE}"
+          export SHARED_WORKDIR_ROOT="${SHARED_WORKDIR_ROOT}"
+          export AITER_SOURCE_DIR="${AITER_SOURCE_DIR}"
+          bash scripts/ci/slurm/launch_mi355x.sh
+
+      - name: Process SGLang benchmark results
+        if: always()
+        run: |
+          set -euo pipefail
+          cd "${SGLANG_WORKSPACE}"
+          python3 -m pip install pyyaml tabulate -q
+          shopt -s nullglob
+          processed=0
+          for result_file in "${GITHUB_WORKSPACE}"/mi355x-dsv4pro-fp8-1p1d_*.json; do
+            basename_file="$(basename "${result_file}")"
+            ctx="$(echo "${basename_file}" | sed -n 's/.*_ctx_\([0-9]*\)_gen.*/\1/p')"
+            gen="$(echo "${basename_file}" | sed -n 's/.*_gen_\([0-9]*\)\.json/\1/p')"
+            [ -n "${ctx}" ] && [ -n "${gen}" ] || continue
+            RESULT_FILENAME="${result_file%.json}" \
+              PREFILL_GPUS="${ctx}" \
+              DECODE_GPUS="${gen}" \
+              RECIPE_FILE="${SGLANG_WORKSPACE}/scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml" \
+              FRAMEWORK=sglang \
+              HW=mi355x \
+              MODEL_PREFIX=dsv4pro \
+              PRECISION=fp8 \
+              ISL=1024 \
+              OSL=1024 \
+              python3 scripts/ci/slurm/process_result.py
+            processed=$((processed + 1))
+          done
+          if [ "${processed}" -eq 0 ]; then
+            echo "No result files were produced."
+            exit 1
+          fi
+          python3 scripts/ci/slurm/summarize.py "${GITHUB_WORKSPACE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Stage artifacts
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts"
+          mkdir -p "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts"
+          cp -a "${GITHUB_WORKSPACE}"/*.json "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts/" 2>/dev/null || true
+          if [ -n "${SHARED_WORKDIR_ROOT:-}" ] && [ -d "${SHARED_WORKDIR_ROOT}" ]; then
+            cp -a "${SHARED_WORKDIR_ROOT}" "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts/shared-workdir"
+          fi
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-mi355x-dsv4pro-fp8-1p1d-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: sglang-mi355x-artifacts/
+
+      - name: Clean up Slurm jobs on failure or cancel
+        if: failure() || cancelled() || steps.benchmark.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_NAME:-}" ]; then
+            echo "RUNNER_NAME unset; skipping Slurm cleanup"
+            exit 0
+          fi
+          JOB_TAG="mi355x-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-dsv4pro-fp8-mi355x-sglang"
+          ACTIVE_JOBS="$(
+            squeue --me --noheader --format="%i %200j" \
+              | grep -F "${JOB_TAG}" \
+              | awk '{print $1}' || true
+          )"
+          if [ -n "${ACTIVE_JOBS}" ]; then
+            echo "Cancelling jobs for ${JOB_TAG}: ${ACTIVE_JOBS}"
+            scancel ${ACTIVE_JOBS}
+          fi
+
+      - name: Fail if benchmark failed
+        if: steps.benchmark.outcome == 'failure'
+        run: exit 1
