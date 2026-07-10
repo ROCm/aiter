@@ -819,18 +819,16 @@ inline constexpr auto layout_imm_offsets_v = layout_to_offsets<vec>(Layout{typen
 // ext_vector_type only accepts scalars, so for packs (is_packs_v) vector_t falls back to a packed struct (reusing the packed array); it is NOT a real HW vector.
 namespace impl {
 template <typename T, index_t N> struct packed_vec : opus::array<T, N> { using base = opus::array<T, N>; using base::base; };
+// native ext_vector for scalars; packed_vec for sub-byte packs. The ext_vector_type form is only
+// instantiated for the scalar (non-pack) case, so it is never formed on a pack struct type.
+template<typename V, index_t N, bool = is_packs_v<V>> struct vector_storage { using type = V __attribute__((ext_vector_type(N))); };
+template<typename V, index_t N> struct vector_storage<V, N, true> { using type = packed_vec<V, N>; };
 }
-template <typename V_, index_t N_, typename Enable = void> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
+template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
 struct vector {
     static constexpr index_t N = N_;
     using value_type           = remove_cvref_t<V_>;
-    using type = value_type __attribute__((ext_vector_type(N))); // this is danguous
-};
-template <typename V_, index_t N_>
-struct vector<V_, N_, std::enable_if_t<is_packs_v<V_>>> {
-    static constexpr index_t N = N_;
-    using value_type = remove_cvref_t<V_>;
-    using type = impl::packed_vec<value_type, N_>;
+    using type = typename impl::vector_storage<value_type, N_>::type;
 };
 template <typename T, index_t N> using vector_t = typename vector<T, N>::type;
 
