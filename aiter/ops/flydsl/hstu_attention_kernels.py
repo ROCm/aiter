@@ -11,6 +11,7 @@ from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
     validate_hstu_attention_bwd,
     build_hstu_attention_bwd,
+    NUM_GRID_GROUPS,
 )
 from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
     build_hstu_attention_bwd_dq,
@@ -621,6 +622,36 @@ def _get_bwd_tuned_config(
     return _bwd_tuned_config_map().get((problem_key, kernel), {})
 
 
+def _build_balance_perm(
+    seq_offsets: torch.Tensor, groups: int = NUM_GRID_GROUPS
+) -> torch.Tensor:
+    """Group-aware sort-by-length permutation for the bwd grid.
+
+    FlyDSL's grid uses `grid_group = block_id % NUM_GRID_GROUPS`, which partitions
+    the batch into `groups` contiguous chunks. A *naive* descending sort would pile
+    all the long sequences into one group and starve the rest (measured ~2.5x
+    slower). Instead, deal the length-sorted sequences round-robin across the
+    groups so every group gets a Sum(n^2)-balanced, longest-first (LPT) set. The
+    kernel remaps `batch_idx = perm[batch_idx]`.
+
+    Returns an int32 tensor `perm` of length B where `perm[slot]` is the sequence
+    that grid slot should process. Falls back to identity when the group
+    boundaries don't align to whole batches (B not divisible by `groups`).
+    """
+    lengths = seq_offsets[1:] - seq_offsets[:-1]
+    B = int(lengths.numel())
+    device = seq_offsets.device
+    if B % groups != 0:
+        return torch.arange(B, dtype=torch.int32, device=device)
+    per = B // groups
+    order = torch.argsort(lengths, descending=True)  # sequence indices, longest first
+    rank = torch.arange(B, device=device)
+    slot = (rank % groups) * per + (rank // groups)
+    perm = torch.empty(B, dtype=torch.int32, device=device)
+    perm[slot] = order.to(torch.int32)
+    return perm
+
+
 def _get_bwd_default_config(kernel: str) -> dict:
     """Conservative heuristic default when no tuned entry exists.
 
@@ -651,6 +682,7 @@ def _compile_bwd_launcher(
     block_n: Optional[int],
     num_waves: Optional[int],
     waves_per_eu: Optional[int],
+    has_perm: bool = False,
 ) -> tuple[Callable, Callable]:
     """Builds the (dV, dK, dQ) launcher triple, resolving tuned -> default -> custom
     per kernel.
@@ -701,6 +733,7 @@ def _compile_bwd_launcher(
         alpha=alpha,
         dtype_str=dtype_str,
         max_seq_len=max_seq_len,
+        has_perm=has_perm,
     )
     dv_launcher = build_hstu_attention_bwd(
         **common_kwargs, which="dv", **_resolve(_BWD_KERNEL_DV)
@@ -731,6 +764,7 @@ def flydsl_hstu_attention_bwd(
     block_n: Optional[int] = None,
     num_waves: Optional[int] = None,
     waves_per_eu: Optional[int] = None,
+    sort_by_length: bool = False,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU attention backward: returns (dq, dk, dv).
@@ -769,6 +803,7 @@ def flydsl_hstu_attention_bwd(
         block_n=block_n,
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
+        has_perm=sort_by_length,
     )
 
     dq = torch.empty_like(q)
@@ -786,6 +821,13 @@ def flydsl_hstu_attention_bwd(
     so_c = seq_offsets.contiguous()
     nt_c = nt.contiguous()
 
+    # Optional group-aware sort-by-length load balancing (see _build_balance_perm).
+    # A dummy 1-elem perm is passed (and never indexed) when disabled.
+    if sort_by_length:
+        perm_c = _build_balance_perm(so_c).contiguous()
+    else:
+        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
+
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
     with torch.cuda.device(q.device.index):
         _run_compiled(
@@ -796,6 +838,7 @@ def flydsl_hstu_attention_bwd(
             do_c,
             so_c,
             nt_c,
+            perm_c,
             dv,
             fx.Stream(launch_stream),
         )
@@ -807,6 +850,7 @@ def flydsl_hstu_attention_bwd(
             do_c,
             so_c,
             nt_c,
+            perm_c,
             dk,
             fx.Stream(launch_stream),
         )
@@ -818,6 +862,7 @@ def flydsl_hstu_attention_bwd(
             do_c,
             so_c,
             nt_c,
+            perm_c,
             dq,
             fx.Stream(launch_stream),
         )
@@ -841,6 +886,7 @@ def _make_bwd_kernel_runners(
     block_n: Optional[int] = None,
     num_waves: Optional[int] = None,
     waves_per_eu: Optional[int] = None,
+    sort_by_length: bool = False,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> dict:
     """Tuning/profiling helper: build the (dV, dK, dQ) launcher triple with an
@@ -870,6 +916,7 @@ def _make_bwd_kernel_runners(
         block_n=block_n,
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
+        has_perm=sort_by_length,
     )
 
     dq = torch.empty_like(q)
@@ -887,26 +934,31 @@ def _make_bwd_kernel_runners(
     so_c = seq_offsets.contiguous()
     nt_c = nt.contiguous()
 
+    if sort_by_length:
+        perm_c = _build_balance_perm(so_c).contiguous()
+    else:
+        perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
+
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
 
     def run_dv():
         with torch.cuda.device(q.device.index):
             _run_compiled(
-                dv_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, dv,
+                dv_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c, dv,
                 fx.Stream(launch_stream),
             )
 
     def run_dk():
         with torch.cuda.device(q.device.index):
             _run_compiled(
-                dk_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, dk,
+                dk_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c, dk,
                 fx.Stream(launch_stream),
             )
 
     def run_dq():
         with torch.cuda.device(q.device.index):
             _run_compiled(
-                dq_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, dq,
+                dq_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c, dq,
                 fx.Stream(launch_stream),
             )
 
