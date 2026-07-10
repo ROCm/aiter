@@ -8,13 +8,21 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Optional
 
-import aiter
 import torch
 
+import aiter
+
 # from aiter import get_torch_quant as get_quant
-from aiter import ActivationType, QuantType, dtypes
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_dynamic_mxfp8_quant_moe_sort,
+    logger,
+    mxfp4_moe_sort_fwd,
+)
 from aiter import get_hip_quant as get_quant
-from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import (
     get_cu_num,
@@ -38,10 +46,10 @@ except ImportError:
 
 
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
-from aiter import (
-    fused_dynamic_mxfp4_quant_moe_sort,
-    fused_dynamic_mxfp8_quant_moe_sort,
-    mxfp4_moe_sort_fwd,
+from aiter.ops.flydsl.mxfp4_kname import (
+    _is_mxfp4_kname,
+    _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
 )
 
 BLOCK_SIZE_M = 32
@@ -50,6 +58,14 @@ BLOCK_SIZE_M = 32
 # Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+# "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
+#   auto (default) / adaptive -> use the adaptive branch. NO shape fallback: the
+#     kernel is codegen'd for a fixed shape set (SHAPES in
+#     csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py) and an un-codegen'd
+#     shape hits TORCH_CHECK. Safe only because output_aux is set only for
+#     tuned-CSV rows routed to the port (exactly the codegen'd shapes).
+#   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
+_MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -93,6 +109,63 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
+def _adaptive_moe_sort(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    topk,
+    block_size,
+    model_dim,
+    *,
+    atomic=False,
+    emit_aux=False,
+    moebuf_dtype=dtypes.bf16,
+):
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    BM = block_size
+    active = min(num_experts, M * topk)
+    max_sorted = (((M * topk + active * (BM - 1)) + BM - 1) // BM) * BM
+
+    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        if atomic
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    empty_bf16 = _empty_bf16(device)
+    bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
+
+    aiter.mxfp4_moe_sort(
+        topk_ids=topk_ids,
+        topk_weight=topk_weights,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        reverse_sorted=reverse_sorted,
+        sorted_weights=sorted_weights,
+        m_indices=m_indices,
+        bf16_zero_out=bf16_zero,
+        bf16_zero_workspace=empty_bf16,
+        M_logical=M,
+        NE=num_experts,
+        TOPK=topk,
+        D_HIDDEN=model_dim,
+        D_INTER=1,  # (void)D_INTER in the sort path; unused
+        MB=BM,
+        prologue=0 if BM == 16 else 1,
+    )
+    std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    if emit_aux:
+        return (*std, m_indices, reverse_sorted)
+    return std
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -106,11 +179,28 @@ def _moe_sorting_impl(
     use_opus,
     return_local_topk_ids=False,
     accumulate=True,
+    output_aux=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
+    if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
+        # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
+        # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
+        return _adaptive_moe_sort(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            topk,
+            block_size,
+            model_dim,
+            atomic=accumulate,
+            emit_aux=True,
+            moebuf_dtype=moebuf_dtype,
+        )
+
+    # -- Opus / CK standard path --
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
@@ -131,6 +221,16 @@ def _moe_sorting_impl(
         # CK sorting does not emit local ids; use Opus so callers do not need a slow
         # Python-side remap or a hard failure when local expert ids are required.
         use_opus = True
+
+    aux_m_indices = None
+    aux_reverse_sorted = None
+    if output_aux:
+        use_opus = True
+        dispatch_policy = 1
+        aux_m_indices = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.i32, device=device
+        )
+        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
@@ -156,6 +256,8 @@ def _moe_sorting_impl(
             workspace,
             dispatch_policy,
             local_topk_ids,
+            aux_m_indices,
+            aux_reverse_sorted,
         )
     else:
         aiter.moe_sorting_fwd(
@@ -173,6 +275,8 @@ def _moe_sorting_impl(
             dispatch_policy,
         )
     ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    if output_aux:
+        return (*ret, aux_m_indices, aux_reverse_sorted)
     if return_local_topk_ids:
         return (*ret, local_topk_ids)
     return ret
@@ -241,6 +345,7 @@ def moe_sorting(
     return_local_topk_ids=False,
     accumulate=True,
     flat=False,
+    output_aux=False,
 ):
     if (
         not _USE_CK_MOE_SORTING
@@ -248,6 +353,7 @@ def moe_sorting(
         and is_flydsl_available()
         and not return_local_topk_ids
         and not flat
+        and not output_aux
         and dispatch_policy == 0
     ):
         return _flydsl_moe_sorting(
@@ -280,6 +386,7 @@ def moe_sorting(
             use_opus=not _USE_CK_MOE_SORTING,
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
+            output_aux=output_aux,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -593,34 +700,69 @@ def fused_moe_(
     assert (
         not metadata.flat or get_gfx() == "gfx950"
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
-    sorting_ret = moe_sorting(
-        topk_ids,
-        topk_weight,
-        global_E,
-        model_dim,
-        dtype,
-        block_size_M,
-        expert_mask,
-        num_local_tokens,
-        moe_sorting_dispatch_policy,
-        return_local_topk_ids=need_local_topk_ids,
-        accumulate=not stage2_uses_route_reduce(metadata.stage2),
-        flat=metadata.flat,
-    )
-    if need_local_topk_ids:
+
+    sort_m_indices = None
+    sort_reverse_sorted = None
+    if metadata.output_aux:
+        # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
+        # not thread expert_mask into moe_sorting below -- EP masking would be
+        # silently ignored and tokens routed to the wrong experts. Fail loudly
+        # until EP support is added to the port.
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
+                "(expert_mask is dropped by the output_aux sort path)."
+            )
+        _kn2 = metadata.stage2.keywords.get("kernelName2", "")
+        _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
         (
             sorted_ids,
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
             moe_buf,
-            local_topk_ids,
-        ) = sorting_ret
-    else:
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-            sorting_ret
+            sort_m_indices,
+            sort_reverse_sorted,
+        ) = moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            accumulate=_atomic,
+            output_aux=True,
         )
         local_topk_ids = None
+    else:
+        sorting_ret = moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+            return_local_topk_ids=need_local_topk_ids,
+            accumulate=not stage2_uses_route_reduce(metadata.stage2),
+            flat=metadata.flat,
+        )
+        if need_local_topk_ids:
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                local_topk_ids,
+            ) = sorting_ret
+        else:
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+                sorting_ret
+            )
+            local_topk_ids = None
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
@@ -685,6 +827,8 @@ def fused_moe_(
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            m_indices=sort_m_indices,
+            reverse_sorted=sort_reverse_sorted,
         )
 
 
@@ -954,8 +1098,8 @@ def get_padded_M(M):
 
 @dataclass
 class MOEMetadata:
-    stage1: Callable
-    stage2: Callable
+    stage1: Optional[Callable]
+    stage2: Optional[Callable]
     block_m: int
     ksplit: int
     run_1stage: bool = False
@@ -964,6 +1108,11 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
+    # Feature flags:
+    #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
+    #  - prequant: fused_moe_2stages quantizes a1 before stage1.
+    output_aux: bool = False
+    prequant: bool = True
     skip_inter_quant: bool = False
     route_bucket: str = ""
     expected_sorted_blocks: Optional[int] = None
@@ -1304,7 +1453,7 @@ def get_2stage_cfgs(
         df = pd.read_csv(tune_file)
         df = _ensure_gfx_column(df)
         if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") == ""]
+            df = df[df["_tag"].fillna("") != "flydsl_fallback"]
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -1331,39 +1480,6 @@ def get_2stage_cfgs(
         fallback = df_fallback.set_index(_INDEX_COLS).to_dict("index")
 
         return primary, fallback
-
-    _flydsl_fallback_cache = {}
-
-    def get_flydsl_fallback_cfgs(tune_file):
-        """Return fallback configs (rows tagged ``flydsl_fallback``)."""
-        if tune_file in _flydsl_fallback_cache:
-            return _flydsl_fallback_cache[tune_file]
-        import pandas as pd
-
-        if not os.path.exists(tune_file):
-            _flydsl_fallback_cache[tune_file] = {}
-            return {}
-        df = pd.read_csv(tune_file)
-        df = _ensure_gfx_column(df)
-        if "_tag" not in df.columns:
-            _flydsl_fallback_cache[tune_file] = {}
-            return {}
-        if "act_type" in df.columns:
-            df["act_type"] = _ACT_TYPE_DISABLED_KEY
-        fb_df = df[df["_tag"] == "flydsl_fallback"]
-        if fb_df.empty:
-            _flydsl_fallback_cache[tune_file] = {}
-            return {}
-        dup_mask = fb_df.duplicated(subset=_INDEX_COLS, keep="first")
-        if dup_mask.any():
-            logger.warning(
-                f"[fused_moe] duplicate fallback rows after disabling act_type in {tune_file}; "
-                f"keeping first match for {int(dup_mask.sum())} rows"
-            )
-            fb_df = fb_df.loc[~dup_mask]
-        result = fb_df.set_index(_INDEX_COLS).to_dict("index")
-        _flydsl_fallback_cache[tune_file] = result
-        return result
 
     global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
@@ -1481,25 +1597,6 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
-    if cfg is not None and not is_flydsl_available():
-        kn1 = str(cfg.get("kernelName1", ""))
-        kn2 = str(cfg.get("kernelName2", ""))
-        if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
-            fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
-            fallback = fallback_cfgs.get(keys, None) or fallback_cfgs.get(
-                keys_disabled, None
-            )
-            if fallback is not None:
-                cfg = fallback
-                logger.info(
-                    f"[fused_moe] flydsl unavailable, using fallback config for {keys}"
-                )
-            else:
-                cfg = None
-                logger.warning(
-                    f"[fused_moe] flydsl unavailable and no fallback for {keys}, "
-                    "using default heuristics"
-                )
 
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
@@ -1595,6 +1692,28 @@ def get_2stage_cfgs(
             return 32
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
+
+    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+        # gate_mode is a runtime weight-layout property, not a tuning key: route
+        # any a4w4 kernelName to the port; the bound interleave flag picks the
+        # compiled il/sep variant at runtime.
+        try:
+            _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        except ValueError:
+            _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
+        return MOEMetadata(
+            stage1=functools.partial(
+                _mxfp4_a4w4_stage1_fw,
+                kernelName1=kernelName1,
+                interleave=(gate_mode == GateMode.INTERLEAVE),
+            ),
+            stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernelName2),
+            block_m=_bm,
+            ksplit=int(ksplit),
+            fuse_quant="fp4",
+            output_aux=True,
+            prequant=False,
+        )
 
     if run_1stage:
         # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
@@ -2077,6 +2196,8 @@ def fused_moe_2stages(
     swiglu_limit=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
+    m_indices=None,
+    reverse_sorted=None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2084,6 +2205,7 @@ def fused_moe_2stages(
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
+    _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
@@ -2107,7 +2229,10 @@ def fused_moe_2stages(
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
     )
-    if (
+    if not metadata.prequant:
+        a1 = hidden_states
+        a1_scale = None
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
@@ -2224,6 +2349,10 @@ def fused_moe_2stages(
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    if m_indices is not None:
+        extra_stage1_args["m_indices"] = m_indices
+        extra_stage1_args["moe_buf"] = _sort_moe_buf
+        extra_stage2_args["reverse_sorted"] = reverse_sorted
     _stage1_call = functools.partial(
         metadata.stage1,
         a1,
