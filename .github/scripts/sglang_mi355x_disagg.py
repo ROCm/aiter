@@ -22,6 +22,15 @@ def replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new, 1)
 
 
+def replace_all(text: str, old: str, new: str, min_count: int = 1) -> str:
+    count = text.count(old)
+    if count < min_count:
+        raise SystemExit(
+            f"expected at least {min_count} launcher match(es), got {count}: {old!r}"
+        )
+    return text.replace(old, new)
+
+
 def patch_launcher(args: argparse.Namespace) -> None:
     root = Path(args.sglang_workspace)
     launcher = root / LAUNCHER_PATH
@@ -42,7 +51,7 @@ def patch_launcher(args: argparse.Namespace) -> None:
         """DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \\
 --security-opt seccomp=unconfined \\
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \\
--v /it-share:/it-share:ro -v $HOME:/host_home"
+-v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 """,
         """MODEL_MOUNT_ARGS=""
 for mount_root in ${MODEL_MOUNT_ROOTS:-/it-share /data /models}; do
@@ -59,73 +68,70 @@ fi
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \\
 --security-opt seccomp=unconfined \\
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \\
--v $WORKDIR:/ci_workdir $MODEL_MOUNT_ARGS $AITER_MOUNT_ARGS"
+-v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $AITER_MOUNT_ARGS $CHECKOUT_DOCKER_ARGS"
 """,
     )
     text = replace_once(
         text,
-        "# ---------------------------------------------------------------------------\n"
-        "# Write per-role scripts that srun dispatches to each compute node.\n"
-        "# ---------------------------------------------------------------------------\n",
-        """# Install the aiter checkout under test inside each serving container. The
-# checkout is mounted read-only from shared storage; copy it to /tmp because
-# editable installs write metadata into the source tree.
-AITER_INSTALL_SNIPPET='
-if [ -d /aiter-under-test ]; then
-  rm -rf /tmp/aiter-under-test
-  cp -a /aiter-under-test /tmp/aiter-under-test
-  cd /tmp/aiter-under-test
-  python3 -m pip uninstall -y amd-aiter aiter || true
-  MAX_JOBS="${AITER_MAX_JOBS:-64}" PREBUILD_KERNELS="${AITER_PREBUILD_KERNELS:-0}" GPU_ARCHS="${GPU_ARCHS:-gfx950}" python3 -m pip install --no-build-isolation -e .
-  python3 -m pip show amd-aiter || python3 -m pip show aiter || true
-  cd - >/dev/null
-fi
-'
+        'CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"',
+        'SGLANG_RUNTIME_WORKSPACE="${SGLANG_RUNTIME_WORKSPACE:-$GITHUB_WORKSPACE}"\n'
+        'CHECKOUT_DOCKER_ARGS="-e SGLANG_USE_CHECKOUT_RUNTIME=$SGLANG_USE_CHECKOUT_RUNTIME"',
+    )
+    text = replace_once(
+        text,
+        'CHECKOUT_SHA="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"',
+        'CHECKOUT_SHA="$(git -C "$SGLANG_RUNTIME_WORKSPACE" rev-parse HEAD)"',
+    )
+    text = replace_once(
+        text,
+        '-C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+        '-C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+    )
+    text = replace_once(
+        text,
+        'cat > "$WORKDIR/prefill_entry.sh" <<EOF',
+        """cat > "$WORKDIR/install_checkout_aiter.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Write per-role scripts that srun dispatches to each compute node.
-# ---------------------------------------------------------------------------
+if [[ ! -d /aiter-under-test ]]; then
+  echo "[checkout-aiter] /aiter-under-test not mounted; using image-baked aiter"
+  exit 0
+fi
+
+RUNTIME_AITER="${RUNTIME_AITER:-/tmp/aiter-under-test-runtime}"
+echo "[checkout-aiter] reinstalling aiter from /aiter-under-test"
+rm -rf "$RUNTIME_AITER"
+mkdir -p "$RUNTIME_AITER"
+tar --exclude='__pycache__' --exclude='*.pyc' \
+  -C /aiter-under-test -cf - . | tar -C "$RUNTIME_AITER" -xf -
+
+python3 -m pip uninstall -y amd-aiter aiter || true
+MAX_JOBS="${AITER_MAX_JOBS:-64}" PREBUILD_KERNELS="${AITER_PREBUILD_KERNELS:-0}" GPU_ARCHS="${GPU_ARCHS:-gfx950}" \
+  python3 -m pip install --no-build-isolation -e "$RUNTIME_AITER"
+python3 -m pip show amd-aiter || python3 -m pip show aiter || true
+EOF
+
+cat > "$WORKDIR/prefill_entry.sh" <<EOF
 """,
+    )
+    text = replace_all(
+        text,
+        'bash "\\$CIDIR/install_checkout_sglang.sh"\n',
+        'bash "\\$CIDIR/install_checkout_sglang.sh"\n'
+        'bash "\\$CIDIR/install_checkout_aiter.sh"\n',
+        min_count=2,
     )
     text = replace_once(
         text,
-        """  $IMAGE python3 -m sglang.launch_server \\
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \\
-  $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
-""",
-        """  $IMAGE bash -lc '
-    set -ex
-    $AITER_INSTALL_SNIPPET
-    exec python3 -m sglang.launch_server \\
-      --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \\
-      $COMMON_FLAGS --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
-  '
-""",
+        "    bash \\$CIDIR/install_checkout_sglang.sh\n",
+        "    bash \\$CIDIR/install_checkout_sglang.sh\n"
+        "    bash \\$CIDIR/install_checkout_aiter.sh\n",
     )
-    text = replace_once(
+    text = replace_all(
         text,
-        """  $IMAGE python3 -m sglang.launch_server \\
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \\
-  $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
-""",
-        """  $IMAGE bash -lc '
-    set -ex
-    $AITER_INSTALL_SNIPPET
-    exec python3 -m sglang.launch_server \\
-      --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \\
-      $COMMON_FLAGS --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
-  '
-""",
-    )
-    text = replace_once(
-        text,
-        "CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}",
-        "CIDIR=/ci_workdir",
-    )
-    text = replace_once(
-        text,
-        "OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\\${C}.json",
-        "OUT=/ci_workdir/raw_conc\\${C}.json",
+        "/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}",
+        "/ci_workdir",
     )
     text = replace_once(
         text,
@@ -141,10 +147,10 @@ PARTITION_ARG=()
     )
     text = replace_once(
         text,
-        """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+        """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
-        """salloc "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+        """salloc "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
     )

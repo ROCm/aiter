@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       sglang_ref:
-        description: "SGLang ref to test; default tracks sgl-project/sglang#29084"
+        description: "SGLang ref to test"
         required: false
         type: string
-        default: "amd-mi355x-disagg-nightly"
+        default: "main"
       image:
         description: "Optional SGLang ROCm image override. Empty uses the recipe default."
         required: false
@@ -72,8 +72,8 @@ permissions:
   contents: read
 
 env:
-  SGLANG_REPOSITORY: Lzy17/sglang
-  SGLANG_REF_DEFAULT: amd-mi355x-disagg-nightly
+  SGLANG_REPOSITORY: sgl-project/sglang
+  SGLANG_REF_DEFAULT: main
   IMAGE_OVERRIDE_DEFAULT: ""
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
@@ -262,6 +262,7 @@ jobs:
           export SLURM_EXCLUSIVE="${SLURM_EXCLUSIVE_OVERRIDE}"
           export TIME_LIMIT="${TIME_LIMIT_OVERRIDE}"
           export SHARED_WORKDIR_ROOT="${SHARED_WORKDIR_ROOT}"
+          export SGLANG_RUNTIME_WORKSPACE="${SGLANG_WORKSPACE}"
           export AITER_SOURCE_DIR="${AITER_SOURCE_DIR}"
           bash scripts/ci/slurm/launch_mi355x.sh
 
