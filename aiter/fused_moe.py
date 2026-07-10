@@ -1017,6 +1017,7 @@ def _flydsl_stage1_wrapper(
     swiglu_limit: Optional[float] = None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    out_dtype: Optional[str] = None,
     v2_output_layout: bool = False,
     **_kwargs,
 ):
@@ -1041,7 +1042,7 @@ def _flydsl_stage1_wrapper(
         tile_k=parsed["tile_k"],
         a_dtype=parsed["a_dtype"],
         b_dtype=parsed["b_dtype"],
-        out_dtype=parsed["out_dtype"],
+        out_dtype=out_dtype or parsed["out_dtype"],
         act=act,
         w1_scale=w1_scale,
         a1_scale=a1_scale,
@@ -1198,9 +1199,16 @@ def _flydsl_v2_stage2_wrapper(
             else t
         )
 
-    if epilog != "reduce":
+    token_num = out.shape[0]
+    model_dim_runtime = out.shape[1]
+    target = out
+    if epilog == "reduce":
+        target = torch.empty(
+            (token_num, topk, model_dim_runtime), dtype=out.dtype, device=out.device
+        )
+    else:
         out.zero_()
-    return mxfp4_moe_gemm2(
+    mxfp4_moe_gemm2(
         inter_sorted_quant=_u8(inter_states),
         inter_sorted_shuffled_scale=_u8(a2_scale),
         w2_u8=_u8(w2),
@@ -1209,8 +1217,8 @@ def _flydsl_v2_stage2_wrapper(
         cumsum_tensor=num_valid_ids,
         sorted_token_ids=sorted_token_ids,
         sorted_weights=sorted_weights,
-        out=out,
-        M_logical=out.shape[0],
+        out=target,
+        M_logical=token_num,
         max_sorted=max_sorted,
         NE=num_experts,
         D_HIDDEN=model_dim,
@@ -1226,6 +1234,11 @@ def _flydsl_v2_stage2_wrapper(
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
     )
+    if epilog == "reduce":
+        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+        _run_moe_reduction(target, out, token_num, topk, model_dim_runtime)
+    return out
 
 
 @functools.lru_cache(maxsize=2048)
@@ -1633,7 +1646,11 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
+        flydsl_v2_stage2_cfg = None
         if is_flydsl2_v2:
+            flydsl_v2_stage2_cfg = parse_flydsl_v2_gemm2_kernel(kernelName2)
+            if flydsl_v2_stage2_cfg is None:
+                raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName2}")
             stage2_func = functools.partial(
                 _flydsl_v2_stage2_wrapper,
                 kernelName=kernelName2,
@@ -1675,6 +1692,9 @@ def get_2stage_cfgs(
             )
         _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
+        if flydsl_v2_stage2_cfg is not None:
+            stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
+            _fuse_quant = flydsl_v2_stage2_cfg["a_dtype"]
         return MOEMetadata(
             stage1_func,
             stage2_func,
