@@ -492,7 +492,11 @@ def _moe_gemm_a8w4_decode(
             )
         write_idx += 1
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
         w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
         if PRESHUFFLED:
             w_buffer_slice = unshuffle_weight_gfx1250(
@@ -500,7 +504,11 @@ def _moe_gemm_a8w4_decode(
             )
         cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
         if is_x_microscaled and not X_SCALE_TDM:
             async_copy.wait_group(NUM_BUFFERS - 1)
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -556,9 +564,13 @@ def _moe_gemm_a8w4_decode(
     # The first NUM_BUFFERS-1 iterations still use the pre-load / WMMA pattern.
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 1 - k_ep) * NUM_TDM_OPS - 1 + TDM_BIAS_WAIT
         )
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
 
         w_buffer_slice = w_buffer.index(read_idx % NUM_BUFFERS)
         if PRESHUFFLED:
@@ -567,9 +579,13 @@ def _moe_gemm_a8w4_decode(
             )
         cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
         )
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
         if is_x_microscaled and not X_SCALE_TDM:
             async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
