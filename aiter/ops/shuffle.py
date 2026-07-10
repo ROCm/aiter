@@ -100,6 +100,41 @@ def shuffle_scale_a16w4_sep_fp4(src: torch.Tensor, experts_cnt: int) -> torch.Te
     return shfl.view(*src.shape).contiguous()
 
 
+def _gate_up_interleave_n(t: torch.Tensor, blk: int = 16) -> torch.Tensor:
+    """Interleave the gate|up-concat N dim (dim1) at `blk`-row granularity:
+    [g0..g_{nb-1} | u0..u_{nb-1}] -> [g0,u0, g1,u1, ...]. t is (E, N, ...)."""
+    x_type = t.dtype
+    view_u8 = x_type not in (torch.bfloat16, torch.float16, torch.float32)
+    if view_u8:
+        t = t.view(torch.uint8)
+    E, N, *rest = t.shape
+    nb = (N // 2) // blk
+    t = t.view(E, 2, nb, blk, *rest).movedim(1, 2).reshape(E, N, *rest).contiguous()
+    return t.view(x_type) if view_u8 else t
+
+
+def shuffle_weight_a16w4_gui_fp4(src: torch.Tensor) -> torch.Tensor:
+    """fp4_bf16 INTERLEAVE weight layout: gate/up interleaved (16-block) + klane-inner.
+
+    Same klane-inner K packing as ``shuffle_weight_a16w4_sep_fp4`` but with gate and
+    up interleaved along N so the fp4_bf16 INTERLEAVE (``_gui``) FlyDSL kernel reads
+    block 2k = gate row k, block 2k+1 = up row k.
+    """
+    return shuffle_weight_a16w4_sep_fp4(_gate_up_interleave_n(src))
+
+
+def shuffle_scale_a16w4_gui_fp4(src: torch.Tensor, experts_cnt: int) -> torch.Tensor:
+    """fp4_bf16 INTERLEAVE E8M0 scale layout (matches shuffle_weight_a16w4_gui_fp4).
+
+    src is 2D (experts_cnt * 2*inter_dim, K//32); the N dim is gate/up interleaved
+    before the klane-inner sep_fp4 scale shuffle.
+    """
+    k_ = src.shape[-1]
+    s3 = src.view(experts_cnt, -1, k_)
+    s3 = _gate_up_interleave_n(s3)
+    return shuffle_scale_a16w4_sep_fp4(s3.reshape(-1, k_), experts_cnt)
+
+
 def shuffle_weight_NK(
     x: torch.Tensor, inst_N: int, inst_K: int, use_int4=False
 ) -> torch.Tensor:
