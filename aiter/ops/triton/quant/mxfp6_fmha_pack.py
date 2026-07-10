@@ -706,3 +706,66 @@ def pack_fp6_v_kernel_view(
     return buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
 
 
+# ---------------------------------------------------------------------------
+# Coalesced + pre-transposed V packer (LDS-order), the V analog of the K
+# quantize_fp6_k_lds_order treatment. The solo kernel's V load becomes a plain
+# contiguous coalesced copy (no per-token PageIdx gather) and the hoist becomes a
+# plain ds_read_b128 (no ds_read_b64_tr_b8 transpose): the byte permutation moves
+# to this one-time host op. Derived empirically (DBG_DUMP_VACC) as the exact
+# _acc_V PV-operand layout the MFMA consumes:
+#   lds-order byte  P = g*1024 + L*16 + b   (g in [0,16), lane L in [0,64), b in [0,16))
+#   dw = 4*g + b//4 ; u = dw//8 ; off = dw%8 ; j = b%4
+#   tok = (u&1)*64 + off*8 + (L//32)*4 + j        (kv-token within the 128-tok tile)
+#   d   = (u//2)*32 + (L%32)                       (head_dim channel)
+# so HBM_ldsorder[tile*16384 + P] = V_fp8[tile*128 + tok, d]. Kernel v_Seqs = 128 B/token.
+# ---------------------------------------------------------------------------
+def _v_lds_order_gather_index(tile: int = 128):
+    """Per-tile [16384] source index (tok*128 + d) for each contiguous LDS-order byte P."""
+    assert tile == 128
+    P = np.arange(16384)
+    g = P // 1024
+    L = (P % 1024) // 16
+    b = P % 16
+    dw = 4 * g + b // 4
+    u = dw // 8
+    off = dw % 8
+    j = b % 4
+    tok = (u & 1) * 64 + off * 8 + (L // 32) * 4 + j
+    d = (u // 2) * 32 + (L % 32)
+    return (tok * 128 + d).astype(np.int64)
+
+
+def quantize_fp8_v_lds_order(v_fp8, tile: int = 128, out_device=None):
+    """Permute raw fp8 V [b, sk, h_kv, d=128] into the kernel's coalesced+pre-transposed LDS-order
+    tile-flat layout. Byte-permutation only (the per-channel v_descale stays an epilogue op). Returns a
+    [b, sk, h_kv, d] uint8 view with strides (v_Bs, 128, v_Hs, 1) so the kernarg V seq-stride is 128 B."""
+    b, sk, h_kv, d = v_fp8.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile
+    vb = v_fp8.detach().contiguous().view(torch.uint8).cpu().numpy()  # [b, sk, h_kv, d] uint8
+    idx = _v_lds_order_gather_index(tile)  # [16384]
+    out = np.zeros((b, h_kv, nt * 16384), np.uint8)
+    for bi in range(b):
+        for hi in range(h_kv):
+            for t in range(nt):
+                lo = t * tile
+                hitok = min(lo + tile, sk)
+                tileV = np.empty((tile, d), np.uint8)
+                tileV[: hitok - lo] = vb[bi, lo:hitok, hi, :]
+                if hitok - lo < tile:  # edge-pad the partial tail tile (replicate last token)
+                    tileV[hitok - lo:] = vb[bi, sk - 1, hi, :]
+                out[bi, hi, t * 16384: (t + 1) * 16384] = tileV.reshape(tile * d)[idx]
+    v_hs = nt * 16384
+    v_bs = h_kv * v_hs
+    flat = torch.from_numpy(out.reshape(-1))
+    # +16384 tile pad: the solo software pipeline prefetches ONE tile past the last consumed tile, and
+    # the coalesced load reads a whole 16384B tile at once, so the final over-prefetch would run off the
+    # end. Padding one tile keeps that read in mapped memory (the garbage tile is never consumed).
+    buf = torch.empty(b * v_bs + 16384 + 256, dtype=torch.uint8)
+    buf[: flat.numel()] = flat
+    if out_device is not None:
+        buf = buf.to(out_device)
+    # keep the caller's fp8 dtype (the bench routes mxfp6 vs fp6fp6 by V dtype; uint8 mis-routes).
+    return buf.view(v_fp8.dtype).as_strided((b, sk, h_kv, d), (v_bs, 128, v_hs, 1))
+
+

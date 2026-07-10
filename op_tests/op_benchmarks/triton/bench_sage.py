@@ -790,6 +790,24 @@ def _sage_quant_mxfp6(
     packed to MXFP6-E2M3 (both QK MFMA operands in fp6): Q via q_packer (base
     pack), K via k_packer -- the coalesced LDS-order pack that is the shipped
     default. V quant (sage_quant_v_kernel) and delta_s match the mxfp4 path."""
+    if os.environ.get("DBG_V_RAMP"):
+        # DEBUG (V-repack layout derivation): override V with a coordinate ramp built from DISTINCT,
+        # monotonic fp8 values (a plain linear ramp collides in fp8), and force v_scale=1 below so the
+        # ramp survives un-normalized into _acc_V. Python argsort of the dumped _acc_V then recovers each
+        # position's coordinate. "d" ramps head_dim (all tokens equal); "tok" ramps token (all d equal).
+        _m = os.environ["DBG_V_RAMP"]
+        _b, _s, _h, _d = v.shape
+        _codes = torch.arange(256, dtype=torch.uint8, device=v.device).view(FP8_TYPE).float()
+        _pos = torch.unique(_codes[torch.isfinite(_codes) & (_codes >= 0)]).sort().values
+
+        def _rampvals(n):  # n monotonic-nondecreasing distinct-fp8 values (argsort recovers index)
+            return _pos[torch.arange(n, device=v.device).clamp_max(_pos.numel() - 1)]
+
+        if _m == "d":
+            v = _rampvals(_d).view(1, 1, 1, _d).expand(_b, _s, _h, _d).contiguous()
+        elif _m == "tok":
+            v = (_rampvals(128)[torch.arange(_s, device=v.device) % 128]
+                 .view(1, _s, 1, 1).expand(_b, _s, _h, _d).contiguous())
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
     assert layout == "bshd", f"aiter_mxfp6 bench path expects bshd, got {layout}"
     b, qo_len, h_qo, head_dim = q.shape
@@ -803,6 +821,8 @@ def _sage_quant_mxfp6(
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
 
     v_scale = v.abs().amax(dim=1).to(torch.float32) / FP8_MAX
+    if os.environ.get("DBG_V_RAMP"):
+        v_scale = torch.ones_like(v_scale)   # keep the ramp un-normalized -> _acc_V shows the raw fp8 ramp
     grid = (b * h_kv * K_NUM_BLKS,)
 
     if sm_scale is None:
@@ -844,6 +864,13 @@ def _sage_quant_mxfp6(
     # K scale rides the existing separate gather.
     q_fp4, q_scale = q_packer(q)
     k_fp4, k_scale = k_packer(k)
+
+    # V: coalesced + pre-transposed LDS-order pack (the V analog of K's lds-order pack) so the solo
+    # kernel's V load is a contiguous copy and the hoist is a plain ds_read_b128. MUST be built with the
+    # matching kernel (SOLO_V_LDS_ORDER=1). SOLO_V_LDS_ORDER=0 keeps the raw-fp8 gather layout.
+    if os.environ.get("SOLO_V_LDS_ORDER", "1") != "0":
+        from aiter.ops.triton.quant.mxfp6_fmha_pack import quantize_fp8_v_lds_order
+        v_fp8 = quantize_fp8_v_lds_order(v_fp8, tile=128, out_device=v_fp8.device)
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
@@ -1614,6 +1641,17 @@ def benchmark_single_case(
             print("[DUMP-P] subtile1 (k32-63):", fp8[16:32])
             print("[DUMP-P] subtile2 (k64-95):", fp8[32:48])
             print("[DUMP-P] subtile3 (k96-127):", fp8[48:64])
+            return 0.0
+        if os.environ.get("DBG_DUMP_VACC", "0") != "0":
+            import numpy as _np
+            # DBG_DUMP_VACC dumps each lane's whole _acc_V (64 dwords) to its own O row (tokens
+            # 0..63, head 0). Recover [64 lanes, 256 acc-bytes] fp8 and save for offline layout derivation.
+            raw = current_primary[0, :64, 0, :].contiguous().view(torch.uint8).cpu()
+            fp8 = raw.view(torch.float8_e4m3fn).float().numpy()  # [64 lanes, 256]
+            tag = os.environ.get("DBG_V_RAMP", "x")
+            _np.save(f"/tmp/vacc_{tag}.npy", fp8)
+            print(f"[VACC] saved /tmp/vacc_{tag}.npy shape={fp8.shape} "
+                  f"min={fp8.min():.2f} max={fp8.max():.2f} nz={int((fp8!=0).sum())}")
             return 0.0
         if os.environ.get("ILP_DUMP_READ", "0") != "0":
             o = current_primary.float()
