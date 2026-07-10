@@ -224,6 +224,7 @@ def build_hstu_attention_bwd(
     block_n: int = 16,
     num_waves: int = 2,
     waves_per_eu: int = 0,
+    has_perm: bool = False,
 ):
     # `which` selects the single output family this kernel produces:
     #   "dv" -> dV = A^T dO         (needs S -> silu -> P; one MFMA reduction)
@@ -322,6 +323,7 @@ def build_hstu_attention_bwd(
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
+        perm: fx.Tensor,
         out: fx.Tensor,
     ) -> None:
         # `out` is dV (which=="dv") or dK (which=="dk"). `v` is unused by the dV kernel.
@@ -350,6 +352,12 @@ def build_hstu_attention_bwd(
         hz_idx = grid_group * fx.Int32(hz_per_group) + local_hz_idx
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
+        # Optional sort-by-length load balancing: remap the batch this slot owns
+        # (heads stay put). `perm` is built host-side so each grid group gets a
+        # Sum(n^2)-balanced, LPT-ordered set of sequences. Build-time gate -> the
+        # dummy `perm` is never traced when disabled.
+        if has_perm:
+            batch_idx = fx.Int32(perm[batch_idx])
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
@@ -742,6 +750,7 @@ def build_hstu_attention_bwd(
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
+        perm: fx.Tensor,
         out: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
@@ -758,6 +767,7 @@ def build_hstu_attention_bwd(
             do,
             seq_offsets,
             num_targets,
+            perm,
             out,
             value_attrs={
                 "passthrough": [

@@ -80,6 +80,7 @@ def build_hstu_attention_bwd_dq(
     block_n: int = 16,
     num_waves: int = 2,
     waves_per_eu: int = 0,
+    has_perm: bool = False,
 ):
     validate_hstu_attention_bwd_dq(
         num_heads,
@@ -163,6 +164,7 @@ def build_hstu_attention_bwd_dq(
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
+        perm: fx.Tensor,
         dq: fx.Tensor,
     ) -> None:
         elem_type = elem_dtype.ir_type
@@ -190,6 +192,9 @@ def build_hstu_attention_bwd_dq(
         hz_idx = grid_group * fx.Int32(hz_per_group) + local_hz_idx
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
+        # Optional sort-by-length load balancing (see hstu_attention_bwd.py).
+        if has_perm:
+            batch_idx = fx.Int32(perm[batch_idx])
 
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
@@ -542,6 +547,7 @@ def build_hstu_attention_bwd_dq(
         do: fx.Tensor,
         seq_offsets: fx.Tensor,
         num_targets: fx.Tensor,
+        perm: fx.Tensor,
         dq: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
@@ -558,6 +564,7 @@ def build_hstu_attention_bwd_dq(
             do,
             seq_offsets,
             num_targets,
+            perm,
             dq,
             value_attrs={
                 "passthrough": [
