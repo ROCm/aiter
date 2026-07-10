@@ -1648,6 +1648,21 @@ namespace py = pybind11;
           py::arg("out"),                                                                  \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
+    m.def("qr_all_reduce_rmsnorm",                                                         \
+          &aiter::qr_all_reduce_rmsnorm,                                                    \
+          "qr_all_reduce_rmsnorm(int fa, Tensor inp, Tensor residual_inp, "                 \
+          "Tensor residual_out, Tensor out, Tensor weight, float eps, int hidden_dim, "     \
+          "int quant_level, bool cast_bf2half) -> ()",                                     \
+          py::arg("fa"),                                                                   \
+          py::arg("inp"),                                                                  \
+          py::arg("residual_inp"),                                                         \
+          py::arg("residual_out"),                                                         \
+          py::arg("out"),                                                                  \
+          py::arg("weight"),                                                               \
+          py::arg("eps"),                                                                  \
+          py::arg("hidden_dim"),                                                           \
+          py::arg("quant_level"),                                                          \
+          py::arg("cast_bf2half") = false);                                                \
     m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
