@@ -37,7 +37,7 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
-    from .fmha_kernels import flydsl_flash_attn_func
+    from .fmha_kernels import flydsl_flash_attn_func, flydsl_fp8_quant
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .kernels.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
@@ -48,6 +48,7 @@ if is_flydsl_available():
     from .kernels.fp8_mqa_logits import (
         flydsl_fp8_mqa_logits,
     )
+    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .kernels.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
@@ -57,7 +58,6 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
-    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -70,6 +70,7 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_fp8_quant",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",

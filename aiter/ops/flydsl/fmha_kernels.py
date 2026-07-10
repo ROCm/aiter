@@ -21,7 +21,9 @@ Public entry point ``flydsl_flash_attn_func`` wraps the FlyDSL
     the output is bf16. Naming mirrors ``flash_attn_fp8_pertensor_func``
     in ``aiter/ops/mha.py``. Both self- and cross-attention are supported for
     fp8 (though for cross-attn the K/V are typically small, so quantizing them
-    may not pay off in practice).
+    may not pay off in practice). Use ``flydsl_fp8_quant`` to produce the fp8
+    q/k/v + descales from bf16/f16 inputs, with optional Hadamard rotation of
+    Q/K -- rotation lives in that producer step, never inside the kernel.
 """
 
 from __future__ import annotations
@@ -40,11 +42,216 @@ from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 __all__ = [
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_func",
+    "flydsl_fp8_quant",
 ]
 
 
 # FP8 input dtype accepted by the fp8 kernel (e4m3, per-tensor descale).
 _FP8_DTYPES = (torch.float8_e4m3fn,)
+
+
+# ---------------------------------------------------------------------------
+# FP8 quantization (+ optional Hadamard rotation) for the fp8 attention path.
+#
+# This is the producer-side preprocessing that turns bf16/f16 q/k/v into the
+# fp8 q/k/v + per-tensor descales that ``flydsl_flash_attn_func`` consumes. The
+# rotation lives HERE, not in the attention kernel: per-tensor fp8 scaling needs
+# the global amax of the *rotated* tensor before the kernel launches, and the
+# kernel only ever sees already-fp8 q/k/v.
+# ---------------------------------------------------------------------------
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # pragma: no cover - triton is normally present
+    _HAS_TRITON = False
+
+_FP8_QUANT_DTYPE = torch.float8_e4m3fn
+_FP8_QUANT_MAX = 448.0
+_ROT_ROWS = 64  # rows per program for the fused rotate+quant kernels
+_HADAMARD_CACHE: dict = {}
+
+
+def _hadamard_matrix(head_dim: int, device, dtype):
+    """Normalized ``head_dim x head_dim`` Hadamard (orthonormal), cached per
+    ``(head_dim, device, dtype)``. Prefers aiter's ``create_hadamard_matrix``;
+    falls back to a local Sylvester construction. Returns ``None`` when head_dim
+    is not a power of two (rotation is then skipped)."""
+    if head_dim & (head_dim - 1):
+        return None
+    key = (head_dim, device, dtype)
+    R = _HADAMARD_CACHE.get(key)
+    if R is not None:
+        return R
+    try:
+        try:
+            from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+                create_hadamard_matrix,
+            )
+        except ImportError:
+            from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
+                create_hadamard_matrix,
+            )
+        R = (create_hadamard_matrix(head_dim, dtype=dtype) / (head_dim**0.5)).to(device)
+    except ImportError:
+        H = torch.ones((1, 1), dtype=torch.float32, device=device)
+        while H.shape[0] < head_dim:
+            H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+        R = (H / (head_dim**0.5)).to(dtype)
+    _HADAMARD_CACHE[key] = R
+    return R
+
+
+def _rotate_bf16(x: torch.Tensor, R: torch.Tensor | None) -> torch.Tensor:
+    """Full-head Hadamard rotation along head_dim (no-op if ``R`` is None)."""
+    return x if R is None else torch.matmul(x, R.to(x.dtype))
+
+
+def _quant_one_pertensor(x: torch.Tensor, R: torch.Tensor | None):
+    """Torch rotate (optional) + per-tensor fp8 quant. Fallback for cross-attn,
+    non-power-of-2 head_dim, rotation-off, or when triton is unavailable."""
+    x = _rotate_bf16(x, R)
+    amax = x.abs().max().to(torch.float32)
+    s = (amax / _FP8_QUANT_MAX).clamp(min=1e-12).reshape(1)
+    xq = (
+        (x.to(torch.float32) / s).clamp(-_FP8_QUANT_MAX, _FP8_QUANT_MAX).to(_FP8_QUANT_DTYPE)
+    )
+    return xq, s
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _rot_amax3(q, k, v, R, aq, ak, av, M, D: tl.constexpr, BLOCK_ROWS: tl.constexpr):
+        """Fused Hadamard-rotate (Q/K only) + per-tensor amax over q/k/v. Row-
+        tiled: each program rotates a ``(BLOCK_ROWS, D)`` tile in-register via
+        ``tl.dot(x, R)`` on the matrix cores and atomic-max's its abs-max into
+        that tensor's scalar. V is not rotated (compute-and-select keeps one
+        branch-free launch). Rotated Q/K never round-trip to HBM."""
+        pid = tl.program_id(0)
+        rb = tl.cdiv(M, BLOCK_ROWS)
+        t = pid // rb
+        b = pid % rb
+        rows = b * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        rmask = rows < M
+        p = tl.where(t == 0, q, tl.where(t == 1, k, v))
+        offs = rows[:, None] * D + tl.arange(0, D)[None, :]
+        x = tl.load(p + offs, mask=rmask[:, None], other=0.0)
+        Rm = tl.load(R + tl.arange(0, D)[:, None] * D + tl.arange(0, D)[None, :])
+        xr = tl.dot(x, Rm)
+        x = tl.where(t < 2, xr, x.to(tl.float32))
+        val = tl.max(tl.abs(x))
+        o = tl.where(t == 0, aq, tl.where(t == 1, ak, av))
+        tl.atomic_max(o, val)
+
+    @triton.jit
+    def _rot_sc3(
+        q, k, v, R, yq, yk, yv, sq, sk, sv, M, D: tl.constexpr, BLOCK_ROWS: tl.constexpr
+    ):
+        """Fused Hadamard-rotate (Q/K only) + scale/clamp/cast to fp8, row-tiled
+        to match ``_rot_amax3`` (rotation recomputed, not reloaded from HBM)."""
+        pid = tl.program_id(0)
+        rb = tl.cdiv(M, BLOCK_ROWS)
+        t = pid // rb
+        b = pid % rb
+        rows = b * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        rmask = rows < M
+        p = tl.where(t == 0, q, tl.where(t == 1, k, v))
+        yp = tl.where(t == 0, yq, tl.where(t == 1, yk, yv))
+        sp = tl.where(t == 0, sq, tl.where(t == 1, sk, sv))
+        offs = rows[:, None] * D + tl.arange(0, D)[None, :]
+        x = tl.load(p + offs, mask=rmask[:, None], other=0.0)
+        Rm = tl.load(R + tl.arange(0, D)[:, None] * D + tl.arange(0, D)[None, :])
+        xr = tl.dot(x, Rm)
+        x = tl.where(t < 2, xr, x.to(tl.float32))
+        x = x * (1.0 / tl.load(sp))
+        # fp8 e4m3 max (448.0) inlined; triton @jit can't read module globals.
+        x = tl.minimum(tl.maximum(x, -448.0), 448.0)
+        tl.store(yp + offs, x.to(yp.dtype.element_ty), mask=rmask[:, None])
+
+
+def _quant_pertensor_flydsl(x: torch.Tensor, rotate: bool):
+    """Per-tensor rotate(optional)+fp8 quant of a single tensor via the fully
+    FlyDSL 2-pass kernel. head_dim==128 only."""
+    from .kernels.fp8_quant_gfx1201 import flydsl_fp8_pertensor_quant
+
+    return flydsl_fp8_pertensor_quant(x, rotate=rotate)
+
+
+def flydsl_fp8_quant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    rotation: bool = True,
+    backend: str = "flydsl",
+):
+    """Per-tensor fp8 (e4m3) quantization of bf16/f16 ``q/k/v`` for the flydsl
+    fp8 attention path, with optional Hadamard rotation of Q/K.
+
+    Returns ``(q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale)`` ready to
+    hand straight to ``flydsl_flash_attn_func(..., q_descale=, k_descale=,
+    v_descale=)``. Descales are 1-element fp32 device tensors following the
+    wrapper contract: ``real = fp8 * descale``.
+
+    Rotation (recommended, default on) applies an orthonormal Hadamard ``R`` to Q
+    and K only. It is QK-preserving -- ``(Q@R)(K@R)^T == Q@K^T`` -- so attention
+    scores are unchanged, while spreading channel outliers so per-tensor e4m3
+    clamps far less (the benefit shows on outlier-heavy real activations).
+
+    ``backend`` selects the producer: ``"flydsl"`` (default) runs the fully-FlyDSL
+    2-pass rotate+quant kernels (in-register FWHT, no Triton); ``"triton"`` runs
+    the fused Triton passes; ``"torch"`` runs the reference. All three keep rotated
+    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires head_dim==128
+    (per-tensor, so q/k/v may differ in size, e.g. cross-attention); it silently
+    falls back to Triton/torch for other head_dims. The Triton fused path
+    additionally requires same-size q/k/v.
+    """
+    head_dim = q.shape[-1]
+    same_size = q.numel() == k.numel() == v.numel()
+    be = backend.lower()
+
+    # Fully-FlyDSL per-tensor path (no Triton). Each tensor is quantized by its
+    # own independent launch, so q/k/v need not be the same size (cross-attention
+    # is fine); only head_dim==128 (VEC=4) is required by the MVP kernel. Uses the
+    # in-register FWHT, so it needs no host-side Hadamard matrix.
+    if be == "flydsl" and head_dim == 128:
+        q8, sq = _quant_pertensor_flydsl(q, rotate=rotation)
+        k8, sk = _quant_pertensor_flydsl(k, rotate=rotation)
+        v8, sv = _quant_pertensor_flydsl(v, rotate=False)
+        return q8, k8, v8, sq, sk, sv
+
+    # Triton/torch fallbacks rotate with an explicit host-side Hadamard matrix.
+    R = _hadamard_matrix(head_dim, q.device, torch.bfloat16) if rotation else None
+    if be == "torch" or not (_HAS_TRITON and R is not None and same_size):
+        q8, sq = _quant_one_pertensor(q, R)
+        k8, sk = _quant_one_pertensor(k, R)
+        v8, sv = _quant_one_pertensor(v, None)
+        return q8, k8, v8, sq, sk, sv
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    M = q.numel() // head_dim
+    q2, k2, v2 = q.view(M, head_dim), k.view(M, head_dim), v.view(M, head_dim)
+    grid = (3 * triton.cdiv(M, _ROT_ROWS),)
+    aq = torch.zeros(1, dtype=torch.float32, device=q.device)
+    ak = torch.zeros(1, dtype=torch.float32, device=q.device)
+    av = torch.zeros(1, dtype=torch.float32, device=q.device)
+    _rot_amax3[grid](q2, k2, v2, R, aq, ak, av, M, D=head_dim, BLOCK_ROWS=_ROT_ROWS)
+    sq = (aq / _FP8_QUANT_MAX).clamp(min=1e-12)
+    sk = (ak / _FP8_QUANT_MAX).clamp(min=1e-12)
+    sv = (av / _FP8_QUANT_MAX).clamp(min=1e-12)
+    q8 = torch.empty_like(q, dtype=_FP8_QUANT_DTYPE)
+    k8 = torch.empty_like(k, dtype=_FP8_QUANT_DTYPE)
+    v8 = torch.empty_like(v, dtype=_FP8_QUANT_DTYPE)
+    _rot_sc3[grid](
+        q2, k2, v2, R,
+        q8.view(M, head_dim), k8.view(M, head_dim), v8.view(M, head_dim),
+        sq, sk, sv, M, D=head_dim, BLOCK_ROWS=_ROT_ROWS,
+    )
+    return q8, k8, v8, sq, sk, sv
 
 
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
