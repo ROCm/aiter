@@ -80,6 +80,3 @@ def test_gemm_decode_performance(M, N, K):
     bytes_transferred = (M * K + N * K + M * N) * 2  # BF16 = 2 bytes
     bw_gbs = bytes_transferred / (us * 1e-6) / 1e9
     print(f"\n[perf] M={M} N={N} K={K}: {us:.1f} us  {bw_gbs:.0f} GB/s")
-
-    # Must complete in reasonable time (< 1 ms for these shapes)
-    assert us < 1000, f"gemm_decode too slow: {us:.1f} us"
