@@ -426,7 +426,7 @@ def moe_gemm_a8w4(
     )
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
-        n_out = w.shape[-1] // reduction_n_matmul  # post-swiglu width
+        n_out = padded_N // reduction_n_matmul  # post-swiglu width
         assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
         m_out = y.shape[-2]
         y_scale = torch.empty((m_out, n_out // 32), dtype=torch.uint8, device=x.device)
@@ -499,6 +499,10 @@ def moe_gemm_a8w4(
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
         )
     elif use_gluon:
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
