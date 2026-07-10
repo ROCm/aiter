@@ -9,15 +9,15 @@ SDPA forced to the FLASH_ATTENTION backend. Correctness is checked against an
 fp32 SDPA reference (not timed, not in the table).
 
 Candidates per shape:
-    sdpa_flash          : torch SDPA, FLASH_ATTENTION backend (baseline)
-    flydsl_bf16         : flydsl_flash_attn_func on bf16/f16 inputs
-    flydsl_fp8          : per-tensor fp8 (bf16 output) with the amax+cast
-                          quantization INSIDE the timed region -- the realistic
-                          path today, where q/k/v arrive bf16 and are quantized
-                          on every attention call
-    flydsl_fp8_prequant : the same fp8 kernel but with q/k/v pre-quantized
-                          outside the timed region -- the producer-fused ceiling
-                          (quant amortized upstream); shows fp8's headroom
+    sdpa_flash            : torch SDPA, FLASH_ATTENTION backend (baseline)
+    flydsl_bf16           : flydsl_flash_attn_func on bf16/f16 inputs
+    flydsl_fp8_incl_quant : per-tensor fp8 (bf16 output) with the Hadamard rotation
+                            of Q/K + amax+cast quantization INSIDE the timed region
+                            -- the realistic xDiT path, where q/k/v arrive bf16 and
+                            are rotated+quantized on every attention call
+    flydsl_fp8_kernel_only: the same fp8 kernel but on q/k/v already quantized
+                            outside the timed region (quant amortized upstream) --
+                            the pure attention-kernel ceiling; shows fp8's headroom
 
 Correctness (functional coverage) lives in the pytest suite
 ``op_tests/flydsl_tests/test_flydsl_fmha.py``; this file is the perf sweep.
@@ -30,12 +30,10 @@ import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from aiter import dtypes
-from aiter.ops.flydsl import flydsl_flash_attn_func
+from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -43,80 +41,6 @@ torch.set_default_device("cuda")
 
 # The flydsl flash-attn kernels are gfx1201/RDNA4 only.
 SUPPORTED_GFX = ["gfx1201"]
-
-FP8_DTYPE = torch.float8_e4m3fn
-FP8_MAX = 448.0
-_QBLOCK = 8192
-
-
-@triton.jit
-def _amax3(q, k, v, aq, ak, av, n, BLOCK: tl.constexpr):
-    """Fused per-tensor amax over q/k/v in a single launch (atomic-max)."""
-    pid = tl.program_id(0)
-    nb = tl.cdiv(n, BLOCK)
-    t = pid // nb
-    b = pid % nb
-    off = b * BLOCK + tl.arange(0, BLOCK)
-    m = off < n
-    p = tl.where(t == 0, q, tl.where(t == 1, k, v))
-    val = tl.max(tl.abs(tl.load(p + off, mask=m, other=0.0)).to(tl.float32))
-    o = tl.where(t == 0, aq, tl.where(t == 1, ak, av))
-    tl.atomic_max(o, val)
-
-
-@triton.jit
-def _sc3(q, k, v, yq, yk, yv, sq, sk, sv, n, BLOCK: tl.constexpr):
-    """Fused scale+clamp+cast of q/k/v to fp8 in a single launch."""
-    pid = tl.program_id(0)
-    nb = tl.cdiv(n, BLOCK)
-    t = pid // nb
-    b = pid % nb
-    off = b * BLOCK + tl.arange(0, BLOCK)
-    m = off < n
-    p = tl.where(t == 0, q, tl.where(t == 1, k, v))
-    yp = tl.where(t == 0, yq, tl.where(t == 1, yk, yv))
-    sp = tl.where(t == 0, sq, tl.where(t == 1, sk, sv))
-    inv = 1.0 / tl.load(sp)
-    x = tl.load(p + off, mask=m, other=0.0).to(tl.float32) * inv
-    # fp8 e4m3 max (448.0) inlined; triton @jit can't read module globals.
-    x = tl.minimum(tl.maximum(x, -448.0), 448.0)
-    tl.store(yp + off, x.to(yp.dtype.element_ty), mask=m)
-
-
-def _quant_one(x):
-    """Single-tensor per-tensor fp8 quant (cross-attn fallback where q and k/v
-    differ in size). real = fp8 * descale."""
-    amax = x.abs().max().to(dtypes.fp32)
-    s = (amax / FP8_MAX).clamp(min=1e-12).reshape(1)
-    xq = (x.to(dtypes.fp32) / s).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
-    return xq, s
-
-
-def _fp8_quant_fused(q, k, v):
-    """Two fused launches (amax3, sc3) across all three tensors. Measured 3-7x
-    faster than aiter's per_tensor_quant_hip (which is 3 separate two-pass
-    per-tensor calls). Returns (q8, k8, v8, sq, sk, sv).
-
-    The fused path needs one shared element count, so cross-attn (q vs k/v differ
-    in size) falls back to per-tensor quant; self-attn keeps the fast path."""
-    if not (q.numel() == k.numel() == v.numel()):
-        q8, sq = _quant_one(q)
-        k8, sk = _quant_one(k)
-        v8, sv = _quant_one(v)
-        return q8, k8, v8, sq, sk, sv
-
-    n = q.numel()
-    grid = (3 * triton.cdiv(n, _QBLOCK),)
-    aq = torch.zeros(1, dtype=dtypes.fp32)
-    ak = torch.zeros(1, dtype=dtypes.fp32)
-    av = torch.zeros(1, dtype=dtypes.fp32)
-    _amax3[grid](q, k, v, aq, ak, av, n, BLOCK=_QBLOCK)
-    sq, sk, sv = aq / FP8_MAX, ak / FP8_MAX, av / FP8_MAX
-    q8 = torch.empty_like(q, dtype=FP8_DTYPE)
-    k8 = torch.empty_like(k, dtype=FP8_DTYPE)
-    v8 = torch.empty_like(v, dtype=FP8_DTYPE)
-    _sc3[grid](q, k, v, q8, k8, v8, sq, sk, sv, n, BLOCK=_QBLOCK)
-    return q8, k8, v8, sq, sk, sv
 
 # (label, batch, seq_len, num_heads, head_dim) -- production diffusion shapes.
 SHAPES = [
@@ -128,13 +52,6 @@ SHAPES = [
 ]
 
 
-def _to_fp8_per_tensor(t):
-    amax = t.abs().amax().clamp(min=1e-8)
-    scale = (amax / FP8_MAX).to(dtypes.fp32)
-    q = (t.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
-    return q, scale
-
-
 def run_torch(q, k, v, causal):
     # Reference only: fp32 SDPA, BSHD in/out. Not timed, not in the table.
     out_bhsd = F.scaled_dot_product_attention(
@@ -144,6 +61,17 @@ def run_torch(q, k, v, causal):
         is_causal=causal,
     )
     return out_bhsd.transpose(1, 2).contiguous()
+
+
+def cosine_stats(out_bshd, ref_bshd, head_dim):
+    # Per (token, head) row cosine vs the fp32 reference: min = worst row,
+    # mean = average row. Both tensors are BSHD.
+    cos = F.cosine_similarity(
+        out_bshd.to(dtypes.fp32).reshape(-1, head_dim),
+        ref_bshd.to(dtypes.fp32).reshape(-1, head_dim),
+        dim=1,
+    )
+    return cos.min().item(), cos.mean().item()
 
 
 @benchmark()
@@ -160,11 +88,10 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
     kb = k.transpose(1, 2).contiguous()
     vb = v.transpose(1, 2).contiguous()
 
-    # Pre-quantized fp8 (producer-fused ceiling): q/k/v already fp8 in HBM, quant
-    # amortized upstream. Quantized once, outside timing.
-    qq, sq = _to_fp8_per_tensor(q)
-    kk, sk = _to_fp8_per_tensor(k)
-    vv, sv = _to_fp8_per_tensor(v)
+    # fp8 kernel-only ceiling: q/k/v already quantized in HBM, quant amortized
+    # upstream. Quantized once, outside timing (rotation off -- this row isolates
+    # the attention kernel, not the quant/rotate producer cost).
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
 
     def _sdpa_flash():
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
@@ -173,30 +100,30 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
     def _flydsl_bf16():
         return flydsl_flash_attn_func(q, k, v, causal=causal)
 
-    def _flydsl_fp8():
-        # Realistic path today: q/k/v arrive bf16, so the fused amax+cast is paid
-        # on every attention call, inside the timed region.
-        q8, k8, v8, s_q, s_k, s_v = _fp8_quant_fused(q, k, v)
+    def _flydsl_fp8_incl_quant():
+        # Realistic path: q/k/v arrive bf16, so the Hadamard rotation of Q/K
+        # plus the fused amax+cast is paid on every call, inside the timed region.
+        q8, k8, v8, s_q, s_k, s_v = flydsl_fp8_quant(q, k, v)
         return flydsl_flash_attn_func(
             q8, k8, v8, causal=causal,
             q_descale=s_q, k_descale=s_k, v_descale=s_v,
         )
 
-    def _flydsl_fp8_prequant():
+    def _flydsl_fp8_kernel_only():
         return flydsl_flash_attn_func(
             qq, kk, vv, causal=causal,
             q_descale=sq, k_descale=sk, v_descale=sv,
         )
 
     # (fn, layout, in_bytes, out_bytes) -- layout is the fn's output layout.
-    # in/out bytes count the attention tensor I/O only (the fp8 amax+cast traffic
-    # in flydsl_fp8 shows up in latency/TFLOPS, not in gb_per_sec).
+    # in/out bytes count the attention tensor I/O only (the fp8 quant/rotate
+    # traffic in flydsl_fp8_incl_quant shows up in latency/TFLOPS, not gb_per_sec).
     elem = q.element_size()
     candidates = {
         "sdpa_flash": (_sdpa_flash, "bhsd", elem, elem),
         "flydsl_bf16": (_flydsl_bf16, "bshd", elem, elem),
-        "flydsl_fp8": (_flydsl_fp8, "bshd", 1, 2),
-        "flydsl_fp8_prequant": (_flydsl_fp8_prequant, "bshd", 1, 2),
+        "flydsl_fp8_incl_quant": (_flydsl_fp8_incl_quant, "bshd", 1, 2),
+        "flydsl_fp8_kernel_only": (_flydsl_fp8_kernel_only, "bshd", 1, 2),
     }
 
     # Non-causal attention fwd: QK^T + P@V = 4*B*H*S^2*D FLOPs; causal ~= half.
@@ -215,12 +142,15 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
             atol=2e-2,
             msg=f"{name}: flydsl_fmha {model}",
         )
+        cos_min, cos_mean = cosine_stats(out_bshd, ref, head_dim)
         nbytes = batch * seq_len * num_heads * head_dim * (3 * in_b + out_b)
         # us in microseconds: TFLOP/s = flop/us/1e6, GB/s = bytes/us/1e3
         # (matches aiter test_mha fwd_tflops / fwd_gb_per_sec conventions).
         ret[f"{name}_us"] = us
         ret[f"{name}_tflops"] = flops / us / 1e6
         ret[f"{name}_gb_per_sec"] = nbytes / us / 1e3
+        ret[f"{name}_cos_min"] = cos_min
+        ret[f"{name}_cos_mean"] = cos_mean
         ret[f"{name}_err"] = err
     return ret
 
