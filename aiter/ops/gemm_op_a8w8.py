@@ -635,7 +635,7 @@ def gemm_a8w8_CK(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     try:
         if ck_config is None:
-            gemm_fn = gemm_a8w8_ck
+            gemm_fn = gemm_a8w8_cktile
         else:
             libtype = ck_config.get("libtype", "ck")
             if libtype == "ck":
