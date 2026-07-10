@@ -108,6 +108,10 @@ def launch_gemm(
         BM * A_ROW_B
     )  # LDS A buffer bytes (row-major [m][col], shared by 4 N-waves)
     A_ROW_I32 = A_ROW_B // 4
+    # XOR-swizzle the 16B A-LDS column-block by (row % k_blk16) to kill bank
+    # conflicts (fp8/fp4 contiguous 16B reads only; fp6 is 32B-strided).
+    swz_lds = a_dtype in ("fp4", "fp8")
+    k_blk16 = A_ROW_B // 16
     K_HALF = K // 2
     KH4 = K_HALF // 4
     K_TILES = K // BK
@@ -236,6 +240,10 @@ def launch_gemm(
                 lin = (i * 256 + tid) * 16
                 row = lin // A_ROW_B
                 col = lin % A_ROW_B
+                # LDS write stays linear (buffer_load_lds needs contiguous dst);
+                # swizzle the gmem *source* column so the physical LDS is XORed.
+                if const_expr(swz_lds):
+                    col = col ^ ((row % k_blk16) * 16)
                 gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 src = fx.slice(a_flat_div, (None, gmem_byte))
@@ -252,17 +260,28 @@ def launch_gemm(
             av = []
             for mi in range_constexpr(m_chunks):
                 for kh in range_constexpr(k_halves):
-                    off = (
-                        (mi * 16 + lane_mod_16) * A_ROW_I32
-                        + kh * A_KH_I32
-                        + lane_div_16 * A_GK_I32
-                    )
+                    row = mi * 16 + lane_mod_16
+                    row_base = row * A_ROW_I32
+                    # 16B (=4 i32) block index within the row; XOR-swizzled to
+                    # match the swizzled LDS write in dma_a_to_lds.
+                    lo_blk = kh * (A_KH_I32 // 4) + lane_div_16 * (A_GK_I32 // 4)
+                    if const_expr(swz_lds):
+                        off = row_base + (lo_blk ^ (row % k_blk16)) * 4
+                    else:
+                        off = row_base + kh * A_KH_I32 + lane_div_16 * A_GK_I32
                     if const_expr(a_dtype == "fp4"):
                         av.append(_read16(base_iter, off))
                     else:
                         # fp6/fp8: pack two halves (64 K apart, f8f6f4 ABI) into i32[A_NDW].
+                        if const_expr(swz_lds):
+                            hi_off = (
+                                row_base
+                                + ((lo_blk + A_HI_OFF // 4) ^ (row % k_blk16)) * 4
+                            )
+                        else:
+                            hi_off = off + A_HI_OFF
                         lo = Vec(fx.memref_load_vec(_read16(base_iter, off)))
-                        hi = Vec(fx.memref_load_vec(_read16(base_iter, off + A_HI_OFF)))
+                        hi = Vec(fx.memref_load_vec(_read16(base_iter, hi_off)))
                         t = fx.make_rmem_tensor(A_NDW, Int32)
                         t.store(lo.shuffle(hi, list(range(A_NDW))))
                         av.append(t)
