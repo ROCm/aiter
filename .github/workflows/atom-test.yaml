@@ -107,7 +107,7 @@ jobs:
           # Per-model runner pin (overrides the generic mapping above). Kimi-K2.7
           # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
           model_runner_overrides = {
-              "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-4",
+              "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-8",
               "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
               "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
               "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-2",     # -tp 2 (MXFP4)
