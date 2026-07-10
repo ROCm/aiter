@@ -1130,9 +1130,9 @@ def _flydsl_stage2_wrapper(
     )
 
 
-_V2_GEMM2_PREFIX = "mxfp4_moe2_"
+_V2_GEMM2_PREFIX = "flydsl_v2_moe2_"
 _V2_GEMM2_RE = re.compile(
-    r"^mxfp4_moe2_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
+    r"^flydsl_v2_moe2_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
 )

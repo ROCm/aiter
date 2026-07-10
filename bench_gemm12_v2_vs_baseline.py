@@ -792,7 +792,7 @@ def main():
         sort_bm = params1["tile_m"]
 
         kn2 = r.get("kernelName2", "")
-        # A gemm2 row can pin itself to the v2 kernel via a mxfp4_moe2_* name in
+        # A gemm2 row can pin itself to the v2 kernel via a flydsl_v2_moe2_* name in
         # kernelName2. When it does (and we're benching gemm2), the v2 config is
         # read from the name and the baseline flydsl/opus side is skipped for
         # that row -- the CSV row IS the "use v2 for moe2" decision.
