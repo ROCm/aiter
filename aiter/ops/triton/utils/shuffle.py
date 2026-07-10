@@ -70,8 +70,7 @@ def shuffle_weight(
 
 
 def moe_weight_gfx1250_decode_view(w: torch.Tensor) -> torch.Tensor:
-    """ 
-    zero-copy fn
+    """zero-copy fn
     Input: ``(E, N, K)`` (K byte-packed for mxfp4). Output shares storage.
     """
     w_u8 = w if w.dtype == torch.uint8 else w.view(torch.uint8)
