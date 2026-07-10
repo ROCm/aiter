@@ -1,6 +1,9 @@
 name: vLLM disagg CI smoke workflow
 
 on:
+  schedule:
+    # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
+    - cron: '30 18 * * *'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
