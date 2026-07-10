@@ -191,9 +191,9 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          # MI35X: skip a gfx950 backend-crashing case on the coming Triton release.
+          # MI35X: skip the gfx950 backend-crashing MHA-PE backward test on the coming Triton release.
           docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_backward_with_pe[True-0.0-32-16-32-4-2048-2048-4]" \
+            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_backward_with_pe" \
             --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
