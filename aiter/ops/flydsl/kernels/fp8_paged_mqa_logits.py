@@ -51,7 +51,6 @@ from ._mqa_logits_common import (
     MFMA_K,
     DEFAULT_COMPILE_HINTS,
     Vec,
-    i32_add as _i32_add,
     device_cu_count,
     load_pack_i64,
     fn_to_fnuz_i64,
@@ -116,7 +115,6 @@ def _build_paged_kernel(
     N_TILES_PER_WAVE = N_TILES // WPB
 
     fm_fast = arith.FastMathFlags.fast
-    D_over_4 = D // 4  # f32-element offset of the co-packed scale within a token
 
     _cvt_tag = ""
     if convert_q_fn:
@@ -161,7 +159,7 @@ def _build_paged_kernel(
         lane = fx.Int32(arith.remui(_to_raw(tid), _to_raw(fx.Int32(64))))
         lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
         lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
-        lane8 = fx.Int32(arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(8))))
+        lane8 = lane_div_N * 8
 
         # fp8 operands read 8 bytes at a time as 2 i32 dwords (v8i8 buffer_load
         # fails to lower on gfx942), then bitcast to i64 for the MFMA.
@@ -179,50 +177,29 @@ def _build_paged_kernel(
 
         context_length = fx.Int32(cl_t[pid_batch])
         # Inclusive causal upper bound: p <= context_length - next_n + pid_next_n.
-        q_limit = fx.Int32(
-            arith.addi(
-                arith.subi(_to_raw(context_length), _to_raw(next_n)),
-                _to_raw(pid_next_n),
-            )
-        )
+        q_limit = context_length - next_n + pid_next_n
 
-        out_row = _i32_add(
-            fx.Int32(arith.muli(_to_raw(pid_batch), _to_raw(next_n))), pid_next_n
-        )
+        out_row = pid_batch * next_n + pid_next_n
         stride_out_i64 = arith.extui(T.i64, _to_raw(stride_out))
         out_row_t = make_out_row_view(out_logits, stride_out_i64, out_row)
 
         # ---- Preload Q frags + weights for the single query row ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
-        q_row_base = _i32_add(
-            fx.Int32(arith.muli(_to_raw(pid_batch), _to_raw(stride_q_batch))),
-            fx.Int32(arith.muli(_to_raw(pid_next_n), _to_raw(stride_q_next_n))),
-        )
+        q_row_base = pid_batch * stride_q_batch + pid_next_n * stride_q_next_n
         a_pack = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
-            h_a = _i32_add(fx.Int32(mi * MFMA_M), lane_mod_N)
-            base_a = _i32_add(
-                q_row_base,
-                fx.Int32(arith.muli(_to_raw(h_a), _to_raw(stride_q_heads))),
-            )
+            h_a = mi * MFMA_M + lane_mod_N
+            base_a = q_row_base + h_a * stride_q_heads
             for kk in range_constexpr(K_STEPS):
-                d_a = _i32_add(fx.Int32(kk * MFMA_K), lane8)
-                raw = load_pack_i64(q_i32, _i32_add(base_a, d_a))
+                d_a = kk * MFMA_K + lane8
+                raw = load_pack_i64(q_i32, base_a + d_a)
                 a_pack[mi][kk] = fn_to_fnuz_i64(raw) if convert_q_fn else raw
 
         # weights[out_row, h] per (mi, ii): head = mi*MFMA_M + lane_div_N*4 + ii
         w_frag = [[None] * 4 for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
             for ii in range_constexpr(4):
-                h_w = _i32_add(
-                    fx.Int32(mi * MFMA_M),
-                    _i32_add(
-                        fx.Int32(
-                            arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(4)))
-                        ),
-                        fx.Int32(ii),
-                    ),
-                )
+                h_w = mi * MFMA_M + lane_div_N * 4 + ii
                 w_frag[mi][ii] = _to_raw(fx.Float32(w_t[out_row, h_w]))
 
         # ---- SplitKV: this CTA owns a disjoint, BKV-aligned slice of the KV
@@ -236,55 +213,37 @@ def _build_paged_kernel(
             _to_raw(context_length), _to_raw(fx.Int32(BKV))
         )
         split_chunk_num = arith.ceildivui(context_chunk_num, _to_raw(split_kv))
-        full_end = arith.muli(context_chunk_num, _to_raw(fx.Int32(BKV)))
-        split_cols = arith.muli(split_chunk_num, _to_raw(fx.Int32(BKV)))
-        tile_lo_col = arith.muli(_to_raw(pid_split_kv), split_cols)
-        tile_hi_col = arith.minsi(arith.addi(tile_lo_col, split_cols), full_end)
-        ctx_m1 = arith.subi(_to_raw(context_length), _to_raw(fx.Int32(1)))
+        full_end = context_chunk_num * BKV
+        split_cols = split_chunk_num * BKV
+        tile_lo_col = pid_split_kv * split_cols
+        tile_hi_col = arith.minsi(_to_raw(tile_lo_col + split_cols), _to_raw(full_end))
+        ctx_m1 = context_length - 1
 
-        tile_lo = _to_raw(fx.Index(fx.Int32(tile_lo_col)))
+        tile_lo = _to_raw(fx.Index(tile_lo_col))
         tile_hi = _to_raw(fx.Index(fx.Int32(tile_hi_col)))
         tile_step = _to_raw(fx.Index(fx.Int32(BKV)))
         tile_loop = scf.ForOp(tile_lo, tile_hi, tile_step, [])
         with ir.InsertionPoint(tile_loop.body):
             col0 = fx.Int32(arith.index_cast(T.i32, tile_loop.induction_variable))
-            wave_ni_base = fx.Int32(
-                arith.muli(_to_raw(wave), _to_raw(fx.Int32(N_TILES_PER_WAVE)))
-            )
+            wave_ni_base = wave * N_TILES_PER_WAVE
             for ni in range_constexpr(N_TILES_PER_WAVE):
-                abs_ni = _i32_add(wave_ni_base, fx.Int32(ni))
-                col = _i32_add(
-                    _i32_add(
-                        col0,
-                        fx.Int32(
-                            arith.muli(_to_raw(abs_ni), _to_raw(fx.Int32(MFMA_N)))
-                        ),
-                    ),
-                    lane_mod_N,
-                )
+                abs_ni = wave_ni_base + ni
+                col = col0 + abs_ni * MFMA_N + lane_mod_N
                 # Clamp the gather index to a valid token (mask handles the rest).
-                col_c = fx.Int32(arith.minsi(_to_raw(col), ctx_m1))
-                ind_off = _i32_add(
-                    fx.Int32(arith.muli(_to_raw(pid_batch), _to_raw(max_block_len))),
-                    col_c,
-                )
+                col_c = fx.Int32(arith.minsi(_to_raw(col), _to_raw(ctx_m1)))
+                ind_off = pid_batch * max_block_len + col_c
                 physical = fx.Int32(ind_t[ind_off])
-                tok_byte = fx.Int32(
-                    arith.muli(_to_raw(physical), _to_raw(index_dim))
-                )
+                tok_byte = physical * index_dim
 
                 b_col = [None] * K_STEPS
                 for kk in range_constexpr(K_STEPS):
-                    d_b = _i32_add(fx.Int32(kk * MFMA_K), lane8)
-                    raw = load_pack_i64(kv_i32, _i32_add(tok_byte, d_b))
+                    d_b = kk * MFMA_K + lane8
+                    raw = load_pack_i64(kv_i32, tok_byte + d_b)
                     b_col[kk] = fn_to_fnuz_i64(raw) if convert_kv_fn else raw
 
                 # Co-packed per-token scale: f32 at byte tok_byte + D.
                 scale_dword = fx.Int32(
-                    arith.divui(
-                        _to_raw(_i32_add(tok_byte, fx.Int32(D))),
-                        _to_raw(fx.Int32(4)),
-                    )
+                    arith.divui(_to_raw(tok_byte + D), _to_raw(fx.Int32(4)))
                 )
                 kv_scale = _to_raw(fx.Float32(kv_f32[scale_dword]))
                 if scale_mul != 1.0:
@@ -376,33 +335,28 @@ def _build_paged_kernel(
 
 # Kernel variants: single-token-per-block, wave-split only ("paged_w<WPB>").
 # WPB must divide the column-tile count BKV/16 (=8 at the default BKV=128).
-def _mk_builder(wpb):
-    return lambda **kw: _build_paged_kernel(**kw, waves_per_block=wpb)
-
-
-_VARIANT_BUILDERS = {f"paged_w{w}": _mk_builder(w) for w in (1, 2, 4)}
-KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
+KERNEL_VARIANTS = tuple(f"paged_w{w}" for w in (1, 2, 4))
 DEFAULT_VARIANT = "paged_w4"
 
 
-def _auto_variant(batch_size, next_n, heads):
-    """Default variant selector: constant WPB=4 (8 column tiles / 4 waves = 2
-    tiles/wave). Shape-adaptive variant selection is not implemented."""
-    return DEFAULT_VARIANT
-
-
-def _resolve_variant(variant, batch_size, next_n, heads):
-    tag = (
-        variant
-        or os.environ.get("FLYDSL_FP8_PAGED_MQA_LOGITS_VARIANT")
-        or _auto_variant(batch_size, next_n, heads)
-    )
-    if tag not in _VARIANT_BUILDERS:
+def _variant_wpb(variant):
+    """Parse the WPB int out of a ``paged_w<WPB>`` tag (single validation point)."""
+    if variant not in KERNEL_VARIANTS:
         raise ValueError(
-            f"unknown fp8_paged_mqa_logits variant {tag!r}; "
+            f"unknown fp8_paged_mqa_logits variant {variant!r}; "
             f"available: {list(KERNEL_VARIANTS)}"
         )
-    return tag
+    return int(variant.removeprefix("paged_w"))
+
+
+def _resolve_variant(variant):
+    """Pick the variant tag: explicit arg, then env override, then default.
+    Shape-adaptive selection is not implemented."""
+    return (
+        variant
+        or os.environ.get("FLYDSL_FP8_PAGED_MQA_LOGITS_VARIANT")
+        or DEFAULT_VARIANT
+    )
 
 
 @lru_cache(maxsize=32)
@@ -423,15 +377,11 @@ def compile_fp8_paged_mqa_logits(
     operand whose -0 (0x80) byte the kernel patches to FNUZ +0, and ``scale_mul``
     folds the 2x-per-converted-operand compensation into the co-packed scale.
     """
-    if variant not in _VARIANT_BUILDERS:
-        raise ValueError(
-            f"unknown fp8_paged_mqa_logits variant {variant!r}; "
-            f"available: {list(KERNEL_VARIANTS)}"
-        )
-    launcher = _VARIANT_BUILDERS[variant](
+    launcher = _build_paged_kernel(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=block_kv,
+        waves_per_block=_variant_wpb(variant),
         scale_mul=scale_mul,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
@@ -542,7 +492,7 @@ def flydsl_fp8_paged_mqa_logits(
     convert_kv_fn = False
     scale_mul = 2.0 if convert_q_fn else 1.0
 
-    variant = _resolve_variant(variant, batch_size, next_n, num_heads)
+    variant = _resolve_variant(variant)
 
     launcher = compile_fp8_paged_mqa_logits(
         num_heads=num_heads,
