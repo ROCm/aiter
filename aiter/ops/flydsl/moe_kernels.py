@@ -1196,13 +1196,17 @@ def build_stage1_compile_inputs(
 ) -> dict:
     """Build the kwargs to drive ``flydsl_moe_stage1`` for AOT precompile.
 
-    The returned dict mirrors the activation/weight/scale/routing shapes that
-    ``fused_moe_2stages`` feeds into ``flydsl_moe_stage1`` at inference, so the
-    JIT cache key written under COMPILE_ONLY matches the runtime lookup.
+    Only the top-level ``a`` / ``w1`` shapes and the boolean flags (dtypes,
+    tile, ``doweight_stage1`` / ``enable_bias`` / ``a_scale_one`` ...) feed the
+    JIT cache key. The scale tensors reach the kernel as bare ``ptr_arg``
+    pointers, whose cache signature carries no shape; the routing tensors' sizes
+    only drive runtime-scalar grid dims. Neither affects the key -- empirically
+    verified byte-identical with ``a1_scale`` / ``w1_scale=None`` and length-1
+    routing across fp4/fp8/int4 x stage1/2 x split-K/bias/doweight. So we skip
+    mirroring the quant-kernel scale shapes (which have no runtime formula to
+    share anyway) and pass ``None``.
     """
     dev = dev if dev is not None else torch.device("cpu")
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
-    is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
     _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
@@ -1211,7 +1215,8 @@ def build_stage1_compile_inputs(
         tokens, topk, E, _block_m_for_sort
     )
 
-    # user-level activation / weight shapes (storage dtype)
+    # Activation / weight shapes DO set the cache key (model_dim / inter_dim / E,
+    # including the fp4 half-byte packing), so these stay exact.
     a_shape = (tokens, model_dim // 2) if a_dtype == "fp4" else (tokens, model_dim)
     if b_dtype in ("fp4", "int4"):
         w1_shape = (E, 2 * inter_dim, model_dim // 2)
@@ -1225,39 +1230,8 @@ def build_stage1_compile_inputs(
     sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
     num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
 
-    # a1_scale mirrors fused_moe_2stages' per_1x32 activation-scale construction.
-    a1_scale = None
-    if use_mx_gemm:
-        if a_dtype == "fp8":
-            if a_scale_one:
-                a1_scale = torch.empty(0, dtype=torch.uint8, device=dev)
-            else:
-                a1_scale = torch.ones(
-                    [max_num_tokens_padded, model_dim // 32],
-                    dtype=torch.uint8,
-                    device=dev,
-                )
-        elif a_dtype == "bf16":
-            a1_scale = torch.ones(
-                [max_num_tokens_padded, model_dim // 32], dtype=torch.uint8, device=dev
-            )
-        elif a_dtype == "fp4":
-            rows = (max_num_tokens_padded + 31) // 32 * 32
-            cols = (model_dim + 31) // 32
-            a1_scale = torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
-
-    # w1_scale: per-32 group along K (mxfp4/fp8) or groupwise bf16 (a16wi4).
-    if use_mx_gemm:
-        w1_scale = torch.zeros(
-            E * 2 * inter_dim * (model_dim // 32), dtype=torch.uint8, device=dev
-        )
-    elif is_int4_weight:
-        w1_scale = torch.zeros(
-            E * (model_dim // 32) * (2 * inter_dim), device=dev, dtype=torch.bfloat16
-        )
-    else:
-        w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-
+    # sorted_weights / bias / topk_ids: only their *presence* flips a cache-key
+    # flag (doweight_stage1 / enable_bias); their shapes are irrelevant.
     sorted_weights = (
         torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
         if doweight_stage1
@@ -1268,7 +1242,6 @@ def build_stage1_compile_inputs(
         if enable_bias
         else None
     )
-    # split-K bias path needs topk_ids; harmless for other paths (unused).
     topk_ids = (
         torch.zeros((tokens, topk), device=dev, dtype=torch.int32)
         if enable_bias
@@ -1290,8 +1263,8 @@ def build_stage1_compile_inputs(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        w1_scale=w1_scale,
-        a1_scale=a1_scale,
+        w1_scale=None,
+        a1_scale=None,
         sorted_weights=sorted_weights,
         use_async_copy=True,
         k_batch=k_batch,
@@ -1329,18 +1302,21 @@ def build_stage2_compile_inputs(
     block_m: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
-    stage1_fuse_quant=None,
-    swiglu_limit: float = 0.0,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
-    act: str = "silu",
     dev=None,
     **_ignored,
 ) -> dict:
-    """Build the kwargs to drive ``flydsl_moe_stage2`` for AOT precompile."""
+    """Build the kwargs to drive ``flydsl_moe_stage2`` for AOT precompile.
+
+    See ``build_stage1_compile_inputs``: only ``inter_states`` / ``w2`` shapes
+    and the boolean flags set the cache key. Scales are bare pointers and
+    routing sizes are runtime-scalar grid dims, so ``a2_scale`` / ``w2_scale``
+    are passed as ``None`` (empirically byte-identical key). This also drops the
+    ``stage1_fuse_quant`` / ``act`` / ``swiglu_limit`` inputs that were only used
+    to mirror the a2_scale shape (absorbed by ``**_ignored``).
+    """
     dev = dev if dev is not None else torch.device("cpu")
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
-    is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
     _block_m_for_sort = block_m if block_m > 0 else (sort_block_m or tile_m)
@@ -1365,43 +1341,7 @@ def build_stage2_compile_inputs(
     sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
     num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
 
-    # a2_scale mirrors fused_moe_2stages stage2 activation-scale construction.
-    a2_scale = None
-    if use_mx_gemm:
-        if stage1_fuse_quant in ("fp4", "fp8"):
-            _sorted_size = max(max_num_tokens_padded, max_num_m_blocks * tile_m)
-            _padded_rows = (_sorted_size + 255) // 256 * 256
-            _padded_cols = ((inter_dim // 32) + 7) // 8 * 8
-            a2_scale = torch.zeros(
-                _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
-            )
-        elif a_dtype == "fp8":
-            if act == "silu" and swiglu_limit == 0.0:
-                rows = (max_num_tokens_padded + 31) // 32 * 32
-                cols = (inter_dim + 31) // 32
-                a2_scale = torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
-            else:
-                a2_scale = torch.ones(
-                    [max_num_tokens_padded, model_dim // 32],
-                    dtype=torch.uint8,
-                    device=dev,
-                )
-        elif a_dtype == "fp4":
-            rows = (max_num_tokens_padded + 31) // 32 * 32
-            cols = (inter_dim + 31) // 32
-            a2_scale = torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
-
-    if use_mx_gemm:
-        w2_scale = torch.zeros(
-            E * model_dim * (inter_dim // 32), dtype=torch.uint8, device=dev
-        )
-    elif is_int4_weight:
-        w2_scale = torch.zeros(
-            E * (inter_dim // 32) * model_dim, device=dev, dtype=torch.bfloat16
-        )
-    else:
-        w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-
+    # Only the presence of sorted_weights / bias flips a cache-key flag.
     sorted_weights = (
         torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
         if not doweight_stage1
@@ -1428,8 +1368,8 @@ def build_stage2_compile_inputs(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         mode=mode,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
+        w2_scale=None,
+        a2_scale=None,
         sorted_weights=sorted_weights,
         sort_block_m=sort_block_m,
         persist=persist,
