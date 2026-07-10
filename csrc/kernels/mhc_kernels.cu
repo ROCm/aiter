@@ -36,19 +36,6 @@ namespace aiter {
     static constexpr bool mhc_bf16_mma_avail = false;
 #endif
 
-    // Residual-load TDM completion helpers (mhc_fused_post_pre_gemm_sqrsum_kernel).
-    // On gfx1250 the residual tile is moved by the TDM engine and tracked by
-    // TENSORcnt (separate from load/async/ds counters). KEEP1 leaves the next
-    // prefetched stage in flight (<=2 inflight, within the <=3 budget); DRAIN
-    // waits for all residual TDMs. No-ops off gfx1250 (residual uses async_load).
-#if defined(__gfx1250__)
-#define MHC_TDM_KEEP1() opus::s_wait_tensorcnt(opus::number<1>{})
-#define MHC_TDM_DRAIN() opus::s_wait_tensorcnt(opus::number<0>{})
-#else
-#define MHC_TDM_KEEP1() ((void)0)
-#define MHC_TDM_DRAIN() ((void)0)
-#endif
-
     constexpr int ceil_pow2(int n) {
         if(n <= 1) return 1;
         int p = 1;
@@ -2220,31 +2207,6 @@ namespace aiter {
 
         static constexpr int tile_mk = tile_m * tile_k;
         static_assert(tile_mk % warp_size == 0, "tile_mk must be divisible by block_size");
-#if defined(__gfx1250__)
-        // ---- gfx1250 x (layer_input) load via TDM: a plain 2D tile ----
-        // x lands in LDS as row*tile_k + hidden (exactly what compute_store_tile
-        // reads); in global x[row][h] = row*x_stride + h. So a 2D TDM tile
-        // reproduces the async layout and leaves compute_store_tile unchanged:
-        //   dim0 = hidden (TileDim0 = tile_k, contiguous)
-        //   dim1 = row    (TileDim1 = tile_m,  stride = x_stride)
-        // Issued by warp 1 (residual is issued by warp 0), so each issuing wave
-        // keeps at most 2 TDM ops in flight (2-stage prefetch) -> still within the
-        // <=3 per-wave budget with both x and residual on TDM. tensor_dim1=m_oob
-        // gives free row OOB (out-of-range rows load 0), so no manual zero-fill and
-        // no async counter -> x is TENSORcnt-tracked, x_load_waitcnt = 0.
-        static constexpr int x_load_waitcnt = 0;
-        auto lds_load_x_tile = [&](int k){
-            if (warp_id == 1) {
-                opus::tdm_window<DTYPE_I, tile_k, tile_m> win;   // ndim=2, cpol=default_cpol=16
-                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_x))
-                    + static_cast<uint32_t>((k & 1) * tile_mk * sizeof(DTYPE_I));
-                DTYPE_I* g = x_ptr + k_split_offset + k * tile_k;
-                // make(lds_addr, global_ptr, tensor_dim0, tensor_dim1, tensor_dim0_stride)
-                win.desc.make(lds, g, tile_k, m_oob, x_stride);
-                win.load_to_lds();
-            }
-        };
-#else
 #if defined(__gfx942__)
         static constexpr int x_async_load_vec = 4 / sizeof(DTYPE_I);
 #else
@@ -2279,42 +2241,7 @@ namespace aiter {
                 }
             }
         };
-#endif
 
-#if defined(__gfx1250__)
-        // ---- gfx1250 residual load via TDM (Tensor Data Mover) ----
-        // The residual tile is [head=hc_mult][row=tile_m][hidden=tile_k] and must
-        // land in LDS as h*tile_mk + row*tile_k + hidden (exactly what
-        // compute_store_tile reads), so a single 3D TDM tile reproduces the async
-        // layout and leaves compute_store_tile unchanged:
-        //   dim0 = hidden (TileDim0 = tile_k, contiguous)
-        //   dim1 = row    (TileDim1 = tile_m,  stride = residual_stride)
-        //   dim2 = head   (TileDim2 = hc_mult, stride = hidden_size)
-        // TDM writes dim0-fastest -> dim1 -> dim2, i.e. linear LDS index
-        //   dim2*(tile_m*tile_k) + dim1*tile_k + dim0 = h*tile_mk + row*tile_k + hidden.
-        // One TDM op per k-step; the 2-stage (n_stages) prefetch keeps at most 2
-        // in flight (<=3 inflight budget). tensor_dim1=m_oob gives free row OOB
-        // (out-of-range rows load 0). residual is TENSORcnt-tracked, so it no longer
-        // contributes to the async counter -> residual_load_waitcnt = 0.
-        static constexpr int residual_load_waitcnt = 0;
-        auto lds_load_residual_tile = [&](int k){
-            // TDM is a wave-level DMA (not per-lane, not EXEC-gated); a single wave
-            // issues one op that fills the whole all-head tile. Only warp 0 issues;
-            // the others see the data after the tensorcnt wait + workgroup barrier
-            // in wait_load_cnt(). Build the 3D descriptor by hand (tdm_window::make
-            // is 2D-only) and reuse the vetted load_to_lds() issue path (cpol=16).
-            if (warp_id == 0) {
-                opus::tdm_window<DTYPE_I, tile_k, tile_m, hc_mult> win;  // ndim=3, cpol=default_cpol=16
-                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual))
-                    + static_cast<uint32_t>((k & 1) * (hc_mult * tile_mk) * sizeof(DTYPE_I));
-                DTYPE_I* g = residual_ptr + k_split_offset + k * tile_k;
-                // make(lds_addr, global_ptr, tensor_dim0, tensor_dim1, tensor_dim0_stride,
-                //      tensor_dim1_stride, lds_barrier_addr, tensor_dim2)
-                win.desc.make(lds, g, tile_k, m_oob, residual_stride, hidden_size, 0, hc_mult);
-                win.load_to_lds();
-            }
-        };
-#else
 #if defined(__gfx942__)
         static constexpr int r_async_load_vec = 4 / sizeof(DTYPE_I);
 #else
@@ -2346,8 +2273,7 @@ namespace aiter {
                 s_offset += s_offset_i;
             }
         };
-#endif
-        
+
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
         using fp32xfntile = opus::array<fp32xtile, repeat_n>;
@@ -2510,30 +2436,12 @@ namespace aiter {
             }
         };
 
-        // gfx9 only: x and residual share the async counter, so the "leave in flight"
-        // count is one stage's worth of async loads. On gfx1250 both x and residual
-        // are TDM (TENSORcnt), there are no async loads, and these are unused.
-        [[maybe_unused]] static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
-        [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
-#if defined(__gfx1250__)
+        // x and residual share the async counter; the "leave in flight" count is one
+        // stage's worth of async loads. On gfx1250 the OOB guard makes the per-stage
+        // async count data-dependent, so x_async_wait/r_async_wait drain to 0 there.
+        static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
+        static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
         auto wait_load_cnt = [&]() {
-            // x (warp 1) and residual (warp 0) are both TDM / TENSORcnt-tracked. Each
-            // issuing wave drains its current stage down to the single prefetch left in
-            // flight (KEEP1, per-wave counter; a no-op on the non-issuing warps), then
-            // the workgroup barrier publishes both tiles to all warps. fn stays on
-            // loadcnt; there are no async loads left, so the async count is -1
-            // (sentinel: suppress s_wait_asynccnt emission; 0 would emit a spurious
-            // s_wait_asynccnt 0).
-            MHC_TDM_KEEP1();
-            s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<-1>{});
-            __builtin_amdgcn_s_barrier();
-            s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<-1>{});
-        };
-#else
-        auto wait_load_cnt = [&]() {
-            // Ensure the current residual TDM stage is resident before the barrier
-            // below publishes it to all warps; leave the next prefetched stage in flight.
-            MHC_TDM_KEEP1();
             if(threadIdx.x < x_async_load_threads) {
                 s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<x_async_wait>{});
             }
@@ -2548,7 +2456,6 @@ namespace aiter {
                 s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<r_async_wait>{});
             }
         };
-#endif
 
         int i = 0;
         for(; i + 3 < k_loop ; i += 2) {
@@ -2579,19 +2486,16 @@ namespace aiter {
             }
             else {
                 s_wait_all_loadcnt(0_I, 0_I);
-                MHC_TDM_DRAIN();
                 __builtin_amdgcn_s_barrier();
             }
             compute_store_tile(i + 1, v_fn1);
             if (i + 2 < k_loop) {
                 s_wait_all_loadcnt(0_I, 0_I);
-                MHC_TDM_DRAIN();
                 __builtin_amdgcn_s_barrier();
                 compute_store_tile(i + 2, v_fn0);
             }
         } else if (i < k_loop) {
             s_wait_all_loadcnt(0_I, 0_I);
-            MHC_TDM_DRAIN();
             __builtin_amdgcn_s_barrier();
             compute_store_tile(i, v_fn0);
         }
