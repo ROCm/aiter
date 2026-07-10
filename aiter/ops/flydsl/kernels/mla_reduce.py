@@ -660,10 +660,13 @@ def compile_mla_reduce(
                 # vmcnt(>0) overlap (depth-1 aliased the single carried os into
                 # the next load dest, forcing vmcnt(0) drain).
                 #
-                # Bounds are carried as float masks (deferred-guard); the split
-                # index is also clamped so OOB prefetches read lds_pmap[0]/
-                # lds_scale[0] (always written) -> no NaN*0 pollution, mask=0
-                # zeroes the contribution.
+                # OOB/tail guard (no separate float mask carried): the split
+                # index is clamped so OOB prefetches read lds_pmap[0]/
+                # lds_scale[0] (always written) -> the os read is finite (no
+                # NaN), and load_scales select-to-0's the invalid split's scale,
+                # which alone zeroes the contribution in the FMA. Carrying a
+                # redundant float mask through the loop state only wasted GRP
+                # VGPRs on this occupancy-1 register-wall-bound kernel.
                 # GRP = splits processed per iteration (loads in flight), tier-
                 # dependent. The long-loop M256/MLDS path (nlse>=4, e.g. b1_s128
                 # @128 splits) wins ~8% in graph mode at GRP=16 (deeper vmcnt
@@ -678,19 +681,18 @@ def compile_mla_reduce(
                 _grp_shift = GRP.bit_length() - 1
                 zero_f = fx.arith.constant(0.0, type=T.f32)
 
-                one_f = fx.arith.constant(1.0, type=T.f32)
-
                 def load_os_group(base_i32):
                     """pmap-only phase of a group load: gather rows + issue the
-                    GRP os buffer_loads + compute the float OOB masks. Depends on
+                    GRP os buffer_loads + compute the OOB valid flags. Depends on
                     lds_pmap (staged + barriered at the top of the work item),
                     NOT on lds_scale, so it can be hoisted ahead of the LSE-reduce
                     scale barrier (lever #6) to overlap the VMEM load latency with
                     the warp0 LSE reduce + the barrier wait.
 
                     Vectorized LDS: base = i*GRP is 16B-aligned so the pmap read
-                    is a wide ds_read_b128. Returns (os_list, masks, valids); the
-                    scale fold happens later in load_scales.
+                    is a wide ds_read_b128. Returns (os_list, valids); the scale
+                    fold (which also absorbs the OOB guard) happens in
+                    load_scales.
 
                     Tail safety: OOB lanes (slot >= n_splits) read stale slots, so
                     the pmap value is substituted with slot-0's (always staged,
@@ -706,7 +708,6 @@ def compile_mla_reduce(
                         )
                     )
                     os_list = []
-                    masks = []
                     valids = []
                     for j in fx.range_constexpr(GRP):
                         split_j = base_i32 + fx.Int32(j)
@@ -722,16 +723,17 @@ def compile_mla_reduce(
                         row_idx, in_bounds = row_from_pmap(pmap_j, local_seq)
                         os_raw = load_o_elems(g_po, row_idx, fx.Index(head), col)
                         valid = fx.arith.andi(in_split, in_bounds)
-                        mask = valid.select(one_f, zero_f)
                         os_list.append(os_raw)
-                        masks.append(mask)
                         valids.append(valid)
-                    return os_list, masks, valids
+                    return os_list, valids
 
                 def load_scales(base_i32, valids):
                     """scale phase: wide ds_read_b128 of lds_scale + select-to-0
-                    on invalid splits (prevents stale-NaN * mask(0) pollution).
-                    Must run after the scale barrier."""
+                    on invalid splits. This select IS the accumulate's OOB guard:
+                    sc=0 zeroes the split's contribution, and the os read is
+                    pmap0-substituted + row-clamped to a finite value, so no
+                    separate float mask is needed. Must run after the scale
+                    barrier."""
                     scale_v = lds_scale.load(fx.Index(base_i32), vec_size=GRP)
                     scs = []
                     for j in fx.range_constexpr(GRP):
@@ -744,16 +746,16 @@ def compile_mla_reduce(
                 def load_group(base_i32):
                     """Combined pmap+scale load for the steady-state loop (both
                     LDS regions are valid past the barrier)."""
-                    os_list, masks, valids = load_os_group(base_i32)
+                    os_list, valids = load_os_group(base_i32)
                     scs = load_scales(base_i32, valids)
-                    return os_list, masks, scs
+                    return os_list, scs
 
                 # Prologue + lever #6: hoist group-0's os buffer_loads ahead of
                 # the scale barrier. They depend only on the already-staged
                 # lds_pmap, so issuing them here overlaps GRP VMEM loads with the
                 # warp0 LSE reduce and the barrier wait; the barrier-protected
                 # scales are folded in afterwards.
-                os_g0, mask_g0, valid_g0 = load_os_group(fx.Int32(0))
+                os_g0, valid_g0 = load_os_group(fx.Int32(0))
 
                 fx.gpu.barrier()
 
@@ -764,10 +766,8 @@ def compile_mla_reduce(
                         _to_raw(os_g0[j][k]) for k in fx.range_constexpr(VEC)
                     ]
                 init_regs = [_to_raw(zero_f) for _ in fx.range_constexpr(VEC)]
-                init_ms = []
-                for j in fx.range_constexpr(GRP):
-                    init_ms += [_to_raw(mask_g0[j]), _to_raw(sc_g0[j])]
-                init_state = init_os + init_regs + init_ms
+                init_sc = [_to_raw(sc_g0[j]) for j in fx.range_constexpr(GRP)]
+                init_state = init_os + init_regs + init_sc
 
                 # N = floor((n_splits - 1) / GRP) loop iterations; the loop
                 # consumes groups 0..N-1 and the epilogue the final carried
@@ -781,7 +781,7 @@ def compile_mla_reduce(
                 )
                 stop_i32 = num_iters * fx.Int32(GRP)
                 loop_stop = fx.arith.index_cast(T.index, _to_raw(stop_i32))
-                _mbase = (GRP + 1) * VEC
+                _sbase = (GRP + 1) * VEC
 
                 def unpack(state):
                     os_g = [
@@ -791,16 +791,14 @@ def compile_mla_reduce(
                     regs = [
                         state[GRP * VEC + k] for k in fx.range_constexpr(VEC)
                     ]
-                    mask_g = [state[_mbase + 2 * j] for j in fx.range_constexpr(GRP)]
-                    sc_g = [state[_mbase + 2 * j + 1] for j in fx.range_constexpr(GRP)]
-                    return os_g, regs, mask_g, sc_g
+                    sc_g = [state[_sbase + j] for j in fx.range_constexpr(GRP)]
+                    return os_g, regs, sc_g
 
-                def accumulate(regs, os_g, mask_g, sc_g):
+                def accumulate(regs, os_g, sc_g):
                     new_regs = list(regs)
                     for j in fx.range_constexpr(GRP):
-                        sc_eff = sc_g[j] * mask_g[j]
                         new_regs = [
-                            new_regs[k] + os_g[j][k] * sc_eff
+                            new_regs[k] + os_g[j][k] * sc_g[j]
                             for k in fx.range_constexpr(VEC)
                         ]
                     return new_regs
@@ -808,28 +806,26 @@ def compile_mla_reduce(
                 for i, state in range(
                     fx.Index(0), loop_stop, fx.Index(GRP), init=init_state
                 ):
-                    os_g, regs, mask_g, sc_g = unpack(state)
+                    os_g, regs, sc_g = unpack(state)
                     i_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(i)))
                     # Issue the next group's loads FIRST (stay in flight), then
                     # FMA the carried group. Vectorized LDS reads for the group.
-                    n_os, n_mask, n_sc = load_group(i_i32 + fx.Int32(GRP))
-                    new_regs = accumulate(regs, os_g, mask_g, sc_g)
+                    n_os, n_sc = load_group(i_i32 + fx.Int32(GRP))
+                    new_regs = accumulate(regs, os_g, sc_g)
                     next_os_flat = []
                     for j in fx.range_constexpr(GRP):
                         next_os_flat += [
                             _to_raw(n_os[j][k]) for k in fx.range_constexpr(VEC)
                         ]
-                    next_ms = []
-                    for j in fx.range_constexpr(GRP):
-                        next_ms += [_to_raw(n_mask[j]), _to_raw(n_sc[j])]
+                    next_sc = [_to_raw(n_sc[j]) for j in fx.range_constexpr(GRP)]
                     results = yield (
                         next_os_flat
                         + [_to_raw(r) for r in new_regs]
-                        + next_ms
+                        + next_sc
                     )
 
-                os_g, regs, mask_g, sc_g = unpack(results)
-                out_elems = accumulate(regs, os_g, mask_g, sc_g)
+                os_g, regs, sc_g = unpack(results)
+                out_elems = accumulate(regs, os_g, sc_g)
                 store_result(seq_i32, out_elems)
 
             def dispatch_tier_body(seq_i32, local_seq):
