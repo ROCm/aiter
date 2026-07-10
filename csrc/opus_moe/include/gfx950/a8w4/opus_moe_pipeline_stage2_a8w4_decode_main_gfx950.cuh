@@ -164,10 +164,9 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
     else
     {
-        if constexpr(T::IS_BM32_BN256)
+        if constexpr(T::IS_BM32_BN256 || T::IS_BM64_BN256)
         {
-            // Fast path for full sorted tiles. Store-side route_row guards are
-            // still kept so malformed metadata cannot write a negative route row.
+            // Full sorted tiles do not need a route-count reduction.
             if(route_base + T::B_M <= sorted_rows)
             {
                 __syncthreads();
@@ -620,24 +619,22 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
 }
 
 // Epilogue: direct atomic output or route-out store.
-typedef __bf16 opus_moe_stage2_a8w4_decode_bf16x2_t __attribute__((ext_vector_type(2)));
 typedef uint32_t opus_moe_stage2_a8w4_decode_u32x4_store_t
     __attribute__((ext_vector_type(4)));
 
 inline __device__ void opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
-    uint32_t packed_bf16x2,
-    __amdgpu_buffer_rsrc_t out_rsrc,
+    opus::bf16x2_t data,
+    opus::i32x4_t out_rsrc,
     int byte_offset)
 {
-    const opus_moe_stage2_a8w4_decode_bf16x2_t data =
-        __builtin_bit_cast(opus_moe_stage2_a8w4_decode_bf16x2_t, packed_bf16x2);
-#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
-    __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(data, out_rsrc, byte_offset, 0, 0);
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+    (void)opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(
+        data, out_rsrc, byte_offset, 0, 0);
 #else
-    opus::i32x4_t rsrc;
-    __builtin_memcpy(&rsrc, &out_rsrc, sizeof(opus::i32x4_t));
-    opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(
-        __builtin_bit_cast(opus::fp16x2_t, data), rsrc, byte_offset, 0, 0);
+    (void)data;
+    (void)out_rsrc;
+    (void)byte_offset;
+    __builtin_trap();
 #endif
 }
 
@@ -708,7 +705,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     int col_base,
     int64_t output_row_stride,
-    __amdgpu_buffer_rsrc_t out_rsrc)
+    opus::i32x4_t out_rsrc)
 {
     constexpr int CSHUFFLE_NLANE =
         OpusMoeStage2A8W4CShuffleLayout<T>::CSHUFFLE_NLANE;
@@ -717,7 +714,6 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
     constexpr int PAIRS_PER_ROW =
         OpusMoeStage2A8W4CShuffleLayout<T>::PAIRS_PER_ROW;
     constexpr int ATOMIC_GROUPS = PAIRS_PER_ROW / CSHUFFLE_NLANE;
-    using Schedule = OpusMoeStage2A8W4DecodeSchedule<T>;
     static_assert(T::BLOCK_SIZE % CSHUFFLE_NLANE == 0);
     static_assert(T::B_M % CSHUFFLE_MLANE == 0);
     static_assert((PAIRS_PER_ROW & (PAIRS_PER_ROW - 1)) == 0);
@@ -737,12 +733,11 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
                 c_layout.output_byte_offset(token, output_row_stride, col_base, col0);
             opus::static_for<ATOMIC_GROUPS>([&](auto group) {
                 constexpr int pair_delta = group.value * CSHUFFLE_NLANE;
-                constexpr int byte_delta =
-                    pair_delta * static_cast<int>(sizeof(uint32_t));
+                constexpr int byte_delta = pair_delta * static_cast<int>(sizeof(uint32_t));
+                const auto data = __builtin_bit_cast(
+                    opus::bf16x2_t, smem_c_pair[pair_base + pair_delta]);
                 opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
-                    smem_c_pair[pair_base + pair_delta],
-                    out_rsrc,
-                    byte_offset + byte_delta);
+                    data, out_rsrc, byte_offset + byte_delta);
             });
         }
     }
@@ -905,7 +900,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     uint32_t* __restrict__ smem_c_pair,
     int col_base,
     int64_t output_row_stride,
-    __amdgpu_buffer_rsrc_t output_rsrc)
+    opus::i32x4_t output_rsrc)
 {
     using namespace opus;
     using opus::operator""_I;
@@ -1098,8 +1093,13 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             static_cast<unsigned long long>(output_rows_per_token) *
             static_cast<unsigned long long>(kargs.stride_o_t) *
             static_cast<unsigned long long>(sizeof(hip_bfloat16)));
-        auto output_rsrc = opus::make_buffer_rsrc(static_cast<void*>(kargs.out_bf16),
-                                                  output_size_bytes);
+        const auto output_ptr_bits = reinterpret_cast<__UINTPTR_TYPE__>(kargs.out_bf16);
+        const opus::i32x4_t output_rsrc{
+            static_cast<int>(static_cast<unsigned int>(output_ptr_bits)),
+            static_cast<int>((static_cast<unsigned long long>(output_ptr_bits) >> 32) &
+                             0xffffu),
+            static_cast<int>(output_size_bytes),
+            static_cast<int>(opus::buffer_default_config())};
         opus_moe_stage2_a8w4_decode_direct_epilogue<T>(
             v_c,
             u_c,

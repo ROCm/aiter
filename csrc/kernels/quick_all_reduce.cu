@@ -87,6 +87,60 @@ void qr_all_reduce(fptr_t _fa, torch::Tensor& inp,
   }
 }
 
+void qr_all_reduce_rmsnorm(fptr_t _fa, torch::Tensor& inp,
+                           torch::Tensor& residual_inp,
+                           torch::Tensor& residual_out, torch::Tensor& out,
+                           torch::Tensor& weight, double eps,
+                           int64_t hidden_dim, int64_t quant_level,
+                           bool cast_bf2half) {
+  auto fa = reinterpret_cast<DeviceComms*>(_fa);
+  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+  auto stream = at::hip::getCurrentHIPStream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_inp.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_out.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), weight.scalar_type());
+  TORCH_CHECK_EQ(inp.numel(), out.numel());
+  TORCH_CHECK_EQ(inp.numel(), residual_inp.numel());
+  TORCH_CHECK_EQ(inp.numel(), residual_out.numel());
+  TORCH_CHECK_EQ(weight.numel(), hidden_dim);
+  TORCH_CHECK_GT(hidden_dim, 0);
+  TORCH_CHECK_EQ(inp.numel() % hidden_dim, 0);
+  TORCH_CHECK_LE(out.numel(), fa->kMaxProblemSize);
+
+  if (out.scalar_type() == at::ScalarType::Half) {
+    fa->allreduce_rmsnorm<half, half, false>(
+        reinterpret_cast<half*>(inp.data_ptr()),
+        reinterpret_cast<half*>(residual_inp.data_ptr()),
+        reinterpret_cast<half*>(residual_out.data_ptr()),
+        reinterpret_cast<half*>(out.data_ptr()),
+        reinterpret_cast<half*>(weight.data_ptr()), static_cast<float>(eps),
+        out.numel(), hidden_dim, quant_level, stream);
+  } else if (out.scalar_type() == at::ScalarType::BFloat16) {
+    if (cast_bf2half) {
+      fa->allreduce_rmsnorm<__hip_bfloat16, half, true>(
+          reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(residual_inp.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(residual_out.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(weight.data_ptr()),
+          static_cast<float>(eps), out.numel(), hidden_dim, quant_level, stream);
+    } else {
+      fa->allreduce_rmsnorm<__hip_bfloat16, __hip_bfloat16, false>(
+          reinterpret_cast<__hip_bfloat16*>(inp.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(residual_inp.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(residual_out.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+          reinterpret_cast<__hip_bfloat16*>(weight.data_ptr()),
+          static_cast<float>(eps), out.numel(), hidden_dim, quant_level, stream);
+    }
+  } else {
+    throw std::runtime_error(
+        "quick allreduce rmsnorm only supports float16 and bfloat16");
+  }
+}
+
 int64_t qr_max_size() {
   // The default is 2GB (2,147,483,648 bytes)
   return static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1;
@@ -101,6 +155,11 @@ int64_t qr_max_size() {
   // world_size == 2 kernel for it.
   #define INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(T, Codec, cast_bf2half)                \
     template struct AllReduceTwoshot<T, Codec<T, 2>, cast_bf2half>;
+
+  #define INSTANTIATE_RMSNORM_FOR_WORLDSIZE(T, CommT, Codec, cast_bf2half)          \
+    template struct AllReduceTwoshotRMSNorm<T, CommT, Codec<CommT, 2>, cast_bf2half>; \
+    template struct AllReduceTwoshotRMSNorm<T, CommT, Codec<CommT, 4>, cast_bf2half>; \
+    template struct AllReduceTwoshotRMSNorm<T, CommT, Codec<CommT, 8>, cast_bf2half>; \
 
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(__hip_bfloat16, CodecQ4, false)
@@ -118,6 +177,20 @@ INSTANTIATE_FOR_WORLDSIZE(half, CodecQ4, false)
 INSTANTIATE_FOR_WORLDSIZE(half, CodecQ6, false)
 INSTANTIATE_FOR_WORLDSIZE(half, CodecFP8, false)
 INSTANTIATE_FOR_WORLDSIZE_TP2_ONLY(half, CodecQ3, false)
+
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, __hip_bfloat16, CodecFP, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, __hip_bfloat16, CodecQ4, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, __hip_bfloat16, CodecQ6, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, __hip_bfloat16, CodecFP8, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, half, CodecFP, true)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, half, CodecQ4, true)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, half, CodecQ6, true)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(__hip_bfloat16, half, CodecFP8, true)
+
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(half, half, CodecFP, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(half, half, CodecQ4, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(half, half, CodecQ6, false)
+INSTANTIATE_RMSNORM_FOR_WORLDSIZE(half, half, CodecFP8, false)
 
 #endif  // USE_ROCM
 } // namespace aiter
