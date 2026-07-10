@@ -405,28 +405,6 @@ inline __device__ bool load_route_metadata_to_smem(
     int* __restrict__ smem_slot,
     uint8_t* __restrict__ smem_route_valid)
 {
-    if constexpr(Traits::ROW_ZERO_METADATA_ONLY)
-    {
-        if(tile.tid < Traits::B_M)
-        {
-            smem_token[tile.tid] = 0;
-            smem_slot[tile.tid] = 0;
-            smem_route_valid[tile.tid] = 0;
-        }
-        if(tile.tid == 0)
-        {
-            int token = 0;
-            int slot = 0;
-            const bool valid = route_is_valid<Traits>(
-                kargs, tile.route_base, token, slot);
-            smem_token[0] = token;
-            smem_slot[0] = slot;
-            smem_route_valid[0] = valid ? 1 : 0;
-        }
-        __syncthreads();
-        return smem_route_valid[0] != 0;
-    }
-
     const bool tile_full_valid =
         tile.route_base + Traits::B_M <= tile.valid_rows;
     int has_route = 0;
