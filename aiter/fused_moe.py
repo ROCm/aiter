@@ -50,6 +50,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
+    parse_flydsl_v2_gemm2_kernel,
 )
 
 BLOCK_SIZE_M = 32
@@ -1176,6 +1177,8 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    if out_dtype is not None:
+        parsed = {**parsed, "out_dtype": out_dtype}
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
@@ -1191,7 +1194,7 @@ def _flydsl_stage1_wrapper(
         tile_k=parsed["tile_k"],
         a_dtype=parsed["a_dtype"],
         b_dtype=parsed["b_dtype"],
-        out_dtype=out_dtype or parsed["out_dtype"],
+        out_dtype=parsed["out_dtype"],
         act=act,
         w1_scale=w1_scale,
         a1_scale=a1_scale,
@@ -1282,29 +1285,390 @@ def _flydsl_stage2_wrapper(
     )
 
 
-_FLYDSL_V2_GEMM2_RE = re.compile(
-    r"^flydslv2_moe2_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
-    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
-    r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
-)
+def _empty_bf16(device):
+    return torch.empty((0,), dtype=dtypes.bf16, device=device)
 
 
-def parse_flydsl_v2_gemm2_kernel(name):
-    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
-    if not m:
-        return None
-    return {
-        "a_dtype": m.group("a"),
-        "b_dtype": m.group("b"),
-        "out_dtype": m.group("out"),
-        "tile_m": int(m.group("tm")),
-        "tile_n": int(m.group("tn")),
-        "tile_k": int(m.group("tk")),
-        "epilog": m.group("epilog"),
-        "persist": bool(m.group("persist")),
-        "use_nt": bool(m.group("nt")),
-        "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
-    }
+def _empty_u8(device):
+    return torch.empty((0,), dtype=torch.uint8, device=device)
+
+
+def _mxfp4_a4w4_stage1(
+    hidden_states,
+    w1,
+    w1_scale,
+    a_quant,
+    a_scale,
+    bf16_zero,
+    sorted_token_ids,
+    sorted_expert_ids,
+    cumsum_tensor,
+    m_indices,
+    *,
+    inline_quant,
+    NE,
+    topk,
+    D_HIDDEN,
+    D_INTER,
+    Kpad_inter,
+    BM,
+    max_sorted,
+    kernelName1,
+    device,
+    use_nt=False,
+    interleave=False,
+):
+    if not inline_quant:
+        aiter.mxfp4_moe_quant(
+            a_input=hidden_states,
+            a_quant=a_quant,
+            a_scale=a_scale,
+            bf16_zero_out=bf16_zero,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=D_HIDDEN,
+            MB=BM,
+        )
+        padded_rows = ((max_sorted + 31) // 32) * 32
+        cols = D_HIDDEN // 32
+        a_scale_sorted_shuffled = torch.empty(
+            (padded_rows * cols * 2,), device=device, dtype=torch.uint8
+        )
+        aiter.mxfp4_moe_sort_scales(
+            a_scale=a_scale,
+            sorted_token_ids=sorted_token_ids,
+            cumsum_tensor=cumsum_tensor,
+            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+            NE=NE,
+            TOPK=topk,
+            D_HIDDEN=D_HIDDEN,
+            MB=BM,
+            max_sorted=max_sorted,
+        )
+    else:
+        # inline_quant: pass a tiny placeholder. gemm1 won't read it.
+        a_scale_sorted_shuffled = _empty_u8(device)
+
+    # -- gemm1: A_q x w1 -> inter (packed MXFP4, sorted layout) ----------
+    # The flydsl port reads/writes D_INTER directly (no K-pad tail to zero).
+    BM_MIN = 64
+    _ia = torch.empty
+    inter_cols = D_INTER // 2
+    inter_scale_cols = D_INTER // 32
+    inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
+    inter_sorted_quant = _ia((max_sorted, inter_cols), device=device, dtype=torch.uint8)
+    inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
+    inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
+    inter_sorted_shuffled_scale = _ia(
+        (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8
+    )
+
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+
+    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
+    flydsl_mxfp4_gemm1(
+        a_quant=a_quant,
+        a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+        w1_u8=w1,
+        w1_scale_u8=_mxfp4_scale_u8(w1_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=cumsum_tensor,
+        m_indices=m_indices,
+        inter_sorted_quant=inter_sorted_quant,
+        inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+        hidden_states=hidden_states,
+        n_tokens=hidden_states.shape[0],
+        BM=BM,
+        use_nt=use_nt,
+        inline_quant=inline_quant,
+        NE=NE,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        topk=topk,
+        interleave=interleave,
+        xcd_swizzle=_xcd1,
+    )
+    return inter_sorted_quant, inter_sorted_shuffled_scale
+
+
+def _mxfp4_a4w4_stage2(
+    inter_sorted_quant,
+    inter_sorted_shuffled_scale,
+    w2,
+    w2_scale,
+    cumsum_tensor,
+    sorted_token_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    reverse_sorted,
+    out_dst,  # caller's output buffer; written in-place (atomic accum or scatter_reduce dst)
+    *,
+    atomic,
+    mxfp4out,
+    kernelName2,
+    M,
+    max_sorted,
+    NE,
+    topk,
+    D_HIDDEN,
+    D_INTER,
+    BM,
+    device,
+    use_nt=False,
+    cshuffle=False,
+    inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
+):
+    _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
+    if atomic:
+        out_buf = out_dst
+    else:
+        _mx_shape_ok = (
+            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
+        )
+
+        # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
+        if _mx_shape_ok and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1":
+            flat_out_q = torch.empty(
+                (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
+            )
+            flat_out_scale = torch.empty(
+                (max_sorted, D_HIDDEN // 32), dtype=torch.uint8, device=device
+            )
+            from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+
+            flydsl_mxfp4_gemm2(
+                inter_sorted_quant=inter_sorted_quant,
+                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                w2_u8=w2,
+                w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+                sorted_expert_ids=sorted_expert_ids,
+                cumsum_tensor=cumsum_tensor,
+                sorted_token_ids=sorted_token_ids,
+                sorted_weights=sorted_weights,
+                flat_out=flat_out_q,
+                flat_out_scale=flat_out_scale,
+                M_logical=M,
+                max_sorted=max_sorted,
+                BM=BM,
+                use_nt=use_nt,
+                atomic=False,
+                mxfp4out=True,
+                cshuffle=cshuffle,
+                NE=NE,
+                D_HIDDEN=D_HIDDEN,
+                D_INTER=D_INTER,
+                D_INTER_REAL=inter_real,
+                topk=topk,
+                xcd_swizzle=_xcd2,
+            )
+            # scatter_reduce fully overwrites each output row -> write the caller's
+            # buffer directly (avoids a redundant (M, D_HIDDEN) D2D copy at the end).
+            out = out_dst
+            aiter.mxfp4_moe_scatter_reduce_q(
+                flat_out_q=flat_out_q,
+                flat_out_scale=flat_out_scale,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights,
+                out=out,
+                NE=NE,
+                TOPK=topk,
+                D_HIDDEN=D_HIDDEN,
+                MB=BM,
+            )
+            return out
+
+        # `_f4out` requested on an unsupported shape -> drop it, run bf16.
+        if mxfp4out:
+            kernelName2 = kernelName2.replace("_f4out", "")
+
+        # Non-atomic bf16: per-sorted-row staging; scatter_reduce afterwards.
+        out_buf = torch.empty((max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
+
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+
+    flydsl_mxfp4_gemm2(
+        inter_sorted_quant=inter_sorted_quant,
+        inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+        w2_u8=w2,
+        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=cumsum_tensor,
+        sorted_token_ids=sorted_token_ids,
+        sorted_weights=sorted_weights,
+        flat_out=out_buf,
+        M_logical=M,
+        max_sorted=max_sorted,
+        BM=BM,
+        use_nt=use_nt,
+        atomic=atomic,
+        mxfp4out=False,
+        cshuffle=cshuffle,
+        NE=NE,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        D_INTER_REAL=inter_real,
+        topk=topk,
+        xcd_swizzle=_xcd2,
+    )
+
+    if atomic:
+        return out_buf
+
+    # -- scatter_reduce: per-(token, topk-slot) flat_out -> per-token out --
+    # Write the caller's buffer directly (scatter_reduce overwrites every row), so the
+    # trailing `moe_out.copy_(out)` becomes a no-op and the D2D copy is eliminated.
+    out = out_dst
+    aiter.mxfp4_moe_scatter_reduce(
+        flat_out=out_buf,
+        reverse_sorted=reverse_sorted,
+        sorted_weights=sorted_weights,
+        out=out,
+        NE=NE,
+        TOPK=topk,
+        D_HIDDEN=D_HIDDEN,
+        MB=BM,
+    )
+    return out
+
+
+def _mxfp4_a4w4_stage1_fw(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    block_m=None,
+    a1_scale=None,
+    w1_scale=None,
+    sorted_weights=None,
+    kernelName1="",
+    m_indices=None,
+    moe_buf=None,
+    interleave=False,
+    **_kwargs,
+):
+    device = hidden_states.device
+    p1 = _parse_mxfp4_g1_kname(kernelName1)
+    BM = p1["BM"]
+    inline_quant = p1["inline_quant"]
+    if w1.element_size() == 1 and w1.dtype != torch.uint8:
+        w1 = w1.view(torch.uint8)
+    NE = w1.shape[0]
+    D_HIDDEN = hidden_states.shape[1]
+    D_INTER = w1.shape[1] // 2
+    Kpad_inter = ((D_INTER + 255) // 256) * 256
+    M = hidden_states.shape[0]
+    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+    a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+
+    bf16_zero = (
+        moe_buf
+        if (moe_buf is not None and moe_buf.numel() > 0 and not inline_quant)
+        else _empty_bf16(device)
+    )
+    return _mxfp4_a4w4_stage1(
+        hidden_states,
+        w1,
+        w1_scale,
+        a_quant,
+        a_scale,
+        bf16_zero,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        m_indices,
+        inline_quant=inline_quant,
+        NE=NE,
+        topk=topk,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        Kpad_inter=Kpad_inter,
+        BM=BM,
+        max_sorted=sorted_token_ids.shape[0],
+        kernelName1=kernelName1,
+        device=device,
+        use_nt=p1["use_nt"],
+        interleave=interleave,
+    )
+
+
+def _mxfp4_a4w4_stage2_fw(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    moe_out,
+    topk,
+    *,
+    w2_scale=None,
+    a2_scale=None,
+    block_m=None,
+    sorted_weights=None,
+    kernelName2="",
+    reverse_sorted=None,
+    **_kwargs,
+):
+
+    device = inter_states.device
+    p2 = _parse_mxfp4_g2_kname(kernelName2)
+    BM = p2["BM"]
+    atomic = p2["atomic"]
+    mxfp4out = p2.get("mxfp4out", False)
+    # Read inter_real BEFORE any w2.view() drops the attr. The flydsl port reads
+    # D_INTER directly (D_INTER_REAL handles the unpadded shard); no K-pad needed.
+    inter_real = getattr(w2, "inter_real", None)
+    if w2.element_size() == 1 and w2.dtype != torch.uint8:
+        w2 = w2.view(torch.uint8)
+    NE = w2.shape[0]
+    D_HIDDEN = w2.shape[1]
+    D_INTER = w1.shape[1] // 2
+    M = moe_out.shape[0]
+    out = _mxfp4_a4w4_stage2(
+        inter_states,
+        a2_scale,
+        w2,
+        w2_scale,
+        num_valid_ids,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        reverse_sorted,
+        moe_out,
+        atomic=atomic,
+        mxfp4out=mxfp4out,
+        kernelName2=kernelName2,
+        M=M,
+        max_sorted=sorted_token_ids.shape[0],
+        NE=NE,
+        topk=topk,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        BM=BM,
+        device=device,
+        use_nt=p2["use_nt"],
+        cshuffle=p2.get("cshuffle", False),
+        inter_real=inter_real,
+    )
+
+    if out is not moe_out:
+        moe_out.copy_(out)
+    return moe_out
+
+
+@functools.lru_cache(maxsize=2048)
+def _mxfp4_scale_u8(scale):
+    """FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
+    same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
+    uint8, or None) unchanged."""
+    if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
+        return scale.view(torch.uint8)
+    return scale
 
 
 def _flydsl_v2_stage2_wrapper(
@@ -1341,13 +1705,6 @@ def _flydsl_v2_stage2_wrapper(
     max_sorted = inter_states.shape[0]
     n_sorted_padded = int(num_valid_ids[0].item())
 
-    def _u8(t):
-        return (
-            t.view(torch.uint8)
-            if t is not None and t.element_size() == 1 and t.dtype != torch.uint8
-            else t
-        )
-
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
     target = out
@@ -1358,10 +1715,10 @@ def _flydsl_v2_stage2_wrapper(
     else:
         out.zero_()
     mxfp4_moe_gemm2(
-        inter_sorted_quant=_u8(inter_states),
-        inter_sorted_shuffled_scale=_u8(a2_scale),
-        w2_u8=_u8(w2),
-        w2_scale_u8=_u8(w2_scale),
+        inter_sorted_quant=_mxfp4_scale_u8(inter_states),
+        inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
+        w2_u8=_mxfp4_scale_u8(w2),
+        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
         sorted_expert_ids=sorted_expert_ids,
         cumsum_tensor=num_valid_ids,
         sorted_token_ids=sorted_token_ids,
@@ -1736,10 +2093,10 @@ def get_2stage_cfgs(
             flat=cfg_flat,
             **route_bucket_metadata,
         )
-    is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
-    is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
-    is_flydsl2_v2 = bool(kernelName2) and kernelName2.startswith("flydslv2_")
-    is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
+    is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
+    is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
+    is_flydsl2_v2 = isinstance(kernelName2, str) and kernelName2.startswith("flydslv2_")
+    is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if (is_flydsl1 or is_flydsl2 or is_flydsl2_v2) and is_flydsl_available():
         enable_bias = (
@@ -2385,6 +2742,8 @@ def fused_moe_2stages(
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
     if metadata.skip_inter_quant and isinstance(a2, tuple):
+        a2, a2_scale = a2[0], a2[1]
+    elif m_indices is not None and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
