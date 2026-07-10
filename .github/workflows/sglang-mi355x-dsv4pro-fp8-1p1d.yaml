@@ -1,14 +1,8 @@
-name: SGLang MI355X DSV4Pro FP8 1P1D
+name: Nightly SGLang MI355X DSV4Pro FP8 1P1D
 
 on:
   schedule:
     - cron: "43 18 * * *"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths:
-      - ".github/workflows/sglang-mi355x-dsv4pro-fp8-1p1d.yaml"
-      - ".github/scripts/sglang_mi355x_disagg.py"
   workflow_dispatch:
     inputs:
       sglang_ref:
@@ -66,7 +60,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
