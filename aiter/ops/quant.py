@@ -1255,6 +1255,7 @@ def _rope_rotate_activation_fp4quant(
     rope_dim: int,
     group_size: int = 32,
     shuffle_scale: bool = True,
+    do_rotate_act: bool = True,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
     Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
@@ -1269,6 +1270,7 @@ def _rope_rotate_activation_bf16(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
+    do_rotate_act: bool = True,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
     ...
@@ -1286,6 +1288,7 @@ def _rope_rotate_activation_fp8quant(
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 128,
+    do_rotate_act: bool = True,
 ) -> None:
     """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
     fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
@@ -1304,6 +1307,7 @@ def rope_rotate_activation(
     scale: Optional[torch.Tensor] = None,
     group_size: Optional[int] = None,
     shuffle_scale: bool = True,
+    do_rotate_act: bool = True,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
@@ -1314,6 +1318,9 @@ def rope_rotate_activation(
       selects the dsv4 preshuffled scale layout.
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
+
+    When ``do_rotate_act`` is False, the Hadamard rotate is skipped and only
+    RoPE (plus any quantization) is applied.
     """
     if out.dtype == dtypes.fp4x2:
         assert scale is not None, "fp4 rope_rotate_activation requires `scale`"
@@ -1327,6 +1334,7 @@ def rope_rotate_activation(
             rope_dim,
             group_size=32 if group_size is None else group_size,
             shuffle_scale=shuffle_scale,
+            do_rotate_act=do_rotate_act,
         )
     elif out.dtype == dtypes.fp8:
         assert scale is not None, "fp8 rope_rotate_activation requires `scale`"
@@ -1339,9 +1347,12 @@ def rope_rotate_activation(
             positions,
             rope_dim,
             group_size=128 if group_size is None else group_size,
+            do_rotate_act=do_rotate_act,
         )
     else:
-        _rope_rotate_activation_bf16(out, input, cos, sin, positions, rope_dim)
+        _rope_rotate_activation_bf16(
+            out, input, cos, sin, positions, rope_dim, do_rotate_act=do_rotate_act
+        )
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)

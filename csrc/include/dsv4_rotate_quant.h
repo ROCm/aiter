@@ -26,7 +26,8 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                             const aiter_tensor_t& positions,
                                             int32_t rope_dim,
                                             int32_t group_size = 32,
-                                            bool shuffle_scale = true);
+                                            bool shuffle_scale = true,
+                                            bool do_rotate_act = true);
 
 // rope+hadamard, bf16/fp16 in-place (out shares dtype/stride with input).
 void rope_rotate_activation(aiter_tensor_t& out,
@@ -34,7 +35,8 @@ void rope_rotate_activation(aiter_tensor_t& out,
                             const aiter_tensor_t& cos,
                             const aiter_tensor_t& sin,
                             const aiter_tensor_t& positions,
-                            int32_t rope_dim);
+                            int32_t rope_dim,
+                            bool do_rotate_act = true);
 
 // rope+hadamard, then fp8-quantize: `out` is fp8 and `scale` receives
 // per-(row, 1xGROUP) fp32 scales ([m, dim/group_size]), matching
@@ -46,7 +48,8 @@ void rope_rotate_activation_fp8quant(aiter_tensor_t& out,
                                      const aiter_tensor_t& sin,
                                      const aiter_tensor_t& positions,
                                      int32_t rope_dim,
-                                     int32_t group_size = 128);
+                                     int32_t group_size = 128,
+                                     bool do_rotate_act = true);
 
 void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
                                                      aiter_tensor_t& scale,
