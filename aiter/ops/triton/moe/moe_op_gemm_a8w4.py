@@ -15,7 +15,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
     _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
-    get_moe_a8w4_prefill_layouts,
+    get_moe_a8w4_layouts,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
@@ -259,9 +259,6 @@ def get_ctas_per_cga(num_ctas, is_prefill):
 
 
 def get_gluon_a8w4_tile_m_scale(m):
-    """CGA M-shards for ``m`` matmul rows, to pass as ``tile_m_scale`` to
-    ``routing()``. ``m == num_tokens * n_expts_act`` in the standard gathered
-    flow. Returns 1 off the gluon path, so it is always safe to call."""
     if get_arch() != "gfx1250":
         return 1
     return get_ctas_per_cga(4, is_prefill=m >= 1024)[0]
@@ -272,8 +269,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_buffers = 3
-    ctas_per_cga = get_ctas_per_cga(4, is_prefill=m >= 1024)
-    num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
+    num_ctas = 4
+    ctas_per_cga = get_ctas_per_cga(num_ctas, is_prefill=m >= 1024)
     split_k = 1
     block_k = 512
 
@@ -498,6 +495,21 @@ def moe_gemm_a8w4(
         )
     # launch kernel
     if use_gluon and block_m == 16:
+        layouts = get_moe_a8w4_layouts(
+            num_warps=config["num_warps"],
+            BLOCK_M=config["block_m"],
+            BLOCK_N=config["block_n"],
+            BLOCK_K=config["block_k"],
+            ctas_per_cga=config["ctas_per_cga"],
+            ACTIVATION_REDUCTION_N=reduction_n_matmul,
+            PRESHUFFLED=preshuffled,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            is_x_microscaled=x_scales is not None,
+            has_quant_static_scale=quant_static_scale is not None,
+            apply_swiglu=apply_swiglu_matmul,
+            GatherIndx=gather_indx,
+            X_SCALE_TDM=X_SCALE_TDM,
+        )
         _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
             y.stride(1),
@@ -548,11 +560,13 @@ def moe_gemm_a8w4(
             CLAMP_BOUNDS=clamp_bounds,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
+            num_ctas=config["num_ctas"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
+            **layouts,
         )
     elif use_gluon:
-        layouts = get_moe_a8w4_prefill_layouts(
+        layouts = get_moe_a8w4_layouts(
             num_warps=config["num_warps"],
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
