@@ -238,11 +238,9 @@ template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S,
 template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
 template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
 
-// number of storage bytes needed to bit-pack N logical elements of pack type T
 template <typename T, index_t N> static constexpr index_t packed_bytes_v = index_t((index_t(sizeof_bits<T>::value) * N + 7) / 8);
 
 namespace impl {
-// cutlass-style read-write proxy for one sub-byte element inside a packed byte buffer.
 template<typename T>
 struct subbyte_reference {
     using storage = typename T::storage;
@@ -263,7 +261,6 @@ struct subbyte_reference {
         *ptr_ = storage((storage(*ptr_) & clr) | storage(item << (idx_ * bits)));
         return *this;
     }
-    // value-copy assignment (avoids the vector<bool> pitfall of rebinding ptr_/idx_)
     OPUS_H_D constexpr const subbyte_reference& operator=(const subbyte_reference& o) const { return *this = o.get(); }
 };
 template<typename T>
@@ -298,12 +295,8 @@ struct array {
     using const_reference = std::conditional_t<is_packed, impl::const_subbyte_reference<value_type>, const value_type&>;
 
     OPUS_H_D constexpr array() = default;
-    // plain types: brace-initialize content directly (needs only copy/move-construct, like the old
-    // aggregate -- crucially works for value types that are neither default-constructible nor assignable,
-    // e.g. opus::smem<T> used in array<smem<T>, N>).
     template<typename... Z, std::enable_if_t<!is_packs_v<value_type> && sizeof...(Z) == N && (std::is_convertible_v<Z, value_type> && ...), bool> = true>
     OPUS_H_D constexpr array(Z&&... zs) : content{ static_cast<value_type>(zs)... } {}
-    // pack types: pack N element values into the nibble buffer via the proxy
     template<typename... Z, std::enable_if_t<is_packs_v<value_type> && sizeof...(Z) == N && (std::is_convertible_v<Z, value_type> && ...), bool> = true>
     OPUS_H_D constexpr array(Z... zs) { index_t i = 0; ((void)((*this)[i++] = static_cast<value_type>(zs)), ...); }
 
@@ -816,11 +809,8 @@ template<typename Layout, index_t vec>
 inline constexpr auto layout_imm_offsets_v = layout_to_offsets<vec>(Layout{typename Layout::Shape{}, typename Layout::Stride{}, typename Layout::Coord{}});
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
-// ext_vector_type only accepts scalars, so for packs (is_packs_v) vector_t falls back to a packed struct (reusing the packed array); it is NOT a real HW vector.
 namespace impl {
 template <typename T, index_t N> struct packed_vec : opus::array<T, N> { using base = opus::array<T, N>; using base::base; };
-// native ext_vector for scalars; packed_vec for sub-byte packs. The ext_vector_type form is only
-// instantiated for the scalar (non-pack) case, so it is never formed on a pack struct type.
 template<typename V, index_t N, bool = is_packs_v<V>> struct vector_storage { using type = V __attribute__((ext_vector_type(N))); };
 template<typename V, index_t N> struct vector_storage<V, N, true> { using type = packed_vec<V, N>; };
 }
@@ -1274,7 +1264,6 @@ OPUS_CAST_DEFINE(fp32, fp32)
 OPUS_CAST_DEFINE(i8, fp32)
 OPUS_CAST_DEFINE(fp32, i8)
 
-// The packs machinery (dpacks/fpacks, is_packs_v, sizeof_bits, subbyte_reference, packed array/vector) is defined earlier so containers can pack; concrete types are declared below via OPUS_DEFINE_*.
 
 #define OPUS_DEFINE_DPACKS(name_, storage_, bits_, is_signed_) \
     struct name_ : opus::impl::dpacks<storage_, bits_, is_signed_> { using base = opus::impl::dpacks<storage_, bits_, is_signed_>; };  \
