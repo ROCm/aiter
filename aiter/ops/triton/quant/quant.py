@@ -18,6 +18,9 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _nvfp4_quant_op,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.gluon.quant_mxfp4 import _dynamic_mxfp4_quant_kernel_gluon_950
+from aiter.ops.triton.gluon.quant_mxfp4 import _dynamic_mxfp4_quant_kernel_gluon_1250
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
@@ -158,6 +161,8 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        use_gluon: Whether to use Gluon kernel (default: True). Only available on (gfx950/1250).
+                  Falls back to Triton kernel on other GPUs.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -208,27 +213,70 @@ def dynamic_mxfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
+    even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-    _dynamic_mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        blockscale_e8m0,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-        num_stages=1,
-    )
-
+    if use_gluon and (get_gfx() == "gfx950"):
+        _dynamic_mxfp4_quant_kernel_gluon_950[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+            num_stages=1,
+        )
+    elif use_gluon and (get_gfx() == "gfx1250"):
+        _dynamic_mxfp4_quant_kernel_gluon_1250[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+            num_stages=1,
+        )
+    else:
+        _dynamic_mxfp4_quant_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+        )
     return (x_fp4, blockscale_e8m0)
 
 
