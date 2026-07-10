@@ -3,48 +3,48 @@
         "BLOCK_M": 16,
         "BLOCK_N": 16,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 4,
-        "num_warps": 2,
+        "NUM_BUFFERS": 7,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_8": {
         "BLOCK_M": 16,
-        "BLOCK_N": 32,
+        "BLOCK_N": 16,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 4,
-        "num_warps": 2,
+        "NUM_BUFFERS": 7,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_16": {
         "BLOCK_M": 16,
-        "BLOCK_N": 32,
+        "BLOCK_N": 16,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 4,
-        "num_warps": 2,
+        "NUM_BUFFERS": 7,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_32": {
-        "BLOCK_M": 32,
-        "BLOCK_N": 32,
+        "BLOCK_M": 16,
+        "BLOCK_N": 16,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 4,
-        "num_warps": 4,
+        "NUM_BUFFERS": 7,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_64": {
         "BLOCK_M": 16,
-        "BLOCK_N": 32,
+        "BLOCK_N": 16,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 4,
-        "num_warps": 2,
+        "NUM_BUFFERS": 7,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_128": {
-        "BLOCK_M": 32,
-        "BLOCK_N": 32,
+        "BLOCK_M": 16,
+        "BLOCK_N": 16,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 4,
-        "num_warps": 4,
+        "NUM_BUFFERS": 7,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_512": {
