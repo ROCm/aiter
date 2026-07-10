@@ -411,9 +411,10 @@ def _moe_gemm_a8w4_decode(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -430,9 +431,10 @@ def _moe_gemm_a8w4_decode(
                 )
             else:
                 gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
+                    gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                    ),
                     offs_x_m,
-                    write_idx * MX_SCALE_BLOCK_K,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
         write_idx += 1
@@ -453,9 +455,10 @@ def _moe_gemm_a8w4_decode(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -472,9 +475,10 @@ def _moe_gemm_a8w4_decode(
                 )
             else:
                 gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
+                    gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                    ),
                     offs_x_m,
-                    write_idx * MX_SCALE_BLOCK_K,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
         write_idx += 1
@@ -966,9 +970,10 @@ def _moe_gemm_a8w4_prefill(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -991,9 +996,10 @@ def _moe_gemm_a8w4_prefill(
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_gather(
-                        x_scales_desc,
+                        gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                            x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                        ),
                         offs_x_m,
-                        write_idx * MX_SCALE_BLOCK_K,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
@@ -1056,9 +1062,10 @@ def _moe_gemm_a8w4_prefill(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -1081,9 +1088,10 @@ def _moe_gemm_a8w4_prefill(
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_gather(
-                        x_scales_desc,
+                        gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                            x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                        ),
                         offs_x_m,
-                        write_idx * MX_SCALE_BLOCK_K,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
