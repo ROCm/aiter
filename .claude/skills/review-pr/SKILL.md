@@ -91,15 +91,18 @@ _Answer:_
 
 Check which type(s) apply; these determine which Step 5 categories are mandatory.
 
-- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), A1 (sibling variants), D1 (atomic zero-init), HK6 (UT)
+- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), HK6 (UT)
+- [ ] **New constexpr / routing flag / new dtype or arch value added** → B4 (do ALL dispatch branches handle the new value, or assert on it?), C4 (new arch string literal?)
 - [ ] **Tuning config (CSV / YAML)** → D3 (hipblaslt), HK4 (kpack:1)
-- [ ] **Dispatch logic change** → B1 (silent bypass), B3 (string normalization), A3 (scope too broad)
+- [ ] **Dispatch logic change** → B1 (silent bypass), B3 (string normalization), B4 (new value unhandled?), A3 (scope too broad)
 - [ ] **Replaces existing kernel as default** → D2 (rollback env-var)
 - [ ] **Core file change** (see Tier table below) → full Step 4 risk assessment
 - [ ] **Refactor / rename** → HK2 (unrelated files), variable name mismatch check
 - [ ] **FP8 / quantization path** → C1 (fnuz by dtype), C2 (fp8_max hardcoded), D1 (atomic zero-init)
+- [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing)
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?)
 
 ---
 
@@ -225,16 +228,32 @@ Common non-aligned dims: `seqlen`, `vocab_size`, `hidden_dim`, `num_heads`, `hea
 Real example (PR#3981): raw string compare in `parallel_state.py` — alias callers missed torch-compile fast path.
 → `⚠️ B3: string dispatch [cond] without normalization — aliases fall through to slow path`
 
-**B4 — Over-conservative assert blocks valid shapes** ⚠️
-`assert M % tileM == 0` when the kernel pads internally and handles non-aligned M.
-Real example (PR#3998): wrapper asserted alignment; asm kernel padded — valid small-M shapes rejected.
-→ `⚠️ B4: assert [constraint] may be unnecessary — verify kernel handles non-aligned inputs`
+**B4 — New dispatch value not handled by all paths, no warning** ⚠️/🔴
+When a PR introduces a new routing value to a multi-way dispatch — a new dtype string (`'fp4'`), a new arch string (`'gfx1201'`), a new layout flag (`SWIGLU_INTERLEAVED`), a new constexpr enum value — every reachable dispatch branch must either (a) handle it explicitly, (b) fall through to a documented safe default, or (c) assert/warn before the wrong branch is reached. If any reachable branch silently falls through to behavior that is wrong for the new value, flag it.
+Severity: 🔴 if the wrong path produces incorrect output silently (wrong layout, wrong kernel, wrong scale). ⚠️ if the wrong path is a safe-but-suboptimal default (e.g., generic tile depths instead of tuned fp4 depths).
+Exception: an upstream assert/raise/isinstance check that prevents the bad value from entering the branch → not B4. A runtime assert that fires for the dangerous combo → not B4.
+FP self-check: Is the uncovered branch actually reachable with the new value? Is there a caller contract (documented or asserted) guaranteeing the bad combo never occurs?
+Real examples: GGUU flag not wired into gfx950 Triton path — runtime assert guards the explicitly dangerous combo but the remaining gap is silent (aiter#4169); fp4 silently falls through to `in_dtype in ('fp8','int8')` tile table, uses generic preload depths (aiter#3941); cross-attention + mt=1 on gfx1250 falls through to get_heuristic_kernel with no gfx1250 kernel compiled for that combo (aiter#3939).
+→ `🔴/⚠️ B4: [new value] reaches [branch] which assumes [old value] — [what wrong thing happens] — add assert or explicit handling`
 
 **B5 — Triton `tl.constexpr` safety check disabled without invariant proof** ⚠️
 A `tl.constexpr` bool that gates a validity check (e.g., `CHECK_NEG_ONE_SENTINEL`, `CHECK_BOUNDS`) can be set `False` by a caller to skip the check. If the invariant the check enforces is not independently guaranteed on that path, illegal memory access or silent wrong values result.
 Trigger: new `tl.constexpr` bool in a Triton kernel that disables a bounds/sentinel/validity check; caller comment says "X path can disable this" without documenting what guarantees the invariant holds on that path.
 Real example (ATOM#1498): `CHECK_NEG_ONE_SENTINEL=False` disables the -1 slot filter in the paged prefill kernel; illegal access if any -1 slot appears without the check.
 → `⚠️ B5: [constexpr] disables [check] — document which caller invariant guarantees no [invalid value] on that path`
+
+**B6 — Accepted parameter silently discarded** ⚠️ (🔴 if controls output correctness)
+Function accepts a parameter in its signature but the value is never used: discarded with `del param`, commented out, unreachable due to `or True` short-circuit, or passed to a callee that immediately discards it.
+Severity: 🔴 if the discarded parameter controls output correctness (e.g., `expert_mask`, `guidance_scale`, `q_scale`, `kv_scale`) — callers passing non-default values silently get wrong output. ⚠️ if it controls a performance knob or optional feature with a working default.
+Exception: method overrides where the base class signature requires the parameter but this subclass legitimately doesn't use it — flag as 📝 with a note that the discard is structural.
+Real examples: `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `use_opus` unreachable due to `or True` guard → torch fallback always fires regardless of GPU/arch; `gate_up` param silently discarded when `is_guinterleave=False` (aiter#4167); `v_scale` strides never computed — `sc_off` indexes v_scale_ptr using k_scale strides, producing wrong scale values on non-contiguous tensors (aiter#3959).
+→ `🔴/⚠️ B6: [param] accepted in [fn] signature but never used — callers passing non-default values silently have no effect`
+
+**B7 — Over-conservative assert blocks valid shapes** ⚠️
+`assert M % tileM == 0` when the kernel pads internally and handles non-aligned M.
+Real example (PR#3998): wrapper asserted alignment; asm kernel padded — valid small-M shapes rejected at the Python layer.
+FP self-check: Does the kernel actually handle non-aligned inputs, or does the assert reflect a real hardware requirement?
+→ `⚠️ B7: assert [constraint] may be unnecessary — verify kernel handles non-aligned inputs before removing`
 
 ---
 
@@ -258,6 +277,13 @@ Fixed `bf16`, `fp8_e8m0`, or similar in a forward path that handles multiple con
 Real examples: ATOM#1423 "not always bf16"; ATOM#1458 "hard code to fp8_e8m0?"
 → `⚠️ C3: dtype hardcoded to [type] — should derive from actual tensor/config`
 
+**C4 — New GPU arch string literal in dispatch condition** ⚠️
+**FP self-check first (do this before deciding to fire):** Search the unchanged lines of this file for the same arch string (e.g., `'gfx1250'`). If that string already appears on an unchanged line → **do not fire** (pre-existing style, not a new violation). Only proceed if the arch string is genuinely new to this file.
+Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx1250':`, `if 'gfx950' in arch_name:`), rather than routing through the central kernel registry or a named constant.
+Also exempt: arch strings used only in comments, docstrings, or directory path strings; arch strings imported from a central registry module.
+Real examples: `'gfx1250'` new to `fused_mxfp4_quant.py` dispatch logic where no prior arch literals existed (aiter#3937 → fire C4); `'gfx1201'` added to `unified_attention.py` where `'gfx1250'` was already on line 79 (aiter#3956 → skip, pre-existing style).
+→ `⚠️ C4: new arch string '[gfxNNNN]' hardcoded in dispatch — route through arch registry or named constant`
+
 ---
 
 ### D — Uninitialized / Boundary State
@@ -267,6 +293,7 @@ _"The code writes or reads memory that was never properly initialized."_
 `atomic_fmax(*ptr, val)` = `*ptr = max(*ptr, val)`. If `*ptr` is uninitialized (from `::empty()`),
 garbage dominates the max → corrupted amax → corrupted FP8 descale → silent wrong quantization.
 Trigger: `atomic_fmax` / `atomic_max` + `::empty()` or non-zeroed allocation near it.
+Severity: 🔴 for atomic accumulation (atomic_fmax, atomicAdd) — garbage propagates into every output element. ⚠️ for partial-sum buffers where a zero-weight coefficient mathematically cancels the contribution (e.g., online softmax with empty batch: `exp(-inf) × garbage = 0`); still flag because `0.0 × NaN = NaN` on IEEE hardware if the allocator returns dirty pages.
 Real example (PR#4015): yzhou103: "AiterTensor::empty does not zero-initialize... garbage in v_amax silently corrupts descale."
 → `🔴 D1: [buffer] passed to atomic_fmax not zero-initialized — use ::zero() not ::empty()`
 
@@ -307,6 +334,26 @@ Trigger: diff adds a new function decorated with `@compile_ops` or `torch.librar
 Python wrapper passes tensor to C++ / HIP kernel but doesn't assert `.is_contiguous()` or call `.contiguous()`. If the caller passes a strided tensor (slice, `.T`, output of non-contiguous `view()`), the kernel reads from wrong addresses — completely silent wrong result.
 Trigger: new Python wrapper that calls a `@compile_ops` or C-extension kernel; check that non-trivially-shaped inputs (anything other than a freshly allocated `torch.empty`) are either asserted contiguous or explicitly made contiguous before the call.
 → `⚠️ D8: [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
+
+**D9 — INT32 overflow in GPU pointer arithmetic** 🔴
+C++ kernel launcher or Python wrapper computes a buffer offset, record count, or index in `int32` (or Python `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
+Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
+Trigger: any arithmetic involving `token_id`, `seq_start`, `batch_offset`, or `total_tokens` that produces a buffer address or array index without an explicit widening to int64 before the multiply; or a TDM descriptor field that feeds into block offset computation without an explicit int32 cast.
+Real examples: `out_base = token_id * num_heads * head_dim` in int32 overflows at scale (PR#3844); forward kernel uses `Int32(seq_start) * Int32(K)` while the backward kernel correctly uses int64 (PR#4113).
+→ `🔴 D9: [expr] in int32 — widen [token_id / seq_start / total_tokens] to int64 before multiplying by [stride]`
+
+**D10 — FlyDSL compile result stored but never called** 🔴
+`flyc.compile(exe, *args)` on a cache-miss path compiles and stores the `CompiledFunction` object (`exe._cf = cf`) but does NOT call it — `cf(*args)` is absent. Every first-invocation of a new (shape, arch, dtype) combination silently no-ops the entire kernel launch and returns the uninitialized `torch.empty` output to the caller with no error.
+Trigger: a cache-miss branch in a `_run_compiled`-style function that calls `flyc.compile(...)` and then returns without executing the compiled result.
+Note: `flyc.compile()` ONLY compiles; it does NOT execute. The compiled result must be explicitly called with `cf(*args)` on the same branch. Do not confuse this with Triton's `@triton.jit` which auto-executes on first call.
+Real example (aiter#3987): `tensor_shim.py` — cold-start on any new shape returns garbage output; all `_launch()` call sites through `fused_moe_gfx942.py` inherit this behavior.
+→ `🔴 D10: [fn] compiles on cache-miss but does not call the result — add cf(*args) on the same branch`
+
+**D10b — FlyDSL arith.bitcast requires arith.unwrap() on operand** 🔴
+Inside a FlyDSL kernel, passing a raw DSL value directly to `arith.bitcast(val, target_type)` causes a type error at JIT-compile time — DSL values must be unwrapped with `arith.unwrap(val)` first. This fails silently in Python (no static type error) and only crashes at kernel JIT time when the shape/dtype combo is first encountered.
+Trigger: any `arith.bitcast(...)` call in a FlyDSL kernel where the first argument is a DSL expression (result of an arithmetic op, a load, or a `const_expr`) rather than a plain Python literal. Check: is `arith.unwrap(...)` wrapping the value?
+Real example (aiter#3944): `arith.bitcast(val, ...)` inside a bf16/f16 output path without `arith.unwrap()` — JIT type error on first invocation of that dtype branch.
+→ `🔴 D10b: [expr] passed to arith.bitcast without arith.unwrap() — wrap as arith.unwrap([expr]) first`
 
 ---
 
@@ -374,6 +421,12 @@ New attention / norm kernel tested only at full head count (TP=1 equivalent). At
 Trigger: new kernel taking `num_heads_q` / `num_heads_k`; PR test shows only one head count without a TP=4 or TP=8 variant.
 → `⚠️ P4: test covers only TP=1 head count — verify at num_heads÷TP=4 (e.g., [128→32])`
 
+**P5 — Benchmark timing excludes one-time setup cost** ⚠️
+Perf numbers exist but the timing window starts AFTER a one-time setup step whose cost is borne by real users on every cold start: weight shuffle/preshuffle, first-call JIT compile, hipMemsetAsync on large buffers, or precompile of variant kernels. Omitting this makes a net-regression look like a speedup.
+Trigger: PR description shows a speedup but the benchmark script (or description) shows timing begins after `shuffle_weight()`, after `warmup_iters`, or inside an already-warm JIT cache. Check: would a user deploying this op from scratch see the same number?
+Real examples: aiter#4166 — `shuffle_weight` excluded from timing, claimed 1.14x win is actually ~0.83x regression when included; aiter#3944 — FlyDSL precompile launches 7 dummy kernels on live stream at cold-start, benchmark captures only warm-cache latency.
+→ `⚠️ P5: timing window excludes [setup step] — re-run benchmark including [shuffle_weight / first-call JIT / precompile] to confirm net improvement`
+
 ---
 
 ### Housekeeping (quick scan)
@@ -390,7 +443,7 @@ Trigger: new kernel taking `num_heads_q` / `num_heads_k`; PR test shows only one
 | `develop=True` on new op | `@compile_ops(..., develop=True)` in added code | `⚠️ HK8: develop=True bypasses JIT cache — remove before op leaves experimental` |
 | Undocumented new env var | `os.environ.get("AITER_...` on a `+` line | `📝 HK9: new env var [NAME] not documented — add to README or known knobs list` |
 | Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ HK10: reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
-| New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep | `📝 HK11: new dependency [pkg] — justify why it's needed and add to requirements` |
+| New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 HK11: new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
 ---
 
@@ -458,22 +511,23 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 📝 [note]
 ```
 
-Each finding must have two parts:
+Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
-2. **Decision needed** — what the human reviewer needs to verify or ask for
+2. **Impact** — what goes wrong at runtime if this is not fixed (wrong output / crash / perf regression)
+3. **Action** — end with a verb phrase: "**Author must** [do X]" or "**Reviewer should ask** [Y]" — no verb = incomplete finding, do not include
 
 Do NOT use rule codes (P1, D4, A1…) in output — they are internal labels only.
 
 Examples of good findings:
-- `🔴 fused_qk_norm_rope_cache_quant.py:463 changes torch.zeros → torch.empty, but the old comment says "trailing pad must be zero for asm reader" and the new comment claims "never read" — direct contradiction. Author must cite the asm spec or a test proving padding is not read.`
-- `⚠️ PR claims fp8 latency is now 1.3–1.5x better, but description has only screenshots, no token/s numbers. Author must provide concrete benchmark data with units.`
-- `⚠️ Chunked indexer logic is copy-pasted verbatim into two Tier-2 files. Author must confirm correctness was verified independently in each file's context.`
-- `📝 No corresponding ATOM PR mentioned — who will call emit_bf16=True?`
+- `🔴 fused_qk_norm_rope_cache_quant.py:463 changes torch.zeros → torch.empty, but the old comment says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized output is corrupted. **Author must** cite the asm spec or a test proving padding is not read.`
+- `⚠️ PR claims fp8 latency is now 1.3–1.5x better, but the benchmark starts timing after shuffle_weight() completes — users pay that cost on every cold start. **Author must** re-run with shuffle_weight included in the timing window and confirm the result is still positive.`
+- `⚠️ Chunked indexer logic is copy-pasted verbatim into deepseek_v2.py and deepseek_v4.py. If v4's variable semantics differ, the formula silently produces wrong KV offsets for v4 callers. **Author must** confirm correctness was verified independently under v4's variable layout.`
+- `📝 No corresponding ATOM consumer PR mentioned. **Reviewer should ask** who will pass emit_bf16=True to activate this path.`
 
-Examples of bad findings (too vague, no action):
-- `⚠️ Missing perf numbers` — no decision, no action
+Examples of bad findings (too vague, no action verb):
+- `⚠️ Missing perf numbers` — no impact stated, no action
 - `🔴 D4 violation` — rule code means nothing to a reviewer
-- `📝 Check backbone files` — reviewer does not know what to do
+- `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion
 
 ---
 
