@@ -17,6 +17,7 @@ through this wrapper instead.
 
 from __future__ import annotations
 
+import collections
 import os
 
 import torch
@@ -27,6 +28,7 @@ from .kernels.mla_reduce import (
     _get_splitk_scratch,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
+    derive_actual_max_splits,
     plan_splitk_capture_safe,
     select_tier,
     should_use_persistent_launch,
@@ -123,6 +125,45 @@ def _out_dtype_str(dtype: torch.dtype) -> str:
     )
 
 
+# ---- actual_max_splits resolution (capture-safe, warmup-populated) ----------
+# actual_max_splits (true max_t(n_splits) over active tiles) gates two host-side
+# decisions that must be BAKED at CUDA-graph capture time: split-K engage/K
+# (plan_splitk_capture_safe) and the low-direct-pmap kernel variant. Deriving it
+# needs a device read (.item()), which is illegal under graph capture.
+#
+# The standard graph pattern is warmup(eager) -> capture -> replay. We derive the
+# true value on the eager/warmup pass (sync allowed) and cache it keyed by the
+# reduce_indptr BUFFER identity. Graph capture requires static input tensors, so
+# a bucket's reduce_indptr is a fixed buffer -- warmup and capture see the same
+# pointer, and capture reuses the warmup-derived value. A capture-time miss
+# returns None, which safely degrades to the num_kv_splits-gated legacy behavior
+# (correctness is unaffected: split-K is device-adaptive per tile). This mirrors
+# the opus-workspace warmup-then-capture idiom in aiter/tuned_gemm.py.
+_ACTUAL_MAX_SPLITS_CACHE: collections.OrderedDict = collections.OrderedDict()
+_ACTUAL_MAX_SPLITS_CACHE_CAP = 512
+
+
+def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:
+    """Capture-safe ``actual_max_splits``: derive+cache eager, reuse on capture.
+
+    Returns the true per-tile max split width for ``reduce_indptr``. On the
+    eager/warmup pass it reads the CSR (host sync) and caches by buffer identity;
+    under CUDA-graph capture it returns the cached warmup value (or ``None`` on a
+    miss, degrading to the ``num_kv_splits`` gate). Never syncs during capture.
+    """
+    key = (reduce_indptr.data_ptr(), int(reduce_indptr.numel()))
+    if torch.cuda.is_current_stream_capturing():
+        return _ACTUAL_MAX_SPLITS_CACHE.get(key)
+    val = derive_actual_max_splits(reduce_indptr)
+    cache = _ACTUAL_MAX_SPLITS_CACHE
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = val
+    if len(cache) > _ACTUAL_MAX_SPLITS_CACHE_CAP:
+        cache.popitem(last=False)
+    return val
+
+
 def flydsl_mla_reduce_v1(
     partial_output: torch.Tensor,  # fp32 [rows, H, Dv] contiguous
     partial_lse: torch.Tensor,  # fp32 [rows, H] contiguous
@@ -156,14 +197,24 @@ def flydsl_mla_reduce_v1(
             the host tier hint (guarded by :func:`_safe_host_tier`; see
             :func:`_host_tier_dispatch_enabled`). Default (flag off): unused -- the
             split count is read per-tile from the CSR map, grid from num_cu.
-        actual_max_splits: optional true ``max_t(n_splits)`` over active tiles
-            (from :func:`derive_actual_max_splits` at planning time). When set,
-            gates device-adaptive split-K engagement instead of the loose
-            ``num_kv_splits`` budget. ``None`` preserves legacy gate behavior.
+        actual_max_splits: optional explicit override of the true
+            ``max_t(n_splits)`` over active tiles. Normally left ``None``: the
+            wrapper auto-resolves it from ``reduce_indptr`` via
+            :func:`_resolve_actual_max_splits` (capture-safe warmup cache), so
+            callers (incl. ``mla_decode_fwd``) need not thread it. When set, the
+            explicit value is used as-is (tests / advanced callers). It gates
+            device-adaptive split-K engagement + the low-direct-pmap variant
+            instead of the loose ``num_kv_splits`` budget.
         stream: launch stream; defaults to the current stream of the device.
     """
     if reduce_indptr.numel() < 2:
         return
+
+    # Auto-resolve the split-K gate input when not explicitly overridden. Uses a
+    # warmup-populated cache so it stays correct AND capture-safe (no device sync
+    # under CUDA-graph capture); see _resolve_actual_max_splits.
+    if actual_max_splits is None:
+        actual_max_splits = _resolve_actual_max_splits(reduce_indptr)
 
     H = partial_output.size(-2)
     Dv = final_output.size(-1)

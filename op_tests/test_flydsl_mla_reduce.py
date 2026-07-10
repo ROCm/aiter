@@ -1134,27 +1134,74 @@ def test_metadata_gate_closes_over_provisioned_budget_edge():
     assert engage_legacy and not engage_gated
 
 
-def test_dispatch_forwards_actual_max_splits(monkeypatch):
-    """The mla.py reduce dispatch seam forwards actual_max_splits to the FlyDSL
-    kernel wrapper (the new plumbing added for phase 2)."""
+def test_dispatch_does_not_thread_actual_max_splits(monkeypatch):
+    """The mla.py reduce dispatch seam NO LONGER threads actual_max_splits: it is
+    dropped from mla_decode_fwd / _mla_reduce_v1_dispatch and auto-resolved inside
+    the FlyDSL wrapper from reduce_indptr (capture-safe warmup cache)."""
+    import inspect
+
     import aiter.mla as mla
     import aiter.ops.flydsl as flydsl
+
+    # Neither public seam exposes the arg anymore.
+    assert "actual_max_splits" not in inspect.signature(
+        mla._mla_reduce_v1_dispatch
+    ).parameters
+    assert "actual_max_splits" not in inspect.signature(
+        mla.mla_decode_fwd
+    ).parameters
 
     monkeypatch.setenv("AITER_MLA_REDUCE_FLYDSL", "1")
     mla._flydsl_mla_reduce_enabled.cache_clear()
     captured = {}
 
     def _capture(*args, **kwargs):
-        captured["actual_max_splits"] = kwargs.get("actual_max_splits")
+        captured["kwargs"] = kwargs
 
     monkeypatch.setattr(flydsl, "flydsl_mla_reduce_v1", _capture)
     try:
         mla._mla_reduce_v1_dispatch(
-            None, None, None, None, None, 1, 0, None, None, actual_max_splits=77
+            None, None, None, None, None, 1, 0, None, None
         )
     finally:
         mla._flydsl_mla_reduce_enabled.cache_clear()
-    assert captured["actual_max_splits"] == 77
+    # Seam forwards num_kv_splits but never actual_max_splits.
+    assert "actual_max_splits" not in captured["kwargs"]
+    assert captured["kwargs"].get("num_kv_splits") == 0
+
+
+def test_resolve_actual_max_splits_eager_and_capture():
+    """The warmup cache resolves the true max split eager, then serves the same
+    value under CUDA-graph capture (no device sync), and misses -> None."""
+    _require_cuda()
+    import torch
+
+    from aiter.ops.flydsl.mla_reduce_kernels import (
+        _ACTUAL_MAX_SPLITS_CACHE,
+        _resolve_actual_max_splits,
+    )
+    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
+
+    # CSR with per-tile widths {5, 8, 3} -> max 8.
+    indptr = torch.tensor([0, 5, 13, 16], dtype=torch.int32, device="cuda")
+    _ACTUAL_MAX_SPLITS_CACHE.clear()
+
+    eager = _resolve_actual_max_splits(indptr)
+    assert eager == derive_actual_max_splits(indptr) == 8
+
+    # Simulate capture: value served from cache (buffer identity), no sync.
+    key = (indptr.data_ptr(), int(indptr.numel()))
+    assert key in _ACTUAL_MAX_SPLITS_CACHE
+
+    # A never-seen buffer under capture -> miss -> None (safe degrade).
+    other = torch.tensor([0, 4, 4], dtype=torch.int32, device="cuda")
+    okey = (other.data_ptr(), int(other.numel()))
+    _ACTUAL_MAX_SPLITS_CACHE.pop(okey, None)
+    graph = torch.cuda.CUDAGraph()
+    side = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=side):
+        miss = _resolve_actual_max_splits(other)
+    assert miss is None
 
 
 # ---------------------------------------------------------------------------
