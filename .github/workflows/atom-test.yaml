@@ -129,7 +129,14 @@ jobs:
               # (MoE scratch buffers corrupted on gfx950 -> accuracy gate fail);
               # setting it here is a high-signal probe for on-chip memory-reuse
               # corruption in the CK-tile 2-stage MoE path.
-              "gpt-oss-120b": "AITER_CKTILE_DEBUG=1\nHSA_NO_SCRATCH_RECLAIM=1",
+              # AITER_CKTILE_TRACE=1 dumps a compact per-MoE-call fingerprint
+              # (layer input, router, stage1_out, stage2_out) to
+              # AITER_CKTILE_TRACE_FILE. Run this on the pass commit and the fail
+              # commit, then diff with compare_cktile_trace.py to find the first
+              # call (and which tensor) that diverges -> where garbage begins.
+              # NOTE: the pass commit must also carry the fused_moe.py trace hooks
+              # for its trace to be emitted.
+              "gpt-oss-120b": "AITER_CKTILE_DEBUG=1\nHSA_NO_SCRATCH_RECLAIM=1\nAITER_CKTILE_TRACE=1\nAITER_CKTILE_TRACE_FILE=/tmp/cktile_trace.jsonl",
           }
 
           # Extra CLI args appended (after the ATOM config's extraArgs) for
@@ -443,6 +450,8 @@ jobs:
           echo ""
           echo "========== Collecting ATOM server log =========="
           docker cp atom_aiter_test:/tmp/atom_server.log ./atom_server.log || true
+          echo "========== Collecting CK-Tile fingerprint trace =========="
+          docker cp atom_aiter_test:/tmp/cktile_trace.jsonl ./cktile_trace.jsonl || true
 
       - name: Check accuracy test results
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && success()
@@ -496,6 +505,15 @@ jobs:
         with:
           name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_accuracy_samples
           path: accuracy_test_results/**
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload CK-Tile fingerprint trace
+        if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_cktile_trace
+          path: cktile_trace.jsonl
           retention-days: 7
           if-no-files-found: warn
 

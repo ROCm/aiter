@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -460,6 +461,7 @@ def fused_moe_(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
+    _cktile_trace_moe_in(hidden_states, topk_ids, topk_weight)
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     assert w1.shape[1] in [
@@ -2650,6 +2652,101 @@ def _cktile_tensor_stats(name, t):
         return f"[CKTILE-DEBUG] {name} out <stats failed: {e}>"
 
 
+# ---------------------------------------------------------------------------
+# CK-Tile per-call fingerprint trace (AITER_CKTILE_TRACE).
+#
+# Goal: run the same workload on a known-good ("pass") commit and a suspect
+# ("fail") commit, dump one compact, content-sensitive fingerprint per MoE
+# call for the layer input (residual), the router output, and each GEMM stage,
+# then diff the two traces to find the FIRST call where the numbers diverge and
+# WHICH tensor diverged first. Unlike the min/max/absmax stats above, these
+# fingerprints include content-sensitive reductions (sum, sum-of-squares/L2),
+# so they can distinguish "wrong value, normal magnitude" corruption that the
+# plain stats are blind to.
+#
+# Enable with:  AITER_CKTILE_TRACE=1  AITER_CKTILE_TRACE_FILE=/path/trace.jsonl
+# Compare with: python compare_cktile_trace.py pass.jsonl fail.jsonl
+# ---------------------------------------------------------------------------
+_CKTILE_TRACE_SEQ = 0  # monotonic MoE-call counter (bumped at fused_moe_ entry)
+_CKTILE_TRACE_CUR = -1  # seq of the MoE call currently executing
+
+
+def _cktile_trace_enabled():
+    return os.environ.get("AITER_CKTILE_TRACE", "0") == "1"
+
+
+def _cktile_fingerprint(t):
+    """Compact, content-sensitive fingerprint of a tensor (fp64 reductions)."""
+    tf = t.detach().to(torch.float32)
+    finite = torch.isfinite(tf)
+    n_nan = int(torch.isnan(tf).sum().item())
+    n_inf = int(torch.isinf(tf).sum().item())
+    ff = tf[finite]
+    if ff.numel() > 0:
+        d = ff.to(torch.float64)
+        mean = float(d.mean().item())
+        absmax = float(ff.abs().max().item())
+        l2 = float(torch.sqrt((d * d).sum()).item())
+        s = float(d.sum().item())
+    else:
+        mean = absmax = l2 = s = float("nan")
+    return {
+        "shape": list(t.shape),
+        "numel": int(t.numel()),
+        "nan": n_nan,
+        "inf": n_inf,
+        "mean": mean,
+        "absmax": absmax,
+        "l2": l2,
+        "sum": s,
+    }
+
+
+def _cktile_trace_write(rec):
+    path = os.environ.get("AITER_CKTILE_TRACE_FILE", "")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def _cktile_trace_moe_in(hidden_states, topk_ids, topk_weight):
+    """Record the layer input (residual) + router output; opens a new seq."""
+    global _CKTILE_TRACE_SEQ, _CKTILE_TRACE_CUR
+    if not _cktile_trace_enabled():
+        return
+    _CKTILE_TRACE_SEQ += 1
+    _CKTILE_TRACE_CUR = _CKTILE_TRACE_SEQ
+    try:
+        rec = {
+            "seq": _CKTILE_TRACE_CUR,
+            "phase": "moe_in",
+            "M": int(topk_ids.shape[0]),
+            "topk": int(topk_ids.shape[1]),
+            "hidden": _cktile_fingerprint(hidden_states),
+            "topk_ids": _cktile_fingerprint(topk_ids),
+            "topk_weight": _cktile_fingerprint(topk_weight),
+        }
+        _cktile_trace_write(rec)
+    except Exception:
+        pass
+
+
+def _cktile_trace_stage(phase, t):
+    """Record a GEMM-stage output fingerprint under the current MoE seq."""
+    if not _cktile_trace_enabled():
+        return
+    try:
+        _cktile_trace_write(
+            {"seq": _CKTILE_TRACE_CUR, "phase": phase, "fp": _cktile_fingerprint(t)}
+        )
+    except Exception:
+        pass
+
+
 def cktile_moe_stage1(
     hidden_states,
     w1,
@@ -2821,6 +2918,7 @@ def cktile_moe_stage1(
             ),
             flush=True,
         )
+    _cktile_trace_stage("stage1_out", out)
     return out
 
 
@@ -2882,6 +2980,7 @@ def cktile_moe_stage2(
             ),
             flush=True,
         )
+    _cktile_trace_stage("stage2_out", out)
     return out
 
 
