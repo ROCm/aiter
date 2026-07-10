@@ -96,26 +96,35 @@ def parity_mask(context_lens, batch_size, next_n, max_model_len):
     ).unsqueeze(1)
 
 
-def build_inputs(batch_size, next_n, heads, index_dim, avg_kv_length, seed=0):
-    """Mirror the production paged benchmark's input builder (blocksize==1)."""
+def build_inputs(batch_size, next_n, heads, index_dim, kv_length, seed=0, var_ratio=0.0):
+    """Paged input builder (blocksize==1).
+
+    ``var_ratio`` controls the per-sequence context-length spread around
+    ``kv_length``: 0.0 gives an exact length (every sequence == kv_length), and
+    v>0 draws lengths uniformly from [(1-v)*kv_length, (1+v)*kv_length].
+    """
     torch.manual_seed(seed)
     random.seed(seed)
     fp8_dtype = get_fp8_e4m3_dtype()
 
-    max_model_len = 2 * avg_kv_length
+    max_model_len = 2 * kv_length
     blocksize = 1
     num_blocks = (max_model_len + blocksize - 1) // blocksize
 
-    var_ratio = 0.5
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int((1 + var_ratio) * avg_kv_length) + 1,
-            (batch_size,),
+    if var_ratio == 0.0:
+        context_lens = torch.full(
+            (batch_size,), kv_length, device="cuda", dtype=torch.int32
         )
-        .cuda()
-        .to(torch.int32)
-    )
+    else:
+        context_lens = (
+            torch.randint(
+                int((1 - var_ratio) * kv_length),
+                int((1 + var_ratio) * kv_length) + 1,
+                (batch_size,),
+            )
+            .cuda()
+            .to(torch.int32)
+        )
     # decode with MTP needs at least next_n tokens of context.
     context_lens = torch.clamp(context_lens, min=next_n)
 
@@ -166,7 +175,9 @@ def time_kernel(fn, repeats, num_iters):
     return statistics.median(us), min(us), max(us)
 
 
-def run_shape(batch_size, next_n, heads, index_dim, avg_kv_length, repeats, num_iters):
+def run_shape(
+    batch_size, next_n, heads, index_dim, kv_length, repeats, num_iters, var_ratio=0.0
+):
     (
         q,
         q_fp8,
@@ -176,7 +187,9 @@ def run_shape(batch_size, next_n, heads, index_dim, avg_kv_length, repeats, num_
         block_tables,
         max_model_len,
         fp8_dtype,
-    ) = build_inputs(batch_size, next_n, heads, index_dim, avg_kv_length)
+    ) = build_inputs(
+        batch_size, next_n, heads, index_dim, kv_length, var_ratio=var_ratio
+    )
 
     ref = ref_fp8_paged_mqa_logits(
         q, kv_cache_fp8, weights, context_lens, block_tables, max_model_len, fp8_dtype
@@ -247,7 +260,7 @@ def run_shape(batch_size, next_n, heads, index_dim, avg_kv_length, repeats, num_
         "grid": batch_size * next_n,
         "H": heads,
         "D": index_dim,
-        "avg_kv": avg_kv_length,
+        "avg_kv": kv_length,
         "ref_ms": ref_med / 1e3,
         "ref_min_ms": ref_min / 1e3,
         "ref_max_ms": ref_max / 1e3,
@@ -282,23 +295,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--num-iters", type=int, default=101)
+    parser.add_argument(
+        "--var-ratio",
+        type=float,
+        default=0.0,
+        help="Per-sequence context-length spread around kv_len. 0.0 = exact "
+        "(every sequence == kv_len); e.g. 0.5 draws lengths in [0.5, 1.5]*kv_len.",
+    )
     args = parser.parse_args()
 
     if get_gfx() not in ("gfx942", "gfx950"):
         print(f"unsupported gfx {get_gfx()}; skipping")
         return
 
+    len_mode = "exact" if args.var_ratio == 0.0 else f"uniform +/-{args.var_ratio:g}"
     print(f"# arch={get_gfx()} fp8={get_fp8_e4m3_dtype()} "
           f"repeats={args.repeats} num_iters={args.num_iters} "
-          f"ref_chunk_k={REF_CHUNK_K} ref_wave_per_eu={REF_WAVE_PER_EU}")
+          f"ref_chunk_k={REF_CHUNK_K} ref_wave_per_eu={REF_WAVE_PER_EU} "
+          f"ctx_len={len_mode} max_model_len=2*kv_len blocksize=1")
     header = (
-        "B nn grid H D avg_kv | ref_ms[min-max] fly_ms[min-max] fly/ref | "
+        "B nn grid H D kv_len | ref_ms[min-max] fly_ms[min-max] fly/ref | "
         "ref_diff fly_diff ref_mask fly_mask ref_pass fly_pass"
     )
     print(header)
     rows = []
-    for (B, nn, H, D, avg) in default_shapes():
-        r = run_shape(B, nn, H, D, avg, args.repeats, args.num_iters)
+    for (B, nn, H, D, kv_len) in default_shapes():
+        r = run_shape(
+            B, nn, H, D, kv_len, args.repeats, args.num_iters, var_ratio=args.var_ratio
+        )
         rows.append(r)
         print(
             f"{r['B']} {r['nn']} {r['grid']} {r['H']} {r['D']} {r['avg_kv']} | "
