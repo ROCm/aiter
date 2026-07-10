@@ -45,6 +45,10 @@ from aiter.ops.flydsl.moe_kernels import (  # noqa: E402
     pick_flydsl_stage2_tile_k,
 )
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4  # noqa: E402
+from aiter.ops.quant import (  # noqa: E402
+    mxfp4_moe_sort_fwd,
+    per_1x32_f8_scale_f8_quant,
+)
 from aiter.utility.fp4_utils import e8m0_shuffle  # noqa: E402
 
 _CUDA = torch.device("cuda")
@@ -745,6 +749,153 @@ def test_flydsl_a16wfp4_situv2_fused_moe(
     )
 
 
+# ---------------------------------------------------------------------------
+# Regression: a16w4 SiTUv2 end-to-end (stage1 -> stage2) over 128-multiple
+# inter_dim, both gate_modes, on the no-pad path (kernel resolves stage1 tile_n
+# for non-256). Numeric comparison vs torch_moe_stage1(situv2)->torch_moe_stage2.
+# Mirrors the a8w4 situv2 E2E guard for the bf16-activation weight path.
+# ---------------------------------------------------------------------------
+_A16W4_SITUV2_BETA = 2.0
+_A16W4_SITUV2_LINEAR_BETA = 1.5
+
+
+@_SKIP_GFX950_FLYDSL
+@pytest.mark.parametrize("gate_mode", ["separated", "interleave"])
+@pytest.mark.parametrize(
+    "inter_dim,seed",
+    [
+        pytest.param(128, 21, id="i128_non256"),
+        pytest.param(256, 22, id="i256_aligned"),
+        pytest.param(384, 23, id="i384_non256"),
+        pytest.param(512, 24, id="i512_aligned"),
+        pytest.param(640, 25, id="i640_non256"),
+    ],
+)
+def test_flydsl_e2e_a16wfp4_situv2(inter_dim, seed, gate_mode):
+    """a16w4 SiTUv2 E2E (stage1->stage2), numeric vs torch ref, both gate_modes.
+
+    Caller passes tile_n=256; the kernel resolves internally for non-256
+    inter_dim. Guards the non-256 tile_n path for the bf16-activation dtype.
+    """
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    torch.set_default_device("cuda")
+    token, model_dim, E, topk, block_m = 1024, 512, 8, 2, 32
+    beta, linear_beta = _A16W4_SITUV2_BETA, _A16W4_SITUV2_LINEAR_BETA
+    gu = gate_mode == "interleave"
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch_quant = aiter.get_torch_quant(Q_TYPE)
+
+    inp = torch.randn((token, model_dim), dtype=torch.bfloat16, device=_CUDA) / 8
+    w1 = (
+        torch.randn((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device=_CUDA)
+        / 8
+    )
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device=_CUDA) / 8
+    score = torch.randn((token, E), dtype=torch.bfloat16, device=_CUDA)
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, torch.bfloat16, block_m
+    )
+
+    w1_qt, w1_scale = torch_quant(w1, quant_dtype=Q_DTYPE_W)
+    w2_qt, w2_scale = torch_quant(w2, quant_dtype=Q_DTYPE_W)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+
+    ref1 = torch_moe_stage1(
+        inp,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=torch.bfloat16,
+        activation=ActivationType.Situv2,
+        quant_type=Q_TYPE,
+        a1_scale=None,
+        w1_scale=w1_scale,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+    )
+    ref2 = torch_moe_stage2(
+        ref1,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        dtype=torch.bfloat16,
+        quant_type=Q_TYPE,
+        w2_scale=w2_scale,
+        a2_scale=None,
+        doweight=True,
+    )
+
+    s1 = flydsl_moe_stage1(
+        a=inp,
+        w1=shuffle_weight_a16w4(w1_qt, 16, gu),
+        sorted_token_ids=sorted_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        topk=topk,
+        tile_m=32,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="bf16",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act="situv2",
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+        w1_scale=shuffle_scale_a16w4(w1_scale, E, gu),
+        a1_scale=None,
+        gate_mode=gate_mode,
+    )
+    torch.cuda.synchronize()
+    p1, md1, pc1 = _check_result(ref1, s1, pass_pct=90.0)
+    assert (
+        p1
+    ), f"a16wfp4_situv2_{gate_mode}_stage1_i{inter_dim} FAIL: max_delta={md1:.4f}, {pc1:.1f}%"
+
+    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+        s1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    a2_q = a2_q.view(token, topk, inter_dim)
+    a2_scale_sort = mxfp4_moe_sort_fwd(
+        a2_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        cols=inter_dim,
+    )
+    out = flydsl_moe_stage2(
+        inter_states=a2_q,
+        w2=shuffle_weight_a16w4(w2_qt, 16, False),
+        sorted_token_ids=sorted_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        topk=topk,
+        tile_m=32,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="atomic",
+        w2_scale=shuffle_scale_a16w4(w2_scale, E, False),
+        a2_scale=a2_scale_sort,
+        sorted_weights=sorted_weights,
+        inter_dim_pad=0,
+        model_dim_pad=0,
+    )
+    torch.cuda.synchronize()
+    p2, md2, pc2 = _check_result(ref2, out, pass_pct=90.0)
+    assert (
+        p2
+    ), f"a16wfp4_situv2_{gate_mode}_e2e_i{inter_dim} FAIL: max_delta={md2:.4f}, {pc2:.1f}%"
+
+
 _ACT_MAP = {"silu": ActivationType.Silu, "situv2": ActivationType.Situv2}
 
 
@@ -923,8 +1074,11 @@ def main():
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--linear-beta", type=float, default=1.0)
     parser.add_argument("--num-iters", type=int, default=50)
-    parser.add_argument( "--timing", type=str, default="cuda_event",
-        choices=["cuda_event", "device", "graph"]
+    parser.add_argument(
+        "--timing",
+        type=str,
+        default="cuda_event",
+        choices=["cuda_event", "device", "graph"],
     )
     args = parser.parse_args()
 

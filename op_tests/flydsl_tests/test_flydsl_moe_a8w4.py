@@ -238,7 +238,7 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
     _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
 
 
-@pytest.mark.parametrize("inter_dim", [640])
+@pytest.mark.parametrize("inter_dim", [256, 384, 640])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
@@ -621,3 +621,202 @@ def test_flydsl_situv2_a8w4_stage1_vec4(
     torch.cuda.synchronize()
     # ref is bf16 while out may be f16 (t32_sep_f16 case); compare in fp32.
     _check_close(data["ref_stage1"].float(), out.float(), label)
+
+
+# ---------------------------------------------------------------------------
+# Regression: a8w4 SiTUv2 end-to-end (stage1 -> stage2) numeric check, both
+# gate_modes, over 128-multiple inter_dim.
+#
+# Guards the non-256 inter_dim bug where stage1 tile_n was not downgraded for
+# a8w4 (fp8 x mxfp4) -> OOB on the N (gate/up) axis -> ~30% wrong final output
+# or GPU memfault at inter=384/640 (separated). The previous a8w4 suite only
+# exercised inter=640 in INTERLEAVE mode, which masked this. Here we compare the
+# FULL E2E output against the torch reference (not just NaN) across aligned
+# (256/512) and non-256 (128/384/640) inter_dim, in BOTH separated and
+# interleave gate_modes, on the no-pad path (kernel resolves tile_n internally).
+# ---------------------------------------------------------------------------
+def _generate_a8w4_situv2_e2e_data(
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    block_m,
+    *,
+    seed=11,
+    gate_mode="separated",
+    situ_beta=SITUV2_BETA,
+    situ_linear_beta=SITUV2_LINEAR_BETA,
+    dtype=torch.bfloat16,
+):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 4
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda") / 4
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda") / 4
+
+    topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = _make_routes(
+        inp, E, topk, block_m
+    )
+    sorted_weights = moe_sorting(topk_ids, topk_weights, E, model_dim, dtype, block_m)[
+        1
+    ]
+
+    a_q, a_scale = per_1x32_f8_scale_f8_quant(
+        inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+    ref1 = torch_moe_stage1(
+        a_q,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        activation=ActivationType.Situv2,
+        quant_type=Q_TYPE,
+        a1_scale=a_scale,
+        w1_scale=w1_scale,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    ref2 = torch_moe_stage2(
+        ref1,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        dtype=dtype,
+        quant_type=Q_TYPE,
+        w2_scale=w2_scale,
+        a2_scale=None,
+        doweight=True,
+    )
+
+    a_scale_sort = mxfp4_moe_sort_fwd(
+        a_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        cols=model_dim,
+    )
+    if gate_mode == "interleave":
+        w1_shuf = shuffle_weight(w1_q, (16, 16), is_guinterleave=True, gate_up=True)
+    else:
+        w1_shuf = shuffle_weight(w1_q, (16, 16))
+    return dict(
+        token=token,
+        inter_dim=inter_dim,
+        topk=topk,
+        a_q=a_q,
+        a_scale_sort=a_scale_sort,
+        w1_shuf=w1_shuf,
+        w1_scale_shuf=e8m0_shuffle(w1_scale),
+        w2_shuf=shuffle_weight_a16w4(w2_q, 16, False),
+        w2_scale_shuf=shuffle_scale_a16w4(w2_scale, E, False),
+        sorted_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        ref_stage1=ref1,
+        ref_stage2=ref2,
+    )
+
+
+# NOTE: gate_mode is SEPARATED only. a8w4 (fp8 activation) + SiTUv2 always maps
+# to separated in production (fused_moe routes SiTUv2 -> q_dtype_a=bf16=a16w4;
+# fp8-activation SiTUv2 only reachable via direct kernel calls, always separated).
+# a8w4 INTERLEAVE E2E is exercised via swiglu in test_flydsl_e2e_a8w4_gui
+# (inter=256/384/640). a16w4 SiTUv2 interleave E2E is covered in the a16wfp4 suite.
+@pytest.mark.parametrize("gate_mode", ["separated"])
+@pytest.mark.parametrize(
+    "inter_dim,seed",
+    [
+        pytest.param(128, 11, id="i128_non256"),
+        pytest.param(256, 12, id="i256_aligned"),
+        pytest.param(384, 13, id="i384_non256"),
+        pytest.param(512, 14, id="i512_aligned"),
+        pytest.param(640, 15, id="i640_non256"),
+    ],
+)
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
+    """a8w4 SiTUv2 E2E (stage1->stage2), numeric vs torch ref.
+
+    Caller passes tile_n=256; the kernel must internally downgrade for non-256
+    inter_dim. Regression guard for the a8w4 separated non-256 OOB bug.
+    """
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    torch.set_default_device("cuda")
+    token, model_dim, E, topk, block_m = 1024, 512, 8, 2, 32
+    d = _generate_a8w4_situv2_e2e_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=seed, gate_mode=gate_mode
+    )
+    topk = d["topk"]
+
+    s1 = flydsl_moe_stage1(
+        a=d["a_q"],
+        w1=d["w1_shuf"],
+        sorted_token_ids=d["sorted_ids"],
+        sorted_expert_ids=d["sorted_expert_ids"],
+        num_valid_ids=d["num_valid_ids"],
+        topk=topk,
+        tile_m=32,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        act="situv2",
+        situ_beta=SITUV2_BETA,
+        situ_linear_beta=SITUV2_LINEAR_BETA,
+        w1_scale=d["w1_scale_shuf"],
+        a1_scale=d["a_scale_sort"],
+        gate_mode=gate_mode,
+    )
+    torch.cuda.synchronize()
+    _check_close(
+        d["ref_stage1"].float(), s1.float(), f"situv2_{gate_mode}_stage1_i{inter_dim}"
+    )
+
+    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+        s1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    a2_q = a2_q.view(token, topk, inter_dim)
+    a2_scale_sort = mxfp4_moe_sort_fwd(
+        a2_scale,
+        sorted_ids=d["sorted_ids"],
+        num_valid_ids=d["num_valid_ids"],
+        token_num=token,
+        cols=inter_dim,
+    )
+    out = flydsl_moe_stage2(
+        inter_states=a2_q,
+        w2=d["w2_shuf"],
+        sorted_token_ids=d["sorted_ids"],
+        sorted_expert_ids=d["sorted_expert_ids"],
+        num_valid_ids=d["num_valid_ids"],
+        topk=topk,
+        tile_m=32,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="atomic",
+        w2_scale=d["w2_scale_shuf"],
+        a2_scale=a2_scale_sort,
+        sorted_weights=d["sorted_weights"],
+        inter_dim_pad=0,
+        model_dim_pad=0,
+    )
+    torch.cuda.synchronize()
+    _check_close(
+        d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
+    )

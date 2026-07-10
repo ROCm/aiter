@@ -1296,7 +1296,11 @@ def flydsl_moe_stage1(
 
     dev = a.device
     _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
-    if _is_a16w4:
+    # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
+    # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
+    # or memfault). Downgrade to a divisor (128). Applies to both a16w4
+    # (bf16 x mxfp4) and a8w4 (fp8 x mxfp4); a4w4 is unaffected.
+    if b_dtype in ("fp4", "mxfp4") and a_dtype in ("bf16", "fp8"):
         tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
