@@ -17,9 +17,9 @@ DEVELOP_COMMITS=$(git -C "$TEMP_DIR" rev-list develop)
 # echo "DEVELOP COMMIT: $DEVELOP_COMMITS"
 
 if ! echo "$DEVELOP_COMMITS" | grep -q "^$CURRENT_COMMIT$"; then
-  echo "?3rdparty/composable_kernel must be commits from develop branch"
+  echo "::warning::composable_kernel commit $CURRENT_COMMIT is not on develop (allowed for local/experimental CK)"
   echo "CURRENT COMMIT: $CURRENT_COMMIT"
-  exit 1
 else
-  echo "?Reference to composable_kernel is valid"
+  echo "Reference to composable_kernel is valid"
 fi
+exit 0

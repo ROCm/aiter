@@ -130,7 +130,8 @@ jobs:
               # setting it here is a high-signal probe for on-chip memory-reuse
               # corruption in the CK-tile 2-stage MoE path.
               # AITER_CKTILE_TRACE=1 dumps a compact per-MoE-call fingerprint
-              # (layer input, router, stage1_out, stage2_out) to
+              # (layer input `hidden`, router, stage1_out/stage2_out for the CK
+              # decode path, and `moe_out` for EVERY call incl. prefill FlyDSL) to
               # AITER_CKTILE_TRACE_FILE. Run this on the pass commit and the fail
               # commit, then diff with compare_cktile_trace.py to find the first
               # call (and which tensor) that diverges -> where garbage begins.

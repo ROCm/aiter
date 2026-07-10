@@ -89,11 +89,15 @@ def fp_diff(fa, fb, rtol):
 
 # Order matters: report the earliest tensor in the dataflow that diverged.
 FIELD_ORDER = [
-    ("hidden", "layer input residual  => UPSTREAM of this MoE"),
+    (
+        "hidden",
+        "layer input residual  => UPSTREAM of this MoE (attn/norm/embed/convert)",
+    ),
     ("topk_ids", "router expert ids     => ROUTING"),
     ("topk_weight", "router weights        => ROUTING"),
-    ("stage1_out", "gemm1 up/gate+SwiGLU  => STAGE 1"),
-    ("stage2_out", "gemm2 down-proj       => STAGE 2"),
+    ("stage1_out", "gemm1 up/gate+SwiGLU  => STAGE 1 (CK decode only)"),
+    ("stage2_out", "gemm2 down-proj       => STAGE 2 (CK decode only)"),
+    ("moe_out", "MoE output            => MoE COMPUTE (prefill FlyDSL or decode CK)"),
 ]
 
 

@@ -552,6 +552,7 @@ def fused_moe_(
             )
 
     if grouped_a8w4_out is not None:
+        _cktile_trace_stage("moe_out", grouped_a8w4_out)
         return grouped_a8w4_out
 
     metadata = get_2stage_cfgs(
@@ -649,9 +650,11 @@ def fused_moe_(
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
-        return _stage1_call()
+        _moe_result = _stage1_call()
+        _cktile_trace_stage("moe_out", _moe_result)
+        return _moe_result
     else:
-        return fused_moe_2stages(
+        _moe_result = fused_moe_2stages(
             hidden_states,
             w1,
             w2,
@@ -685,6 +688,8 @@ def fused_moe_(
             gate_mode=gate_mode,
             expert_mask=expert_mask,
         )
+        _cktile_trace_stage("moe_out", _moe_result)
+        return _moe_result
 
 
 def fused_moe_1stage(
@@ -2675,6 +2680,16 @@ def _cktile_trace_enabled():
     return os.environ.get("AITER_CKTILE_TRACE", "0") == "1"
 
 
+def _cktile_trace_capped():
+    """True once we've recorded enough seqs; keeps the CI trace file small.
+
+    We only need the first forward pass (prefill = token 1) plus a few decode
+    steps to localize the first divergence, so stop after AITER_CKTILE_TRACE_MAX_SEQ
+    MoE calls (default 200; set 0 to disable the cap)."""
+    cap = int(os.environ.get("AITER_CKTILE_TRACE_MAX_SEQ", "200"))
+    return cap > 0 and _CKTILE_TRACE_SEQ > cap
+
+
 def _cktile_fingerprint(t):
     """Compact, content-sensitive fingerprint of a tensor (fp64 reductions)."""
     tf = t.detach().to(torch.float32)
@@ -2716,7 +2731,7 @@ def _cktile_trace_write(rec):
 def _cktile_trace_moe_in(hidden_states, topk_ids, topk_weight):
     """Record the layer input (residual) + router output; opens a new seq."""
     global _CKTILE_TRACE_SEQ, _CKTILE_TRACE_CUR
-    if not _cktile_trace_enabled():
+    if not _cktile_trace_enabled() or _cktile_trace_capped():
         return
     _CKTILE_TRACE_SEQ += 1
     _CKTILE_TRACE_CUR = _CKTILE_TRACE_SEQ
@@ -2737,7 +2752,7 @@ def _cktile_trace_moe_in(hidden_states, topk_ids, topk_weight):
 
 def _cktile_trace_stage(phase, t):
     """Record a GEMM-stage output fingerprint under the current MoE seq."""
-    if not _cktile_trace_enabled():
+    if not _cktile_trace_enabled() or _cktile_trace_capped():
         return
     try:
         _cktile_trace_write(
