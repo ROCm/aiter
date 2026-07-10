@@ -23,6 +23,7 @@
 import os
 import math
 from functools import lru_cache
+from typing import Optional
 
 import torch
 import triton
@@ -34,6 +35,7 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
@@ -189,9 +191,11 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     max_model_len: int,
     ChunkQ: int = 64,
     ChunkK: int = 256,
-    TotalCuCount: int = 80,
+    TotalCuCount: Optional[int] = None,
     WavePerEU: int = 2,
 ):
+    if TotalCuCount is None:
+        TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
 
@@ -296,6 +300,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "stride_out_batch": "i32",
         "max_model_len": "i32",
         "max_block_len": "i32",
+        "num_block": "i32",
     }
     if VarCtxOpt:
         fn_signature["safe_chunks_per_cta_ptr"] = "*i32"
@@ -313,8 +318,9 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["ARCH"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
+    effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
     options = {
-        "num_warps": 4,
+        "num_warps": effective_num_warps,
         "waves_per_eu": effective_wave_per_eu,
         "num_stages": 2,
         "num_ctas": 1,
@@ -408,9 +414,11 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     context_lens: torch.Tensor,
     max_model_len: int,
     ChunkK: int = 256,
-    TotalCuCount: int = 80 if get_gfx() == "gfx942" else 256,
+    TotalCuCount: Optional[int] = None,
     WavePerEU: int = 2,
 ):
+    if TotalCuCount is None:
+        TotalCuCount = get_num_sms()
     assert batch_size < TotalCuCount * WavePerEU // next_n
 
     max_chunks = math.ceil(max_model_len / ChunkK)
@@ -448,19 +456,30 @@ def deepgemm_fp8_paged_mqa_logits(
     Preshuffle: bool = False,
     KVBlockSize: int = 1,
     ChunkK: int = 256,
-    TotalCuCount: int = 80 if get_gfx() == "gfx942" else 256,
+    TotalCuCount: Optional[int] = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
 ):
+    if TotalCuCount is None:
+        TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
-    num_block, block_Size, _, index_dim = kv_cache.size()
+    _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
 
-    if get_gfx() == "gfx1250" and not Preshuffle:
-        WavePerEU = 1
+    if get_gfx() == "gfx1250":
+        if Preshuffle and hidden_dim <= 128:
+            WavePerEU = 4
+        else:
+            WavePerEU = 1
 
     TileQCount = batch_size * next_n
-    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
+    SplitKV = (
+        (max(1, TotalCuCount // TileQCount) + 4)
+        // 5
+        * 5
+        * WavePerEU
+        * (2 if get_gfx() == "gfx1250" else 1)
+    )
 
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
@@ -470,6 +489,7 @@ def deepgemm_fp8_paged_mqa_logits(
         ), f"Preshuffle mode only supports KVBlockSize aligned to 16. Got KVBlockSize={KVBlockSize}"
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
+    num_block = kv_cache.shape[0]
     kv_cache_fp8, kv_cache_scale = (
         kv_cache[..., : KVBlockSize * hidden_dim],
         kv_cache[..., KVBlockSize * hidden_dim :],
@@ -526,6 +546,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 out_logits.stride(0),
                 max_model_len,
                 max_block_len,
+                num_block,
                 SplitKV if not VarCtxOpt else VarCtxSchedule,
                 # constexpr
                 heads,

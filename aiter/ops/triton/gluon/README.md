@@ -22,10 +22,20 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>TBD</td><td>—</td><td>TBD</td>
 </tr>
 <tr>
-  <td rowspan="4"><code>mla_decode_gluon</code></td><td rowspan="4">MLA<br>Decode</td><td rowspan="4">CDNA4</td>
-  <td nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
+  <td><code>gemm_a8w8_blockscale</code></td><td>GEMM<br>(block-scale)</td><td>CDNA4</td>
+  <td nowrap>A/B: fp8_e4m3 (mfma_scaled)<br>Out: bf16/fp16<br>Per-tile scales:<br>A [M, K/GROUP_K],<br>B [N/GROUP_N, K/GROUP_K]<br>BLOCK_K=128, NUM_WARPS=4<br>(BM,BN) &isin; {(64,128),<br>(128,128),(128,256)}</td>
+  <td>python op_tests/op_benchmarks/<br>triton/bench_gemm_a8w8_<br>blockscale.py -gluon</td>
+  <td>~1271<br>TFLOPS<br>(4Kx4Kx4K)</td><td>—</td><td>TBD</td>
+</tr>
+<tr>
+  <td rowspan="5"><code>mla_gluon</code></td><td rowspan="5">MLA</td><td rowspan="5">CDNA4</td>
+  <td rowspan="2" nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
   <td>python op_tests/test_mla.py \<br>-c 16384 -b 64 128 \<br>-n 64,1 128,1 \<br>-d bf16 -kvd bf16</td>
   <td>~563<br>TFLOPS</td><td>~477<br>TFLOPS</td><td>—</td>
+</tr>
+<tr>
+  <td>python op_tests/op_benchmarks/<br>triton/bench_sparse_attention_dsv4.py \<br>--prefill_cfgs 4096,128,4096,1024<br>(sparse prefill)</td>
+  <td>~507<br>TFLOPS</td><td>—</td><td>—</td>
 </tr>
 <tr>
   <td nowrap>(bh16bn128)<br>Q: bf16, KV: fp8, Out: bf16<br>batch_size = 1<br>nhead &le; 16<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=128</td>
@@ -72,13 +82,84 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 
 ---
 
+### `gemm_a8w8_blockscale.py` — FP8 GEMM with block-scale quantization
+
+**Function:** `gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=bf16, y=None, config=None)`
+
+**Description:** Y = X &times; W^T where X and W are fp8_e4m3 and each carries
+per-tile (block) fp32 scales — X by `[M, ceil(K/GROUP_K)]` and W by
+`[ceil(N/GROUP_N), ceil(K/GROUP_K)]`. The inner instruction is
+`gl.amd.cdna4.mfma_scaled` (CDNA4 V_MFMA_SCALE_F32_*) which folds both scales
+into the dot product. The kernel pipelines two independent async-copy streams
+— A/B operands and the per-tile scales — through `NUM_STAGES`-deep LDS
+multi-buffers; pipelining scales separately is the main perf delta vs. the
+equivalent Triton kernel.
+
+**Pipeline.** Three things are in flight on every main-loop iter `k`:
+
+| Stream | Operation | K-tile index |
+|--------|-----------|--------------|
+| global -> LDS | prefetch A, B (`async_copy.buffer_load_to_shared`) | `k + 2` |
+| global -> LDS | prefetch a_scale, b_scale (separate stream) | `k + 1` |
+| LDS -> regs | load operands into mfma dot layouts (becomes next iter's `prev_*`) | `k + 1` |
+| LDS -> regs | load scales (broadcast across MFMA lanes) | `k` |
+| compute | `mfma_scaled` on `prev_a / prev_b` (LDS-read in iter `k - 1`) | `k` |
+| compute | scale-accumulate `acc += mfma_out * a_scale * b_scale` | `k` |
+
+The body of the loop is hard-coded as `EVEN_K=True` so the compiler drops the
+K-mask branch from the hot path. A `commit_group()` is issued *before* the
+LDS reads / MFMA so the backend can hoist `buffer_load_to_shared` up past
+the `ds_read_b128` + `v_mfma_*`; deferring the commit serializes the global
+load behind compute and tanks throughput.
+
+A statically-unrolled wind-down (1 iter when `EVEN_K`, 2 iters when not — the
+extra iter covers the boundary-masked last tile) drains the pipe. The unroll
+is what kills the `prev_a / prev_b` PHI node that would otherwise force the
+dot operands out of AGPRs in the hot loop. Runtime `num_k_iter > N` guards
+make the wind-down a no-op for small-K shapes so only the Final iter runs.
+
+**Parameters**
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) only |
+| A / B dtype | fp8_e4m3 |
+| Output | bf16 (default), fp16 |
+| Scales | fp32 |
+| Scale tile | `GROUP_K`, `GROUP_N` (powers of two, inferred from `w_scale.shape`) |
+| Tile shapes | `(BLOCK_SIZE_M, BLOCK_SIZE_N)` &isin; `{(64,128), (128,128), (128,256)}` |
+| Baked-in | `BLOCK_SIZE_K = 128`, `NUM_WARPS = 4`, MFMA `16&times;16&times;128` |
+| SplitK | `NUM_KSPLIT` (separate reduce kernel `_gemm_a8w8_blockscale_reduce_kernel`) |
+| Tunable | `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `GROUP_SIZE_M`, `NUM_KSPLIT`, `NUM_STAGES`, `NUM_XCDS` |
+| Config | `$AITER_TRITON_CONFIGS_PATH/gemm/gluon/gfx950-GEMM-A8W8_BLOCKSCALE[-N=*-K=*].json` |
+
+**Perf** (MI350, `-gluon` flag selects this kernel; vs. the in-tree Triton kernel):
+
+```
+python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
+```
+
+| M | N | K | Gluon TFLOPS | Triton TFLOPS | Speedup |
+|---|---|---|--------------|---------------|---------|
+| 128   | 1280 | 8192 | 100.6  | 51.1   | 1.97&times; |
+| 2048  | 1280 | 8192 | 677.3  | 341.7  | 1.98&times; |
+| 4096  | 1280 | 8192 | 863.5  | 670.9  | 1.29&times; |
+| 8192  | 1280 | 8192 | 887.1  | 683.1  | 1.30&times; |
+| 16384 | 1280 | 8192 | 1164.9 | 899.0  | 1.30&times; |
+| 4096  | 4096 | 4096 | 1271.4 | 1013.2 | 1.26&times; |
+| 4096  | 4096 | 4160 | 1076.1 | 862.7  | 1.25&times; |
+
+(Small-M shapes where the kernel is launch- / occupancy-bound — e.g. `M=192` and `M=512` at `N=1280, K=8192` — are currently slower than Triton; tuning continues.)
+
+---
+
 ## Attention Kernels
 
-### `mla_decode_gluon.py` — MLA Decode
+### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
-**Function:** `mla_decode_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
+**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
 
-**Description:** Multi-head Latent Attention (DeepSeek MLA) decode kernel with split-KV. Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
+**Description:** Multi-head Latent Attention (DeepSeek MLA) kernel with split-KV. For MLA Decode, Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). For DSv4 Sparse Prefill, Q packs compressed latent and positional encoding into one contiguous row (448 NoPE + 64 RoPE, `q_nope` with shape `[nquery, nhead, 512]`), KV cache has aligned `head_dim=512`, `q_pe` and `k_pe` can be left as placeholders. Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
 
 The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
 
@@ -86,7 +167,7 @@ The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time reg
 - **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
 - **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
 
-All three regimes run the full decode. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_decode_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 

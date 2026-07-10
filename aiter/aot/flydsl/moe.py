@@ -27,6 +27,7 @@ import csv
 import os
 import sys
 import time
+from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -34,11 +35,12 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
-    _ptr_view_safe,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -47,6 +49,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    runtime_swiglu_limit,
 )
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -54,22 +57,6 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
-
-
-def _parse_optional_float(value, source: str) -> float | None:
-    if value is None:
-        return None
-    value = str(value).strip()
-    if value == "":
-        return None
-    try:
-        return float(value)
-    except ValueError as e:
-        raise ValueError(f"{source} must be a float, got {value!r}") from e
-
-
-def _row_swiglu_limit(row: dict[str, str]) -> float:
-    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
 def parse_csv(csv_path: str):
@@ -105,7 +92,6 @@ def parse_csv(csv_path: str):
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
-            swiglu_limit = _row_swiglu_limit(row)
             # Cover both runtime bias choices for fp4-weight MoE. Model configs
             # share kernel families, and runtime bias selection can vary by
             # activation dtype/model semantics.
@@ -125,6 +111,29 @@ def parse_csv(csv_path: str):
                 else None
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
+
+            # cktile_ stage1 runs a FlyDSL post-activation epilogue (silu ->
+            # silu_and_mul_fq, swiglu -> swiglu_and_mul) that the flydsl_-only loop
+            # below skips, so emit its job here. The cache key needs only
+            # (inter_dim, topk)/(inter_dim), which the CSV shape covers regardless
+            # of runtime split_k.
+            if stage1_name.startswith("cktile_"):
+                epi_job = {
+                    "kernel_name": f"cktile_epilogue_{act}",
+                    "stage": "epilogue",
+                    "act": act,
+                    "inter_dim": inter_dim,
+                    "topk": topk,
+                    "cu_num": cu_num,
+                    # Not used by the epilogue compile; zeroed so dedup keys on
+                    # (act, inter_dim, topk, cu_num) only.
+                    "model_dim": 0,
+                    "experts": 0,
+                }
+                key = job_identity(epi_job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(epi_job)
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -149,7 +158,6 @@ def parse_csv(csv_path: str):
                         "enable_bias": enable_bias,
                         "token_num": token,
                         "block_m": block_m,
-                        "swiglu_limit": swiglu_limit,
                     }
                     # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
                     # this changes the shape of a2_scale (sorted scale buffer
@@ -186,7 +194,14 @@ def _precompile_to_cache(
     out_dtype: str = "bf16",
     act: str = "silu",
     doweight_stage1: bool = False,
-    waves_per_eu: int = 3,
+    # Must match the runtime default of ``compile_mixed_moe_gemm2`` /
+    # ``compile_mixed_moe_gemm1`` (``Optional[int] = None``). A scalar default
+    # (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with
+    # the runtime-side tuple for any legacy kernel that does not explicitly
+    # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
+    # production-variant ``_persist_async_w4_cumul3`` does), causing
+    # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
+    waves_per_eu: Optional[int] = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -200,7 +215,12 @@ def _precompile_to_cache(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
-    swiglu_limit: float = 0.0,
+    k_wave: int = 1,
+    # Stage2-only kernel tuning knobs (registered by the production-variant
+    # entries in `get_flydsl_stage2_kernels`). Forwarded into
+    # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -218,7 +238,7 @@ def _precompile_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    is_fp4_weight = b_dtype == "fp4"
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
@@ -286,7 +306,7 @@ def _precompile_to_cache(
 
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             if is_int4_weight:
                 # a16wi4: bf16 activations, int4 weights — no activation scale.
                 return None
@@ -323,7 +343,7 @@ def _precompile_to_cache(
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             return None
         if stage1_fuse_quant in ("fp4", "fp8"):
             # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
@@ -341,7 +361,7 @@ def _precompile_to_cache(
                 _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
             )
         if a_dtype == "fp8":
-            if act == "silu" and swiglu_limit == 0.0:
+            if act == "silu":
                 # fused_moe_2stages uses fused_quant_fp8_sort for this path.
                 rows = (max_num_tokens_padded + 31) // 32 * 32
                 cols = (inter_dim + 31) // 32
@@ -441,7 +461,7 @@ def _precompile_to_cache(
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
             elif is_int4_weight:
                 # a16wi4: bf16 groupwise scale over (E, K//32, N).
@@ -478,7 +498,7 @@ def _precompile_to_cache(
             _grid_y = min(max_num_m_blocks, tokens * topk)
             _kernel_out = tmp_out if _is_splitk else out
             kernel_bias = None if _is_splitk else bias
-            _n_in = inter_dim * 2 if is_fp4_weight else inter_dim
+            _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
             _k_in = model_dim
 
             scale_cols = inter_dim // 32
@@ -491,7 +511,7 @@ def _precompile_to_cache(
                 else torch.empty(0, dtype=torch.uint8, device=dev)
             )
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s1_args_fp4(
                     _kernel_out.view(-1),
                     a.view(-1),
@@ -514,6 +534,7 @@ def _precompile_to_cache(
                         else torch.empty(0, device=dev)
                     ),
                     stream=0,
+                    swiglu_limit=runtime_swiglu_limit(None, act),
                 )
             else:
                 args = _s1_args_std(
@@ -554,7 +575,7 @@ def _precompile_to_cache(
                 enable_bias=(kernel_bias is not None),
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
-                swiglu_limit=swiglu_limit,
+                k_wave=k_wave,
             )
             _run_compiled(exe, args)
 
@@ -575,7 +596,6 @@ def _precompile_to_cache(
                     gui_layout=gui_layout,
                     act=act,
                     enable_bias=False,
-                    swiglu_limit=swiglu_limit,
                 )
                 _run_compiled(
                     silu_fused,
@@ -589,6 +609,7 @@ def _precompile_to_cache(
                         _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
+                        runtime_swiglu_limit(None, act),
                         0,
                     ),
                 )
@@ -604,7 +625,7 @@ def _precompile_to_cache(
             w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
 
             a2_scale = _make_a2_scale_for_stage2()
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
             elif is_int4_weight:
                 w2_scale = torch.zeros(
@@ -669,7 +690,7 @@ def _precompile_to_cache(
             _n_in = model_dim
             _k_in = inter_dim
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s2_args_fp4(
                     target,
                     a,
@@ -721,11 +742,96 @@ def _precompile_to_cache(
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
+                waves_per_eu=waves_per_eu,
+                use_async_copy=use_async_copy,
+                cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
+
+            # Reduce mode (accumulate=False) runs a separate topk reduction
+            # kernel inside the runtime stage2 wrapper. Precompile it via the
+            # same shared helper the runtime uses so the cache key matches.
+            # Single-GPU path uses use_mask=False (plain); EP/masked reduction
+            # is a multi-GPU path (separately gated) and not covered here.
+            if not accumulate:
+                from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+                _run_moe_reduction(
+                    target,
+                    out,
+                    tokens,
+                    topk,
+                    model_dim,
+                    expert_mask=None,
+                    topk_ids=None,
+                    stream=0,
+                )
+
+
+def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
+    """Precompile the CK-Tile split-K post-activation epilogue kernel.
+
+    cktile_moe_stage1 with split_k>1 emits a workspace of interleaved gate/up
+    output and then runs a FlyDSL epilogue to apply the activation:
+      silu  -> flydsl_silu_and_mul_interleaved (silu_and_mul_fq with
+               quant_mode="none", gui_layout=True)
+      swiglu -> flydsl_swiglu_and_mul_interleaved (swiglu_and_mul)
+    Dispatch through the same runtime builders so the cache key matches; the
+    key depends only on inter_dim (swiglu) / (inter_dim, topk) (silu), and the
+    row/token dims are dynamic, so dummy buffers suffice.
+    """
+    import torch
+
+    from aiter.ops.flydsl.moe_kernels import (
+        _get_compiled_silu_fused,
+        _get_compiled_swiglu,
+        _run_compiled,
+    )
+
+    dev = torch.device("cpu")
+    rows = 256
+
+    # COMPILE_ONLY=1 makes the executor compile + persist the artifact without
+    # launching the kernel; without it _run_compiled would dispatch on the
+    # (absent) GPU under fake tensors and fault.
+    with compile_only_env():
+        if act == "swiglu":
+            exe = _get_compiled_swiglu(inter_dim)
+            x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
+            out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
+            # trailing 0 = stream: null/default (compile-only, never launched)
+            _run_compiled(exe, (x, out, rows, 0))
+            return
+
+        exe = _get_compiled_silu_fused(
+            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+        )
+        x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
+        out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
+        empty_scale = torch.empty(0, dtype=torch.uint8, device=dev)
+        empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+        empty_f32 = torch.empty(0, dtype=torch.float32, device=dev)
+        sorted_token_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
+        num_valid_ids = torch.zeros(2, dtype=torch.int32, device=dev)
+        _run_compiled(
+            exe,
+            (
+                _ptr_view_safe(x),
+                _ptr_view_safe(out),
+                _ptr_view_safe(empty_scale),
+                _ptr_view_safe(sorted_token_ids),
+                _ptr_view_safe(num_valid_ids),
+                _ptr_view_safe(empty_i32),
+                _ptr_view_safe(empty_f32),
+                rows,
+                sorted_token_ids.shape[0],
+                float("inf"),  # swiglu_limit (unused for silu)
+                0,  # stream: null/default (compile-only, kernel is never launched)
+            ),
+        )
 
 
 def compile_one_config(
@@ -745,10 +851,15 @@ def compile_one_config(
     Returns a dict with timing info.
     """
     aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
+    is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
-        f"{kernel_name}  "
-        f"model_dim={model_dim} inter_dim={inter_dim} "
-        f"E={experts} topk={topk}"
+        f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
+        if is_epilogue
+        else (
+            f"{kernel_name}  "
+            f"model_dim={model_dim} inter_dim={inter_dim} "
+            f"E={experts} topk={topk}"
+        )
     )
     result = {
         "kernel_name": kernel_name,
@@ -761,17 +872,25 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
-            _precompile_to_cache(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=experts,
-                topk=topk,
-                cu_num=cu_num,
-                **kwargs,
-            )
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
+            if is_epilogue:
+                _precompile_epilogue_to_cache(
+                    act=kwargs.get("act", "silu"),
+                    inter_dim=inter_dim,
+                    topk=topk,
+                )
+            else:
+                _precompile_to_cache(
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    experts=experts,
+                    topk=topk,
+                    cu_num=cu_num,
+                    **kwargs,
+                )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
@@ -810,35 +929,30 @@ def main():
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
+    epilogue_jobs = [j for j in all_jobs if j["stage"] == "epilogue"]
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
-    print(f"  Stage1 jobs:  {len(stage1_jobs)}")
-    print(f"  Stage2 jobs:  {len(stage2_jobs)}")
-    print(f"  Total jobs:   {len(all_jobs)}")
+    print(f"  Stage1 jobs:    {len(stage1_jobs)}")
+    print(f"  Stage2 jobs:    {len(stage2_jobs)}")
+    print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
+    print(f"  Total jobs:     {len(all_jobs)}")
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
 
-    if stage1_jobs:
-        print(f"\n--- Stage 1 ({len(stage1_jobs)} kernels) ---")
-        for i, job in enumerate(stage1_jobs, 1):
-            print(f"\n[{i}/{len(stage1_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
-
-    if stage2_jobs:
-        print(f"\n--- Stage 2 ({len(stage2_jobs)} kernels) ---")
-        for i, job in enumerate(stage2_jobs, 1):
-            print(f"\n[{i}/{len(stage2_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
+    # Stage1, stage2 and CK-Tile epilogue kernels are independent compiles
+    # (each writes its own artifact to cache; none reads another's output), so
+    # they share a single pool for maximum fan-out instead of serial passes.
+    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2 + epilogue) ---")
+    results = run_jobs_parallel(
+        compile_one_config, stage1_jobs + stage2_jobs + epilogue_jobs
+    )
 
     total_elapsed = time.time() - total_t0
 
