@@ -57,14 +57,47 @@ jobs:
     runs-on: [self-hosted, aiter-di-ci-spur-login]
     timeout-minutes: 480
     env:
-      VLLM_REPOSITORY: ${{ github.event.inputs.vllm_repository || 'itej89/vllm' }}
-      VLLM_REF: ${{ github.event.inputs.vllm_ref || 'fix/moriio-ep8-dp8-read-rdma-session-routing' }}
-      MODEL_NAME: ${{ github.event.inputs.model_name || 'mini-max-fp8' }}
-      DISAGG_SCRIPTS_STAGE: ${{ github.event.inputs.disagg_scripts_stage || '/data/csrikris/logs/' }}
-      IMAGE: ${{ github.event.inputs.image || 'vllm/vllm-openai-rocm:v0.23.0' }}
-      SLURM_SCRIPT: ${{ github.event.inputs.slurm_script || 'run_xPyD_diagg.slurm' }}
-      WAIT_TIMEOUT_MINUTES: ${{ github.event.inputs.wait_timeout_minutes || '420' }}
+      VLLM_REPOSITORY_DEFAULT: itej89/vllm
+      VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
+      MODEL_NAME_DEFAULT: mini-max-fp8
+      DISAGG_SCRIPTS_STAGE_DEFAULT: /data/csrikris/logs/
+      IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
+      SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
+      WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
     steps:
+      - name: Apply vLLM disagg inputs
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              event = json.load(f)
+
+          inputs = event.get("inputs") or {}
+
+          def value(name: str, default_env: str) -> str:
+              raw = inputs.get(name, "")
+              default = os.environ[default_env]
+              return raw if raw not in ("", None) else default
+
+          print(f"VLLM_REPOSITORY={value('vllm_repository', 'VLLM_REPOSITORY_DEFAULT')}")
+          print(f"VLLM_REF={value('vllm_ref', 'VLLM_REF_DEFAULT')}")
+          print(f"MODEL_NAME={value('model_name', 'MODEL_NAME_DEFAULT')}")
+          print(
+              "DISAGG_SCRIPTS_STAGE="
+              + value("disagg_scripts_stage", "DISAGG_SCRIPTS_STAGE_DEFAULT")
+          )
+          print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
+          print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
+          print(
+              "WAIT_TIMEOUT_MINUTES="
+              + value("wait_timeout_minutes", "WAIT_TIMEOUT_MINUTES_DEFAULT")
+          )
+          PY
+
       - name: Show runner and Slurm state
         run: |
           set -euo pipefail
@@ -79,12 +112,14 @@ jobs:
           command -v spur && spur --help | head -120 || true
 
       - name: Checkout vLLM disagg branch
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.VLLM_REPOSITORY }}
-          ref: ${{ env.VLLM_REF }}
-          path: vllm
-          fetch-depth: 1
+        run: |
+          set -euo pipefail
+          rm -rf vllm
+          git init vllm
+          cd vllm
+          git remote add origin "https://github.com/${VLLM_REPOSITORY}.git"
+          git fetch --depth=1 origin "${VLLM_REF}"
+          git checkout --detach FETCH_HEAD
 
       - name: Show vLLM disagg inputs
         run: |
