@@ -7,16 +7,27 @@ Covers out[b] = dequant(x[b]) @ dequant(w[b]).T across two variants and two layo
   - variants: a4w4 (MXFP4 A x MXFP4 B), a8w4 (MXFP8 E4M3 A x MXFP4 B)
   - layouts:  bmn ([B,M,*] A/C), mbn ([M,B,*] A/C, deepseek-v4 grouped-output)
 plus odd/large M (ragged-tail OOB), a tile-size sweep, and a CUDA-graph run.
+
+Weights + scales are preshuffled and A/scale_a laid out ONCE here (host prep), then the thin
+flydsl_batched_gemm_mxfp4 launcher runs -- no shuffle on the launch path.
 """
 
 import pytest
 import torch
 
-import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_batched_gemm_mxfp4
-from aiter.test_common import checkAllclose, run_perftest
-from aiter.utility import fp4_utils
+from aiter.ops.flydsl import is_flydsl_available
+
+if not is_flydsl_available():
+    pytest.skip("flydsl is not available", allow_module_level=True)
+
+import aiter  # noqa: E402
+from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
+from aiter.ops.flydsl.batched_gemm_mxfp4 import (  # noqa: E402
+    flydsl_batched_gemm_mxfp4,
+)
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight  # noqa: E402
+from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
+from aiter.utility import fp4_utils  # noqa: E402
 
 torch.set_default_device("cuda")
 
@@ -43,6 +54,45 @@ TILES = [
 ]
 
 
+def preshuffle_operands(x, w, x_scales, w_scales, *, a_dtype="fp4", layout="bmn"):
+    """One-time host prep (done once, NOT per launch): keep A codes plain, preshuffle B and
+    both e8m0 scales, and lay A/scale_a out for `layout`. Inputs are logical [B,M,*]; returns
+    (a, w, a_scales, w_scales) for flydsl_batched_gemm_mxfp4 (a is [B,M,*] bmn / [M,B,*] mbn,
+    the rest flat)."""
+    B, M = x.shape[0], x.shape[1]
+    K = x_scales.shape[-1] * SCALE_GROUP_SIZE
+    M32 = (M + 31) // 32 * 32
+    a_list, sa_list, w_list, sb_list = [], [], [], []
+    for b in range(B):
+        a_list.append(x[b].contiguous())
+        w_list.append(shuffle_weight(w[b].contiguous(), layout=(16, 16)).reshape(-1))
+        sa = x_scales[b]
+        if (
+            M32 != M
+        ):  # pad A-scale rows to M/32 (shuffle_scale over-pads, then slice back)
+            pad = torch.zeros(
+                (M32 - M, K // SCALE_GROUP_SIZE), dtype=sa.dtype, device=sa.device
+            )
+            sa = torch.cat([sa, pad], dim=0)
+        sa = sa.contiguous()
+        sa_list.append(shuffle_scale(sa).reshape(-1)[: sa.numel()])
+        wsb = w_scales[b].contiguous()
+        sb_list.append(shuffle_scale(wsb).reshape(-1)[: wsb.numel()])
+
+    w_sh = torch.cat(w_list)
+    sb = torch.cat(sb_list)
+    if layout == "mbn":  # A / scale_a physically [M,B,*] / [ceil(M/32),B,chunk]
+        mchunks = (M + 31) // 32
+        chunk = sa_list[0].numel() // mchunks
+        a = torch.stack(a_list, dim=1).contiguous()
+        sa = torch.stack([s.view(mchunks, chunk) for s in sa_list], dim=1)
+        sa = sa.contiguous().reshape(-1)
+    else:  # bmn [B,M,*]
+        a = torch.stack(a_list, dim=0).contiguous()
+        sa = torch.cat(sa_list)
+    return a, w_sh, sa, sb
+
+
 def _quant_fp4(x_2d):
     """Per-1x32 MXFP4 quant (aiter triton) -> (codes uint8 [.,K//2], scale uint8 [.,K//32])."""
     qf = aiter.get_triton_quant(aiter.QuantType.per_1x32)
@@ -51,7 +101,7 @@ def _quant_fp4(x_2d):
 
 
 def gen_inputs(variant, B, M, N, K, dtype):
-    """Returns (x, w, x_scales, w_scales, ref) with unshuffled scales (wrapper shuffles)."""
+    """Returns (x, w, x_scales, w_scales, ref) with unshuffled scales (prep shuffles once)."""
     torch.manual_seed(5)
     wc = [_quant_fp4(torch.randn(N, K, dtype=dtype)) for _ in range(B)]
     w = torch.stack([c for c, _ in wc])
@@ -79,11 +129,15 @@ def gen_inputs(variant, B, M, N, K, dtype):
 def _run(variant, layout, B, M, N, K, dtype, tile=(128, 128, 256)):
     a_dtype = "fp8" if variant == "a8w4" else "fp4"
     x, w, x_scales, w_scales, ref = gen_inputs(variant, B, M, N, K, dtype)
+    a, w_sh, sa, sb = preshuffle_operands(
+        x, w, x_scales, w_scales, a_dtype=a_dtype, layout=layout
+    )
     out = flydsl_batched_gemm_mxfp4(
-        x,
-        w,
-        x_scales,
-        w_scales,
+        a,
+        w_sh,
+        sa,
+        sb,
+        N,
         dtype,
         a_dtype=a_dtype,
         layout=layout,
@@ -133,12 +187,17 @@ def test_flydsl_batched_gemm_mxfp4_cudagraph(variant):
     B, M, N, K, dtype = 2, 64, 1024, 4096, torch.bfloat16
     a_dtype = "fp8" if variant == "a8w4" else "fp4"
     x, w, x_scales, w_scales, ref = gen_inputs(variant, B, M, N, K, dtype)
+    a, w_sh, sa, sb = preshuffle_operands(
+        x, w, x_scales, w_scales, a_dtype=a_dtype, layout="bmn"
+    )
+    # Only the (prepared) launch is captured -- no shuffle in the graph.
     out, _us = run_perftest(
         flydsl_batched_gemm_mxfp4,
-        x,
-        w,
-        x_scales,
-        w_scales,
+        a,
+        w_sh,
+        sa,
+        sb,
+        N,
         dtype,
         a_dtype=a_dtype,
         testGraph=True,
