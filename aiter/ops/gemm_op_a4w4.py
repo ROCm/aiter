@@ -174,24 +174,34 @@ def gemm_a4w4(
     # splitK = None
     splitK = 0
     kernelName = ""
-    if ck_config is not None:
-        splitK = ck_config.get("splitK", None)
-        kernelName = ck_config["kernelName"]
-    if (
-        ck_config is not None
-        and kernelName.find("_ZN") == -1
+    if (ck_config is not None
         # or bias is None
     ):
+        libtype = ck_config["libtype"]
+        splitK = ck_config.get("splitK", None)
         splitK = 0 if splitK is None else splitK
-        return gemm_a4w4_blockscale(
-            A.view(m, k // 2),
-            B,
-            A_scale,
-            B_scale,
-            out,
-            splitK=splitK,
-            kernelName=kernelName,
-        )[:m]
+        kernelName = ck_config["kernelName"]
+        if libtype == "cktile":
+            return gemm_a4w4_blockscale_cktile(
+                A.view(m, k // 2),
+                B,
+                A_scale,
+                B_scale,
+                out,
+                splitK=splitK,
+                kernelName=kernelName,
+            )[:m]
+        elif libtype == "ck":
+            print(kernelName)
+            return gemm_a4w4_blockscale(
+                A.view(m, k // 2),
+                B,
+                A_scale,
+                B_scale,
+                out,
+                splitK=splitK,
+                kernelName=kernelName,
+            )[:m]
     assert (
         out.shape[0] % 32 == 0
     ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"

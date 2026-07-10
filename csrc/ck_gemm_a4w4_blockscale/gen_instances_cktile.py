@@ -51,20 +51,11 @@ class gemm_a4w4_blockscale_codegen:
 
     def get_tune_dict(self):
         if os.path.exists(self.tune_file):
-            df = pd.read_csv(self.tune_file)
-            # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
-            # no libtype column.  The Python dispatcher in
-            # aiter/ops/gemm_op_a4w4.py routes ASM rows by
-            # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
-            # apply the same filter here so the CK codegen sees only CK rows and
-            # build_tune_dict's strict validation stays effective on genuine CK
-            # references.
-            df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
             return build_tune_dict(
-                df,
+                pd.read_csv(self.tune_file),
                 default_kernels_dict_cktile,
-                kernels_list,
-                kernels_by_name=kernels_by_name,
+                kernels_list_cktile,
+                libtype="cktile",
             )
         return default_kernels_dict_cktile
 

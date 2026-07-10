@@ -477,7 +477,6 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         run_kwargs = {
             "num_warmup": args.warmup,
             "num_iters": args.iters,
-            "num_rotate_args": 1, # rotating buffer crashes GPU?
         }
 
         for i in range(len(untunedf)):
@@ -560,6 +559,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 )
             key_dict.update(
                 {
+                    "libtype": [libtype],
                     "kernelId": [kernelId],
                     "splitK": [splitK],
                     "us": [time],

@@ -32,13 +32,13 @@ template <typename CDataType>
 BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 {
     static const auto lookup = [] {
-        if constexpr(std::is_same_v<CDataType, F16>)
+        if constexpr(std::is_same_v<CDataType, TILE_FP16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(F16, true)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(TILE_FP16)};
         }
-        else if constexpr(std::is_same_v<CDataType, B16>)
+        else if constexpr(std::is_same_v<CDataType, TILE_BF16>)
         {
-            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(B16, true)};
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(TILE_BF16)};
         }
         else
         {
@@ -62,7 +62,7 @@ BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
     }
 
     // Default heuristic kernel (used when Python had no tuned row).
-    return a4w4_blockscale_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x2_intrawave_v3<
+    return a4w4_blockscale_cktile_128x512x256_1x4x1_16x16x128_default_0x0x0_1<
         CDataType>;
 }
 
@@ -80,11 +80,11 @@ torch::Tensor gemm_a4w4_blockscale_cktile(
 
     if(Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<F16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
+        blockscale_dispatch<TILE_FP16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
     }
     else if(Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<B16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
+        blockscale_dispatch<TILE_BF16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
     }
     else
     {
