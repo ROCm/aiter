@@ -2,6 +2,8 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
