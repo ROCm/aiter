@@ -133,7 +133,14 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
 
     ret = {"gfx": get_gfx()}
     for name, (fn, layout, in_b, out_b) in candidates.items():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base_mb = torch.cuda.memory_allocated() / 1e6
         out, us = run_perftest(fn)
+        # Peak = high-water allocation during the run; transient = peak above the
+        # resting baseline (ref + pre-quantized q/k/v are allocated before the loop
+        # and shared by every candidate), i.e. the candidate's own working set.
+        peak_mb = torch.cuda.max_memory_allocated() / 1e6
         out_bshd = out.transpose(1, 2).contiguous() if layout == "bhsd" else out
         err = checkAllclose(
             ref.to(dtypes.fp32),
@@ -151,6 +158,8 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
         ret[f"{name}_gb_per_sec"] = nbytes / us / 1e3
         ret[f"{name}_cos_min"] = cos_min
         ret[f"{name}_cos_mean"] = cos_mean
+        ret[f"{name}_peak_mb"] = peak_mb
+        ret[f"{name}_transient_mb"] = peak_mb - base_mb
         ret[f"{name}_err"] = err
     return ret
 
