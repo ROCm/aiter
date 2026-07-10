@@ -1,8 +1,9 @@
 """FlyDSL MLA reduce benchmark.
 
 Default (no ``--mode``): GLM-5.2 serving scoreboard — production wrapper path
-with ``final_output=[bs, H, Dv]``, ``actual_max_splits``, adaptive launch, and
-DA split-K. Backends: ``hip``, ``wrapper-daoff``, ``wrapper-daon``.
+with ``final_output=[bs, H, Dv]``, auto-resolved ``actual_max_splits`` (warmup
+cache, same as ``mla_decode_fwd``), adaptive launch, and DA split-K. Backends:
+``hip``, ``wrapper-daoff``, ``wrapper-daon``.
 
 Synthetic / replay modes (``--mode``):
   uniform    uniform synthetic workload; all tiles share ``num_splits``
@@ -18,7 +19,11 @@ import torch
 import aiter
 
 from aiter.test_common import run_perftest
-from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe, select_tier
+from aiter.ops.flydsl.kernels.mla_reduce import (
+    derive_actual_max_splits,
+    plan_splitk_capture_safe,
+    select_tier,
+)
 from op_tests.flydsl_mla_reduce_common import (
     bench_cudagraph,
     build_inputs,
@@ -89,7 +94,6 @@ def _make_serving_wrapper_runner(po, pl, indptr, fmap, pmap, fout, flse, splits)
             fout,
             flse,
             num_kv_splits=splits,
-            actual_max_splits=splits,
         )
 
     return run
@@ -124,6 +128,7 @@ def run_serving(backend: str) -> None:
                 max_seqlen_q=1,
                 num_kv_splits=splits,
                 num_cu=num_cu,
+                actual_max_splits=derive_actual_max_splits(indptr),
             )
             plan = (
                 f"splitk K={K} slots={slots} grid_p={slots * K}"
