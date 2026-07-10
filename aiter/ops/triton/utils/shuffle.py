@@ -69,6 +69,16 @@ def shuffle_weight(
     )
 
 
+def moe_weight_gfx1250_decode_view(w: torch.Tensor) -> torch.Tensor:
+    """zero-copy fn
+    Input: ``(E, N, K)`` (K byte-packed for mxfp4). Output shares storage.
+    """
+    w_u8 = w if w.dtype == torch.uint8 else w.view(torch.uint8)
+    E, N, K = w_u8.shape
+    assert N % 16 == 0, f"N={N} must be divisible by 16"
+    return w_u8.view(E, N // 16, K * 16).transpose(-1, -2)
+
+
 # =============================================================================
 # SCALES
 # =============================================================================
@@ -159,26 +169,31 @@ def shuffle_scale_moe(
     arch=None,
     preshuffle_factor: int = 32,
     scale_kwidth: int = 8,
-) -> torch.Tensor:
+    return_layout: bool = False,
+):
     """Arch-aware MoE scale shuffle (a8w4 / a8w8 / a16w4 / a4w4 family).
 
-    Returns the shuffled scale tensor; the caller supplies the matching
-    ``SWIZZLE_MX_SCALE`` label ("GFX1250_SCALE" for gfx1250, "CDNA4_SCALE" for gfx950).
-    gfx950: preshuffle_factor = 32, scale_kwidth = 8
-    gfx1250: preshuffle_factor = 32, scale_kwidth = 8
-    """
+    gfx950 / gfx1250: preshuffle_factor = 32, scale_kwidth = 8.
 
+    With ``return_layout=True`` also returns the matching ``SWIZZLE_MX_SCALE``
+    label ("GFX1250_SCALE" for gfx1250, "CDNA4_SCALE" for gfx950) as
+    ``(scale, label)``, so callers stay arch-agnostic; otherwise returns just
+    the shuffled scale tensor.
+    """
     arch = arch or get_arch()
+    layout = None
     if arch == "gfx1250":
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
-        return tiled.transpose(-1, -2)
-    if (arch or get_arch()) == "gfx950":
+        layout = "GFX1250_SCALE"
+    elif (arch or get_arch()) == "gfx950":
         tiled = _shuffle_scale_tile_gfx950(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
-    return tiled.transpose(-1, -2)
+        layout = "CDNA4_SCALE"
+    scale = tiled.transpose(-1, -2)
+    return (scale, layout) if return_layout else scale
 
 
 # --- batched scales (FP4 blockscale16, attention) ---

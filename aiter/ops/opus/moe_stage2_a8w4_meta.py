@@ -18,7 +18,7 @@ OPUS_A8W4_OUT_MODE_BF16 = 1
 OPUS_A8W4_OUT_MODE_FP8 = 2
 
 # Kid layout:
-# - 2000-2099: K3 decode candidates, assigned contiguously.
+# - 2000-2099: K3 decode candidates.
 # - 2100-2109: K5 direct atomic bring-up candidates.
 # - 2110-2119: K5 route-output bring-up candidates.
 OPUS_A8W4_KID_K3_ATOMIC_BM16_BN64_B3_WS2 = 2000
@@ -27,6 +27,9 @@ OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC5_RBN2304 = 2002
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072 = 2003
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584 = 2004
 OPUS_A8W4_KID_K3_ROUTE_BF16_BM64_FULL_N7168 = 2005
+OPUS_A8W4_KID_K3_ATOMIC_BM32_BN128_OCC1_B3_WS2 = 2006
+OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072_B3 = 2007
+OPUS_A8W4_KID_K3_ROUTE_BF16_BM32_FULL_N7168_SMALL = 2008
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_OCC6_B2_WS2 = 2100
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_B3_WS2 = 2101
 OPUS_A8W4_KID_K5_ROUTE_BF16_BM64_FULL_N7168 = 2110
@@ -304,6 +307,7 @@ def _route_stage2_instance(
     shape_family: str,
     route_reduce: str,
     min_blocks_per_cu: int = 0,
+    cachectl_b: int = 0,
     tuner_candidate: bool = True,
     min_tuner_token: Optional[int] = None,
     max_tuner_token: Optional[int] = None,
@@ -319,6 +323,7 @@ def _route_stage2_instance(
         sort_block_m=sort_block_m,
         direct_atomic=False,
         min_blocks_per_cu=min_blocks_per_cu,
+        cachectl_b=cachectl_b,
         route_reduce=route_reduce,
         tuner_candidate=tuner_candidate,
         min_tuner_token=min_tuner_token,
@@ -353,7 +358,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         sort_block_m=32,
         route_reduce="rbn2240",
         min_blocks_per_cu=4,
-        min_tuner_token=512,
+        min_tuner_token=8,
         max_tuner_token=4096,
         shape_family=_K3,
     ),
@@ -365,7 +370,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         sort_block_m=32,
         route_reduce="rbn2304",
         min_blocks_per_cu=5,
-        min_tuner_token=512,
+        min_tuner_token=8,
         max_tuner_token=4096,
         shape_family=_K3,
     ),
@@ -376,6 +381,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         block_m=64,
         sort_block_m=64,
         route_reduce="rbn3072",
+        min_tuner_token=128,
         shape_family=_K3,
         mode_default=True,
     ),
@@ -386,6 +392,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         block_m=64,
         sort_block_m=64,
         route_reduce="rbn3584",
+        min_tuner_token=128,
         shape_family=_K3,
     ),
     _route_stage2_instance(
@@ -398,6 +405,42 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         min_tuner_token=4096,
         shape_family=_K3,
         mode_default=True,
+    ),
+    _atomic_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ATOMIC_BM32_BN128_OCC1_B3_WS2,
+        name="opus_moe2_afp8_wfp4_atomic_t32x128x256_sbm32_occ1_cache_b3_ws2",
+        block_m=32,
+        block_n=128,
+        sort_block_m=32,
+        block_threads=128,
+        min_blocks_per_cu=1,
+        cachectl_b=3,
+        cachectl_wscale=2,
+        min_tuner_token=1,
+        max_tuner_token=2048,
+        shape_family=_K3,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072_B3,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_cache_b3",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn3072",
+        cachectl_b=3,
+        min_tuner_token=128,
+        shape_family=_K3,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_BF16_BM32_FULL_N7168_SMALL,
+        name="opus_moe2_afp8_wfp4_bf16_t32x256x256_sbm32_small",
+        out_mode=OPUS_A8W4_OUT_MODE_BF16,
+        block_m=32,
+        sort_block_m=32,
+        route_reduce="full_model_n7168",
+        min_tuner_token=1,
+        max_tuner_token=64,
+        shape_family=_K3,
     ),
 )
 
