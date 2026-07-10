@@ -11,5 +11,19 @@
         "cache_modifier": null,
         "NUM_KSPLIT": 1,
         "MAYBE_LOOP_UNROLL": false
+    },
+    "any": {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": null,
+        "NUM_KSPLIT": 1,
+        "MAYBE_LOOP_UNROLL": false,
+        "kernel_type": "compute_bound"
     }
 }

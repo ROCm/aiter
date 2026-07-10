@@ -61,6 +61,12 @@ def get_x_vals():
     x_vals += [(v, 4096, 2048) for v in (1, 64, 1024)]
     x_vals += [(v, 1536, 4096) for v in (1, 64, 1024)]
     x_vals += [(v, 32768, 1024) for v in (1, 64, 1024)]
+    x_vals += [(v, 8192, 1536) for v in (1, 64, 1024)]
+    x_vals += [(v, 7168, 4096) for v in (1, 64, 1024)]
+    x_vals += [(v, 1536, 7168) for v in (1, 64, 1024)]
+    x_vals += [(v, 7168, 768) for v in (1, 64, 1024)]
+    x_vals += [(v, 2048, 7168) for v in (1, 64, 1024)]
+    x_vals += [(v, 16384, 1536) for v in (1, 64, 1024)]
     return x_vals
 
 
