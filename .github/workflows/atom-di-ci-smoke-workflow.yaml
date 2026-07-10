@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       atom_ref:
-        description: "ROCm/ATOM ref with PR #1475 ATOMesh Spur support"
+        description: "ROCm/ATOM ref with ATOMesh Spur support"
         required: false
         type: string
-        default: "zwan/mesh-model-ci-spur"
+        default: "main"
       atomesh_image:
         description: "ATOM image used by the ATOMesh benchmark"
         required: false
@@ -26,6 +26,16 @@ on:
         required: false
         type: string
         default: "/data/models2/DeepSeek-V4-Pro"
+      glm_5_2_fp8_model_path:
+        description: "GLM-5.2-FP8 model path visible on Spur nodes"
+        required: false
+        type: string
+        default: "/data/models2/GLM-5.2-FP8"
+      run_glm_5_2_fp8:
+        description: "Run GLM-5.2-FP8 2P1D TP-only case"
+        required: false
+        default: false
+        type: boolean
       log_root:
         description: "Root directory for ATOMesh logs"
         required: false
@@ -41,21 +51,16 @@ on:
         required: false
         type: string
         default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15"
-      isl_list:
-        description: "Input lengths for the smoke benchmark"
-        required: false
-        type: string
-        default: "8192"
-      osl:
-        description: "Output length for the smoke benchmark"
-        required: false
-        type: string
-        default: "1"
       conc_list:
         description: "Concurrency list for the smoke benchmark"
         required: false
         type: string
         default: "2"
+      eval_conc_list:
+        description: "Concurrency list for GSM8K eval; empty uses benchmark concurrency"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -65,15 +70,19 @@ permissions:
   contents: read
 
 env:
-  ATOM_REF_DEFAULT: zwan/mesh-model-ci-spur
+  ATOM_REF_DEFAULT: main
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
+  ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
   ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
   ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
   ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
   ISL_LIST_DEFAULT: "8192"
   OSL_DEFAULT: "1"
   CONC_LIST_DEFAULT: "2"
+  GLM_OSL_DEFAULT: "1024"
+  GLM_CONC_LIST_DEFAULT: "128,256"
+  GLM_EVAL_CONC_LIST_DEFAULT: "64,256"
   ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
   ATOMESH_SLURM_ACCOUNT: ""
   ATOMESH_SLURM_PARTITION: ""
@@ -104,24 +113,56 @@ jobs:
               default = os.environ[default_env]
               return raw if raw not in ("", None) else default
 
+          def bool_input(name: str, default: bool = False) -> bool:
+              raw = inputs.get(name, "")
+              if raw in ("", None):
+                  return default
+              if isinstance(raw, bool):
+                  return raw
+              return str(raw).lower() == "true"
+
+          run_glm = bool_input("run_glm_5_2_fp8", False)
+
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
           print(
               "ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO="
               + value("model_path", "ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT")
           )
+          print(
+              "ATOMESH_MODEL_PATH_GLM_5_2_FP8="
+              + value("glm_5_2_fp8_model_path", "ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT")
+          )
+          print(f"RUN_GLM_5_2_FP8={str(run_glm).lower()}")
           print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
           print(
               "ATOMESH_SHARED_WORKSPACE_ROOT="
               + value("shared_workspace_root", "ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT")
           )
-          print(f"ATOMESH_2P1D_NODES={value('spur_nodelist', 'ATOMESH_2P1D_NODES_DEFAULT')}")
+          node_list = value("spur_nodelist", "ATOMESH_2P1D_NODES_DEFAULT")
+          nodes = [node.strip() for node in node_list.split(",") if node.strip()]
+          print(f"ATOMESH_2P1D_NODES={node_list}")
+          print(f"ATOMESH_1P1D_NODES={','.join(nodes[:2])}")
           print(f"ISL_LIST={value('isl_list', 'ISL_LIST_DEFAULT')}")
-          print(f"OSL={value('osl', 'OSL_DEFAULT')}")
-          print(f"CONC_LIST={value('conc_list', 'CONC_LIST_DEFAULT')}")
+          print(
+              "OSL="
+              + value("osl", "GLM_OSL_DEFAULT" if run_glm else "OSL_DEFAULT")
+          )
+          print(
+              "CONC_LIST="
+              + value("conc_list", "GLM_CONC_LIST_DEFAULT" if run_glm else "CONC_LIST_DEFAULT")
+          )
+          eval_conc = inputs.get("eval_conc_list", "")
+          if eval_conc in ("", None):
+              eval_conc = (
+                  os.environ["GLM_EVAL_CONC_LIST_DEFAULT"]
+                  if run_glm
+                  else value("conc_list", "CONC_LIST_DEFAULT")
+              )
+          print(f"EVAL_CONC_LIST={eval_conc}")
           PY
 
-      - name: Checkout ATOM PR 1475 source
+      - name: Checkout ATOM source
         uses: actions/checkout@v4
         with:
           repository: ROCm/ATOM
@@ -174,34 +215,43 @@ jobs:
       - name: Install matrix dependencies
         run: python3 -m pip install pyyaml
 
-      - name: Build DeepSeek-V4-Pro 2P1D benchmark cell
+      - name: Build ATOMesh benchmark cell
         id: cell
         run: |
           set -euo pipefail
           cd ATOM
+          model_name="DeepSeek-V4-Pro"
+          target_topology="2p1d_dpa"
+          if [[ "${RUN_GLM_5_2_FP8}" == "true" ]]; then
+            model_name="GLM-5.2-FP8"
+            target_topology="2p1d"
+          fi
+
           python3 .github/scripts/atomesh/pd_matrix.py \
             --suite nightly \
-            --model DeepSeek-V4-Pro \
+            --model "${model_name}" \
             --image "${ATOMESH_IMAGE}" \
             --benchmark-concurrency "${CONC_LIST}" \
-            --eval-concurrency "${CONC_LIST}" \
+            --eval-concurrency "${EVAL_CONC_LIST}" \
             --output ../atomesh-matrix.json
 
-          python3 - <<'PY'
+          python3 - "${model_name}" "${target_topology}" <<'PY'
           import json
           import os
+          import sys
           from pathlib import Path
 
+          model_name, target_topology = sys.argv[1:3]
           matrix_path = Path("../atomesh-matrix.json")
           matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
           cells = [
               cell
               for cell in matrix.get("include", [])
-              if cell.get("model") == "DeepSeek-V4-Pro"
-              and cell.get("topology") == "2p1d_dpa"
+              if cell.get("model") == model_name
+              and cell.get("topology") == target_topology
           ]
           if not cells:
-              raise SystemExit("No DeepSeek-V4-Pro 2p1d_dpa cell was generated")
+              raise SystemExit(f"No {model_name} {target_topology} cell was generated")
 
           cell = cells[0]
           isl = [
@@ -218,8 +268,13 @@ jobs:
           cell["osl"] = int(os.environ["OSL"])
           cell["concurrency"] = conc
           cell["concurrency_x"] = "x".join(str(value) for value in conc)
-          cell["run_eval"] = False
-          cell["accuracy"]["concurrency"] = conc
+          if model_name == "DeepSeek-V4-Pro":
+              cell["run_eval"] = False
+          cell["accuracy"]["concurrency"] = [
+              int(item)
+              for item in os.environ["EVAL_CONC_LIST"].replace(",", " ").split()
+              if item
+          ]
           cell["runner"]["slurm_submit_runner"] = "aiter-di-ci-spur-login"
           cell["runner"]["slurm_account"] = ""
           cell["runner"]["slurm_partition"] = ""
@@ -292,7 +347,7 @@ jobs:
           mkdir -p ATOM
           tar -C ATOM -xzf atom-source.tar.gz
 
-      - name: Run ATOMesh benchmark cell via PR 1475 submitter
+      - name: Run ATOMesh benchmark cell
         run: |
           set -euo pipefail
           original_workspace="${GITHUB_WORKSPACE}"
