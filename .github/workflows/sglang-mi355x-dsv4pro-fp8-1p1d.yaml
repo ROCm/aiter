@@ -11,11 +11,6 @@ on:
       - ".github/scripts/sglang_mi355x_disagg.py"
   workflow_dispatch:
     inputs:
-      sglang_repository:
-        description: "SGLang repository containing the MI355X disagg launcher"
-        required: false
-        type: string
-        default: "Lzy17/sglang"
       sglang_ref:
         description: "SGLang ref to test; default tracks sgl-project/sglang#29084"
         required: false
@@ -31,11 +26,6 @@ on:
         required: false
         type: string
         default: "/data/models2/DeepSeek-V4-Pro-FP8"
-      model_mount_roots:
-        description: "Space-separated host roots to mount read-only into SGLang containers"
-        required: false
-        type: string
-        default: "/it-share /data /models"
       shared_workspace_root:
         description: "Shared workspace root visible from the Spur submit and compute nodes"
         required: false
@@ -82,11 +72,11 @@ permissions:
   contents: read
 
 env:
-  SGLANG_REPOSITORY_DEFAULT: Lzy17/sglang
+  SGLANG_REPOSITORY: Lzy17/sglang
   SGLANG_REF_DEFAULT: amd-mi355x-disagg-nightly
   IMAGE_OVERRIDE_DEFAULT: ""
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
-  MODEL_MOUNT_ROOTS_DEFAULT: /it-share /data /models
+  MODEL_MOUNT_ROOTS: /it-share /data /models
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
   SLURM_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
   SLURM_PARTITION_DEFAULT: ""
@@ -125,11 +115,9 @@ jobs:
               return raw if raw not in ("", None) else default
 
           pairs = {
-              "SGLANG_REPOSITORY": value("sglang_repository", "SGLANG_REPOSITORY_DEFAULT"),
               "SGLANG_REF": value("sglang_ref", "SGLANG_REF_DEFAULT"),
               "IMAGE_OVERRIDE": value("image", "IMAGE_OVERRIDE_DEFAULT"),
               "MODEL_PATH_OVERRIDE": value("model_path", "MODEL_PATH_DEFAULT"),
-              "MODEL_MOUNT_ROOTS": value("model_mount_roots", "MODEL_MOUNT_ROOTS_DEFAULT"),
               "SHARED_WORKSPACE_ROOT": value(
                   "shared_workspace_root", "SHARED_WORKSPACE_ROOT_DEFAULT"
               ),
@@ -184,7 +172,15 @@ jobs:
       - name: Prepare SGLang and shared aiter source
         run: |
           set -euo pipefail
-          python3 -m pip install pyyaml -q
+          PYTHON_VENV="${RUNNER_TEMP}/sglang-mi355x-venv"
+          if python3 -m venv "${PYTHON_VENV}"; then
+            SGLANG_CI_PYTHON="${PYTHON_VENV}/bin/python"
+            "${SGLANG_CI_PYTHON}" -m pip install --upgrade pip -q
+            "${SGLANG_CI_PYTHON}" -m pip install pyyaml tabulate -q
+          else
+            SGLANG_CI_PYTHON=python3
+            python3 -m pip install --break-system-packages --user pyyaml tabulate -q
+          fi
 
           SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-mi355x-disagg"
           rm -rf "${SGLANG_WORKSPACE}"
@@ -193,8 +189,8 @@ jobs:
           test -f "${SGLANG_WORKSPACE}/scripts/ci/slurm/launch_mi355x.sh"
           test -f "${SGLANG_WORKSPACE}/scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml"
 
-          python3 .github/scripts/sglang_mi355x_disagg.py patch-launcher "${SGLANG_WORKSPACE}"
-          python3 .github/scripts/sglang_mi355x_disagg.py configure-recipe \
+          "${SGLANG_CI_PYTHON}" .github/scripts/sglang_mi355x_disagg.py patch-launcher "${SGLANG_WORKSPACE}"
+          "${SGLANG_CI_PYTHON}" .github/scripts/sglang_mi355x_disagg.py configure-recipe \
             "${SGLANG_WORKSPACE}" \
             --concurrency-list "${CONC_LIST}" \
             --accuracy-enabled "${RUN_ACCURACY}"
@@ -208,6 +204,7 @@ jobs:
 
           {
             echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}"
+            echo "SGLANG_CI_PYTHON=${SGLANG_CI_PYTHON}"
             echo "AITER_SOURCE_DIR=${AITER_SOURCE_DIR}"
             echo "SHARED_WORKDIR_ROOT=${SHARED_WORKDIR_ROOT}"
           } >> "${GITHUB_ENV}"
@@ -231,7 +228,7 @@ jobs:
             exit 0
           fi
           STALE_JOBS="$(
-            squeue --me --noheader --format="%i %200j" \
+            squeue -u "${USER}" --noheader --format="%i %200j" \
               | grep -F "mi355x-ci-${RUNNER_NAME}-" \
               | awk '{print $1}' || true
           )"
@@ -273,7 +270,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "${SGLANG_WORKSPACE}"
-          python3 -m pip install pyyaml tabulate -q
           shopt -s nullglob
           processed=0
           for result_file in "${GITHUB_WORKSPACE}"/mi355x-dsv4pro-fp8-1p1d_*.json; do
@@ -291,14 +287,14 @@ jobs:
               PRECISION=fp8 \
               ISL=1024 \
               OSL=1024 \
-              python3 scripts/ci/slurm/process_result.py
+              "${SGLANG_CI_PYTHON}" scripts/ci/slurm/process_result.py
             processed=$((processed + 1))
           done
           if [ "${processed}" -eq 0 ]; then
             echo "No result files were produced."
             exit 1
           fi
-          python3 scripts/ci/slurm/summarize.py "${GITHUB_WORKSPACE}" >> "${GITHUB_STEP_SUMMARY}"
+          "${SGLANG_CI_PYTHON}" scripts/ci/slurm/summarize.py "${GITHUB_WORKSPACE}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Stage artifacts
         if: always()
@@ -331,7 +327,7 @@ jobs:
           fi
           JOB_TAG="mi355x-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-dsv4pro-fp8-mi355x-sglang"
           ACTIVE_JOBS="$(
-            squeue --me --noheader --format="%i %200j" \
+            squeue -u "${USER}" --noheader --format="%i %200j" \
               | grep -F "${JOB_TAG}" \
               | awk '{print $1}' || true
           )"

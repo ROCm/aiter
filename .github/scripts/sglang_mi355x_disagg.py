@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-
 RECIPE_PATH = Path("scripts/ci/slurm/recipes/mi355x-fp8/dsv4pro/1k1k/1p1d.yaml")
 LAUNCHER_PATH = Path("scripts/ci/slurm/launch_mi355x.sh")
 
