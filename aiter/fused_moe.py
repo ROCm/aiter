@@ -342,6 +342,7 @@ def fused_moe_(
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.INTERLEAVE
+        and int(os.environ.get("AITER_FP4BF16_USE_ITLV", "0"))
         and is_flydsl_available()
     ):
         logger.info("[fused_moe] fp4_bf16 INTERLEAVE: dispatching to FlyDSL kernel")
@@ -1284,7 +1285,14 @@ def get_2stage_cfgs(
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
         _tile_k = 128
-        _gui_tag = "_gui" if gate_mode == GateMode.INTERLEAVE else ""
+        _gui_tag = (
+            "_gui"
+            if (
+                gate_mode == GateMode.INTERLEAVE
+                and int(os.environ.get("AITER_FP4BF16_USE_ITLV", "0"))
+            )
+            else ""
+        )
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = (
@@ -1645,6 +1653,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
         and gate_mode == GateMode.INTERLEAVE
+        and int(os.environ.get("AITER_FP4BF16_USE_ITLV", "0"))
         and is_flydsl_available()
     ):
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
