@@ -418,6 +418,68 @@ def test_flydsl_fmha_correctness_fp8(batch, seq_len, num_heads, head_dim):
     assert cos.mean().item() > 0.998, f"mean_cos={cos.mean().item():.6f}"
 
 
+def test_flydsl_fp8_quant_producer_invariants():
+    """Direct coverage of the FlyDSL fp8 producer (fp8_quant_gfx1201), which the
+    end-to-end tests only exercise transitively: the per-tensor scale contract,
+    rotation=False dequant accuracy, and the rotation-cancellation invariant
+    ``(Q@R)(K@R)^T == Q@K^T`` that attention relies on (the rotation is never
+    undone in the kernel, so a wrong/asymmetric rotation would hide here)."""
+    b, s, h, d = 1, 1024, 8, 128  # head_dim==128 -> FlyDSL path
+    q, k, v = _make_qkv(b, s, h, d, torch.bfloat16)
+
+    # Scale contract: e4m3 outputs, 1-elem fp32 descales (real = fp8 * scale).
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
+    for t8 in (qq, kk, vv):
+        assert t8.dtype == torch.float8_e4m3fn
+    for sc in (sq, sk, sv):
+        assert sc.shape == (1,) and sc.dtype == torch.float32
+
+    # rotation=False: dequant ≈ original (only e4m3 rounding).
+    cos = F.cosine_similarity(
+        (qq.float() * sq).reshape(-1, d), q.float().reshape(-1, d), dim=1
+    )
+    assert cos.mean().item() > 0.99, f"rot=False dequant mean_cos={cos.mean().item():.6f}"
+
+    # rotation=True: rotation must cancel in QK^T. Dequant gives Q@R and K@R; their
+    # inner product must match the unrotated Q@K^T (one head).
+    qr, kr, _, sqr, skr, _ = flydsl_fp8_quant(q, k, v, rotation=True)
+    Qr = (qr.float() * sqr)[0, :, 0]
+    Kr = (kr.float() * skr)[0, :, 0]
+    scores_rot = Qr @ Kr.T
+    scores_ref = q[0, :, 0].float() @ k[0, :, 0].float().T
+    cos_s = F.cosine_similarity(
+        scores_rot.reshape(1, -1), scores_ref.reshape(1, -1), dim=1
+    ).item()
+    assert cos_s > 0.99, f"QK-preservation cos={cos_s:.6f}"
+
+
+def test_flydsl_fp8_quant_backend_agreement():
+    """The flydsl and torch producers use different orthonormal rotations, so they
+    agree only at the attention-output level (the rotation cancels). Guards the new
+    FlyDSL producer against the torch reference on the same inputs."""
+    b, s, h, d = 1, 2048, 12, 128
+    q, k, v = _make_qkv(b, s, h, d, torch.bfloat16)
+    ref = _ref_sdpa_bshd(q, k, v)
+
+    outs = {}
+    for be in ("flydsl", "torch"):
+        qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, backend=be)
+        outs[be] = flydsl_flash_attn_func(
+            qq, kk, vv, causal=False, q_descale=sq, k_descale=sk, v_descale=sv
+        )
+        cos = F.cosine_similarity(
+            outs[be].float().reshape(-1, d), ref.float().reshape(-1, d), dim=1
+        )
+        assert cos.mean().item() > 0.998, f"{be} mean_cos={cos.mean().item():.6f}"
+
+    cos_fb = F.cosine_similarity(
+        outs["flydsl"].float().reshape(-1, d),
+        outs["torch"].float().reshape(-1, d),
+        dim=1,
+    )
+    assert cos_fb.mean().item() > 0.998, f"flydsl-vs-torch mean_cos={cos_fb.mean().item():.6f}"
+
+
 def test_flydsl_fmha_missing_fp8_descale_raises():
     """FP8 inputs without descales must raise (they are required)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
