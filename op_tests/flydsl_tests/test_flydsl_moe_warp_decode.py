@@ -575,6 +575,135 @@ def test_down_reduce_h2_dot2path(shape_name, hidden, inter, topk, experts, B):
 
 
 # ---------------------------------------------------------------------------
+# End-to-end integration: gate_up (f32) → inter_out → down_reduce (f32)
+# ---------------------------------------------------------------------------
+
+
+def _ref_moe_e2e(
+    x, w_gate, w_up, w_down, router_ids, router_wts, B, topk, inter, hidden
+):
+    """Full MoE block reference: gate_up then down_reduce, FP32 arithmetic."""
+    xf, wgf, wuf, wdf = x.float(), w_gate.float(), w_up.float(), w_down.float()
+    y = torch.zeros(B, hidden, dtype=torch.float32, device=x.device)
+    for slot in range(B * topk):
+        tok = slot // topk
+        e = router_ids[slot].item()
+        rw = router_wts[slot].item()
+        gv = wgf[e * inter : (e + 1) * inter] @ xf[tok]
+        uv = wuf[e * inter : (e + 1) * inter] @ xf[tok]
+        ir = torch.sigmoid(gv) * gv * uv  # BF16 round-trip matches kernel
+        y[tok] += rw * (wdf[e * hidden : (e + 1) * hidden] @ ir)
+    return y
+
+
+def _run_e2e(
+    exe_gu,
+    exe_dn,
+    x,
+    w_gate,
+    w_up,
+    w_down,
+    router_ids,
+    router_wts,
+    B,
+    topk,
+    inter,
+    hidden,
+    experts,
+):
+    """Run gate_up then down_reduce and return (inter_out_bf16, y_out_f32)."""
+    stream = torch.cuda.current_stream()
+    inter_out = torch.zeros(B * topk * inter, dtype=torch.bfloat16, device="cuda")
+    exe_gu(
+        _ptr(inter_out),
+        _ptr(x),
+        _ptr(w_gate),
+        _ptr(w_up),
+        _ptr(router_ids),
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+        1.0,
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    y_out = torch.zeros(B, hidden, dtype=torch.float32, device="cuda")  # must zero-init
+    exe_dn(
+        _ptr(y_out),
+        _ptr(inter_out),
+        _ptr(w_down),
+        _ptr(router_ids),
+        _ptr(router_wts),
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+        stream,
+    )
+    torch.cuda.synchronize()
+    return inter_out, y_out
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", SHAPES)
+@pytest.mark.parametrize("B", BATCHES)
+def test_moe_e2e_f32path(shape_name, hidden, inter, topk, experts, B):
+    """Full MoE block (gate_up → inter → down_reduce), FP32 paths — gfx942 + gfx950."""
+    torch.manual_seed(42)
+    x = torch.randn(B, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    w_gate = (
+        torch.randn(experts * inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_up = (
+        torch.randn(experts * inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_down = (
+        torch.randn(experts * hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    router_ids = torch.randint(
+        0, experts, (B * topk,), dtype=torch.int32, device="cuda"
+    )
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    router_wts = (
+        router_wts_raw.view(B, topk)
+        / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    ref = _ref_moe_e2e(
+        x, w_gate, w_up, w_down, router_ids, router_wts, B, topk, inter, hidden
+    )
+
+    exe_gu = compile_wd_moe_gate_up(
+        hidden=hidden, inter=inter, experts=experts, topk=topk, use_dot2=False
+    )
+    exe_dn = compile_wd_moe_down_reduce(
+        hidden=hidden, inter=inter, experts=experts, topk=topk, use_dot2=False
+    )
+    _, y_out = _run_e2e(
+        exe_gu,
+        exe_dn,
+        x,
+        w_gate,
+        w_up,
+        w_down,
+        router_ids,
+        router_wts,
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+    )
+
+    # Tolerance is slightly wider than individual-kernel tests because two
+    # BF16 rounding steps (gate_up output, then down_reduce input) accumulate.
+    _check(ref, y_out, f"{shape_name} B={B} e2e f32path", atol=0.05, rtol=0.05)
+
+
+# ---------------------------------------------------------------------------
 # split-K down_reduce tests  (k_batch > 1, arch-agnostic)
 # ---------------------------------------------------------------------------
 
