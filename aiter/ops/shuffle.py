@@ -2,8 +2,46 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-
+import torch.nn.functional as F
 from aiter.jit.utils.chip_info import get_gfx
+
+
+def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
+    """
+    Preshuffle weights for gfx1250 WMMA.
+
+    For 2D input (N, K): view as (N//16, 16, K//32, 2, 16) ->
+        permute(0, 2, 3, 1, 4) -> reshape (N//16, K*16).
+    For 3D input (E, N, K) or (E, K, N): transpose to (E, N, K) first,
+        then apply the same pattern per-expert.
+
+    The result is reshaped to (N//16, K*16) for TDM-optimal loading.
+    """
+    x_type = w.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        w = w.view(torch.uint8)
+
+    if w.ndim == 2:
+        N, K = w.shape
+        assert N % 16 == 0, f"N={N} must be divisible by 16"
+        assert K % 32 == 0, f"K={K} must be divisible by 32"
+        w = w.view(N // 16, 16, K // 32, 2, 16)
+        w = w.permute(0, 2, 3, 1, 4).contiguous()
+        w = w.view(N // 16, K * 16)
+    elif w.ndim == 3:
+        E, K, N = w.shape
+        assert K % 32 == 0, f"K={K} must be divisible by 32"
+        assert N % 16 == 0, f"N={N} must be divisible by 16"
+        w = w.transpose(-1, -2)  # (E, N, K)
+        w = w.view(E, N // 16, 16, K // 32, 2, 16)
+        w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
+        w = w.view(E, N // 16, K * 16)
+        w = w.transpose(-1, -2)  # (E, K*16, N//16)
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got {w.ndim}D")
+
+    w = w.view(x_type)
+    return w
 
 
 def shuffle_weight(
@@ -12,10 +50,25 @@ def shuffle_weight(
     use_int4=False,
     is_guinterleave=False,
     gate_up: bool = False,
+    pad_k_to: int = 0,
 ) -> torch.Tensor:
     x_type = x.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
         x = x.view(torch.uint8)
+
+    original_k = x.shape[-1]
+    if pad_k_to:
+        if pad_k_to < 0:
+            raise ValueError(f"pad_k_to must be non-negative, got {pad_k_to}")
+        if use_int4:
+            raise NotImplementedError("pad_k_to is not supported with use_int4=True")
+        if is_guinterleave:
+            raise NotImplementedError(
+                "pad_k_to is not supported with is_guinterleave=True"
+            )
+        padded_k = ((original_k + pad_k_to - 1) // pad_k_to) * pad_k_to
+        if padded_k != original_k:
+            x = F.pad(x.contiguous(), (0, padded_k - original_k), value=0)
 
     if is_guinterleave:
         experts_cnt, N, K_pk = x.shape
@@ -33,8 +86,6 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
-        if gate_up:
-            x_.is_guinterleave = True
         return x_
 
     IN, IK = layout
@@ -51,6 +102,9 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    if pad_k_to:
+        x_.aiter_original_k = original_k
+        x_.aiter_padded_k = x.shape[-1]
     return x_
 
 
@@ -61,7 +115,7 @@ def shuffle_weight_a16w4(
 
     When *klane_inner* is True (gate_up only), the KPack dimension is split into
     two L_sub halves and KLane is placed at dword-contiguous stride so that each
-    lane's 4-byte words are packed together.
+    lane's 4-byte words are packed together, enabling buffer_load_dwordx4.
     """
     if gate_up and klane_inner:
         x_type = src.dtype
@@ -104,6 +158,35 @@ def shuffle_weight_NK(
     )
     x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
     return x_.view(*x.shape)
+
+
+def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Tensor:
+    """Shuffle a raw per-expert e8m0 weight (B) scale into the n32k4 layout.
+
+    Input: ``(E, N, K//32)`` (3D) or ``(E*N, K//32)`` (2D, needs ``experts_cnt``).
+    Output: ``(E, N//32, (K//32)*32)`` uint8.
+
+    Within a 32-row super-row the column is ``remain_k*128 + row32*4 + r`` so each
+    lane reads its full WMMA scaleB operand (4 e8m0 of one WMMA-K=128 step) with
+    one contiguous ds_load_b32.  Consumed by the gfx1250 grouped MoE GEMM
+    (see kernels/gemm_mxscale_gfx1250.py).
+    """
+    s = src.view(torch.uint8).contiguous()
+    if s.ndim == 2:
+        if experts_cnt is None:
+            raise ValueError("experts_cnt is required for a 2D n32k4 scale")
+        s = s.view(experts_cnt, -1, s.shape[-1])
+    elif s.ndim != 3:
+        raise ValueError(f"n32k4 scale must be 2D or 3D, got {s.ndim}D")
+    E, N, k_scale = s.shape
+    if N % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale K//32 must be divisible by 4 (K%128==0), got {k_scale}"
+        )
+    g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
+    return g.reshape(E, N // 32, k_scale * 32)
 
 
 def shuffle_scale(
@@ -166,6 +249,26 @@ def shuffle_scale(
     return shfl_scale.view(*src.shape).contiguous()
 
 
+def moe_shuffle_scale(
+    src: torch.Tensor,
+    experts_cnt: int = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+) -> torch.Tensor:
+    """Arch-aware MoE weight (B) scale shuffle."""
+
+    if get_gfx() == "gfx1250":
+        if is_guinterleave:
+            raise ValueError(
+                "moe_shuffle_scale: is_guinterleave is not supported on gfx1250; "
+                "the n32k4 grouped-MoE B-scale layout does not interleave gate/up."
+            )
+        return shuffle_scale_n32k4(src, experts_cnt)
+    return shuffle_scale(
+        src, experts_cnt=experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
+    )
+
+
 def shuffle_scale_a16w4(
     src: torch.Tensor, experts_cnt: int, gate_up: bool, klane_inner: bool = False
 ) -> torch.Tensor:
@@ -186,56 +289,10 @@ def shuffle_scale_a16w4(
         K1 = k_ // K_Pack // K_Lane
         N1 = n_ // N_Lane // N_Pack
         shfl_scale = src.view(experts_cnt, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane)
-        # Permute to: [E, N1, K1, N_Lane, K_Lane, K_Pack, N_Pack]
         shfl_scale = shfl_scale.permute(0, 2, 4, 3, 6, 5, 1).contiguous()
         return shfl_scale.view(*src.shape).contiguous()
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
-    )
-
-
-def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Tensor:
-    """Shuffle a raw per-expert e8m0 weight (B) scale into the n32k4 layout.
-
-    Input: ``(E, N, K//32)`` (3D) or ``(E*N, K//32)`` (2D, needs ``experts_cnt``).
-    Output: ``(E, N//32, (K//32)*32)`` uint8.
-
-    Consumed by the gfx1250 grouped MoE GEMM.
-    """
-    s = src.view(torch.uint8).contiguous()
-    if s.ndim == 2:
-        if experts_cnt is None:
-            raise ValueError("experts_cnt is required for a 2D n32k4 scale")
-        s = s.view(experts_cnt, -1, s.shape[-1])
-    elif s.ndim != 3:
-        raise ValueError(f"n32k4 scale must be 2D or 3D, got {s.ndim}D")
-    E, N, k_scale = s.shape
-    if N % 32 != 0:
-        raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
-    if k_scale % 4 != 0:
-        raise ValueError(
-            f"B-scale K//32 must be divisible by 4 (K%128==0), got {k_scale}"
-        )
-    g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
-    return g.reshape(E, N // 32, k_scale * 32)
-
-
-def moe_shuffle_scale(
-    src: torch.Tensor,
-    experts_cnt: int = None,
-    is_guinterleave: bool = False,
-    gate_up: bool = False,
-) -> torch.Tensor:
-    """Arch-aware MoE weight (B) scale shuffle."""
-    if get_gfx() == "gfx1250":
-        if is_guinterleave:
-            raise ValueError(
-                "moe_shuffle_scale: is_guinterleave is not supported on gfx1250; "
-                "the n32k4 grouped-MoE B-scale layout does not interleave gate/up."
-            )
-        return shuffle_scale_n32k4(src, experts_cnt)
-    return shuffle_scale(
-        src, experts_cnt=experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
     )
 
 
