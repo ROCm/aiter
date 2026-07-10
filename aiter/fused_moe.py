@@ -316,8 +316,8 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         return parsed is not None and parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
-    if func is _mxfp4_v2_stage2_wrapper:
-        cfg = parse_v2_gemm2_kernel(kernel_name)
+    if func is _flydsl_v2_stage2_wrapper:
+        cfg = parse_flydsl_v2_gemm2_kernel(kernel_name)
         return cfg is not None and cfg.get("epilog") == "reduce"
     return False
 
@@ -1130,20 +1130,15 @@ def _flydsl_stage2_wrapper(
     )
 
 
-_V2_GEMM2_PREFIX = "flydsl_v2_moe2_"
-_V2_GEMM2_RE = re.compile(
-    r"^flydsl_v2_moe2_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
+_FLYDSL_V2_GEMM2_RE = re.compile(
+    r"^flydslv2_moe2_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
 )
 
 
-def is_v2_gemm2_kernel(name):
-    return bool(name) and name.startswith(_V2_GEMM2_PREFIX)
-
-
-def parse_v2_gemm2_kernel(name):
-    m = _V2_GEMM2_RE.match(name or "")
+def parse_flydsl_v2_gemm2_kernel(name):
+    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
     if not m:
         return None
     return {
@@ -1160,7 +1155,7 @@ def parse_v2_gemm2_kernel(name):
     }
 
 
-def _mxfp4_v2_stage2_wrapper(
+def _flydsl_v2_stage2_wrapper(
     inter_states,
     w1,
     w2,
@@ -1184,9 +1179,9 @@ def _mxfp4_v2_stage2_wrapper(
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
-    cfg = parse_v2_gemm2_kernel(kernelName)
+    cfg = parse_flydsl_v2_gemm2_kernel(kernelName)
     if cfg is None:
-        raise ValueError(f"Invalid v2 gemm2 kernel name: {kernelName}")
+        raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName}")
 
     bm = cfg["tile_m"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
@@ -1609,10 +1604,10 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
+    is_flydsl2_v2 = bool(kernelName2) and kernelName2.startswith("flydslv2_")
     is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
-    is_v2_2 = is_v2_gemm2_kernel(kernelName2)
-    if (is_flydsl1 or is_flydsl2 or is_v2_2) and is_flydsl_available():
+    if (is_flydsl1 or is_flydsl2 or is_flydsl2_v2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
@@ -1636,9 +1631,9 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
-        if is_v2_2:
+        if is_flydsl2_v2:
             stage2_func = functools.partial(
-                _mxfp4_v2_stage2_wrapper,
+                _flydsl_v2_stage2_wrapper,
                 kernelName=kernelName2,
                 model_dim=model_dim,
                 inter_dim=inter_dim,
@@ -1687,7 +1682,7 @@ def get_2stage_cfgs(
             has_bias=enable_bias and is_flydsl1,
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and is_flydsl2,
-            skip_inter_quant=is_v2_2,
+            skip_inter_quant=is_flydsl2_v2,
             **route_bucket_metadata,
         )
     if (

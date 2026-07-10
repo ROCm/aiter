@@ -43,7 +43,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_kernel_params,
     flydsl_kernel_name,
 )
-from aiter.fused_moe import is_v2_gemm2_kernel, parse_v2_gemm2_kernel
+from aiter.fused_moe import parse_flydsl_v2_gemm2_kernel
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
 from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
     mxfp4_moe_gemm1,
@@ -792,11 +792,11 @@ def main():
         sort_bm = params1["tile_m"]
 
         kn2 = r.get("kernelName2", "")
-        # A gemm2 row can pin itself to the v2 kernel via a flydsl_v2_moe2_* name in
+        # A gemm2 row can pin itself to the v2 kernel via a flydslv2_moe2_* name in
         # kernelName2. When it does (and we're benching gemm2), the v2 config is
         # read from the name and the baseline flydsl/opus side is skipped for
         # that row -- the CSV row IS the "use v2 for moe2" decision.
-        v2_g2 = parse_v2_gemm2_kernel(kn2) if args.stage == "gemm2" else None
+        v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2) if args.stage == "gemm2" else None
         is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
         params2 = get_flydsl_kernel_params(kn2) or {}
         params2.setdefault("tile_m", bm_csv)
