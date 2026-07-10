@@ -175,16 +175,31 @@ def test_flydsl_fmha_correctness_fp8_cross_attention(
     self-attn, just with independent Q vs K/V lengths; output is bf16."""
     g = torch.Generator(device="cuda").manual_seed(0)
     q = torch.randn(
-        batch, seq_q, num_heads, head_dim, generator=g,
-        dtype=torch.bfloat16, device="cuda",
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     k = torch.randn(
-        batch, seq_kv, num_heads, head_dim, generator=g,
-        dtype=torch.bfloat16, device="cuda",
+        batch,
+        seq_kv,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     v = torch.randn(
-        batch, seq_kv, num_heads, head_dim, generator=g,
-        dtype=torch.bfloat16, device="cuda",
+        batch,
+        seq_kv,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v)
     out = flydsl_flash_attn_func(
@@ -438,7 +453,9 @@ def test_flydsl_fp8_quant_producer_invariants():
     cos = F.cosine_similarity(
         (qq.float() * sq).reshape(-1, d), q.float().reshape(-1, d), dim=1
     )
-    assert cos.mean().item() > 0.99, f"rot=False dequant mean_cos={cos.mean().item():.6f}"
+    assert (
+        cos.mean().item() > 0.99
+    ), f"rot=False dequant mean_cos={cos.mean().item():.6f}"
 
     # rotation=True: rotation must cancel in QK^T. Dequant gives Q@R and K@R; their
     # inner product must match the unrotated Q@K^T (one head).
@@ -477,7 +494,9 @@ def test_flydsl_fp8_quant_backend_agreement():
         outs["torch"].float().reshape(-1, d),
         dim=1,
     )
-    assert cos_fb.mean().item() > 0.998, f"flydsl-vs-torch mean_cos={cos_fb.mean().item():.6f}"
+    assert (
+        cos_fb.mean().item() > 0.998
+    ), f"flydsl-vs-torch mean_cos={cos_fb.mean().item():.6f}"
 
 
 def test_flydsl_fmha_missing_fp8_descale_raises():
@@ -538,8 +557,15 @@ def test_flydsl_fmha_fp8_out_buffer_and_softmax_scale():
         batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
     )
     ret = flydsl_flash_attn_func(
-        qq, kk, vv, causal=False, softmax_scale=scale,
-        q_descale=sq, k_descale=sk, v_descale=sv, out=out,
+        qq,
+        kk,
+        vv,
+        causal=False,
+        softmax_scale=scale,
+        q_descale=sq,
+        k_descale=sk,
+        v_descale=sv,
+        out=out,
     )
     assert ret.data_ptr() == out.data_ptr()
     assert out.dtype == torch.bfloat16
@@ -577,9 +603,7 @@ def test_flydsl_fmha_positional_backcompat():
     optional params (which are appended after it)."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
     out_pos = flydsl_flash_attn_func(q, k, v, False, 2, True)  # positional
-    out_kw = flydsl_flash_attn_func(
-        q, k, v, causal=False, waves_per_eu=2, daz=True
-    )
+    out_kw = flydsl_flash_attn_func(q, k, v, causal=False, waves_per_eu=2, daz=True)
     torch.testing.assert_close(out_pos, out_kw, rtol=0, atol=0)
 
 
