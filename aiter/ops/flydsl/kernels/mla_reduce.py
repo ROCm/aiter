@@ -215,6 +215,7 @@ def compile_mla_reduce(
     use_packed_f32_fma: bool = False,
     disable_guards: bool = False,
     adaptive: bool = False,
+    low_direct_pmap_thr: int = 0,
 ):
     """Compile an MLA reduce kernel for fixed (H, Dv, out_dtype, tier).
 
@@ -386,16 +387,22 @@ def compile_mla_reduce(
             t1 = fx.Int32(g_indptr[tile + fx.Index(1)])
             n_splits = t1 - t0
 
-            # Stage reduce_partial_map[t0:t1] to LDS once per work item
-            # (mirrors reduce.cu:431-438; removes per-split global pmap loads).
-            for split_i in range(
-                fx.Int32(tid), fx.Index(n_splits), fx.Int32(NUM_THREADS), init=None
-            ):
-                split_i32 = fx.Int32(split_i)
-                lds_pmap[fx.Index(split_i32)] = fx.Int32(
-                    g_pmap[fx.Index(t0 + split_i32)]
-                )
-            fx.gpu.barrier()
+            def stage_pmap():
+                """Stage reduce_partial_map[t0:t1] to LDS once per work item.
+
+                This is the normal high-split path (mirrors reduce.cu:431-438).
+                Low-split experiments can bypass it and read pmap directly to
+                avoid paying the fixed staging barrier when there are only a few
+                splits to gather.
+                """
+                for split_i in range(
+                    fx.Int32(tid), fx.Index(n_splits), fx.Int32(NUM_THREADS), init=None
+                ):
+                    split_i32 = fx.Int32(split_i)
+                    lds_pmap[fx.Index(split_i32)] = fx.Int32(
+                        g_pmap[fx.Index(t0 + split_i32)]
+                    )
+                fx.gpu.barrier()
 
             # HIP kn_mla_reduce_v1_ps: skip tiles at the CSR sentinel
             # (reduce.cu:692) or with n_splits<=1. Collapse the seq-loop upper
@@ -411,6 +418,7 @@ def compile_mla_reduce(
                 q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
                 q_end = fx.Int32(g_fmap[tile, fx.Index(1)])
             else:
+                stage_pmap()
                 row0_idx0 = fx.Int32(lds_pmap[fx.Index(0)])
                 row1_idx0 = fx.Int32(lds_pmap[fx.Index(1)])
                 qo_len = row1_idx0 - row0_idx0
@@ -465,17 +473,28 @@ def compile_mla_reduce(
                 )
                 return row_idx, in_bounds
 
-            def gather_row(split_i32, local_seq):
-                pmap = fx.Int32(lds_pmap[fx.Index(split_i32)])
+            def pmap_value(split_i32, direct_pmap: bool = False):
+                if fx.const_expr(direct_pmap):
+                    # Clamp the absolute pmap load address for masked tail slots.
+                    # The contribution is later zeroed by the split-valid guard.
+                    in_split = fx.arith.cmpi(
+                        fx.arith.CmpIPredicate.slt, split_i32, n_splits
+                    )
+                    safe_split = in_split.select(split_i32, fx.Int32(0))
+                    return fx.Int32(g_pmap[fx.Index(t0 + safe_split)])
+                return fx.Int32(lds_pmap[fx.Index(split_i32)])
+
+            def gather_row(split_i32, local_seq, direct_pmap: bool = False):
+                pmap = pmap_value(split_i32, direct_pmap)
                 return row_from_pmap(pmap, local_seq)
 
-            def load_split_o(split_i32, local_seq):
-                row_idx, in_bounds = gather_row(split_i32, local_seq)
+            def load_split_o(split_i32, local_seq, direct_pmap: bool = False):
+                row_idx, in_bounds = gather_row(split_i32, local_seq, direct_pmap)
                 loaded = load_o_elems(g_po, row_idx, fx.Index(head), col)
                 zero = fx.arith.constant(0.0, type=T.f32)
                 return [in_bounds.select(v, zero) for v in loaded]
 
-            def load_split_o_raw(split_i32, local_seq):
+            def load_split_o_raw(split_i32, local_seq, direct_pmap: bool = False):
                 """Like load_split_o but without consuming the loaded value.
 
                 Returns the raw loaded VEC scalars plus an OOB float mask
@@ -483,15 +502,15 @@ def compile_mla_reduce(
                 point of use lets the prefetched load stay in flight (vmcnt(1))
                 instead of draining (vmcnt(0)) in the same loop iteration.
                 """
-                row_idx, in_bounds = gather_row(split_i32, local_seq)
+                row_idx, in_bounds = gather_row(split_i32, local_seq, direct_pmap)
                 loaded = load_o_elems(g_po, row_idx, fx.Index(head), col)
                 one = fx.arith.constant(1.0, type=T.f32)
                 zero = fx.arith.constant(0.0, type=T.f32)
                 mask = in_bounds.select(one, zero)
                 return loaded, mask
 
-            def load_split_lse(split_i32, local_seq):
-                row_idx, in_bounds = gather_row(split_i32, local_seq)
+            def load_split_lse(split_i32, local_seq, direct_pmap: bool = False):
+                row_idx, in_bounds = gather_row(split_i32, local_seq, direct_pmap)
                 lse = g_pl[row_idx, fx.Index(head)]
                 neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
                 return in_bounds.select(lse, neg_inf)
@@ -529,9 +548,9 @@ def compile_mla_reduce(
             # opt5: FlyDSL range (init=None -> scf_range without iter_args) so
             # hot_loop_scheduler can interleave the inner split-loop VMEM loads
             # with compute. Strided over the seq positions this block owns.
-            def emit_simple_body(seq_i32, local_seq):
-                o0 = load_split_o(fx.Int32(0), local_seq)
-                lse0 = load_split_lse(fx.Int32(0), local_seq)
+            def emit_simple_body(seq_i32, local_seq, direct_pmap: bool = False):
+                o0 = load_split_o(fx.Int32(0), local_seq, direct_pmap)
+                lse0 = load_split_lse(fx.Int32(0), local_seq, direct_pmap)
 
                 init = [_to_raw(o0[i]) for i in fx.range_constexpr(VEC)]
                 init += [
@@ -546,8 +565,8 @@ def compile_mla_reduce(
                     regs = [state[i] for i in fx.range_constexpr(VEC)]
                     max_lse = state[VEC]
                     sum_e = state[VEC + 1]
-                    os = load_split_o(fx.Int32(s), local_seq)
-                    lse = load_split_lse(fx.Int32(s), local_seq)
+                    os = load_split_o(fx.Int32(s), local_seq, direct_pmap)
+                    lse = load_split_lse(fx.Int32(s), local_seq, direct_pmap)
                     new_max = fx.arith.maximumf(max_lse, lse)
                     old = _exp(max_lse - new_max, use_exp2)
                     new = _exp(lse - new_max, use_exp2)
@@ -568,7 +587,13 @@ def compile_mla_reduce(
                 store_result(seq_i32, out_elems)
                 store_lse(seq_i32, max_lse, sum_e)
 
-            def emit_massive_body(seq_i32, local_seq, nlse: int, grp_override=None):
+            def emit_massive_body(
+                seq_i32,
+                local_seq,
+                nlse: int,
+                grp_override=None,
+                direct_pmap: bool = False,
+            ):
                 """Warp0 LSE reduce -> lds_scale -> barrier -> accumulate.
 
                 ``grp_override`` forces the accumulate GRP (loads-in-flight)
@@ -592,7 +617,7 @@ def compile_mla_reduce(
                             fx.arith.CmpIPredicate.slt, split_idx, n_splits
                         )
                         safe = in_rng.select(split_idx, fx.Int32(0))
-                        lse_j = load_split_lse(safe, local_seq)
+                        lse_j = load_split_lse(safe, local_seq, direct_pmap)
                         lse_j = in_rng.select(lse_j, neg_inf)
                         local_lses.append(lse_j)
                         max_lse = fx.arith.maximumf(max_lse, lse_j)
@@ -684,10 +709,11 @@ def compile_mla_reduce(
                 def load_os_group(base_i32):
                     """pmap-only phase of a group load: gather rows + issue the
                     GRP os buffer_loads + compute the OOB valid flags. Depends on
-                    lds_pmap (staged + barriered at the top of the work item),
-                    NOT on lds_scale, so it can be hoisted ahead of the LSE-reduce
-                    scale barrier (lever #6) to overlap the VMEM load latency with
-                    the warp0 LSE reduce + the barrier wait.
+                    pmap (staged LDS on the normal path, direct global on the
+                    low-split experiment), NOT on lds_scale, so it can be hoisted
+                    ahead of the LSE-reduce scale barrier (lever #6) to overlap
+                    the VMEM load latency with the warp0 LSE reduce + the barrier
+                    wait.
 
                     Vectorized LDS: base = i*GRP is 16B-aligned so the pmap read
                     is a wide ds_read_b128. Returns (os_list, valids); the scale
@@ -700,13 +726,16 @@ def compile_mla_reduce(
                     row-clamped -- no stale value ever reaches the gather address,
                     even with guards disabled.
                     """
-                    base_idx = fx.Index(base_i32)
-                    pmap_v = lds_pmap.load(base_idx, vec_size=GRP)
-                    pmap0 = fx.Int32(
-                        fx.vector.extract(
-                            pmap_v, static_position=[0], dynamic_position=[]
+                    if fx.const_expr(direct_pmap):
+                        pmap0 = fx.Int32(g_pmap[fx.Index(t0)])
+                    else:
+                        base_idx = fx.Index(base_i32)
+                        pmap_v = lds_pmap.load(base_idx, vec_size=GRP)
+                        pmap0 = fx.Int32(
+                            fx.vector.extract(
+                                pmap_v, static_position=[0], dynamic_position=[]
+                            )
                         )
-                    )
                     os_list = []
                     valids = []
                     for j in fx.range_constexpr(GRP):
@@ -714,11 +743,15 @@ def compile_mla_reduce(
                         in_split = fx.arith.cmpi(
                             fx.arith.CmpIPredicate.slt, split_j, n_splits
                         )
-                        pmap_raw = fx.Int32(
-                            fx.vector.extract(
-                                pmap_v, static_position=[j], dynamic_position=[]
+                        if fx.const_expr(direct_pmap):
+                            safe_split = in_split.select(split_j, fx.Int32(0))
+                            pmap_raw = fx.Int32(g_pmap[fx.Index(t0 + safe_split)])
+                        else:
+                            pmap_raw = fx.Int32(
+                                fx.vector.extract(
+                                    pmap_v, static_position=[j], dynamic_position=[]
+                                )
                             )
-                        )
                         pmap_j = fx.Int32(in_split.select(pmap_raw, pmap0))
                         row_idx, in_bounds = row_from_pmap(pmap_j, local_seq)
                         os_raw = load_o_elems(g_po, row_idx, fx.Index(head), col)
@@ -828,7 +861,7 @@ def compile_mla_reduce(
                 out_elems = accumulate(regs, os_g, sc_g)
                 store_result(seq_i32, out_elems)
 
-            def dispatch_tier_body(seq_i32, local_seq):
+            def dispatch_tier_body(seq_i32, local_seq, direct_pmap: bool = False):
                 """Select algorithm from n_splits (runtime for Tier.ALL)."""
                 if fx.const_expr(is_runtime_tier):
                     is_lt_thr = fx.arith.cmpi(
@@ -838,7 +871,7 @@ def compile_mla_reduce(
                     )
                     if_lt = scf.IfOp(is_lt_thr, results_=[], has_else=True)
                     with _if_then(if_lt):
-                        emit_simple_body(seq_i32, local_seq)
+                        emit_simple_body(seq_i32, local_seq, direct_pmap)
                     with _if_else(if_lt):
                         is_le_64 = fx.arith.cmpi(
                             fx.arith.CmpIPredicate.sle,
@@ -865,13 +898,23 @@ def compile_mla_reduce(
                                 )
                                 with _if_then(if_hi):
                                     emit_massive_body(
-                                        seq_i32, local_seq, 1,
+                                        seq_i32,
+                                        local_seq,
+                                        1,
                                         grp_override=M64_HI_GRP,
+                                        direct_pmap=direct_pmap,
                                     )
                                 with _if_else(if_hi):
-                                    emit_massive_body(seq_i32, local_seq, 1)
+                                    emit_massive_body(
+                                        seq_i32,
+                                        local_seq,
+                                        1,
+                                        direct_pmap=direct_pmap,
+                                    )
                             else:
-                                emit_massive_body(seq_i32, local_seq, 1)
+                                emit_massive_body(
+                                    seq_i32, local_seq, 1, direct_pmap=direct_pmap
+                                )
                         with _if_else(if_le64):
                             is_le_256 = fx.arith.cmpi(
                                 fx.arith.CmpIPredicate.sle,
@@ -882,20 +925,45 @@ def compile_mla_reduce(
                                 is_le_256, results_=[], has_else=True
                             )
                             with _if_then(if_le256):
-                                emit_massive_body(seq_i32, local_seq, 4)
+                                emit_massive_body(
+                                    seq_i32, local_seq, 4, direct_pmap=direct_pmap
+                                )
                             with _if_else(if_le256):
                                 emit_massive_body(
-                                    seq_i32, local_seq, NLSE_MLDS
+                                    seq_i32,
+                                    local_seq,
+                                    NLSE_MLDS,
+                                    direct_pmap=direct_pmap,
                                 )
                 elif fx.const_expr(not is_massive):
-                    emit_simple_body(seq_i32, local_seq)
+                    emit_simple_body(seq_i32, local_seq, direct_pmap)
                 else:
-                    emit_massive_body(seq_i32, local_seq, NLSE)
+                    emit_massive_body(
+                        seq_i32, local_seq, NLSE, direct_pmap=direct_pmap
+                    )
 
-            for seq in range(seq0, ub_seq, ntg, init=None):
-                seq_i32 = fx.Int32(seq)
-                local_seq = seq_i32 - q_start
-                dispatch_tier_body(seq_i32, local_seq)
+            def run_seq_loop(direct_pmap: bool = False):
+                for seq in range(seq0, ub_seq, ntg, init=None):
+                    seq_i32 = fx.Int32(seq)
+                    local_seq = seq_i32 - q_start
+                    dispatch_tier_body(seq_i32, local_seq, direct_pmap)
+
+            if fx.const_expr(low_direct_pmap_thr > 0 and use_reduce_final_map):
+                use_direct_pmap = fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.sle,
+                    n_splits,
+                    fx.Int32(low_direct_pmap_thr),
+                )
+                if_direct = scf.IfOp(use_direct_pmap, results_=[], has_else=True)
+                with _if_then(if_direct):
+                    run_seq_loop(direct_pmap=True)
+                with _if_else(if_direct):
+                    stage_pmap()
+                    run_seq_loop(direct_pmap=False)
+            else:
+                if fx.const_expr(use_reduce_final_map):
+                    stage_pmap()
+                run_seq_loop(direct_pmap=False)
 
         if fx.const_expr(persistent and not adaptive):
             # Grid-stride persistent launch (kn_mla_reduce_v1_ps, reduce.cu:669).

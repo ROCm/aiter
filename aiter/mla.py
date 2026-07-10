@@ -658,6 +658,11 @@ def mla_decode_fwd(
                 0,
             )
 
+        if actual_max_splits is None and reduce_indptr is not None:
+            actual_max_splits = int(
+                (reduce_indptr[1:] - reduce_indptr[:-1]).max().item()
+            )
+
         _mla_reduce_v1_dispatch(
             logits,
             attn_lse,

@@ -85,6 +85,14 @@ def _host_tier_dispatch_enabled() -> bool:
     return os.environ.get("AITER_MLA_REDUCE_HOST_TIER", "0") == "1"
 
 
+# Low-split direct-pmap path threshold. For adaptive multi-tile decode whose
+# true per-tile max split (``actual_max_splits``) is <= this, the reduce reads
+# reduce_partial_map directly instead of staging it to LDS + a barrier first
+# (measured faster on the low-split serving shapes; high-split captures keep the
+# vectorized LDS pmap path via a separate compiled kernel). Always on.
+_LOW_DIRECT_PMAP_THR = 8
+
+
 def _safe_host_tier(num_kv_splits: int) -> Tier:
     """Capture-safe host tier from ``num_kv_splits``, GUARDED against under-baking.
 
@@ -260,6 +268,14 @@ def flydsl_mla_reduce_v1(
         and num_final_rows * H * max_seqlen_q <= 4 * num_cu
     )
 
+    low_direct_pmap_thr = 0
+    if (
+        use_adaptive
+        and actual_max_splits is not None
+        and int(actual_max_splits) <= _LOW_DIRECT_PMAP_THR
+    ):
+        low_direct_pmap_thr = _LOW_DIRECT_PMAP_THR
+
     kernel = compile_mla_reduce(
         H=H,
         Dv=Dv,
@@ -270,6 +286,7 @@ def flydsl_mla_reduce_v1(
         use_reduce_final_map=use_reduce_final_map,
         waves_per_eu=waves_per_eu_from_env(),
         adaptive=use_adaptive,
+        low_direct_pmap_thr=low_direct_pmap_thr,
     )
 
     if final_lse is None:
