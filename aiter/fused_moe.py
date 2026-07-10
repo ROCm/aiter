@@ -1017,6 +1017,7 @@ def _flydsl_stage1_wrapper(
     swiglu_limit: Optional[float] = None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    v2_output_layout: bool = False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1058,6 +1059,7 @@ def _flydsl_stage1_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
+        v2_output_layout=v2_output_layout,
     )
 
 
@@ -2195,6 +2197,8 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+        if stage2_func is _flydsl_v2_stage2_wrapper:
+            extra_stage1_args["v2_output_layout"] = True
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:

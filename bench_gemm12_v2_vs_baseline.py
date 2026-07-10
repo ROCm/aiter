@@ -547,12 +547,10 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
 
 
 def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
-    """Run baseline gemm1 (AITER_FMOE_V2 layout) into v2's sorted-row fp8 buffers.
+    """Run baseline gemm1 into v2's sorted-row fp8/fp4 buffers.
 
-    With AITER_FMOE_V2=1 the baseline flydsl gemm1 writes its fused-quant payload
-    by sorted row and its e8m0 scale in the v2 layout, so the outputs can drive
-    the v2 gemm2 directly -- letting --stage gemm2 compare v2 gemm2 on a BASELINE
-    gemm1 producer instead of the v2 gemm1 producer.
+    flydslv2_* GEMM2 consumes the v2 sorted-row payload. This path lets
+    --stage gemm2 compare v2 GEMM2 on a baseline GEMM1 producer.
     """
     a1_scale_sort = moe_mxfp4_sort(
         d["a1_scale"][:token, :].view(token, 1, -1),
@@ -600,6 +598,7 @@ def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
         gate_mode=gate_mode,
         b_nt=params.get("b_nt", 2),
         k_wave=params.get("k_wave", 1),
+        v2_output_layout=True,
     )
     v["isq"] = out.view(torch.uint8).view_as(v["isq"])
     v["iss"] = scale.view(torch.uint8)
@@ -608,9 +607,6 @@ def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
 
 def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
                                   BM_S1, use_nt, BN, k_wave, base_gemm1_params):
-    if os.environ.get("AITER_FMOE_V2", "0") != "1":
-        print("\nwarning: gemm1 v2-layout compare expects AITER_FMOE_V2=1")
-
     populate_baseline_v2_intermediate(d, v, token, topk, base_gemm1_params, BM_S1)
     baseline_isq = v["isq"].clone()
 
@@ -653,11 +649,11 @@ def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
 
 def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_nt,
                   epilog, persist, BN, k_wave, base_gemm1_params=None,
-                  print_output=False):
+                  print_output=False, use_flydslv2_producer=False):
     stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
-    if os.environ.get("AITER_FMOE_V2", "0") == "1":
+    if use_flydslv2_producer:
         if base_gemm1_params is None:
-            raise ValueError("base_gemm1_params is required when AITER_FMOE_V2=1")
+            raise ValueError("base_gemm1_params is required for FlyDSL v2 layout")
         populate_baseline_v2_intermediate(d, v, token, topk, base_gemm1_params, BM_S1)
     else:
         # Populate the sorted fp8 intermediate exactly as v2 production gemm2 consumes it.
@@ -714,6 +710,7 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
     got = _stage2_out_for_check(out, epilog, token, topk, model_dim).float()
     if print_output:
         _print_close_stats("gemm2 v2 vs torch ref", ref, got)
+        _print_tensor("torch ref gemm2 output", ref)
         _print_tensor("v2 gemm2 output", got)
     ok = torch.isclose(ref, got, atol=1.0, rtol=0.05).float().mean().item() * 100
     _, us = run_perftest(fn, num_warmup=WARMUP, num_iters=ITERS)
@@ -867,7 +864,7 @@ def main():
                 BM_v2, epilog, persist, use_nt = select_gemm2_config(
                     args.model_dim, args.inter_dim, args.experts, args.topk, token
                 )
-                if os.environ.get("AITER_FMOE_V2", "0") == "1":
+                if v2_g2 is not None:
                     # The producer is baseline gemm1, so use its sort padding unit.
                     BM_S1 = sort_bm
                 if BM_S1 % BM_v2 != 0:
@@ -887,7 +884,7 @@ def main():
             persist = v2_g2["persist"]
             use_nt = v2_g2["use_nt"]
             BM_S1 = v2_g2["sort_block_m"] or BM_S1
-            if os.environ.get("AITER_FMOE_V2", "0") == "1":
+            if v2_g2 is not None:
                 # Producer is baseline gemm1; align sort unit to its tile.
                 BM_S1 = sort_bm
             if BM_S1 % BM_v2 != 0:
@@ -911,7 +908,8 @@ def main():
                     d, v, token, args.model_dim, args.inter_dim,
                     args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog, persist,
                     BN_v2, KW_v2, base_gemm1_params=params1,
-                    print_output=args.print_output
+                    print_output=args.print_output,
+                    use_flydslv2_producer=v2_g2 is not None,
                 )
                 if v2_g2 is not None:
                     # The CSV's chosen gemm2 is this same v2 kernel, so the
@@ -921,6 +919,7 @@ def main():
                         d, v, token, args.model_dim, args.inter_dim,
                         args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog,
                         persist, BN_v2, KW_v2, base_gemm1_params=params1,
+                        use_flydslv2_producer=True,
                     )
         except Exception as e:
             v2_us, v2_nz = float("nan"), -1

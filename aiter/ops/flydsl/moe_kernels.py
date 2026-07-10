@@ -1131,6 +1131,7 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: Optional[float] = None,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1178,7 +1179,7 @@ def flydsl_moe_stage1(
     _v2_output_layout = (
         _fuse_any_quant
         and not _is_splitk
-        and os.environ.get("AITER_FMOE_V2", "0") == "1"
+        and v2_output_layout
     )
 
     dev = a.device
