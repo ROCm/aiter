@@ -160,7 +160,7 @@ void TileGemmComputeImpl(const HostArguments& args)
         (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8);
 
     constexpr bool TransposeC = GemmConfig::TransposeC_v;
-    static_assert(!TransposeC);
+    // TODO: Try direct store in the future.
 
     using GemmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<GemmConfig::M_Tile_v, GemmConfig::N_Tile_v, GemmConfig::K_Tile_v>,
