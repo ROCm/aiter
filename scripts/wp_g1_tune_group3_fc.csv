@@ -1,0 +1,7 @@
+M,N,K,q_dtype_w
+16,7424,8192,torch.float8_e4m3fn
+32,7424,8192,torch.float8_e4m3fn
+64,7424,8192,torch.float8_e4m3fn
+128,7424,8192,torch.float8_e4m3fn
+4096,7424,8192,torch.float8_e4m3fn
+8192,7424,8192,torch.float8_e4m3fn

@@ -144,14 +144,24 @@ def bench_shape(m, n, k, dtype=dtypes.bf16, quant_dtype=dtypes.fp8):
     })
 
     # --- FlyDSL ---
-    ki = _select_flydsl_preshuffle_kernel(m, n, k)
-    if ki is not None:
+    # Prefer tuned config from bpreshuffle CSV; fall back to heuristic
+    bp_config = get_GEMM_config_with_quant_type(
+        m, n, k, quant_dtype, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    )
+    fly_kernel_name = None
+    if bp_config is not None and bp_config.get("libtype") == "flydsl":
+        fly_kernel_name = bp_config["kernelName"]
+    else:
+        ki = _select_flydsl_preshuffle_kernel(m, n, k)
+        if ki is not None:
+            fly_kernel_name = ki.name
+    if fly_kernel_name is not None:
         out_fly = torch.empty(m, n, dtype=dtype, device="cuda")
         try:
-            run_flydsl(x, weight_shuffled, x_scale, w_scale, out_fly, ki.name)
+            run_flydsl(x, weight_shuffled, x_scale, w_scale, out_fly, fly_kernel_name)
             fly_us = bench_kernel(
                 lambda: run_flydsl(
-                    x, weight_shuffled, x_scale, w_scale, out_fly, ki.name
+                    x, weight_shuffled, x_scale, w_scale, out_fly, fly_kernel_name
                 )
             )
             fly_tflops = flops / fly_us * 1e-6
@@ -166,7 +176,7 @@ def bench_shape(m, n, k, dtype=dtypes.bf16, quant_dtype=dtypes.fp8):
             "fly_us": round(fly_us, 2),
             "fly_tflops": round(fly_tflops, 2),
             "fly_err": round(fly_err_ratio, 4),
-            "fly_kernel": ki.name,
+            "fly_kernel": fly_kernel_name,
         })
 
         if ck_us > 0 and fly_us > 0 and ck_us != float("inf"):
