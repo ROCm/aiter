@@ -15,9 +15,6 @@
 #   Constexpr M   : separate kernel per M=1,2,3,4 — no runtime clamping/branches
 #   B bypass L2   : 0x2000 cache modifier — B (234MB) too large for L2
 #                   A (<=57KB) goes through L2 and benefits from caching
-#
-# HOW TO RUN:
-#   HIP_VISIBLE_DEVICES=7 python3 gemm_decode.py
 # ===========================================================================
 #
 # gemm_decode: warp-per-scalar small-M GEMM for LLM autoregressive decode.
