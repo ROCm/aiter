@@ -115,7 +115,9 @@ def _quant_one_pertensor(x: torch.Tensor, R: torch.Tensor | None):
     amax = x.abs().max().to(torch.float32)
     s = (amax / _FP8_QUANT_MAX).clamp(min=1e-12).reshape(1)
     xq = (
-        (x.to(torch.float32) / s).clamp(-_FP8_QUANT_MAX, _FP8_QUANT_MAX).to(_FP8_QUANT_DTYPE)
+        (x.to(torch.float32) / s)
+        .clamp(-_FP8_QUANT_MAX, _FP8_QUANT_MAX)
+        .to(_FP8_QUANT_DTYPE)
     )
     return xq, s
 
@@ -123,7 +125,9 @@ def _quant_one_pertensor(x: torch.Tensor, R: torch.Tensor | None):
 if _HAS_TRITON:
 
     @triton.jit
-    def _rot_amax3(q, k, v, R, aq, ak, av, M, D: tl.constexpr, BLOCK_ROWS: tl.constexpr):
+    def _rot_amax3(
+        q, k, v, R, aq, ak, av, M, D: tl.constexpr, BLOCK_ROWS: tl.constexpr
+    ):
         """Fused Hadamard-rotate (Q/K only) + per-tensor amax over q/k/v. Row-
         tiled: each program rotates a ``(BLOCK_ROWS, D)`` tile in-register via
         ``tl.dot(x, R)`` on the matrix cores and atomic-max's its abs-max into
@@ -247,9 +251,19 @@ def flydsl_fp8_quant(
     k8 = torch.empty_like(k, dtype=_FP8_QUANT_DTYPE)
     v8 = torch.empty_like(v, dtype=_FP8_QUANT_DTYPE)
     _rot_sc3[grid](
-        q2, k2, v2, R,
-        q8.view(M, head_dim), k8.view(M, head_dim), v8.view(M, head_dim),
-        sq, sk, sv, M, D=head_dim, BLOCK_ROWS=_ROT_ROWS,
+        q2,
+        k2,
+        v2,
+        R,
+        q8.view(M, head_dim),
+        k8.view(M, head_dim),
+        v8.view(M, head_dim),
+        sq,
+        sk,
+        sv,
+        M,
+        D=head_dim,
+        BLOCK_ROWS=_ROT_ROWS,
     )
     return q8, k8, v8, sq, sk, sv
 

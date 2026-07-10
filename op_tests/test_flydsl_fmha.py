@@ -105,14 +105,24 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
         # plus the fused amax+cast is paid on every call, inside the timed region.
         q8, k8, v8, s_q, s_k, s_v = flydsl_fp8_quant(q, k, v)
         return flydsl_flash_attn_func(
-            q8, k8, v8, causal=causal,
-            q_descale=s_q, k_descale=s_k, v_descale=s_v,
+            q8,
+            k8,
+            v8,
+            causal=causal,
+            q_descale=s_q,
+            k_descale=s_k,
+            v_descale=s_v,
         )
 
     def _flydsl_fp8_kernel_only():
         return flydsl_flash_attn_func(
-            qq, kk, vv, causal=causal,
-            q_descale=sq, k_descale=sk, v_descale=sv,
+            qq,
+            kk,
+            vv,
+            causal=causal,
+            q_descale=sq,
+            k_descale=sk,
+            v_descale=sv,
         )
 
     # (fn, layout, in_bytes, out_bytes) -- layout is the fn's output layout.
@@ -166,9 +176,7 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
 
 def main():
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "flydsl flash-attn unsupported on %s; skipping", get_gfx()
-        )
+        aiter.logger.warning("flydsl flash-attn unsupported on %s; skipping", get_gfx())
         return
 
     parser = argparse.ArgumentParser(
