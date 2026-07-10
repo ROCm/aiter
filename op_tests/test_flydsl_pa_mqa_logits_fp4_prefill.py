@@ -29,6 +29,7 @@ import argparse
 import torch
 
 from aiter.ops.flydsl import is_flydsl_available
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import run_perftest
 
 dev = "cuda"
@@ -466,6 +467,10 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     args = ap.parse_args()
+
+    if get_arch() != "gfx950":
+        print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
+        return
 
     if not is_flydsl_available():
         print("[skip] flydsl is not available in this environment.")
