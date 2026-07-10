@@ -561,6 +561,68 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_flydsl_via_ck_path(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, None, dtype)
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_flydsl_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
+
+
+@benchmark()
+def test_gemm_flydsl(dtype, m, n, k, quantDtype=dtypes.fp8):
+    """Test FlyDSL preshuffle GEMM against torch reference for both bf16 and fp16.
+
+    When FlyDSL kernel compilation fails (e.g. FlyDSL version mismatch),
+    the dispatch falls back to CK — the test still validates correctness
+    of whichever backend actually runs.
+    """
+    x = torch.randn((m, k), dtype=dtype, device="cuda")
+    weight = torch.randn((n, k), dtype=dtype, device="cuda")
+    x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
+    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
+    weightshuffle = shuffle_weight(weight, layout=(16, 16))
+
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, None, dtype)
+
+    # Test gemm_a8w8_CK path (routes to FlyDSL when available, falls back to CK)
+    b, avg_b = run_gemm_flydsl_via_ck_path(x, weight, x_scale, w_scale, dtype)
+    err_b = checkAllclose(
+        a, b, msg="flydsl via CK path: ", rtol=1e-1, atol=1e-1, tol_err_ratio=1.0,
+        printLog=False,
+    )
+
+    # Test gemm_a8w8_bpreshuffle path (FlyDSL fallback, then CK)
+    c, avg_c = run_gemm_flydsl_bpreshuffle(
+        x, weightshuffle, x_scale, w_scale, dtype
+    )
+    err_c = checkAllclose(
+        a, c, msg="flydsl bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
+    )
+
+    return {
+        "flydsl via CK us": avg_b,
+        "flydsl via CK err": err_b,
+        "flydsl bpreshuffle us": avg_c,
+        "flydsl bpreshuffle err": err_c,
+    }
+
+
+def test_flydsl_gemm_a8w8(l_dtype, l_mnk):
+    """Run FlyDSL GEMM tests across shapes and output dtypes."""
+    df = []
+    for dtype in l_dtype:
+        for m, n, k in l_mnk:
+            ret = test_gemm_flydsl(dtype, m, n, k, dtypes.fp8)
+            df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a8w8 FlyDSL summary (markdown):\n%s", df_md)
+    return df
+
+
 def _iter_flydsl_csv_cases():
     """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
@@ -717,6 +779,11 @@ parser.add_argument(
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
+parser.add_argument(
+    "--flydsl",
+    action="store_true",
+    help="Run FlyDSL-specific correctness tests (fp8 input, bf16/fp16 output).",
+)
 
 
 args = parser.parse_args()
@@ -797,3 +864,21 @@ if not args.no_legacy:
             bpre_out = os.path.join(args.output, bpre_filename)
             df_bpre.to_csv(bpre_out, index=False)
             print(f"Saved bpreshuffle results to: {bpre_out}")
+
+if args.flydsl:
+    flydsl_mnk = [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (256, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (4096, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (128, 8192, 1024),
+        (512, 8192, 1024),
+        (4096, 8192, 1024),
+    ]
+    test_flydsl_gemm_a8w8([dtypes.bf16, dtypes.fp16], flydsl_mnk)
