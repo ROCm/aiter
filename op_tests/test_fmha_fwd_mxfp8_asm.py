@@ -119,7 +119,10 @@ def _gen_qkv(shape, init_pattern, block_dim):
 # Q/K seq shuffle within each 64-row tile: dst row i takes src row _SEQ_PERM[i].
 _SEQ_TILE = 64
 _SEQ_PERM = np.array(
-    [(i % 32) // 2 + (i // 32) * 32 + (16 if (i % 32) % 2 else 0) for i in range(_SEQ_TILE)],
+    [
+        (i % 32) // 2 + (i // 32) * 32 + (16 if (i % 32) % 2 else 0)
+        for i in range(_SEQ_TILE)
+    ],
     dtype=np.int64,
 )
 
@@ -131,7 +134,9 @@ def _e8m0_tensor_from_bytes(flat_u8):
     return e8
 
 
-def build_gpu_scale_qk(dense_bytes, batch, head_num, seq_len, head_dim, sub, extra_tiles=0):
+def build_gpu_scale_qk(
+    dense_bytes, batch, head_num, seq_len, head_dim, sub, extra_tiles=0
+):
     """Q/K GPU scale: pad seq to `sub`-aligned then interleave-shuffle each
     64-row tile.  dense_bytes: [batch, head_num, seq_len, head_dim//BLOCK_SIZE].
 
@@ -169,10 +174,10 @@ def build_gpu_scale_v(dense_bytes, batch, kv_head, seq_len, v_head_dim, sub_k):
     if num_units > 1:
         tile_seq_rows = sub_k // BLOCK_SIZE
         n_tiles = seq_rows_gpu // tile_seq_rows
-        gpu = gpu.reshape(
-            batch * kv_head, n_tiles, tile_seq_rows, num_units, unit_hdim
-        )
-        gpu = gpu.transpose(0, 1, 3, 2, 4)  # -> [.., num_units, tile_seq_rows, unit_hdim]
+        gpu = gpu.reshape(batch * kv_head, n_tiles, tile_seq_rows, num_units, unit_hdim)
+        gpu = gpu.transpose(
+            0, 1, 3, 2, 4
+        )  # -> [.., num_units, tile_seq_rows, unit_hdim]
         gpu = np.ascontiguousarray(gpu)
     return _e8m0_tensor_from_bytes(gpu.reshape(-1))
 
@@ -206,7 +211,9 @@ def make_inputs(batch, nheads, nheads_k, seqlen_q, seqlen_k, d, init_pattern=0):
 
     q_scale = build_gpu_scale_qk(q_sb, batch, nheads, seqlen_q, d, SUB_Q)
     # K-scale kernel over-read (2 tiles) workaround.
-    k_scale = build_gpu_scale_qk(k_sb, batch, nheads_k, seqlen_k, d, SUB_K, extra_tiles=2)
+    k_scale = build_gpu_scale_qk(
+        k_sb, batch, nheads_k, seqlen_k, d, SUB_K, extra_tiles=2
+    )
     v_scale = build_gpu_scale_v(v_sb, batch, nheads_k, seqlen_k, d_v, SUB_K)
 
     q_in = q_fp8.transpose(1, 2)
@@ -238,7 +245,9 @@ def test_fmha_fwd_mxfp8(batch, nheads, nheads_k, seqlen, d, causal, init_pattern
         q_deq,
         k_deq,
         v_deq,
-    ) = make_inputs(batch, nheads, nheads_k, seqlen, seqlen, d, init_pattern=init_pattern)
+    ) = make_inputs(
+        batch, nheads, nheads_k, seqlen, seqlen, d, init_pattern=init_pattern
+    )
     d_v = d
 
     ref = run_torch(q_deq, k_deq, v_deq, causal)
