@@ -338,15 +338,28 @@ def shuffle_scale(
         raise ValueError("experts_cnt is required when is_guinterleave=True")
 
     n_experts, k_ = src.shape
+    if k_ % 8 != 0:
+        k_padded = (k_ + 7) // 8 * 8
+        scale_padded = torch.empty(
+            n_experts, k_padded, dtype=src.dtype, device=src.device
+        )
+        if scale_padded.element_size() == 1:
+            scale_padded.view(torch.uint8).fill_(0x7F)
+        else:
+            scale_padded.fill_(1)
+        scale_padded[:, :k_] = src
+        src = scale_padded
+        k_ = k_padded
     n_ = n_experts // experts_cnt
-    # MXFP4 constants
+    # MXFP4 constants.  The scale layout packs two 4-scale dwords per tile-K
+    # group, so shapes with K//32 not divisible by 8 are padded above.
     K_Pack = 2
     N_Pack = 2
     N_Lane = 16
     K_Lane = 64 // N_Lane  # 4
 
     # Basic dimensions
-    K1 = k_ // K_Pack // K_Lane  # k_ // 8
+    K1 = k_ // K_Pack // K_Lane
     N1 = n_ // N_Lane // N_Pack  # n_ // 32
     real_k = 32 * k_ * K_Pack * K_Lane  # 1x32 quant
     assert real_k >= 256, f"K {real_k} must be larger than Tile_K(256)"
