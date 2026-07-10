@@ -87,6 +87,7 @@ def build_moe_gather_reduce_module(
     out_dtype: str = "bf16",
     split_k: int = 1,
     vec_dwords: int = 2,
+    w_dtype: str = "f32",
 ):
     """Return a JIT launcher for the one-pass MoE gather-reduce epilogue.
 
@@ -102,9 +103,14 @@ def build_moe_gather_reduce_module(
     out_dtype : str   "bf16" or "f16" (input and output share this dtype)
     split_k   : int   number of split-K slices in grouped_out_flat
     vec_dwords: int   dwords per thread (2 or 4)
+    w_dtype   : str   route-weight dtype: "f32" (default), "bf16", or "f16".
+                      The weight is always accumulated in f32; passing "f32"
+                      lets the host feed native fp32 route weights directly and
+                      avoids a fp32->bf16 copy kernel before the epilogue.
     """
     assert model_dim % 2 == 0, "model_dim must be even (2 elems per dword)"
     assert out_dtype in ("bf16", "f16")
+    assert w_dtype in ("f32", "bf16", "f16")
     if vec_dwords not in (2, 4):
         raise ValueError(f"vec_dwords must be 2 or 4, got {vec_dwords}")
     # Smaller per-thread groups increase column-grid parallelism for tiny token
@@ -117,6 +123,7 @@ def build_moe_gather_reduce_module(
 
     module_name = (
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
+        f"_w{w_dtype}"
     )
 
     @flyc.kernel(name=module_name)
@@ -134,7 +141,11 @@ def build_moe_gather_reduce_module(
         f32 = T.f32
         i32 = T.i32
         vec_i32_ty = T.vec(VEC, i32)
-        w_dt = T.bf16 if out_dtype == "bf16" else T.f16  # weight native dtype
+        # Route-weight native dtype. "f32" lets the host pass raw fp32 route
+        # weights straight through (no pre-cast); bf16/f16 get extended below.
+        # (Ternary, not multi-line if: the flydsl tracer does not capture vars
+        # bound in an if/elif block for the nested _load_row_weight closure.)
+        w_dt = T.f32 if w_dtype == "f32" else (T.bf16 if w_dtype == "bf16" else T.f16)
 
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
@@ -165,14 +176,15 @@ def build_moe_gather_reduce_module(
                 row_i32 = ArithValue(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
-                # weight is bf16/f16 (its native dtype); extend to f32
-                w_f32 = ArithValue(
-                    arith.extf(
-                        f32,
-                        buffer_ops.buffer_load(
-                            w_rsrc, map_off, vec_width=1, dtype=w_dt
-                        ),
-                    )
+                # weight loaded in its native dtype; extend to f32 unless it is
+                # already f32 (native fp32 route weights need no conversion).
+                w_loaded = buffer_ops.buffer_load(
+                    w_rsrc, map_off, vec_width=1, dtype=w_dt
+                )
+                w_f32 = (
+                    ArithValue(w_loaded)
+                    if w_dtype == "f32"
+                    else ArithValue(arith.extf(f32, w_loaded))
                 )
                 return row_i32, w_f32
 
