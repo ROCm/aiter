@@ -3,6 +3,7 @@
 
 import torch
 import itertools
+import gc
 from contextlib import nullcontext
 import aiter
 from aiter import dtypes
@@ -1057,6 +1058,9 @@ for kwargs, extras in case_iter:
                 os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
             else:
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
+        # Reclaim per-case VRAM to avoid OOM under fragmentation.
+        gc.collect()
+        torch.cuda.empty_cache()
     if ret is None:
         continue
     ret.update(extras)
