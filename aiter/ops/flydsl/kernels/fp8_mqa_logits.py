@@ -28,20 +28,25 @@ from aiter.jit.utils.chip_info import get_gfx
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, rocdl
-from flydsl.expr.numeric import ArithValue
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T
 from flydsl._mlir.dialects import scf
 from flydsl._mlir import ir
 
 from .tensor_shim import GTensor, _run_compiled, _to_raw
-
-Vec = fx.Vector
-
-
-def _i32_add(a, b):
-    """i32 add (result stays Int32, not index type)."""
-    return fx.Int32(arith.addi(_to_raw(a), _to_raw(b)))
+from ._mqa_logits_common import (
+    MFMA_M,
+    MFMA_N,
+    MFMA_K,
+    DEFAULT_COMPILE_HINTS as _DEFAULT_COMPILE_HINTS,
+    Vec,
+    i32_add as _i32_add,
+    device_cu_count as _device_cu_count,
+    load_pack_i64,
+    fn_to_fnuz_i64,
+    make_out_row_view,
+    mfma_head_reduce,
+)
 
 
 # Default KV tile width (columns processed per inner-loop iteration).
@@ -49,20 +54,6 @@ _BLOCK_KV = 128
 # Don't split a row's KV window into chunks smaller than this many BKV tiles --
 # below it the per-block Q/weight preload stops being amortized.
 _MIN_TILES_PER_SPLIT = 8
-
-_DEFAULT_COMPILE_HINTS = {
-    "waves_per_eu": 2,
-    "fast_fp_math": True,
-}
-
-
-@lru_cache(maxsize=8)
-def _device_cu_count(device_index: int) -> int:
-    """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
-    try:
-        return torch.cuda.get_device_properties(device_index).multi_processor_count
-    except Exception:
-        return 304
 
 
 def _auto_num_splits(
@@ -121,12 +112,7 @@ def _build_kernel_mfma_r_w(
     WPB = waves_per_block
     MR_BLOCK_THREADS = 64 * WPB
 
-    # MFMA tile dims of the fp8 16x16x32 atom: MFMA_M x MFMA_N output tile,
-    # MFMA_K fp8 elements reduced per MFMA step.
-    MFMA_M = 16
-    MFMA_N = 16
-    MFMA_K = 32
-
+    # MFMA tile dims (MFMA_M/MFMA_N/MFMA_K) come from ._mqa_logits_common.
     assert H % MFMA_M == 0, f"num_heads={H} must be a multiple of MFMA_M={MFMA_M}"
     assert BKV % MFMA_N == 0, f"block_kv={BKV} must be a multiple of MFMA_N={MFMA_N}"
     assert D % MFMA_K == 0, f"head_size={D} must be a multiple of MFMA_K={MFMA_K}"
@@ -141,7 +127,6 @@ def _build_kernel_mfma_r_w(
     N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
 
     fm_fast = arith.FastMathFlags.fast
-    mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
 
     _cvt_tag = ""
     if convert_q_fn:
@@ -199,59 +184,6 @@ def _build_kernel_mfma_r_w(
         # (~46k-square dense outputs), silently mis-writing.
         _stride_i64 = arith.extui(T.i64, _to_raw(stride_logits_s))
 
-        def _make_out_row_t(row_i32):
-            """1-D output GTensor for row_i32; byte base computed in i64."""
-            _ri64 = arith.extui(T.i64, _to_raw(row_i32))
-            _byte = arith.muli(
-                arith.muli(_ri64, _stride_i64), arith.constant(4, type=T.i64)
-            )
-            _idx = arith.index_cast(T.index, _byte)
-            return GTensor(
-                logits, dtype=T.f32, shape=(-1,), static_bytes_offset_i64=_idx
-            )
-
-        def _load_pack_i64(i32_view, byte_off_i32):
-            dword_off = fx.Int32(
-                arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
-            )
-            v2 = i32_view.vec_load((dword_off,), vec_size=2)
-            return Vec(v2).bitcast(fx.Int64)[0].ir_value()
-
-        def _fn_to_fnuz_i64(raw_i64):
-            """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes."""
-            lo_i32 = arith.TruncIOp(T.i32, raw_i64).result
-            hi_i64 = arith.ShRUIOp(raw_i64, arith.constant(32, type=T.i64)).result
-            hi_i32 = arith.TruncIOp(T.i32, hi_i64).result
-
-            def _fix_i32(src):
-                result = arith.constant(0, type=T.i32)
-                for byte_idx in range_constexpr(4):
-                    shift = arith.constant(byte_idx * 8, type=T.i32)
-                    byte_val = arith.andi(
-                        arith.shrui(src, shift),
-                        arith.constant(0xFF, type=T.i32),
-                    )
-                    is_0x80 = arith.cmpi(
-                        arith.CmpIPredicate.eq,
-                        byte_val,
-                        arith.constant(0x80, type=T.i32),
-                    )
-                    cleaned = arith.select(
-                        is_0x80,
-                        arith.constant(0, type=T.i32),
-                        byte_val,
-                    )
-                    result = arith.ori(result, arith.shli(cleaned, shift))
-                return result
-
-            lo_fix = _fix_i32(lo_i32)
-            hi_fix = _fix_i32(hi_i32)
-            lo_64 = arith.ExtUIOp(T.i64, lo_fix).result
-            hi_64 = arith.ShLIOp(
-                arith.ExtUIOp(T.i64, hi_fix).result, arith.constant(32, type=T.i64)
-            ).result
-            return arith.OrIOp(lo_64, hi_64).result
-
         # ---- Preload window bounds, Q frags, and weights for all RPB rows ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
         starts = [None] * RPB
@@ -277,8 +209,8 @@ def _build_kernel_mfma_r_w(
                 base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
                     d_a = _i32_add(fx.Int32(kk * MFMA_K), lane8)
-                    raw = _load_pack_i64(q_i32, _i32_add(base_a, d_a))
-                    row_a[mi][kk] = _fn_to_fnuz_i64(raw) if convert_q_fn else raw
+                    raw = load_pack_i64(q_i32, _i32_add(base_a, d_a))
+                    row_a[mi][kk] = fn_to_fnuz_i64(raw) if convert_q_fn else raw
             a_packs[j] = row_a
 
             # weights[row, h] per (mi, ii): head = mi*MFMA_M + lane_div_N*4 + ii
@@ -363,43 +295,29 @@ def _build_kernel_mfma_r_w(
                 )
                 for kk in range_constexpr(K_STEPS):
                     d_b = _i32_add(fx.Int32(kk * MFMA_K), lane8)
-                    raw = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
-                    b_packs[ni][kk] = _fn_to_fnuz_i64(raw) if convert_kv_fn else raw
+                    raw = load_pack_i64(kv_i32, _i32_add(base_b, d_b))
+                    b_packs[ni][kk] = fn_to_fnuz_i64(raw) if convert_kv_fn else raw
 
             # ---- Per-row MFMA + epilogue (inner loop over RPB rows) ----
             for j in range_constexpr(RPB):
                 row = _i32_add(r0, fx.Int32(j))
-                out_row_t = _make_out_row_t(row)
+                out_row_t = make_out_row_view(logits, _stride_i64, row)
                 for ni in range_constexpr(N_TILES_PER_WAVE):
                     col = cols[ni]
                     kv_scale = kv_scales_tile[ni]
-                    col_sum = _to_raw(f32_0)
-                    for mi in range_constexpr(M_TILES):
-                        acc = Vec.filled(4, 0.0, fx.Float32)
-                        for kk in range_constexpr(K_STEPS):
-                            acc = mfma_fn(
-                                mfma_res_ty,
-                                [a_packs[j][mi][kk], b_packs[ni][kk], acc, 0, 0, 0],
-                            )
-                        # kv_scale (>=0) is hoisted out of the head sum: ReLU is
-                        # positive-homogeneous, so ReLU(s*x)=s*ReLU(x) and the
-                        # whole column sum is scaled once (below) instead of every
-                        # head term -- drops M_TILES*4 muls to one.
-                        for ii in range_constexpr(4):
-                            score = Vec(acc)[ii].ir_value()
-                            relu = arith.maximumf(score, _to_raw(f32_0))
-                            wsc = arith.MulFOp(
-                                relu, w_frag[j][mi][ii], fastmath=fm_fast
-                            ).result
-                            col_sum = arith.AddFOp(
-                                col_sum, wsc, fastmath=fm_fast
-                            ).result
-                    col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
-
-                    # Head-reduce within the wave (width=64): shuffle_xor offsets 16, 32.
-                    for sh in [16, 32]:
-                        peer = _to_raw(ArithValue(col_sum).shuffle_xor(sh, 64))
-                        col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
+                    # fp8 MFMA over heads + ReLU*weight head-sum + kv-scale hoist
+                    # + in-wave shuffle_xor head reduce (see ._mqa_logits_common).
+                    col_sum = mfma_head_reduce(
+                        a_packs[j],
+                        b_packs[ni],
+                        w_frag[j],
+                        kv_scale,
+                        m_tiles=M_TILES,
+                        k_steps=K_STEPS,
+                        res_ty=mfma_res_ty,
+                        f32_0=f32_0,
+                        fm_fast=fm_fast,
+                    )
 
                     # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
                     # `col >= start` is required: the tile loop is BKV-aligned
@@ -518,7 +436,6 @@ def compile_fp8_mqa_logits(
     num_heads: int,
     head_size: int,
     block_kv: int = _BLOCK_KV,
-    paged: bool = False,
     variant: str = DEFAULT_VARIANT,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
@@ -528,13 +445,11 @@ def compile_fp8_mqa_logits(
     ``num_heads``/``head_size`` are compile-time constants (powers of two, D in
     {64, 128}); ``variant`` is an ``mfma_r<RPB>_w<WPB>`` tag (see
     ``KERNEL_VARIANTS``); ``convert_q_fn``/``convert_kv_fn`` mark an FP8 FN
-    operand whose -0 (0x80) byte the kernel patches to FNUZ +0. ``paged`` is
-    reserved for a future variant and must be False.
+    operand whose -0 (0x80) byte the kernel patches to FNUZ +0.
+
+    The paged KV variant lives in its own module
+    (``fp8_paged_mqa_logits.flydsl_fp8_paged_mqa_logits``).
     """
-    if paged:
-        raise NotImplementedError(
-            "Paged FlyDSL fp8_mqa_logits is Phase 2 and not implemented yet."
-        )
     if variant not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {variant!r}; "
@@ -622,7 +537,6 @@ def flydsl_fp8_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=_BLOCK_KV,
-        paged=False,
         variant=variant,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
