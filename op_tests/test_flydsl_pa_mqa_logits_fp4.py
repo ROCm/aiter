@@ -534,9 +534,8 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         f"max_abs_err={max_abs_err:.6f}  mean_abs_err={mean_abs_err:.6f}  "
         f"err_ratio={err_ratio:.4f}  past_ctx_neginf={neg_inf_ok}"
     )
-    assert cos.item() > 0.99, (
-        f"FlyDSL qfp4/kvfp4 vs ref cosine_sim={cos.item():.4f} < 0.99"
-    )
+    cos_val = cos.item()
+    assert cos_val > 0.99, f"FlyDSL qfp4/kvfp4 vs ref cosine_sim={cos_val:.4f} < 0.99"
     assert neg_inf_ok, "OOB tokens were not NEG_INF — early-exit / pre-init broken"
 
     if not bench:
