@@ -1397,7 +1397,9 @@ namespace py = pybind11;
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
           py::arg("dispatch_policy")   = 0,            \
-          py::arg("local_topk_ids")    = std::nullopt);
+          py::arg("local_topk_ids")    = std::nullopt, \
+          py::arg("m_indices")         = std::nullopt, \
+          py::arg("reverse_sorted")    = std::nullopt);
 
 #define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_opus_fwd",                \
@@ -2414,3 +2416,84 @@ namespace py = pybind11;
           py::arg("split_output"),      \
           py::arg("split_lse"),         \
           py::arg("final_output"));
+
+#define MXFP4_MOE_AUX_PYBIND                                              \
+    m.def("mxfp4_moe_sort_quant",                                         \
+          &mxfp4_moe_sort_quant_kernel,                                   \
+          py::arg("a_input"),                                             \
+          py::arg("topk_ids"),                                            \
+          py::arg("topk_weight"),                                         \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("sorted_expert_ids"),                                   \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("a_quant"),                                             \
+          py::arg("a_scale"),                                             \
+          py::arg("m_indices"),                                           \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_sort",                                               \
+          &mxfp4_moe_sort_kernel,                                         \
+          py::arg("topk_ids"),                                            \
+          py::arg("topk_weight"),                                         \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("sorted_expert_ids"),                                   \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("m_indices"),                                           \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("bf16_zero_workspace"),                                 \
+          py::arg("M_logical"),                                           \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("D_INTER"),                                            \
+          py::arg("MB"),                                                  \
+          py::arg("prologue"));                                           \
+    m.def("mxfp4_moe_quant",                                              \
+          &mxfp4_moe_quant_kernel,                                        \
+          py::arg("a_input"),                                             \
+          py::arg("a_quant"),                                             \
+          py::arg("a_scale"),                                             \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_sort_scales",                                        \
+          &mxfp4_moe_sort_scales_kernel,                                  \
+          py::arg("a_scale"),                                             \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("a_scale_sorted_shuffled"),                             \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"),                                                  \
+          py::arg("max_sorted"));                                         \
+    m.def("mxfp4_moe_scatter_reduce",                                     \
+          &mxfp4_moe_scatter_reduce_kernel,                               \
+          py::arg("flat_out"),                                            \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("out"),                                                 \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_scatter_reduce_q",                                   \
+          &mxfp4_moe_scatter_reduce_q_kernel,                             \
+          py::arg("flat_out_q"),                                          \
+          py::arg("flat_out_scale"),                                      \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("out"),                                                 \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));

@@ -29,6 +29,7 @@ class OpKind(enum.Enum):
     construction errors instead of silently routing to the wrong code path."""
 
     MOE = "moe"
+    MXFP4_MOE = "mxfp4_moe"
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
@@ -136,6 +137,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     parent process, just shifted once out of every child."""
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.MXFP4_MOE:
+        from .mxfp4_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GROUPED_MOE:
@@ -150,6 +153,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
     if kind is OpKind.MOE:
         from .moe import compile_one_config
+    elif kind is OpKind.MXFP4_MOE:
+        from .mxfp4_moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
