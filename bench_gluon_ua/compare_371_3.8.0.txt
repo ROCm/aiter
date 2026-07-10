@@ -1,0 +1,10 @@
+triton 3.8.0  (native layout gating (distributed on 3.8+, Blocked on 3.6/3.7), decode nb=2)
+PREFILL b1 8k 64/8: gluon 959 TFLOP/s (1.36x vs triton 703)
+DECODE C64 ctx8192 64/8: gluon 6534 GB/s (S2, 1.14x vs triton 5753 S8)  xc1e-04
+DECODE C128 ctx8192 64/8: gluon 6642 GB/s (S1, 1.17x vs triton 5684 S8)  xc1e-04
+DECODE C32 ctx8192 8/1: gluon 4601 GB/s (S32, 1.41x vs triton 3267 S128)  xc1e-04
+DECODE C16 ctx8192 8/1: gluon 3360 GB/s (S64, 1.22x vs triton 2761 S128)  xc1e-04
+DECODE C64 ctx1024 64/8: gluon 5546 GB/s (S2, 1.29x vs triton 4293 S8)  xc5e-04
+DECODE C128 ctx1024 64/8: gluon 6541 GB/s (S1, 1.50x vs triton 4352 S8)  xc5e-04
+DECODE C32 ctx1024 8/1: gluon 1487 GB/s (S16, 0.98x vs triton 1516 S16)  xc5e-04
+DECODE C16 ctx1024 8/1: gluon 895 GB/s (S16, 1.04x vs triton 862 S16)  xc5e-04

@@ -15,6 +15,26 @@ from packaging.version import Version
 triton_version = Version(triton.__version__)
 
 TRITON_BEYOND_37 = gl.constexpr(triton_version >= Version("3.7"))
+
+
+def _async_copy_accepts_distributed_layout() -> bool:
+    # The offset_bases KV-load path builds a DistributedLinearLayout for the
+    # async_copy offsets. Triton >=3.8 accepts that; 3.7.x's async_copy requires
+    # BlockedLayout/SliceLayout. Detect by inspecting the op's source (version
+    # numbers alone aren't reliable across ROCm forks / dev builds).
+    try:
+        import inspect
+        from triton.experimental.gluon.language.amd.cdna4 import async_copy
+
+        src = inspect.getsource(async_copy.global_load_to_shared)
+    except (OSError, TypeError, ImportError, AttributeError):
+        return False
+    return "DistributedLayout" in src
+
+
+# Use the offset_bases / DistributedLinearLayout KV-load path only when async_copy
+# accepts it; otherwise fall back to the BlockedLayout path (works everywhere).
+ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 float8_info = torch.finfo(e4m3_dtype)
 
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
@@ -80,8 +100,9 @@ def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SI
 
     Returns (blocked_k, blocked_v, shared_k_layout, shared_v_layout).
     """
-    # To support different triton versions
-    if TRITON_BEYOND_37:
+    # To support different triton versions: use the offset_bases /
+    # DistributedLinearLayout path only when async_copy accepts that layout.
+    if TRITON_BEYOND_37 and ASYNC_COPY_SUPPORTS_DISTRIBUTED:
         CONTIGUITY = 16 if FP8_KV else 8  # elements per 128-bit vector load
         LG2_C = CONTIGUITY.bit_length() - 1
         LG2_HS = HEAD_SIZE.bit_length() - 1

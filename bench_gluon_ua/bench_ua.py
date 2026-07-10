@@ -42,6 +42,15 @@ TARGET_PRGMS = CU * 4
 WARMUP, ITERS, FLUSH_MB = 8, 30, 512
 OUT_MD = "/app/aiter/bench_gluon_ua/results.md"
 
+
+def select_gluon_num_splits(num_seqs, num_kv_heads, num_tiles, target_mult=4):
+    """Right-size decode split-KV for the gluon kernel: enough workgroups to fill
+    the GPU (~CU*target_mult) without over-splitting. The Triton NUM_SEGMENTS
+    heuristic over-provisions for gluon (it assumes Triton's nw=2 occupancy), so
+    fewer splits are better. Capped at num_tiles (a split must own >=1 tile)."""
+    target_wgs = CU * target_mult
+    return max(1, min(num_tiles, round(target_wgs / (num_seqs * num_kv_heads))))
+
 # heads given as (num_query_heads, num_kv_heads); both cases are nqpk=8
 PREFILL_SHAPES = [
     dict(B=1, N=8192, Hq=64, Hkv=8),
