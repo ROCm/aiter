@@ -640,6 +640,7 @@ def compile_wd_moe_down_reduce(
     k_vector: int = 8,
     use_dot2: bool = False,
     h_per_warp: int = 1,
+    k_batch: int = 1,
 ):
     """Compile warp-decode down_reduce and return a @flyc.jit launch wrapper.
 
@@ -655,31 +656,27 @@ def compile_wd_moe_down_reduce(
     topk        : top-K experts per token (compile-time).
     k_vector    : BF16 elements per lane per K-step (default 8).
     use_dot2    : if True, use v_dot2_f32_bf16 (gfx950 only).
-    h_per_warp  : output channels per wave (1 or 2).  h_per_warp=2 (H2 layout)
-                  computes two adjacent channels (out_j, out_j+1) per wave,
-                  reusing the same inter[slot] loads for both W_down rows.
-                  Grid becomes B × HIDDEN/h_per_warp.  Must divide hidden evenly.
+    h_per_warp  : output channels per wave (1 or 2).
+    k_batch     : split-K factor (default 1 = no split).  Splits the INTER
+                  contraction across k_batch workgroups; each adds its partial
+                  result via atomicAdd.  Grid y-dimension = k_batch.  Increases
+                  total grid size by k_batch× to improve occupancy for small-grid
+                  shapes (e.g. Qwen3Next B=1 inter=512: k_batch=4 → 4× more blocks).
+                  Requires inter % (k_batch * WAVE_SIZE * k_vector) == 0.
 
     Launch signature:
         exe(_ptr(y_out), _ptr(inter_states), _ptr(w_down), _ptr(router_ids),
             _ptr(router_wts), B, topk, inter, hidden, experts, stream)
-
-    Tensor layouts (all row-major, contiguous):
-        y_out        : [B, HIDDEN]       f32  output (zero-init before launch!)
-        inter_states : [B*TOPK, INTER]   bf16 (gate_up output)
-        w_down       : [E*HIDDEN, INTER] bf16 weight rows
-        router_ids   : [B*TOPK]          i32  expert index per slot
-        router_wts   : [B*TOPK]          f32  router weight per slot
     """
     if hidden % (_WAVE_SIZE * k_vector) != 0:
         raise ValueError(
             f"hidden={hidden} must be divisible by WAVE_SIZE*k_vector"
             f"={_WAVE_SIZE * k_vector}"
         )
-    if inter % (_WAVE_SIZE * k_vector) != 0:
+    if inter % (k_batch * _WAVE_SIZE * k_vector) != 0:
         raise ValueError(
-            f"inter={inter} must be divisible by WAVE_SIZE*k_vector"
-            f"={_WAVE_SIZE * k_vector}"
+            f"inter={inter} must be divisible by k_batch*WAVE_SIZE*k_vector"
+            f"={k_batch * _WAVE_SIZE * k_vector}"
         )
     if h_per_warp not in (1, 2):
         raise ValueError(f"h_per_warp must be 1 or 2, got {h_per_warp}")
@@ -687,14 +684,21 @@ def compile_wd_moe_down_reduce(
         raise ValueError(
             f"hidden={hidden} must be divisible by h_per_warp={h_per_warp}"
         )
+    if k_batch < 1:
+        raise ValueError(f"k_batch must be >= 1, got {k_batch}")
 
     dot2_tag = "_dot2" if use_dot2 else "_f32"
     h2_tag = "_h2" if h_per_warp == 2 else ""
-    module_name = f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}_kv{k_vector}{dot2_tag}{h2_tag}"
+    kb_tag = f"_kb{k_batch}" if k_batch > 1 else ""
+    module_name = (
+        f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}"
+        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}"
+    )
 
     _k_pairs = k_vector // 2
     _k_step = _WAVE_SIZE * k_vector  # INTER elements per loop iteration
     _n_k_steps = inter // _k_step
+    _n_k_steps_per_batch = _n_k_steps // k_batch  # k-steps per split-K workgroup
 
     @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
     def _kernel(
@@ -804,12 +808,19 @@ def compile_wd_moe_down_reduce(
 
             inter_row_base = flat_slot * INTER_i32
 
+            # split-K: this block covers k-steps [k_bid*S .. (k_bid+1)*S-1]
+            # where S = _n_k_steps_per_batch.  k_bid=0 when k_batch=1 (no split).
+            k_bid_i32 = arith.index_cast(i32, gpu.block_id("y"))
+            k_batch_base = k_bid_i32 * arith.constant(
+                _n_k_steps_per_batch * _k_step, type=i32
+            )
+
             # Inner loops compile-time unrolled for each output channel.
             # x loads are shared across all h_per_warp channels; only w loads differ.
             curs: list = [zero_f32] * h_per_warp
-            for k_step in range_constexpr(_n_k_steps):
+            for k_step in range_constexpr(_n_k_steps_per_batch):
                 k_base_c = arith.constant(k_step * _k_step, type=i32)
-                lane_k = k_base_c + lane_kV
+                lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
                 for p in range_constexpr(_k_pairs):
                     p2 = arith.constant(p * 2, type=i32)
                     x_off = (inter_row_base + lane_k + p2) // c_two
@@ -878,12 +889,14 @@ def compile_wd_moe_down_reduce(
         stream: fx.Stream,
     ):
         idx = ir.IndexType.get()
-        # Grid: B × (HIDDEN / h_per_warp) blocks
+        # Grid x: B × (HIDDEN/h_per_warp) — one block per output channel group
+        # Grid y: k_batch         — each y-slice covers INTER/k_batch elements
         grid_x = (
             arith.index_cast(idx, i32_B.ir_value())
             * arith.index_cast(idx, i32_HIDDEN.ir_value())
             // arith.constant(h_per_warp, index=True)
         )
+        grid_y = arith.constant(k_batch, index=True)
         _dk(
             arg_y_out,
             arg_inter,
@@ -895,6 +908,6 @@ def compile_wd_moe_down_reduce(
             i32_INTER,
             i32_HIDDEN,
             i32_E,
-        ).launch(grid=(grid_x, 1, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, grid_y, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
 
     return _launch_down

@@ -575,6 +575,95 @@ def test_down_reduce_h2_dot2path(shape_name, hidden, inter, topk, experts, B):
 
 
 # ---------------------------------------------------------------------------
+# split-K down_reduce tests  (k_batch > 1, arch-agnostic)
+# ---------------------------------------------------------------------------
+
+# k_batch values per shape: inter must be divisible by k_batch * 64 * 8 = k_batch * 512
+# qwen3next inter=512:  k_batch=1 only (512 / 512 = 1 step, can't split further)
+# minimax    inter=1536: k_batch∈{1,3} (1536/512=3)
+# deepseek   inter=2048: k_batch∈{1,2,4} (2048/512=4)
+_SPLITK_PARAMS = [
+    ("qwen3next", 2048, 512, 10, 512, 1),
+    ("minimax", 3072, 1536, 8, 256, 3),
+    ("deepseek-v3", 7168, 2048, 8, 256, 2),
+    ("deepseek-v3", 7168, 2048, 8, 256, 4),
+]
+
+
+def _ref_down_reduce_multi_b(
+    inter_states, w_down, router_ids, router_wts, B, topk, inter, hidden
+):
+    """FP32 reference for down_reduce with correct per-token accumulation."""
+    ref = torch.zeros(B, hidden, dtype=torch.float32, device=inter_states.device)
+    xf = inter_states.float()
+    wf = w_down.float()
+    for slot in range(B * topk):
+        b = slot // topk
+        e = router_ids[slot].item()
+        rw = router_wts[slot].item()
+        ref[b] += rw * (wf[e * hidden : (e + 1) * hidden] @ xf[slot])
+    return ref
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts,k_batch", _SPLITK_PARAMS)
+@pytest.mark.parametrize("B", BATCHES)
+def test_down_reduce_splitk_f32path(
+    shape_name, hidden, inter, topk, experts, k_batch, B
+):
+    """down_reduce split-K (k_batch>1), FP32 scalar path — gfx942 + gfx950."""
+    torch.manual_seed(42)
+    inter_states = (
+        torch.randn(B * topk, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_down = (
+        torch.randn(experts * hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    router_ids = torch.randint(
+        0, experts, (B * topk,), dtype=torch.int32, device="cuda"
+    )
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    router_wts = (
+        router_wts_raw.view(B, topk)
+        / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    ref = _ref_down_reduce_multi_b(
+        inter_states, w_down, router_ids, router_wts, B, topk, inter, hidden
+    )
+    y_out = torch.zeros(B, hidden, dtype=torch.float32, device="cuda")
+
+    exe = compile_wd_moe_down_reduce(
+        hidden=hidden,
+        inter=inter,
+        experts=experts,
+        topk=topk,
+        use_dot2=False,
+        k_batch=k_batch,
+    )
+    _run_down_kernel(
+        exe,
+        y_out,
+        inter_states,
+        w_down,
+        router_ids,
+        router_wts,
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+    )
+
+    _check(
+        ref,
+        y_out,
+        f"{shape_name} B={B} down kb={k_batch} f32path",
+        atol=0.01,
+        rtol=0.05,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Benchmark (not collected by pytest by default; run directly)
 # ---------------------------------------------------------------------------
 
