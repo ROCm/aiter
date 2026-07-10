@@ -53,6 +53,7 @@ from ._mqa_logits_common import (
     Vec,
     device_cu_count,
     load_pack_i64,
+    load_pack_v8i32,
     fn_to_fnuz_i64,
     make_out_row_view,
     mfma_head_reduce,
@@ -142,7 +143,7 @@ def _build_paged_kernel(
         stride_out: fx.Int32,  # out_logits.stride(0) == max_model_len
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
-        mfma_res_ty = Vec.make_type(4, fx.Float32)
+        mfma_res_ty = Vec.make_type(16, fx.Float32)
         scale_mul_c = arith.constant(float(scale_mul), type=T.f32)
 
         tid = fx.thread_idx.x
@@ -161,8 +162,8 @@ def _build_paged_kernel(
         lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
         lane8 = lane_div_N * 8
 
-        # fp8 operands read 8 bytes at a time as 2 i32 dwords (v8i8 buffer_load
-        # fails to lower on gfx942), then bitcast to i64 for the MFMA.
+        # fp8 operands loaded as vector<8xi32> per K-step (32 bytes = 4 i64s)
+        # for the 32x32x64 scaled MFMA. One vec_load_dwordx2 per i64 sub-step.
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
         # Uniform-base views over the co-packed cache: per-token gather is done
         # via the (per-lane) byte offset, NOT the buffer base -- a per-lane base
@@ -185,21 +186,28 @@ def _build_paged_kernel(
 
         # ---- Preload Q frags + weights for the single query row ----
         # A-operand layout is per in-wave lane, so `lane` (not `tid`) indexes Q.
+        # With MFMA_K=64, each K-step loads a vector<8xi32> (4 packed i64s covering
+        # k = lane8 + [0,16,32,48]). fn_to_fnuz not supported for v8i32 operands;
+        # gfx950 uses native fp8 so convert_q_fn is always False on this arch.
         q_row_base = pid_batch * stride_q_batch + pid_next_n * stride_q_next_n
         a_pack = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
             h_a = mi * MFMA_M + lane_mod_N
             base_a = q_row_base + h_a * stride_q_heads
             for kk in range_constexpr(K_STEPS):
-                d_a = kk * MFMA_K + lane8
-                raw = load_pack_i64(q_i32, base_a + d_a)
-                a_pack[mi][kk] = fn_to_fnuz_i64(raw) if convert_q_fn else raw
+                byte_base = base_a + kk * MFMA_K
+                a_pack[mi][kk] = load_pack_v8i32(q_i32, byte_base, lane8)
 
-        # weights[out_row, h] per (mi, ii): head = mi*MFMA_M + lane_div_N*4 + ii
-        w_frag = [[None] * 4 for _ in range_constexpr(M_TILES)]
+        # weights[out_row, h] per (mi, ii): head = mi*MFMA_M + h_off(lane_div_N, ii)
+        # For 32x32x16 fp8 MFMA, the D-reg ii at lane_div_N encodes head:
+        #   h_off = (ii % 4) + lane_div_N * 4 + (ii // 4) * 8
+        # This is the same 4-interleave as 16x16x32 but extended to 16 D-regs.
+        _DREG = 16
+        w_frag = [[None] * _DREG for _ in range_constexpr(M_TILES)]
         for mi in range_constexpr(M_TILES):
-            for ii in range_constexpr(4):
-                h_w = mi * MFMA_M + lane_div_N * 4 + ii
+            for ii in range_constexpr(_DREG):
+                h_off = (ii % 4) + lane_div_N * 4 + (ii // 4) * 8
+                h_w = mi * MFMA_M + h_off
                 w_frag[mi][ii] = _to_raw(fx.Float32(w_t[out_row, h_w]))
 
         # ---- SplitKV: this CTA owns a disjoint, BKV-aligned slice of the KV
@@ -235,11 +243,12 @@ def _build_paged_kernel(
                 physical = fx.Int32(ind_t[ind_off])
                 tok_byte = physical * index_dim
 
+                # B operands: vector<8xi32> per K-step (MFMA_K=64).
+                # convert_kv_fn is always False (gfx950 native fp8).
                 b_col = [None] * K_STEPS
                 for kk in range_constexpr(K_STEPS):
-                    d_b = kk * MFMA_K + lane8
-                    raw = load_pack_i64(kv_i32, tok_byte + d_b)
-                    b_col[kk] = fn_to_fnuz_i64(raw) if convert_kv_fn else raw
+                    byte_base_b = tok_byte + kk * MFMA_K
+                    b_col[kk] = load_pack_v8i32(kv_i32, byte_base_b, lane8)
 
                 # Co-packed per-token scale: f32 at byte tok_byte + D.
                 scale_dword = fx.Int32(
@@ -261,6 +270,7 @@ def _build_paged_kernel(
                     res_ty=mfma_res_ty,
                     f32_0=f32_0,
                     fm_fast=fm_fast,
+                    dreg_count=_DREG,
                 )
 
                 # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.

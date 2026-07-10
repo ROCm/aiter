@@ -150,7 +150,8 @@ def _build_kernel_mfma_r_w(
         num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
-        mfma_res_ty = Vec.make_type(4, fx.Float32)
+        _DREG = 16  # D-regs per lane for 32x32x16 fp8 MFMA
+        mfma_res_ty = Vec.make_type(_DREG, fx.Float32)
 
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -213,17 +214,18 @@ def _build_kernel_mfma_r_w(
                     row_a[mi][kk] = fn_to_fnuz_i64(raw) if convert_q_fn else raw
             a_packs[j] = row_a
 
-            # weights[row, h] per (mi, ii): head = mi*MFMA_M + lane_div_N*4 + ii
-            row_w = [[None] * 4 for _ in range_constexpr(M_TILES)]
+            # weights[row, h] per (mi, ii): head = mi*MFMA_M + h_off(lane_div_N, ii)
+            # For 32x32x16 fp8: h_off = (ii%4) + lane_div_N*4 + (ii//4)*8
+            row_w = [[None] * _DREG for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
-                for ii in range_constexpr(4):
+                for ii in range_constexpr(_DREG):
                     h_w = _i32_add(
                         fx.Int32(mi * MFMA_M),
                         _i32_add(
                             fx.Int32(
                                 arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(4)))
                             ),
-                            fx.Int32(ii),
+                            fx.Int32((ii % 4) + (ii // 4) * 8),
                         ),
                     )
                     row_w[mi][ii] = _to_raw(fx.Float32(w_t[row, h_w]))
@@ -317,6 +319,7 @@ def _build_kernel_mfma_r_w(
                         res_ty=mfma_res_ty,
                         f32_0=f32_0,
                         fm_fast=fm_fast,
+                        dreg_count=_DREG,
                     )
 
                     # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
