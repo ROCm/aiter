@@ -181,12 +181,13 @@ def shuffle_scale_moe(
     the shuffled scale tensor.
     """
     arch = arch or get_arch()
+    layout = "NONE"
     if arch == "gfx1250":
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
         layout = "GFX1250_SCALE"
-    else:
+    elif (arch or get_arch()) == "gfx950":
         tiled = _shuffle_scale_tile_gfx950(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
