@@ -20,6 +20,8 @@ from flydsl.expr import (
     const_expr,
     gpu,
     idx2crd,
+    make_identity_layout,
+    ptrtoint,
     range_constexpr,
     rocdl,
     tdm_ops,
@@ -51,6 +53,34 @@ from aiter.ops.flydsl.kernels.quant_utils import (
     emit_f32_to_e2m1,
     emit_mx_e8m0_scale,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import MOE_KERNARG_PRELOAD_COUNT
+
+
+def _rsrc_from_ptr(p, *, num_records_bytes=None):
+    """Build an AMD buffer resource from an ``fx.Pointer`` kernel arg.
+
+    Replaces ``buffer_ops.create_buffer_resource(memref, ...)`` now that the
+    kernel receives bare pointers (so kernarg preload is not blocked by the
+    per-tensor shape/stride aggregate). ``num_records_bytes=None`` requests the
+    maximum buffer size, matching the old ``max_size=True`` behavior.
+    """
+    addr_i64 = arith.index_cast(T.i64, ptrtoint(p))
+    return buffer_ops.create_buffer_resource_from_addr(
+        addr_i64, num_records_bytes=num_records_bytes
+    )
+
+
+def _desc_src(p):
+    """Adapt an ``fx.Pointer`` for ``make_tensor_descriptor_2d`` / ``l2_prefetch_tile``.
+
+    Those helpers read ``global_ptr.__extract_to_ir_values__()[0]`` and feed it to
+    ``fly.extract_aligned_pointer_as_index``, whose verifier requires a memref --
+    not the ``!fly.ptr`` that a bare pointer kernel arg lowers to. A 1-D identity
+    view over the pointer yields a global memref whose aligned base is the pointer;
+    the view's shape is irrelevant because the descriptor supplies its own
+    ``tensor_shape``/``strides``.
+    """
+    return p.view(make_identity_layout((1,)))
 
 # Common constants
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
@@ -729,15 +759,15 @@ def compile_mxscale_gemm(
 
     @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def kernel_mxscale_gemm(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
-        arg_bias: fx.Tensor,
-        arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_masked_m: fx.Pointer,
+        arg_m_tile_prefix: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
@@ -806,9 +836,7 @@ def compile_mxscale_gemm(
                 if valid_m_override is not None:
                     valid_m_i32 = valid_m_override
                 else:
-                    masked_m_rsrc = buffer_ops.create_buffer_resource(
-                        arg_masked_m, max_size=True
-                    )
+                    masked_m_rsrc = _rsrc_from_ptr(arg_masked_m)
                     valid_m_i32 = buffer_ops.buffer_load(
                         masked_m_rsrc,
                         arith.index_cast(T.i32, batch_idx),
@@ -863,15 +891,23 @@ def compile_mxscale_gemm(
             else:
                 c_rows = m_idx * arith.index(split_k)
             c_nrec = c_rows * n_stride * arith.index(elem_bytes_d)
-            c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
+            c_rsrc = _rsrc_from_ptr(arg_c, num_records_bytes=c_nrec)
             if const_expr(epilogue_bias_mode):
-                bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
+                bias_rsrc = _rsrc_from_ptr(arg_bias)
             zero_i32 = arith.constant(0, type=T.i32)
+
+            # TDM descriptors / L2 prefetch take a memref-style global_ptr; adapt
+            # the bare pointer kernel args once here (see _desc_src).
+            _a_src = _desc_src(arg_a)
+            _b_src = _desc_src(arg_b)
+            _as_src = _desc_src(arg_a_scale)
+            _bs_src = _desc_src(arg_b_scale)
+            _c_src = _desc_src(arg_c)
 
             def make_desc_a(memref, k_base):
                 k_packed_off = k_base // arith.index(PACK_FACTOR_A)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_a,
+                    global_ptr=_a_src,
                     lds_memref=memref,
                     global_offset=(flat_m_base_input, k_packed_off),
                     tensor_shape=(
@@ -892,7 +928,7 @@ def compile_mxscale_gemm(
             def make_desc_b(memref, k_base, n_offset=0):
                 k_packed_off = k_base // arith.index(PACK_FACTOR_B)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_b,
+                    global_ptr=_b_src,
                     lds_memref=memref,
                     global_offset=(
                         batch_b_base
@@ -918,7 +954,7 @@ def compile_mxscale_gemm(
                 if flat_m_base_override is not None:
                     a_scale_row_base = flat_m_base_input // arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_a_scale,
+                    global_ptr=_as_src,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
                     tensor_shape=(
@@ -952,7 +988,7 @@ def compile_mxscale_gemm(
                 if flat_m_base_override is not None:
                     a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_a_scale,
+                    global_ptr=_as_src,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
                     tensor_shape=(
@@ -982,7 +1018,7 @@ def compile_mxscale_gemm(
                 )
                 inner_off = k_scale_off * arith.index(BS_N32K4_BLOCK_N)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_b_scale,
+                    global_ptr=_bs_src,
                     lds_memref=memref,
                     global_offset=(batch_bs_base + outer_off, inner_off),
                     tensor_shape=(
@@ -2020,8 +2056,8 @@ def compile_mxscale_gemm(
                 # gguu (dual-B) front-ends feed this: a warp owns whole 32-col MX
                 # block(s), each block split as 16 cols/lane over the lane_kgrp
                 # pair, so the block amax = local reduce + one shuffle_xor(16).
-                payload_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=True)
-                scale_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
+                payload_rsrc = _rsrc_from_ptr(arg_c)
+                scale_rsrc = _rsrc_from_ptr(arg_bias)
                 c4_i32 = arith.constant(4, type=T.i32)
                 c16_i32 = arith.constant(16, type=T.i32)
                 c23_i32 = arith.constant(23, type=T.i32)
@@ -2412,7 +2448,7 @@ def compile_mxscale_gemm(
                 #     block_threads=block_threads,
                 # )
                 tdm_ops.l2_prefetch_tile(
-                    arg_b,
+                    _b_src,
                     (
                         batch_b_base + blk_n // arith.index(16),
                         pf_k_packed_b * arith.index(16),
@@ -2570,7 +2606,7 @@ def compile_mxscale_gemm(
                     blk_n / arith.index(2) if stage1_act_interleave else blk_n
                 )
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_c,
+                    global_ptr=_c_src,
                     lds_memref=d_lds_base_ptr,
                     global_offset=(
                         flat_m_base + warp_m_off_sgpr,
@@ -3505,10 +3541,8 @@ def compile_mxscale_gemm(
                     epilogue_stores(accs, epi_addrs_box[0])
 
         if const_expr(grouped_persistent_m):
-            prefix_rsrc = buffer_ops.create_buffer_resource(
-                arg_m_tile_prefix, max_size=True
-            )
-            map_rsrc = buffer_ops.create_buffer_resource(arg_m_tile_map, max_size=True)
+            prefix_rsrc = _rsrc_from_ptr(arg_m_tile_prefix)
+            map_rsrc = _rsrc_from_ptr(arg_m_tile_map)
             block_n_id = arith.index_cast(T.index, _raw(gpu.block_idx.x))
             worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
             grid_size = arith.index(_persistent_workers)
@@ -3576,12 +3610,8 @@ def compile_mxscale_gemm(
             _for_ip.__exit__(None, None, None)
         else:
             if const_expr(grouped_contiguous_m):
-                masked_m_rsrc = buffer_ops.create_buffer_resource(
-                    arg_masked_m, max_size=True
-                )
-                layout_rsrc = buffer_ops.create_buffer_resource(
-                    arg_m_tile_map, max_size=True
-                )
+                masked_m_rsrc = _rsrc_from_ptr(arg_masked_m)
+                layout_rsrc = _rsrc_from_ptr(arg_m_tile_map)
                 flat_pid = arith.index_cast(T.index, _raw(gpu.block_idx.x))
                 bz = (
                     arith.index_cast(T.index, _raw(gpu.block_idx.z))
@@ -3708,9 +3738,7 @@ def compile_mxscale_gemm(
                         else arith.index(0)
                     )
                 if const_expr(grouped_masked_m):
-                    masked_m_rsrc = buffer_ops.create_buffer_resource(
-                        arg_masked_m, max_size=True
-                    )
+                    masked_m_rsrc = _rsrc_from_ptr(arg_masked_m)
                     valid_m_i32 = buffer_ops.buffer_load(
                         masked_m_rsrc,
                         arith.index_cast(T.i32, batch_idx),
@@ -3789,11 +3817,11 @@ def compile_mxscale_gemm(
 
     @flyc.jit
     def launch_mxscale_gemm(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         swiglu_limit_f: fx.Float32,
@@ -3852,14 +3880,14 @@ def compile_mxscale_gemm(
 
     @flyc.jit
     def launch_mxscale_gemm_masked(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
-        arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_masked_m: fx.Pointer,
+        arg_m_tile_prefix: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
@@ -3924,14 +3952,14 @@ def compile_mxscale_gemm(
 
     @flyc.jit
     def launch_mxscale_gemm_masked_persistent(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
-        arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_masked_m: fx.Pointer,
+        arg_m_tile_prefix: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         swiglu_limit_f: fx.Float32,
@@ -3981,12 +4009,12 @@ def compile_mxscale_gemm(
 
     @flyc.jit
     def launch_mxscale_gemm_bias(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         swiglu_limit_f: fx.Float32,
@@ -4045,15 +4073,15 @@ def compile_mxscale_gemm(
 
     @flyc.jit
     def launch_mxscale_gemm_masked_bias(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
-        arg_bias: fx.Tensor,
-        arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_masked_m: fx.Pointer,
+        arg_m_tile_prefix: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
@@ -4118,15 +4146,15 @@ def compile_mxscale_gemm(
 
     @flyc.jit
     def launch_mxscale_gemm_masked_persistent_bias(
-        arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
-        arg_a_scale: fx.Tensor,
-        arg_b_scale: fx.Tensor,
-        arg_bias: fx.Tensor,
-        arg_masked_m: fx.Tensor,
-        arg_m_tile_prefix: fx.Tensor,
-        arg_m_tile_map: fx.Tensor,
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_a_scale: fx.Pointer,
+        arg_b_scale: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_masked_m: fx.Pointer,
+        arg_m_tile_prefix: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         swiglu_limit_f: fx.Float32,
@@ -4174,25 +4202,42 @@ def compile_mxscale_gemm(
             stream=stream,
         )
 
-    if expert_sched_mode:
-        launch_mxscale_gemm.compile_hints["llvm_options"] = {
-            "amdgpu-expert-scheduling-mode": True,
-        }
-        launch_mxscale_gemm_masked.compile_hints["llvm_options"] = {
-            "amdgpu-expert-scheduling-mode": True,
-        }
-        launch_mxscale_gemm_masked_persistent.compile_hints["llvm_options"] = {
-            "amdgpu-expert-scheduling-mode": True,
-        }
-        launch_mxscale_gemm_bias.compile_hints["llvm_options"] = {
-            "amdgpu-expert-scheduling-mode": True,
-        }
-        launch_mxscale_gemm_masked_bias.compile_hints["llvm_options"] = {
-            "amdgpu-expert-scheduling-mode": True,
-        }
-        launch_mxscale_gemm_masked_persistent_bias.compile_hints["llvm_options"] = {
-            "amdgpu-expert-scheduling-mode": True,
-        }
+    launch_mxscale_gemm.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_mxscale_gemm_masked.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_mxscale_gemm_masked_persistent.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_mxscale_gemm_bias.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_mxscale_gemm_masked_bias.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    launch_mxscale_gemm_masked_persistent_bias.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
 
     # Quant-out mode threads its e8m0 scale-output buffer through the kernel's
     # bias tensor slot (bias is unused/disallowed in this mode), so it reuses the

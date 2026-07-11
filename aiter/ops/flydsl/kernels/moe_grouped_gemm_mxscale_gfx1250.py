@@ -35,7 +35,18 @@ from aiter.ops.flydsl.kernels.gemm_mxscale_gfx1250 import (
     compile_a8w4_gemm,
     compile_mxfp4_gemm,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+
+
+def _run_gemm(exe, *args):
+    """Dispatch a mxscale GEMM launcher whose tensor args are now ``fx.Pointer``.
+
+    The GEMM kernels take bare pointers (so kernarg preload is not blocked by the
+    per-tensor shape/stride aggregate), so every torch.Tensor argument must be
+    wrapped with ``ptr_arg``; scalars/stream pass through unchanged.
+    """
+    wrapped = [ptr_arg(a) if isinstance(a, torch.Tensor) else a for a in args]
+    _run_compiled(exe, *wrapped)
 
 
 @dataclass(frozen=True)
@@ -1323,7 +1334,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
                 if bias is not None:
-                    _run_compiled(
+                    _run_gemm(
                         fused_gemm,
                         y,
                         x,
@@ -1340,7 +1351,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         stream,
                     )
                 else:
-                    _run_compiled(
+                    _run_gemm(
                         fused_gemm,
                         y,
                         x,
@@ -1357,7 +1368,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             else:
                 if bias is not None:
-                    _run_compiled(
+                    _run_gemm(
                         _get_raw_base_bias(),
                         gemm_tmp,
                         x,
@@ -1374,7 +1385,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         stream,
                     )
                 else:
-                    _run_compiled(
+                    _run_gemm(
                         _get_raw_base(),
                         gemm_tmp,
                         x,
@@ -1403,7 +1414,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
                 if bias is not None:
-                    _run_compiled(
+                    _run_gemm(
                         fused_gemm,
                         y,
                         x,
@@ -1421,7 +1432,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         stream,
                     )
                 else:
-                    _run_compiled(
+                    _run_gemm(
                         fused_gemm,
                         y,
                         x,
@@ -1439,7 +1450,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             else:
                 if bias is not None:
-                    _run_compiled(
+                    _run_gemm(
                         _get_raw_base_bias(),
                         gemm_tmp,
                         x,
@@ -1457,7 +1468,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         stream,
                     )
                 else:
-                    _run_compiled(
+                    _run_gemm(
                         _get_raw_base(),
                         gemm_tmp,
                         x,
@@ -1483,7 +1494,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
                 if bias is not None:
-                    _run_compiled(
+                    _run_gemm(
                         fused_gemm,
                         y,
                         x,
@@ -1501,7 +1512,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         stream,
                     )
                 else:
-                    _run_compiled(
+                    _run_gemm(
                         fused_gemm,
                         y,
                         x,
@@ -1519,7 +1530,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             else:
                 if bias is not None:
-                    _run_compiled(
+                    _run_gemm(
                         _get_raw_base_bias(),
                         gemm_tmp,
                         x,
@@ -1537,7 +1548,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         stream,
                     )
                 else:
-                    _run_compiled(
+                    _run_gemm(
                         _get_raw_base(),
                         gemm_tmp,
                         x,
@@ -1716,7 +1727,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
-                _run_compiled(
+                _run_gemm(
                     gemm,
                     gemm_arg,
                     x,
@@ -1733,7 +1744,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     stream,
                 )
             else:
-                _run_compiled(
+                _run_gemm(
                     gemm,
                     gemm_arg,
                     x,
@@ -1760,7 +1771,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
-                _run_compiled(
+                _run_gemm(
                     gemm,
                     gemm_arg,
                     x,
@@ -1778,7 +1789,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     stream,
                 )
             else:
-                _run_compiled(
+                _run_gemm(
                     gemm,
                     gemm_arg,
                     x,
@@ -1803,7 +1814,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
-                _run_compiled(
+                _run_gemm(
                     gemm,
                     gemm_arg,
                     x,
@@ -1821,7 +1832,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     stream,
                 )
             else:
-                _run_compiled(
+                _run_gemm(
                     gemm,
                     gemm_arg,
                     x,
