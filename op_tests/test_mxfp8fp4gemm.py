@@ -34,6 +34,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
+try:
+    import bench_init
+except ImportError as e:
+    if e.name != "bench_init":
+        raise
+    from op_tests import bench_init
+
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 pd.set_option("display.max_columns", 30)
@@ -42,22 +49,15 @@ pd.set_option("display.width", 1000)
 MX_SCALE_BLOCK = 32
 SUPPORTED_GFX = ["gfx1250"]  # ASM kernels are gfx1250-only (kernarg preload)
 
-
-def _rand_mxfp8(rows: int, k: int) -> torch.Tensor:
-    # Random mxfp8 (e4m3) activations/weights, exactly representable after cast.
-    return (torch.randn((rows, k), dtype=torch.float32) * 2.0).to(torch.float8_e4m3fn)
-
-
-def _rand_fp4_packed(rows: int, k: int) -> torch.Tensor:
-    # Packed mxfp4: each uint8 carries two e2m1 nibbles -> shape (rows, k/2).
-    assert k % 2 == 0
-    return torch.randint(0, 256, (rows, k // 2), dtype=torch.uint8)
+# checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
+# verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
+_TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
 
 
-def _rand_e8m0_scale(rows: int, k: int) -> torch.Tensor:
-    # e8m0 = unsigned 8-bit exponent, bias 127 (0x7F == 1.0). Keep the dynamic
-    # range modest (exponent in [-2, 2]) to match the POC's validated init.
-    return torch.randint(125, 130, (rows, k // MX_SCALE_BLOCK), dtype=torch.uint8)
+def _verdict(err):
+    if err == 0:
+        return "pass"
+    return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
 def _ref(intype, A, B, sA, sB, M, N):
@@ -77,30 +77,38 @@ def _const_mxfp8(rows: int, k: int, val: float) -> torch.Tensor:
     return torch.full((rows, k), val, dtype=torch.float32).to(torch.float8_e4m3fn)
 
 
-def _prep(intype: str, M: int, N: int, K: int, apre: int, init: str):
+def _prep(intype: str, M: int, N: int, K: int, apre: int, data_init: str,
+          scale_init: str, gen):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
-    init="random"   : randn-derived mxfp8/mxfp4 + random e8m0 scales (varied).
-                      Mirrors the POC sin_cos_init=1 (varied, non-zero) pattern.
-    init="constant" : mirrors the POC sin_cos_init=10 -- every A/B element = 0.5
-                      (exact in e4m3 and e2m1) with a neutral e8m0 scale 0x7F
-                      (exp 0 -> 2^0 = 1.0). Deterministic/stable for perf.
+    DATA and SCALE are sampled *independently* (bench_init), selected by
+    ``data_init`` / ``scale_init``:
+      data_init  : uniform (FP8 U(-6,6) / FP4 U(-3,3)) [default] | gaussian |
+                   trig | random | constant (A/B = 0.5)
+      scale_init : auto (E8M0 -> pow2_binomial) [default] | pow2_binomial |
+                   random | constant (neutral 0x7F -> 2^0 = 1.0)
     """
-    if init == "constant":
+    # DATA: A is mxfp8 (e4m3); B is mxfp4 (e2m1 packed) for a8w4, else mxfp8.
+    if data_init == "constant":
         A = _const_mxfp8(M, K, 0.5)
         if intype == "a8w4":
             B = torch.full((N, K // 2), 0x11, dtype=torch.uint8)  # e2m1 nibble 0.5
         else:
             B = _const_mxfp8(N, K, 0.5)
+    else:  # uniform / gaussian / trig / random
+        A = bench_init.fill_fp8((M, K), data_init, gen)
+        if intype == "a8w4":
+            B = bench_init.fill_fp4((N, K), data_init, gen)
+        else:
+            B = bench_init.fill_fp8((N, K), data_init, gen)
+
+    # SCALE: e8m0 per-32 for both operands. auto -> pow2_binomial for E8M0.
+    if scale_init == "constant":
         sA = torch.full((M, K // MX_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
         sB = torch.full((N, K // MX_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-    else:
-        A = _rand_mxfp8(M, K)
-        if intype == "a8w4":
-            B = _rand_fp4_packed(N, K)
-        else:
-            B = _rand_mxfp8(N, K)
-        sA, sB = _rand_e8m0_scale(M, K), _rand_e8m0_scale(N, K)
+    else:  # auto / pow2_binomial / random
+        sA = bench_init.fill_scale_e8m0((M, K // MX_SCALE_BLOCK), scale_init, gen)
+        sB = bench_init.fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
     ref = _ref(intype, A, B, sA, sB, M, N).to(dtypes.bf16)
 
@@ -113,11 +121,13 @@ def _prep(intype: str, M: int, N: int, K: int, apre: int, init: str):
     return inp, ref
 
 
-@benchmark()  # intype, M, N, K, apre, init, ... become the table's left columns
-def test_gemm(intype, M, N, K, apre, init="random", mode="perf"):
+@benchmark()  # intype, M, N, K, apre, data_init, scale_init, ... -> table columns
+def test_gemm(intype, M, N, K, apre, data_init="uniform", scale_init="auto",
+              seed=0, mode="perf"):
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
 
-    inp, ref = _prep(intype, M, N, K, apre, init)
+    gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
+    inp, ref = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
@@ -155,6 +165,7 @@ def test_gemm(intype, M, N, K, apre, init="random", mode="perf"):
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(io_bytes / us / 1e6, 2)
         ret[f"{name} err"] = err
+        ret[f"{name} result"] = _verdict(err)
         if needTrace:
             ret[f"{name} trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
     return ret
@@ -195,13 +206,36 @@ def main():
         help="A-preshuffle sweep list: 1 preshuffles A, 0 sends it row-major",
     )
     parser.add_argument(
-        "--init",
+        "--data-init",
+        dest="data_init",
         nargs="*",
-        choices=["constant", "random"],
-        default=["constant", "random"],
-        help="input-data init mode(s)"
-        "  constant = A=1.0, B=2.0/0x33, neutral e8m0 scales (deterministic)"
-        "  random   = randn-derived mxfp8/mxfp4 + random e8m0 scales",
+        choices=["constant", "uniform", "gaussian", "trig", "random"],
+        default=["constant", "uniform"],
+        help="DATA init distribution(s) (mblas-style; sampled independently of scale).\n"
+        "Paired position-wise with --scale-init (length-1 broadcasts).\n"
+        "  uniform  = FP8 U(-6,6) / FP4 U(-3,3)  [default]\n"
+        "  gaussian = N(0,1)                     [norm-dist / LLM-like]\n"
+        "  trig     = trig_float in [-2,2]       [optimistic pattern]\n"
+        "  random   = pure random on-wire codes  [overly pessimistic]\n"
+        "  constant = A/B = 0.5 (deterministic)",
+    )
+    parser.add_argument(
+        "--scale-init",
+        dest="scale_init",
+        nargs="*",
+        choices=["auto", "pow2_binomial", "random", "constant"],
+        default=["constant", "auto"],
+        help="SCALE init distribution(s) (e8m0 for both operands)\n"
+        "  auto          = E8M0 -> pow2_binomial          [default]\n"
+        "  pow2_binomial = 2^(Binomial(21,0.5)-11)\n"
+        "  random        = random e8m0 byte, exp in [-2,2]\n"
+        "  constant      = neutral scale 0x7F (2^0 = 1.0)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed; same seed -> bit-identical data/scale buffers",
     )
     # Default (M,N,K) = union of the POC perf matrices (run.sh + run_compute.sh).
     # The .cu heuristic picks the registered tile that fits each shape.
@@ -234,11 +268,32 @@ def main():
     )
     args = parser.parse_args()
 
-    rows = []
-    for intype, (M, N, K), apre, init in itertools.product(
-        args.intype, args.shape, args.apre, args.init
-    ):
-        rows.append(test_gemm(intype, M, N, K, apre, init=init, mode=args.mode))
+    # DATA and SCALE init are paired position-wise (NOT crossed), so the default
+    # runs exactly two configs: constant+constant and uniform+auto. A length-1
+    # list broadcasts against the other axis.
+    di_list, si_list = args.data_init, args.scale_init
+    if len(di_list) == 1:
+        di_list = di_list * len(si_list)
+    if len(si_list) == 1:
+        si_list = si_list * len(di_list)
+    if len(di_list) != len(si_list):
+        parser.error(
+            "--data-init and --scale-init must have equal length "
+            "(or length 1 to broadcast)"
+        )
+    init_pairs = list(zip(di_list, si_list))
+
+    # init pair is the OUTERMOST product term -> rows are grouped by
+    # (data_init,scale_init) within the single summary table.
+    rows = [
+        test_gemm(
+            intype, M, N, K, apre,
+            data_init=di, scale_init=si, seed=args.seed, mode=args.mode,
+        )
+        for (di, si), intype, (M, N, K), apre in itertools.product(
+            init_pairs, args.intype, args.shape, args.apre
+        )
+    ]
 
     if rows and args.mode != "func":
         df = pd.DataFrame(rows)

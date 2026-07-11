@@ -6,10 +6,10 @@
 # reference that is only compared (never timed/tabled), TFLOPS + TB/s per
 # candidate, one markdown summary table, and a __main__ guard).
 #
-# Two candidates per (intype, shape, apre) row -- both resolve to the same
-# gfx1250 F4GEMM .co but exercise different entrypoints:
-#   gemm_a4w4 : the unified API the model calls (C++ heuristic picks the tile)
-#   asm       : the low-level asm entry with the tile kernel forced by name
+# One timed candidate per (intype, shape, apre) row:
+#   asm : the low-level asm entry with the tile kernel forced by name
+#         (the unified gemm_a4w4 API resolves to the same .co, so it is not
+#         tabled separately -- a second column would only be confusing).
 #
 #   MXFP4 (intype=mxfp4): per_1x32 e8m0 scales, gfx1250 weight/scale shuffle
 #   NVFP4 (intype=nvfp4): e4m3 per-16 scales + per-tensor global scales
@@ -27,6 +27,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
+try:
+    import bench_init
+except ImportError as e:
+    if e.name != "bench_init":
+        raise
+    from op_tests import bench_init
+
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 pd.set_option("display.max_columns", 30)
@@ -35,6 +42,16 @@ pd.set_option("display.width", 1000)
 SUPPORTED_GFX = ["gfx1250"]  # gfx1250-only F4GEMM (preload SGPR) path
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
+
+# checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
+# verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
+_TOL_ERR_RATIO = 0.05  # matches checkAllclose default tol_err_ratio
+
+
+def _verdict(err):
+    if err == 0:
+        return "pass"
+    return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
 def _e4m3_to_f32(s: torch.Tensor) -> torch.Tensor:
@@ -59,24 +76,23 @@ def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype):
     return (float(gA) * float(gB) * (x_f32 * xs) @ (w_f32 * ws).T).to(dtype)
 
 
-def _prep_mxfp4(M, N, K, apre, dtype, init):
-    if init == "random":
-        # Reuse the per_1x32 e8m0 quant (same block-32 scales the mxfp4
-        # kernel expects); only the shuffle differs from the gfx950 path.
-        quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-        x = torch.randn((M, K), dtype=dtype)
-        w = torch.randn((N, K), dtype=dtype)
-        xq, xs = quant(x, shuffle=False)  # packed fp4 [*, K/2] + e8m0 [*, K/32]
-        wq, ws = quant(w, shuffle=False)
-        xq, wq = xq.view(torch.uint8), wq.view(torch.uint8)
-        xs, ws = xs.view(torch.uint8), ws.view(torch.uint8)
-    else:
-        # Constant init, mirroring f4gemm.cpp data_init=0: A=0x22, B=0x33, and a
-        # neutral e8m0 scale 0x7F (exp 0 -> 2^0 = 1.0). Stable/deterministic for perf.
+def _prep_mxfp4(M, N, K, apre, dtype, data_init, scale_init, gen):
+    # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
+    if data_init == "constant":
+        # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
         xq = torch.full((M, K // 2), 0x22, dtype=torch.uint8)
         wq = torch.full((N, K // 2), 0x33, dtype=torch.uint8)
+    else:  # uniform / gaussian / trig / random
+        xq = bench_init.fill_fp4((M, K), data_init, gen)
+        wq = bench_init.fill_fp4((N, K), data_init, gen)
+    # SCALE (e8m0 per-32). auto -> pow2_binomial for E8M0.
+    if scale_init == "constant":
+        # neutral e8m0 scale 0x7F (exp 0 -> 2^0 = 1.0).
         xs = torch.full((M, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
         ws = torch.full((N, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
+    else:  # auto / pow2_binomial / random
+        xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
+        ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
     ref = run_torch_mxfp4(xq, wq, xs, ws, dtype)
     inp = dict(
         A=shuffle_weight_f4(xq) if apre else xq,
@@ -89,22 +105,25 @@ def _prep_mxfp4(M, N, K, apre, dtype, init):
     return inp, ref
 
 
-def _prep_nvfp4(M, N, K, apre, dtype, init):
-    if init == "random":
-        # No per_1x16 e4m3 quant helper yet: random fp4 + e4m3 scales + globals.
-        xq = torch.randint(0, 256, (M, K // 2), dtype=torch.uint8)
-        wq = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8)
-        xs = torch.randint(0x20, 0x50, (M, K // NVFP4_SCALE_BLOCK), dtype=torch.uint8)
-        ws = torch.randint(0x20, 0x50, (N, K // NVFP4_SCALE_BLOCK), dtype=torch.uint8)
-        gA = gB = 0.5
-    else:
-        # Constant init, mirroring f4gemm.cpp data_init=0: A=0x22, B=0x33, neutral
-        # e4m3 scale 0x38 (exp 7 = bias -> 1.0) and unit global scales.
+def _prep_nvfp4(M, N, K, apre, dtype, data_init, scale_init, gen):
+    # DATA (fp4 e2m1). data & scale sampled independently (bench_init).
+    if data_init == "constant":
+        # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
         xq = torch.full((M, K // 2), 0x22, dtype=torch.uint8)
         wq = torch.full((N, K // 2), 0x33, dtype=torch.uint8)
+    else:  # uniform / gaussian / trig / random
+        xq = bench_init.fill_fp4((M, K), data_init, gen)
+        wq = bench_init.fill_fp4((N, K), data_init, gen)
+    # SCALE (e4m3 per-16). auto -> gaussian(0.34375,0.08) for E4M3.
+    if scale_init == "constant":
+        # neutral e4m3 scale 0x38 (exp 7 = bias -> 1.0).
         xs = torch.full((M, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
         ws = torch.full((N, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
-        gA = gB = 1.0
+    else:  # auto / gaussian / random
+        xs = bench_init.fill_scale_e4m3((M, K // NVFP4_SCALE_BLOCK), scale_init, gen)
+        ws = bench_init.fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
+    # Per-tensor global scale is NOT part of bench_init: keep neutral.
+    gA = gB = 1.0
     ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype)
     inp = dict(
         A=shuffle_weight_f4(xq) if apre else xq,
@@ -117,29 +136,16 @@ def _prep_nvfp4(M, N, K, apre, dtype, init):
     return inp, ref
 
 
-@benchmark()  # (intype, M, N, K, apre, init, dtype) become the table's left columns
-def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
+@benchmark()  # (intype, M, N, K, apre, data_init, scale_init, seed) -> columns
+def test_gemm(intype, M, N, K, apre, data_init, scale_init, seed=0, mode="perf",
+              dtype=dtypes.bf16):
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
+    gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
-    inp, ref = prep(M, N, K, apre, dtype, init)
-
-    def run_unified():
-        # The path the model runs: unified API, C++ heuristic picks the tile.
-        # NVFP4 per-tensor global scales are passed as tensors here.
-        gA = None if inp["gA"] is None else torch.tensor(inp["gA"], dtype=torch.float32)
-        gB = None if inp["gB"] is None else torch.tensor(inp["gB"], dtype=torch.float32)
-        return aiter.gemm_a4w4(
-            inp["A"],
-            inp["B"],
-            inp["sA"],
-            inp["sB"],
-            dtype=dtype,
-            apreshuffle=bool(apre),
-            bpreshuffle=True,
-            global_A_scale=gA,
-            global_B_scale=gB,
-        )
+    inp, ref = prep(M, N, K, apre, dtype, data_init, scale_init, gen)
+    needTrace = mode == "profile"
+    num_iters = 5 if mode == "func" else 101
 
     def run_asm():
         # See hsa/gfx1250/f4gemm/f4gemm.csv.
@@ -168,8 +174,9 @@ def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
             kernelName=knl,
         )
 
-    candidates = {"gemm_a4w4": run_unified}
-    candidates["asm"] = run_asm
+    # Only the low-level asm entry is timed/tabled (the unified gemm_a4w4 path
+    # resolves to the same .co, so a second column would just be confusing).
+    candidates = {"asm": run_asm}
 
     flops = 2 * M * N * K
     nbytes = (
@@ -182,12 +189,15 @@ def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
-        out, us = run_perftest(fn)
+        out, us = run_perftest(fn, num_iters=num_iters, needTrace=needTrace)
         err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
         ret[f"{name} err"] = err
+        ret[f"{name} result"] = _verdict(err)
+        if needTrace:
+            ret[f"{name} trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
     return ret
 
 
@@ -202,7 +212,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the unified gemm_a4w4 API",
+        description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the low-level asm entry",
     )
     parser.add_argument(
         "--intype",
@@ -220,13 +230,44 @@ def main():
         help="A-preshuffle sweep list: 1 preshuffles A, 0 sends it row-major",
     )
     parser.add_argument(
-        "--init",
+        "--data-init",
+        dest="data_init",
         nargs="*",
-        choices=["constant", "random"],
-        default=["constant", "random"],
-        help="input-data init mode(s)"
-        "  constant = A=0x22,B=0x33,neutral scales"
-        "  random   = varied fp4 matrices + random scales",
+        choices=["constant", "uniform", "gaussian", "trig", "random"],
+        default=["constant", "uniform"],
+        help="DATA init distribution(s) (mblas-style; sampled independently of scale).\n"
+        "Paired position-wise with --scale-init (length-1 broadcasts).\n"
+        "  uniform  = FP4 U(-3,3)            [default]\n"
+        "  gaussian = N(0,1)                 [norm-dist / LLM-like]\n"
+        "  trig     = trig_float in [-2,2]   [optimistic pattern]\n"
+        "  random   = pure random e2m1 codes [overly pessimistic]\n"
+        "  constant = A=0x22, B=0x33 (deterministic)",
+    )
+    parser.add_argument(
+        "--scale-init",
+        dest="scale_init",
+        nargs="*",
+        choices=["auto", "pow2_binomial", "gaussian", "random", "constant"],
+        default=["constant", "auto"],
+        help="SCALE init distribution(s) (by scale format)\n"
+        "  auto          = format-recommended: mxfp4/E8M0 -> pow2_binomial,\n"
+        "                  nvfp4/E4M3 -> gaussian(0.34375,0.08)  [default]\n"
+        "  pow2_binomial = 2^(Binomial(21,0.5)-11)   [E8M0 only]\n"
+        "  gaussian      = N(0.34375,0.08)           [E4M3 only]\n"
+        "  random        = random on-wire byte, modest range\n"
+        "  constant      = neutral scale (2^0 = 1.0)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed; same seed -> bit-identical data/scale buffers",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["func", "perf", "profile"],
+        default="perf",
+        help="func=acc only (no table), perf=acc+timing table, profile=perf+trace",
     )
     parser.add_argument(
         "-d",
@@ -249,17 +290,37 @@ def main():
     )
     args = parser.parse_args()
 
+    # DATA and SCALE init are paired position-wise (NOT crossed), so the default
+    # runs exactly two configs: constant+constant and uniform+auto. A length-1
+    # list broadcasts against the other axis.
+    di_list, si_list = args.data_init, args.scale_init
+    if len(di_list) == 1:
+        di_list = di_list * len(si_list)
+    if len(si_list) == 1:
+        si_list = si_list * len(di_list)
+    if len(di_list) != len(si_list):
+        parser.error(
+            "--data-init and --scale-init must have equal length "
+            "(or length 1 to broadcast)"
+        )
+    init_pairs = list(zip(di_list, si_list))
+
     for dtype in args.dtype:  # one table per output dtype
+        # init pair is the OUTERMOST product term -> rows are grouped by
+        # (data_init,scale_init) within the single summary table.
         rows = [
-            test_gemm(intype, M, N, K, apre, init, dtype=dtype)
-            for intype, apre, init, (M, N, K) in itertools.product(
-                args.intype, args.apre, args.init, args.shape
+            test_gemm(intype, M, N, K, apre, di, si, seed=args.seed,
+                      mode=args.mode, dtype=dtype)
+            for (di, si), intype, apre, (M, N, K) in itertools.product(
+                init_pairs, args.intype, args.apre, args.shape
             )
         ]
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "gemm_a4w4 (F4GEMM) summary (markdown):\n%s", df.to_markdown(index=False)
-        )
+        if args.mode != "func":
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
+                df.to_markdown(index=False),
+            )
 
 
 if __name__ == "__main__":
