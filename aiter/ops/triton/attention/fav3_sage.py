@@ -2,15 +2,28 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import torch
 import aiter
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
     sage_fwd,
-    map_dims,
 )
 
+# The ``map_dims`` layout helper lives in attention/utils.py; the Sparge / VFA
+# block-sparse mask, ragged-LUT, and m_init preparation helpers live in
+# attention/block_sparse.py. They are re-exported here so existing
+# ``from aiter.ops.triton.attention.fav3_sage import ...`` call sites keep working.
+from aiter.ops.triton.attention.utils import map_dims  # noqa: F401
+from aiter.ops.triton.attention.block_sparse import (  # noqa: F401
+    block_attn_mask_to_ragged_lut,
+    fill_block_map_triton,
+    fill_causal_mask_triton,
+    get_block_map_meansim,
+    block_attn_mask_to_ragged_lut_topn_front,
+    build_attention_lut,
+    compute_m_proxy_topn,
+)
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -48,6 +61,29 @@ def get_sage_fwd_configs():
         }
 
 
+def build_tile_schedule(
+    lut_count: torch.Tensor,
+    descending: bool = True,
+) -> torch.Tensor:
+    """Order the block-sparse q-block tiles by their KV-block work for load balance.
+
+    The block-sparse kernel launches one program per
+    ``(batch, head, q_block)`` segment, and each program loops over
+    ``lut_count[seg]`` KV blocks (``seg = b*(H*Q) + h*Q + q_block``). When the
+    per-segment counts are very uneven (e.g. some heads near-dense, others
+    sparse) a naive launch leaves heavy tiles running in the tail while light
+    tiles have long finished.
+
+    Returns an int32 permutation of segment indices sorted by ``lut_count``
+    (descending by default = longest-processing-time-first). Used internally by
+    :func:`fav3_sage_func` when ``sparge_load_balancing=True``: the persistent
+    atomic work queue hands these out heaviest-first, shrinking the makespan
+    tail.
+    """
+    order = torch.argsort(lut_count.to(torch.int64), descending=descending, stable=True)
+    return order.to(torch.int32).contiguous()
+
+
 class _FAv3SageWrapperFunc(torch.autograd.Function):
     """
     Sage Attention v1 wrapper that maintains high-precision inputs/outputs.
@@ -78,6 +114,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         config: Optional[dict] = None,
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         smooth_k: bool = True,
+        freeze_softmax_max_count: int = -1,
+        sparge_load_balancing: bool = False,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -179,6 +217,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             lut_start=lut_start,
             lut_count=lut_count,
             use_block_sparse=use_block_sparse,
+            freeze_softmax_max_count=freeze_softmax_max_count,
+            sparge_load_balancing=sparge_load_balancing,
         )
 
         if return_lse:
@@ -210,6 +250,8 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # config
             None,  # block_lut
             None,  # smooth_k
+            None,  # freeze_softmax_max_count
+            None,  # sparge_load_balancing
         )
 
 
@@ -229,6 +271,8 @@ def fav3_sage_wrapper_func(
     config: Optional[dict] = None,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     smooth_k: bool = True,
+    freeze_softmax_max_count: int = -1,
+    sparge_load_balancing: bool = False,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -260,6 +304,12 @@ def fav3_sage_wrapper_func(
                 (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
                 When None, dense attention is used.
         smooth_k: Whether to apply k-smoothing to the K tensor
+        freeze_softmax_max_count: number of inner-loop K-block iterations after
+                which the online-softmax running max is frozen (block-sparse only;
+                -1 disables). See fav3_sage_func / build_attention_lut.
+        sparge_load_balancing: when True (block-sparse only), enable the
+                persistent + atomic longest-processing-time tile schedule to
+                balance work across CUs. See fav3_sage_func for details.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -307,6 +357,8 @@ def fav3_sage_wrapper_func(
         config,
         block_lut,
         smooth_k,
+        freeze_softmax_max_count,
+        sparge_load_balancing,
     )
 
 
@@ -330,6 +382,9 @@ def fav3_sage_func(
     lut_start: Optional[torch.Tensor] = None,
     lut_count: Optional[torch.Tensor] = None,
     use_block_sparse: bool = False,
+    freeze_softmax_max_count: int = -1,
+    sparge_load_balancing: bool = False,
+    m_init: Optional[torch.Tensor] = None,
 ):
     """
     SageAttention v1.
@@ -355,6 +410,23 @@ def fav3_sage_func(
         lut_start: Optional start index for the ragged LUT
         lut_count: Optional count of the ragged LUT
         use_block_sparse: Whether to use block-sparse attention
+        freeze_softmax_max_count: number of inner-loop K-block iterations after
+                which the online-softmax running max stops being updated. Once
+                frozen, the kernel skips the per-block max reduction and the acc
+                rescale, computing ``p = exp(qk - m)``, ``l += rowsum(p)`` and
+                ``acc += p @ v`` with ``m`` held fixed (VFA-style). ``-1``
+                (default) disables freezing and keeps the exact online softmax.
+                Only takes effect on the block-sparse path.
+        m_init: optional precomputed per-row running-max estimate (VFA), fp32
+                ``[batch, nheads_q, num_q_blocks, BLKQ]``. When provided the
+                kernel skips the online-softmax rowmax reduction and the acc
+                rescale entirely (frozen max from the first block), computing
+                ``p = exp2(qk - m_init)``, ``l += rowsum(p)`` and
+                ``acc += p @ v``. Works for the dense non-causal path and the
+                block-sparse path. Mutually exclusive with causal/sliding-window
+                masking and with ``freeze_softmax_max_count``. See
+                :func:`compute_m_proxy_topn` for the estimator. ``None``
+                (default) runs the exact online softmax.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -434,6 +506,44 @@ def fav3_sage_func(
     window_size_left, window_size_right = int(window_size[0]), int(window_size[1])
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
+    if use_block_sparse and use_sliding_window:
+        raise NotImplementedError(
+            "Sliding window and block-sparse attention cannot be enabled "
+            "together; set window_size=(-1, -1) when use_block_sparse=True."
+        )
+
+    if freeze_softmax_max_count >= 0 and not use_block_sparse:
+        raise ValueError(
+            "freeze_softmax_max_count is only meaningful with "
+            "use_block_sparse=True; leave it at -1 (disabled) otherwise."
+        )
+
+    # VFA: a precomputed frozen running-max estimate. Incompatible with the
+    # masking paths (causal/sliding window) and with the warm-up freeze, which
+    # derive their own running max.
+    use_precomputed_max = m_init is not None
+    if use_precomputed_max:
+        if causal or use_sliding_window:
+            raise NotImplementedError(
+                "m_init (VFA precomputed max) does not support causal or "
+                "sliding-window masking; require causal=False and "
+                "window_size=(-1, -1)."
+            )
+        if freeze_softmax_max_count >= 0:
+            raise ValueError(
+                "m_init (VFA precomputed max) and freeze_softmax_max_count are "
+                "mutually exclusive; pass only one."
+            )
+        assert m_init.dtype == torch.float32, "m_init must be fp32"
+        assert m_init.shape == (batch, nheads_q, num_q_blocks, BLKQ), (
+            f"m_init shape {tuple(m_init.shape)} does not match expected "
+            f"{(batch, nheads_q, num_q_blocks, BLKQ)}"
+        )
+        stride_mz, stride_mh, stride_mblk, stride_mr = m_init.stride()
+    else:
+        m_init = torch.zeros(1, dtype=torch.float32, device=q.device)
+        stride_mz = stride_mh = stride_mblk = stride_mr = 0
+
     if use_block_sparse:
         if kv_block_indices is None or lut_start is None or lut_count is None:
             raise ValueError(
@@ -451,9 +561,41 @@ def fav3_sage_func(
         lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
         lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
 
+    if sparge_load_balancing and not use_block_sparse:
+        raise ValueError(
+            "sparge_load_balancing=True is only supported on the block-sparse "
+            "path (use_block_sparse=True)."
+        )
+
+    # Sparge load balancing: sort the (batch, head, q_block) tiles by descending
+    # KV-block count (longest-processing-time first) and run them through a
+    # persistent kernel whose resident programs share a global atomic work queue.
+    # This evens out the makespan when per-q-block KV-block counts are very
+    # uneven (e.g. some heads near-dense, others sparse).
+    use_tile_schedule = bool(sparge_load_balancing)
+    tile_schedule = None
+    tile_counter = None
+    n_tiles = 0
+    if use_tile_schedule:
+        tile_schedule = build_tile_schedule(lut_count)
+        n_tiles = tile_schedule.numel()
+        # Atomic work-queue counter; must start at zero on every launch.
+        tile_counter = torch.zeros(1, dtype=torch.int32, device=q.device)
+        # One resident workgroup per CU saturates this register-heavy kernel
+        # (occupancy ~1); surplus programs just find the queue drained and exit.
+        num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_programs = min(n_tiles, num_cus)
+
     # --- 7. Kernel Launch ---
-    def grid(META):
-        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+    if use_tile_schedule:
+
+        def grid(META):
+            return (num_programs,)
+
+    else:
+
+        def grid(META):
+            return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
     sage_fwd[grid](
         q,
@@ -471,6 +613,11 @@ def fav3_sage_func(
         stride_ksblk,
         stride_vsz,
         stride_vsh,
+        m_init,
+        stride_mz,
+        stride_mh,
+        stride_mblk,
+        stride_mr,
         softmax_lse,
         out,
         None,
@@ -536,6 +683,12 @@ def fav3_sage_func(
         RETURN_SCORES=False,
         USE_SEQUSED=False,
         USE_BLOCK_SPARSE=use_block_sparse,
+        FREEZE_SOFTMAX_MAX_COUNT=freeze_softmax_max_count,
+        USE_PRECOMPUTED_MAX=use_precomputed_max,
+        TILE_SCHEDULE=tile_schedule,
+        TILE_COUNTER=tile_counter,
+        NUM_TILES=n_tiles,
+        USE_TILE_SCHEDULE=use_tile_schedule,
         **config,
     )
 
@@ -543,3 +696,98 @@ def fav3_sage_func(
         return out, softmax_lse
     else:
         return out, None
+
+
+def fav3_sage_vfa_wrapper_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    return_lse: bool = False,
+    layout: str = "bshd",
+    config: Optional[dict] = None,
+    n_sample_blocks: int = 16,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """High-precision VFA API: handles quantization and the ``m_init`` estimate.
+
+    Thin convenience wrapper around :func:`fav3_sage_func`. It quantizes the
+    high-precision Q/K/V, builds the per-row frozen-max estimate ``m_init``, and
+    runs the (now unified) sage kernel with the VFA precomputed-max path.
+
+    The per-row frozen-max estimate ``m_init`` is the top-``n_sample_blocks``
+    blocks per q-block ranked by a SpargeAttn mean-pooled block-score and then
+    evaluated with real K rows (a lower bound on the true per-row max; no safety
+    margin). See :func:`compute_m_proxy_topn`.
+
+    When ``block_lut`` (a ragged ``(kv_block_indices, lut_start, lut_count)``
+    LUT from :func:`block_attn_mask_to_ragged_lut`) is provided, the
+    block-sparse path runs (the hot loop visits only attended K blocks); the
+    same guided ``m_init`` estimate is used.
+    """
+    assert q.dtype in [torch.float16, torch.bfloat16, torch.float32]
+    assert k.dtype in [torch.float16, torch.bfloat16, torch.float32]
+    assert v.dtype in [torch.float16, torch.bfloat16, torch.float32]
+
+    if config is None:
+        config = get_sage_fwd_configs()
+
+    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    _, _, _, head_dim = map_dims(q.shape, bshd_map)
+    softmax_scale = softmax_scale or (head_dim**-0.5)
+
+    BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+    fp8_dtype = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    q_int8, q_descale, k_int8, k_descale, v_fp8, v_descale = sage_quant(
+        q,
+        k,
+        v,
+        fp8_dtype,
+        fp8_max,
+        sm_scale=softmax_scale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        layout=layout,
+    )
+
+    use_block_sparse = block_lut is not None
+    if use_block_sparse:
+        kv_block_indices, lut_start, lut_count = block_lut
+    else:
+        kv_block_indices = lut_start = lut_count = None
+
+    m_init = compute_m_proxy_topn(
+        q,
+        k,
+        q_int8,
+        k_int8,
+        q_descale,
+        k_descale,
+        BLKQ=BLKQ,
+        BLKK=BLKK,
+        layout=layout,
+        n_blocks=n_sample_blocks,
+    )
+
+    out, lse = fav3_sage_func(
+        q_int8,
+        k_int8,
+        v_fp8,
+        q_descale,
+        k_descale,
+        v_descale,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
+        layout=layout,
+        config=config,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
+        use_block_sparse=use_block_sparse,
+        m_init=m_init,
+    )
+    if return_lse:
+        return out, lse
+    return out

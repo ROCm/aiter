@@ -2,7 +2,7 @@ import functools
 import torch
 import triton
 import aiter
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
+from aiter.ops.triton.attention.utils import (
     map_dims,
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (

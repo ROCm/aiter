@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
+from aiter.ops.triton.attention.utils import map_dims
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
     sage_fwd_mxfp4,
