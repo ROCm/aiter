@@ -281,6 +281,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
 
+    num_buffers = min(num_buffers, triton.cdiv(k, block_k))
+
     ret = {
         "block_m": block_m,
         "block_n": block_n,
@@ -502,7 +504,7 @@ def moe_gemm_a8w4(
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
@@ -555,7 +557,7 @@ def moe_gemm_a8w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
             X_SCALE_TDM=X_SCALE_TDM,
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
