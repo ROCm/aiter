@@ -234,15 +234,32 @@ def test_flydsl_batched_gemm_mxfp4_tiles(variant, tile):
     _run(variant, "bmn", 3, 64, 1024, 1024, torch.bfloat16, tile=tile)
 
 
+# Odd / ragged M: M % 32 != 0 and M % 2 != 0 force the last M-tile past the real M,
+# so rows [M, tile_m) must be dropped by the store's OOB path (and their scales
+# OOB-zeroed). B is odd too. Covers both bmn and mbn (mbn interleaves the batch dim
+# into the scale super stride, a distinct OOB code path).
+OOB_M = [1, 17, 31, 33, 65, 127]
+
+
+@pytest.mark.parametrize("M", OOB_M)
+@pytest.mark.parametrize("layout", ["bmn", "mbn"])
 @pytest.mark.parametrize("variant", ["a4w4", "a8w4"])
-def test_flydsl_batched_gemm_mxfp4_cudagraph(variant):
+def test_flydsl_batched_gemm_mxfp4_oob(variant, layout, M):
+    _skip_if_unsupported(variant)
+    torch.cuda.empty_cache()
+    _run(variant, layout, 3, M, 512, 512, torch.bfloat16)
+
+
+@pytest.mark.parametrize("layout", ["bmn", "mbn"])
+@pytest.mark.parametrize("variant", ["a4w4", "a8w4"])
+def test_flydsl_batched_gemm_mxfp4_cudagraph(variant, layout):
     _skip_if_unsupported(variant)
     torch.cuda.empty_cache()
     B, M, N, K, dtype = 2, 64, 1024, 4096, torch.bfloat16
     a_dtype = "fp8" if variant == "a8w4" else "fp4"
     x, w, x_scales, w_scales, ref = gen_inputs(variant, B, M, N, K, dtype)
     a, w_sh, sa, sb = preshuffle_operands(
-        x, w, x_scales, w_scales, a_dtype=a_dtype, layout="bmn"
+        x, w, x_scales, w_scales, a_dtype=a_dtype, layout=layout
     )
     # Only the (prepared) launch is captured -- no shuffle in the graph.
     out, _us = run_perftest(
@@ -254,11 +271,16 @@ def test_flydsl_batched_gemm_mxfp4_cudagraph(variant):
         N,
         dtype,
         a_dtype=a_dtype,
+        layout=layout,
         testGraph=True,
         num_iters=20,
         num_warmup=3,
     )
     err = checkAllclose(
-        ref.float(), out.float(), rtol=1e-2, atol=1e-2, msg=f"flydsl graph {variant}"
+        ref.float(),
+        out.float(),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"flydsl graph {variant} {layout}",
     )
-    assert err < 0.05, f"flydsl graph {variant} mismatch ratio {err:.4f}"
+    assert err < 0.05, f"flydsl graph {variant} {layout} mismatch ratio {err:.4f}"
