@@ -44,6 +44,22 @@ def metric_table(title, key, fmt):
     return L
 
 
+def raw_table():
+    L = ["| ver | C | ctx | heads | impl | split | time µs | GB/s | TFLOP/s | xcheck |",
+         "|---|--:|--:|:--:|:--:|--:|--:|--:|--:|--:|"]
+    for sh in SHAPES:
+        C, ctx, Hq, Hkv = sh
+        for v in VERS:
+            for im in IMPLS:
+                r = get(v, sh, im)
+                if not r:
+                    continue
+                L.append(f"| {VLABEL[v]} | {C} | {ctx} | {Hq}/{Hkv} | {im} | {r['split']} | "
+                         f"{r['time_us']:.1f} | {r['gbps']:.0f} | {r['tflops']:.1f} | {r['xc']:.0e} |")
+    L.append("")
+    return L
+
+
 def speedup_table():
     L = ["### gluon speedup (time_triton / time_gluon), same-version", "",
          "| shape | " + " | ".join(VLABEL[v] for v in VERS) + " |",
@@ -86,6 +102,9 @@ hdr = [
     "  is absent on 3.7/3.8 so decode is nb=2 on all three (apples-to-apples).",
     "- triton installed per column: " + ", ".join(f"`{full[v]}`" for v in VERS) + ".",
     f"- Cross-check gluon-vs-triton output max abs diff ≤ **{xc_max:.0e}** across all cells.",
+    "",
+    "Contents: **exact per-cell measurements** (Time / Bandwidth / Compute tables), a **speedup",
+    "summary**, the **split counts**, and an **appendix with every raw run** (all metrics per row).",
     "",
 ]
 
@@ -131,6 +150,11 @@ tk = [
     f"{len(SHAPES) * len(VERS)} cells.", "",
 ]
 out += tk
+
+out += ["## Appendix — raw per-run data (every measurement, all metrics per row)", "",
+        "One row per profiled run: `time µs` is total kernel time/iter (attention + reduce; "
+        "gluon S=1 is attention only), `GB/s` and `TFLOP/s` are derived from it, `split` is the "
+        "segment/split count used.", ""] + raw_table()
 
 open(f"{BASE}/perf_scan.md", "w").write("\n".join(out) + "\n")
 print("wrote perf_scan.md")
