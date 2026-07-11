@@ -383,8 +383,6 @@ def gemm_a8w8_blockscale_preshuffle(
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
-        extra_constexpr["N_CONST"] = N
-        extra_constexpr["K_CONST"] = K
         config["NUM_BUFFERS"] = config.pop("num_stages", 1)
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel

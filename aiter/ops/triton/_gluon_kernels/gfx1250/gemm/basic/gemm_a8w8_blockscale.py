@@ -791,8 +791,6 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "num_warps",
     "cache_modifier",
     "NUM_BUFFERS",
-    "N_CONST",
-    "K_CONST",
 ]
 
 _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_repr = make_kernel_repr(
@@ -868,8 +866,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    N_CONST: gl.constexpr,
-    K_CONST: gl.constexpr,
     MAYBE_LOOP_UNROLL: gl.constexpr = False,
 ):
     """
@@ -1376,8 +1372,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    N_CONST: gl.constexpr,
-    K_CONST: gl.constexpr,
     MAYBE_LOOP_UNROLL: gl.constexpr = False,
 ):
     """
