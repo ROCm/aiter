@@ -25,13 +25,34 @@ from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (  # noqa: E402
     flydsl_batched_gemm_mxfp4,
 )
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight  # noqa: E402
+from aiter.ops.shuffle import (  # noqa: E402
+    shuffle_scale,
+    shuffle_scale_n32k4,
+    shuffle_weight,
+    shuffle_weight_gfx1250,
+)
 from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
 
 torch.set_default_device("cuda")
 
 SCALE_GROUP_SIZE = 32
+
+# gfx1250 supports only the a8w4 variant (MXFP8 E4M3 A x MXFP4 B) via wave32 WMMA.
+_IS_GFX1250 = get_gfx() == "gfx1250"
+
+
+def _supported_gfx():
+    return get_gfx() in ("gfx950", "gfx1250")
+
+
+def _skip_if_unsupported(variant):
+    if not _supported_gfx():
+        pytest.skip(
+            f"FlyDSL MXFP preshuffle GEMM requires gfx950/gfx1250, got {get_gfx()}"
+        )
+    if _IS_GFX1250 and variant != "a8w4":
+        pytest.skip(f"gfx1250 FlyDSL batched GEMM supports a8w4 only, not {variant}")
 
 # (B, M, N, K). Odd/large M (not multiples of the 32-row scale chunk or the tile) exercise
 # the ragged-M tail: rows past M read 0. N % tile_n == 0, K % 256 == 0.
@@ -54,11 +75,47 @@ TILES = [
 ]
 
 
+def _pad_rows_to_32(s):
+    r = s.shape[0]
+    if r % 32 == 0:
+        return s
+    pad = torch.zeros((32 - r % 32, s.shape[1]), dtype=s.dtype, device=s.device)
+    return torch.cat([s, pad], dim=0)
+
+
+def preshuffle_operands_gfx1250(x, w, x_scales, w_scales, *, layout="bmn"):
+    """gfx1250 a8w4 host prep: A stays plain fp8 codes; B via shuffle_weight_gfx1250;
+    both e8m0 scales via shuffle_scale_n32k4 (rows padded to 32). Mirrors the gfx950
+    prep's bmn/mbn stacking so A / scale_a follow `layout`."""
+    B, M = x.shape[0], x.shape[1]
+    a_list, sa_list, w_list, sb_list = [], [], [], []
+    for b in range(B):
+        a_list.append(x[b].contiguous())
+        w_list.append(shuffle_weight_gfx1250(w[b].contiguous()).reshape(-1))
+        sa = shuffle_scale_n32k4(_pad_rows_to_32(x_scales[b]).unsqueeze(0), experts_cnt=1)
+        sa_list.append(sa.view(torch.uint8).reshape((M + 31) // 32, -1))
+        sb = shuffle_scale_n32k4(_pad_rows_to_32(w_scales[b]).unsqueeze(0), experts_cnt=1)
+        sb_list.append(sb.view(torch.uint8).reshape(-1))
+    w_sh = torch.cat(w_list)
+    sb = torch.cat(sb_list)
+    if layout == "mbn":  # A [M,B,K]; scale_a [ceil(M/32), B, chunk]
+        a = torch.stack(a_list, dim=1).contiguous()
+        sa = torch.stack(sa_list, dim=1).contiguous().reshape(-1)
+    else:  # bmn [B,M,K]; scale_a [B, ceil(M/32), chunk]
+        a = torch.stack(a_list, dim=0).contiguous()
+        sa = torch.cat([s.reshape(-1) for s in sa_list])
+    return a, w_sh, sa, sb
+
+
 def preshuffle_operands(x, w, x_scales, w_scales, *, a_dtype="fp4", layout="bmn"):
     """One-time host prep (done once, NOT per launch): keep A codes plain, preshuffle B and
     both e8m0 scales, and lay A/scale_a out for `layout`. Inputs are logical [B,M,*]; returns
     (a, w, a_scales, w_scales) for flydsl_batched_gemm_mxfp4 (a is [B,M,*] bmn / [M,B,*] mbn,
     the rest flat)."""
+    if _IS_GFX1250:
+        return preshuffle_operands_gfx1250(
+            x, w, x_scales, w_scales, layout=layout
+        )
     B, M = x.shape[0], x.shape[1]
     K = x_scales.shape[-1] * SCALE_GROUP_SIZE
     M32 = (M + 31) // 32 * 32
@@ -163,8 +220,7 @@ def _run(variant, layout, B, M, N, K, dtype, tile=(128, 128, 256)):
 @pytest.mark.parametrize("layout", ["bmn", "mbn"])
 @pytest.mark.parametrize("variant", ["a4w4", "a8w4"])
 def test_flydsl_batched_gemm_mxfp4(variant, layout, B, M, N, K, dtype):
-    if get_gfx() != "gfx950":
-        pytest.skip(f"FlyDSL MXFP preshuffle GEMM requires gfx950, got {get_gfx()}")
+    _skip_if_unsupported(variant)
     torch.cuda.empty_cache()
     _run(variant, layout, B, M, N, K, dtype)
 
@@ -172,8 +228,7 @@ def test_flydsl_batched_gemm_mxfp4(variant, layout, B, M, N, K, dtype):
 @pytest.mark.parametrize("tile", TILES)
 @pytest.mark.parametrize("variant", ["a4w4", "a8w4"])
 def test_flydsl_batched_gemm_mxfp4_tiles(variant, tile):
-    if get_gfx() != "gfx950":
-        pytest.skip(f"FlyDSL MXFP preshuffle GEMM requires gfx950, got {get_gfx()}")
+    _skip_if_unsupported(variant)
     torch.cuda.empty_cache()
     # N=1024 (div 128/256), K=1024 (div 128/256, %256==0); M=64 with an odd batch.
     _run(variant, "bmn", 3, 64, 1024, 1024, torch.bfloat16, tile=tile)
@@ -181,8 +236,7 @@ def test_flydsl_batched_gemm_mxfp4_tiles(variant, tile):
 
 @pytest.mark.parametrize("variant", ["a4w4", "a8w4"])
 def test_flydsl_batched_gemm_mxfp4_cudagraph(variant):
-    if get_gfx() != "gfx950":
-        pytest.skip(f"FlyDSL MXFP preshuffle GEMM requires gfx950, got {get_gfx()}")
+    _skip_if_unsupported(variant)
     torch.cuda.empty_cache()
     B, M, N, K, dtype = 2, 64, 1024, 4096, torch.bfloat16
     a_dtype = "fp8" if variant == "a8w4" else "fp4"
