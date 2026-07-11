@@ -16,6 +16,10 @@ export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 export AITER_BF16_FP8_MOE_BOUND=${AITER_BF16_FP8_MOE_BOUND:-0}
 # set to 1 on the very first run so JIT kernels get built
 export AITER_REBUILD=${AITER_REBUILD:-0}
+# CK (composable_kernel) has no gfx1250 target -> module_moe_asm fails its
+# ck_tile device static_assert. Build the CK-dependent modules CK-free so they
+# fall back to ck_tile_shim.h instead of pulling ck_tile/core.hpp.
+export ENABLE_CK=${ENABLE_CK:-0}
 
 # ---------------- arch detection ----------------
 # Prefer aiter's own get_gfx(); fall back to rocminfo.
@@ -84,10 +88,17 @@ echo "logs -> $LOGDIR"
 classify() {
   local rc="$1" log="$2" tag="$3"
   local st
-  # status: skip (arch/kernel not supported) > fail (rc!=0 or bad log) > pass
+  # Base the verdict on the test's own per-run PASSED/FAILED token
+  # (test_moe_ep.py prints "... PASSED" / "... FAILED"). Generic words like
+  # "failed"/"error" are avoided: benign noise such as "Failed to receive
+  # message rc=2" would otherwise flag a passing run as failed.
+  # status: skip (arch/kernel not supported) > fail > pass
   if [ "$rc" -eq 0 ] && grep -qiE "^skip |: mxfp4 requires|only .* supported" "$log"; then
     st="skip"
-  elif [ "$rc" -ne 0 ] || grep -qiE "traceback|error:|failed|mismatch" "$log"; then
+  elif [ "$rc" -ne 0 ] \
+       || grep -qE "Traceback \(most recent call last\)" "$log" \
+       || grep -qw "FAILED" "$log" \
+       || ! grep -qw "PASSED" "$log"; then
     st="fail(rc=$rc)"
   else
     st="pass"
