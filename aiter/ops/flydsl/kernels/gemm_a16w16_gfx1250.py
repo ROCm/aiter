@@ -6,11 +6,20 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, tdm_ops, vector
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    tdm_ops,
+    vector,
+)
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, get_op_result_or_value
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.expr import idx2crd
 from typing import Optional
 
@@ -18,11 +27,23 @@ from typing import Optional
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE = 32
 
-# LDS padding per row (8 elements -> 16 bytes)
+# LDS row padding (8 elems = 16 bytes)
 LDS_PAD_A = 8
 LDS_PAD_B = 8
 
-_STAGE_NAMES = tuple(f"stage{i}" for i in range(16))
+_STAGE_NAMES = ("ping", "pong", "pang", "pung")
+
+
+def _disable_unroll_on_enclosing_loop():
+    """Tag the enclosing scf.for with llvm.loop metadata so it stays rolled at ASM level."""
+    block = ir.InsertionPoint.current.block
+    op = block.owner
+    if op.name != "scf.for":
+        return
+    anno = ir.Attribute.parse(
+        "#llvm.loop_annotation<unroll = <disable = true>, disableNonforced = true>"
+    )
+    op.attributes["loop_annotation"] = anno
 
 
 def _apply_activation_scalar(val, activation: str):
@@ -87,16 +108,16 @@ def compile_gemm_a16w16(
     activation: Optional[str] = None,
     add_bias: bool = False,
     physical_mk: bool = True,  # True=M-major (row-major X), False=K-major (col-major X)
-    physical_kn: bool = False,  # False=N-major (row-major W), True=K-major (col-major/transposed W)
+    physical_kn: bool = False,  # False=N-major (row-major W), True=K-major (transposed W)
+    loop_carried_load_percent: Optional[int] = None,
+    kernarg_preload: bool = False,
+    use_manual_barrier: bool = False,
 ):
-    """Compile and return a launch function for the A16W16 GEMM kernel.
-    Returns a callable: launch_fn(y, x, w, bias, M, N, stream=stream)
-    """
+    """Compile the A16W16 GEMM kernel; returns launch_fn(y, x, w, bias, M, N, stream=stream)."""
     _ = (M, N)
 
-    # ── Input validation ──
-    if num_buffers < 2:
-        raise ValueError(f"num_buffers must be >= 2, got {num_buffers}")
+    if not (2 <= num_buffers <= 8):
+        raise ValueError(f"num_buffers must be between 2 and 8, got {num_buffers}")
     if in_dtype not in ("fp16", "bf16"):
         raise ValueError(f"in_dtype must be 'fp16' or 'bf16', got {in_dtype!r}")
 
@@ -115,7 +136,6 @@ def compile_gemm_a16w16(
     num_warps = m_warp * n_warp
     block_threads = num_warps * WAVE_SIZE
 
-    # ── Tile dimension validation ──
     if K % tile_k != 0:
         raise ValueError(f"K must be divisible by tile_k={tile_k}, got K={K}")
     if tile_k % WMMA_K != 0:
@@ -127,7 +147,6 @@ def compile_gemm_a16w16(
     if (tile_k & (tile_k - 1)) != 0:
         raise ValueError(f"tile_k must be a power of 2 for TDM, got {tile_k}")
 
-    # ── Physical layout validation ──
     if physical_kn:
         if N == 0:
             raise ValueError(
@@ -151,7 +170,6 @@ def compile_gemm_a16w16(
                 f"(TDM pad_interval requirement), got {tile_m}"
             )
 
-    # ── Warp tile dimensions ──
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     if warp_tile_m % WMMA_M != 0:
@@ -159,7 +177,6 @@ def compile_gemm_a16w16(
     if warp_tile_n % WMMA_N != 0:
         raise ValueError(f"warp_tile_n={warp_tile_n} must be a multiple of {WMMA_N}")
 
-    # ── K-dimension tiling ──
     num_k_tiles = K // tile_k
     if num_k_tiles < num_buffers - 1:
         raise ValueError(
@@ -167,13 +184,11 @@ def compile_gemm_a16w16(
             f"got {num_k_tiles} (K={K}, tile_k={tile_k})"
         )
 
-    # ── Architecture check ──
     gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
     wmma_op = rocdl.wmma_f32_16x16x32_f16 if is_f16 else rocdl.wmma_f32_16x16x32_bf16
 
-    # ── Compute repetition counts ──
     k_wmma_steps = tile_k // WMMA_K
 
     def _elem_type():
@@ -182,11 +197,10 @@ def compile_gemm_a16w16(
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
     n_accs = wmma_m_rep * wmma_n_rep
-    n_frags_per_tile = k_wmma_steps * (wmma_n_rep + wmma_m_rep)
+    N_A_FRAGS = wmma_m_rep * k_wmma_steps
+    N_B_FRAGS = wmma_n_rep * k_wmma_steps
 
-    # ── LDS layout ──
-    # physical_mk=True:  A in LDS as [tile_m, tile_k + pad]
-    # physical_mk=False: A in LDS as [tile_k, tile_m + pad] (K-major)
+    # LDS layout: A is [tile_m, tile_k+pad] (M-major) or [tile_k, tile_m+pad] (K-major)
     if physical_mk:
         lds_a_stride = tile_k + LDS_PAD_A
         lds_a_elems = tile_m * lds_a_stride + LDS_PAD_A
@@ -201,25 +215,28 @@ def compile_gemm_a16w16(
         lds_b_stride = tile_k + LDS_PAD_B
         lds_b_elems = tile_n * lds_b_stride + LDS_PAD_B
 
-    buf_size_elems = lds_a_elems + lds_b_elems
+    lds_a_data_bytes = lds_a_elems * elem_bytes
+    lds_b_data_bytes = lds_b_elems * elem_bytes
 
-    # ── LDS allocation per pipeline stage ──
-    stage_allocators = []
-    stage_a_offsets = []
-    stage_b_offsets = []
-    for i in range(num_buffers):
-        name = _STAGE_NAMES[i]
-        alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name=f"a16w16_{name}")
-        off = alloc._align(alloc.ptr, 16)
-        alloc.ptr = off + buf_size_elems * elem_bytes
-        stage_allocators.append(alloc)
-        stage_a_offsets.append(off)
-        stage_b_offsets.append(off + lds_a_elems * elem_bytes)
+    # Unified LDS allocator: contiguous [A0..A_nb-1 | B0..B_nb-1] ring slots
+    unified_alloc = SmemAllocator(
+        None, arch=gpu_arch, global_sym_name="a16w16_unified"
+    )
+    unified_a_off = unified_alloc._align(unified_alloc.ptr, 16)
+    unified_alloc.ptr = unified_a_off + num_buffers * lds_a_data_bytes
+    unified_b_off = unified_alloc._align(unified_alloc.ptr, 16)
+    unified_alloc.ptr = unified_b_off + num_buffers * lds_b_data_bytes
 
-    # ── Pipeline iteration counts ──
-    pre_loaded = num_buffers - 1
-    main_loop_iters = (num_k_tiles - pre_loaded) // num_buffers
-    tail_tiles = (num_k_tiles - pre_loaded) % num_buffers + pre_loaded
+    stage_a_data_off = [
+        unified_a_off + i * lds_a_data_bytes for i in range(num_buffers)
+    ]
+    stage_b_data_off = [
+        unified_b_off + i * lds_b_data_bytes for i in range(num_buffers)
+    ]
+    stage_allocators = [unified_alloc] * num_buffers
+
+    # TDMs per K-tile: A + B
+    _TDMS_PER_TILE = 2
 
     @flyc.kernel
     def kernel_gemm_a16w16(
@@ -232,14 +249,13 @@ def compile_gemm_a16w16(
     ):
         rocdl.disable_xdl_arb_stall()
 
-        # ── Thread/block indexing ──
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
         blk_m = bx * arith.index(tile_m)
         blk_n = by * arith.index(tile_n)
 
-        # ── Thread-to-warp decomposition ──
+        # Thread -> warp decomposition
         layout_thr = fx.make_layout(
             (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
         )
@@ -261,12 +277,12 @@ def compile_gemm_a16w16(
         # Buffer resource descriptors
         y_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
         y_rsrc = buffer_ops.create_buffer_resource(arg_y, num_records_bytes=y_nrec)
-        if add_bias:
+        if const_expr(add_bias):
             bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
 
         def make_a_desc(k_base, lds_a_mem_ref):
             """TDM descriptor for A tile. Swaps dims when physical_mk=False (K-major)."""
-            if physical_mk:
+            if const_expr(physical_mk):
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_x,
                     lds_memref=lds_a_mem_ref,
@@ -295,7 +311,7 @@ def compile_gemm_a16w16(
 
         def make_b_desc(k_base, lds_b_mem_ref):
             """TDM descriptor for B tile. Swaps dims when physical_kn=True (K-major)."""
-            if physical_kn:
+            if const_expr(physical_kn):
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_w,
                     lds_memref=lds_b_mem_ref,
@@ -321,23 +337,102 @@ def compile_gemm_a16w16(
                 num_warps=num_warps,
             )
 
-        def issue_tdm_load(desc):
-            tdm_ops.tensor_load_2d(desc)
+        # Unified LDS pointers (all NB slots) + per-stage aliases
+        big_a = SmemPtr(
+            unified_alloc.get_base(),
+            unified_a_off,
+            elem_ty,
+            shape=(num_buffers * lds_a_elems,),
+        )
+        big_b = SmemPtr(
+            unified_alloc.get_base(),
+            unified_b_off,
+            elem_ty,
+            shape=(num_buffers * lds_b_elems,),
+        )
+        big_a_mem = big_a.get()
+        big_b_mem = big_b.get()
+        stages_a = [
+            SmemPtr(
+                unified_alloc.get_base(),
+                stage_a_data_off[i],
+                elem_ty,
+                shape=(lds_a_elems,),
+            )
+            for i in range(num_buffers)
+        ]
+        stages_b = [
+            SmemPtr(
+                unified_alloc.get_base(),
+                stage_b_data_off[i],
+                elem_ty,
+                shape=(lds_b_elems,),
+            )
+            for i in range(num_buffers)
+        ]
+        stages_a_mem = [p.get() for p in stages_a]
+        stages_b_mem = [p.get() for p in stages_b]
 
-        def copy_a_to_lds(k_base, lds_a_mem_ref):
-            issue_tdm_load(make_a_desc(k_base, lds_a_mem_ref))
+        # TDM descriptors built once at entry; lo32 advances per K-tile, LDS base per ring slot.
+        _desc_a_init = make_a_desc(arith.index(0), stages_a_mem[0])
+        _desc_b_init = make_b_desc(arith.index(0), stages_b_mem[0])
+        dgroup1_a = _desc_a_init.dgroup1
+        dgroup1_w = _desc_b_init.dgroup1
+        addr_hi_a = vector.extract(
+            _desc_a_init.dgroup0, static_position=[3], dynamic_position=[]
+        )
+        addr_hi_w = vector.extract(
+            _desc_b_init.dgroup0, static_position=[3], dynamic_position=[]
+        )
+        addr_lo_init_a = vector.extract(
+            _desc_a_init.dgroup0, static_position=[2], dynamic_position=[]
+        )
+        addr_lo_init_w = vector.extract(
+            _desc_b_init.dgroup0, static_position=[2], dynamic_position=[]
+        )
+        a_lds_base_i32 = vector.extract(
+            _desc_a_init.dgroup0, static_position=[1], dynamic_position=[]
+        )
+        b_lds_base_i32 = vector.extract(
+            _desc_b_init.dgroup0, static_position=[1], dynamic_position=[]
+        )
+        slot_stride_a_i32 = arith.constant(lds_a_data_bytes, type=T.i32)
+        slot_stride_b_i32 = arith.constant(lds_b_data_bytes, type=T.i32)
+        slot_stride_a_elems_i32 = arith.constant(lds_a_elems, type=T.i32)
+        slot_stride_b_elems_i32 = arith.constant(lds_b_elems, type=T.i32)
 
-        def copy_b_to_lds(k_base, lds_b_mem_ref):
-            issue_tdm_load(make_b_desc(k_base, lds_b_mem_ref))
+        # Per-K-tile lo32 byte advance (tile_k*bytes row-major; outer-stride*bytes if K-major).
+        adv_a_i32 = arith.constant(
+            (tile_k if physical_mk else tile_k * M) * elem_bytes, type=T.i32
+        )
+        adv_w_i32 = arith.constant(
+            (tile_k if not physical_kn else tile_k * N) * elem_bytes, type=T.i32
+        )
+        pred_const = arith.constant(1, type=T.i32)
 
-        def _get_lds_memref(lds_ptr):
-            if isinstance(lds_ptr, SmemPtr):
-                return get_op_result_or_value(lds_ptr.get())
-            return get_op_result_or_value(lds_ptr)
+        def _buf_idx_to_i32(buf_idx):
+            """Accept either Python int (prologue/drain) or i32 SSA (main loop)."""
+            if const_expr(isinstance(buf_idx, int)):
+                return arith.constant(buf_idx, type=T.i32)
+            return buf_idx
 
-        def _precompute_lane_bases(lds_ptr, warp_base, reps, lds_stride):
-            """Pre-compute LDS base addresses for each WMMA rep (M-major layout)."""
-            lds_buffer = _get_lds_memref(lds_ptr)
+        def issue_tdm_loads(buf_idx, lo_a, lo_w):
+            """Issue A+B TDMs for one K-tile into LDS slot buf_idx; returns advanced (lo_a, lo_w)."""
+            buf_i32 = _buf_idx_to_i32(buf_idx)
+            a_addr = arith.addi(a_lds_base_i32, arith.muli(buf_i32, slot_stride_a_i32))
+            b_addr = arith.addi(b_lds_base_i32, arith.muli(buf_i32, slot_stride_b_i32))
+            dg0_a = vector.from_elements(
+                T.vec(4, T.i32), [pred_const, a_addr, lo_a, addr_hi_a]
+            )
+            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a))
+            dg0_w = vector.from_elements(
+                T.vec(4, T.i32), [pred_const, b_addr, lo_w, addr_hi_w]
+            )
+            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0_w, dgroup1_w))
+            return arith.addi(lo_a, adv_a_i32), arith.addi(lo_w, adv_w_i32)
+
+        def _precompute_lane_bases(warp_base, reps, lds_stride):
+            """Per-lane LDS element offsets for `reps` WMMA frags (M/N-major)."""
             row_stride_off = (warp_base + lane16) * arith.index(lds_stride)
             k_lane_off = lane_kgrp * arith.index(8)
             bases = []
@@ -346,16 +441,13 @@ def compile_gemm_a16w16(
                     row_stride_off + arith.index(rep * WMMA_M * lds_stride) + k_lane_off
                 )
                 bases.append(base)
-            return lds_buffer, bases
+            return bases
 
-        def _precompute_a_lane_bases(lds_ptr):
+        def _precompute_a_lane_bases():
             """A fragment lane bases. Uses transpose-load addressing when K-major."""
-            if physical_mk:
-                return _precompute_lane_bases(
-                    lds_ptr, warp_m_base, wmma_m_rep, lds_a_stride
-                )
+            if const_expr(physical_mk):
+                return _precompute_lane_bases(warp_m_base, wmma_m_rep, lds_a_stride)
 
-            lds_buffer = _get_lds_memref(lds_ptr)
             lane8 = lane16 % arith.index(8)
             lane_mgrp = lane16 / arith.index(8)
             k_lane_off = (lane_kgrp * arith.index(8) + lane8) * arith.index(
@@ -366,16 +458,13 @@ def compile_gemm_a16w16(
             for wm in range_constexpr(wmma_m_rep):
                 m_col = warp_m_base + arith.index(wm * WMMA_M) + m_lane_off
                 bases.append(k_lane_off + m_col)
-            return lds_buffer, bases
+            return bases
 
-        def _precompute_b_lane_bases(lds_ptr):
+        def _precompute_b_lane_bases():
             """B fragment lane bases. Uses transpose-load addressing when K-major."""
-            if not physical_kn:
-                return _precompute_lane_bases(
-                    lds_ptr, warp_n_base, wmma_n_rep, lds_b_stride
-                )
+            if const_expr(not physical_kn):
+                return _precompute_lane_bases(warp_n_base, wmma_n_rep, lds_b_stride)
 
-            lds_buffer = _get_lds_memref(lds_ptr)
             lane8 = lane16 % arith.index(8)
             lane_ngrp = lane16 / arith.index(8)
             k_lane_off = (lane_kgrp * arith.index(8) + lane8) * arith.index(
@@ -386,7 +475,10 @@ def compile_gemm_a16w16(
             for wn in range_constexpr(wmma_n_rep):
                 n_col = warp_n_base + arith.index(wn * WMMA_N) + n_lane_off
                 bases.append(k_lane_off + n_col)
-            return lds_buffer, bases
+            return bases
+
+        a_lane_bases = _precompute_a_lane_bases()
+        b_lane_bases = _precompute_b_lane_bases()
 
         def load_wmma_frag_tr(lds_buffer, b_lane_base, ks):
             """Load WMMA B fragment via ds_load_tr16_b128 (K-major LDS)."""
@@ -423,27 +515,47 @@ def compile_gemm_a16w16(
 
         _load_a_frag = load_wmma_frag_tr_a if not physical_mk else load_wmma_frag
 
-        def load_tile_frags(lds_a_ptr, lds_b_ptr):
-            """Bulk-load all k-slice fragments for one tile (no overlap)."""
-            a_buf, a_bases = _precompute_a_lane_bases(lds_a_ptr)
-            b_buf, b_bases = _precompute_b_lane_bases(lds_b_ptr)
-            frags = []
+        def load_a_frags(buf_idx):
+            """Load all A frags for one K-tile from LDS slot buf_idx; index a_frags[ks*wmma_m_rep+wm]."""
+            if const_expr(isinstance(buf_idx, int)):
+                slot_off_a = arith.index(buf_idx * lds_a_elems)
+            else:
+                slot_off_a = arith.index_cast(
+                    T.index, arith.muli(buf_idx, slot_stride_a_elems_i32)
+                )
+            a_frags = []
+            for ks in range_constexpr(k_wmma_steps):
+                for wm in range_constexpr(wmma_m_rep):
+                    a_frags.append(
+                        _load_a_frag(big_a_mem, a_lane_bases[wm] + slot_off_a, ks)
+                    )
+            return a_frags
+
+        def load_b_frags(buf_idx):
+            """Load all B frags for one K-tile from LDS slot buf_idx; index b_frags[ks*wmma_n_rep+wn]."""
+            if const_expr(isinstance(buf_idx, int)):
+                slot_off_b = arith.index(buf_idx * lds_b_elems)
+            else:
+                slot_off_b = arith.index_cast(
+                    T.index, arith.muli(buf_idx, slot_stride_b_elems_i32)
+                )
+            b_frags = []
             for ks in range_constexpr(k_wmma_steps):
                 for wn in range_constexpr(wmma_n_rep):
-                    frags.append(_load_b_frag(b_buf, b_bases[wn], ks))
-                for wm in range_constexpr(wmma_m_rep):
-                    frags.append(_load_a_frag(a_buf, a_bases[wm], ks))
-            return frags
+                    b_frags.append(
+                        _load_b_frag(big_b_mem, b_lane_bases[wn] + slot_off_b, ks)
+                    )
+            return b_frags
 
-        def wmma_tile(accs_in, tile_frags):
-            """Execute all WMMAs for one tile using pre-loaded fragments."""
+        def wmma_tile(accs_in, a_frags, b_frags):
+            """Execute all WMMAs for one tile (ks-outer accumulate); reuseB=(wn>0) hint kept."""
             current_accs = list(accs_in)
             for ks in range_constexpr(k_wmma_steps):
-                base = ks * (wmma_n_rep + wmma_m_rep)
-                b_frags = [tile_frags[base + wn] for wn in range_constexpr(wmma_n_rep)]
-                a_frags = [
-                    tile_frags[base + wmma_n_rep + wm]
-                    for wm in range_constexpr(wmma_m_rep)
+                a_f = [
+                    a_frags[ks * wmma_m_rep + wm] for wm in range_constexpr(wmma_m_rep)
+                ]
+                b_f = [
+                    b_frags[ks * wmma_n_rep + wn] for wn in range_constexpr(wmma_n_rep)
                 ]
                 for wm in range_constexpr(wmma_m_rep):
                     for wn in range_constexpr(wmma_n_rep):
@@ -451,101 +563,14 @@ def compile_gemm_a16w16(
                         # ISA operand order: (B, A, C) — reversed from math
                         current_accs[idx] = wmma_op(
                             T.vec(8, T.f32),
-                            b_frags[wn],
-                            a_frags[wm],
+                            b_f[wn],
+                            a_f[wm],
                             current_accs[idx],
-                            signA=False,
-                            signB=False,
                             modC=0,
                             reuseA=False,
                             reuseB=(wn > 0),
                         ).result
             return current_accs
-
-        def compute_and_prefetch(accs_in, cur_frags, next_lds_a_ptr, next_lds_b_ptr):
-            """Interleave WMMA on current frags with LDS loads for next tile."""
-            current_accs = list(accs_in)
-            next_a_buf, next_a_bases = _precompute_a_lane_bases(next_lds_a_ptr)
-            next_b_buf, next_b_bases = _precompute_b_lane_bases(next_lds_b_ptr)
-            next_frags = []
-
-            for ks in range_constexpr(k_wmma_steps):
-                # Phase 1: ds_read for next tile
-                for wn in range_constexpr(wmma_n_rep):
-                    next_frags.append(_load_b_frag(next_b_buf, next_b_bases[wn], ks))
-                for wm in range_constexpr(wmma_m_rep):
-                    next_frags.append(_load_a_frag(next_a_buf, next_a_bases[wm], ks))
-
-                # Phase 2: WMMA for curr tile
-                base = ks * (wmma_n_rep + wmma_m_rep)
-                b_frags = [cur_frags[base + wn] for wn in range_constexpr(wmma_n_rep)]
-                a_frags = [
-                    cur_frags[base + wmma_n_rep + wm]
-                    for wm in range_constexpr(wmma_m_rep)
-                ]
-                for wm in range_constexpr(wmma_m_rep):
-                    for wn in range_constexpr(wmma_n_rep):
-                        idx = wm * wmma_n_rep + wn
-                        current_accs[idx] = wmma_op(
-                            T.vec(8, T.f32),
-                            b_frags[wn],
-                            a_frags[wm],
-                            current_accs[idx],
-                            signA=False,
-                            signB=False,
-                            modC=0,
-                            reuseA=False,
-                            reuseB=(wn > 0),
-                        ).result
-
-            return current_accs, next_frags
-
-        def _l2_prefetch(k_base):
-            """Issue L2 cache prefetch hints for a future K-tile."""
-            if l2_prefetch_distance <= 0:
-                return
-            pf_k = k_base + arith.index(l2_prefetch_distance * tile_k)
-
-            if physical_mk:
-                tdm_ops.l2_prefetch_tile(
-                    arg_x,
-                    (blk_m, pf_k),
-                    (tile_m, tile_k),
-                    (K, 1),
-                    elem_bytes=elem_bytes,
-                    thread_id=tx,
-                    block_threads=block_threads,
-                )
-            else:
-                tdm_ops.l2_prefetch_tile(
-                    arg_x,
-                    (pf_k, blk_m),
-                    (tile_k, tile_m),
-                    (M, 1),
-                    elem_bytes=elem_bytes,
-                    thread_id=tx,
-                    block_threads=block_threads,
-                )
-            if physical_kn:
-                tdm_ops.l2_prefetch_tile(
-                    arg_w,
-                    (pf_k, blk_n),
-                    (tile_k, tile_n),
-                    (N, 1),
-                    elem_bytes=elem_bytes,
-                    thread_id=tx,
-                    block_threads=block_threads,
-                )
-            else:
-                tdm_ops.l2_prefetch_tile(
-                    arg_w,
-                    (blk_n, pf_k),
-                    (tile_n, tile_k),
-                    (K, 1),
-                    elem_bytes=elem_bytes,
-                    thread_id=tx,
-                    block_threads=block_threads,
-                )
 
         _half_out = out_dtype in ("f16", "bf16")
         _out_elem = (
@@ -560,7 +585,7 @@ def compile_gemm_a16w16(
 
         def _apply_bias_and_activation(accs):
             """Add bias and/or apply activation to accumulators."""
-            if not add_bias and activation is None:
+            if const_expr(not add_bias and activation is None):
                 return accs
 
             for wm in range_constexpr(wmma_m_rep):
@@ -568,7 +593,7 @@ def compile_gemm_a16w16(
                     idx = wm * wmma_n_rep + wn
                     acc = accs[idx]
 
-                    if add_bias:
+                    if const_expr(add_bias):
                         col_base = (
                             blk_n
                             + warp_n_base
@@ -600,7 +625,7 @@ def compile_gemm_a16w16(
                         bias_vec = vector.from_elements(T.vec(8, T.f32), bias_elems)
                         acc = acc + bias_vec
 
-                    if activation is not None:
+                    if const_expr(activation is not None):
                         new_elems = []
                         for i in range_constexpr(8):
                             val = vector.extract(
@@ -626,7 +651,7 @@ def compile_gemm_a16w16(
                         + lane_kgrp * arith.index(8)
                     )
 
-                    if _half_out:
+                    if const_expr(_half_out):
                         h_vec = arith.trunc_f(T.vec(8, _out_elem), final_accs[idx])
                         i32_vec = vector.bitcast(T.vec(4, T.i32), h_vec)
                         c_off_bytes = (row * n_stride + col_base) * arith.index(
@@ -650,196 +675,188 @@ def compile_gemm_a16w16(
                             c_off = row * n_stride + col
                             buffer_ops.buffer_store(vec4, y_rsrc, c_off)
 
-        # Step 1: Initialize accumulators
+        # Accumulators
         acc_zero = arith.constant_vector(0.0, T.vec(8, T.f32))
         accs = [acc_zero] * n_accs
 
-        # Step 2: Set up LDS buffer pointers
-        base_ptrs = [sa.get_base() for sa in stage_allocators]
-        stages_a = [
-            SmemPtr(base_ptrs[i], stage_a_offsets[i], elem_ty, shape=(lds_a_elems,))
-            for i in range_constexpr(num_buffers)
-        ]
-        stages_b = [
-            SmemPtr(base_ptrs[i], stage_b_offsets[i], elem_ty, shape=(lds_b_elems,))
-            for i in range_constexpr(num_buffers)
-        ]
-        stages_a_mem = [stages_a[i].get() for i in range_constexpr(num_buffers)]
-        stages_b_mem = [stages_b[i].get() for i in range_constexpr(num_buffers)]
+        # State carry: [accs (N_ACCS) | cur_a frags (N_A_FRAGS) | cur_b frags (N_B_FRAGS)]
+        N_ACCS = n_accs
 
-        # Step 3: Prologue — pre-load tiles into LDS
-        for i in range_constexpr(pre_loaded):
-            copy_a_to_lds(arith.index(i * tile_k), stages_a_mem[i])
-            copy_b_to_lds(arith.index(i * tile_k), stages_b_mem[i])
+        def _pack_state(accs_, a_, b_):
+            return list(accs_) + list(a_) + list(b_)
 
-        # L2 prefetch prologue
-        if l2_prefetch_distance > 0:
-            for pf_i in range_constexpr(min(l2_prefetch_distance, num_k_tiles)):
-                pf_k = arith.index(pf_i * tile_k)
-                if physical_mk:
-                    tdm_ops.l2_prefetch_tile(
-                        arg_x,
-                        (blk_m, pf_k),
-                        (tile_m, tile_k),
-                        (K, 1),
-                        elem_bytes=elem_bytes,
-                        thread_id=tx,
-                        block_threads=block_threads,
-                    )
-                else:
-                    tdm_ops.l2_prefetch_tile(
-                        arg_x,
-                        (pf_k, blk_m),
-                        (tile_k, tile_m),
-                        (M, 1),
-                        elem_bytes=elem_bytes,
-                        thread_id=tx,
-                        block_threads=block_threads,
-                    )
-                if physical_kn:
-                    tdm_ops.l2_prefetch_tile(
-                        arg_w,
-                        (pf_k, blk_n),
-                        (tile_k, tile_n),
-                        (N, 1),
-                        elem_bytes=elem_bytes,
-                        thread_id=tx,
-                        block_threads=block_threads,
-                    )
-                else:
-                    tdm_ops.l2_prefetch_tile(
-                        arg_w,
-                        (blk_n, pf_k),
-                        (tile_n, tile_k),
-                        (K, 1),
-                        elem_bytes=elem_bytes,
-                        thread_id=tx,
-                        block_threads=block_threads,
-                    )
+        def _unpack_state(state):
+            i = 0
+            accs_ = list(state[i : i + N_ACCS])
+            i += N_ACCS
+            a_ = list(state[i : i + N_A_FRAGS])
+            i += N_A_FRAGS
+            b_ = list(state[i : i + N_B_FRAGS])
+            i += N_B_FRAGS
+            return accs_, a_, b_
 
-        # Prepare first TDM descriptors for main loop
-        if main_loop_iters > 0:
-            _first_load_stage_0 = pre_loaded % num_buffers
-            _first_load_k_0 = pre_loaded * tile_k
-            pending_desc_a = make_a_desc(
-                arith.index(_first_load_k_0), stages_a_mem[_first_load_stage_0]
-            )
-            pending_desc_b = make_b_desc(
-                arith.index(_first_load_k_0), stages_b_mem[_first_load_stage_0]
-            )
+        # ── Prologue (memory-bound): fill NB-1 LDS buffers, then load tile 0 ──
+        lo_a = addr_lo_init_a
+        lo_w = addr_lo_init_w
+        for i in range_constexpr(num_buffers - 1):
+            lo_a, lo_w = issue_tdm_loads(i, lo_a, lo_w)
 
-        main_end = main_loop_iters * num_buffers * tile_k
-
-        # Wait for pre-loaded tiles
-        tdm_ops.tensor_wait(2 * (num_buffers - 2))
+        # Wait retires tile 0 (NB-2 in flight); the 2-iter WAR gap lets the main loop use one barrier.
+        tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
         gpu.barrier()
 
-        # Pre-load fragments for first compute tile
-        cur_frags = load_tile_frags(stages_a[0], stages_b[0])
+        cur_a = load_a_frags(0)
+        cur_b = load_b_frags(0)
 
-        # Step 4: Main loop
-        if main_loop_iters > 0:
-            init_descs = [
-                pending_desc_a.dgroup0,
-                pending_desc_a.dgroup1,
-                pending_desc_b.dgroup0,
-                pending_desc_b.dgroup1,
-            ]
+        # ── Main loop (wait-first, unrolled by 2): ping-pong two register banks, prefetch T+1/T+2 ──
+        main_loop_iters = num_k_tiles - (num_buffers - 1)
+        nb_const_i32 = arith.constant(num_buffers, type=T.i32)
+        one_i32 = arith.constant(1, type=T.i32)
+        load_idx_init = arith.constant(num_buffers - 1, type=T.i32)
+        compute_idx_init = arith.constant(0, type=T.i32)
 
-            for iv, state in range(
-                0,
-                main_end,
-                num_buffers * tile_k,
-                init=list(accs) + init_descs + cur_frags,
-            ):
-                accs_in = list(state[:n_accs])
-                cur_desc_a = tdm_ops.TDMDescriptor2D(state[n_accs], state[n_accs + 1])
-                cur_desc_b = tdm_ops.TDMDescriptor2D(
-                    state[n_accs + 2], state[n_accs + 3]
-                )
-                cur_frags = list(state[n_accs + 4 : n_accs + 4 + n_frags_per_tile])
+        def _wg_barrier():
+            # gpu.barrier() drains ds_loads via fences; manual variant is a bare s_barrier (no fences, faster but racy).
+            if const_expr(use_manual_barrier):
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
+            else:
+                gpu.barrier()
 
-                for s in range_constexpr(num_buffers):
-                    issue_tdm_load(cur_desc_a)
-                    issue_tdm_load(cur_desc_b)
+        def _run_tile(accs_, ca, cb, lo_a_, lo_w_, cidx, lidx, do_prefetch):
+            """Compute K-tile cidx from carried frags; if do_prefetch, load cidx+1 into a fresh bank."""
+            load_buf_i32 = arith.remui(lidx, nb_const_i32)
 
-                    if s == num_buffers - 1:
-                        _l2_prefetch(iv + arith.index(s * tile_k))
+            # Wait at the TOP (above the TDM -> does not count this iter's refill).
+            tdm_ops.tensor_wait(max(0, num_buffers - 3) * _TDMS_PER_TILE)
+            # Refill LDS slot load_buf with the next-to-issue K-tile.
+            lo_a_, lo_w_ = issue_tdm_loads(load_buf_i32, lo_a_, lo_w_)
+            if const_expr(num_buffers == 2):
+                # NB=2: drain the just-issued TDM to close the RAW hazard on the slot we refilled.
+                tdm_ops.tensor_wait(0)
+            # Single barrier: RAW wall for this tile's T+1 ds_reads and (across the backedge) WAR wall for the next refill.
+            _wg_barrier()
 
-                    if s < num_buffers - 1:
-                        _next_load_stage = (s + 1 + pre_loaded) % num_buffers
-                        _next_load_k_off = (s + 1 + pre_loaded) * tile_k
-                        cur_desc_a = make_a_desc(
-                            iv + arith.index(_next_load_k_off),
-                            stages_a_mem[_next_load_stage],
-                        )
-                        cur_desc_b = make_b_desc(
-                            iv + arith.index(_next_load_k_off),
-                            stages_b_mem[_next_load_stage],
-                        )
-                    else:
-                        _next_load_stage = pre_loaded % num_buffers
-                        _next_load_k_off = pre_loaded * tile_k
-                        _next_step = num_buffers * tile_k
-                        cur_desc_a = make_a_desc(
-                            iv + arith.index(_next_step + _next_load_k_off),
-                            stages_a_mem[_next_load_stage],
-                        )
-                        cur_desc_b = make_b_desc(
-                            iv + arith.index(_next_step + _next_load_k_off),
-                            stages_b_mem[_next_load_stage],
-                        )
+            if const_expr(do_prefetch):
+                next_buf_i32 = arith.remui(arith.addi(cidx, one_i32), nb_const_i32)
+                # Preload next tile's A+B, then WMMA (loads co-execute with it); raises peak liveness to ~2 banks.
+                na = load_a_frags(next_buf_i32)
+                nb = load_b_frags(next_buf_i32)
+                accs_ = wmma_tile(accs_, ca, cb)
+                nbank = (na, nb)
+            else:
+                accs_ = wmma_tile(accs_, ca, cb)
+                nbank = None
+            return accs_, nbank, lo_a_, lo_w_
 
-                    tdm_ops.tensor_wait(2 * (num_buffers - 2))
-                    gpu.barrier()
+        if const_expr(main_loop_iters > 0):
+            lo_a_s = lo_a
+            lo_w_s = lo_w
+            load_idx_s = load_idx_init
+            compute_idx_s = compute_idx_init
+            num_pairs = main_loop_iters // 2
 
-                    _next_compute = (s + 1) % num_buffers
-                    accs_in, cur_frags = compute_and_prefetch(
-                        accs_in,
-                        cur_frags,
-                        stages_a[_next_compute],
-                        stages_b[_next_compute],
-                    )
-
-                out_descs = [
-                    cur_desc_a.dgroup0,
-                    cur_desc_a.dgroup1,
-                    cur_desc_b.dgroup0,
-                    cur_desc_b.dgroup1,
+            if const_expr(num_pairs > 0):
+                init_state = _pack_state(accs, cur_a, cur_b) + [
+                    lo_a_s,
+                    lo_w_s,
+                    load_idx_s,
+                    compute_idx_s,
                 ]
-                results = yield list(accs_in) + out_descs + cur_frags
+                results = init_state
+                for pair_step, state in range(0, num_pairs, 1, init=init_state):
+                    _disable_unroll_on_enclosing_loop()
+                    cidx = state[-1]
+                    lidx = state[-2]
+                    lw = state[-3]
+                    lx = state[-4]
+                    p_accs, b0a, b0b = _unpack_state(state[:-4])
 
-            accs = list(results[:n_accs])
-            cur_frags = list(results[n_accs + 4 : n_accs + 4 + n_frags_per_tile])
+                    # sub-0: tile T from bank0, prefetch T+1 -> bank1.
+                    p_accs, bank1, lx, lw = _run_tile(
+                        p_accs, b0a, b0b, lx, lw, cidx, lidx, do_prefetch=True
+                    )
+                    b1a, b1b = bank1
+                    cidx1 = arith.addi(cidx, one_i32)
+                    lidx1 = arith.addi(lidx, one_i32)
 
-        # Step 5: drain remaining tiles
-        _tail_base_k = main_loop_iters * num_buffers
-        _extra_loads = tail_tiles - pre_loaded
+                    # sub-1: tile T+1 from bank1, prefetch T+2 -> bank0 (yielded).
+                    p_accs, bank0, lx, lw = _run_tile(
+                        p_accs, b1a, b1b, lx, lw, cidx1, lidx1, do_prefetch=True
+                    )
+                    nb0a, nb0b = bank0
+                    cidx2 = arith.addi(cidx1, one_i32)
+                    lidx2 = arith.addi(lidx1, one_i32)
 
-        for t in range_constexpr(tail_tiles - 1):
-            if t < _extra_loads:
-                load_tile_idx = _tail_base_k + pre_loaded + t
-                load_stage = (pre_loaded + t) % num_buffers
-                copy_a_to_lds(
-                    arith.index(load_tile_idx * tile_k), stages_a_mem[load_stage]
+                    new_state = _pack_state(p_accs, nb0a, nb0b) + [
+                        lx,
+                        lw,
+                        lidx2,
+                        cidx2,
+                    ]
+                    results = yield new_state
+
+                accs, cur_a, cur_b = _unpack_state(results[:-4])
+                lo_a_s = results[-4]
+                lo_w_s = results[-3]
+                load_idx_s = results[-2]
+                compute_idx_s = results[-1]
+            else:
+                accs = list(accs)
+
+            # Leftover odd tile: compute the carried bank and prefetch the first drain tile into the carry.
+            if const_expr(main_loop_iters % 2 == 1):
+                accs, leftover_bank, lo_a_s, lo_w_s = _run_tile(
+                    accs,
+                    cur_a,
+                    cur_b,
+                    lo_a_s,
+                    lo_w_s,
+                    compute_idx_s,
+                    load_idx_s,
+                    do_prefetch=True,
                 )
-                copy_b_to_lds(
-                    arith.index(load_tile_idx * tile_k), stages_b_mem[load_stage]
-                )
+                cur_a, cur_b = leftover_bank
+                compute_idx_s = arith.addi(compute_idx_s, one_i32)
 
-            _epi_outstanding = 2 * (pre_loaded + min(t + 1, _extra_loads) - t - 1)
-            tdm_ops.tensor_wait(_epi_outstanding)
-            gpu.barrier()
+            final_compute_idx = compute_idx_s
+        else:
+            accs = list(accs)
+            # No main loop ran — drain starts at compute_idx = 0.
+            final_compute_idx = arith.constant(0, type=T.i32)
 
-            _next_epi_stage = (_tail_base_k + t + 1) % num_buffers
-            accs, cur_frags = compute_and_prefetch(
-                accs, cur_frags, stages_a[_next_epi_stage], stages_b[_next_epi_stage]
-            )
+        # ── Drain (fully unrolled): consume carried frags, prefetch next bank per tile; final tile does no wait/barrier/ds_load ──
+        drain_count_d = (
+            num_buffers - 1
+            if main_loop_iters > 0
+            else min(num_buffers - 1, num_k_tiles)
+        )
+        drain_base = main_loop_iters if main_loop_iters > 0 else 0
 
-        # Step 6: Final WMMA
-        accs = wmma_tile(accs, cur_frags)
+        def _drain_wait_for(tile_idx):
+            # Wait for compile-time drain tile tile_idx to land.
+            tdm_ops.tensor_wait(max(0, num_k_tiles - 1 - tile_idx) * _TDMS_PER_TILE)
 
-        # Step 7: Bias, activation, and store
+        accs = list(accs)
+        drain_a, drain_b = cur_a, cur_b
+        for j in range_constexpr(drain_count_d):
+            tile_idx = drain_base + j
+            if const_expr(j < drain_count_d - 1):
+                # Not the last tile: wait + barrier + prefetch tile_idx+1, interleaved with the current WMMA.
+                next_tile = tile_idx + 1
+                _drain_wait_for(next_tile)
+                gpu.barrier()
+                next_a = load_a_frags(next_tile % num_buffers)
+                accs = wmma_tile(accs, drain_a, drain_b)
+                next_b = load_b_frags(next_tile % num_buffers)
+                drain_a, drain_b = next_a, next_b
+            else:
+                # Final K-tile: compute the carried frags — no wait, barrier, or ds_loads.
+                accs = wmma_tile(accs, drain_a, drain_b)
+
+        # ── Epilogue: bias, activation, and store ──
+        if const_expr(num_buffers > 2):
+            rocdl.sched_barrier(0)
         accs = _apply_bias_and_activation(accs)
         epilogue_stores(accs)
 
@@ -861,6 +878,9 @@ def compile_gemm_a16w16(
         physical_kn,
         M,
         N,
+        loop_carried_load_percent,
+        kernarg_preload,
+        use_manual_barrier,
     )
 
     @flyc.jit
@@ -902,11 +922,54 @@ def compile_gemm_a16w16(
                             ir.IntegerType.get_signless(32), _wpe
                         )
 
+        # Flat work-group size hint.
+        flat_wg_attr = ir.StringAttr.get(f"{block_threads},{block_threads}")
+        for op in ctx.gpu_module_body.operations:
+            if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
+
+        # Experimental: amdgpu-loop-carried-load-percent passthrough.
+        if loop_carried_load_percent is not None:
+            lcv = ir.ArrayAttr.get(
+                [
+                    ir.ArrayAttr.get(
+                        [
+                            ir.StringAttr.get("amdgpu-loop-carried-load-percent"),
+                            ir.StringAttr.get(str(int(loop_carried_load_percent))),
+                        ]
+                    )
+                ]
+            )
+            for op in ctx.gpu_module_body.operations:
+                if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                    op.attributes["passthrough"] = lcv
+
+        # Mark kernel args inreg so AMDGPU preloads them into user SGPRs.
+        if kernarg_preload:
+            inreg_attr = ir.UnitAttr.get()
+            for op in ctx.gpu_module_body.operations:
+                if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                    num_args = len(op.regions[0].blocks[0].arguments)
+                    per_arg = [
+                        ir.DictAttr.get({"llvm.inreg": inreg_attr})
+                        for _ in range(num_args)
+                    ]
+                    op.attributes["arg_attrs"] = ir.ArrayAttr.get(per_arg)
+
         launcher.launch(
             grid=(gx, gy, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
+
+    # Backend scheduling hints: only cl::opts present in THIS LLVM are enabled; others raise "Unknown LLVM option" and stay commented.
+    launch_gemm_a16w16.compile_hints["llvm_options"] = {
+        "amdgpu-expert-scheduling-mode": True,  # valid bool cl::opt (GFX12+ only)
+        # Not present in this LLVM; re-enable when built against a downstream LLVM that defines them:
+        # "amdgpu-anti-hints-for-va-vdst", "amdgpu-enable-static-simulator",
+        # "amdgpu-static-sim-inline", "amdgpu-block-carried-latency",
+        # "amdgpu-sched-strategy" ("coexec" is also unrecognized upstream)
+    }
 
     return launch_gemm_a16w16
 
@@ -926,6 +989,9 @@ def gemm_a16w16(
     num_buffers: int = 2,
     waves_per_eu: int = None,
     l2_prefetch_distance: int = 2,
+    kernarg_preload: bool = False,
+    loop_carried_load_percent: Optional[int] = None,
+    use_manual_barrier: bool = False,
 ):
     """Compute Y = X @ W^T + bias. Auto-detects physical layout from strides."""
     assert x.dtype in (
@@ -941,7 +1007,7 @@ def gemm_a16w16(
     M, K = x.shape
     N = w.shape[0]
 
-    # ── Layout ──
+    # Layout from strides
     if x.stride(1) == 1:
         physical_mk = True
     elif x.stride(0) == 1:
@@ -952,7 +1018,7 @@ def gemm_a16w16(
     elif w.stride(0) == 1:
         physical_kn = True
 
-    # ── K-pad ──
+    # K-pad up to a tile_k multiple
     K_padded = ((K + tile_k - 1) // tile_k) * tile_k
     if K_padded != K:
         pad_size = K_padded - K
@@ -970,10 +1036,10 @@ def gemm_a16w16(
             w = torch.nn.functional.pad(w, (0, pad_size))
         K = K_padded
 
-    # ── N-padding ──
+    # N-pad up to a tile_n multiple
     N_stride = ((N + tile_n - 1) // tile_n) * tile_n
 
-    # ── Output allocation ──
+    # Output allocation
     if y is not None:
         y_buf = (
             y
@@ -1016,6 +1082,9 @@ def gemm_a16w16(
         add_bias=(bias.numel() > 0),
         physical_mk=physical_mk,
         physical_kn=physical_kn,
+        kernarg_preload=kernarg_preload,
+        loop_carried_load_percent=loop_carried_load_percent,
+        use_manual_barrier=use_manual_barrier,
     )
 
     launch_fn(y_buf, x, w, bias, M, N_stride, stream=torch.cuda.current_stream())
