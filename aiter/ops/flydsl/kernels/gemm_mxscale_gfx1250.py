@@ -55,7 +55,6 @@ from aiter.ops.flydsl.kernels.quant_utils import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import MOE_KERNARG_PRELOAD_COUNT
 
-
 # Common constants
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
@@ -528,7 +527,9 @@ def compile_mxscale_gemm(
     stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
     stage_layout.ptr = stage_b_scale_rel_off + lds_b_scale_bytes
     if stage1_dual_b:
-        stage_b_up_scale_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
+        stage_b_up_scale_rel_off = stage_layout._align(
+            stage_layout.ptr, LDS_ALIGN_BYTES
+        )
         stage_layout.ptr = stage_b_up_scale_rel_off + lds_b_scale_bytes
     else:
         stage_b_up_scale_rel_off = 0
