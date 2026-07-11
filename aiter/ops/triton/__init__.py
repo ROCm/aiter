@@ -60,6 +60,7 @@ _BACKWARD_COMPAT_MAP = {
     "batched_gemm_a8w8": "gemm.batched.batched_gemm_a8w8",
     "batched_gemm_afp4wfp4_pre_quant": "gemm.batched.batched_gemm_afp4wfp4_pre_quant",
     "batched_gemm_afp4wfp4": "gemm.batched.batched_gemm_afp4wfp4",
+    "batched_gemm_a8wfp4": "gemm.batched.batched_gemm_a8wfp4",
     "batched_gemm_bf16": "gemm.batched.batched_gemm_bf16",
     # Basic GEMM modules (gemm/basic/)
     "gemm_a16w16_agnostic": "gemm.basic.gemm_a16w16_agnostic",
