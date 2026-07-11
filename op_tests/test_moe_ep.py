@@ -388,8 +388,32 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 summary_table = []
 
 
+def _cudagraph_replay(fn, args, kwargs, warmup=3):
+    """Capture `fn(*args, **kwargs)` in a HIP/CUDA graph and replay it once.
+
+    All warmup runs happen on a side stream (required by the caching allocator
+    before capture); the captured output is zeroed before replay so a successful
+    replay must re-populate it. Returns the replayed output tensor."""
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(warmup):
+            fn(*args, **kwargs)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out = fn(*args, **kwargs)
+    if isinstance(g_out, torch.Tensor):
+        g_out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    return g_out
+
+
 def test_fmoe_ep_mxfp4(
-    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8
+    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8, cudagraph=False
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}."""
@@ -511,19 +535,19 @@ def test_fmoe_ep_mxfp4(
         gate_mode = GateMode.SEPARATED.value
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
-    out, us = run_perftest(
-        fused_moe,
-        input_,
-        w1_a,
-        w2_a,
-        topk_weights,
-        topk_ids,
+    moe_args = (input_, w1_a, w2_a, topk_weights, topk_ids)
+    moe_kwargs = dict(
         expert_mask=expert_mask,
         activation=act,
         gate_mode=gate_mode,
         quant_type=QuantType.per_1x32,
         w1_scale=w1_s,
         w2_scale=w2_s,
+    )
+    out, us = run_perftest(
+        fused_moe,
+        *moe_args,
+        **moe_kwargs,
         num_warmup=3,
         num_iters=16,
     )
@@ -552,6 +576,26 @@ def test_fmoe_ep_mxfp4(
     else:
         err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg)
 
+    cudagraph_status = "n/a"
+    if cudagraph:
+        # HIP/CUDA graph capture + replay must reproduce eager output bit-for-bit
+        # (same kernels, same static inputs). This catches graph-unsafe behavior
+        # (host syncs, per-call allocations, .item() shape decisions) that would
+        # break serving stacks (e.g. vLLM) which replay fused_moe from a graph.
+        try:
+            g_out = _cudagraph_replay(fused_moe, moe_args, moe_kwargs)
+            g_diff = _calc_diff(out, g_out)
+            g_ref_diff = _calc_diff(ref, g_out)
+            cudagraph_ok = g_diff < 1e-6 and g_ref_diff < 0.01
+            cudagraph_status = "PASSED" if cudagraph_ok else "FAILED"
+            print(
+                f"[aiter] {_msg} cudagraph vs_eager_diff={g_diff:.2e} "
+                f"vs_ref_diff={g_ref_diff:.6f} {cudagraph_status}"
+            )
+        except Exception as _cg_e:
+            cudagraph_status = f"ERROR({type(_cg_e).__name__})"
+            print(f"[aiter] {_msg} cudagraph capture/replay {cudagraph_status}: {_cg_e}")
+
     summary_table.append(
         {
             "quant": quant_label,
@@ -567,6 +611,7 @@ def test_fmoe_ep_mxfp4(
             "abs_max": round(abs_max, 4),
             "rel_mean": round(rel_mean, 4),
             "checkAllclose_err": err,
+            "cudagraph": cudagraph_status,
         }
     )
 
@@ -665,6 +710,13 @@ parser.add_argument(
     default=[8],
     help="""Expert Parallelism.
     e.g.: -ep 8""",
+)
+parser.add_argument(
+    "--cudagraph",
+    action="store_true",
+    default=os.environ.get("AITER_TEST_CUDAGRAPH", "0") == "1",
+    help="""Also capture/replay the fused_moe call in a HIP/CUDA graph and
+    verify the replayed output matches eager execution (mxfp4 EP path).""",
 )
 
 args = parser.parse_args()
@@ -802,6 +854,7 @@ for test in args.test:
                             args.topk,
                             shared_E=0,
                             ep=ep,
+                            cudagraph=args.cudagraph,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:

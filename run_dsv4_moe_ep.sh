@@ -16,6 +16,9 @@ export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-0}
 export AITER_BF16_FP8_MOE_BOUND=${AITER_BF16_FP8_MOE_BOUND:-0}
 # set to 1 on the very first run so JIT kernels get built
 export AITER_REBUILD=${AITER_REBUILD:-0}
+# also exercise HIP/CUDA-graph capture+replay of fused_moe (1=on, 0=off)
+CUDAGRAPH=${CUDAGRAPH:-1}
+[ "$CUDAGRAPH" = "1" ] && CG_FLAG="--cudagraph" || CG_FLAG=""
 
 # ---------------- arch detection ----------------
 # Prefer aiter's own get_gfx(); fall back to rocminfo.
@@ -37,6 +40,8 @@ case "$GFX" in
     # grouped-gemm a8w4 path (set by the test too, exported here for clarity)
     export AITER_FORCE_A8W4=${AITER_FORCE_A8W4:-1}
     export AITER_USE_GROUPED_GEMM=${AITER_USE_GROUPED_GEMM:-1}
+    # ck_tile has no gfx1250 target yet -> build via the ck_tile_shim (ENABLE_CK=0)
+    export ENABLE_CK=${ENABLE_CK:-0}
     # Running >=3 distinct token sizes in one process trips an async GPU memory
     # fault (HSA_STATUS_ERROR_EXCEPTION) in the FlyDSL grouped a8w4 kernel: each
     # token is fine on its own, but state accumulates across iterations. Isolate
@@ -106,7 +111,7 @@ for q in "${QUANTS[@]}"; do
         log="$LOGDIR/$tag.log"
         echo "==== RUN $tag ===="
         "$PY" -u op_tests/test_moe_ep.py \
-          -t "$q" -m "$tok" -hd "$MD" -id "$ID" -e "$E" -k "$K" -ep "$EP" \
+          -t "$q" -m "$tok" -hd "$MD" -id "$ID" -e "$E" -k "$K" -ep "$EP" $CG_FLAG \
           > "$log" 2>&1
         classify $? "$log" "$tag"
         export AITER_REBUILD=0
@@ -116,7 +121,7 @@ for q in "${QUANTS[@]}"; do
       log="$LOGDIR/$tag.log"
       echo "==== RUN $tag ===="
       "$PY" -u op_tests/test_moe_ep.py \
-        -t "$q" -m $TOKENS -hd "$MD" -id "$ID" -e "$E" -k "$K" -ep "$EP" \
+        -t "$q" -m $TOKENS -hd "$MD" -id "$ID" -e "$E" -k "$K" -ep "$EP" $CG_FLAG \
         > "$log" 2>&1
       classify $? "$log" "$tag"
       export AITER_REBUILD=0
