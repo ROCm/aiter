@@ -9,8 +9,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 7,
-        "MAYBE_LOOP_UNROLL": false
+        "NUM_KSPLIT": 7
     },
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 32,
@@ -22,8 +21,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 7,
-        "MAYBE_LOOP_UNROLL": false
+        "NUM_KSPLIT": 7
     },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 32,
@@ -35,8 +33,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 7,
-        "MAYBE_LOOP_UNROLL": false
+        "NUM_KSPLIT": 7
     },
     "M_LEQ_128": {
         "BLOCK_SIZE_M": 64,
@@ -48,8 +45,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 7,
-        "MAYBE_LOOP_UNROLL": false
+        "NUM_KSPLIT": 7
     },
     "any": {
         "BLOCK_SIZE_M": 256,
@@ -62,7 +58,6 @@
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1,
-        "MAYBE_LOOP_UNROLL": false,
         "kernel_type": "compute_bound"
     }
 }
