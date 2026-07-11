@@ -4518,7 +4518,11 @@ namespace aiter {
       }
 
       // ---- Step 3 (nope threads only): group-amax -> e8m0 -> fp8 + cache write ----
-      float thread_max = 0.0f;
+      // Init the group-amax accumulator to the FP8-quant absmax floor so the reduced
+      // group max is always >= floor. Guards the e8m0 scale against a zero/near-zero
+      // group amax (zero activations under CG warmup / pad / invalid slots) with no
+      // extra op at the scale call site.
+      float thread_max = kFp8KvQuantAbsmaxFloorF32;
       if (is_nope_thread) {
         if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
           #pragma unroll
@@ -4902,7 +4906,9 @@ namespace aiter {
           // fp8 + inline duplicated e8m0 scale into q_out (q_nope_scale_buff, 512B), and
           // write the rotated PE as bf16 into the separate q_rope_out (Q-PE NOT quantized).
           const bool is_nope_thr = (tid < nope_vec);  // nope-first
-          float thread_max = 0.0f;
+          // Floor baked into the accumulator init: guards the e8m0 scale against a
+          // zero/near-zero group amax with no extra op at the scale call site.
+          float thread_max = kFp8KvQuantAbsmaxFloorF32;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) thread_max = fmaxf(thread_max, fabsf(rotated[i]));
           // Group-amax over the Q_REDUCE-lane group via __shfl_xor (DPP corrupts some Q
@@ -5143,8 +5149,10 @@ namespace aiter {
           float factor;
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
             constexpr MxDtype kMxDt = kHwFp8E4m3Dtype;
+            // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
             const E8m0BlockScale s =
-                fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(amax_norm);
+                fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(
+                    fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
             if (is_nope_thread && (tid % reduce_thread_size) == 0) {
               // K NoPE is always group=64 (GROUP_SIZE hardcoded above for the asm reader's
               // 14-byte format); use the generic tid/reduce_thread_size to avoid a magic >>6.
@@ -5266,8 +5274,10 @@ namespace aiter {
       if constexpr (Q_QUANT) {
         const float amax_norm = amax_raw * q_rms_scale;  // == amax(|q_norm|) over the group
         constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
+        // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
         const E8m0BlockScale qs_scale =
-            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(amax_norm);
+            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(
+                fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
         const float factor = q_rms_scale / qs_scale.dq_scale;  // x_in -> fp8 (rstd folded)
 
         query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
