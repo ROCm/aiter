@@ -1399,6 +1399,17 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 grouped_layout = masked_m
             contiguous_m = int(x.shape[1])
             m_tile_total = (contiguous_m + int(cfg.tile_m) - 1) // int(cfg.tile_m)
+            # Pad the M-tile count to a multiple of the XCD count (gfx1250 has 8
+            # XCDs). This removes the ragged tail group in the DeepGEMM
+            # MGroupedContiguous swizzle so every group's num_blocks_in_group is
+            # a multiple of 8; combined with the hardware round-robin
+            # (XCD = block_idx.x % 8), a fixed m_tile's n_tiles all land on the
+            # same XCD (A-row / same-expert L2 reuse). Padding only inflates the
+            # launch grid -- the extra m_tiles fall past the last group's END, so
+            # the scheduler's binary search sets group_active=false and skips
+            # them before any buffer access. No buffer resize needed.
+            _NUM_XCDS = 8
+            m_tile_total = ((m_tile_total + _NUM_XCDS - 1) // _NUM_XCDS) * _NUM_XCDS
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
@@ -1757,6 +1768,17 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 grouped_layout = masked_m
             contiguous_m = int(x.shape[1])
             m_tile_total = (contiguous_m + int(cfg.tile_m) - 1) // int(cfg.tile_m)
+            # Pad the M-tile count to a multiple of the XCD count (gfx1250 has 8
+            # XCDs). This removes the ragged tail group in the DeepGEMM
+            # MGroupedContiguous swizzle so every group's num_blocks_in_group is
+            # a multiple of 8; combined with the hardware round-robin
+            # (XCD = block_idx.x % 8), a fixed m_tile's n_tiles all land on the
+            # same XCD (A-row / same-expert L2 reuse). Padding only inflates the
+            # launch grid -- the extra m_tiles fall past the last group's END, so
+            # the scheduler's binary search sets group_active=false and skips
+            # them before any buffer access. No buffer resize needed.
+            _NUM_XCDS = 8
+            m_tile_total = ((m_tile_total + _NUM_XCDS - 1) // _NUM_XCDS) * _NUM_XCDS
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
