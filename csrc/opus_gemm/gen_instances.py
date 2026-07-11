@@ -1090,19 +1090,22 @@ if __name__ == "__main__":
         for a in archs_for_header:
             f.write(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n")
 
-    # a8w8 (kid 1, 2) referenced unconditionally by dispatcher; symbols must exist on every arch.
-    S |= set(a8w8_scale_kernels_list.keys())
-    S |= set(a8w8_kernels_list.keys())
+    # gfx950 a8w8 (kid 1, 2) is only needed when the module is built with
+    # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.
+    if target_arches is None or "gfx950" in target_arches:
+        S |= set(a8w8_scale_kernels_list.keys())
+        S |= set(a8w8_kernels_list.keys())
 
     # Honor --kernel_tag as a developer override that *further restricts* the set (within the a16w16
     # / a8w8 families).
     if args.kernel_tag:
         tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
         if tag_keys:
-            # Restrict to the requested family + heuristic defaults + a8w8 dispatch.
+            # Restrict to the requested family + heuristic defaults.
             S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
-            S |= set(a8w8_scale_kernels_list.keys())
-            S |= set(a8w8_kernels_list.keys())
+            if target_arches is None or "gfx950" in target_arches:
+                S |= set(a8w8_scale_kernels_list.keys())
+                S |= set(a8w8_kernels_list.keys())
 
     # Heuristic-fallback invariant (single source of truth: opus_gemm_common.py).
     required_heuristic = set(heuristic_kids_for_arch(target_arches))

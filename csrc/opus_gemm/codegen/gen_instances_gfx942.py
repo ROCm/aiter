@@ -18,8 +18,8 @@ from codegen.common import (
 )
 
 
-# gfx942 pipeline header derived from W3_KERNEL_PAIRS: splitk_X reuses
-# nosplit_X's .cuh (paired template).
+# gfx942 pipeline header helper. Paired splitK tags reuse their nosplit
+# sibling's .cuh; kbuf1_sk is splitK-only but keeps the kbuf1 pipeline name.
 def _gfx942_pipeline(tag):
     return f"gfx942/opus_gemm_pipeline_{tag}.cuh"
 
@@ -72,6 +72,7 @@ def _uses_bf16_workspace(k):
 PIPELINE_HEADER_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": _gfx942_pipeline("a16w16_em3en4_lds1_pgr2_sk"),
     "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
+    "a16w16_kbuf1_sk": _gfx942_pipeline("a16w16_kbuf1"),
     "a16w16_quad_mfma32_kbuf1": _gfx942_pipeline("a16w16_quad_mfma32_kbuf1"),
     "a16w16_wave_k_coop": _gfx942_pipeline("a16w16_wave_k_coop"),
     "a16w16_wave_k_coop_accum": _gfx942_pipeline("a16w16_wave_k_coop"),
@@ -98,6 +99,7 @@ KARGS_NAME_MAP = {
 KERNEL_FUNC_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": "gemm_a16w16_em3en4_lds1_pgr2_sk_kernel",
     "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
+    "a16w16_kbuf1_sk": "gemm_a16w16_kbuf1_kernel",
     "a16w16_quad_mfma32_kbuf1": "gemm_a16w16_quad_mfma32_kbuf1_kernel",
     "a16w16_wave_k_coop": "gemm_a16w16_wave_k_coop_kernel",
     "a16w16_wave_k_coop_accum": "gemm_a16w16_wave_k_coop_accum_kernel",
@@ -106,7 +108,10 @@ KERNEL_FUNC_MAP = {
     **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
 }
 
-SPLITK_REDUCE_SUPPORTED_SPLITKS = tuple(range(1, 17))
+# Exact-N row-block reduce is a fast path, not the functional fallback. Keep
+# static split-K variants only for values used by gfx942 tuned rows / common
+# explicit probes; all other split-K values fall through to the generic reduce.
+SPLITK_REDUCE_SUPPORTED_SPLITKS = (1, 3, 4, 5, 6, 8, 10)
 
 # Exact-N row-block reduce: (VEC, N_VEC, ROWS_PER_BLOCK), BLOCK = N_VEC * ROWS_PER_BLOCK.
 EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
@@ -155,9 +160,6 @@ def splitk_reduce_extra_device_instantiations():
         for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:
             for ws_type in ("float", "__bf16"):
                 contents += (
-                    f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, true,  __bf16>(\n"
-                    "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int,\n"
-                    "    const __bf16*, int);\n"
                     f"template __global__ void splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {ws_type}, __bf16, false, __bf16>(\n"
                     "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int,\n"
                     "    const __bf16*, int);\n"
@@ -244,6 +246,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         rowblock_rows_by_n.setdefault(vec * nvec, []).append(rows)
 
     def reduce_rowblock_branch(hasbias):
+        if hasbias:
+            return ""
         hb = "true" if hasbias else "false"
         bias_arg = (
             "reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_"
@@ -870,7 +874,6 @@ _GFX942_NOSPLIT_TAGS = (
     "a16w16_kbuf1_large_tile",
     "a16w16_kbuf2v",
     "a16w16_kbuf2v_bk128",
-    "a16w16_kbuf1",
     "a16w16_wave_k_coop",
     "a16w16_wave_k_coop_accum",
 )
