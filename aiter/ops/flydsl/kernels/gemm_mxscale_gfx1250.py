@@ -105,6 +105,11 @@ def _deepgemm_num_1d_blocks_per_group(
 
 LDS_PAD_A_BYTES = 16
 LDS_PAD_D_BYTES = 16
+# Every LDS buffer (per-stage A/B data + scale sub-buffers, and the stage pitch)
+# starts on this boundary. Data-buffer sizes are already 256-multiples for valid
+# tile dims, so aligning each start to 256 is a no-op today but makes the
+# "every LDS buffer is 256B-aligned" invariant explicit rather than emergent.
+LDS_ALIGN_BYTES = 256
 
 
 def compile_mxscale_gemm(
@@ -471,14 +476,13 @@ def compile_mxscale_gemm(
 
     lds_a_data_bytes = tile_m * lds_a_stride_bytes
     lds_b_data_bytes = tile_n * packed_tile_k_b
-    # Scale-buffer "guard" == round each scale buffer up to a 256B boundary. The
-    # padding (0 when the scale bytes are already 256-aligned) absorbs the b128
+    # Scale-buffer "guard" == round each scale buffer up to LDS_ALIGN_BYTES. The
+    # padding (0 when the scale bytes are already aligned) absorbs the b128
     # scale-load tail over-fetch (ds_load_b128 always pulls a full 16B / 4 dwords
     # even when the per-lane scale count isn't a multiple of 4) and keeps the
-    # next buffer 256-aligned.
-    _SCALE_ALIGN = 256
-    lds_a_scale_bytes = _align_up(tile_m * scale_k_per_tile, _SCALE_ALIGN)
-    lds_b_scale_bytes = _align_up(tile_n * scale_k_per_tile, _SCALE_ALIGN)
+    # next buffer aligned.
+    lds_a_scale_bytes = _align_up(tile_m * scale_k_per_tile, LDS_ALIGN_BYTES)
+    lds_b_scale_bytes = _align_up(tile_n * scale_k_per_tile, LDS_ALIGN_BYTES)
     interleaved_scale_cols_a = wmma_m_rep * scale_k_per_tile
 
     # TDM descriptors partition a tile cooperatively across ``num_warps`` by
@@ -500,7 +504,7 @@ def compile_mxscale_gemm(
     stage_layout = SmemAllocator(
         None, arch=gpu_arch, global_sym_name=f"mxscale_{data_format}_layout"
     )
-    stage_a_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
+    stage_a_data_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
     stage_layout.ptr = stage_a_data_rel_off + lds_a_data_bytes
     # A-scale immediately after A-data (B and B-scale follow) so its b128 tail
     # over-fetch spills into the following B-data (valid LDS), not past the buffer.
@@ -512,19 +516,19 @@ def compile_mxscale_gemm(
         # stage -- that slot would be dead LDS.
         stage_a_scale_rel_off = 0
     else:
-        stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
+        stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
         stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
-    stage_b_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
+    stage_b_data_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
     stage_layout.ptr = stage_b_data_rel_off + lds_b_data_bytes
     if stage1_dual_b:
-        stage_b_up_data_rel_off = stage_layout._align(stage_layout.ptr, 16)
+        stage_b_up_data_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
         stage_layout.ptr = stage_b_up_data_rel_off + lds_b_data_bytes
     else:
         stage_b_up_data_rel_off = 0
-    stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
+    stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
     stage_layout.ptr = stage_b_scale_rel_off + lds_b_scale_bytes
     if stage1_dual_b:
-        stage_b_up_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
+        stage_b_up_scale_rel_off = stage_layout._align(stage_layout.ptr, LDS_ALIGN_BYTES)
         stage_layout.ptr = stage_b_up_scale_rel_off + lds_b_scale_bytes
     else:
         stage_b_up_scale_rel_off = 0
@@ -540,7 +544,7 @@ def compile_mxscale_gemm(
 
     # Each stage's scale buffers are already 256-aligned, so round the whole stage
     # to a 256B pitch; every stage base then lands on a 256 boundary.
-    _stage_pitch_align = 256
+    _stage_pitch_align = LDS_ALIGN_BYTES
     stage_pitch_bytes = _align_up(stage_bytes, _stage_pitch_align)
     arena_alloc = SmemAllocator(
         None,
@@ -564,7 +568,7 @@ def compile_mxscale_gemm(
         as_full_row_stride if tdm_as_in_prologue else interleaved_scale_cols_a
     )
     lds_a_scale_full_bytes = _align_up(
-        tile_m * scale_k_per_tile * num_k_tiles, _SCALE_ALIGN
+        tile_m * scale_k_per_tile * num_k_tiles, LDS_ALIGN_BYTES
     )
     if tdm_as_in_prologue:
         as_full_rel_off = 0
