@@ -43,6 +43,10 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
+    shuffle_weight_a16w4_sep_fp4,
+    shuffle_scale_a16w4_sep_fp4,
+    shuffle_weight_a16w4_gui_fp4,
+    shuffle_scale_a16w4_gui_fp4,
     pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
 )
@@ -241,9 +245,28 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4: bf16 activations + fp4 weights -> fp4_bf16 FlyDSL kernel.
+        # Both stages use the klane-inner sep_fp4 preshuffle layout. Stage2 (down
+        # proj) is always SEPARATED. Stage1 uses the gate/up-interleaved layout when
+        # the INTERLEAVE kernel is selected (AITER_FP4BF16_USE_ITLV=1), else the
+        # SEPARATED (gate|up-concat) layout. Tag is_guinterleave so fused_moe picks
+        # bf16 activations + the fp4_bf16 path.
+        if int(os.environ.get("AITER_FP4BF16_USE_ITLV", "0")):
+            w1_qt_aiter = shuffle_weight_a16w4_gui_fp4(w1_qt_aiter)
+            w1_scale_aiter = shuffle_scale_a16w4_gui_fp4(w1_scale, E)
+        else:
+            w1_qt_aiter = shuffle_weight_a16w4_sep_fp4(w1_qt_aiter)
+            w1_scale_aiter = shuffle_scale_a16w4_sep_fp4(w1_scale, E)
+        w2_qt_aiter = shuffle_weight_a16w4_sep_fp4(w2_qt_aiter)
+        w2_scale_aiter = shuffle_scale_a16w4_sep_fp4(w2_scale, E)
+        w1_qt_aiter.is_guinterleave = True
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType == dtypes.fp8)
+        and (WQDType == dtypes.fp4x2)
+    ):  # a8w4
         gate_up = GateMode(gateMode) == GateMode.INTERLEAVE
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, gate_up)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, gate_up)
@@ -651,6 +674,14 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        # Respect the -q/--quant filter: when a specific quant type is selected,
+        # only test CSV rows whose (qType, AQDType, WQDType) match it. Otherwise a
+        # e.g. a4w4-tuned CSV row (fp4x2/fp4x2) would be dragged into an a16w4 (-q6)
+        # run and compared against a mismatched reference.
+        if args.quant is not None:
+            _row_triple = (kwargs["qType"], kwargs["AQDType"], kwargs["WQDType"])
+            if _row_triple not in l_quant:
+                continue
         # The reference path below uses the CSV q_dtype_a directly, while
         # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
         # Skip CSV rows that are tuned for a different mode to avoid comparing
@@ -872,11 +903,13 @@ for kwargs, extras in case_iter:
         args.swiglu_limit,
     )
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    # a8w4 (fp8 acts) forces the fp8 dispatch via BOUND=0. a16w4 (bf16 acts) must
+    # NOT force fp8 -- it needs bf16 activations for the fp4_bf16 path.
     _force_moe_bound_zero = (
         kwargs["qType"],
         kwargs["AQDType"],
         kwargs["WQDType"],
-    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
+    ) in (_PER1X32_FP8_FP4,)
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:

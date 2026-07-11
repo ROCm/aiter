@@ -332,6 +332,9 @@ def test_flydsl_e2e_a4w4(
     mode: str = "atomic",
     atol: float = 1.0,
     rtol: float = 0.05,
+    bench: bool = False,
+    tile_n: int = 256,
+    tile_k: int = 256,
 ):
     """End-to-end test: FlyDSL stage1 output -> quantise -> FlyDSL stage2."""
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
@@ -339,7 +342,8 @@ def test_flydsl_e2e_a4w4(
     print(f"\n{'='*70}")
     print(
         f"[TEST] FlyDSL E2E A4W4: token={token}, dim=({model_dim},{inter_dim}), "
-        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}"
+        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}, "
+        f"tile={block_m}x{tile_n}x{tile_k}"
     )
     print(f"{'='*70}")
 
@@ -365,8 +369,8 @@ def test_flydsl_e2e_a4w4(
         num_valid_ids=data["num_valid_ids"],
         topk=topk,
         tile_m=block_m,
-        tile_n=256,
-        tile_k=256,
+        tile_n=tile_n,
+        tile_k=tile_k,
         a_dtype="fp4",
         b_dtype="fp4",
         out_dtype=out_dtype_str,
@@ -398,8 +402,8 @@ def test_flydsl_e2e_a4w4(
         num_valid_ids=data["num_valid_ids"],
         topk=topk,
         tile_m=block_m,
-        tile_n=256,
-        tile_k=256,
+        tile_n=tile_n,
+        tile_k=tile_k,
         a_dtype="fp4",
         b_dtype="fp4",
         out_dtype=out_dtype_str,
@@ -409,6 +413,55 @@ def test_flydsl_e2e_a4w4(
         sorted_weights=data["sorted_weights_s2"],
     )
     torch.cuda.synchronize()
+
+    if bench:
+        from aiter.test_common import run_perftest
+
+        _, us1 = run_perftest(
+            flydsl_moe_stage1,
+            a=data["a1_qt"],
+            w1=data["w1_qt_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=topk,
+            tile_m=block_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            a_dtype="fp4",
+            b_dtype="fp4",
+            out_dtype=out_dtype_str,
+            w1_scale=data["w1_scale_shuf"],
+            a1_scale=data["a1_scale_sort"],
+            sorted_weights=data["sorted_weights_s1"],
+            num_iters=20,
+            num_warmup=5,
+        )
+        _, us2 = run_perftest(
+            flydsl_moe_stage2,
+            inter_states=a2_qt_e2e,
+            w2=data["w2_qt_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=topk,
+            tile_m=block_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            a_dtype="fp4",
+            b_dtype="fp4",
+            out_dtype=out_dtype_str,
+            mode=mode,
+            w2_scale=data["w2_scale_shuf"],
+            a2_scale=a2_scale_sort_e2e,
+            sorted_weights=data["sorted_weights_s2"],
+            num_iters=20,
+            num_warmup=5,
+        )
+        print(
+            f"  [BENCH] mfma_moe1(stage1)={us1:.2f} us  "
+            f"mfma_moe2(stage2)={us2:.2f} us  (token={token})"
+        )
 
     ref = data["ref_stage2"]
     return _check_result(
@@ -452,6 +505,13 @@ def main():
     )
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Print per-stage (mfma_moe1/mfma_moe2) us via run_perftest (e2e only)",
+    )
+    parser.add_argument("--tile-n", type=int, default=256, help="stage tile_n (e2e)")
+    parser.add_argument("--tile-k", type=int, default=256, help="stage tile_k (e2e)")
     args = parser.parse_args()
 
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -536,6 +596,9 @@ def main():
                             mode=mode,
                             atol=args.atol,
                             rtol=args.rtol,
+                            bench=args.bench,
+                            tile_n=args.tile_n,
+                            tile_k=args.tile_k,
                         )
                         results.append(
                             (
