@@ -100,8 +100,8 @@ jobs:
           runner_overrides = {
               "atom-mi355-8gpu.predownload": "linux-aiter-do-mi350x-8",
               "linux-atom-do-mi350x-8": "linux-aiter-do-mi350x-8",
-              "linux-atom-mi35x-4": "linux-aiter-do-mi350x-4",
-              "linux-atom-mi35x-1": "linux-aiter-do-mi350x-1",
+              "linux-atom-mi35x-4": "linux-aiter-mi35x-4",
+              "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
           # Per-model runner pin (overrides the generic mapping above). Kimi-K2.7
@@ -109,8 +109,8 @@ jobs:
           model_runner_overrides = {
               "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-8",
               "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
-              "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
-              "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-2",     # -tp 2 (MXFP4)
+              "Qwen3.5-397B-A17B-FP8": "linux-aiter-mi35x-4",  # -tp 4
+              "MiniMax-M2.7-MXFP4": "linux-aiter-mi35x-4",     # -tp 2 (MXFP4)
               "GLM-5.1-FP8": "linux-aiter-do-mi350x-8",            # -tp 8
           }
 
