@@ -1177,7 +1177,6 @@ def mla_decode_fwd_v4_nm(
     #       could shrink it and desync the buffer shapes). Only synthesize a
     #       uniform split_indptr if the caller didn't pass one.
     total_kv = kv_page_indices.shape[0]
-    split_indptr_synthesized = split_indptr is None
     if num_kv_splits is None or split_indptr is None:
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
         meta_num_kv_splits, meta_split_indptr = get_meta_param(
@@ -1193,33 +1192,6 @@ def mla_decode_fwd_v4_nm(
             num_kv_splits = meta_num_kv_splits
         if split_indptr is None:
             split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
-
-    # ---- Ragged per-seq split allocation (short-seq correctness) -----------
-    # get_meta_param picks a SINGLE num_kv_splits from the batch-average kv and
-    # returns a UNIFORM indptr (every seq gets num_kv_splits). For a seq shorter
-    # than num_kv_splits * BLK tokens that over-allocates splits: the decode
-    # distributes kv cyclically across all num_kv_splits, so the trailing
-    # "empty" splits produce garbage partials that the stage2 reduce then merges
-    # in — silently corrupting THAT seq's own output (~45% off). It only
-    # surfaces when the avg-kv-derived num_kv_splits exceeds a short seq's
-    # coverage (e.g. a long seq in the batch raises the average).
-    #
-    # Fix (host-only; decode already reads per-seq split count from split_indptr
-    # and cleanly exits TGs with tg_idz >= that count): rebuild split_indptr
-    # RAGGED, capping each seq at ceil(kv_i / BLK) so short seqs get no empty
-    # splits. num_kv_splits (the kernarg passes it as the buffer's nsplit_max
-    # stride) is left unchanged — only the per-seq split_indptr becomes ragged;
-    # the partial buffer layout is untouched and short seqs just leave their
-    # tail slots unwritten/unread. BLK mirrors the stage2 reduce's `mgc`. Only
-    # applied to a split_indptr WE synthesized (never override a caller's).
-    if split_indptr_synthesized and num_kv_splits > 1:
-        blk = 64 if (max_seqlen_q == 1 and num_heads in (8, 16)) else 16
-        kv_lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int64)
-        per_seq_splits = torch.clamp(
-            (kv_lens + blk - 1) // blk, min=1, max=num_kv_splits
-        ).to(torch.int32)
-        split_indptr = torch.zeros(num_seqs + 1, dtype=torch.int32, device=q.device)
-        split_indptr[1:] = torch.cumsum(per_seq_splits, dim=0).to(torch.int32)
 
     # ---- Multi-pass requires the FP32 split-output path ----
     if num_kv_splits > 1 and out_16_nosplit != 0:
@@ -1286,17 +1258,9 @@ def mla_decode_fwd_v4_nm(
     # we still pass *something* through to satisfy the C ABI.
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
 
-    # Per-batch valid KV split count buffer. Always allocated (and passed to the
-    # asm kernel) so the ABI has a valid device destination, but INTENTIONALLY
-    # left uninitialized: v4 nm ships only for gfx950, where the stage2 reduce
-    # runs with USE_VALID_SPLIT_COUNT_REDUCE=0 (see the stage2 launch below) so
-    # it never reads this buffer's content, and the v4 nm decode kernel doesn't
-    # write it back either -- only the pointer matters. torch.empty avoids the
-    # per-call fill that torch.full would launch (a vectorized_elementwise_kernel
-    # that shows up as an extra slice right before the decode kernel in a
-    # per-call perf trace). NOTE: this relies on v4 nm being gfx950-only; a
-    # future non-gfx950 kernel whose stage2 reads valid_split_count would need a
-    # real init (torch.full) here.
+    # Per-seq valid split count writeback buffer (mirrors the stage1 path above).
+    # Left uninitialized: the valid-split-exporting decode kernel writes the real
+    # (valid) count before stage2 reads it, so pre-filling is dead work.
     valid_split_count = torch.empty((num_seqs,), dtype=dtypes.i32, device=q.device)
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
@@ -1328,7 +1292,16 @@ def mla_decode_fwd_v4_nm(
         device = logits.device
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
-        mgc = 64 if (max_seqlen_q == 1 and num_heads in (8, 16)) else 16
+        # mgc = reduce's per-split KV granularity. On gfx950 the v4 nm decode
+        # tiles at SUB_KV=32, so mgc must be 32 (not 64): otherwise cdiv(kv, mgc)
+        # floors below the per-seq valid split count the kernel exports and drops
+        # a short seq's splits (that mismatch is what previously required the host
+        # ragged rebuild). Other archs keep the original mgc=64 for the gqa16/8
+        # single-token tile.
+        if max_seqlen_q == 1 and num_heads in (8, 16):
+            mgc = 32 if get_gfx() == "gfx950" else 64
+        else:
+            mgc = 16
 
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
@@ -1352,13 +1325,7 @@ def mla_decode_fwd_v4_nm(
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
             MAYBE_FINAL_OUT=True,
             HAS_FINAL_LSE=False,
-            # gfx950 v4 nm uses uniform full-coverage splits with no
-            # empty-split skipping, so the valid-split reduce is a no-op there;
-            # force 0 to keep the legacy reduce path. Other archs follow the
-            # main convention (enable when multi-split).
-            USE_VALID_SPLIT_COUNT_REDUCE=(
-                0 if get_gfx() == "gfx950" else int(num_kv_splits > 1)
-            ),
+            USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
             BATCH_NUM=num_seqs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,

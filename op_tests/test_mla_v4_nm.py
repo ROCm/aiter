@@ -295,17 +295,18 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
         ptr = int.from_bytes(slot(slot_idx)[:8], "little")
         assert ptr != 0, f"slot {slot_idx} pointer is NULL"
 
-    # Slots 19/20 are the valid_split scratch added by the kargs-preload change.
-    # On gfx950 the legacy path leaves them zero: the C entry (void)-ignores
-    # valid_split_count / use_valid_split_count_reduce and the shipped .co never
-    # touches the buffer. Lock that contract (it's what makes the wrapper's
-    # torch.empty(valid_split_count) allocation safe here).
+    # Slots 19/20 are the valid_split-count export scratch. gfx950 now WIRES
+    # them (valid-split-exporting kernels): slot 19 = valid_split_count buffer
+    # ptr (non-NULL, wrapper always allocates it), slot 20 = the opt-in flag =
+    # int(num_kv_splits > 1). This config uses num_kv_splits=1, so the flag is 0
+    # (single-split has no empty tail to skip) while the ptr is still a live
+    # buffer.
     assert (
-        int.from_bytes(slot(19)[:8], "little") == 0
-    ), "slot 19 (ptr_valid_split) must be NULL on gfx950 (kernel ignores it)"
+        int.from_bytes(slot(19)[:8], "little") != 0
+    ), "slot 19 (ptr_valid_split) must be a live buffer ptr on gfx950"
     assert (
         slot_u32(20) == 0
-    ), "slot 20 (s_use_valid_split) must be 0 on gfx950 (kernel ignores it)"
+    ), "slot 20 (s_use_valid_split) must be 0 for num_kv_splits=1 (single-split)"
 
 
 # ---------------------------------------------------------------------------
