@@ -56,32 +56,6 @@ from aiter.ops.flydsl.kernels.quant_utils import (
 from aiter.ops.flydsl.kernels.tensor_shim import MOE_KERNARG_PRELOAD_COUNT
 
 
-def _rsrc_from_ptr(p, *, num_records_bytes=None):
-    """Build an AMD buffer resource from an ``fx.Pointer`` kernel arg.
-
-    Replaces ``buffer_ops.create_buffer_resource(memref, ...)`` now that the
-    kernel receives bare pointers (so kernarg preload is not blocked by the
-    per-tensor shape/stride aggregate). ``num_records_bytes=None`` requests the
-    maximum buffer size, matching the old ``max_size=True`` behavior.
-    """
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(p))
-    return buffer_ops.create_buffer_resource_from_addr(
-        addr_i64, num_records_bytes=num_records_bytes
-    )
-
-
-def _desc_src(p):
-    """Adapt an ``fx.Pointer`` for ``make_tensor_descriptor_2d`` / ``l2_prefetch_tile``.
-
-    Those helpers read ``global_ptr.__extract_to_ir_values__()[0]`` and feed it to
-    ``fly.extract_aligned_pointer_as_index``, whose verifier requires a memref --
-    not the ``!fly.ptr`` that a bare pointer kernel arg lowers to. A 1-D identity
-    view over the pointer yields a global memref whose aligned base is the pointer;
-    the view's shape is irrelevant because the descriptor supplies its own
-    ``tensor_shape``/``strides``.
-    """
-    return p.view(make_identity_layout((1,)))
-
 # Common constants
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
@@ -804,6 +778,31 @@ def compile_mxscale_gemm(
             tile_m
         )
 
+        def build_buffer_resource_from_ptr(p, *, num_records_bytes=None):
+            """Build an AMD buffer resource from an ``fx.Pointer`` kernel arg.
+
+            Replaces ``buffer_ops.create_buffer_resource(memref, ...)`` now that the
+            kernel receives bare pointers (so kernarg preload is not blocked by the
+            per-tensor shape/stride aggregate). ``num_records_bytes=None`` requests
+            the maximum buffer size, matching the old ``max_size=True`` behavior.
+            """
+            addr_i64 = arith.index_cast(T.i64, ptrtoint(p))
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr_i64, num_records_bytes=num_records_bytes
+            )
+
+        def build_memref_from_ptr(p):
+            """Adapt an ``fx.Pointer`` for ``make_tensor_descriptor_2d`` / ``l2_prefetch_tile``.
+
+            Those helpers read ``global_ptr.__extract_to_ir_values__()[0]`` and feed it
+            to ``fly.extract_aligned_pointer_as_index``, whose verifier requires a
+            memref -- not the ``!fly.ptr`` that a bare pointer kernel arg lowers to. A
+            1-D identity view over the pointer yields a global memref whose aligned base
+            is the pointer; the view's shape is irrelevant because the descriptor
+            supplies its own ``tensor_shape``/``strides``.
+            """
+            return p.view(make_identity_layout((1,)))
+
         def _emit_tile(
             batch_idx,
             bx_local,
@@ -836,7 +835,7 @@ def compile_mxscale_gemm(
                 if valid_m_override is not None:
                     valid_m_i32 = valid_m_override
                 else:
-                    masked_m_rsrc = _rsrc_from_ptr(arg_masked_m)
+                    masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
                     valid_m_i32 = buffer_ops.buffer_load(
                         masked_m_rsrc,
                         arith.index_cast(T.i32, batch_idx),
@@ -891,18 +890,18 @@ def compile_mxscale_gemm(
             else:
                 c_rows = m_idx * arith.index(split_k)
             c_nrec = c_rows * n_stride * arith.index(elem_bytes_d)
-            c_rsrc = _rsrc_from_ptr(arg_c, num_records_bytes=c_nrec)
+            c_rsrc = build_buffer_resource_from_ptr(arg_c, num_records_bytes=c_nrec)
             if const_expr(epilogue_bias_mode):
-                bias_rsrc = _rsrc_from_ptr(arg_bias)
+                bias_rsrc = build_buffer_resource_from_ptr(arg_bias)
             zero_i32 = arith.constant(0, type=T.i32)
 
             # TDM descriptors / L2 prefetch take a memref-style global_ptr; adapt
-            # the bare pointer kernel args once here (see _desc_src).
-            _a_src = _desc_src(arg_a)
-            _b_src = _desc_src(arg_b)
-            _as_src = _desc_src(arg_a_scale)
-            _bs_src = _desc_src(arg_b_scale)
-            _c_src = _desc_src(arg_c)
+            # the bare pointer kernel args once here (see build_memref_from_ptr).
+            _a_src = build_memref_from_ptr(arg_a)
+            _b_src = build_memref_from_ptr(arg_b)
+            _as_src = build_memref_from_ptr(arg_a_scale)
+            _bs_src = build_memref_from_ptr(arg_b_scale)
+            _c_src = build_memref_from_ptr(arg_c)
 
             def make_desc_a(memref, k_base):
                 k_packed_off = k_base // arith.index(PACK_FACTOR_A)
@@ -2056,8 +2055,8 @@ def compile_mxscale_gemm(
                 # gguu (dual-B) front-ends feed this: a warp owns whole 32-col MX
                 # block(s), each block split as 16 cols/lane over the lane_kgrp
                 # pair, so the block amax = local reduce + one shuffle_xor(16).
-                payload_rsrc = _rsrc_from_ptr(arg_c)
-                scale_rsrc = _rsrc_from_ptr(arg_bias)
+                payload_rsrc = build_buffer_resource_from_ptr(arg_c)
+                scale_rsrc = build_buffer_resource_from_ptr(arg_bias)
                 c4_i32 = arith.constant(4, type=T.i32)
                 c16_i32 = arith.constant(16, type=T.i32)
                 c23_i32 = arith.constant(23, type=T.i32)
@@ -3541,8 +3540,8 @@ def compile_mxscale_gemm(
                     epilogue_stores(accs, epi_addrs_box[0])
 
         if const_expr(grouped_persistent_m):
-            prefix_rsrc = _rsrc_from_ptr(arg_m_tile_prefix)
-            map_rsrc = _rsrc_from_ptr(arg_m_tile_map)
+            prefix_rsrc = build_buffer_resource_from_ptr(arg_m_tile_prefix)
+            map_rsrc = build_buffer_resource_from_ptr(arg_m_tile_map)
             block_n_id = arith.index_cast(T.index, _raw(gpu.block_idx.x))
             worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
             grid_size = arith.index(_persistent_workers)
@@ -3610,8 +3609,8 @@ def compile_mxscale_gemm(
             _for_ip.__exit__(None, None, None)
         else:
             if const_expr(grouped_contiguous_m):
-                masked_m_rsrc = _rsrc_from_ptr(arg_masked_m)
-                layout_rsrc = _rsrc_from_ptr(arg_m_tile_map)
+                masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
+                layout_rsrc = build_buffer_resource_from_ptr(arg_m_tile_map)
                 flat_pid = arith.index_cast(T.index, _raw(gpu.block_idx.x))
                 bz = (
                     arith.index_cast(T.index, _raw(gpu.block_idx.z))
@@ -3738,7 +3737,7 @@ def compile_mxscale_gemm(
                         else arith.index(0)
                     )
                 if const_expr(grouped_masked_m):
-                    masked_m_rsrc = _rsrc_from_ptr(arg_masked_m)
+                    masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
                     valid_m_i32 = buffer_ops.buffer_load(
                         masked_m_rsrc,
                         arith.index_cast(T.i32, batch_idx),
