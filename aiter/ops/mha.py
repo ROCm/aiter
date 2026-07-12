@@ -314,6 +314,23 @@ def fmha_v3_fwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
+def gen_fmha_fwd_bf16_opus_fwd_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    causal: bool,
+    softmax_scale: float,
+    seqstart_q: Optional[Tensor] = None,
+    seqstart_k: Optional[Tensor] = None,
+    seqstart_q_pad: Optional[Tensor] = None,
+    seqstart_k_pad: Optional[Tensor] = None,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
+) -> None:
+    return None
+
+
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
 # kernel (batch only) or the asymmetric D_QK=192/D_V=128 kernel (batch + group/varlen).
@@ -321,6 +338,7 @@ def fmha_v3_fwd(
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
     fc_name="fmha_fwd_bf16_opus_fwd",
+    gen_fake=gen_fmha_fwd_bf16_opus_fwd_fake,
     develop=True,
 )
 def _fmha_fwd_bf16_opus_fwd(
@@ -1896,9 +1914,24 @@ def _flash_attn_forward(
             ret = ret and (seqlen_k >= seqlen_q)
         return ret
 
-    def _opus_common_ok():
+    def _can_impl_fmha_fwd_hd128_bf16_opus():
+        # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
+        # supersedes v3/CK when enabled. Kernel requires seqlen_q == seqlen_k.
+        if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
+            return False
+        return (hdim_q == 128 and hdim_v == 128) and (seqlen_q == seqlen_k)
+
+    def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
+        # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
+        if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
+            return False
+        return hdim_q == 192 and hdim_v == 128
+
+    def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
         # no LSE/dropout mask, so it must never capture return_lse / the autograd path).
+        # Cheapest / most-selective gates first so the per-head-dim helpers (which read
+        # env vars) are only evaluated once the common conditions already hold.
         ret = get_gfx() == "gfx950"
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -1909,27 +1942,10 @@ def _flash_attn_forward(
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (not return_lse) and (not return_softmax)
-        return ret
-
-    def can_impl_fmha_fwd_hd128_bf16_opus():
-        # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
-        # supersedes v3/CK when enabled. Kernel requires seqlen_q == seqlen_k.
-        if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
-            return False
-        ret = _opus_common_ok()
-        ret = ret and (hdim_q == 128 and hdim_v == 128)
-        ret = ret and (seqlen_q == seqlen_k)
-        return ret
-
-    def can_impl_fmha_fwd_hd192_v128_bf16_opus():
-        # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
-        # since it beats v3 across mid/large shapes; falls back to v3/CK otherwise.
-        # Supports cross-attention (seqlen_q != seqlen_k, causal bottom-right aligned).
-        # AITER_DISABLE_FMHA_OPUS=1 force-disables it (fall back to v3/CK; for A/B).
-        if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
-            return False
-        ret = _opus_common_ok()
-        ret = ret and (hdim_q == 192 and hdim_v == 128)
+        ret = ret and (
+            _can_impl_fmha_fwd_hd128_bf16_opus()
+            or _can_impl_fmha_fwd_hd192_v128_bf16_opus()
+        )
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2011,7 +2027,7 @@ def _flash_attn_forward(
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-    elif can_impl_fmha_fwd_hd128_bf16_opus() or can_impl_fmha_fwd_hd192_v128_bf16_opus():
+    elif can_impl_fmha_fwd_bf16_opus():
         # OPUS gfx950 dense forward (shared entry point; dispatches D=128 vs
         # D_QK=192/D_V=128 in C++ by head dim). Inference-only: the lse/S_dmask/rng
         # slots are unused placeholders (gate guarantees not return_lse/return_softmax).
