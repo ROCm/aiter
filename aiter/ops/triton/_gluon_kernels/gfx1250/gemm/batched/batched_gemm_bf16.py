@@ -4,10 +4,6 @@
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
-    create_shared_layouts,
-    create_wmma_layouts,
-)
 
 _GLUON_REPR_KEYS = [
     "BLOCK_M",

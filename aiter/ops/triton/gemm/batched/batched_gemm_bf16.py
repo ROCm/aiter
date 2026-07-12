@@ -87,8 +87,10 @@ def batched_gemm_bf16(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.batched_gemm_bf16 import (
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
             _KERNEL_MAP,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             create_shared_layouts,
             create_wmma_layouts,
         )
