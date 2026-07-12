@@ -4291,6 +4291,10 @@ namespace aiter {
         int q_scale_stride_0, q_scale_stride_1;
         int num_tokens;
         int num_heads;  // V4 MQA: num_kv_heads is hardcoded to 1 (blockIdx.y==0 is the K wave)
+        // RoPE cos/sin cache row count (= cos_cache.size(0)). positions[token] is
+        // clamped into [0, max_position) before indexing cos/sin so a stale / OOB
+        // position on a CG-pad token can't index out of bounds. 0 disables the clamp.
+        int max_position;
         // --- K-only paged-cache write (fused_kv_norm_rope_group_quant) ---
         // When the K-only kernel writes into a paged cache via slot_mapping, the
         // dest row is block*block_stride + off*row_stride, with block = slot/page_size,
@@ -4732,7 +4736,14 @@ namespace aiter {
       const bool is_k_wave = (combined_head_idx == 0);
 
       // RoPE cos/sin pointers (shared between K and Q phases)
-      const int32_t cos_sin_offset = static_cast<int32_t>(positions[token_idx]) * (pe_dim >> 1);
+      // Clamp position into [0, max_position) before indexing the RoPE tables so a
+      // stale / OOB position on a CG-pad token can't read cos/sin out of bounds
+      // (raw-pointer read; a bad index would fault / return garbage).
+      int32_t rope_pos = static_cast<int32_t>(positions[token_idx]);
+      if (params.max_position > 0)
+        rope_pos = rope_pos < 0 ? 0
+                 : (rope_pos >= params.max_position ? params.max_position - 1 : rope_pos);
+      const int32_t cos_sin_offset = rope_pos * (pe_dim >> 1);
       const scalar_t *cos_ptr = cos_cache + cos_sin_offset;
       const scalar_t *sin_ptr = sin_cache + cos_sin_offset;
 
@@ -5096,7 +5107,13 @@ namespace aiter {
       if (token_idx >= params.num_tokens) return;
       const bool is_k_wave = (combined_head_idx == 0);  // V4 MQA: single K wave
 
-      const int32_t cos_sin_offset = static_cast<int32_t>(positions[token_idx]) * (pe_dim >> 1);
+      // Clamp position into [0, max_position) before indexing the RoPE tables so a
+      // stale / OOB position on a CG-pad token can't read cos/sin out of bounds.
+      int32_t rope_pos = static_cast<int32_t>(positions[token_idx]);
+      if (params.max_position > 0)
+        rope_pos = rope_pos < 0 ? 0
+                 : (rope_pos >= params.max_position ? params.max_position - 1 : rope_pos);
+      const int32_t cos_sin_offset = rope_pos * (pe_dim >> 1);
       const scalar_t* cos_ptr = cos_cache + cos_sin_offset;
       const scalar_t* sin_ptr = sin_cache + cos_sin_offset;
 
@@ -5619,6 +5636,9 @@ void fused_qk_norm_rope_group_quant(
   }
   mla_params.num_tokens = num_tokens;
   mla_params.num_heads = num_heads;
+  // RoPE table row count; used to clamp positions[token] before indexing cos/sin
+  // so a stale / OOB position on a CG-pad token can't read out of bounds.
+  mla_params.max_position = static_cast<int>(cos_cache.size(0));
 
   // --- Optional fused SWA ring-cache write (decode-only) ---
   // All four SWA tensors must be provided together or all omitted.
