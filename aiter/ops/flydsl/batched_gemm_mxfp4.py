@@ -219,11 +219,18 @@ def _run_gfx1250(
             tile_k = 128
             k_tiles = K // tile_k
 
-    # Warp tiling (tuned on gfx1250): 64-wide N warp-tiles; M warp-tiles of 16 rows for
-    # tile_m<=64, 32 rows for tile_m=128. Fewer N-warps cut redundant fp8-A global traffic.
-    n_warp = max(1, tile_n // 64)
+    # Warp tiling. The BW-bound MoE-decode regime (small tile_m) is limited by
+    # per-K-tile overhead, so pack many WMMAs per wave in a small workgroup for high
+    # occupancy: 128-wide N warp-tiles (n_warp=2) with warp_tile_m<=64 to keep the
+    # accumulator VGPRs in budget. The non-BW (latency-bound) path keeps the wider
+    # workgroup that favours latency hiding.
+    if bw_bound:
+        n_warp = max(1, tile_n // 128)
+        m_warp = max(1, tile_m // 64)
+    else:
+        n_warp = max(1, tile_n // 64)
+        m_warp = (tile_m // 16) if tile_m <= 64 else (tile_m // 32)
     warp_tile_n = tile_n // n_warp
-    m_warp = (tile_m // 16) if tile_m <= 64 else (tile_m // 32)
     warp_tile_m = tile_m // m_warp
     if m_warp * n_warp * 32 > 1024:
         raise RuntimeError(
@@ -231,9 +238,9 @@ def _run_gfx1250(
             f"{tile_m}x{tile_n}"
         )
 
-    # Multi-buffer depth: with 4 TDM streams/tile (A+B+scaleA+scaleB) the BW-bound
-    # regime needs a 6-deep ring to stay above the pipeline cliff; else 3 (2 for short K).
-    _target_nb = 6 if bw_bound else 3
+    # Multi-buffer depth: a 3-deep ring overlaps the 4 TDM streams (A+B+scaleA+scaleB)
+    # with compute; going deeper only costs LDS -> occupancy (clamped to k_tiles).
+    _target_nb = 3
     num_buffers = min(_target_nb if k_tiles >= _target_nb else k_tiles, k_tiles)
 
     out_is_f16 = 1 if dtype == torch.float16 else 0
