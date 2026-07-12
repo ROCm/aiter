@@ -158,24 +158,30 @@ def launch_gemm_a8w4_tdm(
         sa_super_off = blk_m64 // 32
         sb_super_off = blk_n64 // 32
 
-        def issue(s, kt):
-            if const_expr(layout_mbn):
-                a_off = blk_m64 * (batch * K) + bz64 * K + kt * tile_k
-            else:
-                a_off = (bz64 * m64 + blk_m64) * K + kt * tile_k
-            b_off = b_outer_row * (Kp * 16) + kt * PACK_TK * 16
-            sa_off = sa_super_off * SA_OUTER_STRIDE + kt * SC_INNER + sa_batch_off
-            sb_off = sb_super_off * SB_OUTER_STRIDE + kt * SC_INNER + sb_batch_off
-            AT, BT = (tile_m, tile_k), (tile_n // 16, PACK_TK * 16)
-            SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
-            gtA = _gv(gA_base, a_off, AT, (A_OUTER_STRIDE, 1))
-            gtB = _gv(gB_base, b_off, BT, (Kp * 16, 1))
-            gtSA = _gv(gSA_base, sa_off, SAT, (SA_OUTER_STRIDE, 1))
-            gtSB = _gv(gSB_base, sb_off, SBT, (SB_OUTER_STRIDE, 1))
-            fx.copy(_tdm(gtA, mn_oob), gtA, _lv(pA[s], AT, (A_LDS_ROW, 1)))
-            fx.copy(_tdm(gtB), gtB, _lv(pB[s], BT, (B_LDS_ROW, 1)))
-            fx.copy(_tdm(gtSA, sa_oob), gtSA, _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)))
-            fx.copy(_tdm(gtSB), gtSB, _lv(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
+        AT, BT = (tile_m, tile_k), (tile_n // 16, PACK_TK * 16)
+        SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
+        if const_expr(layout_mbn):
+            a_off0 = blk_m64 * (batch * K) + bz64 * K
+        else:
+            a_off0 = (bz64 * m64 + blk_m64) * K
+        b_off0 = b_outer_row * (Kp * 16)
+        sa_off0 = sa_super_off * SA_OUTER_STRIDE + sa_batch_off
+        sb_off0 = sb_super_off * SB_OUTER_STRIDE + sb_batch_off
+        gtA0 = _gv(gA_base, a_off0, AT, (A_OUTER_STRIDE, 1))
+        gtB0 = _gv(gB_base, b_off0, BT, (Kp * 16, 1))
+        gtSA0 = _gv(gSA_base, sa_off0, SAT, (SA_OUTER_STRIDE, 1))
+        gtSB0 = _gv(gSB_base, sb_off0, SBT, (SB_OUTER_STRIDE, 1))
+        atomA, atomB = _tdm(gtA0, mn_oob), _tdm(gtB0)
+        atomSA, atomSB = _tdm(gtSA0, sa_oob), _tdm(gtSB0)
+        _adv = fx.rocdl.advance_tdm_atom
+
+        def issue(s, kt):  # bump imm_offset by the K-tile byte delta (base fixed)
+            fx.copy(_adv(atomA, kt * tile_k), gtA0, _lv(pA[s], AT, (A_LDS_ROW, 1)))
+            fx.copy(_adv(atomB, kt * PACK_TK * 16), gtB0, _lv(pB[s], BT, (B_LDS_ROW, 1)))
+            fx.copy(_adv(atomSA, kt * SC_INNER * 4), gtSA0,
+                    _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)))
+            fx.copy(_adv(atomSB, kt * SC_INNER * 4), gtSB0,
+                    _lv(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
