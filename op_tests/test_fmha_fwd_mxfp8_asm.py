@@ -281,15 +281,16 @@ def test_fmha_fwd_mxfp8(batch, nheads, nheads_k, seqlen, d, causal, init_pattern
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
         # fp8 MHA tolerance: the fp8 matmul has an inherent per-element error
-        # (max ~0.06 here), so a very tight atol flags a handful of elements as
-        # a "warning".  These bounds are fp8-appropriate (still far tighter than
-        # aiter's fp8 attention_ref_with_tol floors of atol=0.5/rtol=0.1) and
-        # keep every element within tolerance -> clean pass, no warning.
+        # (worst ~0.056 across all swept shapes).  atol=0.0625 (2^-4) / rtol=0.02
+        # keeps every element within tolerance (clean pass, no warning); the
+        # kernel is deterministic (bit-exact across launches) so this is stable.
+        # Still far tighter than aiter's fp8 attention_ref_with_tol floors of
+        # atol=0.5/rtol=0.1.
         err = checkAllclose(
             ref.to(dtypes.fp32),
             out.to(dtypes.fp32),
-            rtol=5e-2,
-            atol=1e-1,
+            rtol=2e-2,
+            atol=6.25e-2,
             msg=f"{name}: fmha_fwd_mxfp8",
         )
         ret[f"{name} us"] = us
