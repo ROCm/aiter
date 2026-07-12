@@ -178,3 +178,114 @@ def batched_gemm_a8wfp4(
         )
 
     return y
+
+
+# Default gfx1250 gluon configs keyed loosely by variant. Small-M batched GEMM is
+# weight-stream bandwidth bound, so we favor a big N tile + deep TDM pipeline.
+def _get_gluon_config(M, N, K, a_dtype):
+    # 3-stage TDM pipeline, BM=64 / BN=128 / BK=512. Small BN keeps many
+    # workgroups resident (128 CUs) so the weight stream saturates HBM.
+    return {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 512,
+        "NUM_BUFFERS": 3,
+        "PREFETCH_DIST": 0,
+        "num_warps": 4,
+    }
+
+
+def batched_gemm_a8wfp4_gluon(
+    x,
+    w,
+    x_scales,
+    w_scales,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+    a_dtype: str = "fp8",
+    layout: str = "bmn",
+):
+    """Gluon (gfx1250 TDM + wmma_scaled) batched MXFP GEMM.
+
+    Same semantics/args as :func:`batched_gemm_a8wfp4`, but W stays in its natural
+    (B, N, K//2) layout (no internal transpose) and inputs are plain (unshuffled).
+    """
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_a8wfp4 import (
+        _batched_gemm_a8wfp4_gluon_kernel,
+        get_batched_a8wfp4_layouts,
+    )
+
+    _LOGGER.info(
+        f"BATCHED_GEMM_A8WFP4_GLUON: x={tuple(x.shape)} w={tuple(w.shape)} a_dtype={a_dtype}"
+    )
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+    if a_dtype not in _A_DTYPE:
+        raise ValueError(f"a_dtype must be one of {sorted(_A_DTYPE)}; got {a_dtype!r}")
+    if layout not in ("bmn", "mbn"):
+        raise ValueError(f"layout must be 'bmn' or 'mbn'; got {layout!r}")
+
+    A_PACK, A_FORMAT = _A_DTYPE[a_dtype]
+    x_is_fp4 = a_dtype == "fp4"
+
+    Batch, M, _ = x.shape
+    Bw, N, _ = w.shape
+    K = x.shape[-1] * A_PACK
+    assert Batch == Bw, f"batch mismatch: x={Batch}, w={Bw}"
+
+    if y is None:
+        if layout == "mbn":
+            y = torch.empty((M, Batch, N), dtype=dtype, device=x.device).transpose(0, 1)
+        else:
+            y = torch.empty((Batch, M, N), dtype=dtype, device=x.device)
+    assert y.shape == (Batch, M, N)
+
+    if config is None:
+        config = _get_gluon_config(M, N, K, a_dtype)
+
+    BLOCK_M = config["BLOCK_SIZE_M"]
+    BLOCK_N = config["BLOCK_SIZE_N"]
+    BLOCK_K = config["BLOCK_SIZE_K"]
+    num_warps = config["num_warps"]
+    prefetch_dist = config.get("PREFETCH_DIST", 0)
+    k_tiles = triton.cdiv(K, BLOCK_K)
+    num_buffers = min(config["NUM_BUFFERS"], k_tiles)
+
+    layouts = get_batched_a8wfp4_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K, x_is_fp4)
+
+    grid = (Batch, triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N))
+    _batched_gemm_a8wfp4_gluon_kernel[grid](
+        x,
+        w,
+        y,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        w.stride(0),
+        w.stride(1),
+        w.stride(2),
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        x_scales.stride(2),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        w_scales.stride(2),
+        A_FORMAT=A_FORMAT,
+        X_IS_FP4=x_is_fp4,
+        BLOCK_SIZE_M=BLOCK_M,
+        BLOCK_SIZE_N=BLOCK_N,
+        BLOCK_SIZE_K=BLOCK_K,
+        NUM_BUFFERS=num_buffers,
+        PREFETCH_DIST=prefetch_dist,
+        num_warps=num_warps,
+        **layouts,
+    )
+    return y

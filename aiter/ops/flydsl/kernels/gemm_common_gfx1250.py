@@ -121,6 +121,22 @@ def lds_load_b32_raw(lds_base_idx, byte_offset):
     return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
 
 
+def lds_store_b128_raw(lds_base_idx, byte_offset, data):
+    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM).
+
+    Mirror of :func:`lds_load_b128_raw` for the store direction; used when the
+    LDS is a bump-allocated fly SharedAllocator base (no raw memref for the
+    ``vector.store`` path). ``data`` must be a 128-bit vector (``vec<4xi32>``).
+
+    Args:
+        lds_base_idx: LDS byte-base index (e.g. ``ptrtoint`` of a shared ptr).
+        byte_offset: Byte offset (index-type) relative to the base.
+        data: 128-bit value to store (``vector<4xi32>``).
+    """
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
+
+
 def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
     """Transpose-load 16 bytes from LDS using a pre-extracted base index."""
     from flydsl._mlir.dialects import rocdl as _rocdl

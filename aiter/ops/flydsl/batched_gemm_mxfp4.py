@@ -249,8 +249,8 @@ def _run_gfx1250(
         # 2-D view (each dim < 2^31) so the DLPack arg packing doesn't overflow i32 on
         # multi-GB weights; TDM only needs the base address.
         w.reshape(B * (N // 16), (K // 2) * 16),
-        a_scales,
-        w_scales,
+        a_scales.view(torch.int32),
+        w_scales.view(torch.int32),
         M,
         N,
         torch.cuda.current_stream(),
