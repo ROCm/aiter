@@ -384,6 +384,10 @@ def gemm_a8w8_blockscale_preshuffle(
             warp_bases.append((1 << i, 0))
         extra_constexpr["warp_bases"] = tuple(warp_bases)
         config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        # Untuned shapes fall back to a default config that may omit the
+        # MAYBE_LOOP_UNROLL constexpr the gfx1250 a8w8 gluon kernel expects;
+        # supply the safe default so the launch has every constexpr.
+        config.setdefault("MAYBE_LOOP_UNROLL", False)
     else:
         impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
 

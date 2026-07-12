@@ -1903,7 +1903,13 @@ def flydsl_moe_fused_route_quant_scatter(
         weight_dtype = "f16" if gather_w.dtype == torch.float16 else "bf16"
 
     use_routeks_stage1 = (
-        token_num > 1 and topk > 1 and quant_mode == "fp4" and not use_expert_row_base
+        token_num > 1
+        and topk > 1
+        and quant_mode == "fp4"
+        and not use_expert_row_base
+        # EP g2l fusion is only implemented on the generic fused_route_quant_scatter
+        # path; route EP through it (assert message: "use the generic path").
+        and not use_g2l
     )
     route_grid = (numel + 255) // 256
     if counter is None or counter.numel() != E:
@@ -1970,7 +1976,9 @@ def flydsl_moe_fused_route_quant_scatter(
             topids_to_rows.view(token_num, topk),
         )
 
-    use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
+    use_st_ksplit = (
+        token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0 and not use_g2l
+    )
     if use_st_ksplit:
         assert not use_g2l, (
             "EP g2l fusion is not implemented on the st_ksplit path "
