@@ -43,16 +43,19 @@ if _arch_ok:
         gemm_a16w16_opus,
         opus_gemm_workspace_init,
     )
+    from .conv2d_implicit_op import conv2d_implicit_opus  # noqa: E402
 else:
     # Don't raise ImportError -- aiter/__init__.py's star-import would catch
     # it and silently disable the 30+ subsequent op imports.
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
     opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")
+    conv2d_implicit_opus = _make_unsupported_arch_stub("conv2d_implicit_opus")
 
 
 __all__ = [
     "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
+    "conv2d_implicit_opus",
 ]
