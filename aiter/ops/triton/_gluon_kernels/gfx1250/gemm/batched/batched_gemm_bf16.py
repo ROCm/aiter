@@ -67,7 +67,7 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     pid_unified = gl.program_id(axis=1)
 
     num_pid_m = gl.cdiv(M, BLOCK_M)
-    num_pid_n = gl.cdiv(N, BLOCK_N)
+    # num_pid_n = gl.cdiv(N, BLOCK_N)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -398,7 +398,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
     pid_unified = gl.program_id(axis=1)
 
     num_pid_m = gl.cdiv(M, BLOCK_M)
-    num_pid_n = gl.cdiv(N, BLOCK_N)
+    # num_pid_n = gl.cdiv(N, BLOCK_N)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
