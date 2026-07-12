@@ -20,7 +20,7 @@ _GLUON_REPR_KEYS = [
     "NUM_KSPLIT",
     "SPLITK_BLOCK_SIZE",
     "EVEN_K",
-    # "GRID_MN",
+    "GRID_MN",
     "num_warps",
     "cache_modifier",
     "NUM_BUFFERS",
@@ -38,8 +38,8 @@ _gemm_a8w8_blockscale_compute_bound_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        # "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        # * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @gluon.jit(repr=_gemm_a8w8_blockscale_bandwidth_bound_repr)
@@ -79,7 +79,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
-    # GRID_MN: gl.constexpr,
+    GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
@@ -104,11 +104,10 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    GRID_MN = num_pid_m * num_pid_n
     pid_k = pid_unified // GRID_MN
     pid = pid_unified % GRID_MN
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
@@ -426,8 +425,8 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        # "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        # * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @gluon.jit(repr=_gemm_a8w8_blockscale_compute_bound_repr)
@@ -467,7 +466,7 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
-    # GRID_MN: gl.constexpr,
+    GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
@@ -479,11 +478,10 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    GRID_MN = num_pid_m * num_pid_n
     pid_k = pid_unified // GRID_MN
     pid = pid_unified % GRID_MN
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
@@ -787,10 +785,12 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "NUM_KSPLIT",
     "SPLITK_BLOCK_SIZE",
     "EVEN_K",
-    # "GRID_MN",
+    "GRID_MN",
     "num_warps",
     "cache_modifier",
     "NUM_BUFFERS",
+    "N_CONST",
+    "K_CONST",
 ]
 
 _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_repr = make_kernel_repr(
@@ -824,8 +824,8 @@ def depreshuffle_b(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        # "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        # * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @gluon.jit(repr=_gemm_a8w8_blockscale_preshuffle_bandwidth_bound_repr)
@@ -861,12 +861,14 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
-    # GRID_MN: gl.constexpr,
+    GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    MAYBE_LOOP_UNROLL: gl.constexpr = False,
+    N_CONST: gl.constexpr,
+    K_CONST: gl.constexpr,
+    MAYBE_LOOP_UNROLL: gl.constexpr,
 ):
     """
     Gluon gfx1250 kernel for a8w8 blockscale GEMM with preshuffled weights.
@@ -901,11 +903,10 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    GRID_MN = num_pid_m * num_pid_n
     pid_k = pid_unified // GRID_MN
     pid = pid_unified % GRID_MN
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
@@ -1330,8 +1331,8 @@ _gemm_a8w8_blockscale_preshuffle_compute_bound_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        # "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        # * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @gluon.jit(repr=_gemm_a8w8_blockscale_preshuffle_compute_bound_repr)
@@ -1367,12 +1368,14 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     NUM_KSPLIT: gl.constexpr,
     SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
-    # GRID_MN: gl.constexpr,
+    GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    MAYBE_LOOP_UNROLL: gl.constexpr = False,
+    N_CONST: gl.constexpr,
+    K_CONST: gl.constexpr,
+    MAYBE_LOOP_UNROLL: gl.constexpr,
 ):
     """
     Compute-bound variant with ds_read/wmma pipelining.
@@ -1389,11 +1392,10 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    GRID_MN = num_pid_m * num_pid_n
     pid_k = pid_unified // GRID_MN
     pid = pid_unified % GRID_MN
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)

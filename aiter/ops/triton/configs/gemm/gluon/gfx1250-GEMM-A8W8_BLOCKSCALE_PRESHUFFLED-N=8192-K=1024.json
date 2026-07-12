@@ -9,8 +9,7 @@
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".ca",
-        "NUM_KSPLIT": 1,
-        "kernel_type": "bandwidth_bound"
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 16,
@@ -22,8 +21,7 @@
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kernel_type": "bandwidth_bound"
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 64,
@@ -35,8 +33,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kernel_type": "bandwidth_bound"
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_128": {
         "BLOCK_SIZE_M": 64,
@@ -48,8 +45,7 @@
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kernel_type": "bandwidth_bound"
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_256": {
         "BLOCK_SIZE_M": 128,
@@ -61,8 +57,7 @@
         "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kernel_type": "bandwidth_bound"
+        "NUM_KSPLIT": 1
     },
     "any": {
         "BLOCK_SIZE_M": 256,
@@ -70,11 +65,10 @@
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 16,
         "num_warps": 8,
-        "num_stages": 2,
-        "waves_per_eu": 1,
+        "num_stages": 3,
+        "waves_per_eu": 2,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kernel_type": "compute_bound"
+        "NUM_KSPLIT": 1
     }
 }
