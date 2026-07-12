@@ -20,17 +20,8 @@ WMMA: V_WMMA_SCALE_F32_16X16X128_F8F6F4 (wave32), SRC0=fp4 weight, SRC1=fp8 acti
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-    tdm_ops,
-    vector,
-)
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -77,7 +68,6 @@ def launch_gemm_a8w4_tdm(
 ):
     Kp = K // 2
     PACK_TK = tile_k // 2                 # packed fp4 bytes per B row per K-tile
-    LDA_I32 = K // 4                      # fp8 A row stride (i32), bmn
     K_TILES = K // tile_k
     # L2 prefetch measured net-negative here (cooperative num_warps TDM already saturates
     # the DMA queues); left plumbed but disabled (0). >0 = prefetch that many tiles ahead.
@@ -149,13 +139,13 @@ def launch_gemm_a8w4_tdm(
         kgrp = lane // 16
         wave_m = rocdl.readfirstlane(T.i32, wave // n_warp)
         wave_n = rocdl.readfirstlane(T.i32, wave % n_warp)
-        blk_m = bid_x * fx.Int32(tile_m)   # tile origin (for TDM outer offset)
-        blk_n = bid_y * fx.Int32(tile_n)
-        m_idx = arith.index_cast(T.index, i32_m)
+        blk_m = bid_x * tile_m             # tile origin (for TDM outer offset)
+        blk_n = bid_y * tile_n
+        m_idx = fx.index_cast(T.index, i32_m)
         if const_expr(batch > 1):
-            bz_i = arith.index_cast(T.index, bid_z)
+            bz_i = fx.index_cast(T.index, bid_z)
         else:
-            bz_i = arith.index(0)
+            bz_i = fx.index(0)
 
         # ── E8M0 scale TDM geometry (n32k4 preshuffle), i32-word units. ──
         # sa (activation) super-major over M/32; mbn interleaves the batch dim into
@@ -164,27 +154,27 @@ def launch_gemm_a8w4_tdm(
         # are folded into the descriptor inner offset (base ptr = whole buffer).
         if const_expr(layout_mbn):
             SA_OUTER_STRIDE = batch * (K // 4)
-            sa_batch_off = bz_i * arith.index(K // 4)
+            sa_batch_off = bz_i * fx.index(K // 4)
         else:
             SA_OUTER_STRIDE = K // 4
-            m_supers_i = (m_idx + arith.index(31)) // arith.index(32)
-            sa_batch_off = bz_i * m_supers_i * arith.index(K // 4)
+            m_supers_i = (m_idx + fx.index(31)) // fx.index(32)
+            sa_batch_off = bz_i * m_supers_i * fx.index(K // 4)
         SB_OUTER_STRIDE = K // 4
-        sb_batch_off = bz_i * arith.index(N_SUPERS * (K // 4))
-        sa_oob = (i32_m + fx.Int32(31)) // fx.Int32(32)
+        sb_batch_off = bz_i * fx.index(N_SUPERS * (K // 4))
+        sa_oob = (i32_m + 31) // 32
 
         # ── C TDM store geometry (row-major, per-batch column/row block). ──
         # mbn: C physical [M, batch*N]; batch bz occupies columns [bz*N, bz*N+N).
         # bmn: C physical [batch*M, N]; batch bz occupies rows [bz*M, bz*M+M).
         if const_expr(layout_mbn):
             C_OUTER_STRIDE = batch * N
-            c_outer_off = arith.index_cast(T.index, blk_m)
-            c_inner_off = bz_i * arith.index(N) + arith.index_cast(T.index, blk_n)
+            c_outer_off = fx.index_cast(T.index, blk_m)
+            c_inner_off = bz_i * fx.index(N) + fx.index_cast(T.index, blk_n)
             c_oob = i32_m
         else:
             C_OUTER_STRIDE = N
-            c_outer_off = bz_i * m_idx + arith.index_cast(T.index, blk_m)
-            c_inner_off = arith.index_cast(T.index, blk_n)
+            c_outer_off = bz_i * m_idx + fx.index_cast(T.index, blk_m)
+            c_inner_off = fx.index_cast(T.index, blk_n)
             c_oob = fx.Int32(bid_z) * i32_m + i32_m
 
         base = arena.get_base()
@@ -212,20 +202,20 @@ def launch_gemm_a8w4_tdm(
         def _a_offsets(kt):
             if const_expr(layout_mbn):
                 return (
-                    arith.index_cast(T.index, blk_m),
-                    bz_i * arith.index(K) + arith.index(kt * tile_k),
+                    fx.index_cast(T.index, blk_m),
+                    bz_i * fx.index(K) + fx.index(kt * tile_k),
                     batch * K, m_idx,
                 )
             return (
-                bz_i * m_idx + arith.index_cast(T.index, blk_m),
-                arith.index(kt * tile_k),
+                bz_i * m_idx + fx.index_cast(T.index, blk_m),
+                fx.index(kt * tile_k),
                 K, bz_i * m_idx + m_idx,
             )
 
         def _b_outer():
-            return bz_i * arith.index(B_BATCH_ROWS) + arith.index_cast(
+            return bz_i * fx.index(B_BATCH_ROWS) + fx.index_cast(
                 T.index, blk_n
-            ) // arith.index(16)
+            ) // fx.index(16)
 
         def desc_a(s, kt):
             o, i, os, oob = _a_offsets(kt)
@@ -239,7 +229,7 @@ def launch_gemm_a8w4_tdm(
         def desc_b(s, kt):
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_b, lds_memref=stB_mem[s],
-                global_offset=(_b_outer(), arith.index(kt * PACK_TK * 16)),
+                global_offset=(_b_outer(), fx.index(kt * PACK_TK * 16)),
                 tensor_shape=(batch * B_BATCH_ROWS, Kp * 16), strides=(Kp * 16, 1),
                 tile_shape=(tile_n // 16, PACK_TK * 16), elem_bytes=1, num_warps=num_waves,
             )
@@ -249,8 +239,8 @@ def launch_gemm_a8w4_tdm(
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_scale_a, lds_memref=stSA_mem[s],
                 global_offset=(
-                    arith.index_cast(T.index, blk_m) // arith.index(32),
-                    arith.index(kt * SC_INNER) + sa_batch_off,
+                    fx.index_cast(T.index, blk_m) // fx.index(32),
+                    fx.index(kt * SC_INNER) + sa_batch_off,
                 ),
                 tensor_shape=(SA_SUPERS, SC_INNER), strides=(SA_OUTER_STRIDE, 1),
                 tile_shape=(SA_SUPERS, SC_INNER), elem_bytes=4, num_warps=num_waves,
@@ -261,8 +251,8 @@ def launch_gemm_a8w4_tdm(
             return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_scale_b, lds_memref=stSB_mem[s],
                 global_offset=(
-                    arith.index_cast(T.index, blk_n) // arith.index(32),
-                    arith.index(kt * SC_INNER) + sb_batch_off,
+                    fx.index_cast(T.index, blk_n) // fx.index(32),
+                    fx.index(kt * SC_INNER) + sb_batch_off,
                 ),
                 tensor_shape=(SB_SUPERS, SC_INNER), strides=(SB_OUTER_STRIDE, 1),
                 tile_shape=(SB_SUPERS, SC_INNER), elem_bytes=4, num_warps=num_waves,
@@ -284,41 +274,41 @@ def launch_gemm_a8w4_tdm(
                 thread_id=tid, block_threads=block,
             )
             tdm_ops.l2_prefetch_tile(
-                arg_b, (_b_outer(), arith.index(kt * PACK_TK * 16)),
+                arg_b, (_b_outer(), fx.index(kt * PACK_TK * 16)),
                 (tile_n // 16, PACK_TK * 16), (Kp * 16, 1), elem_bytes=1,
                 thread_id=tid, block_threads=block,
             )
 
         # ── LDS fragment loads (tile-local; layout verified in a8w4 probe). ──
-        wmb = rocdl.readfirstlane(T.i32, wave_m * fx.Int32(warp_tile_m))
-        wnb = rocdl.readfirstlane(T.i32, wave_n * fx.Int32(warp_tile_n))
+        wmb = rocdl.readfirstlane(T.i32, wave_m * warp_tile_m)
+        wnb = rocdl.readfirstlane(T.i32, wave_n * warp_tile_n)
 
         def load_a(s, wm, ksl):
-            row = wmb + fx.Int32(wm * 16) + lane16
-            b0 = row * fx.Int32(A_LDS_ROW) + fx.Int32(ksl * 128) + kgrp * fx.Int32(16)
-            v = [Vec(lds_load_b128_raw(stA_idx[s], arith.index_cast(T.index, b0 + fx.Int32(32 * j)))) for j in range_constexpr(4)]
+            row = wmb + wm * 16 + lane16
+            b0 = row * A_LDS_ROW + ksl * 128 + kgrp * 16
+            v = [Vec(lds_load_b128_raw(stA_idx[s], fx.index_cast(T.index, b0 + 32 * j))) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
             return v01.shuffle(v23, list(range(16)))
 
         def load_b(s, wn, ksl):
-            nbl = wnb // fx.Int32(16) + fx.Int32(wn)
-            b0 = nbl * fx.Int32(B_LDS_ROW) + fx.Int32(ksl * 1024) + kgrp * fx.Int32(256) + lane16 * fx.Int32(16)
-            v0 = Vec(lds_load_b128_raw(stB_idx[s], arith.index_cast(T.index, b0)))
-            v1 = Vec(lds_load_b128_raw(stB_idx[s], arith.index_cast(T.index, b0 + fx.Int32(512))))
+            nbl = wnb // 16 + wn
+            b0 = nbl * B_LDS_ROW + ksl * 1024 + kgrp * 256 + lane16 * 16
+            v0 = Vec(lds_load_b128_raw(stB_idx[s], fx.index_cast(T.index, b0)))
+            v1 = Vec(lds_load_b128_raw(stB_idx[s], fx.index_cast(T.index, b0 + 512)))
             return v0.shuffle(v1, list(range(8)))
 
         def load_sa(s, wm, ksl):
-            row_rel = wmb + fx.Int32(wm * 16) + lane16
-            word = (row_rel // fx.Int32(32)) * fx.Int32(SC_INNER) + fx.Int32(ksl * 32) + (row_rel % fx.Int32(32))
-            return lds_load_b32_raw(stSA_idx[s], arith.index_cast(T.index, word * fx.Int32(4)))
+            row_rel = wmb + wm * 16 + lane16
+            word = (row_rel // 32) * SC_INNER + ksl * 32 + (row_rel % 32)
+            return lds_load_b32_raw(stSA_idx[s], fx.index_cast(T.index, word * 4))
 
         def load_sb(s, wn, ksl):
-            col_rel = wnb + fx.Int32(wn * 16) + lane16
-            word = (col_rel // fx.Int32(32)) * fx.Int32(SC_INNER) + fx.Int32(ksl * 32) + (col_rel % fx.Int32(32))
-            return lds_load_b32_raw(stSB_idx[s], arith.index_cast(T.index, word * fx.Int32(4)))
+            col_rel = wnb + wn * 16 + lane16
+            word = (col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)
+            return lds_load_b32_raw(stSB_idx[s], fx.index_cast(T.index, word * 4))
 
-        accs = [arith.constant_vector(0.0, T.vec(8, T.f32)) for _ in range_constexpr(n_acc)]
+        accs = [fx.constant_vector(0.0, T.vec(8, T.f32)) for _ in range_constexpr(n_acc)]
 
         TDM_PER = 4  # A + B + scale-A + scale-B cooperative tensor loads per K-tile
         prologue = min(num_buffers - 1, K_TILES)
@@ -353,12 +343,10 @@ def launch_gemm_a8w4_tdm(
         # first drain + sync to make sure no in-flight load / LDS read races it. ──
         pipeline_fence(outstanding=0)
         for wm in range_constexpr(wmma_m_rep):
-            row_rel = wmb + fx.Int32(wm * 16) + lane16
+            row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
-                col_rel = wnb + fx.Int32(wn * 16) + kgrp * fx.Int32(8)
-                elem_off = arith.index_cast(
-                    T.index, row_rel * fx.Int32(tile_n) + col_rel
-                )
+                col_rel = wnb + wn * 16 + kgrp * 8
+                elem_off = fx.index_cast(T.index, row_rel * tile_n + col_rel)
                 store_acc_vec8_to_lds(
                     stC_mem, elem_off, 0, accs[wm * wmma_n_rep + wn], out_elem=out_elem
                 )
@@ -373,8 +361,8 @@ def launch_gemm_a8w4_tdm(
         tdm_ops.tensor_store_2d(c_desc)
         tdm_ops.tensor_wait(0)
 
-    gx = (i32_m + fx.Int32(tile_m - 1)) // fx.Int32(tile_m)
-    gy = i32_n // fx.Int32(tile_n)
+    gx = (i32_m + (tile_m - 1)) // tile_m
+    gy = i32_n // tile_n
     kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, i32_n).launch(
         grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
     )
