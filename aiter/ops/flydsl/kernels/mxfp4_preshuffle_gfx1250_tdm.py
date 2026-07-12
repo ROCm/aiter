@@ -146,8 +146,8 @@ def launch_gemm_a8w4_tdm(
         def _lv(ptr, shape, stride):  # LDS ring-slot view
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
-        def _tdm_v(view, outer):  # carry the outer-dim OOB extent on the global operand
-            return fx.rocdl.make_tdm_tensor(view, tensor_extents=[outer])
+        def _tdm(gt, extents=None):  # TDM copy atom carrying gt's global tile descriptor
+            return fx.rocdl.make_tdm_atom(gt, tensor_extents=extents, num_warps=num_waves)
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -157,10 +157,6 @@ def launch_gemm_a8w4_tdm(
         b_outer_row = bz64 * B_BATCH_ROWS + blk_n64 // 16
         sa_super_off = blk_m64 // 32
         sb_super_off = blk_n64 // 32
-
-        tdm_ab = fx.make_copy_atom(fx.rocdl.TDM2D(num_waves), fx.Int8)
-        tdm_sc = fx.make_copy_atom(fx.rocdl.TDM2D(num_waves), fx.Int32)
-        tdm_c = fx.make_copy_atom(fx.rocdl.TDM2D(num_waves), out_elem_cls)
 
         def issue(s, kt):
             if const_expr(layout_mbn):
@@ -172,14 +168,14 @@ def launch_gemm_a8w4_tdm(
             sb_off = sb_super_off * SB_OUTER_STRIDE + kt * SC_INNER + sb_batch_off
             AT, BT = (tile_m, tile_k), (tile_n // 16, PACK_TK * 16)
             SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
-            fx.copy(tdm_ab, _tdm_v(_gv(gA_base, a_off, AT, (A_OUTER_STRIDE, 1)), mn_oob),
-                    _lv(pA[s], AT, (A_LDS_ROW, 1)))
-            fx.copy(tdm_ab, _gv(gB_base, b_off, BT, (Kp * 16, 1)),
-                    _lv(pB[s], BT, (B_LDS_ROW, 1)))
-            fx.copy(tdm_sc, _tdm_v(_gv(gSA_base, sa_off, SAT, (SA_OUTER_STRIDE, 1)), sa_oob),
-                    _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)))
-            fx.copy(tdm_sc, _gv(gSB_base, sb_off, SBT, (SB_OUTER_STRIDE, 1)),
-                    _lv(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
+            gtA = _gv(gA_base, a_off, AT, (A_OUTER_STRIDE, 1))
+            gtB = _gv(gB_base, b_off, BT, (Kp * 16, 1))
+            gtSA = _gv(gSA_base, sa_off, SAT, (SA_OUTER_STRIDE, 1))
+            gtSB = _gv(gSB_base, sb_off, SBT, (SB_OUTER_STRIDE, 1))
+            fx.copy(_tdm(gtA, [mn_oob]), gtA, _lv(pA[s], AT, (A_LDS_ROW, 1)))
+            fx.copy(_tdm(gtB), gtB, _lv(pB[s], BT, (B_LDS_ROW, 1)))
+            fx.copy(_tdm(gtSA, [sa_oob]), gtSA, _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)))
+            fx.copy(_tdm(gtSB), gtSB, _lv(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -260,8 +256,9 @@ def launch_gemm_a8w4_tdm(
                 i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
         workgroup_barrier()
-        fx.copy(tdm_c, _lv(fx.recast_iter(out_elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)),
-                _tdm_v(_gv(gC_base, c_off, (tile_m, tile_n), (C_OUTER_STRIDE, 1)), mn_oob))
+        gtC = _gv(gC_base, c_off, (tile_m, tile_n), (C_OUTER_STRIDE, 1))
+        fx.copy(_tdm(gtC, [mn_oob]),
+                _lv(fx.recast_iter(out_elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
         tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
