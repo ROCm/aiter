@@ -367,6 +367,7 @@ def test_op(
 # unit test: in-GEMM1 activation + MXFP8 quant fusion (out_mx_quant)
 # --------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     ", ".join(f.name for f in fields(Case)),
     [
