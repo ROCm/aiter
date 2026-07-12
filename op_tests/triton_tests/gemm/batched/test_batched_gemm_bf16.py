@@ -123,8 +123,7 @@ def minimal_x_vals(num_vals=20):
         for output in [True, False]
     ],
 )
-# @pytest.mark.parametrize("backend", ["triton", "gluon"])
-@pytest.mark.parametrize("backend", ["gluon"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_batched_gemm_bf16(dtype, b, m, n, k, output, backend, kernel_type):
     if backend == "triton" and kernel_type != "bandwidth_bound":
@@ -155,8 +154,7 @@ def test_batched_gemm_bf16(dtype, b, m, n, k, output, backend, kernel_type):
         for layout in ["TT", "NN", "NT"]
     ],
 )
-# @pytest.mark.parametrize("backend", ["triton", "gluon"])
-@pytest.mark.parametrize("backend", ["gluon"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_batched_gemm_bf16_layout(
     dtype, b, m, n, k, layout, output, backend, kernel_type
