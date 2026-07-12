@@ -21,7 +21,7 @@
 #include <netinet/tcp.h>
 #define CK(x) do{hipError_t e=(x); if(e!=hipSuccess){fprintf(stderr,"[r%d] ERR %s:%d %s\n",g_rank,__FILE__,__LINE__,hipGetErrorString(e));exit(2);}}while(0)
 static int g_rank=0;
-constexpr int kMaxBlocks=80;
+constexpr int kMaxBlocks=304;   // allow high occupancy (>= CU count)
 struct Signal { alignas(128) uint32_t start[kMaxBlocks][8]; alignas(128) uint32_t end[kMaxBlocks][8]; alignas(128) uint32_t _flag[kMaxBlocks]; };
 struct __align__(16) RankData { const void* ptrs[8]; };
 struct __align__(16) RankSignals { Signal* signals[8]; };
@@ -144,10 +144,10 @@ struct HPair{ hipMemFabricHandle_t in_h, sg_h; };  // per-rank handles
 
 int main(int argc,char**argv){
     setvbuf(stdout,NULL,_IONBF,0);
-    int rank=0,world=0,gpu=0,port=55570,mb=64,use_tdm=0; const char* coord="127.0.0.1";
+    int rank=0,world=0,gpu=0,port=55570,mb=64,use_tdm=0,ublocks=0,uthreads=512; const char* coord="127.0.0.1";
     for(int i=1;i<argc;i++){ auto A=[&](const char*k){return !strcmp(argv[i],k);};
         if(A("--rank"))rank=atoi(argv[++i]); else if(A("--world"))world=atoi(argv[++i]); else if(A("--gpu"))gpu=atoi(argv[++i]);
-        else if(A("--coord"))coord=argv[++i]; else if(A("--port"))port=atoi(argv[++i]); else if(A("--mb"))mb=atoi(argv[++i]); else if(A("--tdm"))use_tdm=1; }
+        else if(A("--coord"))coord=argv[++i]; else if(A("--port"))port=atoi(argv[++i]); else if(A("--mb"))mb=atoi(argv[++i]); else if(A("--tdm"))use_tdm=1; else if(A("--blocks"))ublocks=atoi(argv[++i]); else if(A("--threads"))uthreads=atoi(argv[++i]); }
     g_rank=rank; CK(hipSetDevice(gpu));
     size_t bytes=(size_t)mb<<20; size_t nfloat=bytes/4; int nvec=(int)(nfloat/4);
 
@@ -185,18 +185,18 @@ int main(int argc,char**argv){
     RankData* in_dp; CK(hipMalloc(&in_dp,sizeof(RankData))); CK(hipMemcpy(in_dp,&h_rd,sizeof(RankData),hipMemcpyHostToDevice));
     auto barrier=[&](){ char b=1; if(rank==0){ for(int r=1;r<world;r++) ra(cfd[r],&b,1); for(int r=1;r<world;r++) sa(cfd[r],&b,1);} else { sa(cfd[0],&b,1); ra(cfd[0],&b,1);} };
 
-    int nb=(nvec/world+511)/512; if(nb>kMaxBlocks)nb=kMaxBlocks; if(nb<1)nb=1;
+    int TH=uthreads; int nb=ublocks>0?ublocks:(nvec/world+TH-1)/TH; if(ublocks==0 && nb>192)nb=192; if(nb>kMaxBlocks)nb=kMaxBlocks; if(nb<1)nb=1;  // 192 blocks: best occupancy/sync tradeoff
     constexpr int TILE=512; size_t tdm_lds=(size_t)8*TILE*16;   // up to 8 peers * 8KB
     auto launch=[&](){
         if(use_tdm){ switch(world){
-            case 2: allreduce2_tdm<2,TILE><<<nb,512,2*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
-            case 4: allreduce2_tdm<4,TILE><<<nb,512,4*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
-            case 8: allreduce2_tdm<8,TILE><<<nb,512,8*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
+            case 2: allreduce2_tdm<2,TILE><<<nb,TH,2*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
+            case 4: allreduce2_tdm<4,TILE><<<nb,TH,4*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
+            case 8: allreduce2_tdm<8,TILE><<<nb,TH,8*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
             default: if(rank==0) printf("unsupported world=%d\n",world);
         } } else { switch(world){
-            case 2: allreduce2<2><<<nb,512>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
-            case 4: allreduce2<4><<<nb,512>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
-            case 8: allreduce2<8><<<nb,512>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
+            case 2: allreduce2<2><<<nb,TH>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
+            case 4: allreduce2<4><<<nb,TH>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
+            case 8: allreduce2<8><<<nb,TH>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
             default: if(rank==0) printf("unsupported world=%d\n",world);
         } }
     };
@@ -216,7 +216,7 @@ int main(int argc,char**argv){
     // busbw convention (nccl): 2*(N-1)/N * size / time
     double busbw=2.0*(world-1)/world*(double)bytes/(us/1e6)/1e9;
     double algbw=(double)bytes/(us/1e6)/1e9;
-    if(rank==0) printf("\n=== allreduce world=%d, %dMB, %s: %.1f us/iter, algbw %.1f GB/s, busbw %.1f GB/s ===\n",world,mb,use_tdm?"TDM":"naive",us,algbw,busbw);
+    if(rank==0) printf("\n=== allreduce world=%d, %dMB, %s, blk=%d th=%d: %.1f us/iter, algbw %.1f GB/s, busbw %.1f GB/s ===\n",world,mb,use_tdm?"TDM":"naive",nb,TH,us,algbw,busbw);
     barrier();
     return 0;
 }

@@ -46,22 +46,39 @@ for r in 0 1 2 3; do ./ualoe_allreduce --rank $r --world 8 --gpu $r      --coord
 for r in 4 5 6 7; do ./ualoe_allreduce --rank $r --world 8 --gpu $((r-4)) --coord <A> --port 55571 --mb 256 & done   # node B
 ```
 
-Flags: `--tdm` selects a TDM (`tensor_load_to_lds`) reduce-scatter path.
+Flags:
+- `--tdm` selects a TDM (`tensor_load_to_lds`) reduce-scatter path.
+- `--blocks N` / `--threads N` override the launch geometry (defaults: 512
+  threads, blocks auto-capped at 192 — see tuning note below).
 
 ## Results (gfx1250, ROCm 7.15, fp32, busbw = 2(N-1)/N · S / t)
 
 | size | TP4 (1 node) | TP8 (2 nodes) |
 |---:|---:|---:|
-| 16 MB | 111 | 114 |
-| 64 MB | — | 156 |
-| 256 MB | 177 | 187 |
-| 1 GB | **184** | **192** |
+| 16 MB | 99 | 84 |
+| 64 MB | 197 | 161 |
+| 256 MB | 243 | 260 |
+| 1 GB | **307** | **299** |
 
-- **Cross-node TP8 ≈ single-node TP4** (192 vs 184 GB/s busbw at 1 GB): crossing
+- **Cross-node TP8 ≈ single-node TP4** (299 vs 307 GB/s busbw at 1 GB): crossing
   the node boundary costs essentially nothing, because intra-node also rides IFOE.
-- Reaches ~39% of the raw per-GPU fabric bandwidth from `ubench/07_ualoe`
-  (~493 GB/s); the gap is the algorithm (two sync barriers + reduction), not the
-  fabric.
-- **TDM** (`--tdm`) does **not** help here (187 vs 192 at 1 GB): the all-reduce is
-  sync/reduction-bound, not read-bandwidth-bound, so TDM's deeper-outstanding
-  reads only add LDS-staging overhead. (TDM does help pure copy — see ubench 07.)
+- Reaches ~60% of the raw per-GPU fabric bandwidth from `ubench/07_ualoe`
+  (~493 GB/s); the remaining gap is the algorithm (two sync barriers + reduction),
+  not the fabric.
+- **Block count is the dominant knob.** The upstream kernel caps grid at
+  `kMaxBlocks` (the barrier flag array is `start[kMaxBlocks][8]`, indexed by
+  `blockIdx.x`). At the old cap of 80 the grid under-occupies the GPU; raising it
+  and sweeping shows a clear optimum at **~192 blocks**:
+
+  | blocks (TP8, 1 GB) | busbw |
+  |---:|---:|
+  | 80  | 192 |
+  | 160 | 286 |
+  | **192** | **299** |
+  | 304 | 223 |
+
+  Too few blocks starves occupancy; too many inflates the per-block cross-rank
+  barrier cost. 192 is the default; override with `--blocks`.
+- **TDM** (`--tdm`) does **not** help here: the all-reduce is sync/reduction-bound,
+  not read-bandwidth-bound, so TDM's deeper-outstanding reads only add LDS-staging
+  overhead. (TDM does help pure copy — see ubench 07.)
