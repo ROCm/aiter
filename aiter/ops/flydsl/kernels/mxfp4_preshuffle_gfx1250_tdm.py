@@ -10,11 +10,13 @@ stream into a shared ``num_buffers``-stage LDS ring, overlapping DMA with the WM
 compute of earlier tiles. Because 4 streams share the ring, a deeper ring (see the
 launcher's ``num_buffers``) is needed to stay above the pipeline cliff. Fragments and
 the i32-packed scales are read from LDS (``ds_load_b128`` / ``ds_load_b32``; layouts
-verified in the a8w4 WMMA probe). The epilogue stages the WMMA tile back into LDS
-(reusing the ring at offset 0) and DMAs it to C with ``tensor_store_2d``. Keeps the
-batched / bmn+mbn / ragged-M design; requires ``tile_m % 32 == 0`` (whole scale supers).
+verified in the a8w4 WMMA probe). The MX-scaled matmul goes through the flydsl
+``WMMAScale`` MMA atom via ``fx.gemm`` (E8M0 block scales on ``scale_a``/``scale_b``).
+The epilogue stages the WMMA tile back into LDS (reusing the ring at offset 0) and
+DMAs it to C with ``tensor_store_2d``. Keeps the batched / bmn+mbn / ragged-M design;
+requires ``tile_m % 32 == 0`` (whole scale supers).
 
-WMMA: V_WMMA_SCALE_F32_16X16X128_F8F6F4 (wave32), SRC0=fp4 weight, SRC1=fp8 activation.
+WMMA atom lowers to V_WMMA_SCALE_F32_16X16X128_F8F6F4 (wave32): A=fp4 weight, B=fp8 act.
 """
 
 import flydsl.compiler as flyc
@@ -308,7 +310,16 @@ def launch_gemm_a8w4_tdm(
             word = (col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)
             return lds_load_b32_raw(stSB_idx[s], fx.index_cast(T.index, word * 4))
 
-        accs = [fx.constant_vector(0.0, T.vec(8, T.f32)) for _ in range_constexpr(n_acc)]
+        # Scaled WMMA via the flydsl MX-scale atom (E8M0). A operand = fp4 weight
+        # (fmt4), B operand = fp8 activation (fmt0); per-block e8m0 scales ride the
+        # atom's scale_a/scale_b state. Register fragments (i32-packed) come from the
+        # LDS shuffle loads below; fx.gemm bitcasts them to the atom's element types.
+        wmma_atom = fx.make_mma_atom(
+            fx.rocdl.WMMAScale(WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, fx.Float8E4M3FN, fx.Float32)
+        )
+        c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
+        for cf in c_frags:
+            cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
 
         TDM_PER = 4  # A + B + scale-A + scale-B cooperative tensor loads per K-tile
         prologue = min(num_buffers - 1, K_TILES)
@@ -330,13 +341,25 @@ def launch_gemm_a8w4_tdm(
                 issue(nxt % num_buffers, nxt)
                 issued += 1
             for ksl in range_constexpr(KWS):
+                act_frs = []
+                for wm in range_constexpr(wmma_m_rep):
+                    t = fx.make_rmem_tensor(16, fx.Int32)   # fp8 activation, 16 i32/lane
+                    t.store(a_fr[wm][ksl])
+                    act_frs.append(t)
+                w_frs = []
+                for wn in range_constexpr(wmma_n_rep):
+                    t = fx.make_rmem_tensor(8, fx.Int32)    # fp4 weight, 8 i32/lane
+                    t.store(b_fr[wn][ksl])
+                    w_frs.append(t)
                 for wm in range_constexpr(wmma_m_rep):
                     for wn in range_constexpr(wmma_n_rep):
                         idx = wm * wmma_n_rep + wn
-                        accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
-                            T.vec(8, T.f32), b_fr[wn][ksl], a_fr[wm][ksl], accs[idx],
-                            sb_fr[wn][ksl], sa_fr[wm][ksl], fmtA=4, fmtB=0,
+                        fx.gemm(
+                            wmma_atom, c_frags[idx], w_frs[wn], act_frs[wm], c_frags[idx],
+                            scale_a=sb_fr[wn][ksl], scale_b=sa_fr[wm][ksl],
                         )
+
+        accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
         # ── TDM store epilogue: stage the WMMA tile into LDS (row-major
         # [tile_m, tile_n]) then DMA it to C. Reuses the ring LDS at offset 0, so
