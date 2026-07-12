@@ -902,6 +902,30 @@ def gemm_a8w8_blockscale_bpreshuffle(
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
+    # Triton path first: it allocates its own output, so skip the Y buffer the
+    # ck/asm paths below need.
+    if config is not None and config["libtype"] == "triton":
+        # kernelName optionally carries the backend hint ("triton"/"gluon");
+        # anything else -> None (auto gluon->triton detection). config=None lets
+        # the triton impl load its own tuned config internally. WQ is already
+        # (16,16)-shuffled == triton's (N//16, K*16) view; x_scale is
+        # column-major -> direct fit.
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
+        )
+
+        kernelName = str(config.get("kernelName", ""))
+        backend = kernelName if kernelName in ("triton", "gluon") else None
+        xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
+        wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+        return _gemm_a8w8_blockscale_preshuffle_triton(
+            xq,
+            wq.reshape(n // 16, k * 16),
+            x_scale,
+            w_scale,
+            dtype=dtype,
+            backend=backend,
+        )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
