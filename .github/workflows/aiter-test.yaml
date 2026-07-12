@@ -725,8 +725,6 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
-          - runner: aiter-8gpu-runner
-            label: MI300X
     runs-on: ${{ matrix.runner }}
 
     steps:
