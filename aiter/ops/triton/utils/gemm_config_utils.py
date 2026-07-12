@@ -249,6 +249,16 @@ def compute_splitk_params(config: dict, K: int) -> dict:
 
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
+        # Round the SPLITK_BLOCK_SIZE to multiple of BLOCK_SIZE_K and update NUM_KSPLIT to again.
+        if config["NUM_KSPLIT"] > 1 and (
+            config["SPLITK_BLOCK_SIZE"] % config["BLOCK_SIZE_K"] != 0
+        ):
+            config["SPLITK_BLOCK_SIZE"] = (
+                triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+                * config["BLOCK_SIZE_K"]
+            )
+            config["NUM_KSPLIT"] = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
+
     return config
 
 

@@ -300,6 +300,10 @@ def gemm_a8w8_blockscale_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True, backend=backend)
 
+    kernel_type_from_config = config.pop("kernel_type", None)
+    if kernel_type_from_config is not None:
+        kernel_type = kernel_type_from_config
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
