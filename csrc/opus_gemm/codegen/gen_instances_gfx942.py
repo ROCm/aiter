@@ -48,6 +48,7 @@ GFX942_EVEN_LOOP_SPLITK_TAGS = (
     "a16w16_kbuf2v_bk128_sk",
     GFX942_QUAD_MFMA32_SPLITK_TAG,
 )
+_GFX942_A8W8_TAGS = ("a8w8_blockscale_bpreshuffle_singlebuf",)
 
 
 def _splitk_traits_geometry(k):
@@ -70,6 +71,7 @@ def _uses_bf16_workspace(k):
 
 
 PIPELINE_HEADER_MAP = {
+    "a8w8_blockscale_bpreshuffle_singlebuf": "gfx942/a8w8/opus_gemm_pipeline_a8w8_blockscale_bpreshuffle.cuh",
     "a16w16_em3en4_lds1_pgr2_sk": _gfx942_pipeline("a16w16_em3en4_lds1_pgr2_sk"),
     "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
     "a16w16_kbuf1_sk": _gfx942_pipeline("a16w16_kbuf1"),
@@ -82,11 +84,18 @@ PIPELINE_HEADER_MAP = {
     },
 }
 
-TRAITS_HEADER_MAP = {tag: GFX942_TRAITS_HEADER for tag in _GFX942_A16W16_TAGS}
+TRAITS_HEADER_MAP = {
+    **{tag: GFX942_TRAITS_HEADER for tag in _GFX942_A16W16_TAGS},
+    "a8w8_blockscale_bpreshuffle_singlebuf": "gfx942/a8w8/opus_gemm_traits_a8w8_blockscale_bpreshuffle.cuh",
+}
 
-TRAITS_NAME_MAP = {tag: GFX942_TRAITS_NAME for tag in _GFX942_A16W16_TAGS}
+TRAITS_NAME_MAP = {
+    **{tag: GFX942_TRAITS_NAME for tag in _GFX942_A16W16_TAGS},
+    "a8w8_blockscale_bpreshuffle_singlebuf": "opus_gemm_a8w8_blockscale_bpreshuffle_traits_gfx942",
+}
 
 KARGS_NAME_MAP = {
+    "a8w8_blockscale_bpreshuffle_singlebuf": "opus_gemm_a8w8_blockscale_bpreshuffle_kargs_gfx942",
     "a16w16_em3en4_lds1_pgr2_sk": "opus_gemm_splitk_kargs",
     "a16w16_kbuf1_large_tile": "opus_gemm_noscale_kargs",
     "a16w16_quad_mfma32_kbuf1": "opus_gemm_noscale_kargs",
@@ -97,6 +106,7 @@ KARGS_NAME_MAP = {
 }
 
 KERNEL_FUNC_MAP = {
+    "a8w8_blockscale_bpreshuffle_singlebuf": "gemm_a8w8_blockscale_bpreshuffle_singlebuf_kernel_gfx942",
     "a16w16_em3en4_lds1_pgr2_sk": "gemm_a16w16_em3en4_lds1_pgr2_sk_kernel",
     "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
     "a16w16_kbuf1_sk": "gemm_a16w16_kbuf1_kernel",
@@ -859,7 +869,153 @@ def gen_a16w16_nosplit_gfx942_instance(
     )
 
 
+def gen_a8w8_blockscale_bpreshuffle_gfx942_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    record_one_instantiation,
+    A8W8_SCALE_HOST_EXTRA,
+    **_unused,
+):
+    """gfx942 A8W8 blockscale bpreshuffle launcher emit.
+
+    This is an explicit tune path. The public C++ wrapper dispatches by
+    integer kid through opus_gemm_a8w8_tune_lookup.h; production opus_gemm()
+    fp8 dispatch remains gfx950-only.
+    """
+    info = _validate_a8w8_blockscale_bpreshuffle_gfx942(k)
+    print(
+        f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+        f"  AGPR={info['agprs']}"
+        f"  LDS={info['lds_bytes'] // 1024}KiB"
+        f"  K>={info['min_k']}"
+    )
+
+    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+        kargs_template_vars(k.kernel_tag, kargs_name)
+    )
+    traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
+    opus::seq<{k.T_M}, {k.T_N}, 1>,
+    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>>;
+"""
+
+    preamble = instance_impl_preamble()
+    host_tu_split = instance_impl_host_tu_split(
+        traits_header,
+        pipeline_header,
+        fwd_decl_kargs_tpl,
+        kernel_func,
+        fwd_decl_kargs_fnarg,
+    )
+    kernel_launch = f"""
+    dim3 grid(num_tiles_n, num_tiles_m);
+    dim3 block({k.BLOCK_SIZE});
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+"""
+    INSTANCE_IMPL = f"""{preamble}
+{host_tu_split}
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale)
+{{{{
+    AITER_CHECK((XQ.dim() == 2 || XQ.dim() == 3),
+        "gfx942 a8w8 expects XQ [M,K] or [B,M,K]");
+    AITER_CHECK((WQ.dim() == 2 || WQ.dim() == 3),
+        "gfx942 a8w8 expects WQ [N,K] or [B,N,K]");
+    AITER_CHECK((Y.dim() == 2 || Y.dim() == 3),
+        "gfx942 a8w8 expects Y [M,N] or [B,M,N]");
+    AITER_CHECK(x_scale.has_value() && w_scale.has_value(),
+        "gfx942 a8w8 blockscale requires x_scale and w_scale");
+
+    int batch = XQ.dim() == 3 ? XQ.size(0) : 1;
+    int M = XQ.dim() == 3 ? XQ.size(1) : XQ.size(0);
+    int K = XQ.dim() == 3 ? XQ.size(2) : XQ.size(1);
+    int N = WQ.dim() == 3 ? WQ.size(1) : WQ.size(0);
+    AITER_CHECK(batch == 1,
+        "gfx942 a8w8 tune path currently supports batch=1 only");
+    AITER_CHECK(WQ.size(WQ.dim() - 1) == K,
+        "WQ K dim must match XQ K dim");
+    AITER_CHECK((Y.dim() == 3 ? Y.size(1) : Y.size(0)) == M &&
+                (Y.dim() == 3 ? Y.size(2) : Y.size(1)) == N,
+        "Y shape must be [M,N] or [B,M,N]");
+    AITER_CHECK(N % {k.B_N} == 0 && K % {k.B_K} == 0,
+        "gfx942 a8w8 tune path requires exact N/K tiles: N%",
+        {k.B_N}, "=0 K%", {k.B_K}, "=0");
+
+    int GROUP_N = {k.GROUP_N};
+    int GROUP_K = {k.GROUP_K};
+    int num_groups_n = N / GROUP_N;
+    int num_groups_k = K / GROUP_K;
+
+    const auto& xs = x_scale.value();
+    const auto& ws = w_scale.value();
+    AITER_CHECK(xs.dtype() == AITER_DTYPE_fp32 && ws.dtype() == AITER_DTYPE_fp32,
+        "gfx942 a8w8 blockscale expects fp32 scales");
+    AITER_CHECK(xs.dim() == 2 && xs.size(0) == M && xs.size(1) == num_groups_k,
+        "x_scale must use CK bpreshuffle layout [K/128,M] flattened as [M,K/128]");
+    AITER_CHECK(ws.dim() == 2 && ws.size(0) == num_groups_n && ws.size(1) == num_groups_k,
+        "w_scale must be row-major [N/128,K/128]");
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = N / {k.B_N};
+    auto stream = aiter::getCurrentHIPStream();
+
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.k = K;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+
+    kargs.ptr_sfa = xs.data_ptr();
+    kargs.ptr_sfb = ws.data_ptr();
+    kargs.stride_sfb = num_groups_k;
+
+{kernel_launch}
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    record_one_instantiation(
+        cg,
+        k,
+        kernel_func,
+        kargs_name,
+        A8W8_SCALE_HOST_EXTRA,
+        kargs_explicit_param,
+    )
+
+
 # ---------- Self-register at import time ----------
+for _tag in _GFX942_A8W8_TAGS:
+    register_emit("gfx942", _tag, gen_a8w8_blockscale_bpreshuffle_gfx942_instance)
+
 # gfx942 splitk family.
 for _tag in GFX942_SPLITK_TAGS:
     register_emit("gfx942", _tag, gen_splitk_gfx942_instance)
@@ -887,6 +1043,112 @@ for _tag in _GFX942_NOSPLIT_TAGS:
 
 # gfx942 (CDNA3 / MI300X) hardware LDS budget per WG.
 _GFX942_LDS_PER_WG_BYTES = 64 * 1024
+
+
+def _validate_a8w8_blockscale_bpreshuffle_gfx942(k: OpusGemmInstance):
+    """Validate gfx942 A8W8 blockscale bpreshuffle tune instances."""
+    errors = []
+    sizeof_da = 1  # fp8
+    if k.BLOCK_SIZE != k.T_M * k.T_N * WARP_SIZE:
+        errors.append(
+            f"BLOCK_SIZE={k.BLOCK_SIZE} != T_M*T_N*64={k.T_M * k.T_N * WARP_SIZE}"
+        )
+    if (k.W_M, k.W_N, k.W_K) != (16, 16, 32):
+        errors.append(
+            f"WAVE=({k.W_M},{k.W_N},{k.W_K}) must be gfx942 fp8 MFMA 16x16x32"
+        )
+    if k.GROUP_M != 1 or k.GROUP_N != 128 or k.GROUP_K != 128:
+        errors.append(
+            f"GROUP=({k.GROUP_M},{k.GROUP_N},{k.GROUP_K}) must be (1,128,128)"
+        )
+    if k.B_M % 2 != 0 or k.B_N % 2 != 0:
+        errors.append(f"B_M={k.B_M}, B_N={k.B_N} must be even")
+    tile_m = k.B_M // 2
+    tile_n = k.B_N // 2
+    tile_m_name = "HALF_B_M"
+    tile_n_name = "HALF_B_N"
+
+    if tile_m % (k.W_M * k.T_M) != 0:
+        errors.append(f"{tile_m_name}={tile_m} not div by W_M*T_M={k.W_M * k.T_M}")
+    if tile_n % (k.W_N * k.T_N) != 0:
+        errors.append(f"{tile_n_name}={tile_n} not div by W_N*T_N={k.W_N * k.T_N}")
+    if k.B_K % k.W_K != 0:
+        errors.append(f"B_K={k.B_K} not div by W_K={k.W_K}")
+    if k.B_K != k.GROUP_K:
+        errors.append(f"B_K={k.B_K} must match GROUP_K={k.GROUP_K}")
+
+    E_M = tile_m // (k.W_M * k.T_M) if (k.W_M * k.T_M) else 0
+    E_N = tile_n // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
+    E_K = k.B_K // k.W_K if k.W_K else 0
+    agpr_per_mfma = (k.W_M * k.W_N) // WARP_SIZE
+    total_agprs = 4 * E_M * E_N * agpr_per_mfma
+    if total_agprs >= 256:
+        errors.append(f"AGPR={total_agprs} must be < 256")
+
+    a_ds_read_insts = (E_M * E_K * k.W_M * k.W_K) // (WARP_SIZE * k.VEC_A)
+    b_ds_read_insts = (E_N * E_K * k.W_N * k.W_K) // (WARP_SIZE * k.VEC_B)
+    if a_ds_read_insts <= 0 or b_ds_read_insts <= 0:
+        errors.append(
+            f"A/B ds_read_insts=({a_ds_read_insts},{b_ds_read_insts}) must be positive"
+        )
+
+    if k.VEC_A != k.VEC_B or k.VEC_A not in (8, 16):
+        errors.append(f"VEC_A/VEC_B=({k.VEC_A},{k.VEC_B}) must be matching 8 or 16")
+
+    smem_linear_wave = WARP_SIZE * k.VEC_A
+    if smem_linear_wave % k.B_K != 0:
+        errors.append(f"smem_linear_wave={smem_linear_wave} not div by B_K={k.B_K}")
+        lds_bytes = -1
+    else:
+        smem_sub = smem_linear_wave // k.B_K
+        if tile_m % smem_sub != 0:
+            errors.append(f"{tile_m_name}={tile_m} not div by smem_sub={smem_sub}")
+        if tile_n % smem_sub != 0:
+            errors.append(f"{tile_n_name}={tile_n} not div by smem_sub={smem_sub}")
+        threads_k_a = k.B_K // k.VEC_A
+        threads_m_per_block = k.BLOCK_SIZE // threads_k_a
+        smem_m_rows = (
+            (tile_m + threads_m_per_block - 1) // threads_m_per_block
+        ) * threads_m_per_block
+        threads_k_b = k.B_K // k.VEC_B
+        threads_n_per_block = k.BLOCK_SIZE // threads_k_b
+        smem_n_rows = (
+            (tile_n + threads_n_per_block - 1) // threads_n_per_block
+        ) * threads_n_per_block
+        smem_m_rep = (smem_m_rows + smem_sub - 1) // smem_sub if smem_sub else 0
+        smem_n_rep = (smem_n_rows + smem_sub - 1) // smem_sub if smem_sub else 0
+        smem_a = smem_m_rep * smem_linear_wave * sizeof_da
+        smem_b = smem_n_rep * smem_linear_wave * sizeof_da
+        lds_bytes = (smem_a + smem_b) * 2
+        if lds_bytes > _GFX942_LDS_PER_WG_BYTES:
+            errors.append(
+                f"LDS={lds_bytes // 1024}KiB exceeds {_GFX942_LDS_PER_WG_BYTES // 1024}KiB"
+            )
+
+    for name, num, den in [
+        ("a_buffer_load_insts", tile_m * k.B_K, k.BLOCK_SIZE * k.VEC_A),
+        ("b_buffer_load_insts", tile_n * k.B_K, k.BLOCK_SIZE * k.VEC_B),
+        ("a_ds_read_insts", E_M * E_K * k.W_M * k.W_K, WARP_SIZE * k.VEC_A),
+        ("b_ds_read_insts", E_N * E_K * k.W_N * k.W_K, WARP_SIZE * k.VEC_B),
+    ]:
+        if den == 0 or (num + den - 1) // den < 1:
+            errors.append(f"{name}={num}/{den} invalid")
+
+    if errors:
+        raise ValueError(
+            f"Invalid gfx942 a8w8 blockscale bpreshuffle instance '{k.name}':\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    return {
+        "E_M": E_M,
+        "E_N": E_N,
+        "E_K": E_K,
+        "agprs": total_agprs,
+        "vgpr_est": -1,
+        "lds_bytes": lds_bytes,
+        "min_k": 2 * k.B_K,
+    }
 
 
 def _validate_a16w16_em3en4_gfx942(k: OpusGemmInstance):

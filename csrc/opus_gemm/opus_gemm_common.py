@@ -674,7 +674,35 @@ def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
-# gfx942 kid registry -- flat two-bucket layout.
+def _a8w8_blockscale_bpreshuffle_singlebuf_gfx942(
+    bs,
+    bm,
+    bn,
+    bk,
+    tm,
+    tn,
+    wm,
+    wn,
+    wk,
+    vec=8,
+):
+    """Single-K-buffer gfx942 A8W8 blockscale bpreshuffle tune path."""
+    name_tag = "a8w8_bs_bpreshuf_sb_tailm_v16" if vec == 16 else "a8w8_bs_bpreshuf_sb_tailm"
+    return OpusGemmInstance(
+        bs, bm, bn, bk,
+        tm, tn,
+        wm, wn, wk,
+        vec, vec, 4,
+        1, 128, 128,
+        "a8w8_blockscale_bpreshuffle_singlebuf",
+        ["bf16_t"],
+        name_tag=name_tag,
+        arch_prefix="gfx942",
+        has_oob=True,
+    )
+
+
+# gfx942 kid registry -- per-family flat maps.
 
 gfx942_nosplit_kernels_list = {
     10000: _a16w16_gfx942        (512, 128, 128,  64,    4, 16, 16, 16),   # kbuf1_large_tile (4-phase, big tile)
@@ -704,15 +732,23 @@ gfx942_splitk_kernels_list = {
     10216: _a16w16_quad_mfma32_sk_bf16ws_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8, group_m=6),  # 10006 bf16 splitK sibling, group-M=6
 }
 
+gfx942_a8w8_kernels_list = {
+    11000: _a8w8_blockscale_bpreshuffle_singlebuf_gfx942(
+        512, 128, 128, 128, 4, 2, 16, 16, 32, vec=16),
+}
 # NOTE: 10402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
 # 11.88us on tuned shapes (bf16_tuned_ge...
 
-gfx942_kernels_list = {**gfx942_nosplit_kernels_list, **gfx942_splitk_kernels_list}
+gfx942_kernels_list = {
+    **gfx942_nosplit_kernels_list,
+    **gfx942_splitk_kernels_list,
+    **gfx942_a8w8_kernels_list,
+}
 
 # -- gfx1250 kernel lists ----------------------------------------------------
 # Kid offset: gfx1250 kids live in the 20000+ range, disjoint from gfx950
 # (<10000) and gfx942 (50000+). Today only the cluster/TDM split-K (atomic
-# fp32 reduction) pipeline is wired (打通阶段：fp32 output, no bias).
+# fp32 reduction) pipeline is wired (????:fp32 output, no bias).
 GFX1250_KID_OFFSET = 20000
 
 

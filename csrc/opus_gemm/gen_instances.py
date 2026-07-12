@@ -34,6 +34,7 @@ from opus_gemm_common import (
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
     default_kernels_dict,
+    gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
     kernels_list,
@@ -136,11 +137,13 @@ def _kernel_func_for(k):
 INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
+    "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
 # All a16w16 tags share the 4-arg (XQ, WQ, Y, int splitK) lookup-table slot.
 A16W16_TUNE_TAGS = set(_A16W16_TAGS)
+A8W8_TUNE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
 # NOSCALE: 3-arg launchers (a16w16 family + a8w8 non-scale).
 NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 
@@ -596,6 +599,43 @@ class opus_gemm_codegen:
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_BF16", "bf16_t")
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_FP32", "fp32_t")
 
+    def gen_a8w8_tune_lookup(self, kernels_dict):
+        """Emit the int-ID-to-kernel map for A8W8 tuning."""
+        header = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See gen_instances.py:gen_a8w8_tune_lookup.
+//
+// BF16-output flat array for A8W8 blockscale bpreshuffle tuning.
+"""
+        entry = """\
+    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
+"""
+
+        def _emit_map(f, macro_name, ctype):
+            f.write(f"#define {macro_name}(CTYPE) \\\n")
+            rows = []
+            for kid, k in kernels_dict.items():
+                if not (isinstance(kid, int) and k.kernel_tag in A8W8_TUNE_TAGS):
+                    continue
+                if ctype not in k.output_dtypes:
+                    continue
+                rows.append((kid, k.name))
+            rows.sort(key=lambda row: row[0])
+            for index, (kid, name) in enumerate(rows):
+                line = entry.format(kid=kid, kernel_name=name)
+                if index == len(rows) - 1:
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
+
+        with open(
+            os.path.join(self.working_path, "opus_gemm_a8w8_tune_lookup.h"), "w"
+        ) as f:
+            f.write(header)
+            _emit_map(f, "GENERATE_A8W8_TUNE_LOOKUP_BF16", "bf16_t")
+
     def gen_manifest_head(self, kernels_dict):
         # Forward declarations for every launcher symbol the dispatcher references.
         MANIFEST_HEAD = """#pragma once
@@ -742,9 +782,11 @@ void
                 "// Auto-generated. Do not edit. See gen_instances.py:_emit_device_tus.\n"
                 "//\n"
                 "// Device-only translation unit for one (kid, dtype) pair.\n"
-                "// Compiled with -D__HIPCC_RTC__ (per-source flag in\n"
-                "// optCompilerConfig.json) so the host pass takes the\n"
-                "// minimal branch -- no torch, no full HIP runtime.\n"
+                "// Keep both JIT and prebuild host passes on the minimal branch --\n"
+                "// no torch and no full HIP runtime.\n"
+                "#ifndef __HIPCC_RTC__\n"
+                "#define __HIPCC_RTC__ 1\n"
+                "#endif\n"
                 f'#include "impl/{name}.cuh"\n' + row["device_decl"]
             )
             Path(
@@ -807,6 +849,9 @@ void
                 "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
                 "//\n"
                 f"// Auto-generated per-arch reduce TU ({reduce_arch}). See gen_instances.py:_emit_splitk_reduce_tu.\n"
+                "#ifndef __HIPCC_RTC__\n"
+                "#define __HIPCC_RTC__ 1\n"
+                "#endif\n"
                 f'#include "{reduce_header}"\n'
                 + "".join(
                     _splitk_reduce_baseline_instantiations(
@@ -854,6 +899,7 @@ void
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)
         self.gen_a16w16_tune_lookup(kernels_dict)
+        self.gen_a8w8_tune_lookup(kernels_dict)
 
 
 def get_tune_dict(tune_dict_csv):
@@ -884,21 +930,32 @@ def get_tune_dict(tune_dict_csv):
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
-        # Accept either the legacy "kernelId" column or the new "solidx" column (matches
-        # aiter/configs/model_configs/gptoss_bf16_tuned_ge...
-        kid_col = "solidx" if "solidx" in tune_df.columns else "kernelId"
+        # Accept either the legacy "kernelId" column or the new "solidx" column.
+        kids = _tune_df_kids(tune_df)
         has_outdtype = "outdtype" in tune_df.columns
         for i in range(len(tune_df)):
+            if kids is None or pd.isna(kids.loc[i]):
+                continue
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             outdtype = (
                 str(tune_df.loc[i, "outdtype"]) if has_outdtype else "torch.bfloat16"
             )
-            kid = int(tune_df.loc[i, kid_col])
+            kid = int(kids.loc[i])
             if kid in kernels_list:
                 tune_dict[(M, N, K, outdtype)] = kernels_list[kid]
     return tune_dict
+
+
+def _tune_df_kids(df):
+    kids = None
+    for col in ("solidx", "kernelId"):
+        if col not in df.columns:
+            continue
+        values = pd.to_numeric(df[col], errors="coerce")
+        kids = values if kids is None else kids.fillna(values)
+    return kids
 
 
 if __name__ == "__main__":
@@ -983,9 +1040,9 @@ if __name__ == "__main__":
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
         "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
-        # gfx942 kid range (10000+); two-bucket registry: nosplit + splitk.
         "gfx942_nosplit": gfx942_nosplit_kernels_list,
         "gfx942_splitk": gfx942_splitk_kernels_list,
+        "gfx942_a8w8": gfx942_a8w8_kernels_list,
     }
 
     # --- Compute the subset-compile set S ------------------------------------ S = (CSV opus rows'
@@ -1019,14 +1076,10 @@ if __name__ == "__main__":
         df = df[df["libtype"] == "opus"]
         if df.empty:
             continue
-        kid_col = (
-            "solidx"
-            if "solidx" in df.columns
-            else ("kernelId" if "kernelId" in df.columns else None)
-        )
-        if kid_col is None:
+        kids = _tune_df_kids(df)
+        if kids is None:
             continue
-        for v in df[kid_col].dropna().tolist():
+        for v in kids.dropna().tolist():
             try:
                 csv_kids.add(int(v))
             except (TypeError, ValueError):
@@ -1148,10 +1201,28 @@ if __name__ == "__main__":
             if df.empty:
                 continue
             # Drop off-arch kids: lookup must only reference symbols S actually emitted.
+            kids = _tune_df_kids(df)
+            if kids is None:
+                continue
+            a16w16_lookup_rows = kids.apply(
+                lambda kid: (
+                    not pd.isna(kid)
+                    and int(kid) in kernels_list
+                    and kernels_list[int(kid)].kernel_tag in A16W16_TUNE_TAGS
+                )
+            )
+            df = df[kids.isin(S) & a16w16_lookup_rows]
+            if df.empty:
+                continue
+            if "kernelId" in df.columns:
+                df = df.copy()
+                if "solidx" in df.columns:
+                    df["solidx"] = df["solidx"].fillna(df["kernelId"])
+                    df = df.drop(columns=["kernelId"])
+                else:
+                    df = df.rename(columns={"kernelId": "solidx"})
             if "solidx" in df.columns:
-                df = df[df["solidx"].astype(int).isin(S)]
-                if df.empty:
-                    continue
+                df["solidx"] = df["solidx"].astype(int)
             combined_frames.append(df)
 
         if combined_frames:

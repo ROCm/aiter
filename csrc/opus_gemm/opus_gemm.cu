@@ -349,6 +349,35 @@ void opus_gemm_a16w16_tune(
   }
 }
 
+void opus_gemm_a8w8_blockscale_bpreshuffle_tune(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale,
+    aiter_tensor_t &Y,
+    int kernelId)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  const auto &arch_info = opus_get_arch_info();
+  AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx942,
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune is only implemented "
+              "for gfx942 today; current device ", arch_info.dev,
+              " has gcnArchName='", arch_info.name, "'");
+  AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune expects fp8 XQ/WQ");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune expects bf16 Y");
+  AITER_CHECK(x_scale.has_value() && w_scale.has_value(),
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune requires x_scale and w_scale");
+
+#ifdef OPUS_BUILD_HAS_GFX942
+  opus_a8w8_tune_dispatch_gfx942(kernelId)(XQ, WQ, Y, x_scale, w_scale);
+#else
+  AITER_CHECK(false,
+              "module_deepgemm_opus was not built with OPUS_BUILD_HAS_GFX942");
+#endif
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Splitk fp32 workspace: per-stream owner.
 //
