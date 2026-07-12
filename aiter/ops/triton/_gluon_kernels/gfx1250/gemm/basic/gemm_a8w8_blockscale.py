@@ -789,8 +789,6 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
     "num_warps",
     "cache_modifier",
     "NUM_BUFFERS",
-    "N_CONST",
-    "K_CONST",
 ]
 
 _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_repr = make_kernel_repr(
@@ -866,9 +864,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    N_CONST: gl.constexpr,
-    K_CONST: gl.constexpr,
-    MAYBE_LOOP_UNROLL: gl.constexpr,
 ):
     """
     Gluon gfx1250 kernel for a8w8 blockscale GEMM with preshuffled weights.
@@ -923,12 +918,9 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     # absolute [row, k*BK] offsets. Toggle for testing.
     USE_DESC_STEP: gl.constexpr = False
 
-    if MAYBE_LOOP_UNROLL:
-        LOOP_UNROLL: gl.constexpr = (
-            (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-        ) < 32
-    else:
-        LOOP_UNROLL: gl.constexpr = False
+    LOOP_UNROLL: gl.constexpr = (
+        (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    ) < 32
     if LOOP_UNROLL:
         NUM_K_ITER: gl.constexpr = (
             SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1
@@ -1373,22 +1365,37 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    N_CONST: gl.constexpr,
-    K_CONST: gl.constexpr,
-    MAYBE_LOOP_UNROLL: gl.constexpr,
 ):
     """
-    Compute-bound variant with ds_read/wmma pipelining.
+    Gluon gfx1250 kernel for a8w8 blockscale GEMM with preshuffled weights.
 
-    Issues load_shared_relaxed (ds_read) for tile i+1 *before* the wmma
-    for tile i so the LDS read latency is hidden behind the matrix op.
+    Weight B is preshuffled on the host into shape (N//16, K*16).
+    The kernel unshuffles in shared memory before the WMMA dot.
+
+    A_scale strides are already adjusted by the wrapper for the
+    transposed vs non-transposed case.
     """
+    # Fast path: when a single scale group spans the whole tile in both N and K,
+    # every column shares one b_scale, so load it with a single scalar global
+    # load (folded into the a-scale at the multiply) instead of a BLOCK_SIZE_N
+    # vector load of identical values.
     LDS_A_SCALE: gl.constexpr = False
     SCALAR_B_SCALE: gl.constexpr = (GROUP_N >= BLOCK_SIZE_N) and (
         GROUP_K >= BLOCK_SIZE_K
     )
 
-    USE_DESC_STEP: gl.constexpr = False
+    # Step the A/B TDM descriptors along K with update_tensor_descriptor
+    # (add_offsets) and issue async_load at a fixed [0, 0], instead of passing
+    # absolute [row, num_loads*BLOCK_K] offsets every iteration. The absolute
+    # form forces the 8-SGPR tile descriptor to be rebuilt from VGPRs
+    # (v_readfirstlane) each load; stepping keeps it in SGPRs (s_add), removing
+    # the per-iter scalarization that dominates low-K shapes. The M/N block
+    # offset is baked into the base pointer and the descriptor shape is shrunk
+    # (M - off_am, K_local) so TDM boundary clamping stays correct.
+    # Fully unroll the K loop using a constexpr trip count derived from
+    # SPLITK_BLOCK_SIZE (like the Triton kernel), so per-iter counters/offsets
+    # become compile-time -- removing the rolled-loop overhead and the runtime
+    # descriptor address math (v_readfirstlane) that dominate low-K shapes.
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
@@ -1408,12 +1415,13 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     if NUM_KSPLIT > 1:
         K_local = SPLITK_BLOCK_SIZE
 
-    if MAYBE_LOOP_UNROLL:
-        LOOP_UNROLL: gl.constexpr = (
-            (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-        ) < 32
-    else:
-        LOOP_UNROLL: gl.constexpr = False
+    # Descriptor stepping (update_tensor_descriptor + fixed [0,0] async_load) vs
+    # absolute [row, k*BK] offsets. Toggle for testing.
+    USE_DESC_STEP: gl.constexpr = False
+
+    LOOP_UNROLL: gl.constexpr = (
+        (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    ) < 32
     if LOOP_UNROLL:
         NUM_K_ITER: gl.constexpr = (
             SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1
@@ -1472,6 +1480,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
 
     b_scale_scalar_off = ((pid_n * BLOCK_SIZE_N) // GROUP_N) * stride_bscale_n
 
+    # Offset scale pointers to this split-K partition
     k_scale_offset = k_split_offset // GROUP_K
     a_scale_ptr += k_scale_offset * stride_ascale_k
     b_scale_ptr += k_scale_offset * stride_bscale_k
@@ -1480,6 +1489,10 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     off_am_tdm = pid_m * BLOCK_SIZE_M
     off_bn_tdm = pid_n * (BLOCK_SIZE_N // 16)
 
+    # TDM tensor descriptors: bake the (M, N) block offset into the base pointer
+    # and shrink the descriptor shape (M - off_am, K_local) so async_load uses a
+    # fixed [0, 0] and steps along K via update_tensor_descriptor (the boundary
+    # clamp stays correct, and the tile descriptor stays in SGPRs).
     if USE_DESC_STEP:
         a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_ptr + k_split_offset * stride_ak + off_am_tdm * stride_am,
@@ -1531,7 +1544,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
 
     # ------------ Prologue ---------------
 
-    # Load first scales
     if SCALAR_B_SCALE:
         b_scale = gl.load(
             b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
@@ -1546,10 +1558,13 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         cache=cache_modifier,
     )
 
-    # TDM prologue: fill pipeline with NUM_BUFFERS tiles (one more than bw-bound)
-    for _ in gl.static_range(NUM_BUFFERS):
+    for _ in gl.static_range(NUM_BUFFERS - 1):
         if USE_DESC_STEP:
             if not EVEN_K:
+                # Ragged K: clamp each tile to its own remaining K extent
+                # (add_offsets leaves the bound stale). Full tiles get
+                # remaining >= BLOCK_SIZE_K (no clamp); the last, partial tile
+                # gets clamped so TDM zero-fills past K.
                 a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     a_desc,
                     set_bounds=[M - off_am_tdm, K_local - num_loads * BLOCK_SIZE_K],
@@ -1567,6 +1582,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             gl.amd.gfx1250.tdm.async_load(
                 b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS)
             )
+            # Advance to the next K tile.
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, BLOCK_SIZE_K]
             )
@@ -1586,10 +1602,8 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             )
         num_loads += 1
 
-    # Wait for tile 0 to land in LDS
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    # Pre-load tile 0 operands from LDS into registers (ds_read)
     cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
     cur_b = depreshuffle_b(
         tdm_smem_b.index(num_computes % NUM_BUFFERS),
@@ -1597,7 +1611,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     ).load(layout=dot_b_layout)
 
-    # Stage first scales
     if not SCALAR_B_SCALE:
         smem_scale_b.store(b_scale)
     else:
@@ -1608,11 +1621,13 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         cur_a_scale = a_scale
 
     # ----- Main Loop --------
-    # Pipelining: ds_read(next) is issued BEFORE wmma(current), so the LDS
-    # read latency is hidden behind the matrix multiply execution.
 
-    for k in (gl.static_range if LOOP_UNROLL else range)(NUM_K_ITER - NUM_BUFFERS):
-        # -- Compute scales for current tile --
+    for k in (gl.static_range if LOOP_UNROLL else range)(
+        NUM_K_ITER - (NUM_BUFFERS - 1)
+    ):
+        # Advance scales
+        a_scale_ptr += stride_ascale_k
+        b_scale_ptr += stride_bscale_k
         if not SCALAR_B_SCALE:
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
         if LDS_A_SCALE:
@@ -1623,11 +1638,24 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         else:
             cur_ab_scale = cur_a_scale[:, None] * cur_b_scale[None, :]
 
-        # -- WMMA for current tile (operands already in registers) --
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += res * cur_ab_scale
 
-        # -- Issue TDM load for tile (num_loads) --
+        if SCALAR_B_SCALE:
+            b_scale = gl.load(
+                b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
+            )
+        else:
+            b_scale = gl.amd.cdna4.buffer_load(
+                ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
+            )
+        a_scale = gl.amd.cdna4.buffer_load(
+            ptr=a_scale_ptr,
+            offsets=offs_a_scale,
+            cache=cache_modifier,
+        )
+
+        # TDM load next tile
         if USE_DESC_STEP:
             if not EVEN_K:
                 a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
@@ -1647,6 +1675,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             gl.amd.gfx1250.tdm.async_load(
                 b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS), pred=1
             )
+            # Advance to the next K tile.
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 a_desc, add_offsets=[0, BLOCK_SIZE_K]
             )
@@ -1667,11 +1696,10 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
                 pred=1,
             )
 
-        # Wait for next compute tile to land
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
 
-        # -- ds_read NEXT tile into registers (issued before next wmma) --
+        # Load next tile from shared (unshuffle B)
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -1680,23 +1708,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
         ).load(layout=dot_b_layout)
-
-        # -- Advance and load next scales --
-        a_scale_ptr += stride_ascale_k
-        b_scale_ptr += stride_bscale_k
-        if SCALAR_B_SCALE:
-            b_scale = gl.load(
-                b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
-            )
-        else:
-            b_scale = gl.amd.cdna4.buffer_load(
-                ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
-            )
-        a_scale = gl.amd.cdna4.buffer_load(
-            ptr=a_scale_ptr,
-            offsets=offs_a_scale,
-            cache=cache_modifier,
-        )
 
         if not SCALAR_B_SCALE:
             smem_scale_b.store(b_scale)
@@ -1711,9 +1722,11 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         cur_b = next_b
         num_computes += 1
 
-    # ======= Epilogue: drain remaining NUM_BUFFERS tiles, no more TDM loads ========
+    # ======= Epilogue ========
 
-    for i in gl.static_range(NUM_BUFFERS - 1):
+    for i in gl.static_range(NUM_BUFFERS - 2):
+        a_scale_ptr += stride_ascale_k
+        b_scale_ptr += stride_bscale_k
         if not SCALAR_B_SCALE:
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
         if LDS_A_SCALE:
@@ -1723,31 +1736,9 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             cur_ab_scale = cur_a_scale[:, None] * cur_b_scale
         else:
             cur_ab_scale = cur_a_scale[:, None] * cur_b_scale[None, :]
-
-        # Wait for next tile
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
-
-        # ds_read NEXT tile (issued before wmma of current)
-        next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
-            layout=dot_a_layout
-        )
-        next_b = depreshuffle_b(
-            tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS),
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-        ).load(layout=dot_b_layout)
-
-        # WMMA for current tile
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += res * cur_ab_scale
 
-        cur_a = next_a
-        cur_b = next_b
-        num_computes += 1
-
-        # Advance scales for next iteration
-        a_scale_ptr += stride_ascale_k
-        b_scale_ptr += stride_bscale_k
         if SCALAR_B_SCALE:
             b_scale = gl.load(
                 b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
@@ -1761,6 +1752,21 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
+
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+        next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
+            layout=dot_a_layout
+        )
+        next_b = depreshuffle_b(
+            tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+        ).load(layout=dot_b_layout)
+
+        cur_a = next_a
+        cur_b = next_b
+        num_computes += 1
+
         if not SCALAR_B_SCALE:
             smem_scale_b.store(b_scale)
         else:
@@ -1770,7 +1776,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         else:
             cur_a_scale = a_scale
 
-    # Final WMMA — last tile, operands already in registers
+    # Final WMMA
     if LDS_A_SCALE:
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
     if not SCALAR_B_SCALE:
