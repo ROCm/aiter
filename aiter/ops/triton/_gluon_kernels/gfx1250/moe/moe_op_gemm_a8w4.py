@@ -633,9 +633,7 @@ def _moe_gemm_a8w4_decode(
         NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
         out_3d = tl.reshape(out, [BLOCK_M, NUM_QB, 32])
         scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
-        out = tl.reshape(out_3d * quant_scale, [BLOCK_M, OUT_BLOCK_N]).to(
-            tl.float8e4nv
-        )
+        out = tl.reshape(out_3d * quant_scale, [BLOCK_M, OUT_BLOCK_N]).to(tl.float8e4nv)
         scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
         offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
         mask_m_s = offs_m_s < M
