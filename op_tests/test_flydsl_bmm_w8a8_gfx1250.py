@@ -27,6 +27,10 @@ import torch
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.bmm_w8a8_gfx1250 import run_bmm_w8a8_gfx1250
+from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+    batched_gemm_bf16 as batched_gemm_bf16_triton,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
@@ -74,6 +78,25 @@ def quant_b_blockwise(b_bnk):
     return q.reshape(Bn, N, K), scale_e8m0, deq
 
 
+def dequant_a(a_q_bmk, a_scale_e8m0, dtype):
+    """fp8 A ``[B,M,K]`` + E8M0 scale ``[B,M,K//gk]`` -> ``dtype`` ``[B,M,K]``."""
+    Bn, M, K = a_q_bmk.shape
+    scale_f32 = fp4_utils.e8m0_to_f32(a_scale_e8m0).unsqueeze(-1)  # [B,M,K//gk,1]
+    blk = a_q_bmk.reshape(Bn, M, K // GROUP_K, GROUP_K).to(dtypes.fp32) * scale_f32
+    return blk.reshape(Bn, M, K).to(dtype)
+
+
+def dequant_b(b_q_bnk, b_scale_e8m0, dtype):
+    """fp8 B ``[B,N,K]`` + E8M0 scale ``[B,N//gn,K//gk]`` -> ``dtype`` ``[B,N,K]``."""
+    Bn, N, K = b_q_bnk.shape
+    scale_f32 = fp4_utils.e8m0_to_f32(b_scale_e8m0)[:, :, None, :, None]
+    blk = (
+        b_q_bnk.reshape(Bn, N // GROUP_N, GROUP_N, K // GROUP_K, GROUP_K).to(dtypes.fp32)
+        * scale_f32
+    )
+    return blk.reshape(Bn, N, K).to(dtype)
+
+
 def run_torch(a_deq_bmk, b_deq_bnk, dtype):
     """fp32 reference batched GEMM ``C[b] = A_deq[b] @ B_deq[b]^T`` -> [B, M, N]."""
     out = torch.matmul(a_deq_bmk, b_deq_bnk.transpose(1, 2))
@@ -94,6 +117,8 @@ def test_gemm(b, m, n, k, dtype, layout):
 
     ref = run_torch(a_deq, b_deq, dtype)  # [B, M, N]
 
+    b_q_shuf = shuffle_weight(b_q, layout=(16, 16))
+
     # Lay A / a_scale / C out per the requested physical layout.
     #   mbn: transposed views of contiguous [m, b, *] tensors.
     #   bmn: plain contiguous [b, m, *].
@@ -108,11 +133,11 @@ def test_gemm(b, m, n, k, dtype, layout):
 
     tile_m, tile_n, tile_k = 64, 256, 128
 
-    def gemm_func():
+    def run_flydsl():
         run_bmm_w8a8_gfx1250(
             C,
             A,
-            b_q.contiguous(),
+            b_q_shuf.contiguous(),
             a_scale,
             b_scale.contiguous(),
             tile_m,
@@ -122,7 +147,21 @@ def test_gemm(b, m, n, k, dtype, layout):
             group_k=GROUP_K,
             group_n=GROUP_N,
         )
-        return C
+        # flydsl writes C in the requested layout; normalize to [B, M, N].
+        return C.permute(1, 0, 2) if layout == "mbn" else C
+
+    # triton bf16 baseline: dequant fp8+E8M0 -> bf16 is timed too, so the row is
+    # end-to-end comparable with flydsl's fused fp8 GEMM (both "include dequant").
+    x_tri = a_q.contiguous()  # fp8 [B, M, K]
+    w_tri = b_q.contiguous()  # fp8 [B, N, K]
+    y_tri = torch.empty(b, m, n, dtype=dtype)
+
+    def run_triton():
+        a_bf16 = dequant_a(x_tri, a_scale_bmk, dtype)  # [B, M, K]
+        w_bf16 = dequant_b(w_tri, b_scale, dtype)  # [B, N, K]
+        return batched_gemm_bf16_triton(a_bf16, w_bf16, YQ=y_tri)  # [B, M, N]
+
+    gemm_funcs = {"flydsl": run_flydsl, "triton": run_triton}
 
     # batched GEMM b x ([m,k] @ [n,k]^T -> [m,n]):
     #   FLOPs = 2 * b * m * n * k;  bytes = (A + B + C) elements * dtype size.
@@ -134,21 +173,19 @@ def test_gemm(b, m, n, k, dtype, layout):
         logger.info("skip bmm_w8a8: requires %s, got %s", SUPPORTED_GFX, get_gfx())
         return ret
 
-    out, us = run_perftest(gemm_func)
-    if layout == "mbn":
-        out = out.permute(1, 0, 2)  # [m, b, n] -> [b, m, n]
-
-    err = checkAllclose(
-        ref.to(dtypes.fp32),
-        out.to(dtypes.fp32),
-        rtol=3e-2,
-        atol=3e-2,
-        msg=f"bmm_w8a8 gfx1250 ({layout})",
-    )
-    ret["us"] = us
-    ret["TFLOPS"] = flops / us / 1e6
-    ret["TB/s"] = nbytes / us / 1e6
-    ret["err"] = err
+    for name, gemm_func in gemm_funcs.items():
+        out, us = run_perftest(gemm_func)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=3e-2,
+            atol=3e-2,
+            msg=f"{name}: bmm_w8a8 gfx1250 ({layout})",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
     return ret
 
 
@@ -189,9 +226,14 @@ def main():
             (16, 1024, 4096),
             (64, 1024, 4096),
             (128, 1024, 4096),
+            (192, 1024, 4096),
             (256, 1024, 4096),
             (512, 1024, 4096),
             (1024, 1024, 4096),
+            (2048, 1024, 4096),
+            (4096,1024, 4096),
+            (8192,1024, 4096),
+            (16384, 1024, 4096)
         ],
         help="""Shape of mnk.
         e.g.:   -s 128,1024,4096
