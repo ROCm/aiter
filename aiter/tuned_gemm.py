@@ -179,6 +179,11 @@ def is_skinny_default_shape(
 ):
     if isinstance(dtype, str):
         dtype = eval(dtype)
+    # The skinny custom GEMV kernels (wvSpltK / LLMM1 / wv_splitk_small) are only
+    # implemented for CDNA (MI250/MI300/MI350); on gfx1250 they are unreachable
+    # stubs that trap. Fall back to the default (torch/hipblaslt) GEMM path.
+    if get_gfx() == "gfx1250":
+        return False
     cu_num = get_cu_num() if cu_num is None else cu_num
     return (
         dtype in [dtypes.fp16, dtypes.bf16]
