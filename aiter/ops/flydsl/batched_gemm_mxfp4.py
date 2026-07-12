@@ -243,16 +243,16 @@ def _run_gfx1250(
         out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
     )
 
+    # A/B only need the base address (views built in-kernel) -> pass as pointers;
+    # bind the contiguous A to a local so its storage outlives the async launch.
+    a_c = a.contiguous()
     launch_gemm_a8w4_tdm(
         out_phys,
-        a.contiguous(),
-        # 2-D view (each dim < 2^31) so the DLPack arg packing doesn't overflow i32 on
-        # multi-GB weights; TDM only needs the base address.
-        w.reshape(B * (N // 16), (K // 2) * 16),
+        ptr_arg(a_c),
+        ptr_arg(w),
         a_scales.view(torch.int32),
         w_scales.view(torch.int32),
         M,
-        N,
         torch.cuda.current_stream(),
         N,
         K,

@@ -85,10 +85,17 @@ def extract_lds_base_idx(smem_ptr):
 
 
 def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
+    """Materialize an LLVM LDS pointer from a pre-extracted byte base.
+
+    ``byte_offset`` may be an index value or an i32/int (e.g. a raw byte
+    expression from the caller); non-index offsets are cast to index here so
+    call sites don't have to wrap every offset in ``index_cast``.
+    """
     from flydsl._mlir.dialects import llvm as _llvm
     from flydsl.expr.arith import ArithValue as _AV
 
+    if not isinstance(_raw(byte_offset).type, ir.IndexType):
+        byte_offset = arith.index_cast(T.index, byte_offset)
     lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
     total_byte = _AV(lds_base_idx) + byte_offset
     addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
