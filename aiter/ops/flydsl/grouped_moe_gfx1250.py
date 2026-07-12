@@ -535,6 +535,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
+    if token_num == 0:
+        # No tokens to compute (common in EP when a rank receives 0 dispatched
+        # tokens). The grouped route/GEMM kernels would launch with a zero-sized
+        # grid -> hipErrorInvalidValue, so short-circuit to an empty output.
+        return torch.zeros((0, model_dim), dtype=dtype, device=device)
     # EP global->local LUT (sentinel ``E`` marks dropped/non-local routes). The
     # contiguous fast path builds it on-device inside the single-block fused route
     # kernel (moe_route_g2l_fused), so it is only materialised standalone for the
