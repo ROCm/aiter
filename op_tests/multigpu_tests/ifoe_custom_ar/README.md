@@ -46,39 +46,61 @@ for r in 0 1 2 3; do ./ualoe_allreduce --rank $r --world 8 --gpu $r      --coord
 for r in 4 5 6 7; do ./ualoe_allreduce --rank $r --world 8 --gpu $((r-4)) --coord <A> --port 55571 --mb 256 & done   # node B
 ```
 
+The default kernel is `allreduce2_opt` — an MLP-unrolled reduce-scatter (U=8
+float4 in flight per thread) + per-peer contiguous allgather, which saturates the
+fabric far better than the naive upstream loop.
+
 Flags:
-- `--tdm` selects a TDM (`tensor_load_to_lds`) reduce-scatter path.
-- `--blocks N` / `--threads N` override the launch geometry (defaults: 512
-  threads, blocks auto-capped at 192 — see tuning note below).
+- `--naive` uses the verbatim upstream 2-stage kernel; `--tdm` uses a TDM
+  (`tensor_load_to_lds`) reduce-scatter path; `--prof` prints per-phase cycle
+  breakdown.
+- `--unroll N` sets the MLP unroll factor (default 8); `--blocks N` / `--threads N`
+  override launch geometry (defaults: 512 threads, blocks auto-capped at 208).
 
 ## Results (gfx1250, ROCm 7.15, fp32, busbw = 2(N-1)/N · S / t)
 
 | size | TP4 (1 node) | TP8 (2 nodes) |
 |---:|---:|---:|
-| 16 MB | 99 | 84 |
-| 64 MB | 197 | 161 |
-| 256 MB | 243 | 260 |
-| 1 GB | **307** | **299** |
+| 16 MB | 83 | 78 |
+| 64 MB | 200 | 197 |
+| 256 MB | 303 | 278 |
+| 1 GB | **360** | **341** |
 
-- **Cross-node TP8 ≈ single-node TP4** (299 vs 307 GB/s busbw at 1 GB): crossing
-  the node boundary costs essentially nothing, because intra-node also rides IFOE.
-- Reaches ~60% of the raw per-GPU fabric bandwidth from `ubench/07_ualoe`
-  (~493 GB/s); the remaining gap is the algorithm (two sync barriers + reduction),
-  not the fabric.
-- **Block count is the dominant knob.** The upstream kernel caps grid at
-  `kMaxBlocks` (the barrier flag array is `start[kMaxBlocks][8]`, indexed by
-  `blockIdx.x`). At the old cap of 80 the grid under-occupies the GPU; raising it
-  and sweeping shows a clear optimum at **~192 blocks**:
+- **Cross-node TP8 ≈ single-node TP4** (341 vs 360 GB/s busbw at 1 GB): crossing
+  the node boundary costs essentially nothing — intra-node also rides IFOE, and
+  a world=2 test measures the same ceiling on-node and across nodes.
 
-  | blocks (TP8, 1 GB) | busbw |
-  |---:|---:|
-  | 80  | 192 |
-  | 160 | 286 |
-  | **192** | **299** |
-  | 304 | 223 |
+### This is the fabric's *bidirectional* ceiling, not a kernel limit
 
-  Too few blocks starves occupancy; too many inflates the per-block cross-rank
-  barrier cost. 192 is the default; override with `--blocks`.
-- **TDM** (`--tdm`) does **not** help here: the all-reduce is sync/reduction-bound,
-  not read-bandwidth-bound, so TDM's deeper-outstanding reads only add LDS-staging
-  overhead. (TDM does help pure copy — see ubench 07.)
+Profiling (`--prof`, TP8 1 GB) shows the sync barriers cost only **~7%**
+(start_sync ~0%, end_sync ~6%); reduce-scatter and allgather (the fabric traffic)
+are **~94%**. So the kernel is memory-bound, and the relevant hardware limit is
+**not** the ~493 GB/s *unidirectional* read peak from `ubench/07_ualoe`.
+
+An all-reduce is inherently **bidirectional**: every GPU reads its peers (inbound)
+while its own buffers are read by peers (outbound) — 2(N-1)/N bytes each way. The
+measured per-GPU *bidirectional* wall (a `world=2` all-reduce, which is a pure
+simultaneous read+write test) is:
+
+| bidir test (1 GB) | busbw/direction |
+|---|---:|
+| world=2 cross-node | ~350 |
+| world=2 intra-node | ~359 |
+
+So busbw for any lossless fp32 all-reduce on this fabric tops out around
+**~350–360 GB/s**, and the tuned kernel is already there. The 493 figure only
+applies to one-directional traffic; the shared per-GPU uplink drops to ~355/dir
+under simultaneous read+write. Reaching higher requires reducing bytes on the
+wire (bf16/fp8 transfer) or in-network reduction, not kernel tuning.
+
+### Tuning notes
+
+- **MLP unroll** took TP8 1 GB from 299 → 341 (+14%): issuing many outstanding
+  float4 loads per thread (the ubench-02 HBM lesson) is what saturates the fabric.
+  U=8 is best for TP8 (7 peers → VGPR pressure caps higher unroll); U=16 helps
+  world=2 (1 peer).
+- **Block count**: `kMaxBlocks` was raised from 80 (under-occupies) to 304; ~208
+  blocks is the sweet spot (too many inflates the per-block barrier cost).
+- **TDM** (`--tdm`) does **not** help: the collective is fabric-bandwidth-bound,
+  not read-latency-bound, so LDS staging only adds overhead. (TDM does help pure
+  copy — see ubench 07.)

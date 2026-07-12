@@ -72,6 +72,64 @@ __global__ void __launch_bounds__(512,1) allreduce2(RankData* in_dp, RankSignals
     }
 }
 
+// instrumented copy: block 0 records per-phase cycles [start_sync, reduce, end_sync, allgather]
+template<int ngpus>
+__global__ void __launch_bounds__(512,1) allreduce2_prof(RankData* in_dp, RankSignals sg, Signal* self_sg, float* result, int rank, int size, unsigned long long* prof){
+    int tid=blockIdx.x*blockDim.x+threadIdx.x, stride=gridDim.x*blockDim.x;
+    int part=size/ngpus, start=rank*part, end=(rank==ngpus-1)?size:start+part, largest=part+size%ngpus;
+    const float4* ptrs[ngpus]; float4* tmps[ngpus];
+    #pragma unroll
+    for(int i=0;i<ngpus;i++){ int t=(rank+i)%ngpus; ptrs[i]=(const float4*)in_dp->ptrs[t]; tmps[i]=tmp_buf<float4>(sg.signals[t]); }
+    long long c0=clock64();
+    start_sync<ngpus>(sg,self_sg,rank);
+    long long c1=clock64();
+    for(int idx=start+tid; idx<end; idx+=stride) tmps[0][idx-start]=preduce<ngpus>(ptrs,idx);
+    long long c2=clock64();
+    end_sync<ngpus>(sg,self_sg,rank);
+    long long c3=clock64();
+    for(int idx=tid; idx<largest; idx+=stride){
+        #pragma unroll
+        for(int i=0;i<ngpus;i++){ int gr=(rank+i)%ngpus; if(gr==ngpus-1||idx<part){ ((float4*)result)[gr*part+idx]=tmps[i][idx]; } }
+    }
+    long long c4=clock64();
+    if(threadIdx.x==0 && blockIdx.x==0){ prof[0]=c1-c0; prof[1]=c2-c1; prof[2]=c3-c2; prof[3]=c4-c3; }
+}
+
+// MLP-optimized: U-way unrolled reduce-scatter + per-peer contiguous allgather.
+// Raises outstanding fabric loads per thread (ubench-02 HBM lesson) to saturate IFOE.
+template<int ngpus,int U>
+__global__ void __launch_bounds__(512,1) allreduce2_opt(RankData* in_dp, RankSignals sg, Signal* self_sg, float* result, int rank, int size){
+    int tid=blockIdx.x*blockDim.x+threadIdx.x, stride=gridDim.x*blockDim.x;
+    int part=size/ngpus, start=rank*part, end=(rank==ngpus-1)?size:start+part, largest=part+size%ngpus;
+    const float4* ptrs[ngpus]; float4* tmps[ngpus];
+    #pragma unroll
+    for(int i=0;i<ngpus;i++){ int t=(rank+i)%ngpus; ptrs[i]=(const float4*)in_dp->ptrs[t]; tmps[i]=tmp_buf<float4>(sg.signals[t]); }
+    start_sync<ngpus>(sg,self_sg,rank);
+    // reduce-scatter: U float4 in flight per thread across the whole peer set
+    for(int i0=start+tid; i0<end; i0+=stride*U){
+        float4 acc[U];
+        #pragma unroll
+        for(int u=0;u<U;u++){ int idx=i0+u*stride; acc[u]= idx<end ? ptrs[0][idx] : float4{0,0,0,0}; }
+        #pragma unroll
+        for(int p=1;p<ngpus;p++){
+            #pragma unroll
+            for(int u=0;u<U;u++){ int idx=i0+u*stride; if(idx<end){ float4 v=ptrs[p][idx]; acc[u].x+=v.x;acc[u].y+=v.y;acc[u].z+=v.z;acc[u].w+=v.w; } }
+        }
+        #pragma unroll
+        for(int u=0;u<U;u++){ int idx=i0+u*stride; if(idx<end) tmps[0][idx-start]=acc[u]; }
+    }
+    end_sync<ngpus>(sg,self_sg,rank);
+    // allgather: each peer's reduced shard copied contiguously (ubench-07 read pattern)
+    #pragma unroll
+    for(int i=0;i<ngpus;i++){
+        int gr=(rank+i)%ngpus; int cnt=(gr==ngpus-1)?largest:part;
+        float4* dst=(float4*)result+(size_t)gr*part; const float4* src=tmps[i];
+        for(int i0=tid; i0<cnt; i0+=stride*U){
+            #pragma unroll
+            for(int u=0;u<U;u++){ int idx=i0+u*stride; if(idx<cnt) dst[idx]=src[idx]; }
+        }
+    }
+}
 
 // ---- TDM (gfx1250 tensor_load_to_lds) for the reduce-scatter read path ----
 using sg0v=int __attribute__((ext_vector_type(4)));
@@ -144,10 +202,11 @@ struct HPair{ hipMemFabricHandle_t in_h, sg_h; };  // per-rank handles
 
 int main(int argc,char**argv){
     setvbuf(stdout,NULL,_IONBF,0);
-    int rank=0,world=0,gpu=0,port=55570,mb=64,use_tdm=0,ublocks=0,uthreads=512; const char* coord="127.0.0.1";
+    // opt (MLP-unrolled) kernel is the default: saturates the bidirectional fabric wall (~355 GB/s/dir).
+    int rank=0,world=0,gpu=0,port=55570,mb=64,use_tdm=0,ublocks=0,uthreads=512,use_prof=0,use_opt=1,uunroll=8; const char* coord="127.0.0.1";
     for(int i=1;i<argc;i++){ auto A=[&](const char*k){return !strcmp(argv[i],k);};
         if(A("--rank"))rank=atoi(argv[++i]); else if(A("--world"))world=atoi(argv[++i]); else if(A("--gpu"))gpu=atoi(argv[++i]);
-        else if(A("--coord"))coord=argv[++i]; else if(A("--port"))port=atoi(argv[++i]); else if(A("--mb"))mb=atoi(argv[++i]); else if(A("--tdm"))use_tdm=1; else if(A("--blocks"))ublocks=atoi(argv[++i]); else if(A("--threads"))uthreads=atoi(argv[++i]); }
+        else if(A("--coord"))coord=argv[++i]; else if(A("--port"))port=atoi(argv[++i]); else if(A("--mb"))mb=atoi(argv[++i]); else if(A("--tdm")){use_tdm=1;use_opt=0;} else if(A("--naive"))use_opt=0; else if(A("--blocks"))ublocks=atoi(argv[++i]); else if(A("--threads"))uthreads=atoi(argv[++i]); else if(A("--prof")){use_prof=1;use_opt=0;} else if(A("--opt"))use_opt=1; else if(A("--unroll"))uunroll=atoi(argv[++i]); }
     g_rank=rank; CK(hipSetDevice(gpu));
     size_t bytes=(size_t)mb<<20; size_t nfloat=bytes/4; int nvec=(int)(nfloat/4);
 
@@ -185,9 +244,12 @@ int main(int argc,char**argv){
     RankData* in_dp; CK(hipMalloc(&in_dp,sizeof(RankData))); CK(hipMemcpy(in_dp,&h_rd,sizeof(RankData),hipMemcpyHostToDevice));
     auto barrier=[&](){ char b=1; if(rank==0){ for(int r=1;r<world;r++) ra(cfd[r],&b,1); for(int r=1;r<world;r++) sa(cfd[r],&b,1);} else { sa(cfd[0],&b,1); ra(cfd[0],&b,1);} };
 
-    int TH=uthreads; int nb=ublocks>0?ublocks:(nvec/world+TH-1)/TH; if(ublocks==0 && nb>192)nb=192; if(nb>kMaxBlocks)nb=kMaxBlocks; if(nb<1)nb=1;  // 192 blocks: best occupancy/sync tradeoff
+    int TH=uthreads; int nb=ublocks>0?ublocks:(nvec/world+TH-1)/TH; if(ublocks==0 && nb>208)nb=208; if(nb>kMaxBlocks)nb=kMaxBlocks; if(nb<1)nb=1;  // ~208 blocks: best occupancy vs barrier cost for the opt kernel
     constexpr int TILE=512; size_t tdm_lds=(size_t)8*TILE*16;   // up to 8 peers * 8KB
+    #define OPTARGS in_dp,sg,(Signal*)sg_buf,result,rank,nvec
+    #define LOPT(NG) switch(uunroll){ case 1: allreduce2_opt<NG,1><<<nb,TH>>>(OPTARGS); break; case 2: allreduce2_opt<NG,2><<<nb,TH>>>(OPTARGS); break; case 8: allreduce2_opt<NG,8><<<nb,TH>>>(OPTARGS); break; default: allreduce2_opt<NG,4><<<nb,TH>>>(OPTARGS);}
     auto launch=[&](){
+        if(use_opt){ switch(world){ case 2: LOPT(2); break; case 4: LOPT(4); break; case 8: LOPT(8); break; default: if(rank==0) printf("unsupported world=%d\n",world);} return; }
         if(use_tdm){ switch(world){
             case 2: allreduce2_tdm<2,TILE><<<nb,TH,2*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
             case 4: allreduce2_tdm<4,TILE><<<nb,TH,4*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
@@ -216,7 +278,23 @@ int main(int argc,char**argv){
     // busbw convention (nccl): 2*(N-1)/N * size / time
     double busbw=2.0*(world-1)/world*(double)bytes/(us/1e6)/1e9;
     double algbw=(double)bytes/(us/1e6)/1e9;
-    if(rank==0) printf("\n=== allreduce world=%d, %dMB, %s, blk=%d th=%d: %.1f us/iter, algbw %.1f GB/s, busbw %.1f GB/s ===\n",world,mb,use_tdm?"TDM":"naive",nb,TH,us,algbw,busbw);
+    const char* mode=use_opt?"opt":(use_tdm?"TDM":"naive");
+    if(rank==0) printf("\n=== allreduce world=%d, %dMB, %s(U=%d), blk=%d th=%d: %.1f us/iter, algbw %.1f GB/s, busbw %.1f GB/s ===\n",world,mb,mode,use_opt?uunroll:0,nb,TH,us,algbw,busbw);
     barrier();
+
+    if(use_prof){
+        unsigned long long* d_prof; CK(hipMalloc(&d_prof,4*sizeof(unsigned long long))); CK(hipMemset(d_prof,0,4*sizeof(unsigned long long)));
+        barrier();
+        switch(world){
+            case 2: allreduce2_prof<2><<<nb,TH>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec,d_prof); break;
+            case 4: allreduce2_prof<4><<<nb,TH>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec,d_prof); break;
+            case 8: allreduce2_prof<8><<<nb,TH>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec,d_prof); break;
+        }
+        CK(hipDeviceSynchronize()); barrier();
+        unsigned long long h_prof[4]; CK(hipMemcpy(h_prof,d_prof,4*sizeof(unsigned long long),hipMemcpyDeviceToHost));
+        double tot=h_prof[0]+h_prof[1]+h_prof[2]+h_prof[3];
+        printf("[rank %d] PROF cycles: start_sync=%llu (%.0f%%) reduce=%llu (%.0f%%) end_sync=%llu (%.0f%%) allgather=%llu (%.0f%%)\n",
+            rank,h_prof[0],100*h_prof[0]/tot,h_prof[1],100*h_prof[1]/tot,h_prof[2],100*h_prof[2]/tot,h_prof[3],100*h_prof[3]/tot);
+    }
     return 0;
 }
