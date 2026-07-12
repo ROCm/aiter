@@ -104,7 +104,7 @@ def _issue_tdm_load_2d(desc, off_0, off_1, smem):
 
 @gluon.jit
 def _issue_tdm_gather_2d(desc, off_0, smem):
-    gl.amd.gfx1250.tdm.async_gather(desc, off_0, 0, smem)
+    gl.amd.gfx1250.tdm.async_gather(desc, off_0, smem)
 
 
 @gluon.jit
