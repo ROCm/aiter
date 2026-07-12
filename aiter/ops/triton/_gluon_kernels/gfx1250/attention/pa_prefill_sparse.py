@@ -55,8 +55,8 @@ def _pa_prefill_sparse(
     kv_indptr_extend_ptr,  # [T+1] int32
     attn_sink_ptr,  # [H]
     out_ptr,  # [T, H, D]
-    total_prefix_pages: gl.constexpr,
-    total_extend_tokens: gl.constexpr,
+    total_prefix_pages,
+    total_extend_tokens,
     q_stride_t: gl.constexpr,
     q_stride_h: gl.constexpr,
     q_stride_d: gl.constexpr,

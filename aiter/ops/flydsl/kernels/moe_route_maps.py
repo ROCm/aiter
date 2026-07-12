@@ -23,7 +23,8 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     STensor,
     ptr_rsrc,
-    MOE_KERNARG_PRELOAD_COUNT,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
 BLOCK_THREADS = 256
@@ -107,8 +108,8 @@ def build_moe_route_maps_module():
 
     launch_route_maps.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_route_maps
@@ -173,8 +174,8 @@ def build_moe_topids_to_rows_module():
 
     launch_topids_to_rows.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_topids_to_rows
@@ -290,8 +291,8 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
 
     launch_topids_to_rows_g2l.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_topids_to_rows_g2l
@@ -499,8 +500,8 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
 
     launch_route_g2l_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_route_g2l_fused

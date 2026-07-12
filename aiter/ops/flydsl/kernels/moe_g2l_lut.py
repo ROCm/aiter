@@ -33,7 +33,8 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     STensor,
     ptr_rsrc,
-    MOE_KERNARG_PRELOAD_COUNT,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
 MAX_G2L_EXPERTS = 512
@@ -153,8 +154,8 @@ def build_moe_g2l_lut_module():
 
     launch_g2l.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 

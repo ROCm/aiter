@@ -19,6 +19,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -265,6 +266,260 @@ def test_sage(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+def _sage_int8_attention_ref(
+    q,
+    k,
+    v,
+    layout: str,
+    softmax_scale: float,
+):
+    q_ref, k_ref, v_ref = q, k, v
+    if layout == "bhsd":
+        q_ref = q_ref.permute(0, 2, 1, 3).contiguous()
+        k_ref = k_ref.permute(0, 2, 1, 3).contiguous()
+        v_ref = v_ref.permute(0, 2, 1, 3).contiguous()
+
+    torch_out = attention_ref(
+        q_ref, k_ref, v_ref, dropout_p=0.0, dropout_mask=None, causal=False
+    )
+    torch_out, _, _ = torch_out
+
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+    return torch_out
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 256)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("hadamard_rotation", [False, True])
+def test_sage_int8_hadamard(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    hadamard_rotation: bool,
+    dtype=torch.bfloat16,
+):
+    """
+    INT8 Sage hadamard_rotation correctness.
+
+    Reference baseline is bf16 ``attention_ref`` (same as ``test_sage``). This test
+    keeps ``q_smooth=False`` so Hadamard is exercised in isolation from Q smoothing.
+    """
+    HEAD_SZ = 128
+    BLOCK_R = 128
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        q_smooth=False,
+        hadamard_rotation=hadamard_rotation,
+        BLOCK_R=BLOCK_R if hadamard_rotation else None,
+    )
+
+    torch_out = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    assert torch_out.shape == triton_out.shape
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+def test_sage_int8_hadamard_preserves_float_logits(dtype=torch.bfloat16):
+    """Orthogonal Hadamard should leave pre-quant QK logits unchanged in float."""
+    HEAD_SZ = 128
+    BLOCK_R = 128
+    BATCH, SEQLEN, NUM_HEADS = 1, 32, 4
+
+    torch.manual_seed(7)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_HEADS,
+        NUM_HEADS,
+        SEQLEN,
+        SEQLEN,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        "bshd",
+    )
+    # Property check in float32: bf16 matmul rounds each multiply-add, so
+    # (q@r)@(k@r)^T != q@k^T when computed in bf16 even for orthogonal R.
+    q_f = q.float()
+    k_f = k.float()
+    r = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=torch.float32) / (
+        BLOCK_R**0.5
+    )
+
+    q_rot = torch.matmul(q_f, r)
+    k_rot = torch.matmul(k_f, r)
+    scores = torch.matmul(q_f, k_f.transpose(-2, -1))
+    scores_rot = torch.matmul(q_rot, k_rot.transpose(-2, -1))
+
+    assert torch.allclose(
+        scores, scores_rot, rtol=1e-3, atol=1e-3
+    ), "Hadamard rotation should preserve QK logits before quantization"
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 256), (512, 512)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (24, 24)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("q_smooth", [False, True])
+def test_sage_int8_q_smooth(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    q_smooth: bool,
+    dtype=torch.bfloat16,
+):
+    """
+    INT8 Sage q_smoothing correctness.
+
+    Reference baseline is bf16 ``attention_ref`` (same as ``test_sage``), not fp16
+    and not sage-without-q_smooth. Sage is a quantized attention approximation;
+    unit tests verify each feature path still lands within the established
+    quantized-attention tolerance band vs full-precision attention.
+
+    This test keeps ``hadamard_rotation=False`` so Q smoothing is exercised in
+    isolation from Hadamard rotation.
+    """
+    HEAD_SZ = 128
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        q_smooth=q_smooth,
+        hadamard_rotation=False,
+    )
+
+    torch_out = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    assert torch_out.shape == triton_out.shape
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 256)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 4)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+def test_sage_int8_q_smooth_and_hadamard(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """
+    INT8 Sage with q_smooth and hadamard_rotation enabled together.
+
+    Reference baseline is bf16 ``attention_ref`` (same as ``test_sage``).
+    """
+    HEAD_SZ = 128
+    BLOCK_R = 128
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        q_smooth=True,
+        hadamard_rotation=True,
+        BLOCK_R=BLOCK_R,
+    )
+
+    torch_out = _sage_int8_attention_ref(q, k, v, layout, softmax_scale)
+    assert torch_out.shape == triton_out.shape
     check_attention_outputs(
         triton_out,
         torch_out,
