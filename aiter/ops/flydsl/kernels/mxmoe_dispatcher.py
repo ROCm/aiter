@@ -1105,7 +1105,12 @@ def get_g2(
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and epilog == "reduce" and a_dtype == "fp8"
+    _bf16_fp4 = os.environ.get("MXFP4_G2_BF16_LDS_FP4", "0") == "1"  # experimental: bf16 C-slab for fp4 (occupancy lever)
+    g2_bf16_lds = (
+        os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1"
+        and epilog == "reduce"
+        and (a_dtype == "fp8" or (a_dtype == "fp4" and _bf16_fp4))
+    )
     key = (
         BM,
         use_nt,
