@@ -152,20 +152,21 @@ def _run_gfx1250_bufload(a, w, a_scales, w_scales, N, dtype, *, layout, tile_m, 
 def _run_gfx1250(
     a, w, a_scales, w_scales, N, dtype, *, a_dtype, layout, tile_m, tile_n, tile_k, out
 ):
-    """gfx1250 wave32 WMMA path. a8w4 only (MXFP8 E4M3 A x MXFP4 B).
+    """gfx1250 wave32 WMMA path. a8w4 (MXFP8 E4M3 A) or a4w4 (MXFP4 A), both x MXFP4 B.
 
     TDM (tensor-DMA) global->LDS with an ``num_buffers``-stage LDS ring overlaps the
     weight/activation DMA with WMMA compute.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
-    if a_dtype != "fp8":
+    if a_dtype not in ("fp8", "fp4"):
         raise NotImplementedError(
-            f"[FlyDSL gfx1250] only a8w4 (a_dtype='fp8') is supported, got {a_dtype!r}"
+            f"[FlyDSL gfx1250] only a8w4 (fp8) / a4w4 (fp4) supported, got {a_dtype!r}"
         )
+    a_is_fp4 = 1 if a_dtype == "fp4" else 0
 
     B, M = (a.shape[0], a.shape[1]) if layout == "bmn" else (a.shape[1], a.shape[0])
-    K = a.shape[-1]  # fp8: 1 byte/code
+    K = a.shape[-1] * _A_CODES_PER_BYTE[a_dtype]  # fp8: 1 byte/code, fp4: 2 codes/byte
 
     # The TDM path streams n32k4 e8m0 scales as whole 32-row/col supers, so tile_m
     # (and tile_n) must be a multiple of 32. Round a smaller/odd caller tile_m up.
@@ -193,7 +194,7 @@ def _run_gfx1250(
     # Regime dispatch: the TDM pipeline wins the weight-BW-bound / small-M (MoE, decode)
     # cases by overlapping DMA with compute, but for large-M compute-bound GEMMs the
     # fully-unrolled direct-buffer-load kernel schedules WMMAs denser and is faster.
-    if M >= 1024 and not bw_bound:
+    if M >= 1024 and not bw_bound and not a_is_fp4:  # bufload kernel is a8w4-only
         return _run_gfx1250_bufload(
             a, w, a_scales, w_scales, N, dtype,
             layout=layout, tile_m=tile_m, tile_n=tile_n, out=out,
@@ -274,6 +275,7 @@ def _run_gfx1250(
         B,
         layout_mbn,
         num_buffers,
+        a_is_fp4,
         0,
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

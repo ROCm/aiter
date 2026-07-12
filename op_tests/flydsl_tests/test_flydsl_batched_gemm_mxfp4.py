@@ -38,7 +38,7 @@ torch.set_default_device("cuda")
 
 SCALE_GROUP_SIZE = 32
 
-# gfx1250 supports only the a8w4 variant (MXFP8 E4M3 A x MXFP4 B) via wave32 WMMA.
+# gfx1250 runs the wave32 WMMA path for both a8w4 (MXFP8 A) and a4w4 (MXFP4 A).
 _IS_GFX1250 = get_gfx() == "gfx1250"
 
 
@@ -51,8 +51,6 @@ def _skip_if_unsupported(variant):
         pytest.skip(
             f"FlyDSL MXFP preshuffle GEMM requires gfx950/gfx1250, got {get_gfx()}"
         )
-    if _IS_GFX1250 and variant != "a8w4":
-        pytest.skip(f"gfx1250 FlyDSL batched GEMM supports a8w4 only, not {variant}")
 
 # (B, M, N, K). Odd/large M (not multiples of the 32-row scale chunk or the tile) exercise
 # the ragged-M tail: rows past M read 0. N % tile_n == 0, K % 256 == 0.

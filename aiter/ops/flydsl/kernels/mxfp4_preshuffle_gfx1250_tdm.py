@@ -39,6 +39,7 @@ def launch_gemm_a8w4_tdm(
     batch: Constexpr[int],
     layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
+    a_is_fp4: Constexpr[int],
     waves_per_eu: Constexpr[int],
 ):
     WMMA_M = WMMA_N = 16
@@ -54,9 +55,16 @@ def launch_gemm_a8w4_tdm(
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
 
-    A_LDS_ROW = tile_k
+    A_PACK = 2 if a_is_fp4 else 1
+    A_ROW_B = tile_k // A_PACK      # A LDS tile-row bytes
+    A_KROW = K // A_PACK            # A global full-row bytes
+    A_KSTEP = WMMA_K // A_PACK      # A LDS bytes per WMMA-K step
+    ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
+    ACT_NDW = 8 if a_is_fp4 else 16  # act fragment i32 count (fp4 8, fp8 16)
+
+    A_LDS_ROW = A_ROW_B
     B_LDS_ROW = PACK_TK * 16
-    STAGE_A = ((tile_m * tile_k + 15) // 16) * 16
+    STAGE_A = ((tile_m * A_ROW_B + 15) // 16) * 16
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
 
     SC_INNER = tile_k // 4
@@ -153,17 +161,18 @@ def launch_gemm_a8w4_tdm(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
         gC_base = fx.get_iter(arg_c)
-        A_OUTER_STRIDE = (batch * K) if layout_mbn else K
+        A_OUTER_STRIDE = (batch * A_KROW) if layout_mbn else A_KROW
         b_outer_row = bz64 * B_BATCH_ROWS + blk_n64 // 16
         sa_super_off = blk_m64 // 32
         sb_super_off = blk_n64 // 32
 
-        AT, BT = (tile_m, tile_k), (tile_n // 16, PACK_TK * 16)
+        # A row bytes / K-tile advance follow the A dtype (fp8 = tile_k, fp4 = tile_k/2).
+        AT, BT = (tile_m, A_ROW_B), (tile_n // 16, PACK_TK * 16)
         SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
         if const_expr(layout_mbn):
-            a_off0 = blk_m64 * (batch * K) + bz64 * K
+            a_off0 = blk_m64 * (batch * A_KROW) + bz64 * A_KROW
         else:
-            a_off0 = (bz64 * m64 + blk_m64) * K
+            a_off0 = (bz64 * m64 + blk_m64) * A_KROW
         b_off0 = b_outer_row * (Kp * 16)
         sa_off0 = sa_super_off * SA_OUTER_STRIDE + sa_batch_off
         sb_off0 = sb_super_off * SB_OUTER_STRIDE + sb_batch_off
@@ -176,7 +185,7 @@ def launch_gemm_a8w4_tdm(
         _adv = fx.rocdl.advance_tdm_atom
 
         def issue(s, kt):  # bump imm_offset by the K-tile byte delta (base fixed)
-            fx.copy(_adv(atomA, kt * tile_k), gtA0, _lv(pA[s], AT, (A_LDS_ROW, 1)))
+            fx.copy(_adv(atomA, kt * A_ROW_B), gtA0, _lv(pA[s], AT, (A_LDS_ROW, 1)))
             fx.copy(_adv(atomB, kt * PACK_TK * 16), gtB0, _lv(pB[s], BT, (B_LDS_ROW, 1)))
             fx.copy(_adv(atomSA, kt * SC_INNER * 4), gtSA0,
                     _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)))
@@ -188,7 +197,11 @@ def launch_gemm_a8w4_tdm(
 
         def load_a(s, wm, ksl):
             row = wmb + wm * 16 + lane16
-            b0 = row * A_LDS_ROW + ksl * 128 + kgrp * 16
+            b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
+            if const_expr(a_is_fp4):
+                v0 = Vec(lds_load_b128_raw(stA_idx[s], b0))
+                v1 = Vec(lds_load_b128_raw(stA_idx[s], b0 + 32))
+                return v0.shuffle(v1, list(range(8)))
             v = [Vec(lds_load_b128_raw(stA_idx[s], b0 + 32 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
@@ -211,9 +224,9 @@ def launch_gemm_a8w4_tdm(
             word = (col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)
             return lds_load_b32_raw(stSB_idx[s], word * 4)
 
-        # Scaled WMMA via the flydsl MX-scale atom (A=fp4 weight, B=fp8 act, E8M0).
+        # Scaled WMMA via the flydsl MX-scale atom (A=fp4 weight, B=fp4/fp8 act, E8M0).
         wmma_atom = fx.make_mma_atom(
-            fx.rocdl.WMMAScale(WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, fx.Float8E4M3FN, fx.Float32)
+            fx.rocdl.WMMAScale(WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32)
         )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
@@ -242,7 +255,7 @@ def launch_gemm_a8w4_tdm(
                 issue(nxt % num_buffers, nxt)
                 issued += 1
             for ksl in range_constexpr(KWS):
-                act = [_rmem(16, a_fr[wm][ksl]) for wm in range_constexpr(wmma_m_rep)]
+                act = [_rmem(ACT_NDW, a_fr[wm][ksl]) for wm in range_constexpr(wmma_m_rep)]
                 wt = [_rmem(8, b_fr[wn][ksl]) for wn in range_constexpr(wmma_n_rep)]
                 for wm in range_constexpr(wmma_m_rep):
                     for wn in range_constexpr(wmma_n_rep):
