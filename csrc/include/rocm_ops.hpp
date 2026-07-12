@@ -679,17 +679,18 @@ namespace py = pybind11;
           py::arg("splitK")     = 0, \
           py::arg("kernelName") = "");
 
-#define GEMM_A8W8_BLOCKSCALE_PYBIND  \
-    m.def("gemm_a8w8_blockscale",    \
-          &gemm_a8w8_blockscale,     \
-          "fp8 blockscale gemm",     \
-          py::arg("XQ"),             \
-          py::arg("WQ"),             \
-          py::arg("x_scale"),        \
-          py::arg("w_scale"),        \
-          py::arg("Out"),            \
-          py::arg("splitK")     = 0, \
-          py::arg("kernelName") = "");
+#define GEMM_A8W8_BLOCKSCALE_PYBIND      \
+    m.def("gemm_a8w8_blockscale",        \
+          &gemm_a8w8_blockscale,         \
+          "fp8 blockscale gemm",         \
+          py::arg("XQ"),                 \
+          py::arg("WQ"),                 \
+          py::arg("x_scale"),            \
+          py::arg("w_scale"),            \
+          py::arg("Out"),                \
+          py::arg("splitK")      = 0,    \
+          py::arg("kernelName")  = "",   \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_tune",   \
@@ -701,7 +702,8 @@ namespace py = pybind11;
           py::arg("w_scale"),            \
           py::arg("Out"),                \
           py::arg("kernelId") = 0,       \
-          py::arg("splitK")   = 0);
+          py::arg("splitK")   = 0,       \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_CKTILE_PYBIND \
     m.def("gemm_a8w8_blockscale_cktile",   \
@@ -714,7 +716,8 @@ namespace py = pybind11;
           py::arg("Out"),                  \
           py::arg("preshuffleB") = false,  \
           py::arg("splitK")      = 0,      \
-          py::arg("kernelName")  = "");
+          py::arg("kernelName")  = "",     \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_cktile_tune",   \
@@ -727,18 +730,20 @@ namespace py = pybind11;
           py::arg("Out"),                       \
           py::arg("kernelId")    = 0,           \
           py::arg("splitK")      = 0,           \
-          py::arg("preshuffleB") = false);
+          py::arg("preshuffleB") = false,       \
+          py::arg("y_is_zeroed") = false);
 
-#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND \
-    m.def("gemm_a8w8_blockscale_bpreshuffle",   \
-          &gemm_a8w8_blockscale_bpreshuffle,    \
-          "fp8 blockscale bpreshuffle gemm",    \
-          py::arg("XQ"),                        \
-          py::arg("WQ"),                        \
-          py::arg("x_scale"),                   \
-          py::arg("w_scale"),                   \
-          py::arg("Out"),                       \
-          py::arg("kernelName") = "");
+#define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_PYBIND  \
+    m.def("gemm_a8w8_blockscale_bpreshuffle",    \
+          &gemm_a8w8_blockscale_bpreshuffle,     \
+          "fp8 blockscale bpreshuffle gemm",     \
+          py::arg("XQ"),                         \
+          py::arg("WQ"),                         \
+          py::arg("x_scale"),                    \
+          py::arg("w_scale"),                    \
+          py::arg("Out"),                        \
+          py::arg("kernelName")  = "",           \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_tune",   \
@@ -750,7 +755,8 @@ namespace py = pybind11;
           py::arg("w_scale"),                        \
           py::arg("Out"),                            \
           py::arg("kernelId") = 0,                   \
-          py::arg("splitK")   = 0);
+          py::arg("splitK")   = 0,                   \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_CKTILE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_cktile",   \
@@ -762,7 +768,9 @@ namespace py = pybind11;
           py::arg("w_scale"),                          \
           py::arg("Out"),                              \
           py::arg("preshuffleB") = true,               \
-          py::arg("kernelName")  = "");
+          py::arg("splitK")      = 0,                  \
+          py::arg("kernelName")  = "",                 \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_cktile_tune",   \
@@ -775,7 +783,8 @@ namespace py = pybind11;
           py::arg("Out"),                                   \
           py::arg("kernelId")    = 0,                       \
           py::arg("splitK")      = 0,                       \
-          py::arg("preshuffleB") = true);
+          py::arg("preshuffleB") = true,                    \
+          py::arg("y_is_zeroed") = false);
 
 #define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
     m.def("gemm_a4w4_blockscale_tune",   \
@@ -1516,7 +1525,8 @@ namespace py = pybind11;
           py::arg("scale_ub")        = std::nullopt,                     \
           py::arg("shuffle_scale")   = false,                            \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("gemm_out_zero_init") = std::nullopt);                 \
     m.def("dynamic_per_group_scaled_quant",                              \
           &aiter::dynamic_per_group_scaled_quant,                        \
           py::arg("out"),                                                \
@@ -2239,17 +2249,18 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND               \
-    m.def("gated_rmsnorm_fp8_group_quant",       \
-          &aiter::gated_rmsnorm_fp8_group_quant, \
-          py::arg("out"),                        \
-          py::arg("scale"),                      \
-          py::arg("x"),                          \
-          py::arg("z"),                          \
-          py::arg("weight"),                     \
-          py::arg("epsilon"),                    \
-          py::arg("group_size"),                 \
-          py::arg("transpose_scale") = false,    \
+#define GATED_RMSNORM_QUANT_PYBIND                             \
+    m.def("gated_rmsnorm_fp8_group_quant",                     \
+          &aiter::gated_rmsnorm_fp8_group_quant,               \
+          py::arg("out"),                                      \
+          py::arg("scale"),                                    \
+          py::arg("x"),                                        \
+          py::arg("z"),                                        \
+          py::arg("weight"),                                   \
+          py::arg("epsilon"),                                  \
+          py::arg("group_size"),                               \
+          py::arg("transpose_scale") = false,                  \
+          py::arg("gemm_out_zero_init") = std::nullopt,        \
           "Fused Gated RMSNorm + FP8 Group Quantization");
 
 #define MHC_PYBIND                              \

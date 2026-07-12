@@ -3,6 +3,7 @@
 #pragma once
 
 #include "aiter_tensor.h"
+#include <optional>
 
 namespace aiter {
 
@@ -38,7 +39,8 @@ void gated_rmsnorm_fp8_group_quant(
     const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
-    bool transpose_scale = false);
+    bool transpose_scale = false,
+    std::optional<aiter_tensor_t> gemm_out_zero_init = std::nullopt);
 
 
 } // namespace aiter

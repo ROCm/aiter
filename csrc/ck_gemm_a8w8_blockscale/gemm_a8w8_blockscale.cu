@@ -14,7 +14,7 @@
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = torch::Tensor (*)(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int, bool);
 
 // Name-keyed dispatch table.  Keys are std::string_view onto the kernel-name
 // string literals embedded in the generated *_lookup.h (static storage,
@@ -85,7 +85,8 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
                                    torch::Tensor& w_scale,
                                    torch::Tensor& Y,
                                    int splitK,
-                                   std::string kernelName)
+                                   std::string kernelName,
+                                   bool y_is_zeroed)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -98,11 +99,11 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<FP32, FP16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        blockscale_dispatch<FP32, FP16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, KBatch, y_is_zeroed);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<FP32, BF16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        blockscale_dispatch<FP32, BF16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, KBatch, y_is_zeroed);
     }
     else
     {

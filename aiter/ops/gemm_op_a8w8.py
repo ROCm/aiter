@@ -237,7 +237,13 @@ def gen_gemm_a8w8_blockscale_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    *args,
+    **kwargs,
 ) -> Tensor:
+    # Accept the trailing optional args (isBpreshuffled, splitK, y_is_zeroed)
+    # added by the cktile / bpreshuffle_cktile entry points so a single shared
+    # fake works for all blockscale FP8 GEMM JIT stubs. The kernel writes into
+    # `Out` regardless of those flags.
     return Out
 
 
@@ -254,6 +260,7 @@ def gemm_a8w8_blockscale_ck(
     Out: torch.Tensor,
     splitK: int = 0,
     kernelName: str = "",
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -271,6 +278,7 @@ def gemm_a8w8_blockscale_cktile(
     isBpreshuffled: bool = False,
     splitK: int = 0,
     kernelName: str = "",
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -286,6 +294,7 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     kernelName: str = "",
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -301,7 +310,9 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     isBpreshuffled: bool = True,
+    splitK: int = 0,
     kernelName: str = "",
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -344,6 +355,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
     kernelName: Optional[str] = None,
     bpreshuffle: int = 1,
     zero_bias_buf: Optional[Tensor] = None,
+    y_is_zeroed: int = 0,
 ) -> None: ...
 
 
@@ -371,6 +383,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     kernelName: Optional[str] = None,
     bpreshuffle: Optional[bool] = True,
     zero_bias_buf: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
         zero_bias_buf = get_zero_bias_buf(B)
@@ -385,6 +398,7 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
         kernelName,
         int(bpreshuffle) if bpreshuffle is not None else 1,
         zero_bias_buf,
+        int(y_is_zeroed),
     )
     return out
 
@@ -746,7 +760,11 @@ def gemm_a8w8_blockscale_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled=False,
+    out: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     m = XQ.shape[0]
     n = WQ.shape[0]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -761,7 +779,32 @@ def gemm_a8w8_blockscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
+    out: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor:
+    """FP8 a8w8 blockscale GEMM (non-bpreshuffle).
+
+    Optional kwargs (used by the zero-init SplitK fusion):
+      - out:          caller-provided output buffer. If None, allocated here.
+      - y_is_zeroed:  when True, caller guarantees ``out`` is pre-zeroed and
+                      the kernel/wrapper skips its zero-init step before the
+                      SplitK atomic-add. Honored by both cktile and legacy
+                      CK branches: cktile's QuantGemmHostArgs passes the
+                      flag down to the kernel; legacy CK gates aiter's
+                      ``Y.zero_()`` while telling the invoker to skip its
+                      own ``hipMemsetAsync`` via ``skip_zero_init=true``.
+                      Has no effect when the chosen kernel runs with
+                      KBatch == 1 (no SplitK atomic-add => no zero-init
+                      required).
+
+    SplitK and kernel-name selection are *always* driven by the tuned CSV
+    (``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE``).  Callers cannot override
+    them: the C++ cktile dispatch is keyed by ``kernelName``, and an empty
+    name falls back to a non-tuned default heuristic kernel.  Bypassing the
+    CSV would therefore silently lose the tuned kernel selection, so this
+    wrapper always resolves splitK and ``kernelName`` from the CSV rather
+    than accepting them as arguments.
+    """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
@@ -769,7 +812,12 @@ def gemm_a8w8_blockscale(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if out is None:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    else:
+        assert out.shape == (m, n), f"out shape {tuple(out.shape)} != ({m}, {n})"
+        assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
+        Y = out
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
@@ -802,6 +850,7 @@ def gemm_a8w8_blockscale(
                     Y,
                     splitK=splitK,
                     kernelName=kernelName,
+                    y_is_zeroed=y_is_zeroed,
                 )
             elif libtype == "cktile":
                 return gemm_a8w8_blockscale_cktile(
@@ -812,11 +861,14 @@ def gemm_a8w8_blockscale(
                     Y,
                     splitK=splitK,
                     kernelName=kernelName,
+                    y_is_zeroed=y_is_zeroed,
                 )
             else:
                 assert 0, f"Unsupported libtype {libtype} for gemm_a8w8_blockscale"
         try:
-            return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_blockscale_ck(
+                XQ, WQ, x_scale, w_scale, Y, y_is_zeroed=y_is_zeroed
+            )
         except RuntimeError as e:
             raise RuntimeError(
                 f"gemm_a8w8_blockscale failed for shape M={m}, N={n}, K={k}, "
@@ -847,7 +899,12 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
+    tuned_file: Optional[str] = None,
 ) -> Tensor:
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
@@ -858,7 +915,33 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    out: Optional[Tensor] = None,
+    y_is_zeroed: bool = False,
+    tuned_file: Optional[str] = None,
 ) -> Tensor:
+    """FP8 a8w8 blockscale GEMM with bpreshuffled weight layout.
+
+    Args:
+        XQ: FP8 activations, shape (M, K).
+        WQ: FP8 weights (preshuffled), shape (N, K) logically.
+        x_scale: per_1x128 activation scales.
+        w_scale: per_128x128 weight scales.
+        dtype: output dtype.
+        out: optional pre-allocated output tensor (shape (M, N), dtype `dtype`).
+            When provided, the GEMM writes into this tensor instead of allocating a new one.
+        y_is_zeroed: when True, the caller has already zeroed `out`, so the
+            kernel will skip its internal Y.zero_() / hipMemsetAsync before
+            the SplitK atomic_add.  Honored by all libtypes (cktile, ck,
+            asm).  Has no effect on the libtype=='ck' branch, which does not
+            expose splitK from the CSV (KBatch stays at 1, so the zero-init
+            is a no-op regardless of this flag); the plumbing is in place for
+            when splitK is exposed there.
+        tuned_file: optional path to a tuned CSV to consult for kernel/splitK
+            selection.  When None, uses the default
+            ``AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE``.  Useful
+            when a caller wants to switch between e.g. a no-SplitK and a
+            with-SplitK tune at runtime.
+    """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
@@ -899,28 +982,55 @@ def gemm_a8w8_blockscale_bpreshuffle(
             dtype=dtype,
             config=_fallback_cfg,
         )
-    config = get_CKGEMM_config(
-        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-    )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    config = get_CKGEMM_config(m, n, k, tuned_file)
+    if out is None:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    else:
+        assert out.shape == (m, n), f"out shape {tuple(out.shape)} != ({m}, {n})"
+        assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
+        Y = out
     if config is not None:
         libtype = config["libtype"]
         kernelName = str(config.get("kernelName", ""))
+        splitK = int(config.get("splitK", 0))
         if libtype == "cktile":
             return gemm_a8w8_blockscale_bpreshuffle_cktile(
-                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                splitK=splitK,
+                kernelName=kernelName,
+                y_is_zeroed=y_is_zeroed,
             )
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(
-                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                kernelName=kernelName,
+                y_is_zeroed=y_is_zeroed,
             )
         elif libtype == "asm":
-            splitK = config["splitK"]
             return gemm_a8w8_blockscale_bpreshuffle_asm(
-                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+                XQ,
+                WQ,
+                Y,
+                x_scale,
+                w_scale,
+                splitK=splitK,
+                kernelName=kernelName,
+                y_is_zeroed=y_is_zeroed,
             )
     try:
-        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_blockscale_bpreshuffle_ck(
+            XQ, WQ, x_scale, w_scale, Y, y_is_zeroed=y_is_zeroed
+        )
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_blockscale_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
@@ -978,7 +1088,12 @@ def gen_gemm_a8w8_blockscale_tune_fake_tensors(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
+    # Accept the trailing optional flags some tune entrypoints carry
+    # (``preshuffleB``, ``y_is_zeroed``) so a single shared fake works across
+    # all blockscale tune JIT stubs. The kernel writes into ``Out`` regardless.
     return Out
 
 
@@ -995,6 +1110,7 @@ def gemm_a8w8_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1012,6 +1128,7 @@ def gemm_a8w8_blockscale_cktile_tune(
     kernelId: int = 0,
     splitK: int = 0,
     preshuffleB: bool = False,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1045,6 +1162,7 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile_tune(
     kernelId: int = 0,
     splitK: int = 0,
     preshuffleB: bool = True,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1061,6 +1179,7 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 

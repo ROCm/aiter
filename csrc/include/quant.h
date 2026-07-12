@@ -21,7 +21,13 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     std::optional<aiter_tensor_t> scale_ub  = std::nullopt,
                                     bool shuffle_scale                      = false,
                                     std::optional<aiter_tensor_t> num_rows  = std::nullopt,
-                                    int num_rows_factor                     = 1);
+                                    int num_rows_factor                     = 1,
+                                    // Optional downstream SplitK-GEMM output buffer to zero-fill
+                                    // as a fused side-effect of this kernel. When provided, the
+                                    // GEMM can be invoked with y_is_zeroed=True and skip its own
+                                    // Y.zero_() ATen launch. Per-group fp8 path only.
+                                    std::optional<aiter_tensor_t> gemm_out_zero_init =
+                                        std::nullopt);
 
 // Canonical dtype-aware per-group dynamic quant. Accepts fp8 / i8 / fp4x2.
 // For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an

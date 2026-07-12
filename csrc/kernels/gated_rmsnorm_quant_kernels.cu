@@ -49,11 +49,33 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
     int64_t x_token_stride,              // x stride along token dim (elements)
     int64_t x_head_stride,               // x stride along head dim (elements)
     int64_t z_token_stride,              // z stride along token dim (elements)
-    int64_t z_head_stride)               // z stride along head dim (elements)
+    int64_t z_head_stride,                // z stride along head dim (elements)
+    void* __restrict__ gemm_out_zero_init = nullptr,
+    int64_t gemm_out_zero_init_num_uint4 = 0)
 {
     // Compile-time validation
     static_assert(GROUP_SIZE == 128, "Only GROUP_SIZE=128 is supported");
     static_assert(THREAD_DATA_SIZE >= 2 && THREAD_DATA_SIZE <= 32, "THREAD_DATA_SIZE must be 2-32");
+
+    // SplitK GEMM zero-init fusion: every thread participates in a grid-strided
+    // 16-byte zero fill of the downstream GEMM output buffer so SplitK can skip
+    // its own Y.zero_() launch.  Buffer must be 16-byte aligned and the count
+    // is in uint4 (16-byte) words.
+    if(gemm_out_zero_init != nullptr)
+    {
+        const int64_t total_threads =
+            static_cast<int64_t>(gridDim.x) * gridDim.y * blockDim.x;
+        const int64_t my_thread_id =
+            (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x
+            + threadIdx.x;
+        auto* y_vec       = reinterpret_cast<uint4*>(gemm_out_zero_init);
+        const uint4 zero4 = {0u, 0u, 0u, 0u};
+        for(int64_t i = my_thread_id; i < gemm_out_zero_init_num_uint4;
+            i += total_threads)
+        {
+            y_vec[i] = zero4;
+        }
+    }
 
     // Calculate groups per warp
     constexpr int WARP_SIZE = 64;
@@ -201,7 +223,9 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
     double epsilon,
     int num_tokens,
     int num_heads,
-    int head_dim)
+    int head_dim,
+    void* gemm_out_zero_init,
+    int64_t gemm_out_zero_init_num_uint4)
 {
     constexpr int GROUP_SIZE = 128;
     constexpr int WARP_SIZE = 64;
@@ -236,7 +260,9 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
             x_token_stride,
             x_head_stride,
             z_token_stride,
-            z_head_stride
+            z_head_stride,
+            gemm_out_zero_init,
+            gemm_out_zero_init_num_uint4
         );
 }
 
@@ -249,7 +275,9 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
-    bool transpose_scale)
+    bool transpose_scale,
+    void* gemm_out_zero_init,
+    int64_t gemm_out_zero_init_num_uint4)
 {
     // Validate constraints
     AITER_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
@@ -274,10 +302,12 @@ void gated_rmsnorm_fp8_group_quant_launcher(
     constexpr int thread_data_size = 16;
     if (transpose_scale) {
         gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, 256, true>(
-            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim,
+            gemm_out_zero_init, gemm_out_zero_init_num_uint4);
     } else {
         gated_rmsnorm_fp8_group_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, 256, false>(
-            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim,
+            gemm_out_zero_init, gemm_out_zero_init_num_uint4);
     }
 }
 
@@ -292,7 +322,8 @@ void gated_rmsnorm_fp8_group_quant(
     const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
-    bool transpose_scale)
+    bool transpose_scale,
+    std::optional<aiter_tensor_t> gemm_out_zero_init)
 {
     // Validate input types
     AITER_CHECK(x.is_gpu(), "Input x must be on CUDA device");
@@ -303,13 +334,42 @@ void gated_rmsnorm_fp8_group_quant(
 
     HipDeviceGuard device_guard(x.device_id);
 
+    // SplitK GEMM zero-init fusion: optional buffer to zero-init in this kernel
+    void* zero_init_ptr = nullptr;
+    int64_t zero_init_num_uint4 = 0;
+    if(gemm_out_zero_init.has_value())
+    {
+        const aiter_tensor_t& y = *gemm_out_zero_init;
+        AITER_CHECK(y.is_gpu(),
+                    __func__,
+                    " gemm_out_zero_init must be on GPU");
+        AITER_CHECK(gemm_out_zero_init->device_id == x.device_id,
+                    __func__,
+                    " gemm_out_zero_init must be on the same device as inputs");
+        AITER_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+                    __func__,
+                    " gemm_out_zero_init base pointer must be 16-byte aligned");
+        AITER_CHECK(y.is_contiguous(),
+                    __func__,
+                    " gemm_out_zero_init must be contiguous");
+        const int64_t total_bytes = y.numel() * y.element_size();
+        AITER_CHECK(total_bytes % 16 == 0,
+                    __func__,
+                    " gemm_out_zero_init total bytes must be a multiple of 16, got ",
+                    total_bytes);
+        zero_init_ptr       = y.data_ptr();
+        zero_init_num_uint4 = total_bytes / 16;
+    }
+
     // Dispatch based on input/output types
     if (x.dtype() == AITER_DTYPE_bf16 && out.dtype() == AITER_DTYPE_fp8) {
         gated_rmsnorm_fp8_group_quant_launcher<opus::bf16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon, group_size, transpose_scale);
+            out, scale, x, z, weight, epsilon, group_size, transpose_scale,
+            zero_init_ptr, zero_init_num_uint4);
     } else if (x.dtype() == AITER_DTYPE_fp16 && out.dtype() == AITER_DTYPE_fp8) {
         gated_rmsnorm_fp8_group_quant_launcher<opus::fp16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon, group_size, transpose_scale);
+            out, scale, x, z, weight, epsilon, group_size, transpose_scale,
+            zero_init_ptr, zero_init_num_uint4);
     } else {
         AITER_CHECK(false, "Unsupported dtype combination. Input: ", AiterDtype_to_str(x.dtype()),
                     ", Output: ", AiterDtype_to_str(out.dtype()));

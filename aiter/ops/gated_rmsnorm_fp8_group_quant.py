@@ -14,6 +14,8 @@ Operations:
 Constraint: ONLY supports head_dim=128 and group_size=128
 """
 
+from typing import Optional
+
 from torch import Tensor
 
 from aiter.jit.core import compile_ops
@@ -30,6 +32,7 @@ def gated_rmsnorm_fp8_group_quant(
     epsilon: float,
     group_size: int,
     transpose_scale: bool = False,
+    gemm_out_zero_init: Optional[Tensor] = None,
 ) -> None:
     """
     HIP kernel for fused Gated RMSNorm + FP8 group quantization.

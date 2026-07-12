@@ -36,7 +36,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t ori_row_stride,
                                       int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
-                                      const int32_t num_cols_factor        = 1)
+                                      const int32_t num_cols_factor        = 1,
+                                      void* __restrict__ gemm_out_zero_init       = nullptr,
+                                      int64_t gemm_out_zero_init_num_uint4 = 0)
 {
     static_assert(!emit_e8m0_scale
                       || std::is_same_v<DTYPE_O, opus::fp4_t>
@@ -48,6 +50,26 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     static constexpr bool use_e8m0_scale =
         std::is_same_v<DTYPE_O, opus::fp4_t> || emit_e8m0_scale;
 
+    // SplitK GEMM zero-init fusion (decoupled from the quant work below):
+    // Zero the downstream GEMM output buffer using grid-strided 16-byte
+    // stores so that the SplitK GEMM kernel can skip its own Y.zero_()
+    // ATen launch.  The buffer must be 16-byte aligned and
+    // gemm_out_zero_init_num_uint4 is the count of uint4 (16-byte) words.
+    // Caller must ensure (M * N_out * sizeof(out_dtype)) is a multiple of 16
+    // and total grid threads x 16B >= per-iteration coverage; for decode
+    // shapes both conditions hold trivially.
+    if(gemm_out_zero_init != nullptr)
+    {
+        const int64_t total_threads = static_cast<int64_t>(gridDim.x) * blockDim.x;
+        const int64_t my_thread_id =
+            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        auto* y_vec       = reinterpret_cast<uint4*>(gemm_out_zero_init);
+        const uint4 zero4 = {0u, 0u, 0u, 0u};
+        for(int64_t i = my_thread_id; i < gemm_out_zero_init_num_uint4; i += total_threads)
+        {
+            y_vec[i] = zero4;
+        }
+    }
     if(num_rows != nullptr)
     {
         ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
@@ -724,7 +746,8 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     std::optional<aiter_tensor_t> scale_ub,
                                     bool shuffle_scale,
                                     std::optional<aiter_tensor_t> num_rows,
-                                    int num_rows_factor)
+                                    int num_rows_factor,
+                                    std::optional<aiter_tensor_t> gemm_out_zero_init)
 {
     AITER_CHECK(input.is_contiguous());
     AITER_CHECK(out.is_contiguous());
@@ -735,6 +758,44 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // Optional fused zero-init of a downstream SplitK GEMM output buffer.
+    // Only the per-group (per_1x128) path supports this fusion; on other
+    // paths the kernel zero-init pointer stays null and a caller that
+    // requested it must fall back to an explicit Y.zero_() upstream.
+    void* gemm_out_zero_init_ptr   = nullptr;
+    int64_t gemm_out_zero_init_n_u4 = 0;
+    if(gemm_out_zero_init.has_value())
+    {
+        AITER_CHECK(out.dtype() == AITER_DTYPE_fp8,
+                    "gemm_out_zero_init is only supported on the fp8 per-group "
+                    "(per_1x128) path; got out.dtype=",
+                    AiterDtype_to_str(out.dtype()));
+        AITER_CHECK(cols == 32 || cols == 64 || cols == 128,
+                    "gemm_out_zero_init requires per-group quant (cols in "
+                    "{32,64,128}); got cols=",
+                    cols);
+        const aiter_tensor_t& y = *gemm_out_zero_init;
+        AITER_CHECK(y.is_gpu(),
+                    "gemm_out_zero_init must be on GPU");
+        AITER_CHECK(y.device_id == input.device_id,
+                    "gemm_out_zero_init must be on the same device as input; "
+                    "got y.device_id=",
+                    y.device_id,
+                    " input.device_id=",
+                    input.device_id);
+        AITER_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+                    "gemm_out_zero_init base pointer must be 16-byte aligned");
+        AITER_CHECK(y.is_contiguous(),
+                    "gemm_out_zero_init must be contiguous");
+        const int64_t y_bytes = y.numel() * y.element_size();
+        AITER_CHECK(y_bytes % 16 == 0,
+                    "gemm_out_zero_init byte size must be a multiple of 16; "
+                    "the producer-fused zero-init currently writes 16-byte "
+                    "vectors only");
+        gemm_out_zero_init_ptr  = y.data_ptr();
+        gemm_out_zero_init_n_u4 = y_bytes / 16;
+    }
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
@@ -766,7 +827,9 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                             ori_cols,
                             oob_size,
                             num_rows_ptr,
-                            num_rows_factor);
+                            num_rows_factor,
+                            gemm_out_zero_init_ptr,
+                            gemm_out_zero_init_n_u4);
                     });
             };
             auto do_launch = [&](auto shuffle_tag) {
