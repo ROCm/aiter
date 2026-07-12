@@ -52,6 +52,7 @@ def add_flydsl_package_path() -> None:
         add_path_if_present(configured)
     add_path_if_present(REPO_ROOT.parent / ".r1_flydsl_pkgs")
 
+
 # Reuse the harness data generators for parity with the benchmark.
 from op_tests.benchmark_topk_per_row_decode import make_logits, make_row_ends  # noqa: E402
 
@@ -100,6 +101,12 @@ def main() -> None:
     ap.add_argument("--next-n", type=int, default=1)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument(
+        "--boost-ms",
+        type=float,
+        default=0.0,
+        help="Run the GPU with a dummy matmul for this many ms to stabilize clocks.",
+    )
     ap.add_argument("--distribution", default="random")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -109,10 +116,6 @@ def main() -> None:
     max_width = args.L if args.max_width is None else args.max_width
     if max_width < args.L:
         raise ValueError(f"--max-width={max_width} must be >= --L={args.L}")
-    if args.kernel == "flydsl" and args.k == 512:
-        raise ValueError("Use --kernel flydsl_tiered for K=512; standalone K=512 was pruned")
-    if args.kernel == "flydsl_tiered" and args.k != 512:
-        raise ValueError("flydsl_tiered is the K=512 tiered path")
 
     batch_size = args.num_rows // args.next_n
     seq_lens, row_ends = make_row_ends(
@@ -136,13 +139,31 @@ def main() -> None:
         op = load_vllm()
 
         def run():
-            op(logits, args.next_n, seq_lens, indices, args.num_rows, stride0, stride1, args.k)
+            op(
+                logits,
+                args.next_n,
+                seq_lens,
+                indices,
+                args.num_rows,
+                stride0,
+                stride1,
+                args.k,
+            )
 
     elif args.kernel == "aiter_hip":
         op = load_aiter()
 
         def run():
-            op(logits, args.next_n, seq_lens, indices, args.num_rows, stride0, stride1, k=args.k)
+            op(
+                logits,
+                args.next_n,
+                seq_lens,
+                indices,
+                args.num_rows,
+                stride0,
+                stride1,
+                k=args.k,
+            )
 
     else:  # FlyDSL variants
         op = load_flydsl()
@@ -159,6 +180,19 @@ def main() -> None:
                 k=args.k,
                 ordered=False,
             )
+
+    if args.boost_ms > 0.0:
+        # Fixed-duration to ramp gpu up to a stable state before measuring.
+        # These kernels are filtered out by the driver's name regex.
+        import time
+
+        heat_a = torch.randn((4096, 4096), dtype=torch.float32, device=device)
+        heat_b = torch.randn((4096, 4096), dtype=torch.float32, device=device)
+        t0 = time.perf_counter()
+        while (time.perf_counter() - t0) * 1000.0 < args.boost_ms:
+            for _ in range(16):
+                heat_a = heat_a @ heat_b
+            torch.cuda.synchronize()
 
     for _ in range(args.warmup):
         run()

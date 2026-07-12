@@ -1,34 +1,72 @@
-# SPDX-License-Identifier: MIT
+"""FlyDSL decode TopK-per-row kernel (tiered persistent multi-block radix-select)
 
-"""Tiered persistent multi-block radix TopK-per-row decode kernel.
+Computes an unordered Top-K index set per decode row, fusing a single-workgroup and
+a multi-block radix-select into one persistent launch grid=(blocks_per_row, num_rows)
+that picks a per-row strategy by valid length. Which is required when decode batch's
+sequences differ in length. Each row derives how many of its blocks_per_row
+workgroups cooperate (active_parts); the rest return immediately.
 
-This module uses one persistent launch, ``grid=(blocks_per_row, num_rows)``,
-per-block LDS histograms, pass-private global histograms, and a row-local
-acquire/release barrier between radix passes. The output is the unordered K=512
-selected set.
+Inputs/outputs:
+  - logits: fp32, logical shape (num_rows, L), strides (stride0, stride1) with
+    stride1 == 1 (contiguous within a row).
+  - seq_lens: int32 causal lengths per sequence; row r scores sequence r // next_n at
+    decode slot r % next_n, valid length seq_len - next_n + slot + 1.
+  - indices: flattened int32 output with shape (num_rows, top_k); each row writes its
+    unordered Top-K index set. A row with fewer than top_k valid entries is
+    identity-filled and padded with -1.
+  - workspace: row-major int32 scratch sized by topk_workspace_slots(num_rows,
+    bits_per_pass). The multi-block tiers merge per-block LDS histograms into its
+    pass-private global histograms over an inter-workgroup acquire/release barrier and
+    coordinate through its counters; the single-workgroup tier never touches it.
+
+Paths (per row, by valid length row_len):
+  - short (row_len <= short_max): active_parts = 1; part 0 runs the whole radix-select
+    in one workgroup — LDS-only histograms, no inter-workgroup barrier, no workspace
+    round-trip.
+  - mid (short_max < row_len <= mid_max): active_parts = min(blocks_per_row, mid_cap).
+  - long (row_len > mid_max): active_parts = min(blocks_per_row, long_cap).
+
+Constraints:
+  - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
+  - bits_per_pass is 10 or 11; the short tier requires 11 bits (2048-bin LDS histogram).
+  - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout and the
+    occupancy deadlock guard rely on it.
+  - workspace must be zeroed before any launch that enters a multi-block tier; its
+    counters and histograms accumulate from zero (needs_workspace_zero reports when).
+  - The row barrier spins (s_sleep), so a row's blocks_per_row workgroups must be
+    co-resident. This is a regular launch, not hipLaunchCooperativeKernel: it is safe
+    only because HIP flattens the grid x-fastest, so a row's parts launch contiguously
+    and drain in order — scheduler launch order, not a cooperative guarantee. Keep
+    num_rows * blocks_per_row co-resident; the wrapper's deadlock guard enforces this,
+    forcing larger batches onto the barrier-free short tier.
 """
 
-import functools
+from functools import cache
+from typing import Any
 
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
+)
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 
-from .layout_utils import crd2idx
-from .tensor_shim import GTensor
-
+# HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins)
+# and the occupancy=2 deadlock guard. Changing it breaks both.
 BLOCK_THREADS = 1024
 WARP_SIZE = 64
-RED_SLOTS = (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE
 LOAD_VEC = 4
-TOP_K = 512
 
-# Match HIP Counter's 128B spacing for hot inter-CTA fields while keeping the
-# workspace as an int32 tensor. Each group is 32 int32 slots == 128B.
+# 128B-spaced inter-workgroup counter groups (32 int32 == 128B each), kept in the int32 workspace.
 COUNTER_STRIDE = 32
 COUNTER_SLOTS = 6 * COUNTER_STRIDE
 COUNTER_ARRIVALS = 2 * COUNTER_STRIDE
@@ -41,7 +79,7 @@ SMEM_META_LEN = 1
 SMEM_META_THRESHOLD = 2
 SMEM_META_ABOVE = 3
 
-# Short one-CTA clone metadata reuses the same 8-int LDS block after zeroing.
+# Short-tier one-workgroup metadata reuses the same 8-int LDS block after zeroing.
 SMEM_META_SHORT_FIRST_ABOVE = 0
 SMEM_META_SHORT_FIRST_THRESHOLD = 1
 SMEM_META_SHORT_SECOND_ABOVE = 2
@@ -56,79 +94,68 @@ def _num_passes(bits_per_pass: int) -> int:
     return (32 + bits_per_pass - 1) // bits_per_pass
 
 
-def tiered_topk_workspace_slots(
+def topk_workspace_slots(
     num_rows: int,
-    blocks_per_row: int,
-    *,
-    bits_per_pass: int,
+    bits_per_pass: int = 11,
 ) -> int:
-    """Return int32 workspace slots for the tiered K=512 path."""
-
-    del blocks_per_row  # Global histograms are atomically merged per row.
-    if num_rows < 0:
-        raise ValueError(f"num_rows must be non-negative, got {num_rows}")
+    """Return int32 workspace slots for the tiered path (row-major, per row)."""
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
     row_slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
     return int(num_rows) * row_slots
 
 
-@functools.lru_cache(maxsize=16)
-def create_topk_per_row_decode_tiered_k512_kernel(
+def needs_workspace_zero(max_row_len: int, top_k: int, short_max: int) -> bool:
+    """Return whether any row can enter the persistent multi-block path."""
+    return max_row_len > max(short_max, top_k)
+
+
+@cache
+def create_topk_per_row_decode_tiered_kernel(
     blocks_per_row: int = 8,
     *,
-    bits_per_pass: int = 10,
+    top_k: int,
+    bits_per_pass: int = 11,
     scan_stages: int = 2,
-    tiered: bool = False,
+    tiered: bool = True,
     tiered_short_max: int = 16384,
     tiered_mid_cap: int = 16,
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
-):
-    """Return a cached tiered persistent K=512 radix-select launcher."""
+) -> Any:
+    short_max = tiered_short_max
+    mid_cap = tiered_mid_cap
+    mid_max = tiered_mid_max
+    long_cap = tiered_long_cap
+    """Return a cached tiered persistent decode radix-select launcher."""
 
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
-    if tiered_short_max < 0:
-        raise ValueError(f"tiered_short_max must be non-negative, got {tiered_short_max}")
-    if tiered_mid_cap < 2:
-        raise ValueError(f"tiered_mid_cap must be >= 2, got {tiered_mid_cap}")
-    if tiered_long_cap < 2:
-        raise ValueError(f"tiered_long_cap must be >= 2, got {tiered_long_cap}")
-    if tiered_mid_max < tiered_short_max:
-        raise ValueError(
-            "tiered_mid_max must be >= tiered_short_max, got "
-            f"{tiered_mid_max} < {tiered_short_max}"
-        )
     if scan_stages not in (1, 2, 4, 8):
         raise ValueError(f"scan_stages must be one of (1, 2, 4, 8), got {scan_stages}")
-    block_threads = BLOCK_THREADS
     if not 2 <= blocks_per_row <= 32:
-        raise ValueError(
-            "Tiered persistent TopK only supports blocks_per_row in [2, 32], "
-            f"got {blocks_per_row}"
-        )
+        raise ValueError(f"blocks_per_row must be in [2, 32], got {blocks_per_row}")
+    if mid_cap < 2 or long_cap < 2:
+        raise ValueError(f"mid_cap/long_cap must be >= 2, got {mid_cap}/{long_cap}")
+    if mid_max < short_max:
+        raise ValueError(f"mid_max must be >= short_max, got {mid_max} < {short_max}")
 
-    # The short-row tier runs a faithful clone of the standalone one-CTA
-    # unordered radix-select path on part 0 only. It uses the 11/11/10 ordered
-    # key scheme, which needs a 2048-bin LDS histogram, so it is only available
-    # when bits_per_pass == 11 (num_buckets == 2048). When unavailable (the
-    # non-default bpp10 device), the tiered short tier falls back to the
-    # single-part persistent path.
-    short_clone = tiered and bits_per_pass == 11
+    # The short tier runs the standalone one-workgroup radix-select (11/11/10 ordered key, 2048-bin LDS
+    # histogram), so it is only available when bits_per_pass == 11.
+    short_tier = tiered and bits_per_pass == 11
+    block_threads = BLOCK_THREADS
     red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
-    threads_per_row = block_threads * blocks_per_row
     num_passes = _num_passes(bits_per_pass)
     num_buckets = 1 << bits_per_pass
     row_workspace_slots = COUNTER_SLOTS + num_passes * num_buckets
     kernel_name = (
-        "topk_per_row_decode_persistent_k512_"
+        f"topk_per_row_decode_persistent_k{top_k}_"
         f"bpp{bits_per_pass}_g{blocks_per_row}_v2"
         f"_stage{scan_stages}"
         f"{'_tiered' if tiered else ''}"
         f"{f'_s{tiered_short_max}_mc{tiered_mid_cap}' if tiered else ''}"
         f"{f'_mm{tiered_mid_max}_lc{tiered_long_cap}' if tiered else ''}"
-        f"{'_oneClone' if short_clone else ''}"
+        f"{'_1wg' if short_tier else ''}"
     )
 
     @fx.struct
@@ -138,19 +165,14 @@ def create_topk_per_row_decode_tiered_k512_kernel(
         s_meta: fx.Array[fx.Int32, 8, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
-    def topk_per_row_decode_tiered_k512_kernel(
+    def topk_per_row_decode_tiered_kernel(
         logits: fx.Tensor,
         next_n: fx.Int32,
         seq_lens: fx.Tensor,
         indices: fx.Tensor,
         workspace: fx.Tensor,
-        num_rows: fx.Int32,
         stride0: fx.Int32,
-        stride1: fx.Int32,
-    ):
-        del num_rows  # Launch grid_y already encodes the validated row count.
-        del stride1  # The Python wrapper admits only stride1 == 1.
-
+    ) -> None:
         block_x = gpu.block_id("x")
         block_y = gpu.block_id("y")
         thread_x = gpu.thread_id("x")
@@ -158,7 +180,6 @@ def create_topk_per_row_decode_tiered_k512_kernel(
         row = ArithValue(arith.index_cast(T.i32, block_y))
         tid = ArithValue(arith.index_cast(T.i32, thread_x))
         tid_idx = arith.index_cast(T.index, thread_x)
-        row_idx = arith.index_cast(T.index, block_y)
         lane = tid % ArithValue(fx.Int32(WARP_SIZE))
         wave = tid // ArithValue(fx.Int32(WARP_SIZE))
 
@@ -170,63 +191,71 @@ def create_topk_per_row_decode_tiered_k512_kernel(
         c_last_wave = fx.Int32(red_slots - 1)
         c_last_lane = fx.Int32(WARP_SIZE - 1)
         c_vec = fx.Int32(LOAD_VEC)
-        c_top_k = fx.Int32(TOP_K)
+        c_top_k = fx.Int32(top_k)
         c_block_i32 = fx.Int32(block_threads)
         c_block_idx = fx.Index(block_threads)
         c_bins_i32 = fx.Int32(num_buckets)
         c_bins_idx = fx.Index(num_buckets)
         c_parts = fx.Int32(blocks_per_row)
-        c_parts_stride_idx = fx.Index(threads_per_row)
-        c_parts_stride4_idx = fx.Index(threads_per_row * 4)
         c_sign_bit = fx.Int32(-2147483648)
         c_neg_one = fx.Int32(-1)
         c_zero_f32 = fx.Float32(0.0)
+        c_row_ws = fx.Int32(row_workspace_slots)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
         s_scan = lds.s_scan.view(fx.make_layout(red_slots * 2, 1))
         s_meta = lds.s_meta.view(fx.make_layout(8, 1))
 
-        logits_rsrc = GTensor(logits, dtype=T.f32, shape=(-1,)).rsrc
-        seq_lens_t = GTensor(seq_lens, dtype=T.i32, shape=(-1,))
-        indices_rsrc = GTensor(indices, dtype=T.i32, shape=(-1,)).rsrc
-        workspace_t = GTensor(workspace, dtype=T.i32, shape=(-1,))
-        workspace_rsrc = workspace_t.rsrc
+        logits_rsrc = buffer_ops.create_buffer_resource(logits, max_size=True)
+        seq_lens_rsrc = buffer_ops.create_buffer_resource(seq_lens, max_size=True)
+        indices_rsrc = buffer_ops.create_buffer_resource(indices, max_size=True)
+        workspace_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         workspace_base_idx = buffer_ops.extract_base_index(workspace, address_space=1)
 
         hist_base_ptr = fx.ptrtoint(lds.s_hist.ptr)
         meta_base_ptr = fx.ptrtoint(lds.s_meta.ptr)
 
-        # Decode row metadata before helper definitions so tiered dispatch can
-        # feed both scan strides and inter-CTA barrier participant counts.
-        seq_row = row // ArithValue(next_n)
-        slot = row - seq_row * ArithValue(next_n)
-        seq_len = ArithValue(seq_lens_t[seq_row])
-        row_len = seq_len - ArithValue(next_n) + slot + ArithValue(c_one)
-        row_len = (row_len > ArithValue(c_zero)).select(row_len, c_zero)
-        row_base = row * ArithValue(stride0)
-        row_out = row * ArithValue(c_top_k)
+        # Decode row geometry.
+        seq_row = ArithValue(row) // ArithValue(next_n)
+        slot = ArithValue(row) - ArithValue(seq_row) * ArithValue(next_n)
+        seq_len = ArithValue(
+            buffer_ops.buffer_load(seq_lens_rsrc, seq_row, vec_width=1, dtype=T.i32)
+        )
+        row_len = (
+            ArithValue(seq_len)
+            - ArithValue(next_n)
+            + ArithValue(slot)
+            + ArithValue(c_one)
+        )
+        row_len = (ArithValue(row_len) > ArithValue(c_zero)).select(row_len, c_zero)
+        row_base = ArithValue(row) * ArithValue(stride0)
+        row_out = ArithValue(row) * ArithValue(c_top_k)
+        row_ws_base = ArithValue(row) * ArithValue(c_row_ws)
 
+        # Per-row active-part cap over the fixed grid (excess blocks return immediately).
         active_parts = c_parts
         if const_expr(tiered):
             # Per-bucket active-part caps over the fixed launch grid (excess
-            # blocks return immediately). Short rows run the single-CTA clone;
+            # blocks return immediately). Short rows run the single-workgroup short tier;
             # the mid and long persistent buckets cap how many of the grid's
             # blocks participate, trading CU coverage against barrier/atomic
             # contention. Caps are clamped to the grid (``c_parts``).
-            c_short_row_len = fx.Int32(tiered_short_max)
-            c_mid_row_len = fx.Int32(tiered_mid_max)
-            c_mid_parts_cap = fx.Int32(tiered_mid_cap)
-            c_long_parts_cap = fx.Int32(tiered_long_cap)
-            mid_parts = (ArithValue(c_parts) < ArithValue(c_mid_parts_cap)).select(
-                c_parts, c_mid_parts_cap
+            c_short = fx.Int32(short_max)
+            c_mid = fx.Int32(mid_max)
+            c_mid_cap = fx.Int32(mid_cap)
+            c_long_cap = fx.Int32(long_cap)
+            mid_parts = (ArithValue(c_parts) < ArithValue(c_mid_cap)).select(
+                c_parts, c_mid_cap
             )
-            long_parts = (ArithValue(c_parts) < ArithValue(c_long_parts_cap)).select(
-                c_parts, c_long_parts_cap
+            long_parts = (ArithValue(c_parts) < ArithValue(c_long_cap)).select(
+                c_parts, c_long_cap
             )
-            active_parts = (row_len <= ArithValue(c_short_row_len)).select(
+            active_parts = (ArithValue(row_len) <= ArithValue(c_short)).select(
                 c_one,
-                (row_len <= ArithValue(c_mid_row_len)).select(mid_parts, long_parts),
+                (ArithValue(row_len) <= ArithValue(c_mid)).select(
+                    mid_parts, long_parts
+                ),
             )
         active_threads = ArithValue(active_parts) * ArithValue(c_block_i32)
         active_stride_idx = arith.index_cast(T.index, active_threads)
@@ -247,29 +276,15 @@ def create_topk_per_row_decode_tiered_k512_kernel(
         )
         single_part_active = ArithValue(active_parts) == ArithValue(c_one)
 
-        ws_layout = fx.make_layout(
-            (1, row_workspace_slots),
-            (row_workspace_slots, 1),
-        )
-        hist_layout = fx.make_layout(
-            (1, num_passes, num_buckets),
-            (row_workspace_slots, num_buckets, 1),
-        )
-
-        def to_i32_index(idx):
-            return arith.index_cast(T.i32, idx)
-
-        def workspace_slot(slot_i32):
-            slot_idx = arith.index_cast(T.index, slot_i32)
-            return to_i32_index(crd2idx((row_idx, slot_idx), ws_layout))
+        def counter_slot(slot_const: int):
+            return ArithValue(row_ws_base) + ArithValue(fx.Int32(slot_const))
 
         def histogram_slot(pass_id: int, bin_i32):
-            bin_idx = arith.index_cast(T.index, bin_i32)
-            pass_offset = crd2idx((row_idx, fx.Index(pass_id), bin_idx), hist_layout)
-            return to_i32_index(fx.Index(COUNTER_SLOTS) + pass_offset)
-
-        def counter_slot(slot: int):
-            return workspace_slot(fx.Int32(slot))
+            return (
+                ArithValue(row_ws_base)
+                + ArithValue(fx.Int32(COUNTER_SLOTS + pass_id * num_buckets))
+                + ArithValue(bin_i32)
+            )
 
         def global_i32_ptr(elem_i32):
             elem_idx = arith.index_cast(T.index, elem_i32)
@@ -313,7 +328,7 @@ def create_topk_per_row_decode_tiered_k512_kernel(
         def global_atomic_load_i32_acquire(elem_i32):
             # Volatile agent-scoped acquire load for the row-barrier spin. The
             # matching release publish below makes histogram updates visible to
-            # peer CTAs without issuing a read-modify-write on the polled slot.
+            # peer workgroups without issuing a read-modify-write on the polled slot.
             return llvm.LoadOp(
                 T.i32,
                 global_i32_ptr(elem_i32),
@@ -334,8 +349,7 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             ).result
 
         def spin_until_slot_ge(elem_i32, target):
-            init_cur = c_zero
-            w = scf.WhileOp([T.i32], [arith.unwrap(init_cur)])
+            w = scf.WhileOp([T.i32], [arith.unwrap(c_zero)])
             before = ir.Block.create_at_start(w.before, [T.i32])
             after = ir.Block.create_at_start(w.after, [T.i32])
             with ir.InsertionPoint(before):
@@ -351,7 +365,7 @@ def create_topk_per_row_decode_tiered_k512_kernel(
 
         def row_barrier(token: int):
             # Intentional no-drain acquire/release protocol: workgroup barriers
-            # bracket local LDS work, the last CTA release-publishes pass_done,
+            # bracket local LDS work, the last workgroup release-publishes pass_done,
             # and peers spin with acquire loads. A full waitcnt drain here is
             # performance/correctness sensitive.
             token_value = fx.Int32(token)
@@ -359,9 +373,7 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             gpu.barrier()
             if tid == ArithValue(c_zero):
                 prev = global_atomic_add_i32(
-                    counter_slot(COUNTER_ARRIVALS),
-                    c_one,
-                    llvm.AtomicOrdering.acq_rel,
+                    counter_slot(COUNTER_ARRIVALS), c_one, llvm.AtomicOrdering.acq_rel
                 )
                 last = (ArithValue(prev) + ArithValue(c_one)) == target_arrivals
                 if last:
@@ -378,7 +390,9 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             # Map larger fp32 values to smaller unsigned keys so ascending
             # bucket scans select descending values. Normalize signed zero to
             # keep tie handling value-equivalent.
-            key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(c_zero_f32, val)
+            key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(
+                c_zero_f32, val
+            )
             bits = ArithValue(key_val).bitcast(T.i32)
             sign = ArithValue(bits).shrui(fx.Int32(31))
             positive_mask = ArithValue(bits) ^ ArithValue(fx.Int32(0x7FFFFFFF))
@@ -403,20 +417,11 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                 dtype=T.f32,
             )
 
-        def load_row_scalar(col_i32):
-            return buffer_ops.buffer_load(
-                logits_rsrc,
-                row_base + ArithValue(col_i32),
-                vec_width=1,
-                dtype=T.f32,
-            )
-
         def clear_local_histogram():
             for hist_idx in range(
                 ArithValue(tid_idx), ArithValue(c_bins_idx), ArithValue(c_block_idx)
             ):
-                hist_i32 = arith.index_cast(T.i32, hist_idx)
-                fx.memref_store(c_zero, s_hist, hist_i32)
+                fx.memref_store(c_zero, s_hist, arith.index_cast(T.i32, hist_idx))
             gpu.barrier()
 
         def wave_inclusive_scan_i32(value):
@@ -433,35 +438,16 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             return cur
 
         def choose_bucket_prefix(target_k):
-            bins_per_scan_thread = 4 if block_threads == 512 and bits_per_pass == 11 else 2
-            first_bin = ArithValue(tid) * ArithValue(fx.Int32(bins_per_scan_thread))
+            # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
+            first_bin = ArithValue(tid) * ArithValue(c_two)
             bin0_valid = ArithValue(first_bin) < ArithValue(c_bins_i32)
             bin1 = ArithValue(first_bin) + ArithValue(c_one)
             bin1_valid = ArithValue(bin1) < ArithValue(c_bins_i32)
             safe0 = bin0_valid.select(first_bin, c_zero)
             safe1 = bin1_valid.select(bin1, c_zero)
-            c0_raw = fx.memref_load(s_hist, safe0)
-            c1_raw = fx.memref_load(s_hist, safe1)
-            c0 = bin0_valid.select(c0_raw, c_zero)
-            c1 = bin1_valid.select(c1_raw, c_zero)
-            if const_expr(bins_per_scan_thread == 4):
-                bin2 = ArithValue(first_bin) + ArithValue(c_two)
-                bin3 = ArithValue(first_bin) + ArithValue(fx.Int32(3))
-                bin2_valid = ArithValue(bin2) < ArithValue(c_bins_i32)
-                bin3_valid = ArithValue(bin3) < ArithValue(c_bins_i32)
-                safe2 = bin2_valid.select(bin2, c_zero)
-                safe3 = bin3_valid.select(bin3, c_zero)
-                c2_raw = fx.memref_load(s_hist, safe2)
-                c3_raw = fx.memref_load(s_hist, safe3)
-                c2 = bin2_valid.select(c2_raw, c_zero)
-                c3 = bin3_valid.select(c3_raw, c_zero)
-                local_total = (
-                    ArithValue(c0) + ArithValue(c1) + ArithValue(c2) + ArithValue(c3)
-                )
-            else:
-                c2 = c_zero
-                c3 = c_zero
-                local_total = ArithValue(c0) + ArithValue(c1)
+            c0 = bin0_valid.select(fx.memref_load(s_hist, safe0), c_zero)
+            c1 = bin1_valid.select(fx.memref_load(s_hist, safe1), c_zero)
+            local_total = ArithValue(c0) + ArithValue(c1)
 
             wave_incl = wave_inclusive_scan_i32(local_total)
             wave_excl_thread = ArithValue(wave_incl) - ArithValue(local_total)
@@ -482,7 +468,9 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                     )
             gpu.barrier()
 
-            wave_off = fx.memref_load(s_scan, ArithValue(wave) + ArithValue(c_red_slots))
+            wave_off = fx.memref_load(
+                s_scan, ArithValue(wave) + ArithValue(c_red_slots)
+            )
             excl0 = ArithValue(wave_off) + ArithValue(wave_excl_thread)
             incl0 = ArithValue(excl0) + ArithValue(c0)
             incl1 = ArithValue(incl0) + ArithValue(c1)
@@ -503,13 +491,6 @@ def create_topk_per_row_decode_tiered_k512_kernel(
 
             emit_find(first_bin, excl0, incl0, c0)
             emit_find(bin1, incl0, incl1, c1)
-            if const_expr(bins_per_scan_thread == 4):
-                bin2 = ArithValue(first_bin) + ArithValue(c_two)
-                bin3 = ArithValue(first_bin) + ArithValue(fx.Int32(3))
-                incl2 = ArithValue(incl1) + ArithValue(c2)
-                incl3 = ArithValue(incl2) + ArithValue(c3)
-                emit_find(bin2, incl1, incl2, c2)
-                emit_find(bin3, incl2, incl3, c3)
             gpu.barrier()
 
         def flush_local_histogram(pass_id: int):
@@ -522,21 +503,39 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                     global_atomic_add_i32(histogram_slot(pass_id, hist_i32), count)
 
         def load_global_histogram(pass_id: int):
-            for hist_idx in range(
-                ArithValue(tid_idx), ArithValue(c_bins_idx), ArithValue(c_block_idx)
+            # Vectorized reload
+            n_vec = num_buckets // LOAD_VEC
+            c_nvec_idx = fx.Index(n_vec)
+            for grp in range(
+                ArithValue(tid_idx), ArithValue(c_nvec_idx), ArithValue(c_block_idx)
             ):
-                hist_i32 = arith.index_cast(T.i32, hist_idx)
-                total = ws_load(histogram_slot(pass_id, hist_i32))
-                fx.memref_store(total, s_hist, hist_i32)
+                base_bin = ArithValue(arith.index_cast(T.i32, grp)) * ArithValue(c_vec)
+                vec = buffer_ops.buffer_load(
+                    workspace_rsrc,
+                    histogram_slot(pass_id, base_bin),
+                    vec_width=LOAD_VEC,
+                    dtype=T.i32,
+                )
+                for j in range_constexpr(LOAD_VEC):
+                    total = vector.extract(
+                        vec, static_position=[j], dynamic_position=[]
+                    )
+                    fx.memref_store(
+                        total, s_hist, ArithValue(base_bin) + ArithValue(fx.Int32(j))
+                    )
             gpu.barrier()
 
         def process_loaded_scan_vec(
-            col_base, vec, pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+            col_base,
+            vec,
+            pass_id: int,
+            start_bit: int,
+            previous_start_bit: int,
+            current_bits,
         ):
             for j in range_constexpr(LOAD_VEC):
                 col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
-                in_range = ArithValue(col_i32) < row_len
-                if in_range:
+                if ArithValue(col_i32) < ArithValue(row_len):
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
                     key = radix_twiddle_key(val)
                     matches_prefix = True
@@ -545,121 +544,70 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                             prefix_for_key(key, previous_start_bit)
                         ) == ArithValue(current_bits)
                     if matches_prefix:
-                        bucket = bucket_for_key(key, start_bit)
-                        lds_atomic_add_i32(hist_base_ptr, bucket, c_one)
+                        lds_atomic_add_i32(
+                            hist_base_ptr, bucket_for_key(key, start_bit), c_one
+                        )
 
-        def scan_vec_block(vblk, pass_id: int, start_bit: int, previous_start_bit: int, current_bits):
-            vblk_i32 = arith.index_cast(T.i32, vblk)
-            col_base = ArithValue(vblk_i32) * ArithValue(c_vec)
-            vec = load_row_vec(col_base)
+        def scan_vec_block(
+            vblk, pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        ):
+            col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
             process_loaded_scan_vec(
-                col_base, vec, pass_id, start_bit, previous_start_bit, current_bits
+                col_base,
+                load_row_vec(col_base),
+                pass_id,
+                start_bit,
+                previous_start_bit,
+                current_bits,
             )
 
         def staged_scan_vec_blocks(
-            vblk, pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+            vblk,
+            pass_id: int,
+            start_bit: int,
+            previous_start_bit: int,
+            current_bits,
         ):
             if const_expr(scan_stages == 1):
-                scan_vec_block(vblk, pass_id, start_bit, previous_start_bit, current_bits)
+                strides = [fx.Index(0)]
             elif const_expr(scan_stages == 2):
-                vblk0 = vblk
-                vblk1 = ArithValue(vblk) + ArithValue(active_stride_idx)
-                col0 = ArithValue(arith.index_cast(T.i32, vblk0)) * ArithValue(c_vec)
-                col1 = ArithValue(arith.index_cast(T.i32, vblk1)) * ArithValue(c_vec)
-                vec0 = load_row_vec(col0)
-                vec1 = load_row_vec(col1)
-                process_loaded_scan_vec(
-                    col0, vec0, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col1, vec1, pass_id, start_bit, previous_start_bit, current_bits
-                )
+                strides = [fx.Index(0), active_stride_idx]
             elif const_expr(scan_stages == 4):
-                vblk0 = vblk
-                vblk1 = ArithValue(vblk) + ArithValue(active_stride_idx)
-                vblk2 = ArithValue(vblk) + ArithValue(active_stride2_idx)
-                vblk3 = ArithValue(vblk) + ArithValue(active_stride3_idx)
-                col0 = ArithValue(arith.index_cast(T.i32, vblk0)) * ArithValue(c_vec)
-                col1 = ArithValue(arith.index_cast(T.i32, vblk1)) * ArithValue(c_vec)
-                col2 = ArithValue(arith.index_cast(T.i32, vblk2)) * ArithValue(c_vec)
-                col3 = ArithValue(arith.index_cast(T.i32, vblk3)) * ArithValue(c_vec)
-                vec0 = load_row_vec(col0)
-                vec1 = load_row_vec(col1)
-                vec2 = load_row_vec(col2)
-                vec3 = load_row_vec(col3)
-                process_loaded_scan_vec(
-                    col0, vec0, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col1, vec1, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col2, vec2, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col3, vec3, pass_id, start_bit, previous_start_bit, current_bits
-                )
+                strides = [
+                    fx.Index(0),
+                    active_stride_idx,
+                    active_stride2_idx,
+                    active_stride3_idx,
+                ]
             else:
-                vblk0 = vblk
-                vblk1 = ArithValue(vblk) + ArithValue(active_stride_idx)
-                vblk2 = ArithValue(vblk) + ArithValue(active_stride2_idx)
-                vblk3 = ArithValue(vblk) + ArithValue(active_stride3_idx)
-                vblk4 = ArithValue(vblk) + ArithValue(active_stride4_idx)
-                vblk5 = ArithValue(vblk) + ArithValue(active_stride4_idx) + ArithValue(active_stride_idx)
-                vblk6 = ArithValue(vblk) + ArithValue(active_stride4_idx) + ArithValue(active_stride2_idx)
-                vblk7 = ArithValue(vblk) + ArithValue(active_stride7_idx)
-                col0 = ArithValue(arith.index_cast(T.i32, vblk0)) * ArithValue(c_vec)
-                col1 = ArithValue(arith.index_cast(T.i32, vblk1)) * ArithValue(c_vec)
-                col2 = ArithValue(arith.index_cast(T.i32, vblk2)) * ArithValue(c_vec)
-                col3 = ArithValue(arith.index_cast(T.i32, vblk3)) * ArithValue(c_vec)
-                col4 = ArithValue(arith.index_cast(T.i32, vblk4)) * ArithValue(c_vec)
-                col5 = ArithValue(arith.index_cast(T.i32, vblk5)) * ArithValue(c_vec)
-                col6 = ArithValue(arith.index_cast(T.i32, vblk6)) * ArithValue(c_vec)
-                col7 = ArithValue(arith.index_cast(T.i32, vblk7)) * ArithValue(c_vec)
-                vec0 = load_row_vec(col0)
-                vec1 = load_row_vec(col1)
-                vec2 = load_row_vec(col2)
-                vec3 = load_row_vec(col3)
-                vec4 = load_row_vec(col4)
-                vec5 = load_row_vec(col5)
-                vec6 = load_row_vec(col6)
-                vec7 = load_row_vec(col7)
+                strides = [
+                    fx.Index(0),
+                    active_stride_idx,
+                    active_stride2_idx,
+                    active_stride3_idx,
+                    active_stride4_idx,
+                    ArithValue(active_stride4_idx) + ArithValue(active_stride_idx),
+                    ArithValue(active_stride4_idx) + ArithValue(active_stride2_idx),
+                    active_stride7_idx,
+                ]
+            cols_v = [
+                ArithValue(arith.index_cast(T.i32, ArithValue(vblk) + ArithValue(s)))
+                * ArithValue(c_vec)
+                for s in strides
+            ]
+            vecs = [load_row_vec(cb) for cb in cols_v]
+            for cb, vc in zip(cols_v, vecs):
                 process_loaded_scan_vec(
-                    col0, vec0, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col1, vec1, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col2, vec2, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col3, vec3, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col4, vec4, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col5, vec5, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col6, vec6, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                process_loaded_scan_vec(
-                    col7, vec7, pass_id, start_bit, previous_start_bit, current_bits
+                    cb, vc, pass_id, start_bit, previous_start_bit, current_bits
                 )
 
         def process_loaded_write_vec(col_base, vec, local_k, kth_bits):
             for j in range_constexpr(LOAD_VEC):
                 col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
-                in_range = ArithValue(col_i32) < row_len
-                if in_range:
+                if ArithValue(col_i32) < ArithValue(row_len):
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
                     key = radix_twiddle_key(val)
-                    key_before_kth = arith.cmpi(
-                        arith.CmpIPredicate.ult, key, kth_bits
-                    )
-                    if key_before_kth:
+                    if arith.cmpi(arith.CmpIPredicate.ult, key, kth_bits):
                         pos = global_atomic_add_i32(
                             counter_slot(COUNTER_OUT_FRONT), c_one
                         )
@@ -678,16 +626,21 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                                 - ArithValue(back)
                             )
                             buffer_ops.buffer_store(
-                                col_i32,
-                                indices_rsrc,
-                                row_out + ArithValue(out_pos),
+                                col_i32, indices_rsrc, row_out + ArithValue(out_pos)
                             )
 
         def write_vec_block(vblk, local_k, kth_bits):
-            vblk_i32 = arith.index_cast(T.i32, vblk)
-            col_base = ArithValue(vblk_i32) * ArithValue(c_vec)
-            vec = load_row_vec(col_base)
-            process_loaded_write_vec(col_base, vec, local_k, kth_bits)
+            col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
+            process_loaded_write_vec(
+                col_base, load_row_vec(col_base), local_k, kth_bits
+            )
+
+        global_vec_tid = part * ArithValue(c_block_i32) + tid
+        global_vec_tid_idx = arith.index_cast(T.index, global_vec_tid)
+        vec_blocks_i32 = ArithValue(
+            ArithValue(row_len) + ArithValue(c_vec) - ArithValue(c_one)
+        ).shrui(fx.Int32(2))
+        vec_blocks_idx = arith.index_cast(T.index, vec_blocks_i32)
 
         def scan_pass(pass_id: int, current_k, current_bits, barrier_token: int):
             start_bit = max(32 - (pass_id + 1) * bits_per_pass, 0)
@@ -719,21 +672,18 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                 init=[global_vec_tid_idx],
             ):
                 staged_scan_vec_blocks(
-                    vblk,
-                    pass_id,
-                    start_bit,
-                    previous_start_bit,
-                    current_bits,
+                    vblk, pass_id, start_bit, previous_start_bit, current_bits
                 )
-                next_tail = ArithValue(vblk) + ArithValue(staged_stride_idx)
-                pass_results = yield [next_tail]
+                pass_results = yield [ArithValue(vblk) + ArithValue(staged_stride_idx)]
             for vblk, pass_state in range(
                 pass_results,
                 ArithValue(vec_blocks_idx),
                 ArithValue(active_stride_idx),
                 init=[c_zero],
             ):
-                scan_vec_block(vblk, pass_id, start_bit, previous_start_bit, current_bits)
+                scan_vec_block(
+                    vblk, pass_id, start_bit, previous_start_bit, current_bits
+                )
                 pass_results = yield [pass_state[0]]
             gpu.barrier()
 
@@ -774,8 +724,9 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                             next_k,
                             next_bits,
                         )
-                    next_tail = ArithValue(vblk) + ArithValue(active_stride4_idx)
-                    write_results = yield [next_tail]
+                    write_results = yield [
+                        ArithValue(vblk) + ArithValue(active_stride4_idx)
+                    ]
                 for vblk, write_state in range(
                     write_results,
                     ArithValue(vec_blocks_idx),
@@ -786,19 +737,12 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                     write_results = yield [write_state[0]]
             return next_k, next_len, next_bits
 
-        global_vec_tid = part * ArithValue(c_block_i32) + tid
-        global_vec_tid_idx = arith.index_cast(T.index, global_vec_tid)
-        vec_blocks_i32 = ArithValue(
-            row_len + ArithValue(c_vec) - ArithValue(c_one)
-        ).shrui(fx.Int32(2))
-        vec_blocks_idx = arith.index_cast(T.index, vec_blocks_i32)
-
-        def one_cta_short_clone():
-            # Faithful clone of the standalone one-CTA unordered radix-select
-            # path for K=512. Runs entirely within a single CTA (part 0):
+        def one_workgroup_short_tier():
+            # Faithful copy of the standalone one-workgroup unordered radix-select.
+            # Runs entirely within a single workgroup (part 0):
             # LDS-only histograms, a hierarchical block scan to locate each
             # radix threshold, and a direct LDS-counter atomic-append write.
-            # Unlike the persistent multi-block path, this clone uses the
+            # Unlike the persistent multi-block path, this short tier uses the
             # standalone ascending ordered key and total-k threshold convention.
             # Three order-preserving passes peel 11/11/10 bits of that key, so
             # it requires a 2048-bin histogram
@@ -825,9 +769,9 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                 return ArithValue(ordered_key(val)).shrui(c_shift)
 
             def radix_bucket(val, shift, mask):
-                return ArithValue(ArithValue(ordered_key(val)).shrui(shift)) & ArithValue(
-                    mask
-                )
+                return ArithValue(
+                    ArithValue(ordered_key(val)).shrui(shift)
+                ) & ArithValue(mask)
 
             def clear_hist():
                 for h in range(
@@ -865,7 +809,9 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                         )
                 gpu.barrier()
 
-                wave_off = fx.memref_load(s_scan, ArithValue(wave) + ArithValue(c_red_slots))
+                wave_off = fx.memref_load(
+                    s_scan, ArithValue(wave) + ArithValue(c_red_slots)
+                )
                 last_off = fx.memref_load(
                     s_scan, ArithValue(c_last_wave) + ArithValue(c_red_slots)
                 )
@@ -902,7 +848,7 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             def hist_pass1_chunk(col_base, vec):
                 for j in range_constexpr(LOAD_VEC):
                     col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
-                    if ArithValue(col_i32) < row_len:
+                    if ArithValue(col_i32) < ArithValue(row_len):
                         val = vector.extract(
                             vec, static_position=[j], dynamic_position=[]
                         )
@@ -911,11 +857,13 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             def hist_pass2_chunk(col_base, vec, first_threshold):
                 for j in range_constexpr(LOAD_VEC):
                     col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
-                    if ArithValue(col_i32) < row_len:
+                    if ArithValue(col_i32) < ArithValue(row_len):
                         val = vector.extract(
                             vec, static_position=[j], dynamic_position=[]
                         )
-                        if ArithValue(ordered_bucket(val)) == ArithValue(first_threshold):
+                        if ArithValue(ordered_bucket(val)) == ArithValue(
+                            first_threshold
+                        ):
                             lds_atomic_add_i32(
                                 hist_base_ptr,
                                 radix_bucket(val, c_mid_shift, c_bin_mask),
@@ -925,16 +873,15 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             def hist_pass3_chunk(col_base, vec, first_threshold, second_threshold):
                 for j in range_constexpr(LOAD_VEC):
                     col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
-                    if ArithValue(col_i32) < row_len:
+                    if ArithValue(col_i32) < ArithValue(row_len):
                         val = vector.extract(
                             vec, static_position=[j], dynamic_position=[]
                         )
                         high_bucket = ordered_bucket(val)
                         mid_bucket = radix_bucket(val, c_mid_shift, c_bin_mask)
-                        matches_refine = (
-                            ArithValue(high_bucket) == ArithValue(first_threshold)
-                        ) & (ArithValue(mid_bucket) == ArithValue(second_threshold))
-                        if matches_refine:
+                        if (ArithValue(high_bucket) == ArithValue(first_threshold)) & (
+                            ArithValue(mid_bucket) == ArithValue(second_threshold)
+                        ):
                             lds_atomic_add_i32(
                                 hist_base_ptr,
                                 radix_bucket(val, c_zero, c_low_mask),
@@ -942,21 +889,34 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                             )
 
             def final_scatter_chunk(
-                col_base, vec, first_threshold, second_threshold, third_threshold, num_needed
+                col_base,
+                vec,
+                first_threshold,
+                second_threshold,
+                third_threshold,
+                num_needed,
             ):
                 for j in range_constexpr(LOAD_VEC):
                     col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
-                    if ArithValue(col_i32) < row_len:
+                    if ArithValue(col_i32) < ArithValue(row_len):
                         val = vector.extract(
                             vec, static_position=[j], dynamic_position=[]
                         )
                         high_bucket = ordered_bucket(val)
                         mid_bucket = radix_bucket(val, c_mid_shift, c_bin_mask)
                         low_bucket = radix_bucket(val, c_zero, c_low_mask)
-                        above_first = ArithValue(high_bucket) > ArithValue(first_threshold)
-                        at_first = ArithValue(high_bucket) == ArithValue(first_threshold)
-                        above_second = ArithValue(mid_bucket) > ArithValue(second_threshold)
-                        at_second = ArithValue(mid_bucket) == ArithValue(second_threshold)
+                        above_first = ArithValue(high_bucket) > ArithValue(
+                            first_threshold
+                        )
+                        at_first = ArithValue(high_bucket) == ArithValue(
+                            first_threshold
+                        )
+                        above_second = ArithValue(mid_bucket) > ArithValue(
+                            second_threshold
+                        )
+                        at_second = ArithValue(mid_bucket) == ArithValue(
+                            second_threshold
+                        )
                         above_low = ArithValue(low_bucket) > ArithValue(third_threshold)
                         at_low = ArithValue(low_bucket) == ArithValue(third_threshold)
                         strictly_above = above_first | (
@@ -997,7 +957,9 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                     ArithValue(vec_blocks_idx),
                     ArithValue(c_block_idx),
                 ):
-                    col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
+                    col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(
+                        c_vec
+                    )
                     chunk_fn(col_base, load_row_vec(col_base))
 
             # Pass 1: high 11 bits over the whole valid row.
@@ -1031,9 +993,7 @@ def create_topk_per_row_decode_tiered_k512_kernel(
             # Pass 3: low 10 bits within the high+mid boundary.
             clear_hist()
             reread_pass(
-                lambda cb, v: hist_pass3_chunk(
-                    cb, v, first_threshold, second_threshold
-                )
+                lambda cb, v: hist_pass3_chunk(cb, v, first_threshold, second_threshold)
             )
             gpu.barrier()
             second_above = fx.memref_load(
@@ -1063,52 +1023,48 @@ def create_topk_per_row_decode_tiered_k512_kernel(
                 )
             )
 
-        direct_fill = row_len <= ArithValue(c_top_k)
+        # Direct-fill: rows with row_len <= top_k (part 0 only) emit identity indices + -1.
+        direct_fill = ArithValue(row_len) <= ArithValue(c_top_k)
         direct_fill_active = (part == ArithValue(c_zero)) & direct_fill
-        direct_fill_iters = direct_fill_active.select(fx.Index(TOP_K), fx.Index(0))
+        direct_fill_iters = direct_fill_active.select(fx.Index(top_k), fx.Index(0))
         for out_col in range(
             ArithValue(tid_idx), ArithValue(direct_fill_iters), ArithValue(c_block_idx)
         ):
             out_col_i32 = arith.index_cast(T.i32, out_col)
-            valid = ArithValue(out_col_i32) < row_len
+            valid = ArithValue(out_col_i32) < ArithValue(row_len)
             out_val = valid.select(out_col_i32, c_neg_one)
             buffer_ops.buffer_store(
                 out_val, indices_rsrc, row_out + ArithValue(out_col_i32)
             )
 
-        if const_expr(short_clone):
-            # Short tier: only part 0 runs the one-CTA clone; every part > 0
-            # returns immediately without touching a row barrier or any
-            # workspace counter. The persistent multi-block path handles the
-            # mid/long tiers (active_parts > 1).
+        if const_expr(short_tier):
             short_active = (
                 single_part_active
                 & (part == ArithValue(c_zero))
-                & (row_len > ArithValue(c_top_k))
+                & (ArithValue(row_len) > ArithValue(c_top_k))
             )
             if short_active:
-                one_cta_short_clone()
+                one_workgroup_short_tier()
             persistent_active = (
-                (row_len > ArithValue(c_top_k))
+                (ArithValue(row_len) > ArithValue(c_top_k))
                 & (part < ArithValue(active_parts))
                 & (~single_part_active)
             )
         else:
-            persistent_active = (row_len > ArithValue(c_top_k)) & (
+            persistent_active = (ArithValue(row_len) > ArithValue(c_top_k)) & (
                 part < ArithValue(active_parts)
             )
+
         if persistent_active:
             local_k = c_top_k
-            local_len = row_len
             kth_bits = c_zero
-
             for pass_id in range_constexpr(num_passes):
-                local_k, local_len, kth_bits = scan_pass(
+                local_k, _local_len, kth_bits = scan_pass(
                     pass_id, local_k, kth_bits, pass_id + 1
                 )
 
     @flyc.jit
-    def launch_topk_per_row_decode_tiered_k512(
+    def launcher(
         logits: fx.Tensor,
         next_n: fx.Int32,
         seq_lens: fx.Tensor,
@@ -1117,22 +1073,15 @@ def create_topk_per_row_decode_tiered_k512_kernel(
         num_rows: fx.Int32,
         stride0: fx.Int32,
         stride1: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
+        stream: fx.Stream,
+    ) -> None:
         grid_y = arith.index_cast(T.index, num_rows)
-        topk_per_row_decode_tiered_k512_kernel(
-            logits,
-            next_n,
-            seq_lens,
-            indices,
-            workspace,
-            num_rows,
-            stride0,
-            stride1,
+        topk_per_row_decode_tiered_kernel(
+            logits, next_n, seq_lens, indices, workspace, stride0
         ).launch(
             grid=(blocks_per_row, grid_y, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    return launch_topk_per_row_decode_tiered_k512
+    return launcher

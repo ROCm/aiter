@@ -2,6 +2,7 @@ import argparse
 import csv
 import importlib
 import os
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,7 +86,9 @@ def make_row_ends(
     next_n: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    seq_lens = torch.full((batch_size,), max_model_len, dtype=torch.int32, device=device)
+    seq_lens = torch.full(
+        (batch_size,), max_model_len, dtype=torch.int32, device=device
+    )
     row_ids = torch.arange(num_rows, dtype=torch.int64, device=device)
     batch_ids = row_ids // next_n
     next_offsets = row_ids % next_n
@@ -121,7 +124,9 @@ def make_values(
         logits = logits_bits.view(dtype)
         if distribution == "mixed":
             mask = torch.randint(0, 2, (shape[0], 1), device=device).bool()
-            logits = torch.where(mask, logits, torch.randn(shape, dtype=dtype, device=device))
+            logits = torch.where(
+                mask, logits, torch.randn(shape, dtype=dtype, device=device)
+            )
         return logits
     if distribution == "ties":
         return torch.randint(-16, 16, shape, dtype=torch.int32, device=device).to(dtype)
@@ -164,12 +169,16 @@ def make_logits(
     return logits
 
 
-def torch_reference(logits: torch.Tensor, row_ends: torch.Tensor, k: int) -> torch.Tensor:
+def torch_reference(
+    logits: torch.Tensor, row_ends: torch.Tensor, k: int
+) -> torch.Tensor:
     ref_k = min(k, logits.shape[1])
     indices = torch.topk(logits, ref_k, dim=-1).indices.to(torch.int32)
     if ref_k == k:
         return indices
-    padded = torch.full((logits.shape[0], k), -1, dtype=torch.int32, device=logits.device)
+    padded = torch.full(
+        (logits.shape[0], k), -1, dtype=torch.int32, device=logits.device
+    )
     padded[:, :ref_k] = indices
     return padded
 
@@ -230,24 +239,30 @@ def time_kernel(
     warmup: int,
     iters: int,
     enabled: bool,
-) -> str:
+) -> tuple[str, str]:
+    """Return (median_latency_us, std_us) from per-call CUDA-event timings."""
     if not enabled:
         fn()
         torch.cuda.synchronize()
-        return "na"
+        return "na", "na"
 
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
+    starts = [torch.cuda.Event(enable_timing=True)]
+    ends = [torch.cuda.Event(enable_timing=True)]
+    samples_us: list[float] = []
+    for i in range(iters):
+        starts[i].record()
         fn()
-    end.record()
-    end.synchronize()
-    return f"{start.elapsed_time(end) * 1000.0 / iters:.3f}"
+        ends[i].record()
+        torch.cuda.synchronize()
+
+    samples_us = [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]
+    median_us = statistics.median(samples_us)
+    std_us = statistics.stdev(samples_us)
+    return f"{median_us:.3f}", f"{std_us:.3f}"
 
 
 def load_aiter_module() -> tuple[object | None, str]:
@@ -283,7 +298,12 @@ def load_vllm_kernel(vllm_path: str | None) -> Kernel:
 
 def load_flydsl_kernel(symbol: str | None, flydsl_path: str | None) -> Kernel:
     if not symbol:
-        return Kernel("flydsl", False, "not configured; pass --flydsl-symbol module:function", None)
+        return Kernel(
+            "flydsl",
+            False,
+            "not configured; pass --flydsl-symbol module:function",
+            None,
+        )
     add_path_if_present(flydsl_path)
     try:
         module_name, func_name = symbol.split(":", maxsplit=1)
@@ -315,14 +335,23 @@ def build_kernels(args: argparse.Namespace, arch: str) -> list[Kernel]:
 
     co_path = repo_root() / TOPK_CO_PATH
     needs_aiter = selected("aiter_hip", selected_kernels) or (
-        selected("aiter_asm", selected_kernels) and arch == "gfx942" and co_path.exists()
+        selected("aiter_asm", selected_kernels)
+        and arch == "gfx942"
+        and co_path.exists()
     )
     aiter_mod, aiter_note = load_aiter_module() if needs_aiter else (None, "")
     if selected("aiter_hip", selected_kernels):
         if aiter_mod is None:
             kernels.append(Kernel("aiter_hip", False, aiter_note, None))
         else:
-            kernels.append(Kernel("aiter_hip", True, "aiter.top_k_per_row_decode", aiter_mod.top_k_per_row_decode))
+            kernels.append(
+                Kernel(
+                    "aiter_hip",
+                    True,
+                    "aiter.top_k_per_row_decode",
+                    aiter_mod.top_k_per_row_decode,
+                )
+            )
 
     if selected("aiter_asm", selected_kernels):
         if arch != "gfx942":
@@ -464,6 +493,7 @@ def run_shape(
                     shape.next_n,
                     shape.stride_mode,
                     "na",
+                    "na",
                     "reference",
                     note,
                 ],
@@ -481,6 +511,7 @@ def run_shape(
                     shape.max_model_len,
                     shape.next_n,
                     shape.stride_mode,
+                    "na",
                     "na",
                     "unavailable",
                     "fast path only supports k=2048",
@@ -500,13 +531,16 @@ def run_shape(
                     shape.next_n,
                     shape.stride_mode,
                     "na",
+                    "na",
                     "unavailable",
                     note,
                 ],
             )
             continue
 
-        indices = torch.empty((shape.num_rows, shape.k), dtype=torch.int32, device=device)
+        indices = torch.empty(
+            (shape.num_rows, shape.k), dtype=torch.int32, device=device
+        )
 
         def invoke() -> None:
             run_kernel(
@@ -520,7 +554,9 @@ def run_shape(
             )
 
         try:
-            latency = time_kernel(invoke, args.warmup, args.iters, not args.correctness_only)
+            latency, latency_std = time_kernel(
+                invoke, args.warmup, args.iters, not args.correctness_only
+            )
             ok, compare_note = compare_indices(
                 logits,
                 indices,
@@ -534,6 +570,7 @@ def run_shape(
                 note = f"{note}; {compare_note}"
         except Exception as exc:
             latency = "na"
+            latency_std = "na"
             correctness = "error"
             note = f"{note}; {type(exc).__name__}: {exc}"
 
@@ -548,6 +585,7 @@ def run_shape(
                 shape.next_n,
                 shape.stride_mode,
                 latency,
+                latency_std,
                 correctness,
                 note,
             ],
@@ -627,7 +665,7 @@ def main() -> None:
         raise SystemExit("A CUDA/HIP-visible AMD device is required.")
 
     add_repo_to_python_path()
-    torch.set_default_device("cuda:0")
+    # torch.set_default_device("cuda:0")
     arch = arch_name()
     kernels = build_kernels(args, arch)
     writer = csv.writer(sys.stdout)
@@ -642,6 +680,7 @@ def main() -> None:
             "next_n",
             "stride_mode",
             "latency_us",
+            "latency_std_us",
             "correctness",
             "notes",
         ],

@@ -2,7 +2,7 @@
 
 """FlyDSL decode TopK-per-row kernel builders.
 
-This module contains the single-CTA unordered radix-select implementation used
+This module contains the single-workgroup unordered radix-select implementation used
 for non-tiered TopK sizes. K=512 is served by the tiered persistent kernel, so
 the non-tiered ordered compact/bitonic paths are intentionally absent.
 
@@ -27,7 +27,7 @@ RED_SLOTS = (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE
 # Width of the vectorized (stride-1) global load used by the radix passes.
 # Reading 4 contiguous fp32 logits per buffer instruction quarters the VMEM
 # instruction count of every full-row pass, which is the dominant cost of the
-# one-CTA-per-row decode kernel (cost grows ~linearly with row length).
+# one-workgroup-per-row decode kernel (cost grows ~linearly with row length).
 LOAD_VEC = 4
 RADIX_BITS = 11
 RADIX_BINS = 1 << RADIX_BITS
@@ -40,7 +40,7 @@ def create_topk_per_row_decode_kernel(top_k: int):
     Launcher signature matches the existing decode interface:
     ``(logits, next_n, seqLens, indices, numRows, stride0, stride1, stream=...)``.
     The output is an unordered Top-K set. K=512 is intentionally handled by the
-    tiered persistent kernel, which embeds the one-CTA clone for short rows.
+    tiered persistent kernel, which embeds the one-workgroup short tier for short rows.
     """
 
     if top_k <= 0:

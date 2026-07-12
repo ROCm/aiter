@@ -27,10 +27,10 @@ RUNNER = REPO_ROOT / "op_tests" / "topk_decode_rocprof_runner.py"
 # Substring/regex that identifies the kernel-under-test in the mangled name.
 KERNEL_MATCH = {
     "flydsl": re.compile(r"topk_per_row_decode_radix_unordered_k2048"),
-    "flydsl_tiered": re.compile(
-        r"topk_per_row_decode_persistent_k512_bpp\d+_g\d+_v\d+_stage\d+.*_tiered"
+    "flydsl_tiered": re.compile(r"topk_per_row_decode_persistent_k"),
+    "aiter_hip": re.compile(
+        r"radix_topk_one_block_kernel|radix_kernel|last_filter_kernel"
     ),
-    "aiter_hip": re.compile(r"radix_topk_one_block_kernel|radix_kernel|last_filter_kernel"),
     "vllm": re.compile(r"topKPerRowDecode"),
 }
 
@@ -55,15 +55,20 @@ def run_cell(
     pmc: list[str] | None,
     pmc_kernel_regex: str | None,
     stat: str = "median",
-) -> tuple[float, int, str]:
+    boost_ms: float = 0.0,
+) -> tuple[float, float, int, str]:
     width_tag = "" if max_width is None else f"_W{max_width}"
     tag = f"{kernel}_k{k}_rows{num_rows}_L{L}{width_tag}"
     out_file = outdir / tag
     for f in glob.glob(str(out_file) + "*"):
         os.remove(f)
     cmd = [
-        "rocprofv3", "--kernel-trace", "--output-format", "csv",
-        "--output-file", str(out_file),
+        "rocprofv3",
+        "--kernel-trace",
+        "--output-format",
+        "csv",
+        "--output-file",
+        str(out_file),
     ]
     if pmc:
         cmd += ["--pmc", *pmc]
@@ -71,38 +76,58 @@ def run_cell(
         cmd += ["--kernel-include-regex", pmc_kernel_regex]
     cmd += [
         "--",
-        sys.executable, str(RUNNER),
-        "--kernel", kernel, "--k", str(k), "--L", str(L),
-        "--num-rows", str(num_rows),
-        "--iters", str(iters), "--warmup", str(warmup),
-        "--distribution", distribution,
+        sys.executable,
+        str(RUNNER),
+        "--kernel",
+        kernel,
+        "--k",
+        str(k),
+        "--L",
+        str(L),
+        "--num-rows",
+        str(num_rows),
+        "--iters",
+        str(iters),
+        "--warmup",
+        str(warmup),
+        "--boost-ms",
+        str(boost_ms),
+        "--distribution",
+        distribution,
     ]
     if max_width is not None:
         cmd += ["--max-width", str(max_width)]
     env = os.environ.copy()
     env.update(KERNEL_ENV.get(kernel, {}))
+    print(f"\n\n{cmd}\n\n")
+    print(f"\n\n{' '.join(cmd)}\n\n")
     log = subprocess.run(cmd, capture_output=True, text=True, env=env)
     csvs = glob.glob(str(out_file) + "*kernel_trace.csv")
     if not csvs:
-        return float("nan"), 0, f"no trace ({log.returncode}): {log.stderr[-200:]}"
+        return (
+            float("nan"),
+            float("nan"),
+            0,
+            f"no trace ({log.returncode}): {log.stderr[-200:]}",
+        )
 
     rows = list(csv.DictReader(open(csvs[0])))
     pat = KERNEL_MATCH[kernel]
     matched = [r for r in rows if pat.search(r["Kernel_Name"])]
     if not matched:
         names = {r["Kernel_Name"][:60] for r in rows}
-        return float("nan"), 0, f"no matching kernel; saw {names}"
+        return float("nan"), float("nan"), 0, f"no matching kernel; saw {names}"
 
     matched.sort(key=lambda r: int(r["Start_Timestamp"]))
     total_launches = warmup + iters
     kpc = max(1, len(matched) // total_launches)  # kernels per call (multi-block > 1)
     # Drop warmup launches, keep the measured tail.
-    measured = matched[warmup * kpc:]
+    measured = matched[warmup * kpc :]
     durs_ns = [int(r["End_Timestamp"]) - int(r["Start_Timestamp"]) for r in measured]
     # Per-call time = sum of the kpc kernels in each call.
-    per_call = [sum(durs_ns[i:i + kpc]) for i in range(0, len(durs_ns), kpc)]
+    per_call = [sum(durs_ns[i : i + kpc]) for i in range(0, len(durs_ns), kpc)]
     if not per_call:
-        return float("nan"), kpc, "no measured launches"
+        return float("nan"), float("nan"), kpc, "no measured launches"
     # ``min`` is robust to noisy co-tenant GPU contention (sharing CUs only ever
     # inflates a kernel's measured duration), while ``median`` is the default.
     reduce_fn = min if stat == "min" else statistics.median
@@ -125,14 +150,18 @@ def run_cell(
                         row["Counter_Name"], 0.0
                     ) + float(row["Counter_Value"])
                 counter_note = ", ".join(
-                    f"{name}={value:.0f}" for name, value in sorted(counter_totals.items())
+                    f"{name}={value:.0f}"
+                    for name, value in sorted(counter_totals.items())
                 )
                 note = (
                     f"{note}; VGPR={resource.get('VGPR_Count')}, "
                     f"SGPR={resource.get('SGPR_Count')}, "
                     f"LDS={resource.get('LDS_Block_Size')}, {counter_note}"
                 ).strip("; ")
-    return reduce_fn(per_call) / 1000.0, kpc, note  # us
+
+    # note: min + std doesn't make much sense statistically, median + std does
+    std_us = statistics.stdev(per_call) / 1000.0
+    return reduce_fn(per_call) / 1000.0, std_us, kpc, note  # us
 
 
 def main() -> None:
@@ -150,8 +179,18 @@ def main() -> None:
         type=int,
         nargs="+",
         default=[
-            1024, 2048, 4096, 8192, 12288, 14336, 16384,
-            24576, 32768, 49152, 65536, 120000,
+            1024,
+            2048,
+            4096,
+            8192,
+            12288,
+            14336,
+            16384,
+            24576,
+            32768,
+            49152,
+            65536,
+            120000,
         ],
     )
     ap.add_argument("--num-rows", type=int, default=1)
@@ -163,6 +202,12 @@ def main() -> None:
     )
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument(
+        "--boost-ms",
+        type=float,
+        default=250.0,
+        help="Run the GPU with a dummy matmul for this many ms to stabilize clocks.",
+    )
     ap.add_argument(
         "--stat",
         choices=["median", "min"],
@@ -187,15 +232,11 @@ def main() -> None:
     for kernel in args.kernels:
         if kernel not in KERNEL_MATCH:
             raise SystemExit(f"unknown kernel {kernel}; choices={sorted(KERNEL_MATCH)}")
-    if 512 in args.k and "flydsl" in args.kernels:
-        raise SystemExit("Use flydsl_tiered for K=512; standalone flydsl K=512 was pruned")
-    if any(k != 512 for k in args.k) and "flydsl_tiered" in args.kernels:
-        raise SystemExit("flydsl_tiered only supports K=512")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    results: dict[tuple[str, int, int], tuple[float, int, str]] = {}
+    results: dict[tuple[str, int, int], tuple[float, float, int, str]] = {}
     for kernel in args.kernels:
         for k in args.k:
             for L in args.L:
@@ -212,18 +253,25 @@ def main() -> None:
                     args.pmc,
                     args.pmc_kernel_regex,
                     args.stat,
+                    args.boost_ms,
                 )
                 results[(kernel, k, L)] = res
                 print(
                     f"[{kernel:9s} k={k:4d} rows={args.num_rows:2d} L={L:6d}] "
-                    f"{res[0]:7.2f} us  {res[2]}",
+                    f"{res[0]:7.2f} +/- {res[1]:5.2f} us  {res[3]}",
                     flush=True,
                 )
 
     # Markdown table: rows = (k, L), columns = kernels.
     print(
         "\n## Kernel-only %s latency (us), distribution=%s, num_rows=%d, max_width=%s, iters=%d"
-        % (args.stat, args.distribution, args.num_rows, args.max_width or "L", args.iters)
+        % (
+            args.stat,
+            args.distribution,
+            args.num_rows,
+            args.max_width or "L",
+            args.iters,
+        )
     )
     header = "| k | num_rows | L | " + " | ".join(args.kernels) + " |"
     sep = "|" + "---|" * (3 + len(args.kernels))
@@ -233,8 +281,8 @@ def main() -> None:
         for L in args.L:
             cells = []
             for kernel in args.kernels:
-                v = results[(kernel, k, L)][0]
-                cells.append("na" if v != v else f"{v:.2f}")
+                v, s = results[(kernel, k, L)][0], results[(kernel, k, L)][1]
+                cells.append("na" if v != v else f"{v:.2f}±{s:.2f}")
             print(f"| {k} | {args.num_rows} | {L} | " + " | ".join(cells) + " |")
 
 
