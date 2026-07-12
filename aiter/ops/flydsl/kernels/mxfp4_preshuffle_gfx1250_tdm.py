@@ -146,8 +146,8 @@ def launch_gemm_a8w4_tdm(
         def _lv(ptr, shape, stride):  # LDS ring-slot view
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
-        def _tdm_v(view, dim1):  # carry the outer-dim OOB extent on the global operand
-            return fx.rocdl.make_tdm_tensor(view, tensor_dim1=dim1)
+        def _tdm_v(view, outer):  # carry the outer-dim OOB extent on the global operand
+            return fx.rocdl.make_tdm_tensor(view, tensor_extents=[outer])
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
