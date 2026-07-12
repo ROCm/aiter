@@ -146,6 +146,9 @@ def launch_gemm_a8w4_tdm(
         def _lv(ptr, shape, stride):  # LDS ring-slot view
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
+        def _tdm_v(view, dim1):  # carry the outer-dim OOB extent on the global operand
+            return fx.rocdl.make_tdm_tensor(view, tensor_dim1=dim1)
+
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
@@ -169,12 +172,12 @@ def launch_gemm_a8w4_tdm(
             sb_off = sb_super_off * SB_OUTER_STRIDE + kt * SC_INNER + sb_batch_off
             AT, BT = (tile_m, tile_k), (tile_n // 16, PACK_TK * 16)
             SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
-            fx.copy(tdm_ab, _gv(gA_base, a_off, AT, (A_OUTER_STRIDE, 1)),
-                    _lv(pA[s], AT, (A_LDS_ROW, 1)), oob_outer=mn_oob)
+            fx.copy(tdm_ab, _tdm_v(_gv(gA_base, a_off, AT, (A_OUTER_STRIDE, 1)), mn_oob),
+                    _lv(pA[s], AT, (A_LDS_ROW, 1)))
             fx.copy(tdm_ab, _gv(gB_base, b_off, BT, (Kp * 16, 1)),
                     _lv(pB[s], BT, (B_LDS_ROW, 1)))
-            fx.copy(tdm_sc, _gv(gSA_base, sa_off, SAT, (SA_OUTER_STRIDE, 1)),
-                    _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)), oob_outer=sa_oob)
+            fx.copy(tdm_sc, _tdm_v(_gv(gSA_base, sa_off, SAT, (SA_OUTER_STRIDE, 1)), sa_oob),
+                    _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)))
             fx.copy(tdm_sc, _gv(gSB_base, sb_off, SBT, (SB_OUTER_STRIDE, 1)),
                     _lv(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
 
@@ -258,7 +261,7 @@ def launch_gemm_a8w4_tdm(
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
         workgroup_barrier()
         fx.copy(tdm_c, _lv(fx.recast_iter(out_elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)),
-                _gv(gC_base, c_off, (tile_m, tile_n), (C_OUTER_STRIDE, 1)), oob_outer=mn_oob)
+                _tdm_v(_gv(gC_base, c_off, (tile_m, tile_n), (C_OUTER_STRIDE, 1)), mn_oob))
         tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
