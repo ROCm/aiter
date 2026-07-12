@@ -54,20 +54,16 @@ def launch_gemm_a8w4_tdm(
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
 
-    A_TILE_B = tile_m * tile_k
-    B_TILE_B = (tile_n // 16) * (PACK_TK * 16)
     A_LDS_ROW = tile_k
     B_LDS_ROW = PACK_TK * 16
-    STAGE_A = ((A_TILE_B + 15) // 16) * 16
-    STAGE_B = ((B_TILE_B + 15) // 16) * 16
+    STAGE_A = ((tile_m * tile_k + 15) // 16) * 16
+    STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
 
     SC_INNER = tile_k // 4
     SA_SUPERS = tile_m // 32
     SB_SUPERS = tile_n // 32
-    SA_TILE_W = SA_SUPERS * SC_INNER
-    SB_TILE_W = SB_SUPERS * SC_INNER
-    STAGE_SA = ((SA_TILE_W * 4 + 15) // 16) * 16
-    STAGE_SB = ((SB_TILE_W * 4 + 15) // 16) * 16
+    STAGE_SA = ((SA_SUPERS * SC_INNER * 4 + 15) // 16) * 16
+    STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 127) // 128) * 128
@@ -115,25 +111,21 @@ def launch_gemm_a8w4_tdm(
         m64 = fx.Int64(i32_m)
         bz64 = fx.Int64(bid_z) if const_expr(batch > 1) else 0
 
-        # ── scale (n32k4, i32 words) per-batch base offset + super stride. ──
+        # ── scale (n32k4 i32-word) super stride + per-batch base, and C geometry;
+        # mbn interleaves batch into the super/row stride, bmn stacks per-batch. ──
         if const_expr(layout_mbn):
-            SA_OUTER_STRIDE = batch * (K // 4)
+            SA_OUTER_STRIDE, C_OUTER_STRIDE = batch * (K // 4), batch * N
             sa_batch_off = bz64 * (K // 4)
-        else:
-            SA_OUTER_STRIDE = K // 4
-            sa_batch_off = bz64 * ((m64 + 31) // 32) * (K // 4)
-        SB_OUTER_STRIDE = K // 4
-        sb_batch_off = bz64 * (N_SUPERS * (K // 4))
-        # OOB (tile-start-relative): valid M rows (A load / C store) and M-supers
-        mn_oob = i32_m - blk_m
-        sa_oob = (i32_m + 31) // 32 - blk_m // 32
-
-        if const_expr(layout_mbn):
-            C_OUTER_STRIDE = batch * N
             c_off = blk_m64 * (batch * N) + bz64 * N + blk_n64
         else:
-            C_OUTER_STRIDE = N
+            SA_OUTER_STRIDE, C_OUTER_STRIDE = K // 4, N
+            sa_batch_off = bz64 * ((m64 + 31) // 32) * (K // 4)
             c_off = (bz64 * m64 + blk_m64) * N + blk_n64
+        SB_OUTER_STRIDE = K // 4
+        sb_batch_off = bz64 * (N_SUPERS * (K // 4))
+        # OOB (tile-start-relative): valid M rows (A load / C store), M-supers (scale-A).
+        mn_oob = i32_m - blk_m
+        sa_oob = (i32_m + 31) // 32 - blk_m // 32
 
         base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr  # uint8 shared
         pA = [fx.add_offset(base_ptr, i * PITCH) for i in range_constexpr(num_buffers)]
@@ -148,11 +140,11 @@ def launch_gemm_a8w4_tdm(
         stSA_idx, stSB_idx = [_bidx(p) for p in pSA], [_bidx(p) for p in pSB]
         stC_idx = _bidx(base_ptr)
 
-        def _view(it, shape, stride):
-            return fx.Tensor(fx.make_view(it, fx.make_layout(shape, stride)))
+        def _gv(base, off, shape, stride):  # offset a global base -> tile view
+            return fx.Tensor(fx.make_view(fx.add_offset(base, off), fx.make_layout(shape, stride)))
 
-        def _goff(base, off):
-            return fx.add_offset(base, off)
+        def _lv(ptr, shape, stride):  # LDS ring-slot view
+            return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -177,14 +169,14 @@ def launch_gemm_a8w4_tdm(
             sb_off = sb_super_off * SB_OUTER_STRIDE + kt * SC_INNER + sb_batch_off
             AT, BT = (tile_m, tile_k), (tile_n // 16, PACK_TK * 16)
             SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
-            fx.copy(tdm_ab, _view(_goff(gA_base, a_off), AT, (A_OUTER_STRIDE, 1)),
-                    _view(pA[s], AT, (A_LDS_ROW, 1)), oob_outer=mn_oob)
-            fx.copy(tdm_ab, _view(_goff(gB_base, b_off), BT, (Kp * 16, 1)),
-                    _view(pB[s], (tile_n // 16, B_LDS_ROW), (B_LDS_ROW, 1)))
-            fx.copy(tdm_sc, _view(_goff(gSA_base, sa_off), SAT, (SA_OUTER_STRIDE, 1)),
-                    _view(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)), oob_outer=sa_oob)
-            fx.copy(tdm_sc, _view(_goff(gSB_base, sb_off), SBT, (SB_OUTER_STRIDE, 1)),
-                    _view(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
+            fx.copy(tdm_ab, _gv(gA_base, a_off, AT, (A_OUTER_STRIDE, 1)),
+                    _lv(pA[s], AT, (A_LDS_ROW, 1)), oob_outer=mn_oob)
+            fx.copy(tdm_ab, _gv(gB_base, b_off, BT, (Kp * 16, 1)),
+                    _lv(pB[s], BT, (B_LDS_ROW, 1)))
+            fx.copy(tdm_sc, _gv(gSA_base, sa_off, SAT, (SA_OUTER_STRIDE, 1)),
+                    _lv(fx.recast_iter(fx.Int32, pSA[s]), SAT, (SC_INNER, 1)), oob_outer=sa_oob)
+            fx.copy(tdm_sc, _gv(gSB_base, sb_off, SBT, (SB_OUTER_STRIDE, 1)),
+                    _lv(fx.recast_iter(fx.Int32, pSB[s]), SBT, (SC_INNER, 1)))
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -265,8 +257,8 @@ def launch_gemm_a8w4_tdm(
                 i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
         workgroup_barrier()
-        fx.copy(tdm_c, _view(fx.recast_iter(out_elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)),
-                _view(_goff(gC_base, c_off), (tile_m, tile_n), (C_OUTER_STRIDE, 1)), oob_outer=mn_oob)
+        fx.copy(tdm_c, _lv(fx.recast_iter(out_elem_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)),
+                _gv(gC_base, c_off, (tile_m, tile_n), (C_OUTER_STRIDE, 1)), oob_outer=mn_oob)
         tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
