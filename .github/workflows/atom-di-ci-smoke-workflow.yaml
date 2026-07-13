@@ -226,6 +226,7 @@ jobs:
           policy_old = '    --policy "${ROUTER_POLICY}"\n'
           policy_new = (
               '    --policy "${ROUTER_POLICY}"\n'
+              '    --dp-aware\n'
               '    --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"\n'
           )
           if policy_new not in text:
