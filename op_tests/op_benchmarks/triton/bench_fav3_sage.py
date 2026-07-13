@@ -33,6 +33,7 @@ from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
@@ -469,6 +470,9 @@ def fav3_sage_forward_func(
     causal: bool,
     layout: Literal["bshd", "bhsd"],
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    hadamard_rotation: bool = False,
+    R: Optional[torch.Tensor] = None,
+    BLOCK_R: Optional[int] = None,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
@@ -482,6 +486,9 @@ def fav3_sage_forward_func(
         return_lse=False,
         layout=layout,
         block_lut=block_lut,
+        hadamard_rotation=hadamard_rotation,
+        R=R,
+        BLOCK_R=BLOCK_R,
     )
 
 
@@ -678,7 +685,18 @@ def primary_output(result):
 
 
 def attn_forward_func(
-    q, k, v, func_name, softmax_scale, k_smooth, layout, dtype, block_lut=None
+    q,
+    k,
+    v,
+    func_name,
+    softmax_scale,
+    k_smooth,
+    layout,
+    dtype,
+    block_lut=None,
+    hadamard_rotation=False,
+    R=None,
+    BLOCK_R=None,
 ):
     if func_name == "fav3_sage":  # fav3 sage hybrid
         fn = fav3_sage_forward_func(
@@ -688,6 +706,9 @@ def attn_forward_func(
             causal=False,
             layout=layout,
             block_lut=block_lut,
+            hadamard_rotation=hadamard_rotation,
+            R=R,
+            BLOCK_R=BLOCK_R,
         )
     else:
         q, k, v = layout_preprocess(q, k, v, layout=layout, target_layout="bshd")
@@ -748,6 +769,22 @@ def bench_kernel(
     softmax_scale = 1.0 / (D_HEAD**0.5)
     k_smooth = args.k_smooth
 
+    hadamard_rotation = getattr(args, "hadamard_rotate", False)
+    block_r = getattr(args, "BLOCK_R", None)
+    r = None
+    if hadamard_rotation:
+        if block_r is None:
+            block_r = D_HEAD
+        if block_r > D_HEAD:
+            raise ValueError(f"BLOCK_R ({block_r}) must be <= head dim ({D_HEAD})")
+        if D_HEAD % block_r != 0:
+            raise ValueError(
+                f"head dim ({D_HEAD}) must be divisible by BLOCK_R ({block_r})"
+            )
+        r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+            block_r**0.5
+        )
+
     # FLOPS calculation variables (same OPS definition as plan)
     total_flops = 0.0
     total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
@@ -773,6 +810,9 @@ def bench_kernel(
         layout=args.layout,
         dtype=arg_to_torch_dtype[args.dtype],
         block_lut=block_lut,
+        hadamard_rotation=hadamard_rotation,
+        R=r,
+        BLOCK_R=block_r if hadamard_rotation else None,
     )
     rep = getattr(args, "rep", 100)
     warmup = getattr(args, "warmup", 25)
@@ -1334,6 +1374,18 @@ def parse_args():
         type=int,
         default=None,
         help="When --block_sparsity is set: run this many times with new random mask each time; report throughput stats. Ignored with --block_mask_file.",
+    )
+    parser.add_argument(
+        "-hadamard_rotate",
+        type=lambda v: bool(int(v)),
+        default=False,
+        help="Apply Hadamard rotation before INT8 Q/K quant: 1/0 (default 0)",
+    )
+    parser.add_argument(
+        "-BLOCK_R",
+        type=int,
+        default=128,
+        help="Hadamard matrix size; must divide head dim",
     )
     parser.add_argument(
         "--rep",
