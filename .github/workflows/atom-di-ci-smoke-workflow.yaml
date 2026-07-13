@@ -293,6 +293,10 @@ jobs:
                   )
               cell["nodes"] = node_list[:required_nodes]
 
+          cell_env = cell.setdefault("env", {})
+          for scope in ("common", "prefill", "decode"):
+              cell_env.setdefault(scope, {})["ATOM_PD_RANK_MAPPING_POLICY"] = "idx2idx"
+
           Path("../atomesh-cell.json").write_text(
               json.dumps(cell, indent=2),
               encoding="utf-8",
