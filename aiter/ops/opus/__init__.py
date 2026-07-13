@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""opus kernel Python user-facing API; a16w16 today, a8w8 in follow-ups.
+"""opus kernel Python user-facing API.
 
 Public API: `gemm_a16w16_opus` (CSV lookup + C++ heuristic) and
-`opus_gemm_a16w16_tune` (id-based binding). On unsupported arch the
-two callables become stubs that raise RuntimeError on invocation, so
-`import aiter` keeps working alongside its 30+ other ops.
+`opus_gemm_a16w16_tune` (id-based binding). The gfx942 A8W8 blockscale
+bpreshuffle entry is an explicit tune API.
 """
 
 from ._arch import _detect_arch
 
 _SUPPORTED = {"gfx950", "gfx942", "gfx1250"}
-_FEATURE = "aiter.ops.opus (a16w16)"
+_FEATURE = "aiter.ops.opus"
 _HINT = (
     "opus_gemm supports gfx950 (MFMA 16x16x32 / ds_read_b64_tr / 160 KiB "
     "LDS) and gfx942 (MFMA 16x16x16 / ds_read_b128 / 64 KiB LDS). Set "
@@ -43,16 +42,28 @@ if _arch_ok:
         gemm_a16w16_opus,
         opus_gemm_workspace_init,
     )
+
+    def opus_gemm_a8w8_blockscale_bpreshuffle_tune(*args, **kwargs):
+        from .gemm_op_a8w8 import (
+            opus_gemm_a8w8_blockscale_bpreshuffle_tune as _impl,
+        )
+
+        return _impl(*args, **kwargs)
+
 else:
     # Don't raise ImportError -- aiter/__init__.py's star-import would catch
     # it and silently disable the 30+ subsequent op imports.
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
+    opus_gemm_a8w8_blockscale_bpreshuffle_tune = _make_unsupported_arch_stub(
+        "opus_gemm_a8w8_blockscale_bpreshuffle_tune"
+    )
     opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")
 
 
 __all__ = [
     "opus_gemm_a16w16_tune",
+    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
 ]

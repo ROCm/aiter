@@ -6,19 +6,19 @@
 #include "hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh"
 #include "mla.h"
 
-void hk_mla_decode_fwd(torch::Tensor& query,
-                       torch::Tensor& kv_buffer,
-                       const torch::Tensor& qo_indptr,
-                       const torch::Tensor& kv_indptr,
-                       const torch::Tensor& kv_page_indices,
-                       const torch::Tensor& kv_last_page_lens,
-                       const torch::Tensor& work_indptr,
-                       const torch::Tensor& work_info_set,
-                       const int max_seqlen_q,
-                       const float softmax_scale,
-                       torch::Tensor& split_output,
-                       torch::Tensor& split_lse,
-                       torch::Tensor& final_output)
+void hk_mla_v32_decode_fwd(aiter_tensor_t& query,
+                           aiter_tensor_t& kv_buffer,
+                           const aiter_tensor_t& qo_indptr,
+                           const aiter_tensor_t& kv_indptr,
+                           const aiter_tensor_t& kv_page_indices,
+                           const aiter_tensor_t& kv_last_page_lens,
+                           const aiter_tensor_t& work_indptr,
+                           const aiter_tensor_t& work_info_set,
+                           const int max_seqlen_q,
+                           const float softmax_scale,
+                           aiter_tensor_t& split_output,
+                           aiter_tensor_t& split_lse,
+                           aiter_tensor_t& final_output)
 {
     const int32_t num_head = query.size(1);
 
@@ -59,8 +59,8 @@ void hk_mla_decode_fwd(torch::Tensor& query,
         }
         else
         {
-            TORCH_CHECK(false,
-                        "hk_mla_decode_fwd: unsupported GPU arch '",
+            AITER_CHECK(false,
+                        "hk_mla_v32_decode_fwd: unsupported GPU arch '",
                         gfx,
                         "' (supported: gfx942, gfx950).");
         }
@@ -86,15 +86,17 @@ void hk_mla_decode_fwd(torch::Tensor& query,
         }
         else
         {
-            TORCH_CHECK(
-                false, "hk_mla_decode_fwd: unsupported GPU arch '", gfx, "' (supported: gfx950).");
+            AITER_CHECK(false,
+                        "hk_mla_v32_decode_fwd: unsupported GPU arch '",
+                        gfx,
+                        "' (supported: gfx950).");
         }
     }
     else
     {
-        TORCH_CHECK(
+        AITER_CHECK(
             false,
-            "hk_mla_decode_fwd requires num_head * max_seqlen_q == 64 or 128, got num_head = ",
+            "hk_mla_v32_decode_fwd requires num_head * max_seqlen_q == 64 or 128, got num_head = ",
             num_head,
             ", max_seqlen_q = ",
             max_seqlen_q);
