@@ -287,7 +287,6 @@ def _bench_graph(fn):
         graph.replay()
 
     _, us = _replay()
-    del graph
     return us
 
 
@@ -338,7 +337,7 @@ def bench_worker(
         results[n] = row
 
         dist.barrier(group=group)
-        del a, b, out_f
+        a = b = out_f = None
         torch.cuda.empty_cache()
 
     _teardown()
