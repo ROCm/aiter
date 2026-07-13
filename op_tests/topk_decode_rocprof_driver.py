@@ -39,6 +39,17 @@ KERNEL_MATCH = {
 # .co is specialized for K=2048 and takes no k argument.
 FIXED_K = {"aiter_asm": 2048}
 
+# Per-call workspace-zeroing kernel each impl launches before its compute kernel
+# (only when a multi-block tier runs). Used by --include-zero to fold the memset
+# into the reported time. flydsl zeroes via torch's zero_() (FillFunctor); aiter
+# zeroes via hipMemset (rocclr fillBufferAligned). Matched by time-window, not
+# count, so one-time setup fills (e.g. seqLens allocation) don't mis-pair.
+KERNEL_ZERO_MATCH = {
+    "flydsl": re.compile(r"FillFunctor"),
+    "flydsl_tiered": re.compile(r"FillFunctor"),
+    "aiter_hip": re.compile(r"fillBufferAligned"),
+}
+
 KERNEL_ENV = {
     "flydsl_tiered": {
         "FLYDSL_TOPK_TIERED": "1",
@@ -61,6 +72,7 @@ def run_cell(
     pmc_kernel_regex: str | None,
     stat: str = "median",
     boost_ms: float = 0.0,
+    include_zero: bool = False,
 ) -> tuple[float, float, int, str]:
     width_tag = "" if max_width is None else f"_W{max_width}"
     tag = f"{kernel}_k{k}_rows{num_rows}_L{L}{width_tag}"
@@ -133,10 +145,40 @@ def run_cell(
     per_call = [sum(durs_ns[i : i + kpc]) for i in range(0, len(durs_ns), kpc)]
     if not per_call:
         return float("nan"), float("nan"), kpc, "no measured launches"
+
+    zero_note = ""
+    if include_zero and KERNEL_ZERO_MATCH.get(kernel) is not None:
+        zpat = KERNEL_ZERO_MATCH[kernel]
+        fills = sorted(
+            (int(r["Start_Timestamp"]), int(r["End_Timestamp"]) - int(r["Start_Timestamp"]))
+            for r in rows
+            if zpat.search(r["Kernel_Name"])
+        )
+        # Attribute a fill to a call if it runs between the prior call's compute
+        # and this call's compute (i.e. this call's workspace zero). Lower bound is
+        # inclusive: some impls (aiter's hipMemset) pipeline the fill to start
+        # exactly at the prior compute's end timestamp. Warmup region excluded so
+        # one-time setup fills (seqLens, etc.) never get counted.
+        prev_end = (
+            int(matched[warmup * kpc - 1]["End_Timestamp"]) if warmup * kpc > 0 else 0
+        )
+        n_zero = 0
+        for ci in range(len(per_call)):
+            cs = int(measured[ci * kpc]["Start_Timestamp"])
+            ce = int(measured[ci * kpc + kpc - 1]["End_Timestamp"])
+            zsum = sum(d for (st, d) in fills if prev_end <= st < cs)
+            if zsum:
+                n_zero += 1
+            per_call[ci] += zsum
+            prev_end = ce
+        zero_note = f"+zero({n_zero}/{len(per_call)})"
+        
     # ``min`` is robust to noisy co-tenant GPU contention (sharing CUs only ever
     # inflates a kernel's measured duration), while ``median`` is the default.
     reduce_fn = min if stat == "min" else statistics.median
     note = "" if kpc == 1 else f"{kpc} kernels/call summed"
+    if zero_note:
+        note = f"{note}; {zero_note}".strip("; ")
     if pmc:
         pmc_csvs = glob.glob(str(out_file) + "*counter_collection.csv")
         if not pmc_csvs:
@@ -214,6 +256,12 @@ def main() -> None:
         help="Run the GPU with a dummy matmul for this many ms to stabilize clocks.",
     )
     ap.add_argument(
+        "--include-zero",
+        action="store_true",
+        help="Fold the per-call workspace-zeroing kernel (memset/fill) into the "
+        "reported time (kernel + zero). Default is kernel-only.",
+    )
+    ap.add_argument(
         "--stat",
         choices=["median", "min"],
         default="median",
@@ -269,6 +317,7 @@ def main() -> None:
                     args.pmc_kernel_regex,
                     args.stat,
                     args.boost_ms,
+                    args.include_zero,
                 )
                 results[(kernel, k, L)] = res
                 print(
