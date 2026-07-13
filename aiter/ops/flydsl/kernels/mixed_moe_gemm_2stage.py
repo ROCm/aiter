@@ -4562,11 +4562,12 @@ def compile_mixed_moe_gemm2(
 
                         if const_expr(doweight_stage2):
                             v = v * tw
+                        v_out = arith.trunc_f(out_elem(), v)
 
                         lds_idx = row_base_lds + col_local
-                        v_out = arith.trunc_f(out_elem(), v)
                         vec1_out = T.vec(1, out_elem())
                         v1 = vector.from_elements(vec1_out, [v_out])
+
                         vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                 row_stride_bytes_py = int(model_dim) * int(out_elem_bytes)
