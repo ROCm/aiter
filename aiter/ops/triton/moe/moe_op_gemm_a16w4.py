@@ -143,7 +143,7 @@ def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
     block_k = 256
 
     if block_m == 16:
-        block_n = 256
+        block_n = 128
         num_warps = 4
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -157,7 +157,7 @@ def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
 
     elif block_m == 32:
         if n <= 1024:
-            block_n = 256
+            block_n = 128
             num_warps = 4
         elif n <= 4096:
             block_n = 256
@@ -248,7 +248,7 @@ def get_gluon_kernel_config_v1(m, n, k, routing_data):
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
+    num_stages = 1
     split_k = 1
     block_k = 256
 
@@ -266,7 +266,6 @@ def get_gluon_kernel_config_v1(m, n, k, routing_data):
             grid = grid_m * grid_n * split_k
 
     elif block_m == 32:
-        num_stages = 2
         if n <= 1024:
             block_n = 128
             num_warps = 4
@@ -274,11 +273,10 @@ def get_gluon_kernel_config_v1(m, n, k, routing_data):
             block_n = 256
             num_warps = 4
         else:
-            block_n = 512 
+            block_n = 256 
             num_warps = 4
 
     else:
-        num_stages = 1
         block_n =  256
         num_warps = 4
 
@@ -437,7 +435,7 @@ def moe_gemm_a16w4(
           #print(f"v1 kernel")
           config = get_gluon_kernel_config_v1(M, N, K, routing_data)
     else:
-        print(f"triton kernel")
+        #print(f"triton kernel")
         config = get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
