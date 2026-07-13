@@ -137,7 +137,10 @@ jobs:
               # call (and which tensor) that diverges -> where garbage begins.
               # NOTE: the pass commit must also carry the fused_moe.py trace hooks
               # for its trace to be emitted.
-              "gpt-oss-120b": "AITER_CKTILE_DEBUG=1\nHSA_NO_SCRATCH_RECLAIM=1\nAITER_CKTILE_TRACE=1\nAITER_CKTILE_TRACE_FILE=/tmp/cktile_trace.jsonl",
+              # Debug logging/tracing disabled (was: AITER_CKTILE_DEBUG=1 +
+              # AITER_CKTILE_TRACE=1 + AITER_CKTILE_TRACE_FILE) so per-MoE-call
+              # fingerprinting/prints don't add device syncs that perturb batching.
+              "gpt-oss-120b": "HSA_NO_SCRATCH_RECLAIM=1",
           }
 
           # Extra CLI args appended (after the ATOM config's extraArgs) for
@@ -339,8 +342,6 @@ jobs:
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
-          -e AITER_LOG_LEVEL=DEBUG \
-          -e AITER_CKTILE_DEBUG=1 \
           -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
