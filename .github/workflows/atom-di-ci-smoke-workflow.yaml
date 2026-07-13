@@ -246,7 +246,7 @@ jobs:
                             return Self::handle_serialization_error(e);
                         }
                         let correlation_id = self.adapter.correlation_id(&ctx);
-"""
+          """
           relay_new = """                        if let Err(e) = self
                             .adapter
                             .inject_decode_fields(&mut decode_request_json, &ctx)
@@ -270,7 +270,7 @@ jobs:
                             }
                         }
                         let correlation_id = self.adapter.correlation_id(&ctx);
-"""
+          """
           if relay_new not in text:
               if relay_old not in text:
                   raise SystemExit("Failed to find ATOM relay decode injection point")
