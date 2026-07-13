@@ -1753,6 +1753,7 @@ def flydsl_moe_topids_to_rows(
     gather_w: Optional[torch.Tensor] = None,
     weight_in: Optional[torch.Tensor] = None,
     counter: Optional[torch.Tensor] = None,
+    num_local_tokens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -1776,6 +1777,19 @@ def flydsl_moe_topids_to_rows(
     numel = token_num * topk
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
 
+    # Dynamic EP token count (capture-safe): the dispatch buffer is padded to a
+    # static token_num but only the first ``num_local_tokens`` (= total_recv) rows
+    # are valid. Build a (1,) int32 DEVICE scalar num_valid_routes = total_recv*topk
+    # (no host sync); the route kernel treats routes >= this as dropped. When
+    # truncation is disabled we pass ``numel`` so every route stays valid.
+    if num_local_tokens is not None:
+        num_valid_routes = (
+            num_local_tokens.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            * int(topk)
+        ).contiguous()
+    else:
+        num_valid_routes = torch.tensor([numel], dtype=torch.int32, device=device)
+
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
         assert gather_w is not None, "expert_mask fused path requires gather_w (out)"
@@ -1790,6 +1804,7 @@ def flydsl_moe_topids_to_rows(
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
             ptr_arg(gather_w.reshape(-1)),
+            ptr_arg(num_valid_routes),
             int(mask_i32.numel()),
             numel,
             int(max_m),

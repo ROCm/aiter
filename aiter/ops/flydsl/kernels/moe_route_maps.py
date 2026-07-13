@@ -336,6 +336,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         counter: fx.Pointer,  # (E,) int32 out (== masked_m), zeroed then atomic'd
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drop->0
+        num_valid_routes: fx.Pointer,  # (1,) int32; routes >= this are treated as dropped (EP dynamic token count)
         n: Int32,  # E_global (mask length)
         numel: Int32,
         max_m: Int32,
@@ -429,15 +430,30 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         out_rsrc = ptr_rsrc(topids_to_rows)
         w_rsrc = ptr_rsrc(gather_w)
 
+        # Dynamic EP token count: routes >= num_valid_routes belong to dead-tail
+        # padding rows of the dispatch buffer (rows >= total_recv) and must not
+        # contribute. Load once and fold into the per-route "dropped" predicate so
+        # they reuse the existing drop path (gather_w=0, folded to bucket 0). When
+        # truncation is disabled the caller passes numel here, so nothing is oob.
+        nvr_rsrc = ptr_rsrc(num_valid_routes)
+        nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
+
         tid_idx = arith.index_cast(T.index, tid)
         numel_idx = arith.index_cast(T.index, ArithValue(numel))
         stride_idx = arith.index(MAX_G2L_EXPERTS)
         route_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
         with ir.InsertionPoint(route_loop.body):
             route = arith.index_cast(i32, route_loop.induction_variable)
-            ge = buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
+            is_oob = arith.cmpi(CmpIPredicate.uge, route, ArithValue(nvr))
+            ge_raw = buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
+            # Clamp oob routes' global id to 0 BEFORE the LDS LUT lookup: dead-tail
+            # dispatch rows (route >= num_valid_routes) may carry -1 / stale garbage
+            # expert ids, which would otherwise OOB-read lds_lut. oob is forced to
+            # the drop path below regardless of the clamped lookup result.
+            ge = arith.select(is_oob, c0, _raw(ge_raw))
             le = lds_lut[fx.Index(ArithValue(ge))]
-            is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(E))
+            is_drop_lut = arith.cmpi(CmpIPredicate.eq, le, ArithValue(E))
+            is_drop = arith.ori(is_drop_lut, is_oob)
             eff_e = arith.select(is_drop, c0, _raw(le))
 
             # Fused weight cast+mask: kept -> cast(f32->wdt), dropped -> 0.
@@ -471,6 +487,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         counter: fx.Pointer,
         topids_to_rows: fx.Pointer,
         gather_w: fx.Pointer,
+        num_valid_routes: fx.Pointer,
         n: fx.Int32,
         numel: fx.Int32,
         max_m: fx.Int32,
@@ -488,6 +505,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             counter,
             topids_to_rows,
             gather_w,
+            num_valid_routes,
             n,
             numel,
             max_m,
