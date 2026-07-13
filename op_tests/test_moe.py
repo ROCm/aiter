@@ -414,7 +414,7 @@ parser.add_argument(
 parser.add_argument(
     "-a",
     "--activation",
-    type=dtypes.str2ActivationType,
+    type=str,
     choices=[
         "silu",
         "gelu",
@@ -427,6 +427,7 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+args.activation = dtypes.str2ActivationType(args.activation)
 
 
 for test in args.test:

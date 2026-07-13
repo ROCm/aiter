@@ -328,7 +328,16 @@ def _get_config(
     K: int,
 ):
     # Note: Config files use K=2*K in their naming
-    config, is_tunned = get_gemm_config("BATCHED_GEMM-AFP4WFP4", M, N, 2 * K)
+    # Custom bounds add a dedicated M_LEQ_320 bucket (BLOCK_SIZE_M=128) so M~320
+    # avoids the ~37% tile padding of BLOCK_SIZE_M=256, without affecting M>320
+    # (which keeps BLOCK_SIZE_M=256 via the "any" bucket).
+    config, is_tunned = get_gemm_config(
+        "BATCHED_GEMM-AFP4WFP4",
+        M,
+        N,
+        2 * K,
+        bounds=(4, 8, 16, 32, 64, 128, 256, 320, 512, 1024, 2048, 4096, 8192),
+    )
 
     # Apply custom split-K logic for AFP4WFP4
     if config["NUM_KSPLIT"] > 1:

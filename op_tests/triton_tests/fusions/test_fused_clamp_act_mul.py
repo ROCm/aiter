@@ -11,7 +11,7 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     per_token_fp8_group_quant,
     upcast,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import un_shuffle_scales
+from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
 
 
 def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
@@ -179,8 +179,12 @@ def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_sca
         expected = fp4_utils.e8m0_shuffle(ref_scale)
         assert scale.shape == expected.shape
         sm = scale.shape[0]
-        got = un_shuffle_scales(scale.view(sm // 32, -1))[:M, :num_blocks]
-        exp = un_shuffle_scales(expected.view(sm // 32, -1))[:M, :num_blocks]
+        got = unshuffle_scale_gemm(scale.view(sm // 32, -1), arch="gfx950")[
+            :M, :num_blocks
+        ]
+        exp = unshuffle_scale_gemm(expected.view(sm // 32, -1), arch="gfx950")[
+            :M, :num_blocks
+        ]
         assert torch.equal(got, exp)
         assert torch.equal(got, ref_scale)
     else:

@@ -4,7 +4,7 @@
 import math
 from typing import Optional, Tuple
 
-from aiter.ops.enum import QuantType, Enum
+from aiter.ops.enum import QuantType, Enum, MlaVersion
 import torch
 import triton
 import triton.language as tl
@@ -392,7 +392,7 @@ def pa_ps_fwd_asm(
 
 
 # ---------------------------------------------------------------------------
-# pa_decode_bf16_asm (gfx1250) — persistent / split-KV paged-attention decode.
+# pa_decode_bf16_asm (gfx1250) -- persistent / split-KV paged-attention decode.
 #
 # Wraps the SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256,
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
@@ -491,7 +491,7 @@ def pa_decode_bf16_asm(
         # produce inf/NaN in the in-kernel sink merge.
         sink = torch.full((q_head_num,), -1.0e30, dtype=torch.float32, device=device)
     else:
-        sink = sink.to(torch.float32).contiguous()
+        assert sink.dtype == torch.float32, "sink must be in fp32 for pa ASM"
 
     _pa_decode_bf16_asm(
         Q,
@@ -813,10 +813,69 @@ def mla_decode_stage1_asm_fwd(
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
     lse: Optional[torch.Tensor] = None,
-    # [batch_size, num_heads]
+    # [1] per-tensor
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
-    # [1] pertensor
+    # round-robin context-parallel (CP) extension:
+    #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
+    #   cp_world_size : number of CP ranks (W); 1 == disabled
+    #   cp_rank       : this rank id (r); local kv idx j -> global pos j*W + r
+    g_kv_indptr: Optional[torch.Tensor] = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    # [batch_size] scratch for gfx1250 packed MLA kernels
+    valid_split_count: Optional[torch.Tensor] = None,
+    use_valid_split_count_reduce: int = 0,
+) -> None: ...
+
+
+MD_NAME_V4 = "module_mla_v4_asm"
+
+
+@compile_ops(MD_NAME_V4, ffi_type="ctypes")
+def mla_decode_v4_asm(
+    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
+    Q: torch.Tensor,
+    # [total_query_len, num_heads, kv_rotary]   BF16
+    qrope: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, head_size]  FP8
+    KV: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
+    kvrope: torch.Tensor,
+    # [num_seqs+1]
+    qo_indptr: torch.Tensor,
+    # [num_seqs+1]
+    kv_indptr: torch.Tensor,
+    # [num_page_used]
+    kv_page_indices: torch.Tensor,
+    # [num_seqs]
+    kv_last_page_lens: torch.Tensor,
+    # [num_seqs+1]
+    split_indptr: torch.Tensor,
+    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
+    # tensor; there is no nullable-sink convention on the C ABI. Pass
+    # torch.full((num_heads,), float("-inf")) for "no sink" math.
+    sink: torch.Tensor,
+    max_seqlen_q: int,
+    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
+    softmax_scale: float,
+    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
+    out_16_nosplit: int,
+    num_kv_splits: int,
+    # outputs
+    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
+    splitData: torch.Tensor,
+    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
+    splitLse: torch.Tensor,
+    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
+    output: torch.Tensor,
+    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
+    # per-request valid kv-split count the kernel writes (slot 19). Pass a
+    # real tensor when use_valid_split_count_reduce != 0; otherwise the
+    # kernel skips the write and nullptr is fine.
+    valid_split_count: Optional[torch.Tensor] = None,
+    use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
 
@@ -1096,13 +1155,28 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 8 == 0
-    cu_num = get_mla_decode_fwd_max_splits(
+    max_splits = get_mla_decode_fwd_max_splits(
         num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
-    max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
+    packed_qo_len = effective_seqlen_qo * num_head_qo
+    max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 16))
+
     if (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and packed_qo_len >= 64
+        and num_head_qo <= 64
+        and (packed_qo_len < 128 or num_head_qo == 48)
+    ):
+        if num_head_qo * 2 > 64:
+            # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
+            max_qo_tiles_per_batch = effective_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 64))
+    elif (
         num_head_qo == 16
         or (
             get_gfx() == "gfx942"
@@ -1128,11 +1202,18 @@ def get_mla_metadata_info_v1(
                 or (num_head_qo == 128)
             )
         )
+        or (
+            get_gfx() in ("gfx942", "gfx950")
+            and num_head_qo == 64
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and effective_seqlen_qo == 1
+        )
     ):
-        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+        max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
     elif (
         get_gfx() == "gfx950"
-        and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and (packed_qo_len >= 128 or num_head_qo > 64)
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
@@ -1140,34 +1221,40 @@ def get_mla_metadata_info_v1(
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(
-                math.ceil(effective_seqlen_qo * num_head_qo / 128)
-            )
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
 
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = (batch_size + cu_num - 1) * max_qo_tiles_per_batch
+        max_work = (batch_size + max_splits - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+            min(batch_size + max_splits - 1, (max_splits - 1) * 2)
+            * max_qo_tiles_per_batch
         )
     else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
+        max_work = tile_cnt * max_splits
+        max_split_tiles = tile_cnt * max_splits
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
-    # the worst case absorb the entire global budget, so reduce_partial_map must
-    # hold up to tile_cnt * per_tile_cap entries.
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # budget shared across all tiles, so the total number of partial reduce
+    # entries is bounded by the base tiles (one per tile) plus at most the global
+    # split budget of EXTRA splits distributed across them:
+    #     reduce_partial_map <= tile_cnt + per_tile_cap
+    # The previous `tile_cnt * per_tile_cap` assumed every tile could individually
+    # absorb the whole global budget simultaneously, which the shared budget
+    # forbids. With cudagraph batch_size >> cu_num that product collapsed to
+    # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
+    # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
-        per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
+        per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
+        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            ((cu_num + 1), torch.int32),  # work_indptr
+            ((max_splits + 1), torch.int32),  # work_indptr
             ((max_work, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
@@ -1176,7 +1263,7 @@ def get_mla_metadata_info_v1(
     else:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            (cu_num + 1, torch.int32),  # work_indptr
+            (max_splits + 1, torch.int32),  # work_indptr
             ((tile_cnt * num_kv_splits, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
@@ -1206,8 +1293,12 @@ def get_mla_metadata_v1(
     topk: int = -1,
     max_split_per_batch: int = -1,
     intra_batch_mode: bool = False,
-    dtype_q: Optional[torch.dtype] = None,
-    dtype_kv: Optional[torch.dtype] = None,
+    is_cp_round_robin: bool = False,
+    mla_version: int = MlaVersion.V32.value,
+    dtype_q_nope: Optional[torch.dtype] = None,
+    dtype_q_rope: Optional[torch.dtype] = None,
+    dtype_kv_nope: Optional[torch.dtype] = None,
+    dtype_kv_rope: Optional[torch.dtype] = None,
 ) -> None:
     """
     Inputs:
@@ -1294,7 +1385,7 @@ def get_mla_metadata_v1_no_redundant(
     ...
 
 
-@compile_ops("module_mla_reduce")
+@compile_ops("module_mla_reduce", develop=True)
 def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -1305,7 +1396,41 @@ def mla_reduce_v1(
     num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-) -> None: ...
+) -> None:
+    """
+    Cross-split (flash-style) reduction for split-KV MLA decode.
+
+    The decode kernel splits each (batch, head) sequence into KV tiles and
+    writes one *partial* attention output + log-sum-exp per split. This op
+    combines the partials belonging to the same query tile into the final
+    output using the standard online-softmax combine
+    (``out = sum_k exp(lse_k - lse*) * out_k``), then normalizes.
+
+    Args:
+        partial_output: [max(reduce_partial_map)+s, h, dv] fp32. Per-split
+            partial attention outputs (unnormalized numerators) to merge.
+        partial_lse: [max(reduce_partial_map)+s, h] fp32. Per-split
+            log-sum-exp denominators paired with ``partial_output``.
+        reduce_indptr: [#reduce_tiles + 1] int32. Group boundaries into
+            ``reduce_partial_map``: the partials for reduce tile ``i`` are
+            ``reduce_partial_map[reduce_indptr[i] : reduce_indptr[i+1]]``.
+        reduce_final_map: optional [#reduce_tiles, 2] int32. The final-output
+            location of each merged group. ``None`` means the reduce tiles
+            map to final rows in order (no indirection).
+        reduce_partial_map: [reduce_indptr[-1]] int32. Locations in the
+            partial buffer of the tiles waiting to be reduced.
+        max_seqlen_q: max query length (tokens) per decode step.
+        num_kv_splits: sizing hint for the reducer's per-split LDS scratch
+            (``max_splits = max(device_cu_count, num_kv_splits)``).
+            **``0`` means auto** — size to the device CU count. Pass a value
+            larger than the CU count only to force a bigger split budget;
+            values <= CU count (incl. 0) are clamped up to it.
+        final_output: [bs, h, dv]. Combined, normalized output (written
+            in-place).
+        final_lse: optional [bs, h] fp32. Combined LSE; written only when
+            provided.
+    """
+    ...
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
@@ -1483,8 +1608,10 @@ def decode_update_mla_metadata_v1(
     )
 
 
-@compile_ops("module_hk_mla")
-def hk_mla_decode_fwd(
+@compile_ops(
+    "module_hk_mla_v32_fwd_mi3xx", fc_name="hk_mla_v32_decode_fwd", develop=True
+)
+def hk_mla_v32_decode_fwd_mi3xx(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
@@ -1507,3 +1634,112 @@ def hk_mla_decode_fwd(
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
 ) -> None: ...
+
+
+def hk_mla_v32_decode_fwd(
+    query: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+) -> None:
+    """Arch-dispatching entry point for the HK V3.2 MLA decode kernel."""
+    arch_id = get_gfx()
+    if arch_id in ("gfx942", "gfx950"):
+        hk_mla_v32_decode_fwd_mi3xx(
+            query,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            softmax_scale,
+            split_output,
+            split_lse,
+            final_output,
+        )
+    else:
+        raise NotImplementedError(
+            f"hk_mla_v32_decode_fwd has no implementation for arch {arch_id}"
+        )
+
+
+@compile_ops(
+    "module_hk_mla_v40_fwd_mi3xx", fc_name="hk_mla_v40_decode_fwd", develop=True
+)
+def hk_mla_v40_decode_fwd_mi3xx(
+    # [total_q, num_heads, V4_DIM_QK_PACKED=512]  FP8
+    #   per-token bytes: NOPE 448 + dup-E8M0 14 + pad 50
+    query: torch.Tensor,
+    # [total_q, num_heads, V4_DIM_ROPE=64]        BF16
+    query_rope: torch.Tensor,
+    # [num_page, page_size, num_kv_heads=1, 512]  FP8 (same packing as Q)
+    kv_buffer: torch.Tensor,
+    # [num_page, page_size, num_kv_heads=1, 64]   BF16
+    kv_buffer_rope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+def hk_mla_v40_decode_fwd(
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    kv_buffer_rope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> None:
+    """Arch-dispatching entry point for the HK V4.0 MLA decode kernel."""
+    arch_id = get_gfx()
+    if arch_id in ("gfx942", "gfx950"):
+        hk_mla_v40_decode_fwd_mi3xx(
+            query,
+            query_rope,
+            kv_buffer,
+            kv_buffer_rope,
+            qo_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            softmax_scale,
+            split_output,
+            split_lse,
+            final_output,
+            attn_sink,
+        )
+    else:
+        raise NotImplementedError(
+            f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
+        )
