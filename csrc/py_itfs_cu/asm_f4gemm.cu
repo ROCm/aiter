@@ -77,6 +77,11 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         const auto& cfg = el.second;
         if(cfg.intype != intype || cfg.a_preshuffle != a_preshuffle)
             continue;
+        // The heuristic (no explicit kernelName) is the production path: always
+        // the scaled, bf16-output variant. The noscale / fp4-output .co are
+        // opt-in via an explicit kernelName only, so skip them here.
+        if(cfg.scale != 1 || cfg.outtype != "bf16")
+            continue;
         // Persistent/cluster shaders don't mask partial tiles, so the problem
         // must tile both dims exactly.
         if((N % cfg.tile_n) != 0 || (M % cfg.tile_m) != 0)
@@ -143,9 +148,10 @@ static void f4gemm_launch(aiter_tensor_t* A,
                                 float           GlobalScaleB,
                                 hipStream_t     stream)
 {
-    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 || out->dtype() == AITER_DTYPE_fp4x2,
                 __func__,
-                " only supports BFloat16 output");
+                " only supports BFloat16 or packed FP4 (fp4x2) output");
+    const bool out_is_fp4 = (out->dtype() == AITER_DTYPE_fp4x2);
     AITER_CHECK(intype == F4_INTYPE_MXFP4 || intype == F4_INTYPE_NVFP4,
                 __func__,
                 " unsupported intype ",
@@ -168,7 +174,12 @@ static void f4gemm_launch(aiter_tensor_t* A,
     // Strides in bytes.
     unsigned int stride_a = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
     unsigned int stride_b = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
-    unsigned int stride_d = static_cast<unsigned int>(Ndim) * 2;     // bf16
+    // Output row stride in bytes: bf16 = Ndim*2; packed fp4 (e2m1, 2 vals/byte,
+    // cvt_scale=1) = Ndim/2. Output format is compile-time per .co; the host only
+    // needs the matching stride + buffer dtype.
+    unsigned int stride_d = out_is_fp4
+                                ? static_cast<unsigned int>(Ndim / 2)
+                                : static_cast<unsigned int>(Ndim) * 2;
     unsigned int stride_sa = static_cast<unsigned int>(Kdim / scale_block);
     unsigned int stride_sb = static_cast<unsigned int>(Kdim / scale_block);
 
