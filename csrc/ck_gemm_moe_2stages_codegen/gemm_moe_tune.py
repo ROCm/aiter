@@ -61,6 +61,8 @@ if is_flydsl_available():
         get_flydsl_stage2_kernels_int4_bf16,
         get_flydsl_stage1_kernels_fp4_bf16,
         get_flydsl_stage2_kernels_fp4_bf16,
+        get_flydsl_stage1_kernels_a8w4_bf16,
+        get_flydsl_stage2_kernels_a8w4_bf16,
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
@@ -461,6 +463,35 @@ class FmoeTuner(TunerCommon):
         )
 
     @staticmethod
+    def _a8w4_rowmajor_quant(x, group_size=32):
+        """MX-FP8 activation quant matching the gfx942 a8w4 kernel contract.
+
+        Produces a per-1x32 pow2 (E8M0) block scale kept as a row-major f32 1-D
+        tensor (the layout the decode kernel indexes as ``row*num_groups +
+        k_block``), plus the bf16 dequant so a matched reference consumes the same
+        activation values the kernel sees. Returns
+        ``(a_fp8, a_scale_f32_1d, a_dequant_bf16)``.
+        """
+        orig = x.shape
+        flat = x.reshape(-1, orig[-1]).to(dtypes.fp32)
+        rows, K = flat.shape
+        ng = K // group_size
+        blocks = flat.reshape(rows, ng, group_size)
+        amax = blocks.abs().amax(dim=-1).clamp_min(1e-12)
+        # E8M0 pow2 scale so each block max maps below the fp8 E4M3 max (~240).
+        exp = torch.ceil(torch.log2(amax / 224.0))
+        scale = torch.pow(2.0, exp)  # [rows, ng] f32 pow2
+        a_fp8 = (blocks / scale.unsqueeze(-1)).reshape(rows, K).to(dtypes.fp8)
+        dequant = (
+            a_fp8.to(dtypes.fp32).reshape(rows, ng, group_size) * scale.unsqueeze(-1)
+        ).reshape(orig).to(dtypes.bf16)
+        return (
+            a_fp8.reshape(orig),
+            scale.contiguous().view(-1),
+            dequant,
+        )
+
+    @staticmethod
     def run_flydsl_stage1_out(
         a1_qt,
         w1_qt_shffle_ck,
@@ -484,8 +515,14 @@ class FmoeTuner(TunerCommon):
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        _is_a8w4 = kparams.get("in_dtype") == "a8w4_bf16" and get_gfx() == "gfx942"
+        # a8w4 decode: disable the async global->LDS copy to match the runtime path.
+        _use_async_copy = not _is_a8w4
+        # a8w4: `a1_qt` is already MX-FP8 codes and `a1_scale` is the row-major pow2
+        # A-scale (prepared in generate_data_2stages). a16w4: bf16 activation.
+        a_launch = a1_qt.to(dtypes.fp8) if q_dtype_a == dtypes.fp8 else a1_qt
         result = flydsl_moe_stage1(
-            a=a1_qt.to(dtypes.fp8) if q_dtype_a == dtypes.fp8 else a1_qt,
+            a=a_launch,
             w1=w1_qt_shffle_ck,
             sorted_token_ids=sorted_ids,
             sorted_expert_ids=sorted_expert_ids,
@@ -501,7 +538,7 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
-            use_async_copy=True,
+            use_async_copy=_use_async_copy,
             k_batch=kparams.get("k_batch", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
@@ -1054,10 +1091,12 @@ class FmoeTuner(TunerCommon):
         elif (
             q_type == QuantType.per_1x32
             and q_dtype_w == dtypes.fp4x2
-            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+            and q_dtype_a in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
             and get_gfx() == "gfx942"
         ):
-            # gfx942 a16w4: int4-style preshuffle + bf16-expanded scales.
+            # gfx942 a16w4 / a8w4: int4-style preshuffle + bf16-expanded scales for
+            # the FlyDSL decode kernels (identical weight layout for both; only the
+            # activation dtype differs).
             E1, N1 = w1_qt.shape[0], w1_qt.shape[1]
             K1 = w1_qt.shape[2] * 2
             E2, N2 = w2_qt.shape[0], w2_qt.shape[1]
@@ -1068,10 +1107,13 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_flydsl, w2_scale_flydsl = repack_mxfp4_for_gfx942_fp4_bf16(
                 w2_qt, w2_scale, E2, N2, K2
             )
-            w1_qt_shffle_ck = w1_qt_shffle
-            w2_qt_shffle_ck = w2_qt_shffle
-            w1_scale_aiter = w1_scale
-            w2_scale_aiter = w2_scale
+            if q_dtype_a != dtypes.fp8:
+                # a16w4 CK path uses unshuffled fp4 weights. a8w4 keeps the
+                # shuffle_weight_a16w4 CK weights/scales set in the branch above.
+                w1_qt_shffle_ck = w1_qt_shffle
+                w2_qt_shffle_ck = w2_qt_shffle
+                w1_scale_aiter = w1_scale
+                w2_scale_aiter = w2_scale
         else:
             if w1_scale_aiter is None:
                 w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
@@ -1100,11 +1142,28 @@ class FmoeTuner(TunerCommon):
             else:
                 a1_scale_fp4_sort = a1_scale
 
+            # a8w4: MX-FP8 activation (kernel) + matched bf16 dequant (reference)
+            # with a row-major pow2 A-scale, so the reference consumes the same
+            # activation values the kernel sees.
+            a1_qt_a8w4_fp8 = a1_qt
+            if (
+                q_type == QuantType.per_1x32
+                and q_dtype_w == dtypes.fp4x2
+                and q_dtype_a == dtypes.fp8
+                and get_gfx() == "gfx942"
+            ):
+                (
+                    a1_qt_a8w4_fp8,
+                    a1_scale_fp4_sort,
+                    a1_qt,
+                ) = FmoeTuner._a8w4_rowmajor_quant(a1_qt)
+
             # For the _fp8 FlyDSL variant (a_scale_one=True): cast bf16 input to fp8.
             a1_qt_fp8_cast = input.to(dtypes.fp8)
 
             return {
                 "a1_qt": a1_qt,
+                "a1_qt_a8w4_fp8": a1_qt_a8w4_fp8,
                 "w1_qt_shffle_ck": w1_qt_shffle_ck,
                 "w2_qt_shffle_ck": w2_qt_shffle_ck,
                 "a1_scale": a1_scale,
@@ -1126,6 +1185,9 @@ class FmoeTuner(TunerCommon):
                 "w2_scale_flydsl": w2_scale_flydsl,
                 "a1_qt_fp8_cast": a1_qt_fp8_cast,
                 "a1_scale_none": None,
+                # gfx942 a8w4 tunes the plain (bias-free) decode, same as a16w4; the
+                # fused-bias variant is not modeled by the torch reference here.
+                # Other archs keep their original fused-bias path unchanged.
                 "bias": (
                     torch.clamp(
                         torch.randn(
@@ -1139,6 +1201,7 @@ class FmoeTuner(TunerCommon):
                         and q_type == QuantType.per_1x32
                         and q_dtype_a == dtypes.fp8
                         and dtype in [dtypes.bf16, dtypes.fp16]
+                        and get_gfx() != "gfx942"
                     )
                     else None
                 ),
@@ -1167,6 +1230,7 @@ class FmoeTuner(TunerCommon):
             )
             # ref1 is always bf16
             ref1_bf16 = ref1
+            a2_qt_a8w4_fp8 = None
 
             if q_type == QuantType.per_1x32 and (
                 q_dtype_w == dtypes.i4x2
@@ -1199,8 +1263,23 @@ class FmoeTuner(TunerCommon):
                     token_num=token,
                     block_size=blockM,
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp8
+                and get_gfx() == "gfx942"
+            ):
+                # gfx942 a8w4 FlyDSL stage2: MX-FP8 activation (kernel) + matched
+                # bf16 dequant (reference), row-major pow2 A-scale. a2_scale stays
+                # None so the reference consumes the dequant directly (bf16 path,
+                # like a16w4).
+                (
+                    a2_qt_a8w4_fp8,
+                    a2_scale_mxfp4_sort,
+                    a2_qt,
+                ) = FmoeTuner._a8w4_rowmajor_quant(ref1)
+                a2_scale = None
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
-                # FlyDSL stage2 receives fp8 input
+                # FlyDSL stage2 receives fp8 input (non-gfx942 path).
                 a2_qt = ref1.to(dtypes.fp8)
                 M = sorted_ids.shape[0]
                 N = a2_qt.shape[-1]
@@ -1215,11 +1294,14 @@ class FmoeTuner(TunerCommon):
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
                 a2_scale_mxfp4_sort = a2_scale
             a2_qt = a2_qt.view(token, topk, -1)
+            if a2_qt_a8w4_fp8 is not None:
+                a2_qt_a8w4_fp8 = a2_qt_a8w4_fp8.view(token, topk, -1)
             if doweight_stage1:
                 sorted_weights = None
 
             return {
                 "a2_qt": a2_qt,
+                "a2_qt_a8w4_fp8": a2_qt_a8w4_fp8,
                 "w1_qt_shffle_ck": w1_qt_shffle_ck,
                 "w2_qt_shffle_ck": w2_qt_shffle_ck,
                 "a2_scale": a2_scale,
@@ -1241,6 +1323,8 @@ class FmoeTuner(TunerCommon):
                 "w2_scale_flydsl": w2_scale_flydsl,
                 "ref1_bf16": ref1_bf16,
                 "a2_scale_none": None,
+                # gfx942 a8w4 stage2 has no fused bias (see stage1 note); tune
+                # bias-free. Other archs keep their original fused-bias path.
                 "bias": (
                     torch.clamp(
                         torch.randn((expert, model_dim), dtype=dtype, device=device),
@@ -1252,6 +1336,7 @@ class FmoeTuner(TunerCommon):
                         and q_type == QuantType.per_1x32
                         and q_dtype_a == dtypes.fp8
                         and dtype in [dtypes.bf16, dtypes.fp16]
+                        and get_gfx() != "gfx942"
                     )
                     else None
                 ),
@@ -3123,7 +3208,7 @@ class FmoeTuner(TunerCommon):
         return tasks_flydsl
 
     def gen_flydsl_fp4_bf16_2stages_task(self, info, blockMs):
-        """gfx942 a16w4 (bf16 x MX-FP4) FlyDSL decode candidates."""
+        """gfx942 a16w4 (bf16 x MX-FP4) / a8w4 (fp8 x MX-FP4) FlyDSL decode candidates."""
         tasks_flydsl = []
         if not is_flydsl_available():
             return tasks_flydsl
@@ -3147,15 +3232,27 @@ class FmoeTuner(TunerCommon):
         if not (
             q_type == QuantType.per_1x32
             and q_dtype_w == dtypes.fp4x2
-            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+            and q_dtype_a in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
             and gfx == "gfx942"
         ):
             return tasks_flydsl
 
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        flydsl_s1_kernels = get_flydsl_stage1_kernels_fp4_bf16(out_dtype_str)
-        flydsl_s2_kernels = get_flydsl_stage2_kernels_fp4_bf16(out_dtype_str)
+        if q_dtype_a == dtypes.fp8:
+            # a8w4 (fp8 x MX-FP4): same decode template + weight repack as a16w4,
+            # only the activation is fp8. Kernels carry a_dtype="fp8". The kernel
+            # consumes the pre-quantized MX-FP8 activation; the torch reference keeps
+            # the matched bf16 dequant (see generate_data_2stages).
+            flydsl_s1_kernels = get_flydsl_stage1_kernels_a8w4_bf16(out_dtype_str)
+            flydsl_s2_kernels = get_flydsl_stage2_kernels_a8w4_bf16(out_dtype_str)
+            _s1_act_key = "a1_qt_a8w4_fp8"
+            _s2_act_key = "a2_qt_a8w4_fp8"
+        else:
+            flydsl_s1_kernels = get_flydsl_stage1_kernels_fp4_bf16(out_dtype_str)
+            flydsl_s2_kernels = get_flydsl_stage2_kernels_fp4_bf16(out_dtype_str)
+            _s1_act_key = "a1_qt"
+            _s2_act_key = "a2_qt"
 
         for blockM in blockMs:
             if blockM not in [16, 32, 64, 128] or not use_g1u1:
@@ -3164,6 +3261,11 @@ class FmoeTuner(TunerCommon):
                 # a16w4 constraint: block_m == kn1.tile_m == kn2.tile_m.
                 ktm = kparams["tile_m"]
                 if ktm != blockM:
+                    continue
+                # a8w4 exposes interleave (_gui) gate_mode variants; they reorder the
+                # gate/up columns, which the separated-layout torch reference here
+                # does not model. Tune only the separated variants (matches a16w4).
+                if kparams.get("gate_mode") == "interleave":
                     continue
                 # All k_batch variants; the correctness gate drops bad configs.
                 kb = kparams.get("k_batch", 1)
@@ -3219,7 +3321,7 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage1_out,
                         (
                             [
-                                "a1_qt",
+                                _s1_act_key,
                                 "w1_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -3298,7 +3400,7 @@ class FmoeTuner(TunerCommon):
                         FmoeTuner.run_flydsl_stage2_out,
                         (
                             [
-                                "a2_qt",
+                                _s2_act_key,
                                 "w2_qt_shffle_flydsl",
                                 "sorted_ids",
                                 "sorted_expert_ids",
@@ -3654,7 +3756,7 @@ class FmoeTuner(TunerCommon):
                         q_dtype_w == dtypes.i4x2
                         or (
                             q_dtype_w == dtypes.fp4x2
-                            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                            and q_dtype_a in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
                         )
                     )
                 )
@@ -3689,7 +3791,7 @@ class FmoeTuner(TunerCommon):
                     q_dtype_w == dtypes.i4x2
                     or (
                         q_dtype_w == dtypes.fp4x2
-                        and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                        and q_dtype_a in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
                     )
                 )
             )

@@ -1564,31 +1564,41 @@ def get_2stage_cfgs(
         else:
             # a8w4: fp8 activation x MX-FP4 weight (a8w4_bf16 decode path).
             _a_type = "fp8"
-            _ksplit = 0
-            # block_m must match tile_m for moe_sorting. t16 at production shapes
-            # (e.g. 2048x7168x4096) leaves ~25% non-finite stage1 with mxfp4 weights
-            # when use_async_copy is on; t32/t64 are stable for interleave Swiglu.
+            # block_m must match tile_m for moe_sorting; tile_m=32 (or 64 at very
+            # large token counts) is the stable choice for this decode path.
             _tile_m = 32 if token < 16384 else 64
             _tile_n = 128
             _tile_k = 128
-            _use_gui = (
-                gate_mode == GateMode.INTERLEAVE
-                or activation == ActivationType.Swiglu
-            )
-            kn1 = flydsl_kernel_name(
+            _raw_ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+            _base_kn1 = flydsl_kernel_name(
                 1, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k
             )
+            # a8w4 uses the separated-layout split-K decode kernel, the same family
+            # the tuner searches (and matching the a16w4 path): pick a registered
+            # split-K factor (>=2) that divides model_dim, preferring the heuristic
+            # magnitude. k_batch is parsed from the kernel name, so the _kb{k}
+            # suffix is what selects split-K; the interleaved (_gui) layout is not
+            # used on this path.
+            _splitk_candidates = sorted(
+                kb
+                for kb in (2, 4)
+                if model_dim % kb == 0
+                and (model_dim // kb) % _tile_k == 0
+                and get_flydsl_kernel_params(f"{_base_kn1}_kb{kb}") is not None
+            )
+            if _splitk_candidates:
+                if _raw_ksplit >= 2:
+                    _le = [kb for kb in _splitk_candidates if kb <= _raw_ksplit]
+                    _ksplit = max(_le) if _le else min(_splitk_candidates)
+                else:
+                    _ksplit = min(_splitk_candidates)
+                kn1 = f"{_base_kn1}_kb{_ksplit}"
+            else:
+                _ksplit = 0
+                kn1 = _base_kn1
             kn2 = flydsl_kernel_name(
                 2, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k, "atomic"
             )
-            if _use_gui:
-                _gui_kn1 = f"{kn1}_gui"
-                if get_flydsl_kernel_params(_gui_kn1) is not None:
-                    kn1 = _gui_kn1
-            if get_flydsl_kernel_params(kn1) is None:
-                kn1 = flydsl_kernel_name(
-                    1, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k
-                )
             if get_flydsl_kernel_params(kn2) is None:
                 kn2 = flydsl_kernel_name(
                     2, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k, "atomic"

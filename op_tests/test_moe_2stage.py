@@ -831,7 +831,15 @@ def _iter_legacy_cases():
                     pad_pairs = [(0, 0)]
             for hidden_pad, intermediate_pad in pad_pairs:
                 use_inter_dim = inter_dim
-                if get_gfx() == "gfx942" and use_inter_dim < 1024:
+                # Only bump skinny inter_dim to 4096 when padding is requested; the
+                # no-pad case (the only one gfx942 reaches, see pad filter above)
+                # passes through unchanged so CLI shapes can match tuned rows
+                # (e.g. inter_dim=256).
+                if (
+                    get_gfx() == "gfx942"
+                    and use_inter_dim < 1024
+                    and (hidden_pad or intermediate_pad)
+                ):
                     use_inter_dim = 4096
                 for act_type in args.act:
                     for m in args.tokenNum:
