@@ -747,47 +747,49 @@ def _run_moe_reduction(
         raise ValueError(
             "topk_ids is required when expert_mask is provided for reduce mode"
         )
-    if is_fp8 and use_mask:
-        raise NotImplementedError(
-            "MXFP8 route-out reduce does not support EP expert_mask yet"
-        )
+    # Map torch dtype -> compile_moe_reduction dtype_str
+    if out.dtype == torch.float16:
+        _reduce_dtype_str = "f16"
+    elif out.dtype == torch.bfloat16:
+        _reduce_dtype_str = "bf16"
+    elif out.dtype == torch.float32:
+        _reduce_dtype_str = "f32"
+    else:
+        _reduce_dtype_str = None
+
+    if _reduce_dtype_str is None:
+        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # This drops the EP mask, so only valid for non-EP runs.
+        if use_mask:
+            raise NotImplementedError(
+                f"Masked moe reduction not supported for dtype {out.dtype}"
+            )
+        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        return
+
+    reduce_out_dtype_str = None
+    X = target
+    if is_fp8:
+        if use_mask:
+            raise NotImplementedError(
+                "MXFP8 route-out reduce does not support EP expert_mask yet"
+            )
+        _reduce_dtype_str = "fp8"
+        reduce_out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+        # fp8 route-out is a flat uint8 [rows, model_dim + model_dim/8] buffer.
+    else:
+        X = target.view(token_num, topk, model_dim)
 
     from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-    if is_fp8:
-        _dtype_str = "fp8"
-        _out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
-        # fp8 route-out is a flat uint8 [rows, model_dim + model_dim/8] buffer,
-        # consumed as-is (not reshaped to [token, topk, model_dim]).
-        X = target
-    else:
-        # Map torch dtype -> compile_moe_reduction dtype_str
-        if out.dtype == torch.float16:
-            _dtype_str = "f16"
-        elif out.dtype == torch.bfloat16:
-            _dtype_str = "bf16"
-        elif out.dtype == torch.float32:
-            _dtype_str = "f32"
-        else:
-            # Unsupported dtype for the masked kernel — fall back to torch.sum.
-            # This drops the EP mask, so only valid for non-EP runs.
-            if use_mask:
-                raise NotImplementedError(
-                    f"Masked moe reduction not supported for dtype {out.dtype}"
-                )
-            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
-            return
-        _out_dtype_str = None
-        X = target.view(token_num, topk, model_dim)
 
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
-        dtype_str=_dtype_str,
+        dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
         # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
         num_experts=int(expert_mask.numel()) if use_mask else 0,
-        out_dtype_str=_out_dtype_str,
+        out_dtype_str=reduce_out_dtype_str,
     )
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
@@ -1625,19 +1627,16 @@ def flydsl_moe_stage2(
     if not accumulate:
         if return_per_slot:
             target = out.view(-1)
-        elif _s2_fp8_inter:
-            # uint8 [rows, N value bytes + N/8 e8m0 scale bytes]
-            _rows = token_num * topk
-            target = torch.empty(
-                (_rows, model_dim + model_dim // 8),
-                device=out.device,
-                dtype=torch.uint8,
-            )
         else:
+            # fp8 route-out stores uint8 rows: N value bytes + N/8 e8m0 scale bytes.
             target = torch.empty(
-                (token_num * topk * model_dim,),
+                (
+                    (token_num * topk, model_dim + model_dim // 8)
+                    if _s2_fp8_inter
+                    else (token_num * topk * model_dim,)
+                ),
                 device=out.device,
-                dtype=out.dtype,
+                dtype=torch.uint8 if _s2_fp8_inter else out.dtype,
             )
 
     if use_mx_gemm:

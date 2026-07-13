@@ -3655,15 +3655,12 @@ def compile_moe_reduction(
         )
         return ty() if callable(ty) else ty
 
+    module_name = (
+        f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
+        f"_{dtype_str}_topk{topk}_md{model_dim}"
+    )
     if is_fp8:
-        module_name = (
-            f"moe_reduction_fp8_kernel_{elem_type_tag}_topk{topk}_md{model_dim}"
-        )
-    else:
-        module_name = (
-            f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
-            f"_{dtype_str}_topk{topk}_md{model_dim}"
-        )
+        module_name = f"moe_reduction_fp8_kernel_{elem_type_tag}_topk{topk}_md{model_dim}"
 
     elem_bytes_c = 2 if is_fp8 else ((32 if dtype_str == "f32" else 16) // 8)
     fp8_row_bytes_in = model_dim + model_dim // 8
@@ -3707,12 +3704,11 @@ def compile_moe_reduction(
             # fold the per-WG token byte offset into the descriptor's 48-bit
             # base address (computed in i64). The in-kernel voffsets then only
             # need to address one token's slab.
+            slab_elems_x = c_topk * c_model_dim
+            x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
             if const_expr(is_fp8):
                 # X row = model_dim fp8 bytes + model_dim/8 e8m0 bytes.
                 x_slab_nbytes = c_topk * fx.Index(fp8_row_bytes_in)
-            else:
-                slab_elems_x = c_topk * c_model_dim
-                x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
             y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)
             x_base_off_i64 = fx.Int64(token_idx * x_slab_nbytes)
             y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
