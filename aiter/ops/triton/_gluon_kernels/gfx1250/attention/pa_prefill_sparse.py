@@ -40,7 +40,7 @@ def _region_prologue(
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
     cur_valid = slot_reg >= 0
     safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
-    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, 0, kv_bufs.index(0))
+    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
     return cur_valid, safe_slot_cur
 
 
@@ -239,7 +239,7 @@ def _pa_prefill_sparse(
         slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
         cur_valid = slot_reg >= 0
         safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
-        gl.amd.gfx1250.tdm.async_gather(pkv_desc, safe_slot_cur, 0, kv_bufs.index(0))
+        gl.amd.gfx1250.tdm.async_gather(pkv_desc, safe_slot_cur, kv_bufs.index(0))
 
         buf_idx: gl.int32 = 0
         p_iters = p_num_tiles
@@ -262,7 +262,7 @@ def _pa_prefill_sparse(
             next_valid = slot_reg >= 0
             safe_next_slot = gl.where(next_valid, slot_reg, 0)
             gl.amd.gfx1250.tdm.async_gather(
-                pkv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
+                pkv_desc, safe_next_slot, kv_bufs.index(async_idx)
             )
 
             gl.amd.gfx1250.tdm.async_wait(2)
@@ -362,7 +362,7 @@ def _pa_prefill_sparse(
         slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
         cur_valid = slot_reg >= 0
         safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
-        gl.amd.gfx1250.tdm.async_gather(ekv_desc, safe_slot_cur, 0, kv_bufs.index(0))
+        gl.amd.gfx1250.tdm.async_gather(ekv_desc, safe_slot_cur, kv_bufs.index(0))
 
         buf_idx: gl.int32 = 0
         e_iters = e_num_tiles
@@ -385,7 +385,7 @@ def _pa_prefill_sparse(
             next_valid = slot_reg >= 0
             safe_next_slot = gl.where(next_valid, slot_reg, 0)
             gl.amd.gfx1250.tdm.async_gather(
-                ekv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
+                ekv_desc, safe_next_slot, kv_bufs.index(async_idx)
             )
 
             gl.amd.gfx1250.tdm.async_wait(2)
