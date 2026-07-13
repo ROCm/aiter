@@ -167,23 +167,62 @@ def run_case(label, shape, dim, dtype, tp_size, init_method_factory):
     }
 
 
-# Cases designed for tp_size=8 and bf16 (pack_size = 16 // 2 = 8).
-# Each case targets a specific kernel branch in dispatchReduceScatter:
-#
-#   first_dim_vec  : numel % (ngpus * pack_size) == 0  → split_first_dim
-#   last_dim_vec   : last % (ngpus * pack_size) == 0   → split_lastdim (vec)
-#   last_dim_naive : last % ngpus == 0 but % pack != 0 → split_lastdim_naive
-#   mid_dim_vec    : k % pack_size == 0                → split_middim (vec)
-#   mid_dim_naive  : k % pack_size != 0                → split_middim_naive
-#
-# All five satisfy shape[dim] % ngpus == 0 (Python wrapper's hard requirement).
-l_cases = [
-    ("first_dim_vec", (512, 1024), 0),
-    ("last_dim_vec", (256, 512), -1),
-    ("last_dim_naive", (256, 40), -1),
-    ("mid_dim_vec", (16, 64, 64), 1),
-    ("mid_dim_naive", (16, 64, 5), 1),
-]
+def build_cases(tp_size, dtype):
+    """Build test cases that target each kernel branch in dispatchReduceScatter.
+
+    Each case is designed so that shape[dim] % tp_size == 0 (hard requirement)
+    and the vectorisation / naive path is selected by the alignment of the
+    last dimension with pack_size.
+
+    Kernel branches:
+      first_dim_vec  : numel % (ngpus * pack_size) == 0  → split_first_dim
+      last_dim_vec   : last % (ngpus * pack_size) == 0   → split_lastdim (vec)
+      last_dim_naive : last % ngpus == 0 but % pack != 0 → split_lastdim_naive
+      mid_dim_vec    : k % pack_size == 0                → split_middim (vec)
+      mid_dim_naive  : k % pack_size != 0                → split_middim_naive
+    """
+    pack_size = 16 // dtype.itemsize
+
+    # first_dim_vec: 2-D, scatter on dim 0
+    #   shape[0] % tp_size == 0, numel % (tp_size * pack_size) == 0
+    first_rows = 64 * tp_size
+    first_cols = pack_size * tp_size
+    assert (first_rows * first_cols) % (tp_size * pack_size) == 0
+
+    # last_dim_vec: 2-D, scatter on last dim
+    #   shape[-1] % (tp_size * pack_size) == 0
+    last_vec_cols = pack_size * tp_size
+    last_vec_rows = 256
+
+    # last_dim_naive: 2-D, scatter on last dim
+    #   shape[-1] % tp_size == 0 BUT shape[-1] % (tp_size * pack_size) != 0
+    last_naive_cols = tp_size * (pack_size - 1) if pack_size > 1 else tp_size
+    if last_naive_cols % (tp_size * pack_size) == 0:
+        last_naive_cols = tp_size
+    last_naive_rows = 256
+
+    # mid_dim_vec: 3-D, scatter on dim 1
+    #   shape[1] % tp_size == 0, k (last dim) % pack_size == 0
+    mid_vec_m = 16
+    mid_vec_n = 8 * tp_size
+    mid_vec_k = pack_size * 8
+
+    # mid_dim_naive: 3-D, scatter on dim 1
+    #   shape[1] % tp_size == 0, k % pack_size != 0
+    mid_naive_m = 16
+    mid_naive_n = 8 * tp_size
+    mid_naive_k = pack_size + 1 if pack_size > 1 else 3
+    if mid_naive_k % pack_size == 0:
+        mid_naive_k += 1
+
+    return [
+        ("first_dim_vec", (first_rows, first_cols), 0),
+        ("last_dim_vec", (last_vec_rows, last_vec_cols), -1),
+        ("last_dim_naive", (last_naive_rows, last_naive_cols), -1),
+        ("mid_dim_vec", (mid_vec_m, mid_vec_n, mid_vec_k), 1),
+        ("mid_dim_naive", (mid_naive_m, mid_naive_n, mid_naive_k), 1),
+    ]
+
 
 l_dtype = ["bf16"]
 
@@ -203,6 +242,14 @@ parser.add_argument(
     default=None,
     help="run only one case by label, e.g. mid_dim_naive",
 )
+parser.add_argument(
+    "-t",
+    "--tp_size",
+    type=int,
+    choices=[2, 4, 8],
+    default=8,
+    help="tensor-parallel world size (default: 8)",
+)
 
 
 if __name__ == "__main__":
@@ -212,21 +259,24 @@ if __name__ == "__main__":
         dtypes_to_run = [dtypes.d_dtypes[k] for k in l_dtype]
     else:
         dtypes_to_run = [dtypes.d_dtypes[args.dtype]]
-    if args.case is None:
-        cases_to_run = l_cases
-    else:
-        cases_to_run = [c for c in l_cases if c[0] == args.case]
-        assert cases_to_run, f"no case named {args.case!r}"
 
-    tp_size = 8
+    tp_size = args.tp_size
 
     def init_method_factory():
         return get_distributed_init_method(get_ip(), get_open_port())
 
     rows = []
     for dtype in dtypes_to_run:
+        all_cases = build_cases(tp_size, dtype)
+        if args.case is None:
+            cases_to_run = all_cases
+        else:
+            cases_to_run = [c for c in all_cases if c[0] == args.case]
+            assert cases_to_run, f"no case named {args.case!r}"
         for label, shape, dim in cases_to_run:
-            print(f"\n=== {label}  shape={shape}  dim={dim}  dtype={dtype} ===")
+            print(
+                f"\n=== {label}  shape={shape}  dim={dim}  dtype={dtype}  tp={tp_size} ==="
+            )
             row = run_case(label, shape, dim, dtype, tp_size, init_method_factory)
             print(
                 f"  max_abs_err={row['max_abs_err']:.4g}  "
