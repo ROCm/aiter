@@ -467,10 +467,18 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
             ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
             ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            # oob (dead-tail) routes must NOT claim a real slot: incrementing the
+            # counter would inflate masked_m[0] by the whole padding tail,
+            # reshuffling the contiguous GEMM layout so valid rows land in cells
+            # the masked GEMM never writes (grouped_out is uninitialised). Add 0
+            # for oob so masked_m matches the trimmed (total_recv) case exactly;
+            # the row then points at an already-written bucket-0 cell and folds
+            # away via gather_w=0. Normal expert-mask drops still take a slot.
+            incr = arith.select(is_oob, c0, _raw(c1))
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,
-                arith.constant(1, type=i32),
+                incr,
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
                 alignment=4,
