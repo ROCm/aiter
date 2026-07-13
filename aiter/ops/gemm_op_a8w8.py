@@ -642,7 +642,6 @@ def gemm_a8w8_CK(
             gemm_fn = gemm_a8w8_cktile
         else:
             libtype = ck_config.get("libtype", "ck")
-            libtype = "ck" if libtype == "Null" else libtype
             if libtype == "ck":
                 gemm_fn = gemm_a8w8_ck
             elif libtype == "cktile":
