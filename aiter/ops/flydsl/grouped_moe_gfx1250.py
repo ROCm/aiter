@@ -385,6 +385,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     bias2: Optional[torch.Tensor],
     gate_mode: GateMode = GateMode.SEPARATED,
     swiglu_limit: Optional[float] = None,
+    num_local_tokens: Optional[torch.Tensor] = None,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -879,6 +880,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                     gather_w=_gather_w_buf,
                     weight_in=gather_weight,
                     counter=_g2l_counter,
+                    num_local_tokens=num_local_tokens,
                 )
                 _grouped_dbg("route done, start psum+remap")
                 _starts_t, psum_t, _ = contiguous_psum_remap(

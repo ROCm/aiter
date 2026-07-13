@@ -654,6 +654,7 @@ def fused_moe_(
                 bias2=bias2,
                 gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
+                num_local_tokens=num_local_tokens,
             )
 
     if grouped_a8w4_out is not None:
