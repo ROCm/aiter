@@ -431,6 +431,11 @@ jobs:
           cd "${shared_workspace}"
           chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
 
+          # The self-hosted runner can retain Spur per-rank variables. Slurm
+          # inherits the environment by default, and those variables make the
+          # ATOMesh Slurm script take its single-rank Spur path.
+          unset SPUR_TASK_OFFSET SPUR_PEER_NODES SPUR_NODELIST
+
           cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
           cancel_slurm_from_wrapper() {
             local rc=$?
