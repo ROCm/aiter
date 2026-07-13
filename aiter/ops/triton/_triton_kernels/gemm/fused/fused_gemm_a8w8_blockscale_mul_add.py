@@ -346,7 +346,7 @@ def _get_config(
     # On gfx950 the dedicated FUSED-GEMM-A8W8_BLOCKSCALE-MUL_ADD family recovers
     # this op's large-M regression (M > 512 -> the "any" bucket) with a fast
     # 64x64 tile. That same tile is numerically correct for fuse_type=0 (a*Y + b) but
-    # is miscompiled by Triton 3.8 for fuse_type=1 (a*b + Y) (fails correctness), so 
+    # is miscompiled by Triton 3.8 for fuse_type=1 (a*b + Y) (fails correctness), so
     # fuse_type=1 must fall back to the base GEMM-A8W8_BLOCKSCALE config (128x128), which is
     # correct. fuse_type=1 therefore does not get the large-M speedup.
     if arch_info.get_arch() == "gfx950" and fuse_type == 0:
