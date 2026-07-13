@@ -58,34 +58,35 @@ def _e4m3_to_f32(s: torch.Tensor) -> torch.Tensor:
     return s.view(torch.float8_e4m3fn).to(torch.float32)
 
 
-def run_torch_mxfp4(xq, wq, xs, ws, dtype, noscale=False):
-    # Reference only: fp32 math, cast back. Not timed, not in the table.
+def run_torch_mxfp4(xq, wq, xs, ws, noscale=False):
+    # Reference only: fp32 math. Returns fp32; the caller casts to bf16 or
+    # quantizes to packed fp4 per outtype. Not timed, not in the table.
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
     if noscale:
         # noscale kernel drops all per-block scale loads and uses the HW default
         # scale (1.0), so the reference must ignore the e8m0 scales too.
-        return (x_f32 @ w_f32.T).to(dtype)
+        return x_f32 @ w_f32.T
     xs = fp4_utils.e8m0_to_f32(xs).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
     ws = fp4_utils.e8m0_to_f32(ws).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
-    return ((x_f32 * xs) @ (w_f32 * ws).T).to(dtype)
+    return (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype, noscale=False):
-    # Reference only: fp32 math, cast back. Not timed, not in the table.
+def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=False):
+    # Reference only: fp32 math. Returns fp32 (see run_torch_mxfp4).
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
     if noscale:
         # noscale kernel drops the per-block e4m3 scales (HW default 1.0) but
         # STILL folds the per-tensor global scales gA*gB, so the reference must
         # match: skip the per-block scales, keep the global ones.
-        return (float(gA) * float(gB) * (x_f32 @ w_f32.T)).to(dtype)
+        return float(gA) * float(gB) * (x_f32 @ w_f32.T)
     xs = _e4m3_to_f32(xs).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
     ws = _e4m3_to_f32(ws).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
-    return (float(gA) * float(gB) * (x_f32 * xs) @ (w_f32 * ws).T).to(dtype)
+    return float(gA) * float(gB) * (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def _prep_mxfp4(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=False):
+def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
     if data_init == "constant":
         # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
@@ -102,7 +103,7 @@ def _prep_mxfp4(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=False)
     else:  # auto / pow2_binomial / random
         xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
         ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
-    ref = run_torch_mxfp4(xq, wq, xs, ws, dtype, noscale=noscale)
+    ref = run_torch_mxfp4(xq, wq, xs, ws, noscale=noscale)
     inp = dict(
         A=shuffle_weight_f4(xq) if apre else xq,
         B=shuffle_weight_f4(wq),
@@ -114,7 +115,7 @@ def _prep_mxfp4(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=False)
     return inp, ref
 
 
-def _prep_nvfp4(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=False):
+def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     # DATA (fp4 e2m1). data & scale sampled independently (bench_init).
     if data_init == "constant":
         # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
@@ -133,7 +134,7 @@ def _prep_nvfp4(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=False)
         ws = bench_init.fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
     # Per-tensor global scale is NOT part of bench_init: keep neutral.
     gA = gB = 1.0
-    ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype, noscale=noscale)
+    ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=noscale)
     inp = dict(
         A=shuffle_weight_f4(xq) if apre else xq,
         B=shuffle_weight_f4(wq),
@@ -145,18 +146,25 @@ def _prep_nvfp4(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=False)
     return inp, ref
 
 
-@benchmark()  # (intype, M, N, K, apre, scale, data_init, scale_init, seed) -> columns
-def test_gemm(intype, M, N, K, apre, scale, data_init, scale_init, seed=0, mode="perf",
-              dtype=dtypes.bf16):
+@benchmark()  # (intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed) -> cols
+def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed=0,
+              mode="perf", dtype=dtypes.bf16):
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
     # scale=0 selects the *_noscale kernel: per-block scales are ignored (HW
     # default 1.0). The scale tensors are still built/shuffled and handed to the
     # kernel (API-required); the kernel ignores them and the reference matches.
     noscale = scale == 0
+    # outtype=fp4 selects the packed-FP4-output kernel: the fp32 result is
+    # quantized to e2m1 (cvt_scale=1) and written 2 vals/byte, so the reference
+    # must quantize the same way and the output tensor is fp4x2 [M, N//2].
+    out_fp4 = outtype == "fp4"
+    out_dtype = dtypes.fp4x2 if out_fp4 else dtype
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
-    inp, ref = prep(M, N, K, apre, dtype, data_init, scale_init, gen, noscale=noscale)
+    inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen, noscale=noscale)
+    # Reference in the kernel's output form: quantized e2m1 for fp4, else bf16.
+    ref = fp4_utils.f32_to_mxfp4(ref_f32) if out_fp4 else ref_f32.to(dtype)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
@@ -164,7 +172,7 @@ def test_gemm(intype, M, N, K, apre, scale, data_init, scale_init, seed=0, mode=
         # See hsa/gfx1250/f4gemm/f4gemm.csv.
         pre = "ABpreShuffle" if apre else "BpreShuffle"
         ns = "_noscale" if noscale else ""
-        base = f"f4gemm_bf16_{intype}_{pre}_256x256_4x4_ps{ns}"
+        base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
         knl = f"_ZN5aiter{len(base)}{base}E"
         if intype == "nvfp4":
             return aiter.gemm_nvfp4_asm(
@@ -174,7 +182,7 @@ def test_gemm(intype, M, N, K, apre, scale, data_init, scale_init, seed=0, mode=
                 inp["sB"],
                 inp["gA"],
                 inp["gB"],
-                dtype=dtype,
+                dtype=out_dtype,
                 a_preshuffle=bool(apre),
                 kernelName=knl,
             )
@@ -183,7 +191,7 @@ def test_gemm(intype, M, N, K, apre, scale, data_init, scale_init, seed=0, mode=
             inp["B"],
             inp["sA"],
             inp["sB"],
-            dtype=dtype,
+            dtype=out_dtype,
             a_preshuffle=bool(apre),
             kernelName=knl,
         )
@@ -193,18 +201,30 @@ def test_gemm(intype, M, N, K, apre, scale, data_init, scale_init, seed=0, mode=
     candidates = {"asm": run_asm}
 
     flops = 2 * M * N * K
+    # Output bytes: packed fp4 is M*N/2 bytes; bf16 is M*N*itemsize.
+    out_bytes = (M * N) // 2 if out_fp4 else M * N * dtype.itemsize
     nbytes = (
         inp["A"].nbytes
         + inp["B"].nbytes
         + inp["sA"].nbytes
         + inp["sB"].nbytes
-        + M * N * dtype.itemsize  # bf16 output
+        + out_bytes
     )
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
         out, us = run_perftest(fn, num_iters=num_iters, needTrace=needTrace)
-        err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
+        if out_fp4:
+            # e2m1 is a coarse, deterministic quantization: compare the dequantized
+            # values with zero tolerance == exact fp4-code match (mirrors the host
+            # FP4 byte compare). Borderline RNE ties on random data may differ.
+            err = checkAllclose(
+                fp4_utils.mxfp4_to_f32(ref),
+                fp4_utils.mxfp4_to_f32(out),
+                rtol=0, atol=0, msg=f"{intype} {name} fp4",
+            )
+        else:
+            err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
@@ -251,6 +271,14 @@ def main():
         default=[1],
         help="scale sweep list: 1 = per-block-scale kernel, 0 = noscale kernel "
         "(per-block scale=1.0; needs the *_noscale.co, see f4gemm.csv)",
+    )
+    parser.add_argument(
+        "--outtype",
+        nargs="*",
+        choices=["bf16", "fp4"],
+        default=["bf16"],
+        help="output-format sweep list: bf16 (default) or fp4 (packed e2m1, "
+        "cvt_scale=1; needs the f4gemm_fp4_*.co, see f4gemm.csv)",
     )
     parser.add_argument(
         "--data-init",
@@ -332,10 +360,10 @@ def main():
         # init pair is the OUTERMOST product term -> rows are grouped by
         # (data_init,scale_init) within the single summary table.
         rows = [
-            test_gemm(intype, M, N, K, apre, sc, di, si, seed=args.seed,
+            test_gemm(intype, M, N, K, apre, sc, ot, di, si, seed=args.seed,
                       mode=args.mode, dtype=dtype)
-            for (di, si), intype, apre, sc, (M, N, K) in itertools.product(
-                init_pairs, args.intype, args.apre, args.scale, args.shape
+            for (di, si), intype, apre, sc, ot, (M, N, K) in itertools.product(
+                init_pairs, args.intype, args.apre, args.scale, args.outtype, args.shape
             )
         ]
         if args.mode != "func":
