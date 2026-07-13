@@ -4,7 +4,7 @@
 // Split-K reduce kernels (gfx942): sum workspace partials across split-K and write C[B, M, N].
 #pragma once
 
-#include "../opus_gemm_utils.cuh"
+#include "../../opus_gemm_utils.cuh"
 #include "opus_gemm_traits_a16w16.cuh"  // opus_splitk_ws_handle
 #include <cstdint>
 

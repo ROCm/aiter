@@ -4,7 +4,7 @@
 // Traits for a16w16 (bf16) pipelines.
 #pragma once
 
-#include "../opus_gemm_utils.cuh"
+#include "../../opus_gemm_utils.cuh"
 
 // Split-barrier a16w16 traits
 
