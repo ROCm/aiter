@@ -21,11 +21,13 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    get_flydsl_stage1_kernels_nvfp4_bf16,
 )
 from aiter.utility.fp4_utils import (
     _quantize_nvfp4_weight_for_moe,
     shuffle_nvfp4_weight_for_flydsl,
 )
+from aiter.aot.flydsl.moe import compile_one_config
 
 
 DTYPE = torch.bfloat16
@@ -608,3 +610,47 @@ def test_fused_moe_2stages_correctness(
     )
     torch.cuda.synchronize()
     _assert_close("fused_moe_2stages", out, ref, atol=2e-1, rtol=2e-1)
+
+
+def test_aot_compile_one_config_nvfp4() -> None:
+    """Smoke-test the AOT compilation path for an nvfp4 kernel.
+
+    Calls compile_one_config with FakeTensorMode so no GPU is required.
+    A non-None compile_time in the result means _precompile_to_cache ran
+    without raising.
+    """
+    kernels = get_flydsl_stage1_kernels_nvfp4_bf16("bf16")
+    kernel_name = next(
+        name
+        for name, params in kernels.items()
+        if params["tile_m"] == 16
+        and params["tile_n"] == 128
+        and params["tile_k"] == 128
+        and params["k_batch"] == 1
+    )
+    params = get_flydsl_kernel_params(kernel_name)
+    assert params is not None
+
+    model_dim = 512
+    inter_dim = 512
+    experts = 8
+    topk = 2
+
+    result = compile_one_config(
+        kernel_name=kernel_name,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        act="silu",
+        doweight_stage1=False,
+        token_num=16,
+        block_m=0,
+        enable_bias=False,
+        **params,
+    )
+
+    assert result["compile_time"] is not None, (
+        f"compile_one_config raised for nvfp4 kernel {kernel_name!r}: "
+        "check _precompile_to_cache for the global_scale arg fix"
+    )
