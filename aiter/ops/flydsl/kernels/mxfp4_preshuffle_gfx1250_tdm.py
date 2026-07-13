@@ -240,7 +240,7 @@ def launch_gemm_a8w4_tdm(
         _FRONT = list(range(front_wm))
         _BACK = list(range(front_wm, wmma_m_rep))
 
-        def _emit(wm_list, act, wt, sa_k, sb_k):
+        def _mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
                 wm = wm_list[i]
                 for wn_raw in range_constexpr(wmma_n_rep):
@@ -253,32 +253,38 @@ def launch_gemm_a8w4_tdm(
         DS_B = 2
         _BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
 
-        def _load_bs(buf, ksl):
+        def _load_b_scales(buf, ksl):
             wt = [_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
             sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def _stream(buf, ksl, wt, sb_k, sa_k, nxt_ksl, mid_cb=None):
+        def _kstep(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
+            # Partial front drain keeps back-A ds_reads in flight so the front WMMAs
+            # hide them; prefetch_kt (next K-tile TDM) is issued between front/back
+            # WMMA groups so its DMA overlaps the back WMMAs.
             act_f = [_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in _FRONT]
-            rocdl.s_wait_dscnt(0)
-            _emit(_FRONT, act_f, wt, sa_k, sb_k)
-            if const_expr(mid_cb is not None):
-                rocdl.sched_barrier(0)
-                mid_cb()
-                rocdl.sched_barrier(0)
             if const_expr(len(_BACK) > 0):
                 act_b = [_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in _BACK]
+                rocdl.s_wait_dscnt(len(_BACK) * DS_A)
+            else:
                 rocdl.s_wait_dscnt(0)
-                _emit(_BACK, act_b, wt, sa_k, sb_k)
-            return _load_bs(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
+            _mma_rows(_FRONT, act_f, wt, sa_k, sb_k)
+            if const_expr(prefetch_kt is not None):
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % num_buffers, prefetch_kt)
+                rocdl.sched_barrier(0)
+            if const_expr(len(_BACK) > 0):
+                rocdl.s_wait_dscnt(0)
+                _mma_rows(_BACK, act_b, wt, sa_k, sb_k)
+            return _load_b_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
 
-        def compute_stream(buf, mid_cb):
-            prev = _load_bs(buf, 0)
+        def compute_ktile(buf, prefetch_kt):
+            prev = _load_b_scales(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                cb = mid_cb if const_expr(ksl == 0) else None
-                prev = _stream(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, mid_cb=cb)
+                pk = prefetch_kt if const_expr(ksl == 0) else None
+                prev = _kstep(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, prefetch_kt=pk)
             _fr, _bk = front_wm * wmma_n_rep, len(_BACK) * wmma_n_rep
             for _ks in range_constexpr(KWS):
                 rocdl.sched_dsrd((_BS_DS if _ks == 0 else 0) + front_wm * DS_A)
@@ -290,29 +296,23 @@ def launch_gemm_a8w4_tdm(
             rocdl.sched_barrier(0)
 
         TDM_PER = 4
-        # Prologue: preload the first (num_buffers-1) K-tiles (constexpr count).
+        # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
+        # compute into the slot the fence just freed (one fence/barrier per K-tile).
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
-        # Steady state (runtime scf.for): compute ring slot kt%nb while issuing tile
-        # kt+nb-1 mid-compute; the fence keeps (nb-2) tiles' TDMs in flight.
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
             pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-
-            def _mid():
-                nk = kt + (num_buffers - 1)
-                issue(nk % num_buffers, nk)
-
-            compute_stream(buf, _mid)
-        # Tail: last (num_buffers-1) tiles are already resident; drain progressively.
+            compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
+        # Tail: last (num_buffers-1) tiles are resident; drain progressively.
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
             pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
-            compute_stream(buf, None)
+            compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
