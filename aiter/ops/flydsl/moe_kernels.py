@@ -1132,16 +1132,22 @@ def flydsl_silu_and_mul_interleaved(
 # ---------------------------------------------------------------------------
 
 
-def moe_sorting_shape(tokens: int, topk: int, num_experts: int, block_m: int):
-    """Single source of truth for moe-sorting padded sizes.
+def _aot_routing_placeholder(tokens: int, topk: int, num_experts: int, tile_m: int):
+    """Placeholder sizes for the AOT compile-only routing buffers.
 
-    Mirrors the allocation in ``aiter.fused_moe.moe_sorting``:
-        max_num_tokens_padded = tokens*topk + num_experts*block_m - topk
-    Returns ``(max_num_tokens_padded, max_num_m_blocks)``.
+    These buffers (``sorted_token_ids`` / ``sorted_expert_ids`` /
+    ``sorted_weights``) reach the kernel as bare ``ptr_arg`` pointers (null under
+    ``FakeTensor``), so their length **never enters the JIT cache key** -- it only
+    feeds runtime-scalar grid dims that don't exist at compile time. We therefore
+    deliberately do NOT mirror ``aiter.fused_moe.moe_sorting``'s padded-size
+    formula (runtime keeps its own copy; there is no shared size contract to keep
+    in sync). A coarse non-zero over-estimate just keeps the host body's shape
+    math sane. Cache-key-neutrality is guarded by
+    ``aiter/aot/flydsl/_cache_key_parity.py``.
     """
-    max_num_tokens_padded = tokens * topk + num_experts * block_m - topk
-    max_num_m_blocks = (max_num_tokens_padded + block_m - 1) // block_m
-    return max_num_tokens_padded, max_num_m_blocks
+    rows = tokens * topk + num_experts * tile_m
+    blocks = max(1, (rows + tile_m - 1) // tile_m)
+    return rows, blocks
 
 
 def _moe_storage_dtype(dtype: str):
@@ -1209,10 +1215,11 @@ def build_stage1_compile_inputs(
     dev = dev if dev is not None else torch.device("cpu")
     tokens = token_num if token_num > 0 else tile_m
     E = experts
-    _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
-    _block_m_for_sort = block_m if block_m > 0 else _sort_block_m
-    max_num_tokens_padded, max_num_m_blocks = moe_sorting_shape(
-        tokens, topk, E, _block_m_for_sort
+    # sort_block_m / block_m no longer size these buffers (see
+    # _aot_routing_placeholder): the routing buffers are pointer args, so their
+    # length is irrelevant to the cache key.
+    max_num_tokens_padded, max_num_m_blocks = _aot_routing_placeholder(
+        tokens, topk, E, tile_m
     )
 
     # Activation / weight shapes DO set the cache key (model_dim / inter_dim / E,
@@ -1319,9 +1326,10 @@ def build_stage2_compile_inputs(
     dev = dev if dev is not None else torch.device("cpu")
     tokens = token_num if token_num > 0 else tile_m
     E = experts
-    _block_m_for_sort = block_m if block_m > 0 else (sort_block_m or tile_m)
-    max_num_tokens_padded, max_num_m_blocks = moe_sorting_shape(
-        tokens, topk, E, _block_m_for_sort
+    # See _aot_routing_placeholder: pointer-arg routing buffers, size irrelevant
+    # to the cache key; sort_block_m / block_m no longer feed this.
+    max_num_tokens_padded, max_num_m_blocks = _aot_routing_placeholder(
+        tokens, topk, E, tile_m
     )
 
     a_shape = (
