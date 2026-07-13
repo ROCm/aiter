@@ -242,6 +242,8 @@ template torch::Tensor
 #include <cstdlib>
 
 #include <torch/extension.h>
+
+{eight_waves_definition}
 """
         MAINFEST_template = """
 template <typename ABDataType, typename DDataType, typename EDataType, bool HasBias>
@@ -263,7 +265,10 @@ torch::Tensor
         with open(
             os.path.join(self.working_path, "gemm_a8w8_cktile_manifest.h"), "w"
         ) as f:
-            f.write(MAINFEST_head)
+            eight_waves_supported = (
+                "#define EIGHT_WAVES_SUPPORTED" if get_gfx() == "gfx950" else ""
+            )
+            f.write(MAINFEST_head.format(eight_waves_definition=eight_waves_supported))
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
             f.write(MAINFEST_end)

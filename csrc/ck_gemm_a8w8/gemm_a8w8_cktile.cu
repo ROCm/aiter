@@ -34,32 +34,28 @@ template <typename ABDataType, typename DDataType, typename EDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
   const int cu_num           = get_device_cu_num();
-  const std::string_view gfx = get_device_gfx();
 
-  if(gfx == "gfx950")
+#ifdef EIGHT_WAVES_SUPPORTED
+  if(div_ceil(M, 256) * div_ceil(N, 256) > cu_num)
   {
-    if(div_ceil(M, 256) * div_ceil(N, 256) > cu_num)
-    {
-      return a8w8_cktile_256x256x128_4x2x1_16x16_intrawave_0x1x0_2<ABDataType,
-                                                                    DDataType,
-                                                                    EDataType,
-                                                                    true>;
-    }
-    else
-    {
-      return a8w8_cktile_192x256x128_4x2x1_16x16_intrawave_0x1x0_2<ABDataType,
-                                                                    DDataType,
-                                                                    EDataType,
-                                                                    true>;
-    }
+    return a8w8_cktile_256x256x128_4x2x1_16x16_intrawave_0x1x0_2<ABDataType,
+                                                                  DDataType,
+                                                                  EDataType,
+                                                                  true>;
   }
   else
   {
-    return a8w8_cktile_16x128x256_1x4x1_16x16_intrawave_0x0x0_1<ABDataType,
-                                                                DDataType,
-                                                                EDataType,
-                                                                true>;
+    return a8w8_cktile_192x256x128_4x2x1_16x16_intrawave_0x1x0_2<ABDataType,
+                                                                  DDataType,
+                                                                  EDataType,
+                                                                  true>;
   }
+#else
+  return a8w8_cktile_16x128x256_1x4x1_16x16_intrawave_0x0x0_1<ABDataType,
+                                                              DDataType,
+                                                              EDataType,
+                                                              true>;
+#endif
 }
 
 // Helper function to return the next largest power of 2
