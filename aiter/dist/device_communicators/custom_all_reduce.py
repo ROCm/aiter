@@ -985,6 +985,128 @@ class CustomAllreduce:
         else:
             return self.reduce_scatter(input, output, dim, registered=False)
 
+    # ---- add_fused_allreduce dispatch ----
+    #
+    # Internal kernel selector values (the ``algo`` arg of the C++
+    # ``ops.add_fused_allreduce``). Not part of the public API — callers use
+    # ``add_fused_allreduce`` which auto-selects the fastest path.
+    _ADD_FUSED_2STAGE = 0  # fused kernel, reduce-scatter + all-gather
+    _ADD_FUSED_1STAGE = 1  # fused kernel, push-then-local-reduce
+    _ADD_FUSED_UNFUSED = 2  # torch.add + separate custom_all_reduce
+    #
+    # Per-world-size element-count thresholds derived from the bf16 graph-mode
+    # latency sweep in op_tests/multigpu_tests/bench_add_fused_allreduce.py.
+    # Each entry is (one_stage_max, two_stage_max) in element count:
+    #     numel <= one_stage_max                 -> 1stage
+    #     one_stage_max < numel <= two_stage_max -> 2stage
+    #     numel > two_stage_max                  -> unfused (torch.add + car),
+    #                                               falling back to 2stage when
+    #                                               the size exceeds the AR cap.
+    # 1stage wins only at small sizes (its cost grows linearly with numel);
+    # 2stage dominates the mid range; the separated torch.add + custom AR wins
+    # once tensors are large enough that fusion no longer hides the add.
+    _ADD_FUSED_AR_THRESHOLDS = {
+        2: (64 * 1024, 4 * 1024 * 1024),
+        4: (16 * 1024, 4 * 1024 * 1024),
+        8: (8 * 1024, 2 * 1024 * 1024),
+    }
+    # Conservative default for world sizes without measured data (e.g. 6):
+    # smallest 1stage window and smallest 2stage window observed.
+    _ADD_FUSED_AR_DEFAULT = (8 * 1024, 2 * 1024 * 1024)
+
+    def _select_add_fused_allreduce_algo(self, inp: torch.Tensor) -> int:
+        """Pick the fastest add_fused_allreduce path for ``inp``'s size.
+
+        Returns one of ``_ADD_FUSED_{1STAGE,2STAGE,UNFUSED}``. The unfused path
+        is only chosen when ``custom_all_reduce`` can actually service the
+        summed tensor; otherwise it stays on the fused 2stage kernel.
+        """
+        one_stage_max, two_stage_max = self._ADD_FUSED_AR_THRESHOLDS.get(
+            self.world_size, self._ADD_FUSED_AR_DEFAULT
+        )
+        numel = inp.numel()
+        if numel <= one_stage_max:
+            return self._ADD_FUSED_1STAGE
+        if numel <= two_stage_max:
+            return self._ADD_FUSED_2STAGE
+        # Large tensors: the separated path is fastest, but only if the summed
+        # tensor fits the custom_all_reduce size cap. Otherwise use 2stage.
+        if self.should_custom_ar(inp):
+            return self._ADD_FUSED_UNFUSED
+        return self._ADD_FUSED_2STAGE
+
+    def add_fused_allreduce(
+        self,
+        inp_a: torch.Tensor,
+        inp_b: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fused (inp_a + inp_b) followed by an all-reduce across ranks.
+
+        out = allreduce_over_ranks(inp_a + inp_b)
+
+        inp_a/inp_b are same-shape, same-dtype tensors. Out-of-place. Inputs
+        are read locally by the kernel (no IPC-registered copy needed), so
+        there is no `registered` fast path here.
+
+        The fastest path is selected automatically from the input size and the
+        world size (see ``_select_add_fused_allreduce_algo``): the fused 1stage
+        kernel for small tensors, the fused 2stage kernel for the mid range, and
+        the separated ``torch.add`` + ``custom_all_reduce`` for large tensors.
+        """
+        assert inp_a.shape == inp_b.shape, "add_fused_allreduce inputs must match"
+        assert inp_a.dtype == inp_b.dtype, "add_fused_allreduce dtypes must match"
+
+        algo = self._select_add_fused_allreduce_algo(inp_a)
+        if algo == self._ADD_FUSED_UNFUSED:
+            return self._add_fused_allreduce_unfused(inp_a, inp_b, out=out)
+
+        if out is None:
+            out = torch.empty_like(inp_a)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        ops.add_fused_allreduce(self._ptr, inp_a, inp_b, out, algo)
+        return out
+
+    def _add_fused_allreduce_unfused(
+        self,
+        inp_a: torch.Tensor,
+        inp_b: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Separated (torch.add + custom_all_reduce) path for large tensors.
+
+        Mirrors ``custom_all_reduce``'s capture / warmup handling so it is safe
+        under CUDA-graph capture, and writes into ``out`` (via ``all_reduce``)
+        to avoid an extra device-to-device copy at large sizes. Falls back to
+        the fused 2stage kernel if the summed tensor cannot be serviced by the
+        custom all-reduce (e.g. it exceeds the size cap).
+        """
+        summed = torch.add(inp_a, inp_b)
+        if self.disabled or not self.should_custom_ar(summed):
+            if out is None:
+                out = torch.empty_like(inp_a)
+            assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+            ops.add_fused_allreduce(
+                self._ptr, inp_a, inp_b, out, self._ADD_FUSED_2STAGE
+            )
+            return out
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce(
+                    summed,
+                    out=out,
+                    registered_input=self.enable_register_for_capturing,
+                )
+            # warmup forward (pre-capture): mimic the out-of-place allocation
+            # pattern without running the real collective.
+            if out is None:
+                return torch.zeros_like(inp_a)
+            out.zero_()
+            return out
+        return self.all_reduce(summed, out=out, registered_input=False)
+
     def _allgather_out_shape(self, inp: torch.Tensor, dim: int):
         ndim = inp.dim()
         if dim == 0:

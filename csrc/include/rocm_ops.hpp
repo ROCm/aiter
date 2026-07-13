@@ -488,6 +488,13 @@ namespace py = pybind11;
           py::arg("split_dim"),                                                                \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"));                                                               \
+    m.def("add_fused_allreduce",                                                               \
+          &aiter::add_fused_allreduce,                                                         \
+          py::arg("_fa"),                                                                      \
+          py::arg("inp_a"),                                                                    \
+          py::arg("inp_b"),                                                                    \
+          py::arg("out"),                                                                      \
+          py::arg("algo") = 0);                                                                \
     m.def("all_gather_reg",                                                                    \
           &aiter::all_gather_reg,                                                              \
           py::arg("_fa"),                                                                      \

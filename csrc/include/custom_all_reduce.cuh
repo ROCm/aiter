@@ -774,6 +774,169 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
     }
 }
 
+// -------------------------------------------------
+// ----- add fuse allreduce
+// -------------------------------------------------
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) add_fused_allreduce_1stage(
+    T* __restrict__ input_a,
+    T* __restrict__ input_b,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size
+)
+{
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    constexpr int pack_size = 16 / sizeof(T);
+    int lane_id = threadIdx.x % tnum_gpu;
+    int warp_id = threadIdx.x / tnum_gpu;
+    using P = typename opus::vector_t<T, pack_size>;
+    using A = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int stride = gridDim.x * tnum_gpu;
+
+    P* tmps[ngpus];
+    __shared__ T smem[THREAD_NUM * pack_size];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    // should only loop once
+    start_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      if (warp_id == 0)
+      {
+        P inp_a = *(reinterpret_cast<P*>(input_a) + idx);
+        P inp_b = *(reinterpret_cast<P*>(input_b) + idx);
+        P add_c;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          add_c[i] = downcast_s<T>(
+            upcast_s(inp_a[i]) + upcast_s(inp_b[i])
+          );
+        }
+        tmps[rank][idx] = add_c;
+      }
+      end_sync<ngpus>(sg, self_sg, rank);
+      *(reinterpret_cast<P*>(smem) + threadIdx.x) = tmps[warp_id][idx];
+      __syncthreads();
+      if (warp_id == 0)
+      {
+        P reduce_elem = *(reinterpret_cast<P*>(smem) + lane_id);
+        P reduce_rslt_T;
+        A reduce_rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          reduce_rslt[i] = upcast_s(reduce_elem[i]);
+        }
+#pragma unroll
+        for (int i = 1; i < ngpus; ++i)
+        {
+          reduce_elem = *(reinterpret_cast<P*>(smem) + i * tnum_gpu + lane_id);
+#pragma unroll
+          for (int j = 0; j < pack_size; ++j)
+          {
+            reduce_rslt[j] += upcast_s(reduce_elem[j]);
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          reduce_rslt_T[i] = downcast_s<T>(reduce_rslt[i]);
+        }
+        *(reinterpret_cast<P*>(result) + idx) = reduce_rslt_T;
+      }
+      __syncthreads();
+    }
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) add_fused_allreduce_2stage(
+    T* __restrict__ input_a,
+    T* __restrict__ input_b,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size
+)
+{
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P = typename opus::vector_t<T, pack_size>;
+    using A = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int tid = blockIdx.x * tnum_gpu + lane_id;
+    int stride = gridDim.x * tnum_gpu;
+    __shared__ T smem[THREAD_NUM * pack_size];
+
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      P inp_a = *(reinterpret_cast<P*>(input_a) + warp_id * size + idx);
+      P inp_b = *(reinterpret_cast<P*>(input_b) + warp_id * size + idx);
+      P add_c;
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        add_c[i] = downcast_s<T>(
+          upcast_s(inp_a[i]) + upcast_s(inp_b[i])
+        );
+      }
+      tmps[rank][warp_id * size + idx] = add_c;
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      *(reinterpret_cast<P*>(&smem[0]) + threadIdx.x) = tmps[warp_id][rank * size + idx];
+      __syncthreads();
+      if (warp_id == 0)
+      {
+        P reduce_elem = *(reinterpret_cast<P*>(&smem[0]) + lane_id);
+        A reduce_rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          reduce_rslt[i] = upcast_s(reduce_elem[i]);
+        }
+        for (int i = 1; i < ngpus; ++i)
+        {
+          reduce_elem = *(reinterpret_cast<P*>(&smem[0]) + i * tnum_gpu + lane_id);
+#pragma unroll
+          for (int j = 0; j < pack_size; ++j)
+          {
+            reduce_rslt[j] += upcast_s(reduce_elem[j]);
+          }
+        }
+        P rslt;
+#pragma unroll
+        for (int i = 0; i < pack_size; ++i)
+        {
+          rslt[i] = downcast_s<T>(reduce_rslt[i]);
+        }
+        tmps[rank][rank * size + idx] = rslt;
+      }
+      __syncthreads();
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = tid; idx < size; idx += stride)
+    {
+      *(reinterpret_cast<P*>(result) + warp_id * size + idx) = tmps[warp_id][warp_id * size + idx];
+    }
+}
+
 // ========== reduce_scatter kernel start ==========
 //
 // reduce_scatter has 3 categories depending on where the scatter dim sits in
@@ -4067,6 +4230,59 @@ void dispatchAllGather(
         default: printf("allgather world_size error\n");
         }
     }
+}
+
+// Fused (A + B) followed by a 2-stage all-reduce.
+//   result = allreduce_over_ranks( input_a + input_b )
+// `input_a`/`input_b`/`result` are plain local device pointers: the kernel
+// reads A/B locally and only crosses devices through the temp buffers
+// (get_tmp_buf on the IPC-registered meta pool), so no get_buffer_RD /
+// IPC registration of the inputs is needed.
+//
+// `numel` is the element count of one rank's input tensor. The kernel indexes
+// as `warp_id * size + idx` with warp_id in [0, ngpus), so the per-launch
+// `size` is numel / (pack_size * world_size). Requires
+// numel % (pack_size * world_size) == 0.
+template <typename T>
+void dispatchAddFusedAllReduce(
+    hipStream_t stream, T* input_a, T* input_b, T* result, int64_t numel, int algo = 0)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int threads   = THREAD_NUM;
+    if(numel % (int64_t)(pack_size * world_size_) != 0)
+    {
+        throw std::runtime_error(
+            "add_fused_allreduce requires numel to be a multiple of pack_size * world_size (" +
+            std::to_string(pack_size * world_size_) + ")");
+    }
+    // 2stage splits the input across ranks, so each rank processes numel/world_size
+    // packed elements. 1stage processes the full tensor locally and pushes it to
+    // every peer, so `size` is the full packed length.
+    int size_2stage  = (int)(numel / (pack_size * world_size_));
+    int size_1stage  = (int)(numel / pack_size);
+    int size         = (algo == 1) ? size_1stage : size_2stage;
+    int tnum_per_gpu  = threads / world_size_;
+    int blocks        = std::min(kMaxBlocks, (size + tnum_per_gpu - 1) / tnum_per_gpu);
+    blocks            = std::max(blocks, 1);
+    dim3 grid(blocks);
+    dim3 block(threads);
+#define ADD_FUSED_AR_CASE(NG)                                                    \
+    case NG:                                                                     \
+        if(algo == 1)                                                            \
+            add_fused_allreduce_1stage<T, NG><<<grid, block, 0, stream>>>(       \
+                input_a, input_b, sg_, self_sg_, result, rank_, size);          \
+        else                                                                    \
+            add_fused_allreduce_2stage<T, NG><<<grid, block, 0, stream>>>(       \
+                input_a, input_b, sg_, self_sg_, result, rank_, size);          \
+        break;
+    switch(world_size_)
+    {
+        ADD_FUSED_AR_CASE(2)
+        ADD_FUSED_AR_CASE(4)
+        ADD_FUSED_AR_CASE(8)
+    default: throw std::runtime_error("add_fused_allreduce only supports 2, 4, 8 gpus");
+    }
+#undef ADD_FUSED_AR_CASE
 }
 
 template <typename T>

@@ -51,6 +51,16 @@ def reduce_scatter(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def add_fused_allreduce(
+    _fa: int,
+    inp_a: torch.Tensor,
+    inp_b: torch.Tensor,
+    out: torch.Tensor,
+    algo: int = 0,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_reg(
     _fa: int,
     inp: torch.Tensor,
