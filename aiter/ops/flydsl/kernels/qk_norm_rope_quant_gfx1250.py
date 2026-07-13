@@ -428,7 +428,7 @@ def _build_kernel(
                     bf16_v = vector.extract(
                         vec_bf16, static_position=[i], dynamic_position=[]
                     )
-                    out.append(arith.extf(f32, bf16_v))
+                    out.append(bf16_v.extf(f32))
             else:
                 half_dw = 4
                 half_bf16 = half_dw * 2  # 8 bf16 per chunk
@@ -444,7 +444,7 @@ def _build_kernel(
                         bf16_v = vector.extract(
                             vbf16, static_position=[i], dynamic_position=[]
                         )
-                        out.append(arith.extf(f32, bf16_v))
+                        out.append(bf16_v.extf(f32))
             return out
 
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
@@ -604,25 +604,19 @@ def _build_kernel(
 
             # ---- Extract cos/sin values (loads issued early, now consumed) ----
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_vals = [arith.extf(f32, cos_raw)]
-                sin_vals = [arith.extf(f32, sin_raw)]
+                cos_vals = [cos_raw.extf(f32)]
+                sin_vals = [sin_raw.extf(f32)]
             else:
                 cos_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            cos_raw, static_position=[i], dynamic_position=[]
-                        ),
-                    )
+                    vector.extract(
+                        cos_raw, static_position=[i], dynamic_position=[]
+                    ).extf(f32)
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            sin_raw, static_position=[i], dynamic_position=[]
-                        ),
-                    )
+                    vector.extract(
+                        sin_raw, static_position=[i], dynamic_position=[]
+                    ).extf(f32)
                     for i in range(PAIRS_PER_THREAD)
                 ]
 
