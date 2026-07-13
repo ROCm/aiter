@@ -231,8 +231,6 @@ def _run_gfx1250(
     else:
         n_warp = max(1, tile_n // 64)
         m_warp = (tile_m // 16) if tile_m <= 64 else (tile_m // 32)
-    warp_tile_n = tile_n // n_warp
-    warp_tile_m = tile_m // m_warp
     if m_warp * n_warp * 32 > 1024:
         raise RuntimeError(
             f"[FlyDSL gfx1250] block {m_warp * n_warp * 32} > 1024 for tile "
@@ -269,13 +267,10 @@ def _run_gfx1250(
         tile_k,
         m_warp,
         n_warp,
-        warp_tile_m,
-        warp_tile_n,
         out_is_f16,
         B,
         layout_mbn,
         num_buffers,
         a_is_fp4,
-        0,
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

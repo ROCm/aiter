@@ -49,13 +49,12 @@ sb = shuffle_scale_n32k4(pad32(w_scales[0]).unsqueeze(0), experts_cnt=1).view(to
 sa = shuffle_scale_n32k4(pad32(x_scales[0]).unsqueeze(0), experts_cnt=1).view(torch.uint8).reshape(-1)
 a = x.contiguous()
 out = torch.empty((B, M, N), dtype=torch.bfloat16)
-wtm, wtn = tm // mw, tn // nw
 
 
 def run():
     launch_gemm_a8w4_tdm(out, ptr_arg(a), ptr_arg(w_sh), sa.view(torch.int32),
                          sb.view(torch.int32), M, torch.cuda.current_stream(),
-                         N, K, tm, tn, tk, mw, nw, wtm, wtn, 0, B, 0, nb, 0, 0)
+                         N, K, tm, tn, tk, mw, nw, 0, B, 0, nb, 0)
 
 
 mm = -1.0
