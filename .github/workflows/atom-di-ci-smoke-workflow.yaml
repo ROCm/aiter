@@ -236,6 +236,47 @@ jobs:
 
           server_path.write_text(text, encoding="utf-8")
           print(f"{server_path}: patched ATOM PD rank mapping policy argument")
+
+          router_path = Path("atom/mesh/src/routers/http_pd_router.rs")
+          text = router_path.read_text(encoding="utf-8")
+          relay_old = """                        if let Err(e) = self
+                            .adapter
+                            .inject_decode_fields(&mut decode_request_json, &ctx)
+                        {
+                            return Self::handle_serialization_error(e);
+                        }
+                        let correlation_id = self.adapter.correlation_id(&ctx);
+"""
+          relay_new = """                        if let Err(e) = self
+                            .adapter
+                            .inject_decode_fields(&mut decode_request_json, &ctx)
+                        {
+                            return Self::handle_serialization_error(e);
+                        }
+                        if let Some(prefill_dp_rank) = prefill.dp_rank() {
+                            if let Some(obj) = prefill_request_json.as_object_mut() {
+                                obj.insert(
+                                    "data_parallel_rank".to_string(),
+                                    serde_json::json!(prefill_dp_rank),
+                                );
+                            }
+                        }
+                        if let Some(decode_dp_rank) = decode.dp_rank() {
+                            if let Some(obj) = decode_request_json.as_object_mut() {
+                                obj.insert(
+                                    "data_parallel_rank".to_string(),
+                                    serde_json::json!(decode_dp_rank),
+                                );
+                            }
+                        }
+                        let correlation_id = self.adapter.correlation_id(&ctx);
+"""
+          if relay_new not in text:
+              if relay_old not in text:
+                  raise SystemExit("Failed to find ATOM relay decode injection point")
+              text = text.replace(relay_old, relay_new, 1)
+          router_path.write_text(text, encoding="utf-8")
+          print(f"{router_path}: patched explicit ATOM PD data_parallel_rank injection")
           PY
 
       - name: Install matrix dependencies
