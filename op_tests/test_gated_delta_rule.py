@@ -19,6 +19,9 @@ from aiter.ops.triton.gated_delta_net import (
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+)
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -940,9 +943,28 @@ def test_chunk_opt_varlen_hip(
 
 
 @pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens"),
     [
-        pytest.param(*test, id="hip-indice-H{}-D{}-mask_p{}-cu_seqlens{}".format(*test))
+        pytest.param(*test, id="indice-H{}-D{}-mask_p{}-cu_seqlens{}".format(*test))
         for test in [
             (4, 128, 0, [0, 15]),
             (4, 128, 0, [0, 256, 500, 1000]),
@@ -960,31 +982,37 @@ def test_chunk_opt_varlen_hip(
 )
 @pytest.mark.skipif(
     os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
-    reason="Skipping test_chunk_opt_vk_indice_hip because SKIP_TEST_CHUNK_VARLEN is set",
+    reason="Skipping test_chunk_opt_vk_indice because SKIP_TEST_CHUNK_VARLEN is set",
 )
-@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
-@pytest.mark.skipif(
-    _is_gfx12_runtime(),
-    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
-)
-def test_chunk_opt_vk_indice_hip(
+def test_chunk_opt_vk_indice(
+    backend: str,
     H: int,
     D: int,
     mask_p: float,
     cu_seqlens: list[int],
     state_dtype: torch.dtype,
 ):
-    """Functional test for the indexed state-pool HIP fwd_h.
+    """Functional test for the indexed state-pool fwd_h on both backends.
 
-    Both paths go through the single ``chunk_gated_delta_rule_fwd_h_hip_fn`` and
-    the same kernel; the only differences are the per-sequence slot gather
-    (``initial_state_indices``) on read and the in-place write-back into that
-    slot. So when the pool holds the same initial states at (scattered) slots,
-    dense vs indexed must be bit-identical, and non-indexed pool slots must stay
-    untouched.
+    The Triton (``chunk_gated_delta_rule_fwd_h_opt_vk``) and HIP
+    (``chunk_gated_delta_rule_fwd_h_hip_fn``) entries share the same dense/indexed
+    contract: the only differences from the dense path are the per-sequence slot
+    gather (``initial_state_indices``) on read and the in-place write-back into
+    that slot. So when the pool holds the same initial states at (scattered)
+    slots, dense vs indexed must be bit-identical, and non-indexed pool slots must
+    stay untouched. The check is a same-backend self-comparison, so it does not
+    depend on the gate layout being interpreted a particular way.
     """
-    if D != 128:
-        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        # HIP kernel is specialized for D=128 / bf16 and reads head-major gates.
+        if D != 128:
+            pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
     cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
@@ -992,12 +1020,12 @@ def test_chunk_opt_vk_indice_hip(
     N = len(cu_seqlens) - 1
     B = 1
 
-    # fwd_h-stage inputs (layout unchanged): k [B,T,Hg,K] token-major,
-    # w/u [B,H,T,K|V] head-major, g [B,T,H] token-major. Hg == H (no GQA).
+    # fwd_h-stage inputs: k [B,T,H,K] token-major, w/u [B,H,T,K|V] head-major,
+    # g head-major [B,H,T]. Hg == H (no GQA).
     k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
     w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
     u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
-    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
     g = g * (torch.rand_like(g) > mask_p)
 
     # Dense per-sequence initial states [N, H, V, K] (random, so the gather is
@@ -1005,7 +1033,7 @@ def test_chunk_opt_vk_indice_hip(
     h0 = torch.randn(N, H, D, D, dtype=state_dtype, device=device)
 
     # --- dense reference: slot == i_n ---
-    h_ref, vnew_ref, ht_ref = chunk_gated_delta_rule_fwd_h_hip_fn(
+    h_ref, vnew_ref, ht_ref = fwd_h(
         k=k.clone(),
         w=w.clone(),
         u=u.clone(),
@@ -1014,7 +1042,7 @@ def test_chunk_opt_vk_indice_hip(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         state_dtype=state_dtype,
-        g_head_major=False,
+        **extra_kwargs,
     )
 
     # --- indexed pool: scatter the N states into a larger pool at unique,
@@ -1026,9 +1054,9 @@ def test_chunk_opt_vk_indice_hip(
     pool_before = pool.clone()
     pool[indices.long()] = h0.clone()
 
-    # Indexed pool path via the unified entry: passing initial_state_indices
-    # switches to slot gather + in-place write-back (final_state aliases pool).
-    h_idx, vnew_idx, ht_idx = chunk_gated_delta_rule_fwd_h_hip_fn(
+    # Indexed pool path: passing initial_state_indices switches to slot gather +
+    # in-place write-back (final_state aliases pool).
+    h_idx, vnew_idx, ht_idx = fwd_h(
         k=k.clone(),
         w=w.clone(),
         u=u.clone(),
@@ -1037,7 +1065,8 @@ def test_chunk_opt_vk_indice_hip(
         initial_state_indices=indices,
         output_final_state=True,
         cu_seqlens=cu_seqlens,
-        g_head_major=False,
+        state_dtype=state_dtype,
+        **extra_kwargs,
     )
     assert ht_idx is pool  # in-place: final state aliases the pool buffer
 
