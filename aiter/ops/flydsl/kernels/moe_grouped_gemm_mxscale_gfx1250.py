@@ -505,9 +505,13 @@ def _compile_stage1_finalize_act(
                     for pair_idx in range_constexpr(VEC_DW * 2):
                         g = g_acc[pair_idx]
                         u = u_acc[pair_idx]
+                        # Clamp gate/up with swiglu_limit for BOTH silu and
+                        # swiglu (silu without a limit passes +inf, a no-op),
+                        # matching the bias finalize kernel, the fused GEMM
+                        # epilogue, and torch_moe_stage1.
+                        g = -((-g).maximumf(neg_lim))
+                        u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
-                            g = -((-g).maximumf(neg_lim))
-                            u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                             t = g * alpha * neg_log2e
                             emu = ArithValue(
                                 llvm.call_intrinsic(
@@ -612,11 +616,15 @@ def _compile_stage1_finalize_act(
                         g_hi = g_hi_acc[lane]
                         u_lo = u_lo_acc[lane]
                         u_hi = u_hi_acc[lane]
+                        # Clamp gate/up with swiglu_limit for BOTH silu and
+                        # swiglu (silu without a limit passes +inf, a no-op),
+                        # matching the bias finalize kernel, the fused GEMM
+                        # epilogue, and torch_moe_stage1.
+                        g_lo = -((-g_lo).maximumf(neg_lim))
+                        g_hi = -((-g_hi).maximumf(neg_lim))
+                        u_lo = (-((-u_lo).maximumf(neg_lim))).maximumf(neg_lim)
+                        u_hi = (-((-u_hi).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
-                            g_lo = -((-g_lo).maximumf(neg_lim))
-                            g_hi = -((-g_hi).maximumf(neg_lim))
-                            u_lo = (-((-u_lo).maximumf(neg_lim))).maximumf(neg_lim)
-                            u_hi = (-((-u_hi).maximumf(neg_lim))).maximumf(neg_lim)
                             t_lo = g_lo * alpha * neg_log2e
                             t_hi = g_hi * alpha * neg_log2e
                             emu_lo = ArithValue(
