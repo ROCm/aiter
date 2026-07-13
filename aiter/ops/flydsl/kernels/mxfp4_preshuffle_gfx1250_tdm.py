@@ -246,22 +246,57 @@ def launch_gemm_a8w4_tdm(
             return t
 
         front_wm = (wmma_m_rep + 1) // 2
-        _WM_GROUPS = [list(range(front_wm)), list(range(front_wm, wmma_m_rep))]
+        _FRONT = list(range(front_wm))
+        _BACK = list(range(front_wm, wmma_m_rep))
 
-        def _emit_group(s, ksl, wm_list, wt, sa_fr, sb_fr):
-            if const_expr(len(wm_list) == 0):
-                return
-            act = [_rmem(ACT_NDW, load_a(s, wm, ksl)) for wm in wm_list]
-            rocdl.s_wait_dscnt(0)
+        def _emit(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
                 wm = wm_list[i]
                 for wn_raw in range_constexpr(wmma_n_rep):
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
                     fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[i], c_frags[idx],
-                            scale_a=sb_fr[wn], scale_b=sa_fr[wm])
+                            scale_a=sb_k[wn], scale_b=sa_k[wm])
+
+        # Per-WMMA-K-step bundle (B frags + B/A e8m0 scales) + full drains + the
+        # hot-loop scheduler below mirror the gemm_mxscale compute pipeline.
+        DS_A = 2 if a_is_fp4 else 4
+        DS_B = 2
+        _BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
+
+        def _load_bs(s, ksl):
+            wt = [_rmem(8, load_b(s, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
+            sb_k = [load_sb(s, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
+            sa_k = [load_sa(s, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            return wt, sb_k, sa_k
+
+        def _stream(s, ksl, wt, sb_k, sa_k, nxt_ksl, mid_cb=None):
+            act_f = [_rmem(ACT_NDW, load_a(s, wm, ksl)) for wm in _FRONT]
+            rocdl.s_wait_dscnt(0)
+            _emit(_FRONT, act_f, wt, sa_k, sb_k)
+            if const_expr(mid_cb is not None):  # overlap next-tile DMA with back WMMAs
+                rocdl.sched_barrier(0)
+                mid_cb()
+                rocdl.sched_barrier(0)
+            if const_expr(len(_BACK) > 0):
+                act_b = [_rmem(ACT_NDW, load_a(s, wm, ksl)) for wm in _BACK]
+                rocdl.s_wait_dscnt(0)
+                _emit(_BACK, act_b, wt, sa_k, sb_k)
+            return _load_bs(s, nxt_ksl) if const_expr(nxt_ksl is not None) else None
+
+        def hot_loop_scheduler():
+            _fr, _bk = front_wm * wmma_n_rep, len(_BACK) * wmma_n_rep
+            for _ks in range_constexpr(KWS):
+                rocdl.sched_dsrd((_BS_DS if _ks == 0 else 0) + front_wm * DS_A)
+                rocdl.sched_mfma(_fr)
+                rocdl.sched_dsrd(len(_BACK) * DS_A)
+                rocdl.sched_mfma(_bk)
+                if const_expr(_ks < KWS - 1):
+                    rocdl.sched_dsrd(_BS_DS)
+            rocdl.sched_barrier(0)
 
         TDM_PER = 4
+        L2_PF = num_buffers  # B L2-prefetch distance (K-tiles ahead)
         prologue = min(num_buffers - 1, K_TILES)
         issued = 0
         for i in range_constexpr(prologue):
@@ -270,24 +305,31 @@ def launch_gemm_a8w4_tdm(
         for kt in range_constexpr(K_TILES):
             s = kt % num_buffers
             pipeline_fence(outstanding=TDM_PER * (issued - (kt + 1)))
-            # e8m0 scales up front (small ds_load_b32); A and B weight are streamed
-            # per WMMA-K step so only one k-step's fragments are live at a time.
-            sa_fr = [[load_sa(s, wm, ksl) for ksl in range_constexpr(KWS)] for wm in range_constexpr(wmma_m_rep)]
-            sb_fr = [[load_sb(s, wn, ksl) for ksl in range_constexpr(KWS)] for wn in range_constexpr(wmma_n_rep)]
-            nxt = kt + num_buffers - 1
+            nxt, pf_kt = kt + num_buffers - 1, kt + L2_PF
+
+            # Next-tile TDM issue + B L2-prefetch, deferred into the compute body so
+            # the DMA overlaps the WMMAs (mirrors gemm_mxscale mid_compute_callback).
+            def _mid_tdm():
+                if const_expr(nxt < K_TILES):
+                    issue(nxt % num_buffers, nxt)
+                if const_expr(pf_kt < K_TILES):
+                    tdm_ops.l2_prefetch_tile(
+                        gtB0, (0, pf_kt * PACK_TK * 16), (tile_n // 16, PACK_TK * 16),
+                        (Kp * 16, 1), elem_bytes=1, thread_id=tid, block_threads=block,
+                    )
             if const_expr(nxt < K_TILES):
-                issue(nxt % num_buffers, nxt)
                 issued += 1
+
+            prev = _load_bs(s, 0)
             for ksl in range_constexpr(KWS):
-                wt = [_rmem(8, load_b(s, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
-                sa_k = [sa_fr[wm][ksl] for wm in range_constexpr(wmma_m_rep)]
-                sb_k = [sb_fr[wn][ksl] for wn in range_constexpr(wmma_n_rep)]
-                for wm_list in _WM_GROUPS:
-                    _emit_group(s, ksl, wm_list, wt, sa_k, sb_k)
+                nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
+                cb = _mid_tdm if const_expr(ksl == 0) else None
+                prev = _stream(s, ksl, prev[0], prev[1], prev[2], nxt_ksl, mid_cb=cb)
+            hot_loop_scheduler()
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
-        # ── Epilogue: stage the WMMA tile into LDS
+        # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
         pipeline_fence(outstanding=0)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
