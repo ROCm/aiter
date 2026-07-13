@@ -1011,6 +1011,8 @@ def flydsl_qk_norm_rope_quant(
             swa_kv=swa_kv,
             state_slot_mapping=state_slot_mapping,
             batch_id_per_token=batch_id_per_token,
+            swa_block_tables=swa_block_tables,
+            swa_block_size=swa_block_size,
             stream=stream,
         )
 
