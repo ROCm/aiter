@@ -124,6 +124,7 @@ def create_topk_per_row_decode_tiered_kernel(
     tiered_mid_cap: int = 16,
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
+    mask_non_finite: bool = True,
 ) -> Any:
     short_max = tiered_short_max
     mid_cap = tiered_mid_cap
@@ -158,6 +159,7 @@ def create_topk_per_row_decode_tiered_kernel(
         f"{f'_s{tiered_short_max}_mc{tiered_mid_cap}' if tiered else ''}"
         f"{f'_mm{tiered_mid_max}_lc{tiered_long_cap}' if tiered else ''}"
         f"{'_1wg' if short_tier else ''}"
+        f"{'_mf' if mask_non_finite else ''}"
     )
 
     @fx.struct
@@ -200,6 +202,8 @@ def create_topk_per_row_decode_tiered_kernel(
         c_bins_idx = fx.Index(num_buckets)
         c_parts = fx.Int32(blocks_per_row)
         c_sign_bit = fx.Int32(-2147483648)
+        c_exp_mask = fx.Int32(0x7F800000)  # fp32 exponent bits (all-ones => inf/NaN)
+        c_neg_fltmax = fx.Float32(-3.4028234663852886e38)  # torch.finfo(f32).min
         c_neg_one = fx.Int32(-1)
         c_zero_f32 = fx.Float32(0.0)
         c_row_ws = fx.Int32(row_workspace_slots)
@@ -388,10 +392,20 @@ def create_topk_per_row_decode_tiered_kernel(
                     spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
             gpu.barrier()
 
+        def mask_nonfinite(val):
+            if const_expr(not mask_non_finite):
+                return val
+            bits = ArithValue(val).bitcast(T.i32)
+            is_nonfinite = ArithValue(
+                ArithValue(bits) & ArithValue(c_exp_mask)
+            ) == ArithValue(c_exp_mask)
+            return is_nonfinite.select(c_neg_fltmax, val)
+
         def radix_twiddle_key(val):
             # Map larger fp32 values to smaller unsigned keys so ascending
             # bucket scans select descending values. Normalize signed zero to
             # keep tie handling value-equivalent.
+            val = mask_nonfinite(val)
             key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(
                 c_zero_f32, val
             )
@@ -758,6 +772,7 @@ def create_topk_per_row_decode_tiered_kernel(
             c_thirtyone = fx.Int32(31)
 
             def ordered_key(val):
+                val = mask_nonfinite(val)
                 key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(
                     c_zero_f32, val
                 )

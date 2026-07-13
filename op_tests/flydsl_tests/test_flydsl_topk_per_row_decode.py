@@ -254,6 +254,44 @@ def test_all_identical_values(k):
     _assert_batch(logits, indices, row_ends, k)
 
 
+@pytest.mark.parametrize("L", [8192, 120003], ids=["short", "long"])
+@pytest.mark.parametrize("k", [256, 2048])
+def test_non_finite_never_selected(k, L):
+    """+inf / -inf / NaN in the valid region must never be selected"""
+    device = torch.device("cuda")
+    torch.manual_seed(_SEED)
+    logits = torch.randn((1, L), dtype=torch.float32, device=device)
+    # Scatter non-finite through the valid region. +inf/NaN are the ones a raw-bit
+    # radix-select wrongly ranks at the very top; -inf should sort out naturally.
+    bad = {
+        10: float("inf"),
+        100: float("nan"),
+        L // 3: float("inf"),
+        L // 2: float("-inf"),
+        L - 5: float("nan"),
+    }
+    for pos, val in bad.items():
+        logits[0, pos] = val
+    sl = torch.tensor([L], dtype=torch.int32, device=device)
+
+    indices = _run(logits, sl, 1, 1, k)
+    got = indices[0].to(device).long()
+
+    # (a) no selected index points to a non-finite value
+    sel_vals = logits[0, got]
+    assert torch.isfinite(sel_vals).all(), (
+        f"selected non-finite values: "
+        f"{sel_vals[~torch.isfinite(sel_vals)][:8].tolist()}"
+    )
+    # (b) the selected set is the top-k of the finite values (non-finite -> -inf)
+    sanitized = torch.where(
+        torch.isfinite(logits[0]),
+        logits[0],
+        torch.full_like(logits[0], float("-inf")),
+    )
+    _assert_row_topk_set(sanitized.cpu(), indices[0].cpu(), k, L)
+
+
 @pytest.mark.parametrize("k", [512, 2048])
 def test_row_strided_logits(k):
     """logits.stride(0) > width (row-slice of a wider buffer): exercises the

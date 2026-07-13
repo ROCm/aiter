@@ -68,6 +68,8 @@ def _environ_kernel_config() -> dict:
         tiered_mid_max=_env_int("FLYDSL_TOPK_TIERED_MID_MAX"),
         tiered_long_cap=_env_int("FLYDSL_TOPK_TIERED_LONG_CAP"),
         bits_per_pass=_env_int("FLYDSL_TOPK_TIERED_BPP"),
+        # 0/1 override for the non-finite mask (default on); set 0 to disable.
+        mask_non_finite=_env_int("FLYDSL_TOPK_TIERED_MASK_NONFINITE"),
     )
     return {k: v for k, v in cfg.items() if v is not None}
 
@@ -122,6 +124,7 @@ def _default_kernel_config(
         tiered_mid_cap=tiered_mid_cap_default,
         tiered_mid_max=_TIERED_MID_MAX,
         tiered_long_cap=tiered_long_cap_default,
+        mask_non_finite=True,
     )
 
 
