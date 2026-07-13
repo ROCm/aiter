@@ -294,19 +294,29 @@ def _nvfp4_gemm_asm(
 ) -> None: ...
 
 
+def _alloc_f4gemm_out(M: int, N: int, dtype: torch.dtype, device) -> Tensor:
+    """Allocate the F4GEMM output. Packed FP4 (e2m1) output is 2 values/byte, so
+    it is a ``[M, N//2]`` ``fp4x2`` tensor; bf16 output is a plain ``[M, N]``."""
+    if dtype == dtypes.fp4x2:
+        assert N % 2 == 0, "packed fp4 output requires even N"
+        return torch.empty((M, N // 2), dtype=dtypes.fp4x2, device=device)
+    return torch.empty((M, N), dtype=dtype, device=device)
+
+
 def gemm_mxfp4_asm(
     A: Tensor,  # A:[M, K/2] fp4x2
     B: Tensor,  # B:[N, K/2] fp4x2
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0
-    dtype: torch.dtype = dtypes.bf16,
+    dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp4x2 (packed e2m1)
     a_preshuffle: bool = True,
     kernelName: str = "",
 ) -> Tensor:
-    """MXFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e8m0 scales."""
+    """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales; output is bf16
+    ``[M,N]`` or packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1), chosen by ``dtype``."""
     M = A.shape[0]
     N = B.shape[0]
-    out = torch.empty((M, N), dtype=dtype, device=A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device)
     _mxfp4_gemm_asm(
         A,
         B,
@@ -326,14 +336,15 @@ def gemm_nvfp4_asm(
     ScaleB: Tensor,  # e4m3
     GlobalScaleA: float,
     GlobalScaleB: float,
-    dtype: torch.dtype = dtypes.bf16,
+    dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp4x2 (packed e2m1)
     a_preshuffle: bool = True,
     kernelName: str = "",
 ) -> Tensor:
-    """NVFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e4m3 scales + global alphas."""
+    """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas;
+    output is bf16 ``[M,N]`` or packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1)."""
     M = A.shape[0]
     N = B.shape[0]
-    out = torch.empty((M, N), dtype=dtype, device=A.device)
+    out = _alloc_f4gemm_out(M, N, dtype, A.device)
     _nvfp4_gemm_asm(
         A,
         B,
