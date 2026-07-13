@@ -286,7 +286,7 @@ _GEMM2_TUNED_TABLE = {
         8: (32, 'atomic', False, False),  # 20.526us ok100% sbm32
         16: (32, 'atomic', False, False),  # 36.722us ok100% sbm32
         32: (32, 'atomic', False, True),  # 65.429us ok100% sbm32
-        64: (64, 'reduce', False, True),  # 85.183us ok100% sbm64
+        64: (32, 'atomic', False, True),  # 68.020us ok100% sbm32
         128: (32, 'atomic', False, True),  # 68.822us ok100% sbm32
         256: (64, 'reduce', False, True),  # 89.203us ok100% sbm64
         512: (32, 'atomic', False, True),  # 80.653us ok100% sbm32
