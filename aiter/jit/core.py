@@ -127,6 +127,11 @@ AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
 )
 
+AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM = os.getenv(
+    "AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_bmm.csv",
+)
+
 AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     "AITER_CONFIG_BF16_BATCHED_GEMM",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
@@ -197,6 +202,14 @@ class AITER_CONFIG(object):
             "AITER_CONFIG_A8W8_BATCHED_GEMM",
             AITER_CONFIG_A8W8_BATCHED_GEMM,
             "a8w8_tuned_batched_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM",
+            AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM,
+            "a8w8_blockscale_bpreshuffle_tuned_bmm",
         )
 
     @property

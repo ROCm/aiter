@@ -21,8 +21,12 @@ ragged (no host padding of A / a_scale). N / K must divide their tiles.
 
 from __future__ import annotations
 
+import re
+
 import torch
 from torch import Tensor
+
+from aiter import dtypes
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
 _compile_bmm = None
@@ -68,6 +72,19 @@ def _shapes_from_layout(A: Tensor, C: Tensor, layout: str):
     if (Mc, Bc) != (M, B):
         raise RuntimeError(f"[FlyDSL bmm_w8a8] A / C (M, B) mismatch for layout={layout!r}: A gives (M={M}, B={B}), C gives (M={Mc}, B={Bc})")
     return B, M, N, K
+
+_KERNEL_NAME_RE = re.compile(
+    r"^flydsl_blockscale_bpreshuffle_bmm_"
+    r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
+    r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
+    r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
+    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
+)
+
+def parse_wmma_kernel_name(name: str):
+    """Parse a flydsl_blockscale_bpreshuffle_wmma_ kernelName, or return None."""
+    m = _KERNEL_NAME_RE.fullmatch(name)
+    return {k: int(v) for k, v in m.groupdict().items()} if m else None
 
 
 def run_bmm_w8a8_gfx1250(
@@ -182,5 +199,36 @@ def run_bmm_w8a8_gfx1250(
     )
     return C
 
+def run_bmm_a8w8_blockscale_bmm_gfx1250(
+    A: Tensor,
+    B: Tensor,
+    a_scale: Tensor,
+    b_scale: Tensor,
+    C: Tensor,
+    layout: str,
+    kernel_name: str,
+) -> Tensor:
+    cfg = parse_wmma_kernel_name(kernel_name)
 
-__all__ = ["run_bmm_w8a8_gfx1250"]
+    if cfg is None:
+        raise ValueError(
+            f"[FlyDSL gfx1250 blockscale bmm] unrecognised kernelName: {kernel_name!r}"
+        )
+
+    return run_bmm_w8a8_gfx1250(
+        C,
+        A,
+        B,
+        a_scale,
+        b_scale,
+        cfg["tile_m"],
+        cfg["tile_n"],
+        cfg["tile_k"],
+        layout=layout,
+        num_buffers=cfg["num_buffers"],
+        split_k=cfg["split_k"],
+        cluster_m=cfg["cluster_m"],
+        cluster_n=cfg["cluster_n"],
+        m_warp=cfg["m_warp"],
+        n_warp=cfg["n_warp"],
+    )
