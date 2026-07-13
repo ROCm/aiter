@@ -28,8 +28,8 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 # the O(L) scan.
 _TIERED_MID_MAX = 65536
 
-# Batch-aware short-vs-multi-block crossover per arch for
-# short_max = min(cap, base + num_rows*slope).
+# The short-vs-multi-block crossover is independent of K for the same reason,
+# but does depend on the rows: short_max = min(cap, base + num_rows*slope).
 # These params were found empirically on MI300X and MI355X
 _SHORT_MAX_PARAMS = {
     # arch:   (base, slope, cap)
@@ -148,7 +148,10 @@ def _apply_deadlock_guard(
     max_model_len: int,
 ) -> dict:
     """Clamp the tiered config so the mid/long-tier inter-workgroup barrier cannot
-    deadlock.
+    deadlock. The possibility of deadlock requires both a wide batch (num_rows > ~80-90)
+    and long rows (L > ~16-40K). Note: The HIP kernel also redirects to a
+    single-workgroup tier for large batch-sizes, but doesn't explicitly call out the
+    deadlock risk (see the should_use_mulblocks function).
 
     The tiered kernels spin on a barrier over a non-cooperative launch, which gives
     no guarantee that a row's participating workgroups are all resident at the same
@@ -156,9 +159,6 @@ def _apply_deadlock_guard(
     of its row arrives. A deadlock can potentially happen once the barrier-blocked
     workgroups exceeds the resident capacity. In this case, we cap the active
     workgroups or force the barrier-free short tier (single workgroup/row).
-
-    No-op unless rows can reach the barrier tiers (max_model_len > short_max)
-    at a batch large enough to matter, so the common decode shape is untouched.
 
     Example for MI300X:
     The deadlock guard is active around num_rows >= 87 with max_model_len > 32768
@@ -203,14 +203,8 @@ def _apply_deadlock_guard(
         kernel_config["tiered_mid_cap"] = min(mid_cap, max_safe_active_workgroups)
         kernel_config["tiered_long_cap"] = min(long_cap, max_safe_active_workgroups)
     else:
-        # Even 2-way cooperation exceeds the envelope: route every row to the
-        # barrier-free short tier. Requires bits_per_pass == 11 (the short tier);
-        # target archs (gfx942/gfx950) satisfy this.
         kernel_config["tiered_short_max"] = max_model_len
 
-        # Keep the mid_max >= short_max validator happy when max_model_len exceeds
-        # the default mid_max. The tiered kernel builder rejects short_max > mid_max
-        # at compile time.
         kernel_config["tiered_mid_max"] = max(
             kernel_config["tiered_mid_max"], max_model_len
         )
