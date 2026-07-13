@@ -10,6 +10,7 @@ Kernels:
   * flydsl                -> FlyDSL standalone unordered radix-select path (K=2048)
   * flydsl_tiered         -> K=512 persistent path with in-kernel tier dispatch
   * aiter_hip             -> aiter.top_k_per_row_decode (HIP radix one/multi-block)
+  * aiter_asm             -> aiter.top_k_per_row_decode_fast (gfx942 asm .co, K=2048 only)
   * vllm                  -> torch.ops._C.top_k_per_row_decode (vLLM sampler.cu kernel)
 
 The vLLM op is registered by loading the prebuilt stable-libtorch .so directly,
@@ -77,6 +78,12 @@ def load_aiter():
     return aiter.top_k_per_row_decode
 
 
+def load_aiter_asm():
+    import aiter
+
+    return aiter.top_k_per_row_decode_fast
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -86,6 +93,7 @@ def main() -> None:
             "flydsl",
             "flydsl_tiered",
             "aiter_hip",
+            "aiter_asm",
             "vllm",
         ],
     )
@@ -163,6 +171,21 @@ def main() -> None:
                 stride0,
                 stride1,
                 k=args.k,
+            )
+
+    elif args.kernel == "aiter_asm":
+        # gfx942 asm .co: fixed K=2048, no k argument.
+        op = load_aiter_asm()
+
+        def run():
+            op(
+                logits,
+                args.next_n,
+                seq_lens,
+                indices,
+                args.num_rows,
+                stride0,
+                stride1,
             )
 
     else:  # FlyDSL variants

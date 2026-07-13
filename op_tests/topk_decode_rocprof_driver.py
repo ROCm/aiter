@@ -31,8 +31,13 @@ KERNEL_MATCH = {
     "aiter_hip": re.compile(
         r"radix_topk_one_block_kernel|radix_kernel|last_filter_kernel"
     ),
+    "aiter_asm": re.compile(r"aiter::DecodeTopK::topk_per_row_decode"),
     "vllm": re.compile(r"topKPerRowDecode"),
 }
+
+# Kernels that only support a fixed K (skip other K in the sweep). The gfx942 asm
+# .co is specialized for K=2048 and takes no k argument.
+FIXED_K = {"aiter_asm": 2048}
 
 KERNEL_ENV = {
     "flydsl_tiered": {
@@ -239,6 +244,16 @@ def main() -> None:
     results: dict[tuple[str, int, int], tuple[float, float, int, str]] = {}
     for kernel in args.kernels:
         for k in args.k:
+            if kernel in FIXED_K and k != FIXED_K[kernel]:
+                # Fixed-K kernel (e.g. asm) doesn't support this K -> record na.
+                for L in args.L:
+                    results[(kernel, k, L)] = (
+                        float("nan"),
+                        float("nan"),
+                        0,
+                        f"na ({kernel}: K={FIXED_K[kernel]} only)",
+                    )
+                continue
             for L in args.L:
                 res = run_cell(
                     kernel,

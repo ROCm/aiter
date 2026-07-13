@@ -26,11 +26,18 @@ _TIERED_BLOCK_THREADS = 1024
 _TIERED_LOAD_VEC = 4
 _TIERED_SCAN_STAGES = 2
 
-# Both thresholds are independent of K.
-# K only affects the final O(K) index scatter,
-# which is negligible compared to the O(L) scan.
-_TIERED_SHORT_MAX = 16384
+# Independent of K: K only affects the final O(K) index scatter, negligible vs
+# the O(L) scan.
 _TIERED_MID_MAX = 65536
+
+# Batch-aware short-vs-multi-block crossover per arch for
+# short_max = min(cap, base + num_rows*slope).
+# These params were found empirically on MI300X and MI355X
+_SHORT_MAX_PARAMS = {
+    # arch:   (base, slope, cap)
+    "gfx942": (16384, 1536, 40960),
+    "gfx950": (24576, 1792, 57344),
+}
 
 
 def _env_int(name: str, default: int | None = None) -> int | None:
@@ -42,23 +49,6 @@ def _env_int(name: str, default: int | None = None) -> int | None:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {value!r}") from exc
-
-
-def _default_tiered_bpp(arch: str | None = None) -> int:
-    cu_count = _multi_processor_count(arch)
-    lds_per_cu = SMEM_CAPACITY_MAP.get(arch, 0)
-    return 11 if cu_count >= 128 or lds_per_cu >= 128 * 1024 else 10
-
-
-def _default_tiered_blocks_per_row(
-    *,
-    max_model_len: int,
-    block_threads: int,
-) -> int:
-    max_blocks = 64 if block_threads == 512 else 32
-    items_per_block = _TIERED_LOAD_VEC * block_threads
-    blocks = max(2, math.ceil(max_model_len / items_per_block))
-    return min(blocks, max_blocks)
 
 
 @functools.cache
@@ -88,11 +78,20 @@ def _default_kernel_config(
     num_rows: int,
     max_model_len: int,
 ) -> dict:
-    blocks_per_row = _default_tiered_blocks_per_row(
-        max_model_len=max_model_len,
-        block_threads=_TIERED_BLOCK_THREADS,
+    arch = get_rocm_arch()
+
+    # Grid width per row: enough workgroups to cover the row at LOAD_VEC elements
+    # per thread, clamped to [2, 32] (32 = the wg cap the mid/long tiers can use;
+    # BLOCK_THREADS is fixed at 1024, so max_blocks is 32).
+    items_per_block = _TIERED_LOAD_VEC * _TIERED_BLOCK_THREADS
+    blocks_per_row = min(32, max(2, math.ceil(max_model_len / items_per_block)))
+
+    # bits_per_pass: 11 (2048-bin LDS histogram) whenever the arch can afford it;
+    # the short tier requires 11. gfx942/gfx950 both qualify (CU count >= 128).
+    cu_count = _multi_processor_count(arch)
+    bits_per_pass = (
+        11 if cu_count >= 128 or SMEM_CAPACITY_MAP.get(arch, 0) >= 128 * 1024 else 10
     )
-    bits_per_pass = _default_tiered_bpp()
 
     # Max cooperating workgroups per row for the mid/long tiers (the real wg count
     # is min(blocks_per_row, cap)). Scales down with batch size: a single long row
@@ -110,10 +109,11 @@ def _default_kernel_config(
     else:  #  num_rows >= 8
         tiered_long_cap_default = 8
 
-    # Batch-aware short vs multi-block crossover. The multi-block barrier
-    # floor grows under CU contention as more rows launch, while the single
-    # workgroup path is flat in batch.
-    tiered_short_max = min(40960, _TIERED_SHORT_MAX + num_rows * 1536)
+    # Batch-aware short vs multi-block crossover (arch-specific base/slope/cap). The
+    # multi-block barrier floor grows under CU contention as more rows launch, while
+    # the single-workgroup path is flat in batch.
+    base, slope, cap = _SHORT_MAX_PARAMS.get(arch, _SHORT_MAX_PARAMS["gfx942"])
+    tiered_short_max = min(cap, base + num_rows * slope)
 
     return dict(
         blocks_per_row=blocks_per_row,
@@ -209,6 +209,13 @@ def _apply_deadlock_guard(
         # barrier-free short tier. Requires bits_per_pass == 11 (the short tier);
         # target archs (gfx942/gfx950) satisfy this.
         kernel_config["tiered_short_max"] = max_model_len
+
+        # Keep the mid_max >= short_max validator happy when max_model_len exceeds
+        # the default mid_max. The tiered kernel builder rejects short_max > mid_max
+        # at compile time.
+        kernel_config["tiered_mid_max"] = max(
+            kernel_config["tiered_mid_max"], max_model_len
+        )
     return kernel_config
 
 
