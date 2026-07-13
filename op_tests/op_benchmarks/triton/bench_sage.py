@@ -863,7 +863,14 @@ def _sage_quant_mxfp6(
     # default (the kernel's cooperative K load is a contiguous coalesced copy). The
     # K scale rides the existing separate gather.
     q_fp4, q_scale = q_packer(q)
-    k_fp4, k_scale = k_packer(k)
+    if os.environ.get("SOLO_K_FP4", "0") != "0":
+        # K -> fp4 (E2M1) in the solo lds-order C0 image (same 16384B/tile + seq-stride 128 as fp6, so
+        # the coalesced load + K-scale path are unchanged; only the K data is fp4). MUST pair with a
+        # SOLO_K_FP4=1 kernel build (cbsz=_FP4 K srcA, C0-only hoist).
+        from aiter.ops.triton.quant.mxfp6_fmha_pack import quantize_fp4_k_lds_order
+        k_fp4, k_scale = quantize_fp4_k_lds_order(k, tile=128, out_device=k.device)
+    else:
+        k_fp4, k_scale = k_packer(k)
 
     # V: coalesced + pre-transposed LDS-order pack (the V analog of K's lds-order pack) so the solo
     # kernel's V load is a contiguous copy and the hoist is a plain ds_read_b128. MUST be built with the

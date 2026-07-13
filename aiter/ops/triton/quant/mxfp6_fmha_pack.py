@@ -803,6 +803,83 @@ def _v_lds_order_gather_index_fp4(tile: int = 128):
     return (tok * 128 + d).astype(np.int64)
 
 
+def _fp4_k_c0_byte(T, c):
+    """CANDIDATE host-128 C0 byte for (token-in-tile T 0..127, channel c 0..127). The K coalesced load
+    is a verbatim copy (host tile-byte == LDS tile-byte); the hoist reads C0 at
+    LDS[(n*2+half)*1024 + parity*512 + tok32*16 + b], and the MMA lane L = parity*32 + tok32 holds
+    kv-token n*32+tok32, K-block parity. Candidate: half=c//64, parity=(c%64)//32, chan32=(c%64)%32,
+    2 channels/byte at (chan32//8)*4 + (chan32%8)//2. The DBG_KPROBE (SOLO_K_FP4=1, SOLO_V_FP4=0)
+    surfaces the residual head-dim permutation as sigma so this can be corrected byte-exact."""
+    h_sel = T // 64
+    bn64 = T % 64
+    n = bn64 // 32
+    tok32 = bn64 % 32
+    half = c // 64
+    parity = (c % 64) // 32
+    chan32 = (c % 64) % 32
+    L = parity * 32 + tok32
+    return (h_sel * 4096 + (n * 2 + half) * 1024 + L * 16
+            + (chan32 // 8) * 4 + (chan32 % 8) // 2).astype(np.int64)
+
+
+def quantize_fp4_k_lds_order(k_thd, tile: int = 128, out_device=None):
+    """Raw K [b, sk, h, 128] (float) -> fp4 (E2M1) + E8M0 per-32-block scale in the solo kernel's
+    coalesced LDS-order image (the fp4 analog of quantize_fp6_k_lds_order). The 16384B/tile image and
+    seq-stride 128 are UNCHANGED from fp6 (so the cooperative load + K-scale path are byte-identical);
+    only the content differs: 32 fp4 (16B) per (subtile,half) live in the C0 region, C1 stays zero
+    (unread by the fp4 hoist). Returns (k_view uint8 [b,sk,h,96] seq-stride 128, scale uint8 [b,sk,h,4])."""
+    if not isinstance(k_thd, np.ndarray):
+        k = k_thd.detach().to(torch.float32).cpu().numpy().astype(np.float64)
+    else:
+        k = k_thd.astype(np.float64)
+    b, sk, h, d = k.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile
+    nb = d // 32
+    blk = k.reshape(b, sk, h, nb, 32)
+    amax = np.abs(blk).max(-1)                                  # [b,sk,h,nb]
+    _mant, e = np.frexp(np.maximum(amax, 0.0))
+    E = np.where(amax == 0, 0, e - 2).astype(np.int64)          # E2M1 MX block exponent (no clip)
+    scaled = blk / (2.0 ** E)[..., None]
+    codes = np.abs(np.abs(scaled)[..., None] - _E2M1_MAG).argmin(-1).astype(np.uint8)
+    codes = codes | ((scaled < 0).astype(np.uint8) * 8)         # [b,sk,h,nb,32] E2M1 4-bit
+    codes = codes.reshape(b, sk, h, 128).astype(np.uint8)       # channel-major nibble per (T,c)
+    # KPROBE (SOLO_K_FP4=1) showed the fp4 K srcA reads head-dim d as codes[rol5_block(d)] -- a 5-bit
+    # left-rotate WITHIN each 32-block. Counteract by pre-permuting the channel axis codes[rol5(c)]
+    # (stays within the 32-block, so the per-block E8M0 scale assignment is unchanged).
+    _cc = np.arange(128)
+    _loc = _cc & 31
+    _perm = (_cc & ~31) | ((_loc >> 1) | ((_loc & 1) << 4))   # ror5 within 32-block (net rol5*ror5=id)
+    codes = codes[:, :, :, _perm]
+    scale_b = ((E + 127) & 0xFF).astype(np.uint8)               # [b,sk,h,4] E8M0
+    # candidate C0 byte for the 64 even channels (odd channels share the byte's high nibble)
+    Tv = np.arange(128)[:, None]
+    ce = np.arange(0, 128, 2)[None, :]                          # even channels -> low nibble
+    be = np.broadcast_to(_fp4_k_c0_byte(Tv, ce), (128, 64))     # [128,64]
+    k_hs = nt * 16384
+    k_bs = h * k_hs
+    sk_pad = nt * tile
+    if sk_pad != sk:                                            # edge-pad the partial tail tile
+        codes = np.concatenate([codes, np.repeat(codes[:, sk - 1: sk], sk_pad - sk, axis=1)], axis=1)
+    ct = codes.reshape(b, nt, tile, h, 128)
+    packed = (ct[..., 0::2] | (ct[..., 1::2] << 4))             # [b,nt,128T,h,64] low|high
+    pk = np.transpose(packed, (0, 3, 1, 2, 4))                  # [b,h,nt,128,64]
+    out = np.zeros((b, h, nt, 16384), np.uint8)
+    out[:, :, :, be] = pk                                       # scatter into C0 (be bijection)
+    flat = torch.from_numpy(np.ascontiguousarray(out).reshape(-1))
+    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8)
+    buf[: flat.numel()] = flat
+    sflat = torch.from_numpy(np.ascontiguousarray(scale_b).reshape(-1))
+    sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8)
+    sbuf[: sflat.numel()] = sflat
+    if out_device is not None:
+        buf = buf.to(out_device)
+        sbuf = sbuf.to(out_device)
+    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 128, k_hs, 1))
+    scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
+    return k_view, scale
+
+
 def quantize_fp4_v_lds_order(v, tile: int = 128, out_device=None):
     """Raw V [b, sk, h_kv, 128] (float) -> per-channel fp4 (E2M1) codes laid out in the solo kernel's
     coalesced LDS-order (the fp4 analog of quantize_fp8_v_lds_order; b128 hoist, no transpose). Returns
