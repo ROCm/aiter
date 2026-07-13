@@ -72,10 +72,10 @@
         "kernel_type": "compute_bound"
     },
     "any": {
-        "BLOCK_M": 64,
+        "BLOCK_M": 128,
         "BLOCK_N": 64,
-        "BLOCK_K": 256,
-        "NUM_BUFFERS": 3,
+        "BLOCK_K": 128,
+        "NUM_BUFFERS": 6,
         "num_warps": 4,
         "kernel_type": "compute_bound"
     },
