@@ -30,32 +30,10 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> q_out,
     std::optional<aiter_tensor_t> index_q_out,
     std::optional<aiter_tensor_t> index_slot_mapping,
-    bool asm_layout = false);
-
-void fused_qknorm_idxrqknorm_fp8(
-    aiter_tensor_t& qkv,
-    const aiter_tensor_t& q_norm_weight,
-    const aiter_tensor_t& k_norm_weight,
-    const aiter_tensor_t& cos_sin_cache,
-    const aiter_tensor_t& positions,
-    int64_t num_heads,
-    int64_t num_kv_heads,
-    int64_t rotary_dim,
-    double eps,
-    const aiter_tensor_t& index_q_norm_weight,
-    const aiter_tensor_t& index_k_norm_weight,
-    int64_t num_index_heads,
-    const aiter_tensor_t& slot_mapping,
-    std::optional<aiter_tensor_t> kv_cache_k,
-    std::optional<aiter_tensor_t> kv_cache_v,
-    aiter_tensor_t& index_cache,
-    int64_t block_size,
-    aiter_tensor_t& q_out,
-    aiter_tensor_t& index_q_out,
-    const aiter_tensor_t& index_slot_mapping,
-    const std::string& kv_cache_dtype,
-    const aiter_tensor_t& k_scale,
-    const aiter_tensor_t& v_scale,
+    const std::string& kv_cache_dtype = "auto",
+    const std::string& index_cache_dtype = "auto",
+    std::optional<aiter_tensor_t> k_scale = std::nullopt,
+    std::optional<aiter_tensor_t> v_scale = std::nullopt,
     bool asm_layout = false);
 
 } // namespace aiter
