@@ -1202,6 +1202,13 @@ def get_mla_metadata_info_v1(
                 or (num_head_qo == 128)
             )
         )
+        or (
+            get_gfx() in ("gfx942", "gfx950")
+            and num_head_qo == 64
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and effective_seqlen_qo == 1
+        )
     ):
         max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
     elif (

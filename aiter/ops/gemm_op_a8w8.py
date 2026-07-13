@@ -126,20 +126,24 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 
 def _parse_flydsl_kernel_name(kernel_name: str):
-    """Parse tile config from flydsl kernelName.
-    Returns ``(tile_m, tile_n, tile_k, lds_stage, cshuffle, async_copy,
-    waves_per_eu, xcd_swizzle)`` or None on parse failure.
+    """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
+    waves_per_eu, xcd_swizzle, lds_stage, scheduler)``, or None on failure.
+    Legacy names lacking the xcd/lds/scheduler tokens default them to
+    ``0``/``2``/``"Default"``.
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_"
-        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?$",
         kernel_name,
     )
     if m is None:
         return None
-    return tuple(int(m.group(i)) for i in range(1, 9))
+    tm, tn, tk, acp, wpe = (int(m.group(i)) for i in range(1, 6))
+    xcd_swizzle = int(m.group(6)) if m.group(6) else 0
+    lds_stage = int(m.group(7)) if m.group(7) else 2
+    scheduler = m.group(8) if m.group(8) else "Default"
+    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler)
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -164,7 +168,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, lds, csh, acp, wpe, xcd = parsed
+    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler = parsed
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -175,11 +179,11 @@ def gemm_a8w8_bpreshuffle_flydsl(
         tm,
         tn,
         tk,
-        lds,
-        csh,
         acp,
         wpe,
-        xcd,
+        xcd_swizzle,
+        lds_stage=lds_stage,
+        enable_scheduler=str(scheduler).lower() != "off",
     )
     return Out
 
@@ -898,6 +902,30 @@ def gemm_a8w8_blockscale_bpreshuffle(
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )
+    # Triton path first: it allocates its own output, so skip the Y buffer the
+    # ck/asm paths below need.
+    if config is not None and config["libtype"] == "triton":
+        # kernelName optionally carries the backend hint ("triton"/"gluon");
+        # anything else -> None (auto gluon->triton detection). config=None lets
+        # the triton impl load its own tuned config internally. WQ is already
+        # (16,16)-shuffled == triton's (N//16, K*16) view; x_scale is
+        # column-major -> direct fit.
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
+        )
+
+        kernelName = str(config.get("kernelName", ""))
+        backend = kernelName if kernelName in ("triton", "gluon") else None
+        xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
+        wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+        return _gemm_a8w8_blockscale_preshuffle_triton(
+            xq,
+            wq.reshape(n // 16, k * 16),
+            x_scale,
+            w_scale,
+            dtype=dtype,
+            backend=backend,
+        )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]

@@ -317,11 +317,9 @@ def mla_decode_fwd(
         # Per-batch valid KV split count writeback buffer. Always allocated (and
         # passed to stage1) so the asm kernel has a valid destination; whether
         # stage2 actually uses it is gated by use_valid_split_count_reduce.
-        # Initialized to num_kv_splits so a min() against it is a no-op until the
-        # kernel overwrites it with the real (smaller) valid count.
-        valid_split_count = torch.full(
-            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
-        )
+        # Left uninitialized: the asm kernel writes the real (valid) count before
+        # stage2 reads it, so pre-filling would be dead work.
+        valid_split_count = torch.empty((bs,), dtype=dtypes.i32, device=device)
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
         aiter.mla_decode_stage1_asm_fwd(
@@ -466,6 +464,13 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
                 and max_seqlen_q == 2
+            )
+            or (
+                get_gfx() in ("gfx942", "gfx950")
+                and nhead == 64
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
             )
             or (
                 get_gfx() == "gfx950"
