@@ -261,9 +261,10 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kSchedWmmaMask = 0x008;                 // WMMA group
     static constexpr int kSchedWmmaCount = kExpM * kExpN * kExpKHalf;
 
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
-    // tdm_window types live only where tdm_window is available (gfx1250
-    // device pass + host pass). Non-gfx1250 device passes never reference them.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+    // tdm_window types live only where tdm_window is available (gfx1250 device
+    // pass + host pass, clang>=22). Non-gfx1250 device passes and clang-20
+    // (ROCm 7.1) CI never reference them -- opus::tdm_window is gated identically.
     using WindowA = opus::tdm_window<DataA, kTdmK, kARows, 0, 0, 0,
                                        1, 0, 0, 0, 1, 0, 0, 0, 0,
                                        kLdsPadEn, kPadInterval, kPadAmount, opus::seq<>>;

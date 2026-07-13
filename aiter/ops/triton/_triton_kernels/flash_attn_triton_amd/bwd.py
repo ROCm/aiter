@@ -2894,7 +2894,7 @@ def _bwd_dkdv_inner(
     curr_philox_offset = batch_philox_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
 
-    for blk_idx in range(num_steps):
+    for blk_idx in tl.range(num_steps, num_stages=1):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_m = {curr_m}")  # noqa: E701
         offs_m = curr_m + tl.arange(0, BLOCK_M)
@@ -3099,7 +3099,7 @@ def _bwd_dq_inner(
     step_n = BLOCK_N2
     curr_philox_offset = batch_philox_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
-    for blk_idx in range(num_steps):
+    for blk_idx in tl.range(num_steps, num_stages=1):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
         offs_n = curr_n + tl.arange(0, BLOCK_N2)

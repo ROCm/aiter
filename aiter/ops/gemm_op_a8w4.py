@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# gfx1250 (mi400) MXFP8 x MXFP4 GEMM (a8w4) -- ASM, kernarg preload mode.
+# gfx1250 MXFP8 x MXFP4 GEMM (a8w4) -- ASM, kernarg preload mode.
 # A (activation) is mxfp8 (e4m3, 1 byte/elem); B (weight) is mxfp4 (e2m1,
 # 2 elems/byte). Both operands carry OCP MX e8m0 block scales (block=32). The
 # kernel variant is auto-selected by the .cu heuristic unless an explicit
-# kernelName is given. See csrc/py_itfs_cu/asm_mxfp8fp4gemm_mi400.cu.
+# kernelName is given. See csrc/py_itfs_cu/asm_mxfp8fp4gemm.cu.
 
 from typing import Optional
 

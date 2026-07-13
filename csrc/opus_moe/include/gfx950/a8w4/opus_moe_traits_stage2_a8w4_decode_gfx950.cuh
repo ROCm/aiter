@@ -61,7 +61,8 @@ struct OpusMoeStage2A8W4DecodeShape
     // route_out XCD swizzle (gfx950=8 XCDs).
     static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : 8;
     static constexpr int SWIZZLE_W = 2;
-    static constexpr int SWIZZLE_C = 0;
+    static constexpr int SWIZZLE_C =
+        (!DIRECT_ATOMIC_OUT && (IS_BM32_BN256 || IS_BM64_BN256)) ? 32 : 0;
     static constexpr bool DECODE_PACE_ROUTE_BLOCKS_TO_POW2 = PaceRouteBlocksToPow2;
     static constexpr int K_TILES = DECODE_EFFECTIVE_INTER_DIM / K_STEP_PACKED;
     static constexpr int A_LDS_STAGES = K_TILES, A_LDS_STAGE_ELEMS = B_M * K_STEP_PACKED;
