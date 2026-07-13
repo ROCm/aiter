@@ -18,6 +18,16 @@ void qr_all_reduce(fptr_t _fa,
                    torch::Tensor& out,
                    int64_t quant_level,
                    bool cast_bf2half = false);
+void qr_all_reduce_rmsnorm(fptr_t _fa,
+                           torch::Tensor& inp,
+                           torch::Tensor& residual_inp,
+                           torch::Tensor& residual_out,
+                           torch::Tensor& out,
+                           torch::Tensor& weight,
+                           double eps,
+                           int64_t hidden_dim,
+                           int64_t quant_level,
+                           bool cast_bf2half = false);
 int64_t qr_max_size();
 
 } // namespace aiter

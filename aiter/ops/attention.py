@@ -870,6 +870,12 @@ def mla_decode_v4_asm(
     splitLse: torch.Tensor,
     # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
     output: torch.Tensor,
+    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
+    # per-request valid kv-split count the kernel writes (slot 19). Pass a
+    # real tensor when use_valid_split_count_reduce != 0; otherwise the
+    # kernel skips the write and nullptr is fine.
+    valid_split_count: Optional[torch.Tensor] = None,
+    use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
 
@@ -1195,6 +1201,13 @@ def get_mla_metadata_info_v1(
                 or (num_head_qo == 64)
                 or (num_head_qo == 128)
             )
+        )
+        or (
+            get_gfx() in ("gfx942", "gfx950")
+            and num_head_qo == 64
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and effective_seqlen_qo == 1
         )
     ):
         max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
