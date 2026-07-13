@@ -839,7 +839,7 @@ def quantize_fp4_k_lds_order(k_thd, tile: int = 128, out_device=None):
     blk = k.reshape(b, sk, h, nb, 32)
     amax = np.abs(blk).max(-1)                                  # [b,sk,h,nb]
     _mant, e = np.frexp(np.maximum(amax, 0.0))
-    E = np.where(amax == 0, 0, e - 2).astype(np.int64)          # E2M1 MX block exponent (no clip)
+    E = np.where(amax == 0, 0, e - int(os.environ.get("KFP4_ESHIFT", "3"))).astype(np.int64)  # E2M1 MX block exp
     scaled = blk / (2.0 ** E)[..., None]
     codes = np.abs(np.abs(scaled)[..., None] - _E2M1_MAG).argmin(-1).astype(np.uint8)
     codes = codes | ((scaled < 0).astype(np.uint8) * 8)         # [b,sk,h,nb,32] E2M1 4-bit
