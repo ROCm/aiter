@@ -2,8 +2,7 @@
 
 Default (no ``--mode``): GLM-5.2 serving scoreboard — production wrapper path
 with ``final_output=[bs, H, Dv]``, auto-resolved ``actual_max_splits`` (warmup
-cache, same as ``mla_decode_fwd``), adaptive launch, and DA split-K. Backends:
-``hip``, ``wrapper-daoff``, ``wrapper-daon``.
+cache, same as ``mla_decode_fwd``), adaptive launch, and DA split-K. Backends: ``hip``, ``wrapper``.
 
 Synthetic / replay modes (``--mode``):
   uniform    uniform synthetic workload; all tiles share ``num_splits``
@@ -12,7 +11,6 @@ Synthetic / replay modes (``--mode``):
 """
 
 import argparse
-import os
 import sys
 
 import torch
@@ -50,7 +48,7 @@ SERVING_SCENARIOS = [
     ("b8_s2", 8, 2),
 ]
 
-SERVING_BACKENDS = ("hip", "wrapper-daoff", "wrapper-daon")
+SERVING_BACKENDS = ("hip", "wrapper")
 
 
 def _serving_build(active_tiles, splits):
@@ -100,11 +98,6 @@ def _make_serving_wrapper_runner(po, pl, indptr, fmap, pmap, fout, flse, splits)
 
 
 def run_serving(backend: str) -> None:
-    if backend == "wrapper-daoff":
-        os.environ["AITER_MLA_REDUCE_DA_SPLITK"] = "0"
-    elif backend == "wrapper-daon":
-        os.environ["AITER_MLA_REDUCE_DA_SPLITK"] = "1"
-
     num_cu = torch.cuda.get_device_properties(0).multi_processor_count
     print(
         f"# GLM-5.2 serving mla_reduce  H={SERVING_H} Dv={SERVING_DV} out=bf16 M=1 "
@@ -132,7 +125,7 @@ def run_serving(backend: str) -> None:
             )
             plan = (
                 f"splitk K={K} slots={slots} grid_p={slots * K}"
-                if (engage and backend == "wrapper-daon")
+                if engage
                 else "single-kernel"
             )
         _, kernel_us = run_perftest(run, num_warmup=25, num_iters=100)
@@ -269,7 +262,7 @@ def main():
     ap.add_argument(
         "backend",
         nargs="?",
-        default="wrapper-daon",
+        default="wrapper",
         choices=SERVING_BACKENDS,
         help="serving-path backend (default when no --mode)",
     )

@@ -538,7 +538,6 @@ def test_da_splitk_wrapper_vs_hip(monkeypatch):
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
@@ -567,7 +566,6 @@ def test_da_splitk_capture_safe_varying_splits(monkeypatch):
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
     from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     pool = 304
@@ -664,7 +662,6 @@ def test_actual_max_splits_wrapper_loose_budget_correct(monkeypatch):
         plan_splitk_capture_safe,
     )
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
@@ -716,7 +713,6 @@ def test_actual_max_splits_wrapper_cudagraph_replay(monkeypatch):
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
     from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "1")
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
@@ -1243,7 +1239,6 @@ def test_adaptive_launch_wrapper_vs_hip(monkeypatch, label, active, splits):
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
     monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "0")
     dt = "bf16"
     po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
         active, splits, _out_dtype(dt)
@@ -1269,7 +1264,6 @@ def test_adaptive_launch_cudagraph_replay(monkeypatch):
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
     monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "0")
     dt = "bf16"
     po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
         8, 32, _out_dtype(dt)
@@ -1293,7 +1287,6 @@ def test_adaptive_launch_single_tile_uses_persistent(monkeypatch):
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
     monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
-    monkeypatch.setenv("AITER_MLA_REDUCE_DA_SPLITK", "0")
     dt = "bf16"
     po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
         1, 32, _out_dtype(dt)

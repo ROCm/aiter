@@ -1172,19 +1172,6 @@ def plan_splitk(*, active_tiles, H, max_seqlen_q, max_splits, num_cu):
     return True, int(K), int(base_blocks)
 
 
-def da_splitk_enabled() -> bool:
-    """Gate for the DEVICE-ADAPTIVE, capture-safe split-K (default ON).
-
-    Unlike :func:`splitk_enabled` (opt-in; its host plan reads the device CSR via
-    ``.item()`` so it only works outside graph capture), this path takes ALL its
-    launch-time decisions from host-visible values already on the wrapper stack
-    (``final_output.size(0)``, ``num_kv_splits``, ``num_cu``) -- no device read,
-    no sync -- so it is safe to enable by default. Set
-    ``AITER_MLA_REDUCE_DA_SPLITK=0`` to force it off.
-    """
-    return os.environ.get("AITER_MLA_REDUCE_DA_SPLITK", "1") == "1"
-
-
 def derive_actual_max_splits(reduce_indptr) -> int:
     """Return ``max_t(reduce_indptr[t+1] - reduce_indptr[t])`` from the CSR.
 
@@ -1246,8 +1233,6 @@ def plan_splitk_capture_safe(
     (fixed batch bucket, varying context) -- the capture-safety property the
     opt-in ``plan_splitk`` cannot provide.
     """
-    if not da_splitk_enabled():
-        return False, 1, 0
     factor = int(os.environ.get("MLA_SPLITK_FACTOR", _SPLITK_FACTOR_DEFAULT))
     min_splits = int(
         os.environ.get("MLA_SPLITK_MIN_SPLITS", _SPLITK_MIN_SPLITS_DEFAULT)
