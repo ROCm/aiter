@@ -584,7 +584,7 @@ def fmha_fwd_mxfp8_asm(
         v: (batch, seqlen_k, nheads_k, hdim_v) fp8 (e4m3), bhsd memory layout
         q_scale/k_scale/v_scale: float8_e8m0fnu micro-scaling descale buffers.
         softmax_scale: softmax scaling; defaults to hdim_q ** -0.5.
-        is_causal: must be False (causal not supported yet).
+        is_causal: causal masking (requires seqlen_q == seqlen_k).
         return_lse: whether the returned lse contents are meaningful.
         out: optional preallocated bf16 output [batch, seqlen_q, nheads, hdim_v].
 
@@ -592,8 +592,6 @@ def fmha_fwd_mxfp8_asm(
         (out, lse). The kernel always touches the lse buffer; when
         return_lse=False its contents are undefined and should be ignored.
     """
-    assert not is_causal, "fmha_fwd_mxfp8_asm: causal masking is not supported yet"
-
     batch, q_seq_len, q_head_num, qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
@@ -1793,10 +1791,11 @@ def _flash_attn_forward(
             return t.dim() == 4 and t.stride(-1) == 1 and t.stride(2) > t.stride(1)
 
         ret = ret and _is_bhsd(q) and _is_bhsd(k) and _is_bhsd(v)
-        # Only the D128 non-causal kernel is registered in fmha_fwd_mxfp8.csv.
+        # Both D128 non-causal (mask=0) and causal (mask=1) kernels are
+        # registered in fmha_fwd_mxfp8.csv; causal uses seqlen_q == seqlen_k.
         ret = ret and (hdim_q == 128)
         ret = ret and (hdim_v == hdim_q)
-        ret = ret and (not causal)
+        ret = ret and ((not causal) or (seqlen_q == seqlen_k))
         ret = ret and (seqlen_k % 128 == 0)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
