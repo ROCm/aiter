@@ -835,21 +835,57 @@ def _get_default_bf16_nvfp4_fused_moe_params(
     arch = get_gfx()
     lds_cap_bytes = _LDS_CAP_BYTES[arch]
     stage1_tile_k = next(
-        tk
-        for tk in (256, 128, 64)
-        if model_dim % tk == 0 and 2 * int(tile_m) * int(tk) * 2 <= lds_cap_bytes
+        (
+            tk
+            for tk in (256, 128, 64)
+            if model_dim % tk == 0 and 2 * int(tile_m) * int(tk) * 2 <= lds_cap_bytes
+        ),
+        None,
     )
+    if stage1_tile_k is None:
+        raise ValueError(
+            f"No supported tile_k for nvfp4 stage1 default: model_dim={model_dim} "
+            "is not divisible by 64, 128, or 256 within LDS capacity constraints."
+        )
     stage2_tile_k = next(
-        tk
-        for tk in (256, 128, 64)
-        if inter_dim % tk == 0 and 2 * int(tile_m) * int(tk) * 2 <= lds_cap_bytes
+        (
+            tk
+            for tk in (256, 128, 64)
+            if inter_dim % tk == 0 and 2 * int(tile_m) * int(tk) * 2 <= lds_cap_bytes
+        ),
+        None,
     )
+    if stage2_tile_k is None:
+        raise ValueError(
+            f"No supported tile_k for nvfp4 stage2 default: inter_dim={inter_dim} "
+            "is not divisible by 64, 128, or 256 within LDS capacity constraints."
+        )
+
+    stage1_tile_n = next(
+        (tn for tn in (128, 64) if inter_dim % tn == 0),
+        None,
+    )
+    if stage1_tile_n is None:
+        raise ValueError(
+            "No supported tile_n for nvfp4 stage1 default: FlyDSL nvfp4_bf16 stage1 requires inter_dim to be a positive "
+            f"multiple of tile_n, got inter_dim={inter_dim}, not divisible by 128 or 64."
+        )
 
     kernelName1 = flydsl_kernel_name(
-        1, "bf16", "nvfp4", "bf16", tile_m, 128, stage1_tile_k
+        1, "bf16", "nvfp4", "bf16", tile_m, stage1_tile_n, stage1_tile_k
     )
+    stage2_tile_n = next(
+        (tn for tn in (128, 64) if model_dim % tn == 0),
+        None,
+    )
+    if stage2_tile_n is None:
+        raise ValueError(
+            "No supported tile_n for nvfp4 stage2 default: FlyDSL nvfp4_bf16 stage2 requires model_dim to be a positive "
+            f"multiple of tile_n, got model_dim={model_dim}, not divisible by 128 or 64."
+        )
+
     kernelName2 = flydsl_kernel_name(
-        2, "bf16", "nvfp4", "bf16", tile_m, 128, stage2_tile_k, "atomic"
+        2, "bf16", "nvfp4", "bf16", tile_m, stage2_tile_n, stage2_tile_k, "atomic"
     )
 
     return {

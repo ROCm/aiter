@@ -375,7 +375,7 @@ def get_flydsl_stage2_kernels_nvfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     b_dtype = "nvfp4"
     tile_ks = [64, 128, 256]
     tile_ms = [16, 32, 64, 128]
-    tile_ns = [128]
+    tile_ns = [64, 128]
     modes = ["atomic"]
     arch = get_gfx()
     lds_cap_bytes = _LDS_CAP_BYTES[arch]
