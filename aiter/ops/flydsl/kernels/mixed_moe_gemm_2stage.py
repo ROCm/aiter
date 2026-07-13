@@ -3110,9 +3110,7 @@ def compile_mixed_moe_gemm2(
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}{cumul_tag}{xcd_tag}{acc_tag}"
     ).replace("-", "_")
-    # fp8 output keeps the CShuffle staging buffer in f32 (4B) like the quant
-    # path in gemm1; bf16/f16 stage at 2B.
-    cshuffle_elem_bytes = 4 if need_fp8_out else 2
+    cshuffle_elem_bytes = 2
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     lds_out_bytes = (
         cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
@@ -3260,11 +3258,9 @@ def compile_mixed_moe_gemm2(
                 SmemPtr(
                     base_ptr,
                     lds_x_ptr.byte_offset,
-                    (
-                        T.f32
-                        if need_fp8_out
-                        else (T.bf16 if out_is_bf16 else T.f16)
-                    ),
+                    # fp8 output stages bf16 in LDS (re-widened to f32 in the
+                    # epilogue before quantization); f16 output stages f16.
+                    (T.bf16 if (need_fp8_out or out_is_bf16) else T.f16),
                     shape=(tile_m * tile_n,),
                 ).get()
                 if _use_cshuffle_epilog
@@ -4596,17 +4592,13 @@ def compile_mixed_moe_gemm2(
                             v = v * tw
 
                         lds_idx = row_base_lds + col_local
-                        if const_expr(need_fp8_out):
-                            # Stage the (weighted) f32 result; quantize to MXFP8
-                            # in store_pair after the CShuffle transpose.
-                            vec1_f32 = T.vec(1, f32)
-                            v1 = vector.from_elements(vec1_f32, [v])
-                            vector.store(v1, lds_out, [lds_idx], alignment=4)
-                        else:
-                            v_out = arith.trunc_f(out_elem(), v)
-                            vec1_out = T.vec(1, out_elem())
-                            v1 = vector.from_elements(vec1_out, [v_out])
-                            vector.store(v1, lds_out, [lds_idx], alignment=2)
+                        # fp8 output stages bf16 (re-widened to f32 + quantized
+                        # in store_pair); bf16/f16 stage their own dtype.
+                        stage_elem = T.bf16 if need_fp8_out else out_elem()
+                        v_out = arith.trunc_f(stage_elem, v)
+                        vec1_out = T.vec(1, stage_elem)
+                        v1 = vector.from_elements(vec1_out, [v_out])
+                        vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                 row_stride_bytes_py = int(model_dim) * int(out_elem_bytes)
                 use_buf_atomic = bool(accumulate) and (row_stride_bytes_py <= 16384)
@@ -4671,11 +4663,10 @@ def compile_mixed_moe_gemm2(
                         c0_f32_q = arith.constant(0.0, type=T.f32)
                         frag_vals = []
                         for i in range_constexpr(e_vec):
-                            frag_vals.append(
-                                vector.extract(
-                                    frag, static_position=[i], dynamic_position=[]
-                                )
+                            bf16_v = vector.extract(
+                                frag, static_position=[i], dynamic_position=[]
                             )
+                            frag_vals.append(arith.extf(T.f32, bf16_v))
                         local_max = c0_f32_q
                         for i in range_constexpr(e_vec):
                             abs_v = llvm.call_intrinsic(
@@ -4799,9 +4790,9 @@ def compile_mixed_moe_gemm2(
                     n_tile_base=n_tile_base,
                     lds_out=lds_out,
                     frag_elem_type=(
-                        ir.F32Type.get()
-                        if need_fp8_out
-                        else (ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get())
+                        ir.BF16Type.get()
+                        if (need_fp8_out or out_is_bf16)
+                        else ir.F16Type.get()
                     ),
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
