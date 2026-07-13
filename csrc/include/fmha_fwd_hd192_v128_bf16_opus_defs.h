@@ -37,6 +37,9 @@ struct opus_gqa_d192_kargs {
     int stride_v_b;
     int stride_v_n;
     int stride_v_h;
+    // Softmax scale applied to Q·K^T (the kernel additionally folds in log2(e) for its
+    // exp2-based softmax). Host passes the caller's scale, defaulting to 1/sqrt(D_QK).
+    float softmax_scale;
     // ── group mode (varlen / packed sequences) ──
     // Prefix-sum arrays (length B+1) locating each group in the packed Q/K/V/O buffers.
     // *_seqstart_*    → real sequence lengths (seqlen = seqstart[g+1]-seqstart[g]) used for

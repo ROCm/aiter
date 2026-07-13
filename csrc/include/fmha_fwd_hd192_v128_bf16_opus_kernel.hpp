@@ -595,7 +595,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // Scaling constants and online softmax state
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
     constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = (1.0f / sqrtf(static_cast<float>(kargs.D_QK))) * LOG2_E;
+    const float temperature_scale = kargs.softmax_scale * LOG2_E;
 
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;

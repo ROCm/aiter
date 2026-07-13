@@ -1166,9 +1166,7 @@ def test_flash_attn_func_opus(
     assert (out - out_ref).abs().max().item() <= out_tol
 
     with torch.no_grad():
-        out_opus = fmha_fwd_bf16_opus_fwd(
-            q, k, v, softmax_scale=d**-0.5, causal=causal
-        )
+        out_opus = fmha_fwd_bf16_opus_fwd(q, k, v, softmax_scale=d**-0.5, causal=causal)
     assert torch.equal(
         out, out_opus
     ), "flash_attn_func did not route to the opus kernel (env/gate not engaged)"
@@ -1204,7 +1202,9 @@ def test_flash_attn_func_opus_d192_v128(batch_size, seqlen, nheads, nheads_k, ca
     torch.manual_seed(0)
     d_qk, d_v = 192, 128
     q = torch.randn(batch_size, seqlen, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
-    k = torch.randn(batch_size, seqlen, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(
+        batch_size, seqlen, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16
+    )
     v = torch.randn(batch_size, seqlen, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
 
     with torch.no_grad():
@@ -1221,11 +1221,11 @@ def test_flash_attn_func_opus_d192_v128(batch_size, seqlen, nheads, nheads_k, ca
         )
 
     out_ref, _, _ = attention_ref(q, k, v, causal=causal)
-    out_pt, _, _ = attention_ref(
-        q, k, v, causal=causal, upcast=False, reorder_ops=True
-    )
+    out_pt, _, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-    print(f"[opus-d192] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
+    print(
+        f"[opus-d192] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}"
+    )
     assert (out - out_ref).abs().max().item() <= out_tol
 
     with torch.no_grad():
@@ -1251,9 +1251,7 @@ _OPUS_D192_GROUP_CASES = [
 @pytest.mark.parametrize(
     "num_groups,seqlens,nheads,nheads_k",
     _OPUS_D192_GROUP_CASES,
-    ids=[
-        f"g{g}_h{h}_hkv{hk}" for (g, _sl, h, hk) in _OPUS_D192_GROUP_CASES
-    ],
+    ids=[f"g{g}_h{h}_hkv{hk}" for (g, _sl, h, hk) in _OPUS_D192_GROUP_CASES],
 )
 def test_fmha_fwd_bf16_opus_d192_v128_group(
     num_groups, seqlens, nheads, nheads_k, causal

@@ -134,9 +134,8 @@ void launch_d192_v128(aiter_tensor_t& q,
     if (softmax_scale <= 0.0f) {
         softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_QK));
     }
-    // NOTE: the D=192 kernel derives its own scale (1/sqrt(D_QK) * log2(e)) internally
-    // and does not read softmax_scale from kargs; the argument is accepted for API
-    // symmetry with the D=128 path. Custom scales are not currently plumbed through.
+    // Plumbed into the kernel via kargs; the kernel folds in log2(e) for its exp2 softmax.
+    kargs.softmax_scale = softmax_scale;
 
     HipDeviceGuard guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -150,15 +149,38 @@ void launch_d192_v128(aiter_tensor_t& q,
         // v [total_k, H_KV, D_V], out [total_q, H, D_V]. group = num sequences.
         AITER_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && out.dim() == 3,
                     "group mode expects packed 3-D q/k/v/out [total, H, D]");
-        AITER_CHECK(seqstart_k.has_value(), "group mode requires seqstart_k");
+        AITER_CHECK(static_cast<int>(q.size(2)) == D_QK && static_cast<int>(k.size(2)) == D_QK,
+                    "group mode q/k head dim must be 192");
+        AITER_CHECK(static_cast<int>(v.size(2)) == D_V && static_cast<int>(out.size(2)) == D_V,
+                    "group mode v/out head dim must be 128");
+        AITER_CHECK(seqstart_q.has_value() && seqstart_k.has_value(),
+                    "group mode requires seqstart_q and seqstart_k");
         H    = static_cast<int>(q.size(1));
         H_KV = static_cast<int>(k.size(1));
+        AITER_CHECK(static_cast<int>(v.size(1)) == H_KV, "group mode k/v must share H_KV");
+        AITER_CHECK(static_cast<int>(out.size(0)) == static_cast<int>(q.size(0)) &&
+                    static_cast<int>(out.size(1)) == H,
+                    "group mode out must be [total_q, H, D_V]");
         B    = static_cast<int>(seqstart_q->numel()) - 1;   // num groups
         AITER_CHECK(B > 0, "group mode requires seqstart_q length >= 2");
         AITER_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0,
                     "group mode requires max_seqlen_q / max_seqlen_k > 0");
         N    = max_seqlen_q;
         N_KV = max_seqlen_k;
+
+        // Validate the cumulative-length arrays before reinterpreting their storage as
+        // int32: a wrong dtype (e.g. int64), non-contiguous layout, or wrong length would
+        // otherwise silently corrupt the per-group offsets or fault.
+        auto check_seqstart = [&](const aiter_tensor_t& s, const char* name) {
+            AITER_CHECK(s.dtype() == AITER_DTYPE_i32, name, " must be int32");
+            AITER_CHECK(s.dim() == 1, name, " must be 1-D");
+            AITER_CHECK(s.is_contiguous(), name, " must be contiguous");
+            AITER_CHECK(static_cast<int>(s.numel()) == B + 1, name, " length must be num_groups+1");
+        };
+        check_seqstart(*seqstart_q, "seqstart_q");
+        check_seqstart(*seqstart_k, "seqstart_k");
+        if (seqstart_q_pad.has_value()) check_seqstart(*seqstart_q_pad, "seqstart_q_pad");
+        if (seqstart_k_pad.has_value()) check_seqstart(*seqstart_k_pad, "seqstart_k_pad");
 
         // Packed single-sequence strides (no batch stride).
         kargs.stride_q_b = 0; kargs.stride_q_n = static_cast<int>(q.stride(0));   kargs.stride_q_h = static_cast<int>(q.stride(1));

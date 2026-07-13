@@ -419,6 +419,13 @@ def fmha_fwd_bf16_opus_varlen_fwd(
             (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
         )
 
+    seqstart_q = seqstart_q.to(torch.int32).contiguous()
+    seqstart_k = seqstart_k.to(torch.int32).contiguous()
+    if seqstart_q_pad is not None:
+        seqstart_q_pad = seqstart_q_pad.to(torch.int32).contiguous()
+    if seqstart_k_pad is not None:
+        seqstart_k_pad = seqstart_k_pad.to(torch.int32).contiguous()
+
     _fmha_fwd_bf16_opus_fwd(
         q,
         k,
