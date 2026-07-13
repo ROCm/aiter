@@ -855,8 +855,8 @@ def quantize_fp4_k_lds_order(k_thd, tile: int = 128, out_device=None):
     # candidate C0 byte for the 64 even channels (odd channels share the byte's high nibble)
     Tv = np.arange(128)[:, None]
     ce = np.arange(0, 128, 2)[None, :]                          # even channels -> low nibble
-    be = np.broadcast_to(_fp4_k_c0_byte(Tv, ce), (128, 64))     # [128,64]
-    k_hs = nt * 16384
+    be = np.broadcast_to(_fp4_k_c0_byte(Tv, ce), (128, 64))     # [128,64] all in [0,8192) (C0 only)
+    k_hs = nt * 8192                                            # fp4 K tile = 8192B (C0 only, no C1)
     k_bs = h * k_hs
     sk_pad = nt * tile
     if sk_pad != sk:                                            # edge-pad the partial tail tile
@@ -864,8 +864,8 @@ def quantize_fp4_k_lds_order(k_thd, tile: int = 128, out_device=None):
     ct = codes.reshape(b, nt, tile, h, 128)
     packed = (ct[..., 0::2] | (ct[..., 1::2] << 4))             # [b,nt,128T,h,64] low|high
     pk = np.transpose(packed, (0, 3, 1, 2, 4))                  # [b,h,nt,128,64]
-    out = np.zeros((b, h, nt, 16384), np.uint8)
-    out[:, :, :, be] = pk                                       # scatter into C0 (be bijection)
+    out = np.zeros((b, h, nt, 8192), np.uint8)
+    out[:, :, :, be] = pk                                       # scatter into C0 (be bijection, [0,8192))
     flat = torch.from_numpy(np.ascontiguousarray(out).reshape(-1))
     buf = torch.empty(b * k_bs + 256, dtype=torch.uint8)
     buf[: flat.numel()] = flat
@@ -875,7 +875,10 @@ def quantize_fp4_k_lds_order(k_thd, tile: int = 128, out_device=None):
     if out_device is not None:
         buf = buf.to(out_device)
         sbuf = sbuf.to(out_device)
-    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 128, k_hs, 1))
+    # Present the launcher's required head_size_q_phys=96 last dim but with seq-stride 64 (the compact
+    # fp4 C0 tile) -- the launcher passes ptr+strides so the overlapping [.,96]/stride-64 view is just a
+    # descriptor (the +256 buf pad covers the last token's 96-wide overread). _s_k_Seqs=64.
+    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 64, k_hs, 1))
     scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
     return k_view, scale
 
