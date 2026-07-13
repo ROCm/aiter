@@ -126,29 +126,6 @@ def flydsl_batched_gemm_mxfp4(
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
 
 
-def _run_gfx1250_bufload(a, w, a_scales, w_scales, N, dtype, *, layout, tile_m, tile_n, out):
-    """Direct buffer-load WMMA kernel (best for large-M compute-bound a8w4)."""
-    from .kernels.mxfp4_preshuffle_gfx1250 import launch_gemm_a8w4
-
-    B, M = (a.shape[0], a.shape[1]) if layout == "bmn" else (a.shape[1], a.shape[0])
-    K = a.shape[-1]
-    n_warp = max(1, tile_n // 64)
-    warp_tile_n = tile_n // n_warp
-    m_warp = (tile_m // 16) if tile_m <= 64 else (tile_m // 32)
-    warp_tile_m = tile_m // m_warp
-    out_is_f16 = 1 if dtype == torch.float16 else 0
-    layout_mbn = 1 if layout == "mbn" else 0
-    shape = (M, B, N) if layout == "mbn" else (B, M, N)
-    out_phys = out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
-    launch_gemm_a8w4(
-        ptr_arg(out_phys), ptr_arg(a.reshape(-1)), ptr_arg(w),
-        ptr_arg(a_scales), ptr_arg(w_scales), M, N, torch.cuda.current_stream(),
-        N, K, tile_m, tile_n, m_warp, n_warp, warp_tile_m, warp_tile_n,
-        out_is_f16, B, layout_mbn, 0,
-    )
-    return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
-
-
 def _run_gfx1250(
     a, w, a_scales, w_scales, N, dtype, *, a_dtype, layout, tile_m, tile_n, tile_k, out
 ):
@@ -191,56 +168,47 @@ def _run_gfx1250(
     _n_bn = B * ((N + tile_n - 1) // tile_n)
     bw_bound = _n_bn >= 2 * _num_cu
 
-    # Regime dispatch: the TDM pipeline wins the weight-BW-bound / small-M (MoE, decode)
-    # cases by overlapping DMA with compute, but for large-M compute-bound GEMMs the
-    # fully-unrolled direct-buffer-load kernel schedules WMMAs denser and is faster.
-    if M >= 1024 and not bw_bound and not a_is_fp4:  # bufload kernel is a8w4-only
-        return _run_gfx1250_bufload(
-            a, w, a_scales, w_scales, N, dtype,
-            layout=layout, tile_m=tile_m, tile_n=tile_n, out=out,
-        )
-
-    # Shrink tile_m to the smallest {16,32,64,128} that still covers M -- but only when the
-    # batch x N-tile grid already fills the GPU. Massively-batched MoE shapes (small M per
-    # expert) are then weight-bandwidth-bound, so an oversized tile_m just loads+discards
-    # padding rows; small grids stay latency-bound and prefer the larger tile_m for
-    # occupancy/latency hiding. Never grow past the caller's tile_m.
-    if bw_bound:
-        _cands = [t for t in (32, 64, 128) if t <= tile_m]
-        if _cands:
-            tile_m = next((t for t in _cands if t >= M), _cands[-1])
-        # Weight-BW-bound MoE regime: tuned TDM shape (256-N tiles maximise B reuse per
-        # A/scale load; 128-K tiles with a deep ring keep the DMA queues full). With
-        # A/B *and* both e8m0 scale tiles streamed through the ring via TDM, a deeper
-        # ring (see _target_nb below) is needed to hide the extra DMA latency -- there
-        # is a sharp cliff below ~5 stages on gfx1250 for this shape.
-        if N % 256 == 0:
-            tile_n = 256
-        if K % 128 == 0:
-            tile_k = 128
-            k_tiles = K // tile_k
-
-    # Warp tiling. The BW-bound MoE-decode regime (small tile_m) is limited by
-    # per-K-tile overhead, so pack many WMMAs per wave in a small workgroup for high
-    # occupancy: 128-wide N warp-tiles (n_warp=2) with warp_tile_m<=64 to keep the
-    # accumulator VGPRs in budget. The non-BW (latency-bound) path keeps the wider
-    # workgroup that favours latency hiding.
-    if bw_bound:
-        n_warp = max(1, tile_n // 128)
-        m_warp = max(1, tile_m // 64)
+    # Regime dispatch. The TDM kernel serves every gfx1250 batched shape now:
+    #  - large-M compute-bound: tuned 256x256x256 w4x2 (nb2) config (~4900 TF; beats
+    #    the old direct-buffer-load path and gemm_fp8fp4);
+    #  - weight-BW-bound / small-M (MoE, decode): overlap DMA with compute via a deeper
+    #    ring on small tile_m.
+    compute_bound = (M >= 1024) and not bw_bound
+    if compute_bound and N % 256 == 0:
+        tile_m, tile_n = 256, 256
+        tile_k = 256 if K % 256 == 0 else 128
+        k_tiles = K // tile_k
+        m_warp, n_warp = 4, 2
+        num_buffers = min(2, k_tiles)
     else:
-        n_warp = max(1, tile_n // 64)
-        m_warp = (tile_m // 16) if tile_m <= 64 else (tile_m // 32)
+        # Shrink tile_m to the smallest {32,64,128} covering M when the batch x N-tile
+        # grid already fills the GPU (BW-bound MoE); small grids keep the larger tile_m
+        # for latency hiding. Never grow past the caller's tile_m.
+        if bw_bound:
+            _cands = [t for t in (32, 64, 128) if t <= tile_m]
+            if _cands:
+                tile_m = next((t for t in _cands if t >= M), _cands[-1])
+            if N % 256 == 0:
+                tile_n = 256
+            if K % 128 == 0:
+                tile_k = 128
+                k_tiles = K // tile_k
+        # BW-bound: pack many WMMAs per wave in a small workgroup (128-wide N tiles,
+        # warp_tile_m<=64). Non-BW latency-bound: wider workgroup for latency hiding.
+        if bw_bound:
+            n_warp = max(1, tile_n // 128)
+            m_warp = max(1, tile_m // 64)
+        else:
+            n_warp = max(1, tile_n // 64)
+            m_warp = (tile_m // 16) if tile_m <= 64 else (tile_m // 32)
+        # 3-deep ring overlaps the 4 TDM streams (A+B+scaleA+scaleB) with compute.
+        num_buffers = min(3, k_tiles)
+
     if m_warp * n_warp * 32 > 1024:
         raise RuntimeError(
             f"[FlyDSL gfx1250] block {m_warp * n_warp * 32} > 1024 for tile "
             f"{tile_m}x{tile_n}"
         )
-
-    # Multi-buffer depth: a 3-deep ring overlaps the 4 TDM streams (A+B+scaleA+scaleB)
-    # with compute; going deeper only costs LDS -> occupancy (clamped to k_tiles).
-    _target_nb = 3
-    num_buffers = min(_target_nb if k_tiles >= _target_nb else k_tiles, k_tiles)
 
     out_is_f16 = 1 if dtype == torch.float16 else 0
     layout_mbn = 1 if layout == "mbn" else 0

@@ -88,9 +88,8 @@ def launch_gemm_a8w4_tdm(
         i32_n: fx.Int32,
         i32_k: fx.Int32,
     ):
-        rocdl.disable_xdl_arb_stall()  # SCHED_MODE: back-to-back WMMA issue
+        rocdl.disable_xdl_arb_stall()  # SCHED_MODE bit[4]: allow back-to-back WMMA issue
 
-        # Runtime-K: K-tile loop bound + dynamic A/B/scale outer strides.
         K_TILES = i32_k // tile_k
         k64 = fx.Int64(i32_k)
         A_KROW, Kp16, K4 = k64 // A_PACK, (k64 // 2) * 16, k64 // 4
