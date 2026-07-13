@@ -407,7 +407,7 @@ def _compile_stage1_finalize_act(
 
     module_name = (
         f"moe_stage1_finalize_act_{act}_{out_dtype}"
-        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}_v4_sk{split_k}"
+        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}_sk{split_k}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
@@ -505,6 +505,8 @@ def _compile_stage1_finalize_act(
                     for pair_idx in range_constexpr(VEC_DW * 2):
                         g = g_acc[pair_idx]
                         u = u_acc[pair_idx]
+                        g = -((-g).maximumf(neg_lim))
+                        u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
                             g = -((-g).maximumf(neg_lim))
                             u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
@@ -612,11 +614,11 @@ def _compile_stage1_finalize_act(
                         g_hi = g_hi_acc[lane]
                         u_lo = u_lo_acc[lane]
                         u_hi = u_hi_acc[lane]
+                        g_lo = -((-g_lo).maximumf(neg_lim))
+                        g_hi = -((-g_hi).maximumf(neg_lim))
+                        u_lo = (-((-u_lo).maximumf(neg_lim))).maximumf(neg_lim)
+                        u_hi = (-((-u_hi).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
-                            g_lo = -((-g_lo).maximumf(neg_lim))
-                            g_hi = -((-g_hi).maximumf(neg_lim))
-                            u_lo = (-((-u_lo).maximumf(neg_lim))).maximumf(neg_lim)
-                            u_hi = (-((-u_hi).maximumf(neg_lim))).maximumf(neg_lim)
                             t_lo = g_lo * alpha * neg_log2e
                             t_hi = g_hi * alpha * neg_log2e
                             emu_lo = ArithValue(
