@@ -2705,17 +2705,18 @@ def flydsl_fused_compress_attn(
       - ``"fp8"``  → FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
       - ``"fp4"``  → FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
         (``kv_cache`` uint8 [NB, k_tiles, 4, k_per_block, 16];
-        ``cache_scale`` uint8 [NB, k_tiles, 4, k_per_block]). Legacy
-        single-wave kernel only (never auto K-split).
+        ``cache_scale`` uint8 [NB, k_tiles, 4, k_per_block]).
 
-    ``k_split_num_waves`` (BF16 or FP8 scatter): when set to NW > 1, routes to
-    the multi-wave LDS K-split kernel (block = 64*NW, K split across NW waves,
+    ``k_split_num_waves`` (BF16, FP8, or FP4 scatter): when set to NW > 1, routes
+    to the multi-wave LDS K-split kernel (block = 64*NW, K split across NW waves,
     single dispatch). Speeds up the latency-bound decode regime (small N,
     1 wave/CU) where the legacy single-wave serial K-chain stalls. Requires a
     real ``block_tables`` (has_block_table). When None, auto-picks NW for the
-    tuned CSA Main (BF16) and CSA Indexer (FP8) shapes via
+    tuned CSA Main (BF16), CSA Indexer (FP8), and CSA Indexer (FP4) shapes via
     :func:`csa_ksplit_num_waves` and uses legacy elsewhere; when 1, forces
-    legacy. K must be divisible by NW.
+    legacy. K must be divisible by NW. (The K-split win comes from parallelizing
+    the dtype-agnostic online-softmax pool, so FP4 reuses the FP8 wave-count
+    heuristic on the shared CSA Indexer geometry.)
     """
     # ---- resolve quant mode (quant_mode overrides the legacy `quant` bool) ----
     #   "none"        -> bf16 paged write
