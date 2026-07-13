@@ -78,5 +78,13 @@
         "NUM_BUFFERS": 3,
         "num_warps": 4,
         "kernel_type": "compute_bound"
+    },
+    "M_LEQ_256": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 16,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 5,
+        "num_warps": 2,
+        "kernel_type": "compute_bound"
     }
 }
