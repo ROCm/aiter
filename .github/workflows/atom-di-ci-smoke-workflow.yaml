@@ -267,17 +267,32 @@ jobs:
                         }
           """
           marker = "                        let correlation_id = self.adapter.correlation_id(&ctx);\n"
-          anchor = "                        let mut decode_request_json = prefill_request_json.clone();\n"
-          if rank_patch not in text:
-              anchor_pos = text.find(anchor)
-              if anchor_pos < 0:
-                  raise SystemExit("Failed to find ATOM relay decode request anchor")
-              marker_pos = text.find(marker, anchor_pos)
+
+          def insert_rank_patch(source, function_name):
+              fn_anchor = f"    async fn {function_name}"
+              fn_pos = source.find(fn_anchor)
+              if fn_pos < 0:
+                  raise SystemExit(f"Failed to find {function_name}")
+              next_fn_pos = source.find("\n    async fn ", fn_pos + len(fn_anchor))
+              section_end = next_fn_pos if next_fn_pos >= 0 else len(source)
+              section = source[fn_pos:section_end]
+              if rank_patch in section:
+                  return source, False
+              marker_pos = source.find(marker, fn_pos, section_end)
               if marker_pos < 0:
-                  raise SystemExit("Failed to find ATOM relay correlation_id marker")
-              text = text[:marker_pos] + rank_patch + text[marker_pos:]
+                  raise SystemExit(f"Failed to find {function_name} correlation_id marker")
+              return source[:marker_pos] + rank_patch + source[marker_pos:], True
+
+          patched_functions = []
+          for function_name in ("execute_vllm_mooncake", "execute_atom_relay"):
+              text, changed = insert_rank_patch(text, function_name)
+              if changed:
+                  patched_functions.append(function_name)
           router_path.write_text(text, encoding="utf-8")
-          print(f"{router_path}: patched explicit ATOM PD data_parallel_rank injection")
+          print(
+              f"{router_path}: patched explicit ATOM PD data_parallel_rank injection "
+              f"for {patched_functions or 'already-patched functions'}"
+          )
           PY
 
       - name: Install matrix dependencies
