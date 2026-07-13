@@ -3003,7 +3003,18 @@ def compile_mixed_moe_gemm2(
 
     out_s = str(out_dtype).strip().lower()
     if const_expr(
-        out_s not in ("f16", "fp16", "half", "bf16", "bfloat16", "f32", "fp32", "float", "fp8")
+        out_s
+        not in (
+            "f16",
+            "fp16",
+            "half",
+            "bf16",
+            "bfloat16",
+            "f32",
+            "fp32",
+            "float",
+            "fp8",
+        )
     ):
         raise ValueError(
             f"out_dtype must be 'f16', 'bf16', 'f32', or 'fp8', got {out_dtype!r}"
@@ -4649,9 +4660,7 @@ def compile_mixed_moe_gemm2(
                         ax_e = (amax_bits >> c23_i32_q) & c255_i32_q
                         E = ax_e - c7_i32_q
                         E = arith.maxsi(E, c1_i32_q)
-                        is_zero = arith.cmpi(
-                            CmpIPredicate.eq, amax_bits, c0_i32_q
-                        )
+                        is_zero = arith.cmpi(CmpIPredicate.eq, amax_bits, c0_i32_q)
                         E = arith.select(is_zero, c0_i32_q, E)
                         quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(T.f32)
                         scaled_vals = []
@@ -4671,9 +4680,7 @@ def compile_mixed_moe_gemm2(
                                 packed_w,
                                 1,
                             )
-                            word_ptr = ptr_addr_idx + arith.constant(
-                                wg * 4, index=True
-                            )
+                            word_ptr = ptr_addr_idx + arith.constant(wg * 4, index=True)
                             out_ptr_v = idx_to_llvm_ptr(word_ptr)
                             packed_raw = (
                                 packed_w._value
