@@ -15,9 +15,13 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v2 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v2,
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1_swizzle_only import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1_swizzle,
 )
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v2_swizzle_only import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v2_swizzle,
+)
+
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
@@ -128,7 +132,174 @@ def get_kernel_config(m, n, k, routing_data):
     }
     return ret
 
-def get_gluon_kernel_config(m, n, k, routing_data):
+def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    group_m = 4
+    num_xcds = 8
+    xcd_swizzle = num_xcds
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 2
+    split_k = 1
+    block_k = 256
+
+    if block_m == 16:
+        block_n = 256
+        num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    elif block_m == 32:
+        if n <= 1024:
+            block_n = 256
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 4
+        else:
+            block_n = 256
+            num_warps = 4
+
+    else:
+        block_n =  256
+        num_warps = 4
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
+    return ret
+
+def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    group_m = 4
+    num_xcds = 8
+    xcd_swizzle = num_xcds
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 2
+    split_k = 1
+    block_k = 256
+
+    if block_m == 16:
+        block_n = 256
+        num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    elif block_m == 32:
+        if n <= 1024:
+            block_n = 128
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 128
+            num_warps = 4
+        else:
+            block_n = 256
+            num_warps = 4
+
+    else:
+        block_n =  64
+        num_warps = 4
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
+    return ret
+
+def get_gluon_kernel_config_v1(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    group_m = 4
+    num_xcds = 8
+    xcd_swizzle = num_xcds
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 2
+    split_k = 1
+    block_k = 256
+
+    if block_m == 16:
+        block_n = 128 
+        num_warps = 4
+
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+
+    elif block_m == 32:
+        num_stages = 2
+        if n <= 1024:
+            block_n = 128
+            num_warps = 4
+        elif n <= 4096:
+            block_n = 256
+            num_warps = 4
+        else:
+            block_n = 512 
+            num_warps = 4
+
+    else:
+        num_stages = 1
+        block_n =  256
+        num_warps = 4
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
+    return ret
+
+
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -162,7 +333,7 @@ def get_gluon_kernel_config(m, n, k, routing_data):
         else:
             # block_n=512 here overflows LDS once X, W and the (swizzled) scale
             # tile are all staged through shared memory; 256 leaves headroom.
-            block_n = 512
+            block_n = 512 
             num_warps = 4
 
     else:
@@ -185,7 +356,7 @@ def get_gluon_kernel_config(m, n, k, routing_data):
         "kpack": 1,
     }
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
-    return ret
+    return ret 
 
 def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
@@ -251,8 +422,22 @@ def moe_gemm_a16w4(
 
     # compute optimization flags
     if use_gluon:
-        config = get_gluon_kernel_config(M, N, K, routing_data)
+        mask_k_limit =K % 256
+        use_v1, use_swizzle_v1 = True, False
+        #use_v1, use_swizzle_v1 = False, True 
+        #use_v1, use_swizzle_v1 = False, False 
+        if use_v1 == False and mask_k_limit == 0 and swizzle_mx_scale is not None:
+            if use_swizzle_v1:
+              #print(f"v1 swizzle kernel")
+              config = get_gluon_kernel_config_v1_swizzle(M, N, K, routing_data)
+            else:
+              print(f"v2 swizzle kernel")
+              config = get_gluon_kernel_config_v2_swizzle(M, N, K, routing_data)       
+        else:
+          #print(f"v1 kernel")
+          config = get_gluon_kernel_config_v1(M, N, K, routing_data)
     else:
+        print(f"triton kernel")
         config = get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
@@ -300,62 +485,118 @@ def moe_gemm_a16w4(
     # launch kernel
     
     if use_gluon:
-        mask_k_limit =K % config["block_k"]
-        if mask_k_limit == 0 and swizzle_mx_scale is not None:
-            _moe_gemm_a16w4_gluon_gfx950_v2[grid,](
-            y,
-            y.stride(0),
-            y.stride(1),
-            y.stride(2),
-            x,
-            x.stride(0),
-            x.stride(1),
-            w,
-            w.stride(0),
-            w.stride(1),
-            w.stride(2),
-            w_scales,
-            w_scales.stride(0),  # stride_w_mx_e
-            w_scales.stride(1),  # stride_w_mx_k
-            w_scales.stride(2),  # stride_w_mx_n
-            bias,
-            stride_bias,
-            gammas,
-            M,
-            N,
-            K,
-            gather_indx,
-            expt_hist,
-            expt_token_offs_raw,
-            expt_hist_sum,
-            expt_block_pid_map,
-            grid_m,
-            grid_n,
-            apply_swiglu_matmul,
-            alpha,
-            limit,
-            reduction_n_matmul,
-            swiglu_add_residual,
-            routing_data.n_expts_act,
-            config["block_m"],
-            config["block_n"],
-            config["block_k"],
-            config["group_m"],
-            XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            SPLIT_K=config["split_k"],
-            #MASK_K_LIMIT=K % config["block_k"],
-            #NUM_FULL_K=K // config["block_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
-            num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
-            waves_per_eu=config["waves_per_eu"],
-            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-            kpack=config["kpack"],
+        if use_v1 == False and mask_k_limit == 0 and swizzle_mx_scale is not None:
+            if use_swizzle_v1:
+              _moe_gemm_a16w4_gluon_gfx950_v1_swizzle[grid,](
+              y,
+              y.stride(0),
+              y.stride(1),
+              y.stride(2),
+              x,
+              x.stride(0),
+              x.stride(1),
+              w,
+              w.stride(0),
+              w.stride(1),
+              w.stride(2),
+              w_scales,
+              w_scales.stride(0),  # stride_w_mx_e
+              w_scales.stride(1),  # stride_w_mx_k
+              w_scales.stride(2),  # stride_w_mx_n
+              bias,
+              stride_bias,
+              gammas,
+              M,
+              N,
+              K,
+              gather_indx,
+              expt_hist,
+              expt_token_offs_raw,
+              expt_hist_sum,
+              expt_block_pid_map,
+              grid_m,
+              grid_n,
+              apply_swiglu_matmul,
+              alpha,
+              limit,
+              reduction_n_matmul,
+              swiglu_add_residual,
+              routing_data.n_expts_act,
+              config["block_m"],
+              config["block_n"],
+              config["block_k"],
+              config["group_m"],
+              XCD_SWIZZLE=config["xcd_swizzle"],
+              NUM_BUFFERS=config["num_stages"],
+              SWIZZLE_MX_SCALE=swizzle_mx_scale,
+              SPLIT_K=config["split_k"],
+              #MASK_K_LIMIT=K % config["block_k"],
+              #NUM_FULL_K=K // config["block_k"],
+              W_CACHE_MODIFIER=config["w_cache_modifier"],
+              num_warps=config["num_warps"],
+              num_stages=config["num_stages"],
+              UPCAST_INDICES=should_upcast_indices(x, w, y),
+              waves_per_eu=config["waves_per_eu"],
+              matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+              kpack=config["kpack"],
 
             )
+            else:
+              _moe_gemm_a16w4_gluon_gfx950_v2_swizzle[grid,](
+              y,
+              y.stride(0),
+              y.stride(1),
+              y.stride(2),
+              x,
+              x.stride(0),
+              x.stride(1),
+              w,
+              w.stride(0),
+              w.stride(1),
+              w.stride(2),
+              w_scales,
+              w_scales.stride(0),  # stride_w_mx_e
+              w_scales.stride(1),  # stride_w_mx_k
+              w_scales.stride(2),  # stride_w_mx_n
+              bias,
+              stride_bias,
+              gammas,
+              M,
+              N,
+              K,
+              gather_indx,
+              expt_hist,
+              expt_token_offs_raw,
+              expt_hist_sum,
+              expt_block_pid_map,
+              grid_m,
+              grid_n,
+              apply_swiglu_matmul,
+              alpha,
+              limit,
+              reduction_n_matmul,
+              swiglu_add_residual,
+              routing_data.n_expts_act,
+              config["block_m"],
+              config["block_n"],
+              config["block_k"],
+              config["group_m"],
+              XCD_SWIZZLE=config["xcd_swizzle"],
+              NUM_BUFFERS=config["num_stages"],
+              SWIZZLE_MX_SCALE=swizzle_mx_scale,
+              SPLIT_K=config["split_k"],
+              #MASK_K_LIMIT=K % config["block_k"],
+              #NUM_FULL_K=K // config["block_k"],
+              W_CACHE_MODIFIER=config["w_cache_modifier"],
+              num_warps=config["num_warps"],
+              num_stages=config["num_stages"],
+              UPCAST_INDICES=should_upcast_indices(x, w, y),
+              waves_per_eu=config["waves_per_eu"],
+              matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+              kpack=config["kpack"],
+
+            )
+           
         else:
             _moe_gemm_a16w4_gluon_gfx950_v1[(grid,)](
             y,

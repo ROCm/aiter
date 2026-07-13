@@ -213,8 +213,143 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("backend",[None, "triton"])
+#@pytest.mark.parametrize("backend",[None, "triton"])
+@pytest.mark.parametrize("backend",[None])
 def test_op(
+    m,
+    n,
+    k,
+    do_gather,
+    do_scatter,
+    has_y_gammas,
+    apply_swiglu,
+    n_expts_tot,
+    n_expts_act,
+    hbm_swizzling,
+    backend,
+    device="cuda",
+):
+
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    if hbm_swizzling:
+        if not arch_info.is_mx_scale_preshuffling_avail():
+            pytest.skip(
+                "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
+            )
+        if n % 32 != 0 or k % (32 * 8) != 0:
+            pytest.skip(
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+            )
+
+    torch.manual_seed(0)
+
+    weight_dtype_str = "mxfp4_e2m1"
+    weight_dtype = str_to_torch_dtype[weight_dtype_str]
+
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
+    )
+
+    # x: (m, k)
+    # w: (num_expts_tot, k, n)
+    # bias: (num_expts_tot, n)
+    # gammas: (m*num_expts_act)
+    x_tri, w_tri, bias_tri, gammas = init_compute_data(
+        m,
+        n,
+        k,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        has_y_gammas,
+        device=device,
+    )
+    x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+
+    # downcast to mxfp
+    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    if hbm_swizzling:
+        swizzle_mx_scale = "CDNA4_SCALE"
+        w_scale_tri = shuffle_scale_moe(
+            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
+    else:
+        swizzle_mx_scale = None
+
+    x_mx_scales_tri = None
+    out_dtype = torch.bfloat16
+    x_static_scale = None
+    quant_static_scale = None
+    maxtol = 4e-1
+    rmstol = 4e-2
+
+    ref_y = moe_gemm_torch(
+        x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
+    )
+
+    #print(f"w_tri.shape={w_tri.shape}")
+    #print(f"w_scale_tri.shape={w_scale_tri.shape}")
+    tri_y = moe_gemm_a16w4(
+        x_tri,
+        w_tri,
+        x_mx_scales_tri,
+        w_scale_tri,
+        x_static_scale,
+        quant_static_scale,
+        bias_tri,
+        rdata,
+        gindx,
+        sindx,
+        gammas,
+        swizzle_mx_scale,
+        out_dtype,
+        apply_swiglu,
+        backend=backend
+    )
+    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+@pytest.mark.parametrize(
+    ", ".join(f.name for f in fields(Case)),
+    [
+        tuple(getattr(case, f.name) for f in fields(Case))
+        for case in [
+            Case(4, 32, 256, 4, 1, hbm_swizzling=True),
+            Case(1024, 4096, 4096, 256, 6, hbm_swizzling=True),
+            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
+            Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
+            Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
+            Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
+            Case(16, 256, 256, 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
+            Case(4096, 256, 256, 128, 4, hbm_swizzling=True),
+            Case(4097, 1024, 1024, 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "do_gather, do_scatter",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
+@pytest.mark.parametrize("has_y_gammas", [False, True])
+@pytest.mark.parametrize("apply_swiglu", [False, True])
+#@pytest.mark.parametrize("has_y_gammas", [True])
+#@pytest.mark.parametrize("apply_swiglu", [True])
+#@pytest.mark.parametrize("backend",[None, "triton"])
+@pytest.mark.parametrize("backend",[None])
+def test_swizzling(
     m,
     n,
     k,

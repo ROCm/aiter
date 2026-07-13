@@ -265,12 +265,22 @@ def _moe_gemm_a16w4(
     SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(4, 2, 8, order=[0, 1])
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     # N-major consume layout for the scale local_load before unswizzle/broadcast.
+    '''
     REG_WS_CONSUME_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[1, 64],
         warps_per_cta=[num_warps, 1],
         order=[1, 0]
     )
+    '''
+
+    REG_WS_CONSUME_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+    reg_bases=[[0, 64], [0, 128], [0, 2], [0, 1]],
+    lane_bases=[[0, 4], [0, 8], [0, 16], [0, 32], [0, 0], [0, 0]],
+    warp_bases=[[1, 0], [2, 0]],
+    block_bases=[],
+    shape=[4, 256],
+)
 
     # X / gather offsets
     X_base = X
@@ -353,6 +363,7 @@ def _moe_gemm_a16w4(
         x = x_smem.load(DOT_LAYOUT_X)
         w = w_smem.load(DOT_LAYOUT_W_PACKED)
         w_scales = ws_smem.load(REG_WS_CONSUME_LAYOUT)
+        #w_scales = ws_smem.load(DOT_LAYOUT_W)
 
         # Scale -> [BLOCK_K, BLOCK_N] to match the axis=0 upcast output (DOT_LAYOUT_W).
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
@@ -362,8 +373,7 @@ def _moe_gemm_a16w4(
             .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
             .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
         )
-        # scaled_upcast requires scale.layout == output layout; gluon can't thread a
-        # linear layout (#linear2) through the unswizzle, so keep one cheap convert.
+
         w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
 
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
