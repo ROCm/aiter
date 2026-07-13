@@ -6,8 +6,6 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
-from flydsl.expr.primitive import atom_set_value
-from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -40,10 +38,8 @@ def launch_gemm_a8w4_tdm(
     layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
-    cluster_m: Constexpr[int] = 1,
-    cluster_n: Constexpr[int] = 1,
+    wave_spec: Constexpr[int] = 0,
 ):
-    use_cluster = cluster_m * cluster_n > 1  # gfx1250 WG-cluster TDM multicast
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -57,13 +53,21 @@ def launch_gemm_a8w4_tdm(
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
 
-    A_PACK = 2 if a_is_fp4 else 1
-    A_ROW_B = tile_k // A_PACK      # A tile-row data bytes (per K-tile)
-    A_KSTEP = WMMA_K // A_PACK      # A LDS bytes per WMMA-K step
-    ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
-    ACT_NDW = 8 if a_is_fp4 else 16  # act fragment i32 count (fp4 8, fp8 16)
+    # Wave-specialized TDM: each tensor is split 2 ways across a loader-wave
+    # pair instead of cooperatively across all waves. >=8 waves gives each
+    # tensor its own pair (A:{0,1} B:{2,3} SA:{4,5} SB:{6,7}); 4-7 waves reuse
+    # the A/B pairs for the scales (A,SA:{0,1} B,SB:{2,3}). Disabled below 4
+    # waves or when wave_spec == 0 (cooperative all-wave TDM).
+    use_ws = (wave_spec != 0) and (num_waves >= 4) and (num_waves % 2 == 0)
+    ws_full8 = use_ws and (num_waves >= 8)
 
-    LDS_PAD_A = 16  # +16B A-row stride pad kills the 16-way ds_read bank conflict
+    A_PACK = 2 if a_is_fp4 else 1
+    A_ROW_B = tile_k // A_PACK
+    A_KSTEP = WMMA_K // A_PACK
+    ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
+    ACT_NDW = 8 if a_is_fp4 else 16
+
+    LDS_PAD_A = 16  # A-row pad avoids the 16-way ds_read bank conflict
     A_LDS_ROW = A_ROW_B + LDS_PAD_A
     B_LDS_ROW = PACK_TK * 16
     STAGE_A = ((tile_m * A_LDS_ROW + 15) // 16) * 16
@@ -93,7 +97,7 @@ def launch_gemm_a8w4_tdm(
         i32_n: fx.Int32,
         i32_k: fx.Int32,
     ):
-        rocdl.disable_xdl_arb_stall()  # SCHED_MODE bit[4]: allow back-to-back WMMA issue
+        rocdl.disable_xdl_arb_stall()  # SCHED_MODE bit[4]: back-to-back WMMA
 
         K_TILES = i32_k // tile_k
         k64 = fx.Int64(i32_k)
@@ -109,7 +113,7 @@ def launch_gemm_a8w4_tdm(
         wave_n = wave % n_warp
         blk_m = bid_x * tile_m
         blk_n = bid_y * tile_n
-        blk_m64 = fx.Int64(blk_m)  # i64 element offsets keep address math off fx.index
+        blk_m64 = fx.Int64(blk_m)  # i64 offsets keep address math off fx.index
         blk_n64 = fx.Int64(blk_n)
         m64 = fx.Int64(i32_m)
         n64 = fx.Int64(i32_n)
@@ -128,26 +132,26 @@ def launch_gemm_a8w4_tdm(
             c_outer_off, c_inner_off, c_stride = bz64 * m64 + blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = bz64 * (N_SUPERS * K4)
-        mn_oob = i32_m - blk_m                          # valid M rows (A load / C store)
-        sa_oob = (i32_m + 31) // 32 - blk_m // 32       # valid M-supers (scale-A)
+        mn_oob = i32_m - blk_m                       # valid M rows (A load / C store)
+        sa_oob = (i32_m + 31) // 32 - blk_m // 32    # valid M-supers (scale-A)
 
-        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr  # uint8 shared
+        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
 
         def _bidx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
         stC_idx = _bidx(base_ptr)
 
-        def _buf_ptr(s):  # runtime ring-slot base pointer for buffer s
+        def _buf_ptr(s):  # ring-slot base pointer for buffer s
             return fx.add_offset(base_ptr, s * PITCH)
 
-        def _gv(base, off, shape, stride):  # offset a global base -> tile view
+        def _gv(base, off, shape, stride):  # global base -> tile view
             return fx.Tensor(fx.make_view(fx.add_offset(base, off), fx.make_layout(shape, stride)))
 
         def _lv(ptr, shape, stride):  # LDS ring-slot view
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
-        def _tdm(gt, outer, stride):  # 2-D TDM atom; outer clamps dim0, stride = runtime outer stride
+        def _tdm(gt, outer, stride):  # 2-D TDM atom (outer clamp + runtime outer stride)
             return fx.rocdl.make_tdm_atom(gt, [outer, None], strides=[stride, None], num_warps=num_waves)
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
@@ -167,47 +171,62 @@ def launch_gemm_a8w4_tdm(
         b_off0 = b_outer_row * Kp16
         sa_off0 = sa_super_off * SA_OUTER_STRIDE + sa_batch_off
         sb_off0 = sb_super_off * SB_OUTER_STRIDE + sb_batch_off
-        # Views carry a STATIC placeholder layout stride (runtime make_layout stride
-        # segfaults); the real runtime K stride goes to the atom via `strides=`.
+        # Views carry a static placeholder stride; the runtime K stride goes to
+        # the atom via `strides=` (a runtime make_layout stride segfaults).
         gtA0 = _gv(gA_base, a_off0, AT, (A_ROW_B, 1))
         gtB0 = _gv(gB_base, b_off0, BT, (PACK_TK * 16, 1))
         gtSA0 = _gv(gSA_base, sa_off0, SAT, (SC_INNER, 1))
         gtSB0 = _gv(gSB_base, sb_off0, SBT, (SC_INNER, 1))
+        # num_warps=2 under wave-spec: the copy lowering derives each wave's
+        # sub-tile from its absolute wave_id via rem/div, so gating to an
+        # even-based wave pair tiles correctly (base is a multiple of 2).
+        a_nw = b_nw = s_nw = 2 if const_expr(use_ws) else num_waves
         atomA = fx.rocdl.make_tdm_atom(
-            gtA0, [mn_oob, None], strides=[A_OUTER_STRIDE, None], num_warps=num_waves,
+            gtA0, [mn_oob, None], strides=[A_OUTER_STRIDE, None], num_warps=a_nw,
             pad_interval=A_ROW_B, pad_amount=LDS_PAD_A,
         )
-        atomB = _tdm(gtB0, None, Kp16)
-        atomSA, atomSB = _tdm(gtSA0, sa_oob, SA_OUTER_STRIDE), _tdm(gtSB0, None, SB_OUTER_STRIDE)
-        # WG-cluster multicast: A/scale_A shared across cluster_n WGs (same M-tile),
-        # B/scale_B across cluster_m WGs (same N-tile) -> one DRAM read per group.
-        if const_expr(use_cluster):
-            lx, ly = cluster.compute_cluster_position()
-            a_mask, b_mask = cluster.compute_mcast_masks(lx, ly, cluster_m, cluster_n)
-            atomA = atom_set_value(atomA, "workgroup_mask", a_mask)
-            atomSA = atom_set_value(atomSA, "workgroup_mask", a_mask)
-            atomB = atom_set_value(atomB, "workgroup_mask", b_mask)
-            atomSB = atom_set_value(atomSB, "workgroup_mask", b_mask)
+        atomB = fx.rocdl.make_tdm_atom(gtB0, [None, None], strides=[Kp16, None], num_warps=b_nw)
+        atomSA = fx.rocdl.make_tdm_atom(
+            gtSA0, [sa_oob, None], strides=[SA_OUTER_STRIDE, None], num_warps=s_nw)
+        atomSB = fx.rocdl.make_tdm_atom(
+            gtSB0, [None, None], strides=[SB_OUTER_STRIDE, None], num_warps=s_nw)
         _adv = fx.rocdl.advance_tdm_atom
 
-        base_i32 = fx.recast_iter(fx.Int32, base_ptr)  # aligned base for i32 scale views
+        base_i32 = fx.recast_iter(fx.Int32, base_ptr)  # i32 base for scale views
 
-        def issue(s, kt):  # load K-tile kt into ring slot s (advance atom imm_offset)
+        def do_copy(s, kt):  # load K-tile kt into ring slot s
             pa = _buf_ptr(s)
             so4 = s * (PITCH // 4)
-            fx.copy(_adv(atomA, kt * A_ROW_B), gtA0, _lv(pa, AT, (A_LDS_ROW, 1)))
-            fx.copy(_adv(atomB, kt * (PACK_TK * 16)), gtB0,
-                    _lv(fx.add_offset(pa, STAGE_A), BT, (B_LDS_ROW, 1)))
-            fx.copy(_adv(atomSA, kt * (SC_INNER * 4)), gtSA0,
-                    _lv(fx.add_offset(base_i32, so4 + SA_OFF // 4), SAT, (SC_INNER, 1)))
-            fx.copy(_adv(atomSB, kt * (SC_INNER * 4)), gtSB0,
-                    _lv(fx.add_offset(base_i32, so4 + SB_OFF // 4), SBT, (SC_INNER, 1)))
+            cpA = lambda: fx.copy(_adv(atomA, kt * A_ROW_B), gtA0, _lv(pa, AT, (A_LDS_ROW, 1)))
+            cpB = lambda: fx.copy(_adv(atomB, kt * (PACK_TK * 16)), gtB0,
+                                  _lv(fx.add_offset(pa, STAGE_A), BT, (B_LDS_ROW, 1)))
+            cpSA = lambda: fx.copy(_adv(atomSA, kt * (SC_INNER * 4)), gtSA0,
+                                   _lv(fx.add_offset(base_i32, so4 + SA_OFF // 4), SAT, (SC_INNER, 1)))
+            cpSB = lambda: fx.copy(_adv(atomSB, kt * (SC_INNER * 4)), gtSB0,
+                                   _lv(fx.add_offset(base_i32, so4 + SB_OFF // 4), SBT, (SC_INNER, 1)))
+            if const_expr(use_ws and ws_full8):  # A:{0,1} B:{2,3} SA:{4,5} SB:{6,7}
+                if wave < 2:
+                    cpA()
+                elif wave < 4:
+                    cpB()
+                elif wave < 6:
+                    cpSA()
+                elif wave < 8:
+                    cpSB()
+            elif const_expr(use_ws):  # A,SA:{0,1}  B,SB:{2,3}
+                if wave < 2:
+                    cpA()
+                    cpSA()
+                elif wave < 4:
+                    cpB()
+                    cpSB()
+            else:
+                cpA(); cpB(); cpSA(); cpSB()
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        # load_* read from ring-slot base `buf`; sub-buffer offsets (0/STAGE_A/SA_OFF/
-        # SB_OFF) are folded into the byte offset.
+        # load_* read the ring-slot base `buf` with the sub-buffer byte offset folded in.
         def load_a(buf, wm, ksl):
             row = wmb + wm * 16 + lane16
             b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
@@ -273,9 +292,8 @@ def launch_gemm_a8w4_tdm(
             return wt, sb_k, sa_k
 
         def _kstep(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
-            # Partial front drain keeps back-A ds_reads in flight so the front WMMAs
-            # hide them; prefetch_kt (next K-tile TDM) is issued between front/back
-            # WMMA groups so its DMA overlaps the back WMMAs.
+            # Partial front drain hides back-A ds_reads under the front WMMAs;
+            # prefetch_kt's TDM is issued between front/back groups to overlap it.
             act_f = [_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in _FRONT]
             if const_expr(len(_BACK) > 0):
                 act_b = [_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in _BACK]
@@ -285,7 +303,7 @@ def launch_gemm_a8w4_tdm(
             _mma_rows(_FRONT, act_f, wt, sa_k, sb_k)
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
-                issue(prefetch_kt % num_buffers, prefetch_kt)
+                do_copy(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
             if const_expr(len(_BACK) > 0):
                 rocdl.s_wait_dscnt(0)
@@ -308,29 +326,30 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(_BS_DS)
             rocdl.sched_barrier(0)
 
-        TDM_PER = 4
-        # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
-        # compute into the slot the fence just freed (one fence/barrier per K-tile).
+        # tensor_loads/wave/K-tile: cooperative=4, wave-spec=1 (>=8 waves) or 2.
+        TDM_PER = (1 if ws_full8 else 2) if const_expr(use_ws) else 4
+        # Prologue preloads nb-1 tiles; steady loop prefetches tile kt+nb-1 mid-
+        # compute into the slot the fence just freed (one fence/barrier per tile).
         for i in range_constexpr(num_buffers - 1):
-            issue(i, i)
+            do_copy(i, i)
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2), use_cluster=use_cluster)
-            compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
-        # Tail: last (num_buffers-1) tiles are resident; drain progressively.
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+            compute_ktile(buf, kt + (num_buffers - 1))
+        # Tail: last nb-1 tiles are resident; drain progressively.
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j), use_cluster=use_cluster)
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
         # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
-        pipeline_fence(outstanding=0, use_cluster=use_cluster)
+        pipeline_fence(outstanding=0)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
@@ -338,7 +357,7 @@ def launch_gemm_a8w4_tdm(
                 h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
                 i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
-        workgroup_barrier(use_cluster=use_cluster)
+        workgroup_barrier()
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
@@ -348,12 +367,8 @@ def launch_gemm_a8w4_tdm(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    cluster_dims = (cluster_m, cluster_n, 1) if (cluster_m * cluster_n > 1) else None
-    if cluster_dims is not None:
-        # Grid must be cluster-divisible; extra M-tiles are OOB-clipped (mn_oob).
-        gx = ((gx + (cluster_m - 1)) // cluster_m) * cluster_m
     kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, N, K).launch(
-        grid=(gx, gy, batch), block=(block, 1, 1), stream=stream, cluster=cluster_dims
+        grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
     )
 
 
