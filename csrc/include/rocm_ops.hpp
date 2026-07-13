@@ -293,6 +293,17 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
+#define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
+    m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
+          &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \
+          "opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
+          py::arg("XQ"),                                  \
+          py::arg("WQ"),                                  \
+          py::arg("x_scale"),                             \
+          py::arg("w_scale"),                             \
+          py::arg("Y"),                                   \
+          py::arg("kernelId"));
+
 #define OPUS_GEMM_WORKSPACE_INIT_PYBIND                              \
     m.def("opus_gemm_workspace_init",                                \
           &opus_gemm_workspace_init,                                 \
@@ -1791,32 +1802,10 @@ namespace py = pybind11;
           py::arg("q_out"),                                \
           py::arg("index_q_out"),                          \
           py::arg("index_slot_mapping"),                   \
-          py::arg("asm_layout")    = false);                \
-    m.def("fused_qknorm_idxrqknorm_fp8",     \
-          &aiter::fused_qknorm_idxrqknorm_fp8, \
-          py::arg("qkv"),                                  \
-          py::arg("q_norm_weight"),                        \
-          py::arg("k_norm_weight"),                        \
-          py::arg("cos_sin_cache"),                        \
-          py::arg("positions"),                            \
-          py::arg("num_heads"),                            \
-          py::arg("num_kv_heads"),                         \
-          py::arg("rotary_dim"),                           \
-          py::arg("eps"),                                  \
-          py::arg("index_q_norm_weight"),                  \
-          py::arg("index_k_norm_weight"),                  \
-          py::arg("num_index_heads"),                       \
-          py::arg("slot_mapping"),                         \
-          py::arg("kv_cache_k"),                           \
-          py::arg("kv_cache_v"),                           \
-          py::arg("index_cache"),                          \
-          py::arg("block_size"),                           \
-          py::arg("q_out"),                                \
-          py::arg("index_q_out"),                          \
-          py::arg("index_slot_mapping"),                   \
-          py::arg("kv_cache_dtype"),                       \
-          py::arg("k_scale"),                              \
-          py::arg("v_scale"),                              \
+          py::arg("kv_cache_dtype") = "auto",              \
+          py::arg("index_cache_dtype") = "auto",           \
+          py::arg("k_scale") = std::nullopt,                \
+          py::arg("v_scale") = std::nullopt,                \
           py::arg("asm_layout")    = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
