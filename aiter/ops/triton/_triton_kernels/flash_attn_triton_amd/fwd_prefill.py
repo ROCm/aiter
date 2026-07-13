@@ -329,7 +329,7 @@ def _attn_fwd_inner(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     # loop over k, v, and update accumulator
-    for start_n in range(block_min, block_max, BLOCK_N):
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=1):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
