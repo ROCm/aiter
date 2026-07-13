@@ -795,7 +795,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             D_ACC row_max = temperature_scale * attn_row_max<T>(vs_cur);
             bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
             bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-            row_max = all_below ? m_row : row_max;
+            row_max = all_below ? m_row : max(m_row, row_max);
             asm volatile("" : "+v"(row_max) ::);
             // scale-sub a leading slice (STAGE5_SUB_CNT) of the S tile here (moved forward
             // from stage7); the rest stays in stage7. Pin vs_cur so it stays in this stage.
