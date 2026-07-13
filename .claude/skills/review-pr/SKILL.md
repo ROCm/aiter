@@ -101,8 +101,9 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **FP8 / quantization path** → C1 (fnuz by dtype), C2 (fp8_max hardcoded), D1 (atomic zero-init)
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
-- [ ] **Async / multi-stream** → G1 (stream sync missing)
+- [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
 - [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?)
+- [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 
 ---
 
@@ -242,12 +243,22 @@ Trigger: new `tl.constexpr` bool in a Triton kernel that disables a bounds/senti
 Real example (ATOM#1498): `CHECK_NEG_ONE_SENTINEL=False` disables the -1 slot filter in the paged prefill kernel; illegal access if any -1 slot appears without the check.
 → `⚠️ B5: [constexpr] disables [check] — document which caller invariant guarantees no [invalid value] on that path`
 
-**B6 — Accepted parameter silently discarded** ⚠️ (🔴 if controls output correctness)
-Function accepts a parameter in its signature but the value is never used: discarded with `del param`, commented out, unreachable due to `or True` short-circuit, or passed to a callee that immediately discards it.
-Severity: 🔴 if the discarded parameter controls output correctness (e.g., `expert_mask`, `guidance_scale`, `q_scale`, `kv_scale`) — callers passing non-default values silently get wrong output. ⚠️ if it controls a performance knob or optional feature with a working default.
-Exception: method overrides where the base class signature requires the parameter but this subclass legitimately doesn't use it — flag as 📝 with a note that the discard is structural.
-Real examples: `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `use_opus` unreachable due to `or True` guard → torch fallback always fires regardless of GPU/arch; `gate_up` param silently discarded when `is_guinterleave=False` (aiter#4167); `v_scale` strides never computed — `sc_off` indexes v_scale_ptr using k_scale strides, producing wrong scale values on non-contiguous tensors (aiter#3959).
-→ `🔴/⚠️ B6: [param] accepted in [fn] signature but never used — callers passing non-default values silently have no effect`
+**B6 — API propagation incompleteness** 🔴/⚠️
+When an API surface changes in dimension X, all downstream receivers (Y) must be updated. Unhandled propagation silently falls through to wrong behavior (Z).
+
+| Sub-type | X (what changed) | Y (downstream not updated) | Z (failure) | Sev |
+|----------|-----------------|---------------------------|-------------|-----|
+| param-discard | new param in signature | function body | value accepted but never used | ⚠️/🔴 |
+| param-removed | param removed from call | same-file call sites | TypeError at call time | 🔴 |
+| repr-key | new Gluon constexpr | kernel repr key list | stale JIT binary served | 🔴 |
+| arch-discard | arch-specific kwarg | non-target-arch path | kwarg silently discarded | ⚠️ |
+| dispatch-silent | multi-backend fallback | caller logging | backend switch with no diagnostic | ⚠️ |
+| rename | public symbol renamed | all importers | AttributeError at import time | 🔴 |
+
+Severity (param-discard): 🔴 if param controls output correctness (`expert_mask`, `q_scale`, `kv_scale`); ⚠️ for performance knobs or optional features with working defaults.
+Exception: method override where base class forces the signature but subclass legitimately ignores the param — flag as 📝 (structural discard, not a bug).
+Real examples (param-discard): `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `v_scale` strides never computed — `sc_off` indexes v_scale_ptr using k_scale strides, wrong scale on non-contiguous tensors (aiter#3959); `gate_up` discarded when `is_guinterleave=False` (aiter#4167).
+→ `🔴/⚠️ B6-[sub-type]: [what changed] — [downstream not updated] — [failure]`
 
 **B7 — Over-conservative assert blocks valid shapes** ⚠️
 `assert M % tileM == 0` when the kernel pads internally and handles non-aligned M.
@@ -280,8 +291,8 @@ Real examples: ATOM#1423 "not always bf16"; ATOM#1458 "hard code to fp8_e8m0?"
 **C4 — New GPU arch string literal in dispatch condition** ⚠️
 **FP self-check first (do this before deciding to fire):** Search the unchanged lines of this file for the same arch string (e.g., `'gfx1250'`). If that string already appears on an unchanged line → **do not fire** (pre-existing style, not a new violation). Only proceed if the arch string is genuinely new to this file.
 Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx1250':`, `if 'gfx950' in arch_name:`), rather than routing through the central kernel registry or a named constant.
-Also exempt: arch strings used only in comments, docstrings, or directory path strings; arch strings imported from a central registry module.
-Real examples: `'gfx1250'` new to `fused_mxfp4_quant.py` dispatch logic where no prior arch literals existed (aiter#3937 → fire C4); `'gfx1201'` added to `unified_attention.py` where `'gfx1250'` was already on line 79 (aiter#3956 → skip, pre-existing style).
+Also exempt: arch strings used only in comments, docstrings, or directory path strings; arch strings imported from a central registry module; arch strings used as **capability guards inside a kernel-specific wrapper function** (not in the centralized dispatch layer) — e.g., `get_gfx() == 'gfx1250'` inside `flydsl_flash_attn_batch_func` determines whether the FlyDSL variant is available; that check belongs in the wrapper, not in the central registry, and does not trigger C4 (aiter#3870).
+Real examples: `'gfx1250'` new to `fused_mxfp4_quant.py` dispatch logic where no prior arch literals existed (aiter#3937 → fire C4); `'gfx1201'` added to `unified_attention.py` where `'gfx1250'` was already on line 79 (aiter#3956 → skip, pre-existing style); `get_gfx() == "gfx1250"` inside FlyDSL wrapper `flydsl_flash_attn_batch_func` (aiter#3870 → skip, capability guard not centralized dispatch).
 → `⚠️ C4: new arch string '[gfxNNNN]' hardcoded in dispatch — route through arch registry or named constant`
 
 ---
@@ -296,6 +307,13 @@ Trigger: `atomic_fmax` / `atomic_max` + `::empty()` or non-zeroed allocation nea
 Severity: 🔴 for atomic accumulation (atomic_fmax, atomicAdd) — garbage propagates into every output element. ⚠️ for partial-sum buffers where a zero-weight coefficient mathematically cancels the contribution (e.g., online softmax with empty batch: `exp(-inf) × garbage = 0`); still flag because `0.0 × NaN = NaN` on IEEE hardware if the allocator returns dirty pages.
 Real example (PR#4015): yzhou103: "AiterTensor::empty does not zero-initialize... garbage in v_amax silently corrupts descale."
 → `🔴 D1: [buffer] passed to atomic_fmax not zero-initialized — use ::zero() not ::empty()`
+
+**D1b — Python-side UnboundLocalError from conditional assignment** 🔴
+A variable is assigned inside an `if/elif` branch but referenced unconditionally after the block. Python does not detect this statically — `UnboundLocalError` or `NameError` fires only at runtime when the skipped branch is exercised. Silent in test environments that never hit the uninitialized path.
+Trigger: new `if/elif` gate assigns a variable (`result = ...`) on some branches; a later line references it without a pre-block default. Check: is there a `var = None` or `var = default_val` before the if-block?
+Exception: if there is a definitive `else` branch that also assigns the variable, or if the variable is only ever used inside the branch that assigns it.
+Real example (ATOM#860): `needs_independent_noise` returned from `prepare_model()` tuple but assigned only in one branch of `prefill_forward` — other branch paths raised `NameError` when the sampler tried to use it.
+→ `🔴 D1b: [var] assigned only inside [branch] but referenced unconditionally — add [var = default] before the if-block`
 
 **D2 — New default path without rollback env-var** ⚠️
 New implementation replaces existing default before wide validation: is there an env var to revert?
@@ -396,6 +414,12 @@ _"Written on stream A, consumed on stream B — no sync between them."_
 HIP/CUDA streams execute concurrently by default. A tensor produced on stream A and consumed by a kernel on stream B without an explicit sync between them causes the consumer to read garbage — no crash, no error, silent wrong output.
 Trigger: diff introduces a non-default `torch.cuda.Stream`, passes an explicit `stream=` argument to a kernel, or prepares buffers/weights on a side stream that are later consumed during forward pass on the compute stream. Check: is there `stream.synchronize()`, `stream.wait_stream(other)`, `hipEventRecord` + `hipStreamWaitEvent`, or `torch.cuda.current_stream().wait_stream(other)` between the last write on stream A and the first read on stream B?
 → `🔴 G1: [tensor] written on [stream A] consumed on [stream B] without sync — add stream.wait_stream() or hipStreamWaitEvent`
+
+**G1b — Blocking queue.get() without timeout in production serving code** ⚠️
+`queue.get()` without `timeout=` in a worker or service thread that depends on an external producer (decode loop, stream consumer, request handler). If the producer exits abnormally, the worker blocks forever — no crash, no log, hung process.
+Trigger: `queue.get()` or `asyncio.Queue.get()` inside a `while True:` worker loop in production serving paths (entrypoints, engine loop, scheduler) without `timeout=` and without a corresponding `except queue.Empty` / `asyncio.TimeoutError` handler or a `done` flag.
+Exception: test code, CLI tools, or one-shot scripts where a hang is detectable (CI timeout, interactive TTY).
+→ `⚠️ G1b: [worker] blocks on queue.get() without timeout — add timeout= and handle Empty/TimeoutError to survive producer failure`
 
 ---
 
