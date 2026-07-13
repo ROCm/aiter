@@ -626,6 +626,309 @@ def compile_wd_moe_gate_up(
 
 
 # ---------------------------------------------------------------------------
+# gate_up split-K (two-phase, arch-agnostic, f32 path only)
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=None)
+def compile_wd_moe_gate_up_splitk(
+    *,
+    hidden: int,
+    inter: int,
+    experts: int,
+    topk: int,
+    k_vector: int = 8,
+    k_batch: int = 2,
+):
+    """Compile gate_up split-K phase 1: FP32 partial sums via atomicAdd.
+
+    Splits the HIDDEN contraction across k_batch workgroups.  Each block
+    computes dot(x[k_slice], w_gate/w_up[k_slice]) and atomicAdds its
+    partial result into FP32 scratch buffers.
+
+    Grid: (B * TOPK * INTER, k_batch, 1).
+    Caller must zero-init gate_scratch and up_scratch before launch.
+    After this kernel, call compile_wd_moe_gate_finalize() to produce BF16 inter_out.
+
+    Parameters
+    ----------
+    hidden   : HIDDEN dimension.
+    inter    : INTER dimension (output neurons per expert).
+    experts  : E, number of experts.
+    topk     : top-K experts per token.
+    k_vector : elements per lane per K-step (default 8).
+    k_batch  : number of split-K workgroups (≥ 2).
+
+    Launch signature:
+        exe(_ptr(gate_scratch), _ptr(up_scratch), _ptr(x), _ptr(w_gate), _ptr(w_up),
+            _ptr(router_ids), B, topk, inter, hidden, experts, stream)
+
+    Scratch buffers:
+        gate_scratch : [B*TOPK*INTER] f32, zero-init before launch
+        up_scratch   : [B*TOPK*INTER] f32, zero-init before launch
+    """
+    if hidden % (k_batch * _WAVE_SIZE * k_vector) != 0:
+        raise ValueError(
+            f"hidden={hidden} must be divisible by k_batch*WAVE_SIZE*k_vector"
+            f"={k_batch * _WAVE_SIZE * k_vector}"
+        )
+    if k_batch < 2:
+        raise ValueError(f"k_batch must be >= 2 for split-K, got {k_batch}")
+
+    module_name = (
+        f"wd_gate_up_sk_h{hidden}_i{inter}_e{experts}_topk{topk}"
+        f"_kv{k_vector}_kb{k_batch}"
+    )
+    _k_pairs = k_vector // 2
+    _k_step = _WAVE_SIZE * k_vector
+    _n_k_steps = hidden // _k_step
+    _n_k_steps_per_batch = _n_k_steps // k_batch
+    _w_nbytes = experts * inter * hidden * 2  # BF16 weight bytes (w_dtype="bf16")
+
+    @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
+    def _kernel(
+        arg_gate_scratch: fx.Pointer,  # [B*TOPK*INTER] f32, zero-init
+        arg_up_scratch: fx.Pointer,  # [B*TOPK*INTER] f32, zero-init
+        arg_x: fx.Pointer,
+        arg_w_gate: fx.Pointer,
+        arg_w_up: fx.Pointer,
+        arg_router_ids: fx.Pointer,
+        i32_B: fx.Int32,
+        i32_TOPK: fx.Int32,
+        i32_INTER: fx.Int32,
+        i32_HIDDEN: fx.Int32,
+        i32_E: fx.Int32,
+    ):
+        f32 = T.f32
+        i32 = T.i32
+        i64 = T.i64
+        bf16 = T.bf16
+
+        B_i32 = i32_B.ir_value()
+        TOPK_i32 = i32_TOPK.ir_value()
+        INTER_i32 = i32_INTER.ir_value()
+        HIDDEN_i32 = i32_HIDDEN.ir_value()
+
+        def _rsrc(ptr, nbytes_i32):
+            addr64 = arith.index_cast(i64, fx.ptrtoint(ptr))
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr64, num_records_bytes=nbytes_i32
+            )
+
+        max_slots = B_i32 * TOPK_i32
+        x_rsrc = _rsrc(arg_x, max_slots * HIDDEN_i32 * arith.constant(2, type=i32))
+        rid_rsrc = _rsrc(arg_router_ids, max_slots * arith.constant(4, type=i32))
+        scratch_nrec = max_slots * INTER_i32 * arith.constant(4, type=i32)  # f32 = 4B
+        gsc_rsrc = _rsrc(arg_gate_scratch, scratch_nrec)
+        usc_rsrc = _rsrc(arg_up_scratch, scratch_nrec)
+
+        lane_i32 = arith.index_cast(i32, gpu.thread_id("x"))
+        blk_i32 = arith.index_cast(i32, gpu.block_id("x"))
+
+        neuron_j = arith.remui(blk_i32, INTER_i32)
+        blk_div = arith.divui(blk_i32, INTER_i32)
+        expert_k = arith.remui(blk_div, TOPK_i32)
+        token_b = arith.divui(blk_div, TOPK_i32)
+
+        expert_e = buffer_ops.buffer_load(
+            rid_rsrc, token_b * TOPK_i32 + expert_k, vec_width=1, dtype=i32
+        )
+
+        # Per-row weight resources (i64 to avoid i32 overflow)
+        HIDDEN_i64 = arith.extsi(i64, HIDDEN_i32)
+        INTER_i64 = arith.extsi(i64, INTER_i32)
+        expert_i64 = arith.extsi(i64, expert_e)
+        neuron_i64 = arith.extsi(i64, neuron_j)
+        w_row_byte_off = (
+            (expert_i64 * INTER_i64 + neuron_i64)
+            * HIDDEN_i64
+            * arith.constant(2, type=i64)
+        )
+        row_nb = HIDDEN_i32 * arith.constant(2, type=i32)
+        wg_base = arith.addi(arith.index_cast(i64, fx.ptrtoint(arg_w_gate)), w_row_byte_off)
+        wu_base = arith.addi(arith.index_cast(i64, fx.ptrtoint(arg_w_up)), w_row_byte_off)
+        wg_row_rsrc = buffer_ops.create_buffer_resource_from_addr(wg_base, num_records_bytes=row_nb)
+        wu_row_rsrc = buffer_ops.create_buffer_resource_from_addr(wu_base, num_records_bytes=row_nb)
+
+        # split-K offset
+        k_bid_i32 = arith.index_cast(i32, gpu.block_id("y"))
+        k_batch_base = k_bid_i32 * arith.constant(_n_k_steps_per_batch * _k_step, type=i32)
+
+        lane_kV = lane_i32 * arith.constant(k_vector, type=i32)
+        c_two = arith.constant(2, type=i32)
+        x_row_base = token_b * HIDDEN_i32
+
+        # f32 scalar accumulation (arch-agnostic)
+        for_op = scf.ForOp(
+            arith.constant(0, index=True),
+            arith.constant(_n_k_steps_per_batch, index=True),
+            arith.constant(1, index=True),
+            iter_args=[arith.constant(0.0, type=f32), arith.constant(0.0, type=f32)],
+        )
+        with ir.InsertionPoint(for_op.body):
+            step_i32 = arith.index_cast(i32, for_op.induction_variable)
+            g_acc = for_op.inner_iter_args[0]
+            u_acc = for_op.inner_iter_args[1]
+            lane_k = arith.addi(k_batch_base, step_i32 * arith.constant(_k_step, type=i32)) + lane_kV
+            g_cur, u_cur = g_acc, u_acc
+            for p in range_constexpr(_k_pairs):
+                p2 = arith.constant(p * 2, type=i32)
+                x_word = buffer_ops.buffer_load(
+                    x_rsrc, (x_row_base + lane_k + p2) // c_two, vec_width=1, dtype=i32
+                )
+                g_word = buffer_ops.buffer_load(
+                    wg_row_rsrc, (lane_k + p2) // c_two, vec_width=1, dtype=i32
+                )
+                u_word = buffer_ops.buffer_load(
+                    wu_row_rsrc, (lane_k + p2) // c_two, vec_width=1, dtype=i32
+                )
+                x0 = _bf16_pair_to_f32(x_word, 0)
+                x1 = _bf16_pair_to_f32(x_word, 1)
+                g_cur = arith.addf(g_cur, arith.addf(
+                    arith.mulf(x0, _bf16_pair_to_f32(g_word, 0)),
+                    arith.mulf(x1, _bf16_pair_to_f32(g_word, 1)),
+                ))
+                u_cur = arith.addf(u_cur, arith.addf(
+                    arith.mulf(x0, _bf16_pair_to_f32(u_word, 0)),
+                    arith.mulf(x1, _bf16_pair_to_f32(u_word, 1)),
+                ))
+            scf.YieldOp([g_cur, u_cur])
+
+        gate_sum = _butterfly_reduce(for_op.results[0])
+        up_sum = _butterfly_reduce(for_op.results[1])
+
+        # Epilogue: lane 0 atomicAdds FP32 partials into scratch buffers
+        zero_i32 = arith.constant(0, type=i32)
+        lane_zero = arith.cmpi(CmpIPredicate.eq, lane_i32, zero_i32)
+        if_op = scf.IfOp(lane_zero)
+        with ir.InsertionPoint(if_op.then_block):
+            out_elem = (token_b * TOPK_i32 + expert_k) * INTER_i32 + neuron_j
+            byte_off = out_elem * arith.constant(4, type=i32)
+            rocdl.raw_ptr_buffer_atomic_fadd(gate_sum, gsc_rsrc, byte_off, zero_i32, zero_i32)
+            rocdl.raw_ptr_buffer_atomic_fadd(up_sum, usc_rsrc, byte_off, zero_i32, zero_i32)
+            scf.YieldOp([])
+
+    _sk = _kernel
+
+    @flyc.jit
+    def _launch_sk(
+        arg_gate_scratch: fx.Pointer,
+        arg_up_scratch: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w_gate: fx.Pointer,
+        arg_w_up: fx.Pointer,
+        arg_router_ids: fx.Pointer,
+        i32_B: fx.Int32,
+        i32_TOPK: fx.Int32,
+        i32_INTER: fx.Int32,
+        i32_HIDDEN: fx.Int32,
+        i32_E: fx.Int32,
+        stream: fx.Stream,
+    ):
+        idx = ir.IndexType.get()
+        grid_x = (
+            arith.index_cast(idx, i32_B.ir_value())
+            * arith.index_cast(idx, i32_TOPK.ir_value())
+            * arith.index_cast(idx, i32_INTER.ir_value())
+        )
+        grid_y = arith.constant(k_batch, index=True)
+        _sk(
+            arg_gate_scratch, arg_up_scratch, arg_x, arg_w_gate, arg_w_up,
+            arg_router_ids, i32_B, i32_TOPK, i32_INTER, i32_HIDDEN, i32_E,
+        ).launch(grid=(grid_x, grid_y, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
+
+    return _launch_sk
+
+
+@functools.lru_cache(maxsize=None)
+def compile_wd_moe_gate_finalize(*, inter: int, topk: int):
+    """Compile gate_up split-K phase 2: silu(gate_scratch)*up_scratch → BF16.
+
+    Reads accumulated FP32 partials from phase 1, applies silu(gate)*up,
+    writes BF16 to inter_out.  One block per output neuron.
+
+    Grid: B * TOPK * INTER blocks.
+    """
+    module_name = f"wd_gate_finalize_i{inter}_topk{topk}"
+
+    @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
+    def _kernel(
+        arg_inter_out: fx.Pointer,    # [B*TOPK*INTER] bf16, output
+        arg_gate_scratch: fx.Pointer,  # [B*TOPK*INTER] f32, fully accumulated
+        arg_up_scratch: fx.Pointer,    # [B*TOPK*INTER] f32, fully accumulated
+        i32_B: fx.Int32,
+        i32_TOPK: fx.Int32,
+        i32_INTER: fx.Int32,
+    ):
+        f32 = T.f32
+        i32 = T.i32
+        i64 = T.i64
+        bf16 = T.bf16
+
+        B_i32 = i32_B.ir_value()
+        TOPK_i32 = i32_TOPK.ir_value()
+        INTER_i32 = i32_INTER.ir_value()
+
+        def _rsrc(ptr, nbytes_i32):
+            addr64 = arith.index_cast(i64, fx.ptrtoint(ptr))
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr64, num_records_bytes=nbytes_i32
+            )
+
+        max_slots = B_i32 * TOPK_i32
+        nelem = max_slots * INTER_i32
+        scratch_nrec = nelem * arith.constant(4, type=i32)
+        out_nrec = nelem * arith.constant(2, type=i32)
+        gsc_rsrc = _rsrc(arg_gate_scratch, scratch_nrec)
+        usc_rsrc = _rsrc(arg_up_scratch, scratch_nrec)
+        out_rsrc = _rsrc(arg_inter_out, out_nrec)
+
+        lane_i32 = arith.index_cast(i32, gpu.thread_id("x"))
+        elem = arith.index_cast(i32, gpu.block_id("x"))  # block_id == neuron index
+
+        # Lane 0 reads gate_scratch[elem] and up_scratch[elem], applies silu, writes BF16
+        zero_i32 = arith.constant(0, type=i32)
+        lane_zero = arith.cmpi(CmpIPredicate.eq, lane_i32, zero_i32)
+        if_op = scf.IfOp(lane_zero)
+        with ir.InsertionPoint(if_op.then_block):
+            gate_val = buffer_ops.buffer_load(gsc_rsrc, elem, vec_width=1, dtype=f32)
+            up_val = buffer_ops.buffer_load(usc_rsrc, elem, vec_width=1, dtype=f32)
+            # silu(gate) = gate * sigmoid(gate)
+            neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+            t = arith.mulf(gate_val, neg_log2e)
+            sig = rocdl.rcp(f32, arith.addf(arith.constant(1.0, type=f32), rocdl.exp2(f32, t)))
+            silu_g = arith.mulf(gate_val, sig)
+            out_f32 = arith.mulf(silu_g, up_val)
+            buffer_ops.buffer_store(arith.truncf(bf16, out_f32), out_rsrc, elem)
+            scf.YieldOp([])
+
+    _fin = _kernel
+
+    @flyc.jit
+    def _launch_fin(
+        arg_inter_out: fx.Pointer,
+        arg_gate_scratch: fx.Pointer,
+        arg_up_scratch: fx.Pointer,
+        i32_B: fx.Int32,
+        i32_TOPK: fx.Int32,
+        i32_INTER: fx.Int32,
+        stream: fx.Stream,
+    ):
+        idx = ir.IndexType.get()
+        grid_x = (
+            arith.index_cast(idx, i32_B.ir_value())
+            * arith.index_cast(idx, i32_TOPK.ir_value())
+            * arith.index_cast(idx, i32_INTER.ir_value())
+        )
+        _fin(
+            arg_inter_out, arg_gate_scratch, arg_up_scratch,
+            i32_B, i32_TOPK, i32_INTER,
+        ).launch(grid=(grid_x, 1, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
+
+    return _launch_fin
+
+
+# ---------------------------------------------------------------------------
 # Stage 2: down_reduce
 # ---------------------------------------------------------------------------
 
