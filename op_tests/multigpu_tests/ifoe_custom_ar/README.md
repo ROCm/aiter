@@ -86,3 +86,24 @@ geometry; both default to tuned values.
 - **`fp8`** (`allreduce2_fp8`) — same idea with fp8 e4m3 (quarter the fabric
   bytes, fp32 accumulate); lossier than bf16 but the highest throughput.
   Requires the tensor byte size to be a multiple of 64.
+
+## Benchmark / reproduce
+
+`--bench` reports `us/iter` and busbw; `--sweep` runs a latency sweep over a
+range of element counts (`--elems N1 N2 ...` for custom sizes). Example — the
+TP4 latency sweep across all three modes:
+
+```bash
+torchrun --nproc_per_node=4 test_ifoe_allreduce.py --sweep --bench --modes fp32 bf16 fp8
+```
+
+TP8 sweep (two nodes, run on each with the coordinator on node 0):
+
+```bash
+torchrun --nnodes=2 --node_rank=<0|1> --nproc_per_node=4 \
+    --master_addr=<node0-ip> --master_port=29500 \
+    test_ifoe_allreduce.py --sweep --bench
+```
+
+Each line prints `us/iter` per (size, mode); compare against your reference
+all-reduce (e.g. RCCL / the stock aiter path) at the same shapes.
