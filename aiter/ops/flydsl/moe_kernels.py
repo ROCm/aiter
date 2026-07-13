@@ -782,15 +782,17 @@ def _run_moe_reduction(
 
     from .kernels.moe_gemm_2stage import compile_moe_reduction
 
-    reduce_exe = compile_moe_reduction(
+    reduce_kwargs = dict(
         topk=topk,
         model_dim=model_dim,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
         # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
         num_experts=int(expert_mask.numel()) if use_mask else 0,
-        out_dtype_str=reduce_out_dtype_str,
     )
+    if is_fp8:
+        reduce_kwargs["out_dtype_str"] = reduce_out_dtype_str
+    reduce_exe = compile_moe_reduction(**reduce_kwargs)
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
         tk = topk_ids.to(torch.int32).contiguous()
