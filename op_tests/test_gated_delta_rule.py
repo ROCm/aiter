@@ -16,6 +16,9 @@ from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule_opt,
     chunk_gated_delta_rule_opt_vk,
 )
+from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+    chunk_gated_delta_rule_fwd_h_hip_fn,
+)
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -934,6 +937,126 @@ def test_chunk_opt_varlen_hip(
     assert tri_ht.dtype == state_dtype
     assert_close("o", ref.float(), tri.float(), tol)
     assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens"),
+    [
+        pytest.param(*test, id="hip-indice-H{}-D{}-mask_p{}-cu_seqlens{}".format(*test))
+        for test in [
+            (4, 128, 0, [0, 15]),
+            (4, 128, 0, [0, 256, 500, 1000]),
+            (4, 128, 0.5, [0, 256, 500, 1000]),
+            (4, 128, 0, [0, 15, 100, 300, 1200, 2000]),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_vk_indice_hip because SKIP_TEST_CHUNK_VARLEN is set",
+)
+@pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
+@pytest.mark.skipif(
+    _is_gfx12_runtime(),
+    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
+)
+def test_chunk_opt_vk_indice_hip(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    state_dtype: torch.dtype,
+):
+    """Functional test for the indexed state-pool HIP fwd_h.
+
+    Both paths go through the single ``chunk_gated_delta_rule_fwd_h_hip_fn`` and
+    the same kernel; the only differences are the per-sequence slot gather
+    (``initial_state_indices``) on read and the in-place write-back into that
+    slot. So when the pool holds the same initial states at (scattered) slots,
+    dense vs indexed must be bit-identical, and non-indexed pool slots must stay
+    untouched.
+    """
+    if D != 128:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = int(cu_seqlens[-1])
+    N = len(cu_seqlens) - 1
+    B = 1
+
+    # fwd_h-stage inputs (layout unchanged): k [B,T,Hg,K] token-major,
+    # w/u [B,H,T,K|V] head-major, g [B,T,H] token-major. Hg == H (no GQA).
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    g = g * (torch.rand_like(g) > mask_p)
+
+    # Dense per-sequence initial states [N, H, V, K] (random, so the gather is
+    # actually exercised -- a wrong slot would read different values).
+    h0 = torch.randn(N, H, D, D, dtype=state_dtype, device=device)
+
+    # --- dense reference: slot == i_n ---
+    h_ref, vnew_ref, ht_ref = chunk_gated_delta_rule_fwd_h_hip_fn(
+        k=k.clone(),
+        w=w.clone(),
+        u=u.clone(),
+        g=g.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        g_head_major=False,
+    )
+
+    # --- indexed pool: scatter the N states into a larger pool at unique,
+    # non-identity slots to prove the gather honours initial_state_indices ---
+    pool_size = N + 7
+    perm = torch.randperm(pool_size, device=device)
+    indices = perm[:N].to(torch.int32)
+    pool = torch.randn(pool_size, H, D, D, dtype=state_dtype, device=device)
+    pool_before = pool.clone()
+    pool[indices.long()] = h0.clone()
+
+    # Indexed pool path via the unified entry: passing initial_state_indices
+    # switches to slot gather + in-place write-back (final_state aliases pool).
+    h_idx, vnew_idx, ht_idx = chunk_gated_delta_rule_fwd_h_hip_fn(
+        k=k.clone(),
+        w=w.clone(),
+        u=u.clone(),
+        g=g.clone(),
+        initial_state=pool,
+        initial_state_indices=indices,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        g_head_major=False,
+    )
+    assert ht_idx is pool  # in-place: final state aliases the pool buffer
+
+    # 1. snapshots + recomputed values are bit-identical to the dense path
+    assert torch.equal(h_idx, h_ref), "h snapshots differ between dense and indexed"
+    assert torch.equal(vnew_idx, vnew_ref), "v_new differs between dense and indexed"
+
+    # 2. in-place write-back: the final state landed in the indexed pool slots
+    # and equals the dense final state
+    assert torch.equal(
+        pool[indices.long()], ht_ref
+    ), "in-place final state at indexed slots differs from dense final_state"
+
+    # 3. non-indexed pool slots must be left exactly as they were
+    untouched = torch.ones(pool_size, dtype=torch.bool, device=device)
+    untouched[indices.long()] = False
+    assert torch.equal(
+        pool[untouched], pool_before[untouched]
+    ), "non-indexed pool slots were modified by the kernel"
 
 
 @pytest.mark.parametrize(
