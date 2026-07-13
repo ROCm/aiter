@@ -36,7 +36,7 @@
         "BLOCK_N": 128,
         "BLOCK_K": 128,
         "NUM_BUFFERS": 4,
-        "num_warps": 4,
+        "num_warps": 2,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_128": {
