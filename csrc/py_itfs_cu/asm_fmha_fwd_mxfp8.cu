@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ASM FMHA forward (MXFP8, gfx1250 / MI450).
+// ASM FMHA forward (MXFP8, gfx1250).
 //
 // This is a **dedicated** integration path, intentionally kept separate from
 // the bf16 `asm_fmha_fwd_with_sink` path and from the shared `fmha_v3` path.
@@ -162,8 +162,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 v_scale->dtype() == AITER_DTYPE_fp8_e8m0,
                 "fmha_fwd_mxfp8_asm: q/k/v_scale must be fp8_e8m0 (float8_e8m0fnu)");
 
-    AITER_CHECK(is_causal == 0,
-                "fmha_fwd_mxfp8_asm: causal masking is not supported yet");
+    // causal (mask=1) and non-causal (mask=0) are both registered in
+    // fmha_fwd_mxfp8.csv; kernel selection below picks the matching .co by
+    // mask_flag and the grid uses tg_div=2 for causal (double-Q).
 
     AITER_CHECK(q->dim() == 4 && k->dim() == 4 && v->dim() == 4,
                 "fmha_fwd_mxfp8_asm: q/k/v must be 4-D tensors (bshd shape)");
