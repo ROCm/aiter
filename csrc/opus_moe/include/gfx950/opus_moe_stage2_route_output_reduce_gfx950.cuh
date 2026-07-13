@@ -62,7 +62,7 @@ opus_moe_stage2_route_reduce_pack_bf16x4(const float* acc, int base)
 //              unrolls and issues the route loads before the final reduction.
 // TOPK == 0 -> fallback to the runtime kargs.topk loop.
 template<int BLOCK_N, int BLOCK_THREADS, int TOPK = 0, bool ROUTE_FP8 = false>
-__global__ __launch_bounds__(BLOCK_THREADS, 4) void
+__global__ __launch_bounds__(BLOCK_THREADS, ROUTE_FP8 ? 2 : 4) void
 opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_route_reduce_kargs kargs)
 {
 #ifdef __HIP_DEVICE_COMPILE__
@@ -106,7 +106,8 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
             {
                 const uint8_t* rp =
                     ro8 + static_cast<int64_t>(route_row_base + slot) * rstride;
-                const uint64_t f8 = *reinterpret_cast<const uint64_t*>(rp + col);
+                const uint64_t f8 =
+                    __builtin_nontemporal_load(reinterpret_cast<const uint64_t*>(rp + col));
                 const float sf = __builtin_bit_cast(
                     float, static_cast<uint32_t>(rp[scale_off + (col >> 3)]) << 23);
                 const f32x2 s2 = f32x2{sf, sf};
