@@ -9,14 +9,17 @@
 // HIP *fabric* handles (see custom_all_reduce_ifoe.cu), which are node
 // independent -- so the identical kernel runs cross-node over the IFOE fabric.
 //
-// Two data paths are provided:
+// Three data paths are provided:
 //   * allreduce2_opt  -- fp32, MLP-unrolled (U float4 in flight per thread).
 //   * allreduce2_bf16 -- bf16 on the wire (half the fabric bytes, fp32
 //                        accumulate); lossy.
+//   * allreduce2_fp8  -- fp8 e4m3 on the wire (quarter the fabric bytes, fp32
+//                        accumulate); lossier, highest busbw.
 #pragma once
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
 #include <cstdint>
 
 namespace aiter {
@@ -272,6 +275,107 @@ __global__ void __launch_bounds__(512, 1) allreduce2_bf16(
             cvt_b2f(tmps[i][o], a, b);
             result[2 * ((size_t)gr * part + o)]     = a;
             result[2 * ((size_t)gr * part + o) + 1] = b;
+        }
+    }
+}
+
+// ---- fp8 (e4m3) on-wire path -------------------------------------------------
+// One "hex" = 16 fp32 elems = 4 float4 = an fp8x16 (16B) on the wire; quarter the
+// fabric bytes, fp32 accumulate. Lossy (fp8 rounding); higher busbw than bf16.
+using fp8 = __hip_fp8_e4m3;
+struct __align__(16) fp8x16 { fp8 v[16]; };
+
+IFOE_DINLINE fp8x16 cvt_f2f8(float4 a, float4 b, float4 c, float4 d)
+{
+    fp8x16 o;
+    o.v[0]=fp8(a.x);  o.v[1]=fp8(a.y);  o.v[2]=fp8(a.z);  o.v[3]=fp8(a.w);
+    o.v[4]=fp8(b.x);  o.v[5]=fp8(b.y);  o.v[6]=fp8(b.z);  o.v[7]=fp8(b.w);
+    o.v[8]=fp8(c.x);  o.v[9]=fp8(c.y);  o.v[10]=fp8(c.z); o.v[11]=fp8(c.w);
+    o.v[12]=fp8(d.x); o.v[13]=fp8(d.y); o.v[14]=fp8(d.z); o.v[15]=fp8(d.w);
+    return o;
+}
+IFOE_DINLINE void cvt_f82f(fp8x16 o, float4& a, float4& b, float4& c, float4& d)
+{
+    a.x=float(o.v[0]);  a.y=float(o.v[1]);  a.z=float(o.v[2]);  a.w=float(o.v[3]);
+    b.x=float(o.v[4]);  b.y=float(o.v[5]);  b.z=float(o.v[6]);  b.w=float(o.v[7]);
+    c.x=float(o.v[8]);  c.y=float(o.v[9]);  c.z=float(o.v[10]); c.w=float(o.v[11]);
+    d.x=float(o.v[12]); d.y=float(o.v[13]); d.z=float(o.v[14]); d.w=float(o.v[15]);
+}
+
+__global__ void cast_fp8(const float4* own_in, fp8x16* my_f8, int size16)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+    for(int o = tid; o < size16; o += stride)
+        my_f8[o] = cvt_f2f8(own_in[4*o], own_in[4*o+1], own_in[4*o+2], own_in[4*o+3]);
+}
+
+// size16 = element count / 16. in_f8_dp: peer fp8 buffers (already cast).
+template <int ngpus, int U>
+__global__ void __launch_bounds__(512, 1) allreduce2_fp8(
+    RankData* in_f8_dp, RankSignals sg, Signal* self_sg, float4* result, int rank, int size16)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+    int part = size16 / ngpus, start = rank * part, end = (rank == ngpus - 1) ? size16 : start + part,
+        largest = part + size16 % ngpus;
+    const fp8x16* ptrs[ngpus];
+    fp8x16* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int t   = (rank + i) % ngpus;
+        ptrs[i] = (const fp8x16*)in_f8_dp->ptrs[t];
+        tmps[i] = tmp_buf<fp8x16>(sg.signals[t]);
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    // reduce-scatter: fp8 reads, fp32 accumulate, U-way MLP
+    for(int o0 = start + tid; o0 < end; o0 += stride * U)
+    {
+        float4 A[U], B[U], C[U], D[U];
+#pragma unroll
+        for(int u = 0; u < U; u++)
+        {
+            int o = o0 + u * stride;
+            if(o < end) cvt_f82f(ptrs[0][o], A[u], B[u], C[u], D[u]);
+        }
+#pragma unroll
+        for(int p = 1; p < ngpus; p++)
+        {
+#pragma unroll
+            for(int u = 0; u < U; u++)
+            {
+                int o = o0 + u * stride;
+                if(o < end)
+                {
+                    float4 a, b, c, d;
+                    cvt_f82f(ptrs[p][o], a, b, c, d);
+                    A[u].x+=a.x; A[u].y+=a.y; A[u].z+=a.z; A[u].w+=a.w;
+                    B[u].x+=b.x; B[u].y+=b.y; B[u].z+=b.z; B[u].w+=b.w;
+                    C[u].x+=c.x; C[u].y+=c.y; C[u].z+=c.z; C[u].w+=c.w;
+                    D[u].x+=d.x; D[u].y+=d.y; D[u].z+=d.z; D[u].w+=d.w;
+                }
+            }
+        }
+#pragma unroll
+        for(int u = 0; u < U; u++)
+        {
+            int o = o0 + u * stride;
+            if(o < end) tmps[0][o - start] = cvt_f2f8(A[u], B[u], C[u], D[u]);
+        }
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+    // allgather: read peers' fp8 reduced shards, cast to fp32 result
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int gr = (rank + i) % ngpus, cnt = (gr == ngpus - 1) ? largest : part;
+        for(int o = tid; o < cnt; o += stride)
+        {
+            float4 a, b, c, d;
+            cvt_f82f(tmps[i][o], a, b, c, d);
+            result[4 * ((size_t)gr * part + o)]     = a;
+            result[4 * ((size_t)gr * part + o) + 1] = b;
+            result[4 * ((size_t)gr * part + o) + 2] = c;
+            result[4 * ((size_t)gr * part + o) + 3] = d;
         }
     }
 }

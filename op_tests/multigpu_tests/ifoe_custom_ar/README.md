@@ -8,7 +8,7 @@ handles. Packaged as the `module_custom_all_reduce_ifoe` JIT module.
 
 | file | role |
 |---|---|
-| `csrc/include/custom_all_reduce_ifoe.cuh` | device kernels (opt fp32 + bf16), sync, structs |
+| `csrc/include/custom_all_reduce_ifoe.cuh` | device kernels (opt fp32 + bf16 + fp8), sync, structs |
 | `csrc/include/custom_all_reduce_ifoe.h` | host API declarations |
 | `csrc/kernels/custom_all_reduce_ifoe.cu` | fabric alloc/import, context, launch dispatch |
 | `csrc/pybind/custom_all_reduce_ifoe_pybind.cu` | pybind entry |
@@ -56,7 +56,7 @@ torchrun --nnodes=2 --node_rank=0 --nproc_per_node=4 \
 ```
 
 The first run JIT-compiles `module_custom_all_reduce_ifoe`. The driver runs both
-the `fp32` and `bf16` modes and checks correctness.
+the `fp32`, `bf16`, and `fp8` modes and checks correctness.
 
 ### API
 
@@ -65,6 +65,7 @@ from aiter.dist.device_communicators.ifoe_custom_all_reduce import IfoeCustomAll
 comm = IfoeCustomAllreduce(group, torch.device("cuda", local_rank), max_bytes=1 << 30)
 out = comm.all_reduce(x)                  # fp32, lossless
 out = comm.all_reduce(x, mode="bf16")     # bf16 on the wire (lossy)
+out = comm.all_reduce(x, mode="fp8")      # fp8 e4m3 on the wire (lossier, fastest)
 comm.dispose()
 ```
 
@@ -79,6 +80,9 @@ geometry; both default to tuned values.
   in flight per thread) + per-peer contiguous allgather.
 - **`bf16`** (`allreduce2_bf16`) — casts each rank's fp32 input to bf16 (a
   separate kernel, for grid-wide visibility), does the reduce-scatter/allgather
-  in bf16, and accumulates in fp32. Lossy (bf16 rounds the addends before
-  summing — standard for ML gradient all-reduce); the test's correctness check
-  passes because the small-integer test values are exact in bf16.
+  in bf16 (half the fabric bytes), and accumulates in fp32. Lossy (bf16 rounds
+  the addends before summing — standard for ML gradient all-reduce); the test's
+  correctness check passes because the small-integer test values are exact in bf16.
+- **`fp8`** (`allreduce2_fp8`) — same idea with fp8 e4m3 (quarter the fabric
+  bytes, fp32 accumulate); lossier than bf16 but the highest throughput.
+  Requires the tensor byte size to be a multiple of 64.

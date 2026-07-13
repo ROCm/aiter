@@ -46,7 +46,7 @@ def _bench(comm, x, mode, iters=100, warmup=20):
 def main():
     ap = argparse.ArgumentParser(description="IFOE custom all-reduce test")
     ap.add_argument("--mb", type=int, default=256, help="tensor size in MiB (fp32)")
-    ap.add_argument("--modes", nargs="+", default=["fp32", "bf16"])
+    ap.add_argument("--modes", nargs="+", default=["fp32", "bf16", "fp8"])
     ap.add_argument(
         "--bench", action="store_true", help="also time and report bandwidth"
     )

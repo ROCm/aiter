@@ -152,6 +152,8 @@ fptr_t ifoe_init(int64_t rank,
     ifoe::allreduce2_opt<NG, U><<<nb, TH, 0, st>>>(ar->in_dp, ar->sg, ar->self_sg, (float*)out_ptr, ar->rank, nvec)
 #define IFOE_BF(NG, U) \
     ifoe::allreduce2_bf16<NG, U><<<nb, TH, 0, st>>>(ar->bf_dp, ar->sg, ar->self_sg, (float4*)out_ptr, ar->rank, size8)
+#define IFOE_FP8(NG, U) \
+    ifoe::allreduce2_fp8<NG, U><<<nb, TH, 0, st>>>(ar->bf_dp, ar->sg, ar->self_sg, (float4*)out_ptr, ar->rank, size16)
 
 template <int U>
 static void launch_opt(IfoeAR* ar, void* out_ptr, int nb, int TH, int nvec, hipStream_t st)
@@ -175,6 +177,17 @@ static void launch_bf(IfoeAR* ar, void* out_ptr, int nb, int TH, int size8, hipS
     default: throw std::invalid_argument("ifoe: unsupported world");
     }
 }
+template <int U>
+static void launch_fp8(IfoeAR* ar, void* out_ptr, int nb, int TH, int size16, hipStream_t st)
+{
+    switch(ar->world)
+    {
+    case 2: IFOE_FP8(2, U); break;
+    case 4: IFOE_FP8(4, U); break;
+    case 8: IFOE_FP8(8, U); break;
+    default: throw std::invalid_argument("ifoe: unsupported world");
+    }
+}
 
 void ifoe_all_reduce(fptr_t ctx,
                      int64_t inp_ptr,
@@ -191,15 +204,18 @@ void ifoe_all_reduce(fptr_t ctx,
     size_t bytes     = (size_t)numel * (size_t)elt_size;
     if(bytes % 32 != 0)
         throw std::invalid_argument("ifoe: tensor bytes must be a multiple of 32");
+    if(mode == 2 && bytes % 64 != 0)
+        throw std::invalid_argument("ifoe fp8: tensor bytes must be a multiple of 64");
     int nvec         = (int)(bytes / 16); // float4 count
     int size8        = (int)(bytes / 32); // octet count (bf16 path)
+    int size16       = (int)(bytes / 64); // hex count (fp8 path)
     int TH           = 512;
-    int U            = unroll > 0 ? (int)unroll : 8;
+    int U            = unroll > 0 ? (int)unroll : (mode == 2 ? 4 : 8); // fp8 default U=4
 
     // stage the input into the fabric-visible buffer peers read
     IFOE_CK(hipMemcpyAsync(ar->self_input, (void*)inp_ptr, bytes, hipMemcpyDeviceToDevice, st));
 
-    int blkcap = (mode == 1) ? 256 : 208; // bf16 moves half the bytes -> more blocks
+    int blkcap = (mode >= 1) ? 256 : 208; // lower-precision moves fewer bytes -> more blocks
     int nb     = blocks > 0 ? (int)blocks : (nvec / ar->world + TH - 1) / TH;
     if(blocks <= 0 && nb > blkcap)
         nb = blkcap;
@@ -208,7 +224,17 @@ void ifoe_all_reduce(fptr_t ctx,
     if(nb < 1)
         nb = 1;
 
-    if(mode == 1)
+    if(mode == 2)
+    {
+        ifoe::cast_fp8<<<nb, TH, 0, st>>>((const float4*)ar->self_input, (ifoe::fp8x16*)ar->self_bf, size16);
+        switch(U)
+        {
+        case 1: launch_fp8<1>(ar, out_ptr, nb, TH, size16, st); break;
+        case 2: launch_fp8<2>(ar, out_ptr, nb, TH, size16, st); break;
+        default: launch_fp8<4>(ar, out_ptr, nb, TH, size16, st); break;
+        }
+    }
+    else if(mode == 1)
     {
         ifoe::cast_bf16<<<nb, TH, 0, st>>>((const float4*)ar->self_input, (bf16x8*)ar->self_bf, size8);
         switch(U)

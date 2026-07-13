@@ -12,6 +12,7 @@ Usage::
     comm = IfoeCustomAllreduce(group, device, max_bytes=1 << 30)
     out = comm.all_reduce(x)                 # fp32, lossless
     out = comm.all_reduce(x, mode="bf16")    # bf16 on the wire (lossy)
+    out = comm.all_reduce(x, mode="fp8")     # fp8 e4m3 on the wire (lossier, fastest)
     comm.dispose()
 """
 
@@ -28,7 +29,7 @@ from aiter.ops.custom_all_reduce_ifoe import (
 )
 
 _HANDLE_BYTES = 64  # sizeof(hipMemFabricHandle_t)
-_MODES = {"fp32": 0, "bf16": 1}
+_MODES = {"fp32": 0, "bf16": 1, "fp8": 2}
 
 
 class IfoeCustomAllreduce:
