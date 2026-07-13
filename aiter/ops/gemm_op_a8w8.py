@@ -943,6 +943,15 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_asm(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
             )
+        elif libtype == "opus":
+            kernelId = int(config["kernelId"])
+            from aiter.ops.opus.gemm_op_a8w8 import (
+                opus_gemm_a8w8_blockscale_bpreshuffle_tune,
+            )
+
+            return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
+                XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
+            )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     except RuntimeError as e:

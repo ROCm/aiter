@@ -329,6 +329,10 @@
             "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')"
         ],
         "flags_extra_hip_per_source": {
+            "*a8w8_bs_bpreshuf*.device.cu": [
+                "-D__HIPCC_RTC__",
+                "-mllvm --disable-machine-licm"
+            ],
             "*.device.cu": [
                 "-D__HIPCC_RTC__"
             ]
@@ -341,7 +345,7 @@
         "verbose": "False",
         "is_python_module": "True",
         "is_standalone": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv --compiled_kids_sidecar={{0}}/../../compiled_kids_opus.json'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv:{AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE} --compiled_kids_sidecar={{0}}/../../compiled_kids_opus.json'"
     },
     "module_gemm_a8w8_bpreshuffle_cktile": {
         "srcs": [
@@ -1592,10 +1596,10 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_hk_mla": {
+    "module_hk_mla_v32_fwd_mi3xx": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/mla_hk_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/mla/hk_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mla_hk_v32_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v32_decode_fwd.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_utils.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_buffer_managers.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_softmax.cuh'",
@@ -1604,7 +1608,25 @@
             "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": ["'-DKITTENS_CDNA4'"],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''",
+        "third_party": ["'HipKittens'", "'ComposableKernel'"],
+        "is_experimental": "True"
+    },
+    "module_hk_mla_v40_fwd_mi3xx": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_hk_v40_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk_v40_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_utils.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_v40_buffer_managers_gen1.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/hk_mla_softmax.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/mi35x_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1.cuh'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-DKITTENS_CDNA4'"],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
