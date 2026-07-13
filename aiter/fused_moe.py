@@ -351,15 +351,16 @@ def fused_moe_(
         _out_str = "bf16"
         _tile_m = 16 if M < 2048 else 32 if M < 16384 else 64
         _tile_n = 128
-        _tile_k = 128
+        _tile_k1 = 256 if M <= 4 else 128
+        _tile_k2 = 128
         _kn1 = (
             flydsl_kernel_name(
-                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
+                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k1
             )
             + "_gui"
         )
         _kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k2, "atomic"
         )
         metadata = MOEMetadata(
             functools.partial(
@@ -1286,7 +1287,8 @@ def get_2stage_cfgs(
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
-        _tile_k = 128
+        _tile_k1 = 256 if gate_mode == GateMode.INTERLEAVE and token <= 4 else 128
+        _tile_k2 = 128
         _gui_tag = (
             "_gui"
             if (
@@ -1299,12 +1301,12 @@ def get_2stage_cfgs(
 
         kn1 = (
             flydsl_kernel_name(
-                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
+                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k1
             )
             + _gui_tag
         )
         kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k2, "atomic"
         )
         return MOEMetadata(
             functools.partial(
@@ -1661,8 +1663,12 @@ def fused_moe_2stages(
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         _tile_m = 16 if token_num < 2048 else 32 if token_num < 16384 else 64
+        _tile_k1 = 256 if token_num <= 4 else 128
         _kn1 = (
-            flydsl_kernel_name(1, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128) + "_gui"
+            flydsl_kernel_name(
+                1, "bf16", "fp4bf16", "bf16", _tile_m, 128, _tile_k1
+            )
+            + "_gui"
         )
         _kn2 = flydsl_kernel_name(
             2, "bf16", "fp4bf16", "bf16", _tile_m, 128, 128, "atomic"

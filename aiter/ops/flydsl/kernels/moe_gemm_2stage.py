@@ -378,7 +378,7 @@ def compile_moe_gemm1(
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}{_act_tag}"
-        f"_abi7"
+        f"_abi8"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -990,7 +990,10 @@ def compile_moe_gemm1(
                 # fp4_bf16 SEPARATED: num_acc_n dwordx4 weight + num_acc_n dwordx4 scale.
                 # Other quantised: k_unroll weight loads per ni (+ scale if groupwise).
                 if const_expr(is_fp4_bf16):
-                    _b_vmem_per_tile = num_acc_n + num_acc_n
+                    _mxfp4_k128_groups = (k_unroll + 3) // 4
+                    _mxfp4_scale_loads = num_acc_n * _mxfp4_k128_groups
+                    _mxfp4_weight_loads = num_acc_n * _mxfp4_k128_groups
+                    _b_vmem_per_tile = _mxfp4_weight_loads + _mxfp4_scale_loads
                 elif const_expr(is_int4_bf16_groupwise):
                     _b_vmem_per_tile = k_unroll * num_acc_n * 2
                 else:
@@ -1093,25 +1096,26 @@ def compile_moe_gemm1(
                                     static_position=[_klane_hw],
                                     dynamic_position=[],
                                 )
-                        # Pass 2: one buffer_load_dwordx4 per ni loads all 4 KLane
-                        # dwords at once (klane_inner layout). Per-ku dword extracted
-                        # by vector.extract — no extra VMEM instructions in the ku loop.
+                        # Pass 2: one buffer_load_dwordx4 per (K128 group, ni) loads
+                        # all 4 KLane dwords at once (klane_inner layout).
                         _b_dwords = {}
-                        for ni in range_constexpr(num_acc_n):
-                            _b_dwords[ni] = load_b_raw_mxfp4_klane4(
-                                buffer_ops,
-                                arith,
-                                vector,
-                                arg_b=arg_w,
-                                b_rsrc=w_rsrc,
-                                layout_b=layout_b,
-                                base_k=base_k,
-                                n_blk=blk_list[ni],
-                                n_intra=intra_list[ni],
-                                lane_div_16=lane_div_16,
-                                elem_type=w_elem,
-                                kpack_bytes=kpack_bytes,
-                            )
+                        for k_group in range_constexpr(_mxfp4_k128_groups):
+                            group_base_k = base_k + arith.index(k_group * 128)
+                            for ni in range_constexpr(num_acc_n):
+                                _b_dwords[(k_group, ni)] = load_b_raw_mxfp4_klane4(
+                                    buffer_ops,
+                                    arith,
+                                    vector,
+                                    arg_b=arg_w,
+                                    b_rsrc=w_rsrc,
+                                    layout_b=layout_b,
+                                    base_k=group_base_k,
+                                    n_blk=blk_list[ni],
+                                    n_intra=intra_list[ni],
+                                    lane_div_16=lane_div_16,
+                                    elem_type=w_elem,
+                                    kpack_bytes=kpack_bytes,
+                                )
                         _defer_scale = tile_n <= 128
                         raw_data = []
                         for ku in range_constexpr(k_unroll):
@@ -1125,7 +1129,7 @@ def compile_moe_gemm1(
                             k_pack_sub_rt = (adj_ku // fx.Index(4)) % fx.Index(2)
                             for ni in range_constexpr(num_acc_n):
                                 raw_i32 = vector.extract(
-                                    _b_dwords[ni],
+                                    _b_dwords[(_k0_blk, ni)],
                                     static_position=[ku % 4],
                                     dynamic_position=[],
                                 )
