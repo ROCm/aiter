@@ -168,12 +168,13 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
+    # Kernel/.co name for this config. See hsa/gfx1250/f4gemm/f4gemm.csv.
+    pre = "ABpreShuffle" if apre else "BpreShuffle"
+    ns = "_noscale" if noscale else ""
+    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
+    knl = f"_ZN5aiter{len(base)}{base}E"
+
     def run_asm():
-        # See hsa/gfx1250/f4gemm/f4gemm.csv.
-        pre = "ABpreShuffle" if apre else "BpreShuffle"
-        ns = "_noscale" if noscale else ""
-        base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
-        knl = f"_ZN5aiter{len(base)}{base}E"
         if intype == "nvfp4":
             return aiter.gemm_nvfp4_asm(
                 inp["A"],
@@ -213,7 +214,24 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
-        out, us = run_perftest(fn, num_iters=num_iters, needTrace=needTrace)
+        try:
+            out, us = run_perftest(fn, num_iters=num_iters, needTrace=needTrace)
+        except Exception as e:
+            # The .co for this config isn't available (e.g. an fp4-output or
+            # noscale variant not yet built/deployed, or nvfp4-fp4 which the
+            # shader can't emit). Report it as unsupported and keep the sweep
+            # going instead of aborting the whole run.
+            aiter.logger.warning(
+                "f4gemm not supported: intype=%s outtype=%s scale=%s apre=%s "
+                "M=%s N=%s K=%s [%s.co]: %s",
+                intype, outtype, scale, apre, M, N, K, base, e,
+            )
+            ret[f"{name} us"] = float("nan")
+            ret[f"{name} TFLOPS"] = float("nan")
+            ret[f"{name} TB/s"] = float("nan")
+            ret[f"{name} err"] = float("nan")
+            ret[f"{name} result"] = "not support"
+            continue
         if out_fp4:
             # e2m1 is a coarse, deterministic quantization: compare the dequantized
             # values with zero tolerance == exact fp4-code match (mirrors the host
