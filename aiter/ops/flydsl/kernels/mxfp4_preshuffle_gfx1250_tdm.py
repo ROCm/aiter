@@ -6,6 +6,8 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.primitive import atom_set_value
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -38,7 +40,10 @@ def launch_gemm_a8w4_tdm(
     layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
+    cluster_m: Constexpr[int] = 1,
+    cluster_n: Constexpr[int] = 1,
 ):
+    use_cluster = cluster_m * cluster_n > 1  # gfx1250 WG-cluster TDM multicast
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -174,6 +179,15 @@ def launch_gemm_a8w4_tdm(
         )
         atomB = _tdm(gtB0, None, Kp16)
         atomSA, atomSB = _tdm(gtSA0, sa_oob, SA_OUTER_STRIDE), _tdm(gtSB0, None, SB_OUTER_STRIDE)
+        # WG-cluster multicast: A/scale_A shared across cluster_n WGs (same M-tile),
+        # B/scale_B across cluster_m WGs (same N-tile) -> one DRAM read per group.
+        if const_expr(use_cluster):
+            lx, ly = cluster.compute_cluster_position()
+            a_mask, b_mask = cluster.compute_mcast_masks(lx, ly, cluster_m, cluster_n)
+            atomA = atom_set_value(atomA, "workgroup_mask", a_mask)
+            atomSA = atom_set_value(atomSA, "workgroup_mask", a_mask)
+            atomB = atom_set_value(atomB, "workgroup_mask", b_mask)
+            atomSB = atom_set_value(atomSB, "workgroup_mask", b_mask)
         _adv = fx.rocdl.advance_tdm_atom
 
         base_i32 = fx.recast_iter(fx.Int32, base_ptr)  # aligned base for i32 scale views
@@ -303,20 +317,20 @@ def launch_gemm_a8w4_tdm(
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2), use_cluster=use_cluster)
             compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
         # Tail: last (num_buffers-1) tiles are resident; drain progressively.
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j), use_cluster=use_cluster)
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
         # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
-        pipeline_fence(outstanding=0)
+        pipeline_fence(outstanding=0, use_cluster=use_cluster)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
@@ -324,7 +338,7 @@ def launch_gemm_a8w4_tdm(
                 h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
                 i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
-        workgroup_barrier()
+        workgroup_barrier(use_cluster=use_cluster)
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
@@ -334,8 +348,12 @@ def launch_gemm_a8w4_tdm(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
+    cluster_dims = (cluster_m, cluster_n, 1) if (cluster_m * cluster_n > 1) else None
+    if cluster_dims is not None:
+        # Grid must be cluster-divisible; extra M-tiles are OOB-clipped (mn_oob).
+        gx = ((gx + (cluster_m - 1)) // cluster_m) * cluster_m
     kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, N, K).launch(
-        grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
+        grid=(gx, gy, batch), block=(block, 1, 1), stream=stream, cluster=cluster_dims
     )
 
 
