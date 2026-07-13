@@ -210,6 +210,31 @@ jobs:
                   "Failed to replace all ATOMesh Spur runner labels in: "
                   + ", ".join(remaining)
               )
+
+          server_path = Path(".github/scripts/atomesh/pd_server_atom.sh")
+          text = server_path.read_text(encoding="utf-8")
+          sync_old = 'apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"\n'
+          sync_new = (
+              'apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"\n'
+              'ATOM_PD_RANK_MAPPING_POLICY="${ATOMESH_ENV_ATOM_PD_RANK_MAPPING_POLICY:-${ATOM_PD_RANK_MAPPING_POLICY}}"\n'
+          )
+          if sync_new not in text:
+              if sync_old not in text:
+                  raise SystemExit("Failed to find ATOMESH_ENV apply point")
+              text = text.replace(sync_old, sync_new, 1)
+
+          policy_old = '    --policy "${ROUTER_POLICY}"\n'
+          policy_new = (
+              '    --policy "${ROUTER_POLICY}"\n'
+              '    --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"\n'
+          )
+          if policy_new not in text:
+              if policy_old not in text:
+                  raise SystemExit("Failed to find router policy argument")
+              text = text.replace(policy_old, policy_new, 1)
+
+          server_path.write_text(text, encoding="utf-8")
+          print(f"{server_path}: patched ATOM PD rank mapping policy argument")
           PY
 
       - name: Install matrix dependencies
