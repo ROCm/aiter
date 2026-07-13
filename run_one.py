@@ -1,5 +1,5 @@
 """Time the batched a8w4 TDM kernel at an explicit tile_m (for 256x256x256 tuning).
-Usage: run256.py tile_m tile_n tile_k nb mw nw [ref]
+Usage: run256.py tile_m tile_n tile_k nb mw nw cm cn [const[=VALUE]] [ref]
 """
 import sys
 import torch
@@ -36,14 +36,22 @@ def time_graph(fn, iters=50):
     return e0.elapsed_time(e1) * 1000.0 / (5 * iters)
 
 
-tm, tn, tk, nb, mw, nw = (int(v) for v in sys.argv[1:7])
-want_ref = "ref" in sys.argv[7:]
+tm, tn, tk, nb, mw, nw, cm, cn = (int(v) for v in sys.argv[1:9])
+rest = sys.argv[9:]
+const_tok = next((t for t in rest if t == "const" or t.startswith("const=")), None)
+const_init = None if const_tok is None else float(const_tok.split("=", 1)[1]) if "=" in const_tok else 0.0
+want_ref = "ref" in rest
 torch.manual_seed(5)
 qf = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-c0, s0 = qf(torch.randn(N, K, dtype=torch.bfloat16), shuffle=False)
+if const_init is None:
+    c0, s0 = qf(torch.randn(N, K, dtype=torch.bfloat16), shuffle=False)
+    x = (torch.randn(B, M, K) * 4.0).to(torch.float8_e4m3fn).view(torch.uint8)
+    x_scales = torch.randint(124, 130, (B, M, K // SG), dtype=torch.uint8)
+else:
+    c0, s0 = qf(torch.full((N, K), const_init, dtype=torch.bfloat16), shuffle=False)
+    x = torch.full((B, M, K), const_init, dtype=torch.float8_e4m3fn).view(torch.uint8)
+    x_scales = torch.full((B, M, K // SG), 127, dtype=torch.uint8)
 w = c0.view(torch.uint8)[None]; w_scales = s0.view(torch.uint8)[None]
-x = (torch.randn(B, M, K) * 4.0).to(torch.float8_e4m3fn).view(torch.uint8)
-x_scales = torch.randint(124, 130, (B, M, K // SG), dtype=torch.uint8)
 w_sh = shuffle_weight_gfx1250(w[0].contiguous()).reshape(B * (N // 16), (K // 2) * 16)
 sb = shuffle_scale_n32k4(pad32(w_scales[0]).unsqueeze(0), experts_cnt=1).view(torch.uint8).reshape(-1)
 sa = shuffle_scale_n32k4(pad32(x_scales[0]).unsqueeze(0), experts_cnt=1).view(torch.uint8).reshape(-1)
@@ -54,7 +62,7 @@ out = torch.empty((B, M, N), dtype=torch.bfloat16)
 def run():
     launch_gemm_a8w4_tdm(out, ptr_arg(a), ptr_arg(w_sh), sa.view(torch.int32),
                          sb.view(torch.int32), M, torch.cuda.current_stream(),
-                         N, K, tm, tn, tk, mw, nw, 0, B, 0, nb, 0)
+                         N, K, tm, tn, tk, mw, nw, 0, B, 0, nb, 0, cm, cn)
 
 
 mm = -1.0
@@ -67,4 +75,4 @@ if want_ref:
     d = (out.float() - ref.float()).abs()
     mm = (d > (1e-2 + 1e-2 * ref.float().abs())).float().mean().item()
 us = time_graph(run)
-print(f"{tm}x{tn}x{tk} nb{nb} w{mw}x{nw}: {us:.1f} us  {tflops(us):.1f} TF  mism {mm:.3f}", flush=True)
+print(f"{tm}x{tn}x{tk} nb{nb} w{mw}x{nw} c{cm}x{cn}: {us:.1f} us  {tflops(us):.1f} TF  mism {mm:.3f}", flush=True)
