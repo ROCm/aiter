@@ -15,7 +15,7 @@ on:
         description: "ROCm/ATOM ref with ATOMesh Spur support"
         required: false
         type: string
-        default: "main"
+        default: "pull/1501/head"
       atomesh_image:
         description: "ATOM image used by the ATOMesh benchmark"
         required: false
@@ -70,7 +70,7 @@ permissions:
   contents: read
 
 env:
-  ATOM_REF_DEFAULT: main
+  ATOM_REF_DEFAULT: pull/1501/head
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
