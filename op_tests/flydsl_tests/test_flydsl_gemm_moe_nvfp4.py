@@ -28,6 +28,7 @@ from aiter.utility.fp4_utils import (
     shuffle_nvfp4_weight_for_flydsl,
 )
 from aiter.aot.flydsl.moe import compile_one_config
+from aiter.jit.core import AITER_CONFIGS
 
 
 DTYPE = torch.bfloat16
@@ -240,6 +241,10 @@ def test_online_tuning(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,"
         "us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,tflops,bw,_tag\n"
     )
+    # get_config_file is lru_cached; the import of aiter.aot.flydsl.moe populates
+    # that cache at module load time (before monkeypatch takes effect). Clear it so
+    # the monkeypatched AITER_CONFIG_FMOE env var is actually picked up.
+    AITER_CONFIGS.get_config_file.cache_clear()
     monkeypatch.setenv("AITER_CONFIG_FMOE", str(tune_file))
     monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
 
