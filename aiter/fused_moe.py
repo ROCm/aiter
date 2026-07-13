@@ -809,6 +809,7 @@ def _flydsl_stage1_wrapper(
     swiglu_limit: float = 0.0,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    zero_out=None,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -846,6 +847,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        zero_out=zero_out,
     )
 
 
@@ -1816,6 +1818,20 @@ def fused_moe_2stages(
     extra_stage2_args = {}
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage1_kernel_name = getattr(metadata.stage1, "keywords", {}).get(
+        "kernelName", ""
+    )
+    stage1_kernel_params = (
+        aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(stage1_kernel_name)
+        if stage1_func is _flydsl_stage1_wrapper
+        else None
+    )
+    fuse_stage2_zero = bool(
+        stage1_kernel_params
+        and stage1_kernel_params.get("b_dtype") == "fp4bf16"
+        and not metadata.fuse_quant
+        and int(os.environ.get("AITER_FLYDSL_FUSE_STAGE2_ZERO", "1"))
+    )
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -1825,6 +1841,8 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+        if fuse_stage2_zero:
+            extra_stage1_args["zero_out"] = moe_out
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1931,7 +1949,7 @@ def fused_moe_2stages(
     # zeroed output buffer. moe_out comes from moe_sorting (torch.empty, not
     # zeroed), so zero it here when the stage2 function is our FlyDSL wrapper.
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
-    if stage2_func is _flydsl_stage2_wrapper:
+    if stage2_func is _flydsl_stage2_wrapper and not fuse_stage2_zero:
         moe_out.zero_()
 
     metadata.stage2(
