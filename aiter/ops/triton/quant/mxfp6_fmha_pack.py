@@ -769,3 +769,82 @@ def quantize_fp8_v_lds_order(v_fp8, tile: int = 128, out_device=None):
     return buf.view(v_fp8.dtype).as_strided((b, sk, h_kv, d), (v_bs, 128, v_hs, 1))
 
 
+_E2M1_MAG = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])  # E2M1 code 0..7 -> magnitude
+
+
+def _v_lds_order_gather_index_fp4(tile: int = 128):
+    """Per-tile [16384] source ELEMENT index (tok*128 + d) for each contiguous LDS-order NIBBLE Q
+    (fp4 V tile = 8192 B = 16384 nibbles). CANDIDATE natural layout (ramp-probe corrects the kv/channel
+    shuffles): block g (0..7) = (n=g//2 head-dim-32, k=g%2 kv-64); within a block lane L reads its 16B
+    = one kv-token's 32 channels (channel m at byte-in-lane m//2, nibble m%2). Matches the b128 hoist
+    _acc_V[L,4g+dw] = tile byte g*1024 + L*16 + dw*4."""
+    assert tile == 128
+    # Mirror the WORKING fp8 _v_lds_order_gather_index: channel d comes from the LANE (L%32), kv-token
+    # from the dword+nibble within the lane's block data. fp8 had 8 dwords x 4 bytes/dword (elem e =
+    # off*4 + j); fp4 has 4 dwords x 8 nibbles/dword (elem e = off4*8 + nib). Same 32 elem/lane/block ->
+    # same kv-token set via e//4 (dword-of-4) + e%4. Block u = g -> n=u//2 (head-dim-32), k=u&1 (kv-64).
+    Q = np.arange(16384)
+    P = Q // 2                 # byte
+    nlo = Q % 2                # low/high nibble within the byte
+    g = P // 1024              # block u 0..7
+    L = (P % 1024) // 16       # lane 0..63
+    b = P % 16                 # byte in lane's 16B (0..15)
+    off4 = b // 4              # dword in block 0..3
+    nib = (b % 4) * 2 + nlo    # nibble (K-element) in dword 0..7 (packed 2/byte, low nibble first)
+    e = off4 * 8 + nib         # element index in the lane's 32-elem block sequence (0..31)
+    u = g
+    tok = (u & 1) * 64 + (e // 4) * 8 + (L // 32) * 4 + (e % 4)
+    # KPROBE showed the fp4 srcA read maps logical token t -> physical V[swap_bits(2,5)(t)]; undo it
+    # (involution) by swapping bits 2 and 5 of tok here (bit 6 = kv-64 block is untouched).
+    b2 = (tok >> 2) & 1
+    b5 = (tok >> 5) & 1
+    tok = (tok & ~np.int64(0b100100)) | (b5 << 2) | (b2 << 5)
+    d = (u // 2) * 32 + (L % 32)
+    return (tok * 128 + d).astype(np.int64)
+
+
+def quantize_fp4_v_lds_order(v, tile: int = 128, out_device=None):
+    """Raw V [b, sk, h_kv, 128] (float) -> per-channel fp4 (E2M1) codes laid out in the solo kernel's
+    coalesced LDS-order (the fp4 analog of quantize_fp8_v_lds_order; b128 hoist, no transpose). Returns
+    (packed uint8 view [b, sk, h_kv, 64] with seq-stride 64 B, per-channel descale f32 [b, h_kv, 128]).
+    descale[d] = amax_kv|V[.,d]| / 6.0 (E2M1 max), applied in the kernel epilogue (same as f6f8)."""
+    b, sk, h_kv, d = v.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile
+    vb = v.detach().to(torch.float32).cpu().numpy()                 # [b, sk, h, 128]
+    amax = np.abs(vb).max(axis=1, keepdims=True)                    # [b, 1, h, 128] per-channel over kv
+    descale = np.where(amax > 0.0, amax / 6.0, 1.0).astype(np.float32)
+    scaled = vb / descale                                          # [b, sk, h, 128]
+    codes = np.abs(np.abs(scaled)[..., None] - _E2M1_MAG).argmin(-1).astype(np.uint8)  # 3-bit mag
+    codes = codes | ((scaled < 0).astype(np.uint8) * 8)            # | sign bit -> 4-bit E2M1 code
+    idx = _v_lds_order_gather_index_fp4(tile)                       # [16384] nibble -> src elem
+    out = np.zeros((b, h_kv, nt * 8192), np.uint8)
+    for bi in range(b):
+        for hi in range(h_kv):
+            for t in range(nt):
+                lo = t * tile
+                hitok = min(lo + tile, sk)
+                tileC = np.zeros((tile, d), np.uint8)
+                tileC[: hitok - lo] = codes[bi, lo:hitok, hi, :]
+                if hitok - lo < tile:
+                    tileC[hitok - lo:] = codes[bi, sk - 1, hi, :]  # edge-pad partial tail
+                nibs = tileC.reshape(tile * d)[idx]                # [16384] code per output nibble
+                packed = (nibs[0::2] | (nibs[1::2] << 4)).astype(np.uint8)  # [8192]
+                out[bi, hi, t * 8192: (t + 1) * 8192] = packed
+    v_hs = nt * 8192
+    v_bs = h_kv * v_hs
+    flat = torch.from_numpy(out.reshape(-1))
+    buf = torch.empty(b * v_bs + 8192 + 256, dtype=torch.uint8)     # +1 tile pad for the over-prefetch
+    buf[: flat.numel()] = flat
+    desc = torch.from_numpy(np.ascontiguousarray(descale[:, 0]))    # [b, h, 128]
+    if out_device is not None:
+        buf = buf.to(out_device)
+        desc = desc.to(out_device)
+    # reinterpret as fp8 (1 byte) so the bench's V-dtype dispatch routes to the mxfp6 slot; the kernel
+    # reads the bytes as packed fp4 (cbsz=_FP4). Present head-dim 128 (the launcher requires hdim_v==128)
+    # but seq-stride 64 B so v_Seqs=64 (the compact fp4 tile) -- the launcher passes ptr+strides, so the
+    # overlapping [.,128]/stride-64 view is just a descriptor (the +1-tile pad covers the tail overread).
+    v_view = buf.view(torch.float8_e4m3fn).as_strided((b, sk, h_kv, 128), (v_bs, 64, v_hs, 1))
+    return v_view, desc
+
+

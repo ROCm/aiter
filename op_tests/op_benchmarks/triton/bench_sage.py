@@ -868,7 +868,15 @@ def _sage_quant_mxfp6(
     # V: coalesced + pre-transposed LDS-order pack (the V analog of K's lds-order pack) so the solo
     # kernel's V load is a contiguous copy and the hoist is a plain ds_read_b128. MUST be built with the
     # matching kernel (SOLO_V_LDS_ORDER=1). SOLO_V_LDS_ORDER=0 keeps the raw-fp8 gather layout.
-    if os.environ.get("SOLO_V_LDS_ORDER", "1") != "0":
+    if os.environ.get("SOLO_V_FP4", "0") != "0":
+        # V -> per-channel fp4 (E2M1) in the solo lds-order layout (half the V LDS/prefetch). v_scale
+        # becomes the per-channel /6.0 (E2M1 max) descale, applied in the kernel epilogue (same site as
+        # the f6f8 per-channel fp8 descale). MUST pair with a SOLO_V_FP4=1 kernel build.
+        from aiter.ops.triton.quant.mxfp6_fmha_pack import quantize_fp4_v_lds_order
+        v_fp8, v_scale = quantize_fp4_v_lds_order(v, tile=128, out_device=v.device)
+        if os.environ.get("DBG_VFP4_NOSCALE"):
+            v_scale = torch.ones_like(v_scale)   # localize NaN: descale path vs operand layout
+    elif os.environ.get("SOLO_V_LDS_ORDER", "1") != "0":
         from aiter.ops.triton.quant.mxfp6_fmha_pack import quantize_fp8_v_lds_order
         v_fp8 = quantize_fp8_v_lds_order(v_fp8, tile=128, out_device=v_fp8.device)
 
@@ -1545,6 +1553,69 @@ def compute_memory_bytes(
     return q_size + k_size + v_size + o_size
 
 
+_KPROBE_V = None  # [s, d] float: the random per-token V injected by the K-layout probe
+
+
+def _kprobe_fill(q, k, v):
+    """DBG_KPROBE: overwrite (q,k,v) in place with a near-identity-P passthrough probe so the fp4-V
+    token/channel LAYOUT can be read directly. Q[qi]=LARGE*e_qi, K[ti]=e_ti (orthogonal one-hots, needs
+    d>=s) -> scores = LARGE*delta -> softmax P ~= Identity -> O[q,:] ~= V_read[q,:]. V[t,:] is distinct
+    random per token, so matching each output row back to a V row recovers the layout permutation."""
+    global _KPROBE_V
+    b, s, h, d = q.shape
+    assert b == 1 and h == 1 and d >= s, f"kprobe needs b=1,h=1,d>=s (got {q.shape}); use --b 1 --hq 1 --sq {d}"
+    dev = q.device
+    large = float(os.environ.get("KPROBE_LARGE", "2000"))
+    q.zero_()
+    k.zero_()
+    idx = torch.arange(s, device=dev)
+    q[0, idx, 0, idx] = large
+    k[0, idx, 0, idx] = 1.0
+    g = torch.Generator().manual_seed(1234)
+    Vp = torch.randn(s, d, generator=g)
+    v[0, :, 0, :] = Vp.to(dev, v.dtype)
+    _KPROBE_V = Vp.float()
+
+
+def _kprobe_decode(args, q, k, v, fn, block_attn_mask):
+    """Run kernel + reference on the probe inputs, recover per-row token permutation sigma (which
+    kv-token's V is actually read when the kernel indexes 'token q'), and print its bit-structure."""
+    import numpy as np
+    cur = to_bshd_output_if_needed(primary_output(fn()), args.layout).float()
+    ref = make_reference_output(args, q, k, v, block_attn_mask).float()
+    Vn = _KPROBE_V.cpu().numpy()                      # [s, d]
+    myO = cur[0, :, 0, :].cpu().numpy()               # [s, d]
+    refO = ref[0, :, 0, :].cpu().numpy()
+    s = Vn.shape[0]
+    Vunit = Vn / (np.linalg.norm(Vn, axis=1, keepdims=True) + 1e-9)
+
+    def match(O):  # scale-invariant (cosine) token match: which V row each output row points at
+        On = O / (np.linalg.norm(O, axis=1, keepdims=True) + 1e-9)
+        sim = On @ Vunit.T                                    # [q, t]
+        p = sim.argmax(1)
+        return p, sim[np.arange(s), p]
+
+    ident = np.arange(s)
+    perm_ref, cos_ref = match(refO)
+    perm_my, cos_my = match(myO)
+    # magnitude ratio ||myO[q]|| / ||V[sigma(q)]||  (reveals a pure descale error even when token is right)
+    mag = np.linalg.norm(myO, axis=1) / (np.linalg.norm(Vn[perm_my], axis=1) + 1e-9)
+    pa = np.r_[np.arange(0, 32), np.arange(64, 96)]           # pipeA query rows
+    pb = np.r_[np.arange(32, 64), np.arange(96, 128)]         # pipeB query rows
+    print(f"[KPROBE] ref identity={np.mean(perm_ref==ident):.3f} cos={cos_ref.mean():.3f} "
+          f"(gate: must be ~1.0)")
+    print(f"[KPROBE] my  identity all={np.mean(perm_my==ident):.3f} "
+          f"pipeA={np.mean(perm_my[pa]==ident[pa]):.3f} pipeB={np.mean(perm_my[pb]==ident[pb]):.3f}")
+    print(f"[KPROBE] my  token-cos all={cos_my.mean():.3f} pipeA={cos_my[pa].mean():.3f} "
+          f"pipeB={cos_my[pb].mean():.3f}  (high cos + wrong id => token permutation; low cos => mix/garbage)")
+    print(f"[KPROBE] my  magratio pipeA={mag[pa].mean():.3f} pipeB={mag[pb].mean():.3f} "
+          f"(≈1 => scale ok; ≠1 => descale error)")
+    print(f"[KPROBE] sigma[q] = kv-token read at score-slot q:")
+    for lo in range(0, s, 16):
+        print(f"[KPROBE]  q{lo:3d}: {perm_my[lo:lo+16]}  cos {np.array2string(cos_my[lo:lo+16], precision=2, floatmode='fixed')}")
+    return 0.0
+
+
 def benchmark_single_case(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -1554,6 +1625,8 @@ def benchmark_single_case(
     loaded_single_mask: Optional[LoadedMask],
     explicit_block_attn_mask: Optional[torch.Tensor] = None,
 ) -> float:
+    if os.environ.get("DBG_KPROBE"):
+        _kprobe_fill(q, k, v)
     shape = infer_shape_spec(q, v, args.layout)
     if os.environ.get("ILP_DUP_Q", "0") != "0" and args.layout == "bshd":
         # DEBUG: make rows 32:64 of each 64-tile identical to rows 0:31 so ILP pipeA (rows 0-31)
@@ -1577,6 +1650,8 @@ def benchmark_single_case(
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
+        if os.environ.get("DBG_KPROBE"):
+            return _kprobe_decode(args, q, k, v, fn, block_attn_mask)
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         if os.environ.get("ILP_DUP_Q", "0") != "0":
