@@ -56,15 +56,19 @@ def launch_gemm_a8w4_tdm(
     block = num_waves * WAVE
 
     A_PACK = 2 if a_is_fp4 else 1
-    A_ROW_B = tile_k // A_PACK      # A LDS tile-row bytes
+    A_ROW_B = tile_k // A_PACK      # A tile-row data bytes
     A_KROW = K // A_PACK            # A global full-row bytes
     A_KSTEP = WMMA_K // A_PACK      # A LDS bytes per WMMA-K step
     ACT_ELEM = fx.Float4E2M1FN if a_is_fp4 else fx.Float8E4M3FN
     ACT_NDW = 8 if a_is_fp4 else 16  # act fragment i32 count (fp4 8, fp8 16)
 
-    A_LDS_ROW = A_ROW_B
+    # Pad the A LDS row stride (mirrors gemm_mxscale's LDS_PAD_A_BYTES=16): 16 lanes
+    # read rows at this stride in load_a, so an unpadded power-of-two stride collides
+    # all 16 on the same LDS banks. +16B (a ds_load_b128 width) shifts each row off.
+    LDS_PAD_A = 16
+    A_LDS_ROW = A_ROW_B + LDS_PAD_A
     B_LDS_ROW = PACK_TK * 16
-    STAGE_A = ((tile_m * A_ROW_B + 15) // 16) * 16
+    STAGE_A = ((tile_m * A_LDS_ROW + 15) // 16) * 16
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
 
     SC_INNER = tile_k // 4
@@ -180,7 +184,11 @@ def launch_gemm_a8w4_tdm(
         gtB0 = _gv(gB_base, b_off0, BT, (Kp * 16, 1))
         gtSA0 = _gv(gSA_base, sa_off0, SAT, (SA_OUTER_STRIDE, 1))
         gtSB0 = _gv(gSB_base, sb_off0, SBT, (SB_OUTER_STRIDE, 1))
-        atomA, atomB = _tdm(gtA0, mn_oob), _tdm(gtB0)
+        atomA = fx.rocdl.make_tdm_atom(
+            gtA0, [mn_oob, None], num_warps=num_waves,
+            pad_interval=A_ROW_B, pad_amount=LDS_PAD_A,
+        )
+        atomB = _tdm(gtB0)
         atomSA, atomSB = _tdm(gtSA0, sa_oob), _tdm(gtSB0)
         _adv = fx.rocdl.advance_tdm_atom
 
@@ -237,6 +245,22 @@ def launch_gemm_a8w4_tdm(
             t.store(v)
             return t
 
+        front_wm = (wmma_m_rep + 1) // 2
+        _WM_GROUPS = [list(range(front_wm)), list(range(front_wm, wmma_m_rep))]
+
+        def _emit_group(s, ksl, wm_list, wt, sa_fr, sb_fr):
+            if const_expr(len(wm_list) == 0):
+                return
+            act = [_rmem(ACT_NDW, load_a(s, wm, ksl)) for wm in wm_list]
+            rocdl.s_wait_dscnt(0)
+            for i in range_constexpr(len(wm_list)):
+                wm = wm_list[i]
+                for wn_raw in range_constexpr(wmma_n_rep):
+                    wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
+                    idx = wm * wmma_n_rep + wn
+                    fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[i], c_frags[idx],
+                            scale_a=sb_fr[wn], scale_b=sa_fr[wm])
+
         TDM_PER = 4
         prologue = min(num_buffers - 1, K_TILES)
         issued = 0
@@ -246,8 +270,8 @@ def launch_gemm_a8w4_tdm(
         for kt in range_constexpr(K_TILES):
             s = kt % num_buffers
             pipeline_fence(outstanding=TDM_PER * (issued - (kt + 1)))
-            a_fr = [[load_a(s, wm, ksl) for ksl in range_constexpr(KWS)] for wm in range_constexpr(wmma_m_rep)]
-            b_fr = [[load_b(s, wn, ksl) for ksl in range_constexpr(KWS)] for wn in range_constexpr(wmma_n_rep)]
+            # e8m0 scales up front (small ds_load_b32); A and B weight are streamed
+            # per WMMA-K step so only one k-step's fragments are live at a time.
             sa_fr = [[load_sa(s, wm, ksl) for ksl in range_constexpr(KWS)] for wm in range_constexpr(wmma_m_rep)]
             sb_fr = [[load_sb(s, wn, ksl) for ksl in range_constexpr(KWS)] for wn in range_constexpr(wmma_n_rep)]
             nxt = kt + num_buffers - 1
@@ -255,13 +279,11 @@ def launch_gemm_a8w4_tdm(
                 issue(nxt % num_buffers, nxt)
                 issued += 1
             for ksl in range_constexpr(KWS):
-                act = [_rmem(ACT_NDW, a_fr[wm][ksl]) for wm in range_constexpr(wmma_m_rep)]
-                wt = [_rmem(8, b_fr[wn][ksl]) for wn in range_constexpr(wmma_n_rep)]
-                for wm in range_constexpr(wmma_m_rep):
-                    for wn in range_constexpr(wmma_n_rep):
-                        idx = wm * wmma_n_rep + wn
-                        fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[wm], c_frags[idx],
-                                scale_a=sb_fr[wn][ksl], scale_b=sa_fr[wm][ksl])
+                wt = [_rmem(8, load_b(s, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
+                sa_k = [sa_fr[wm][ksl] for wm in range_constexpr(wmma_m_rep)]
+                sb_k = [sb_fr[wn][ksl] for wn in range_constexpr(wmma_n_rep)]
+                for wm_list in _WM_GROUPS:
+                    _emit_group(s, ksl, wm_list, wt, sa_k, sb_k)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
@@ -285,3 +307,10 @@ def launch_gemm_a8w4_tdm(
     kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m).launch(
         grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
     )
+
+
+# Match the tuned no-batch gemm_mxscale_gfx1250: enable the amdgpu expert
+# instruction scheduler (denser WMMA/DMA interleave for the compute-bound path).
+launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
+    "amdgpu-expert-scheduling-mode": True,
+}
