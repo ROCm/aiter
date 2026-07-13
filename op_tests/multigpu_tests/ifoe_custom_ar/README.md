@@ -51,11 +51,14 @@ float4 in flight per thread) + per-peer contiguous allgather, which saturates th
 fabric far better than the naive upstream loop.
 
 Flags:
+- `--bf16` transfers bf16 on the wire (half the fabric bytes, fp32 accumulate) —
+  the only way to exceed the lossless fabric ceiling (see below).
 - `--naive` uses the verbatim upstream 2-stage kernel; `--tdm` uses a TDM
   (`tensor_load_to_lds`) reduce-scatter path; `--prof` prints per-phase cycle
   breakdown.
 - `--unroll N` sets the MLP unroll factor (default 8); `--blocks N` / `--threads N`
-  override launch geometry (defaults: 512 threads, blocks auto-capped at 208).
+  override launch geometry (defaults: 512 threads, blocks auto-capped at 208, or
+  256 for `--bf16`).
 
 ## Results (gfx1250, ROCm 7.15, fp32, busbw = 2(N-1)/N · S / t)
 
@@ -88,10 +91,27 @@ simultaneous read+write test) is:
 | world=2 intra-node | ~359 |
 
 So busbw for any lossless fp32 all-reduce on this fabric tops out around
-**~350–360 GB/s**, and the tuned kernel is already there. The 493 figure only
+**~350–360 GB/s**, and the tuned fp32 kernel is already there. The 493 figure only
 applies to one-directional traffic; the shared per-GPU uplink drops to ~355/dir
-under simultaneous read+write. Reaching higher requires reducing bytes on the
-wire (bf16/fp8 transfer) or in-network reduction, not kernel tuning.
+under simultaneous read+write.
+
+### bf16 on-wire (`--bf16`): past the fp32 wall
+
+The only way past the ~355 GB/s lossless wall is to move fewer bytes. `--bf16`
+casts each rank's fp32 input to bf16 (a separate kernel, for grid-wide
+visibility), does the reduce-scatter/allgather in bf16 — **half the fabric
+bytes** — and accumulates in fp32. Effective (fp32-equivalent) busbw:
+
+| size | TP4 | TP8 |
+|---:|---:|---:|
+| 256 MB | 474 | 459 |
+| 1 GB | **579** | **557** |
+
+That's ~1.6× the fp32 kernel and well past 450 GB/s. It's lossy (bf16 rounds the
+addends before summing — standard for ML gradient all-reduce); the built-in
+correctness check still passes because the small-integer test values are exact in
+bf16. There is still headroom (bf16 moves ~275 GB/s of real fabric traffic vs the
+355 wall) — the remaining cost is the cast pass + conversion ALU, not the fabric.
 
 ### Tuning notes
 

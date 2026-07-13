@@ -8,6 +8,7 @@
 // Build: hipcc -std=c++17 -O3 ualoe_allreduce.cpp -o ualoe_allreduce
 // Run  : ./ualoe_allreduce --rank R --world N --gpu G --coord IP --port P --mb MB
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,6 +132,58 @@ __global__ void __launch_bounds__(512,1) allreduce2_opt(RankData* in_dp, RankSig
     }
 }
 
+// ---- bf16 on-wire transfer: halve fabric bytes (accumulate in fp32) ----
+// One "octet" = 8 fp32 elems = 2 float4 = a bf16x8 (16B) on the wire.
+using bf16=__hip_bfloat16;
+struct __align__(16) bf16x8 { bf16 v[8]; };
+DINLINE bf16x8 cvt_f2b(float4 a, float4 b){ bf16x8 o;
+    o.v[0]=__float2bfloat16(a.x);o.v[1]=__float2bfloat16(a.y);o.v[2]=__float2bfloat16(a.z);o.v[3]=__float2bfloat16(a.w);
+    o.v[4]=__float2bfloat16(b.x);o.v[5]=__float2bfloat16(b.y);o.v[6]=__float2bfloat16(b.z);o.v[7]=__float2bfloat16(b.w); return o; }
+DINLINE void cvt_b2f(bf16x8 o, float4& a, float4& b){
+    a.x=__bfloat162float(o.v[0]);a.y=__bfloat162float(o.v[1]);a.z=__bfloat162float(o.v[2]);a.w=__bfloat162float(o.v[3]);
+    b.x=__bfloat162float(o.v[4]);b.y=__bfloat162float(o.v[5]);b.z=__bfloat162float(o.v[6]);b.w=__bfloat162float(o.v[7]); }
+
+// cast own fp32 input -> own bf16 wire buffer. Separate kernel so its writes are
+// grid-globally visible (kernel boundary) before the reduce reads them cross-block.
+__global__ void cast_bf16(const float4* own_in, bf16x8* my_bf, int size8){
+    int tid=blockIdx.x*blockDim.x+threadIdx.x, stride=gridDim.x*blockDim.x;
+    for(int o=tid;o<size8;o+=stride) my_bf[o]=cvt_f2b(own_in[2*o], own_in[2*o+1]);
+}
+
+// size8 = element count / 8 (octets). in_bf_dp: peer bf16 buffers (already cast).
+template<int ngpus,int U>
+__global__ void __launch_bounds__(512,1) allreduce2_bf16(RankData* in_bf_dp, RankSignals sg, Signal* self_sg, float4* result, int rank, int size8){
+    int tid=blockIdx.x*blockDim.x+threadIdx.x, stride=gridDim.x*blockDim.x;
+    int part=size8/ngpus, start=rank*part, end=(rank==ngpus-1)?size8:start+part, largest=part+size8%ngpus;
+    const bf16x8* ptrs[ngpus]; bf16x8* tmps[ngpus];
+    #pragma unroll
+    for(int i=0;i<ngpus;i++){ int t=(rank+i)%ngpus; ptrs[i]=(const bf16x8*)in_bf_dp->ptrs[t]; tmps[i]=tmp_buf<bf16x8>(sg.signals[t]); }
+    start_sync<ngpus>(sg,self_sg,rank);
+    // reduce-scatter: own shard, bf16 reads, fp32 accumulate, U-way MLP
+    for(int o0=start+tid; o0<end; o0+=stride*U){
+        float4 accA[U], accB[U];
+        #pragma unroll
+        for(int u=0;u<U;u++){ int o=o0+u*stride; if(o<end) cvt_b2f(ptrs[0][o],accA[u],accB[u]); }
+        #pragma unroll
+        for(int p=1;p<ngpus;p++){
+            #pragma unroll
+            for(int u=0;u<U;u++){ int o=o0+u*stride; if(o<end){ float4 va,vb; cvt_b2f(ptrs[p][o],va,vb);
+                accA[u].x+=va.x;accA[u].y+=va.y;accA[u].z+=va.z;accA[u].w+=va.w;
+                accB[u].x+=vb.x;accB[u].y+=vb.y;accB[u].z+=vb.z;accB[u].w+=vb.w; } }
+        }
+        #pragma unroll
+        for(int u=0;u<U;u++){ int o=o0+u*stride; if(o<end) tmps[0][o-start]=cvt_f2b(accA[u],accB[u]); }
+    }
+    end_sync<ngpus>(sg,self_sg,rank);
+    // allgather: read peers' bf16 reduced shards, cast to fp32 result
+    #pragma unroll
+    for(int i=0;i<ngpus;i++){
+        int gr=(rank+i)%ngpus; int cnt=(gr==ngpus-1)?largest:part;
+        for(int o=tid;o<cnt;o+=stride){ float4 a,b; cvt_b2f(tmps[i][o],a,b);
+            result[2*((size_t)gr*part+o)]=a; result[2*((size_t)gr*part+o)+1]=b; }
+    }
+}
+
 // ---- TDM (gfx1250 tensor_load_to_lds) for the reduce-scatter read path ----
 using sg0v=int __attribute__((ext_vector_type(4)));
 using sg1v=int __attribute__((ext_vector_type(8)));
@@ -198,21 +251,22 @@ static void* imp(const hipMemFabricHandle_t& fh,size_t tot,int dev){
     hipMemAccessDesc ad={}; ad.location.type=hipMemLocationTypeDevice; ad.location.id=dev; ad.flags=hipMemAccessFlagsProtReadWrite;
     CK(hipMemSetAccess(p,tot,&ad,1)); return p;
 }
-struct HPair{ hipMemFabricHandle_t in_h, sg_h; };  // per-rank handles
+struct HPair{ hipMemFabricHandle_t in_h, sg_h, bf_h; };  // per-rank handles (bf_h = bf16 wire buffer)
 
 int main(int argc,char**argv){
     setvbuf(stdout,NULL,_IONBF,0);
     // opt (MLP-unrolled) kernel is the default: saturates the bidirectional fabric wall (~355 GB/s/dir).
-    int rank=0,world=0,gpu=0,port=55570,mb=64,use_tdm=0,ublocks=0,uthreads=512,use_prof=0,use_opt=1,uunroll=8; const char* coord="127.0.0.1";
+    int rank=0,world=0,gpu=0,port=55570,mb=64,use_tdm=0,ublocks=0,uthreads=512,use_prof=0,use_opt=1,uunroll=8,use_bf16=0; const char* coord="127.0.0.1";
     for(int i=1;i<argc;i++){ auto A=[&](const char*k){return !strcmp(argv[i],k);};
         if(A("--rank"))rank=atoi(argv[++i]); else if(A("--world"))world=atoi(argv[++i]); else if(A("--gpu"))gpu=atoi(argv[++i]);
-        else if(A("--coord"))coord=argv[++i]; else if(A("--port"))port=atoi(argv[++i]); else if(A("--mb"))mb=atoi(argv[++i]); else if(A("--tdm")){use_tdm=1;use_opt=0;} else if(A("--naive"))use_opt=0; else if(A("--blocks"))ublocks=atoi(argv[++i]); else if(A("--threads"))uthreads=atoi(argv[++i]); else if(A("--prof")){use_prof=1;use_opt=0;} else if(A("--opt"))use_opt=1; else if(A("--unroll"))uunroll=atoi(argv[++i]); }
+        else if(A("--coord"))coord=argv[++i]; else if(A("--port"))port=atoi(argv[++i]); else if(A("--mb"))mb=atoi(argv[++i]); else if(A("--tdm")){use_tdm=1;use_opt=0;} else if(A("--naive"))use_opt=0; else if(A("--blocks"))ublocks=atoi(argv[++i]); else if(A("--threads"))uthreads=atoi(argv[++i]); else if(A("--prof")){use_prof=1;use_opt=0;} else if(A("--opt"))use_opt=1; else if(A("--bf16")){use_bf16=1;use_opt=0;} else if(A("--unroll"))uunroll=atoi(argv[++i]); }
     g_rank=rank; CK(hipSetDevice(gpu));
     size_t bytes=(size_t)mb<<20; size_t nfloat=bytes/4; int nvec=(int)(nfloat/4);
 
-    size_t itot,stot; hipMemFabricHandle_t in_fh,sg_fh;
+    size_t itot,stot,bftot; hipMemFabricHandle_t in_fh,sg_fh,bf_fh;
     void* in_buf=fab(bytes,gpu,itot,in_fh);                          // my input (peers read)
     void* sg_buf=fab(sizeof(Signal)+bytes,gpu,stot,sg_fh);          // my Signal + tmp (peers read/write)
+    void* bf_buf=fab(bytes/2,gpu,bftot,bf_fh);                       // my bf16 wire buffer (peers read)
     CK(hipMemset(sg_buf,0,sizeof(Signal)));
     { std::vector<float> h(nfloat,(float)(rank+1)); CK(hipMemcpy(in_buf,h.data(),bytes,hipMemcpyHostToDevice)); }
     float* result; CK(hipMalloc(&result,bytes));
@@ -220,7 +274,7 @@ int main(int argc,char**argv){
 
     // ---- coordinator all-gather of fabric handles ----
     std::vector<HPair> tab(world);
-    tab[rank].in_h=in_fh; tab[rank].sg_h=sg_fh;
+    tab[rank].in_h=in_fh; tab[rank].sg_h=sg_fh; tab[rank].bf_h=bf_fh;
     std::vector<int> cfd(world,-1);   // rank0: client fds
     if(rank==0){
         int s=socket(AF_INET,SOCK_STREAM,0); int one=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
@@ -235,20 +289,26 @@ int main(int argc,char**argv){
         int one=1; setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one));
         sa(fd,&rank,4); sa(fd,&tab[rank],sizeof(HPair)); ra(fd,tab.data(),sizeof(HPair)*world); cfd[0]=fd;
     }
-    // import peers' input + signal buffers
-    RankData h_rd; RankSignals sg;
+    // import peers' input + signal + bf16 buffers
+    RankData h_rd, h_bf; RankSignals sg;
     for(int i=0;i<world;i++){
-        if(i==rank){ h_rd.ptrs[i]=in_buf; sg.signals[i]=(Signal*)sg_buf; }
-        else       { h_rd.ptrs[i]=imp(tab[i].in_h,itot,gpu); sg.signals[i]=(Signal*)imp(tab[i].sg_h,stot,gpu); }
+        if(i==rank){ h_rd.ptrs[i]=in_buf; sg.signals[i]=(Signal*)sg_buf; h_bf.ptrs[i]=bf_buf; }
+        else       { h_rd.ptrs[i]=imp(tab[i].in_h,itot,gpu); sg.signals[i]=(Signal*)imp(tab[i].sg_h,stot,gpu); h_bf.ptrs[i]=imp(tab[i].bf_h,bftot,gpu); }
     }
     RankData* in_dp; CK(hipMalloc(&in_dp,sizeof(RankData))); CK(hipMemcpy(in_dp,&h_rd,sizeof(RankData),hipMemcpyHostToDevice));
+    RankData* bf_dp; CK(hipMalloc(&bf_dp,sizeof(RankData))); CK(hipMemcpy(bf_dp,&h_bf,sizeof(RankData),hipMemcpyHostToDevice));
     auto barrier=[&](){ char b=1; if(rank==0){ for(int r=1;r<world;r++) ra(cfd[r],&b,1); for(int r=1;r<world;r++) sa(cfd[r],&b,1);} else { sa(cfd[0],&b,1); ra(cfd[0],&b,1);} };
 
-    int TH=uthreads; int nb=ublocks>0?ublocks:(nvec/world+TH-1)/TH; if(ublocks==0 && nb>208)nb=208; if(nb>kMaxBlocks)nb=kMaxBlocks; if(nb<1)nb=1;  // ~208 blocks: best occupancy vs barrier cost for the opt kernel
+    int blkcap=use_bf16?256:208;   // bf16 moves half the bytes -> wants more blocks to saturate
+    int TH=uthreads; int nb=ublocks>0?ublocks:(nvec/world+TH-1)/TH; if(ublocks==0 && nb>blkcap)nb=blkcap; if(nb>kMaxBlocks)nb=kMaxBlocks; if(nb<1)nb=1;
     constexpr int TILE=512; size_t tdm_lds=(size_t)8*TILE*16;   // up to 8 peers * 8KB
     #define OPTARGS in_dp,sg,(Signal*)sg_buf,result,rank,nvec
     #define LOPT(NG) switch(uunroll){ case 1: allreduce2_opt<NG,1><<<nb,TH>>>(OPTARGS); break; case 2: allreduce2_opt<NG,2><<<nb,TH>>>(OPTARGS); break; case 8: allreduce2_opt<NG,8><<<nb,TH>>>(OPTARGS); break; default: allreduce2_opt<NG,4><<<nb,TH>>>(OPTARGS);}
+    #define BFARGS bf_dp,sg,(Signal*)sg_buf,(float4*)result,rank,nvec/2
+    #define LBF(NG) switch(uunroll){ case 2: allreduce2_bf16<NG,2><<<nb,TH>>>(BFARGS); break; case 4: allreduce2_bf16<NG,4><<<nb,TH>>>(BFARGS); break; default: allreduce2_bf16<NG,8><<<nb,TH>>>(BFARGS);}
     auto launch=[&](){
+        if(use_bf16){ cast_bf16<<<nb,TH>>>((const float4*)in_buf,(bf16x8*)bf_buf,nvec/2);
+            switch(world){ case 2: LBF(2); break; case 4: LBF(4); break; case 8: LBF(8); break; default: if(rank==0) printf("unsupported world=%d\n",world);} return; }
         if(use_opt){ switch(world){ case 2: LOPT(2); break; case 4: LOPT(4); break; case 8: LOPT(8); break; default: if(rank==0) printf("unsupported world=%d\n",world);} return; }
         if(use_tdm){ switch(world){
             case 2: allreduce2_tdm<2,TILE><<<nb,TH,2*TILE*16>>>(in_dp,sg,(Signal*)sg_buf,result,rank,nvec); break;
@@ -278,8 +338,8 @@ int main(int argc,char**argv){
     // busbw convention (nccl): 2*(N-1)/N * size / time
     double busbw=2.0*(world-1)/world*(double)bytes/(us/1e6)/1e9;
     double algbw=(double)bytes/(us/1e6)/1e9;
-    const char* mode=use_opt?"opt":(use_tdm?"TDM":"naive");
-    if(rank==0) printf("\n=== allreduce world=%d, %dMB, %s(U=%d), blk=%d th=%d: %.1f us/iter, algbw %.1f GB/s, busbw %.1f GB/s ===\n",world,mb,mode,use_opt?uunroll:0,nb,TH,us,algbw,busbw);
+    const char* mode=use_bf16?"bf16":(use_opt?"opt":(use_tdm?"TDM":"naive"));
+    if(rank==0) printf("\n=== allreduce world=%d, %dMB, %s(U=%d), blk=%d th=%d: %.1f us/iter, algbw %.1f GB/s, busbw %.1f GB/s ===\n",world,mb,mode,(use_opt||use_bf16)?uunroll:0,nb,TH,us,algbw,busbw);
     barrier();
 
     if(use_prof){
