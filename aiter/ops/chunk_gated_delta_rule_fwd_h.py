@@ -194,9 +194,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     g: Optional[Tensor] = None,
     gk: Optional[Tensor] = None,
     initial_state: Optional[Tensor] = None,
-    initial_state_indices: Optional[Tensor] = None,
     output_final_state: bool = False,
-    inplace_final_state: Optional[bool] = None,
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: Optional[Tensor] = None,
@@ -204,6 +202,8 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     state_dtype: Optional[torch.dtype] = None,
     use_exp2: bool = True,
     g_head_major: bool = False,
+    initial_state_indices: Optional[Tensor] = None,
+    inplace_final_state: Optional[bool] = None,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
     HIP hidden-state forward with h layout [V, K] (K=128, V=128, bf16), always
