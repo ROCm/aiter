@@ -24,7 +24,7 @@ from aiter.jit.core import compile_ops
 
 
 # Shares the same JIT-compiled module as gated_rmsnorm_fp8_group_quant.
-@compile_ops("module_gated_rmsnorm_quant")
+@compile_ops("module_gated_rmsnorm_quant", develop=True)
 def gated_rmsnorm_fp8_per_token_quant(
     out: Tensor,
     scale: Tensor,

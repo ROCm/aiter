@@ -61,11 +61,11 @@ void gated_rmsnorm_fp8_group_quant(
  *   epsilon: Small value for numerical stability
  */
 void gated_rmsnorm_fp8_per_token_quant(
-    torch::Tensor& out,           // [num_tokens, num_heads * head_dim]
-    torch::Tensor& scale,          // [num_tokens]
-    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim] - input to normalize
-    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim] - gating tensor
-    torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
+    aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
+    aiter_tensor_t& scale,          // [num_tokens]
+    const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim] - input to normalize
+    const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim] - gating tensor
+    const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon);
 
 

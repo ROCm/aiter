@@ -2,7 +2,6 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
-#include "py_itfs_common.h"
 // This TU only needs core opus type/traits (bf16_t/fp16_t/fp8_t, cast, finfo,
 // vector_traits), all of which live in opus/opus.hpp. Avoid pulling in the much
 // heavier aiter_opus_plus.h (+ hip_reduce.h, c10, hip_bf16) that hipcc would
@@ -10,8 +9,6 @@
 #include "opus/opus.hpp"
 #include "aiter_stream.h"
 #include "gated_rmsnorm_quant.h"
-#include "dispatch_utils.h"
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 namespace aiter {
 
@@ -492,11 +489,11 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
 
 template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE>
 void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
-    torch::Tensor& out,
-    torch::Tensor& scale,
-    torch::Tensor const& x,
-    torch::Tensor const& z,
-    torch::Tensor const& weight,
+    aiter_tensor_t& out,
+    aiter_tensor_t& scale,
+    const aiter_tensor_t& x,
+    const aiter_tensor_t& z,
+    const aiter_tensor_t& weight,
     double epsilon,
     int num_tokens,
     int num_heads,
@@ -515,7 +512,7 @@ void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
     dim3 grid(num_tokens);
     dim3 block(num_warps * WARP_SIZE);
 
-    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    hipStream_t stream = aiter::getCurrentHIPStream();
 
     const int64_t x_token_stride = x.stride(0);
     const int64_t x_head_stride  = x.stride(1);
@@ -542,42 +539,42 @@ void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
 
 template <typename DTYPE_I, typename DTYPE_O>
 void gated_rmsnorm_fp8_per_token_quant_launcher(
-    torch::Tensor& out,           // [num_tokens, num_heads * head_dim]
-    torch::Tensor& scale,          // [num_tokens]
-    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim]
-    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim]
-    torch::Tensor const& weight,   // [head_dim]
+    aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
+    aiter_tensor_t& scale,          // [num_tokens]
+    const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim]
+    const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim]
+    const aiter_tensor_t& weight,   // [head_dim]
     double epsilon)
 {
-    TORCH_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
-    TORCH_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
+    AITER_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
+    AITER_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
     const int num_tokens = x.size(0);
     const int num_heads = x.size(1);
     const int head_dim = x.size(2);
 
-    TORCH_CHECK(z.size(0) == num_tokens && z.size(1) == num_heads && z.size(2) == head_dim,
+    AITER_CHECK(z.size(0) == num_tokens && z.size(1) == num_heads && z.size(2) == head_dim,
                 "Gating tensor z must have same shape as x");
-    TORCH_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
-    TORCH_CHECK(num_heads <= 128, "ONLY num_heads <= 128 is supported (block must cover all heads), got ", num_heads);
-    TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
+    AITER_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
+    AITER_CHECK(num_heads <= 128, "ONLY num_heads <= 128 is supported (block must cover all heads), got ", num_heads);
+    AITER_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
 
     // head_dim must be unit-stride for vectorized loads; token/head may be strided slices.
-    TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
-    TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
+    AITER_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
+    AITER_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
 
     // The kernel writes out via a flat row-major [num_tokens, num_heads*head_dim]
     // index, so out must be contiguous AND large enough for every (token, head,
     // elem) it will touch; otherwise a too-small/strided out is silently corrupted.
     const int64_t out_elems = static_cast<int64_t>(num_tokens) * num_heads * head_dim;
-    TORCH_CHECK(out.is_contiguous(), "out must be contiguous [num_tokens, num_heads*head_dim]");
-    TORCH_CHECK(out.numel() == out_elems,
+    AITER_CHECK(out.is_contiguous(), "out must be contiguous [num_tokens, num_heads*head_dim]");
+    AITER_CHECK(static_cast<int64_t>(out.numel()) == out_elems,
                 "out must have num_tokens*num_heads*head_dim (", out_elems, ") elements, got ", out.numel());
 
     // scale is indexed as a flat scale[token_id] fp32 buffer, so it must be a
     // contiguous float32 tensor with exactly num_tokens elements.
-    TORCH_CHECK(scale.scalar_type() == at::ScalarType::Float, "scale must be float32, got ", scale.scalar_type());
-    TORCH_CHECK(scale.is_contiguous(), "scale must be contiguous");
-    TORCH_CHECK(scale.numel() == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
+    AITER_CHECK(scale.dtype() == AITER_DTYPE_fp32, "scale must be float32, got ", AiterDtype_to_str(scale.dtype()));
+    AITER_CHECK(scale.is_contiguous(), "scale must be contiguous");
+    AITER_CHECK(static_cast<int64_t>(scale.numel()) == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
 
     constexpr int thread_data_size = 16;
     gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size>(
@@ -588,37 +585,39 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
  * Python interface: fused gated RMSNorm + FP8 per-token quantization.
  */
 void gated_rmsnorm_fp8_per_token_quant(
-    torch::Tensor& out,           // [num_tokens, num_heads * head_dim] (FP8)
-    torch::Tensor& scale,          // [num_tokens] (fp32)
-    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim]
-    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim]
-    torch::Tensor const& weight,   // [head_dim]
+    aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim] (FP8)
+    aiter_tensor_t& scale,          // [num_tokens] (fp32)
+    const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim]
+    const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim]
+    const aiter_tensor_t& weight,   // [head_dim]
     double epsilon)
 {
-    TORCH_CHECK(x.is_cuda(), "Input x must be on CUDA device");
-    TORCH_CHECK(z.is_cuda(), "Input z must be on CUDA device");
-    TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA device");
-    TORCH_CHECK(out.is_cuda(), "Output must be on CUDA device");
-    TORCH_CHECK(scale.is_cuda(), "Scale must be on CUDA device");
+    AITER_CHECK(x.is_gpu(), "Input x must be on CUDA device");
+    AITER_CHECK(z.is_gpu(), "Input z must be on CUDA device");
+    AITER_CHECK(weight.is_gpu(), "Weight must be on CUDA device");
+    AITER_CHECK(out.is_gpu(), "Output must be on CUDA device");
+    AITER_CHECK(scale.is_gpu(), "Scale must be on CUDA device");
+
+    HipDeviceGuard device_guard(x.device_id);
 
     // The kernel is instantiated with opus::fp8_t and quantizes against
-    // opus::finfo<fp8_t>::max(), which is the *hardware-native* FP8 format
-    // (gfx942 -> e4m3fnuz/240, otherwise OCP e4m3fn/448). The output dtype does
-    // NOT select the range, so an out tensor typed as the non-native FP8 would be
-    // written with the wrong encoding. Require the native dtype (torch_fp8 does a
-    // runtime gfx94 arch query on the host) so the bits match what downstream reads.
-    TORCH_CHECK(out.scalar_type() == torch_fp8,
-                "out must be the hardware-native FP8 dtype (", torch_fp8, ") on this GPU, got ", out.scalar_type());
+    // opus::finfo<fp8_t>::max(), i.e. the *hardware-native* FP8 format (gfx942 ->
+    // e4m3fnuz/240, otherwise OCP e4m3fn/448). aiter_tensor_t only carries a single
+    // AITER_DTYPE_fp8 tag (no e4m3fnuz vs e4m3fn distinction), so we can only check
+    // that out is FP8 here -- callers must pass the arch-native FP8 buffer so the
+    // written bits match what downstream reads (same contract as the group path).
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp8,
+                "out must be FP8, got ", AiterDtype_to_str(out.dtype()));
 
-    if (x.scalar_type() == at::ScalarType::BFloat16) {
+    if (x.dtype() == AITER_DTYPE_bf16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::bf16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon);
-    } else if (x.scalar_type() == at::ScalarType::Half) {
+    } else if (x.dtype() == AITER_DTYPE_fp16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::fp16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon);
     } else {
-        TORCH_CHECK(false, "Unsupported dtype combination. Input: ", x.scalar_type(),
-                    ", Output: ", out.scalar_type());
+        AITER_CHECK(false, "Unsupported dtype combination. Input: ", AiterDtype_to_str(x.dtype()),
+                    ", Output: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
