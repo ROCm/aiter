@@ -239,21 +239,7 @@ jobs:
 
           router_path = Path("atom/mesh/src/routers/http_pd_router.rs")
           text = router_path.read_text(encoding="utf-8")
-          relay_old = """                        if let Err(e) = self
-                            .adapter
-                            .inject_decode_fields(&mut decode_request_json, &ctx)
-                        {
-                            return Self::handle_serialization_error(e);
-                        }
-                        let correlation_id = self.adapter.correlation_id(&ctx);
-          """
-          relay_new = """                        if let Err(e) = self
-                            .adapter
-                            .inject_decode_fields(&mut decode_request_json, &ctx)
-                        {
-                            return Self::handle_serialization_error(e);
-                        }
-                        if let Some(prefill_dp_rank) = prefill.dp_rank() {
+          rank_patch = """                        if let Some(prefill_dp_rank) = prefill.dp_rank() {
                             if let Some(obj) = prefill_request_json.as_object_mut() {
                                 obj.insert(
                                     "data_parallel_rank".to_string(),
@@ -269,12 +255,17 @@ jobs:
                                 );
                             }
                         }
-                        let correlation_id = self.adapter.correlation_id(&ctx);
           """
-          if relay_new not in text:
-              if relay_old not in text:
-                  raise SystemExit("Failed to find ATOM relay decode injection point")
-              text = text.replace(relay_old, relay_new, 1)
+          marker = "                        let correlation_id = self.adapter.correlation_id(&ctx);\n"
+          anchor = "                        let mut decode_request_json = prefill_request_json.clone();\n"
+          if rank_patch not in text:
+              anchor_pos = text.find(anchor)
+              if anchor_pos < 0:
+                  raise SystemExit("Failed to find ATOM relay decode request anchor")
+              marker_pos = text.find(marker, anchor_pos)
+              if marker_pos < 0:
+                  raise SystemExit("Failed to find ATOM relay correlation_id marker")
+              text = text[:marker_pos] + rank_patch + text[marker_pos:]
           router_path.write_text(text, encoding="utf-8")
           print(f"{router_path}: patched explicit ATOM PD data_parallel_rank injection")
           PY
