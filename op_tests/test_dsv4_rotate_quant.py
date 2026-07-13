@@ -292,7 +292,7 @@ def test_rope_rotate_fp4quant(
         sin,
         positions,
         rope_dim,
-        scale=scale,
+        out_scale=scale,
         group_size=32,
         shuffle_scale=shuffle_scale,
     )
@@ -498,7 +498,7 @@ def test_rope_rotate_fp8quant(M, head_num, N, dtype=torch.bfloat16):
         sin,
         positions,
         rope_dim,
-        scale=q_scale,
+        out_scale=q_scale,
         group_size=group_size,
     )
 
