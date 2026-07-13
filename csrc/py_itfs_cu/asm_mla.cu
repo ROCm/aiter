@@ -10,11 +10,11 @@
 #include <unordered_map>
 
 // Debug instrumentation (host prints + post-launch sync/error checks + raw
-// buffer dumps) for the gfx1250 mi400 MLA dispatch is compiled ONLY when
+// buffer dumps) for the gfx1250 gfx1250 MLA dispatch is compiled ONLY when
 // ASM_DEBUG is defined (e.g. JIT build with `-DASM_DEBUG`, toggled by
 // AITER_ASM_DEBUG=1). When ASM_DEBUG is not defined, none of the debug code
 // below is compiled, so the normal build performs a pure async launch and is
-// completely unaffected. This mirrors poc_kl/mi400/mla/mla_execute_v3_hip.inl,
+// completely unaffected. This mirrors poc_kl/gfx1250/mla/mla_execute_v3_hip.inl,
 // which keeps its prints and dumps in the C++ host under its own MLA_DEBUG
 // macro. ASM_DEBUG is shared across asm-kernel ports; the stage1 raw buffer
 // dump is additionally gated at runtime by the op-specific
@@ -82,7 +82,7 @@ struct __attribute__((packed)) KernelArgs
     p3 _p27;
 };
 
-struct __attribute__((packed)) MlaMi400KernelArgs
+struct __attribute__((packed)) MlaGfx1250KernelArgs
 {
     void* ptr_R;
     p2 _p0;
@@ -123,7 +123,7 @@ struct __attribute__((packed)) MlaMi400KernelArgs
     p2 _p17;
 };
 
-struct __attribute__((packed)) MlaMi400PackedKernelArgs
+struct __attribute__((packed)) MlaGfx1250PackedKernelArgs
 {
     void* ptr_R;                  // dword 0-1
     void* ptr_LSE;                // dword 2-3
@@ -198,7 +198,7 @@ std::string get_heuristic_kernel_mla(std::string q_type,
 // Dump a device tensor's contiguous raw bytes plus a .meta.txt, matching the
 // poc_kl dump format (name, dtype, shape, stride, element_size, numel, nbytes,
 // layout). Copies device->host first since asm dispatch tensors live on GPU.
-static void mla_dump_mi400_debug_buffer(const std::string& dump_dir,
+static void mla_dump_gfx1250_debug_buffer(const std::string& dump_dir,
                                         const char* name,
                                         const aiter_tensor_t* t)
 {
@@ -215,7 +215,7 @@ static void mla_dump_mi400_debug_buffer(const std::string& dump_dir,
         hipError_t err = hipMemcpy(host.data(), t->data_ptr(), nbytes, hipMemcpyDeviceToHost);
         if(err != hipSuccess)
         {
-            std::printf("[aiter][mi400][debug] dump %s: hipMemcpy D2H failed: %s\n",
+            std::printf("[aiter][gfx1250][debug] dump %s: hipMemcpy D2H failed: %s\n",
                         name,
                         hipGetErrorString(err));
             return;
@@ -230,7 +230,7 @@ static void mla_dump_mi400_debug_buffer(const std::string& dump_dir,
     }
     else
     {
-        std::printf("[aiter][mi400][debug] failed to open dump file %s\n", bin_path.c_str());
+        std::printf("[aiter][gfx1250][debug] failed to open dump file %s\n", bin_path.c_str());
     }
 
     std::string shape  = "(";
@@ -264,7 +264,7 @@ static void mla_dump_mi400_debug_buffer(const std::string& dump_dir,
 }
 #endif
 
-static void mla_decode_mi400_dispatch(
+static void mla_decode_gfx1250_dispatch(
     aiter_tensor_t* Q,
     aiter_tensor_t* KV,
     aiter_tensor_t* qo_indptr,
@@ -318,18 +318,18 @@ static void mla_decode_mi400_dispatch(
     const int kv_split     = splitData->size(1);
     // TODO: Keep the ABI decision in this host dispatch layer: it owns kernel
     // selection and the exact kernarg layout. qh128 remains on the legacy ABI
-    // for e2e stability; the other gfx1250 mi400 kernels use packed preload.
-    const bool use_packed_mi400_args = !(gqa_ratio == 128 && max_seqlen_q == 1);
+    // for e2e stability; the other gfx1250 gfx1250 kernels use packed preload.
+    const bool use_packed_gfx1250_args = !(gqa_ratio == 128 && max_seqlen_q == 1);
     constexpr int bdx      = 128;
     constexpr int bdy      = 1;
     constexpr int bdz      = 1;
 
     AITER_CHECK(nhead_kv == 1, __func__, ": only support nhead_kv == 1 for minimal smoke");
-    // Supported gfx1250 mi400 variants, matching hsa/gfx1250/mla/mla_asm.csv and
+    // Supported gfx1250 gfx1250 variants, matching hsa/gfx1250/mla/mla_asm.csv and
     // the poc_kl 1-threadgroup (`1tg`) kernels. Each kernel processes the full
     // flattened extent M = gqa_ratio * max_seqlen_q in a single workgroup, so
     // sub_Q == M and the grid is exactly one tile along the M (x) dimension
-    // (mirrors make_launch_geometry() in poc_kl/mi400/mla/mla_helper.h). The CSV
+    // (mirrors make_launch_geometry() in poc_kl/gfx1250/mla/mla_helper.h). The CSV
     // heuristic lookup is keyed by (gqa_ratio, max_seqlen_q), so reject any combo
     // that has no registered kernel before touching the dispatch path.
     const bool supported_variant =
@@ -341,7 +341,7 @@ static void mla_decode_mi400_dispatch(
         (gqa_ratio == 128 && max_seqlen_q == 1);
     AITER_CHECK(supported_variant,
                 __func__,
-                ": unsupported (gqa_ratio, max_seqlen_q) combo for gfx1250 mi400 MLA; got gqa_ratio=",
+                ": unsupported (gqa_ratio, max_seqlen_q) combo for gfx1250 gfx1250 MLA; got gqa_ratio=",
                 gqa_ratio,
                 " max_seqlen_q=",
                 max_seqlen_q,
@@ -357,7 +357,7 @@ static void mla_decode_mi400_dispatch(
     AITER_CHECK(q_scale->dtype() == AITER_DTYPE_fp32 && kv_scale->dtype() == AITER_DTYPE_fp32,
                 __func__,
                 ": q_scale and kv_scale must be fp32");
-    if(use_packed_mi400_args)
+    if(use_packed_gfx1250_args)
     {
         AITER_CHECK(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr,
                     __func__,
@@ -369,13 +369,13 @@ static void mla_decode_mi400_dispatch(
                     __func__,
                     ": valid_split_count must have at least batch entries");
     }
-    // ABI contract with the mi400 .co: with out_16_nosplit==1 the passes==1
+    // ABI contract with the gfx1250 .co: with out_16_nosplit==1 the passes==1
     // fast-path writes FINAL bf16 output directly into R. For passes>1, R holds
     // fp32 split partials that Python reduces in stage2.
     const auto expected_split_dtype = (kv_split == 1) ? AITER_DTYPE_bf16 : AITER_DTYPE_fp32;
     AITER_CHECK(splitData->dtype() == expected_split_dtype,
                 __func__,
-                ": gfx1250 mi400 MLA splitData (R) dtype mismatch; expected ",
+                ": gfx1250 gfx1250 MLA splitData (R) dtype mismatch; expected ",
                 AiterDtype_to_str(expected_split_dtype),
                 " for kv_split=",
                 kv_split,
@@ -383,7 +383,7 @@ static void mla_decode_mi400_dispatch(
                 AiterDtype_to_str(splitData->dtype()));
     AITER_CHECK(splitLse->dtype() == AITER_DTYPE_fp32,
                 __func__,
-                ": gfx1250 mi400 MLA requires splitLse to be fp32; got ",
+                ": gfx1250 gfx1250 MLA requires splitLse to be fp32; got ",
                 AiterDtype_to_str(splitLse->dtype()));
 
     CFG* config_map = &cfg_mla_asm;
@@ -391,7 +391,7 @@ static void mla_decode_mi400_dispatch(
         get_heuristic_kernel_mla("fp8", "fp8", gqa_ratio, 0, 0, 0, max_seqlen_q, arch_id, config_map, 0);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable gfx1250 kernel");
 
-    static SynchronizedCache<std::string_view, AiterAsmKernel> mi400_impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> gfx1250_impl_ptr_map;
     AiterAsmKernel* impl_ptr = nullptr;
     auto it                  = config_map->find(kernelName);
     if(it != config_map->end())
@@ -400,16 +400,16 @@ static void mla_decode_mi400_dispatch(
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
         impl_ptr =
-            &mi400_impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+            &gfx1250_impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
     {
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     }
 
-    // gfx1250 mi400 dispatch. qh128 is temporarily left on the legacy 288B ABI
+    // gfx1250 gfx1250 dispatch. qh128 is temporarily left on the legacy 288B ABI
     // because it is used by e2e. Other gfx1250 private kernels use the new
-    // 120B packed-preload ABI from poc_kl/mi400/mla/mla_execute_v3_hip.inl.
+    // 120B packed-preload ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
     const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
@@ -419,12 +419,12 @@ static void mla_decode_mi400_dispatch(
     const unsigned int log2_page = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
     const unsigned int out_16_nosplit = (kv_split == 1) ? 1 : 0;
 
-    MlaMi400KernelArgs legacy_args = {};
-    MlaMi400PackedKernelArgs packed_args = {};
+    MlaGfx1250KernelArgs legacy_args = {};
+    MlaGfx1250PackedKernelArgs packed_args = {};
     void* kernarg_ptr = nullptr;
     size_t arg_size = 0;
 
-    if(!use_packed_mi400_args)
+    if(!use_packed_gfx1250_args)
     {
         legacy_args.ptr_R = splitData->data_ptr();
         legacy_args.ptr_LSE = splitLse->data_ptr();
@@ -478,15 +478,15 @@ static void mla_decode_mi400_dispatch(
     const int gdz = (gqa_ratio == 128) ? kv_split * 2 : kv_split;
 
 #ifdef ASM_DEBUG
-    std::printf("[aiter][mi400][debug] kernelName=%s\n", kernelName.c_str());
+    std::printf("[aiter][gfx1250][debug] kernelName=%s\n", kernelName.c_str());
     if(it != config_map->end())
     {
         const auto& cfg = it->second;
-        std::printf("[aiter][mi400][debug] knl_name=%s co_name=%s\n",
+        std::printf("[aiter][gfx1250][debug] knl_name=%s co_name=%s\n",
                     cfg.knl_name.c_str(),
                     cfg.co_name.c_str());
     }
-    std::printf("[aiter][mi400][debug] inputs: arch=%s batch=%d num_heads=%d nhead_kv=%d "
+    std::printf("[aiter][gfx1250][debug] inputs: arch=%s batch=%d num_heads=%d nhead_kv=%d "
                 "gqa_ratio=%d max_seqlen_q=%d page_size=%d qk_head_dim=%d q_elem_size=%d "
                 "kv_split=%d softmax_scale=%g\n",
                 arch_id.c_str(),
@@ -500,7 +500,7 @@ static void mla_decode_mi400_dispatch(
                 q_elem_size,
                 kv_split,
                 softmax_scale);
-    std::printf("[aiter][mi400][debug] tensor shapes: Q=(%ld,%ld,%ld) KV=(%ld,%ld,%ld,%ld) "
+    std::printf("[aiter][gfx1250][debug] tensor shapes: Q=(%ld,%ld,%ld) KV=(%ld,%ld,%ld,%ld) "
                 "splitData=(%ld,%ld,%ld,%ld) splitLse=(%ld,%ld,%ld,%ld) output=(%ld,%ld,%ld)\n",
                 Q->size(0),
                 Q->size(1),
@@ -520,7 +520,7 @@ static void mla_decode_mi400_dispatch(
                 output->size(0),
                 output->size(1),
                 output->size(2));
-    std::printf("[aiter][mi400][debug] tensor strides: Q=(%ld,%ld,%ld) KV=(%ld,%ld,%ld,%ld) "
+    std::printf("[aiter][gfx1250][debug] tensor strides: Q=(%ld,%ld,%ld) KV=(%ld,%ld,%ld,%ld) "
                 "splitData=(%ld,%ld,%ld,%ld) splitLse=(%ld,%ld,%ld,%ld) output=(%ld,%ld,%ld)\n",
                 Q->stride(0),
                 Q->stride(1),
@@ -540,10 +540,10 @@ static void mla_decode_mi400_dispatch(
                 output->stride(0),
                 output->stride(1),
                 output->stride(2));
-    std::printf("[aiter][mi400][debug] ABI=%s arg_size=%zu\n",
-                use_packed_mi400_args ? "packed-120B" : "legacy-288B-qh128",
+    std::printf("[aiter][gfx1250][debug] ABI=%s arg_size=%zu\n",
+                use_packed_gfx1250_args ? "packed-120B" : "legacy-288B-qh128",
                 arg_size);
-    std::printf("[aiter][mi400][debug] ptrs: R=%p LSE=%p Q=%p KV=%p LTP=%p LTD=%p LTL=%p "
+    std::printf("[aiter][gfx1250][debug] ptrs: R=%p LSE=%p Q=%p KV=%p LTP=%p LTD=%p LTL=%p "
                 "QTP=%p QSCALE=%p KVSCALE=%p VSC=%p output=%p final_lse=%p stream=%p\n",
                 splitData->data_ptr(),
                 splitLse->data_ptr(),
@@ -559,7 +559,7 @@ static void mla_decode_mi400_dispatch(
                 output->data_ptr(),
                 lse == nullptr ? nullptr : lse->data_ptr(),
                 stream);
-    std::printf("[aiter][mi400][debug] kernargs: scalar=%g q_seq_lens=%u passes=%u "
+    std::printf("[aiter][gfx1250][debug] kernargs: scalar=%g q_seq_lens=%u passes=%u "
                 "stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u use_valid_split_count_reduce=%u\n",
                 softmax_scale,
                 static_cast<unsigned int>(q_seq_lens_kernel),
@@ -568,8 +568,8 @@ static void mla_decode_mi400_dispatch(
                 stride_page,
                 log2_page,
                 out_16_nosplit,
-                use_packed_mi400_args ? packed_args.use_valid_split_count_reduce : 0u);
-    std::printf("[aiter][mi400][debug] launch: grid=(%d,%d,%d) block=(%d,%d,%d)\n",
+                use_packed_gfx1250_args ? packed_args.use_valid_split_count_reduce : 0u);
+    std::printf("[aiter][gfx1250][debug] launch: grid=(%d,%d,%d) block=(%d,%d,%d)\n",
                 gdx,
                 gdy,
                 gdz,
@@ -582,12 +582,12 @@ static void mla_decode_mi400_dispatch(
         !(skip_kernel_env[0] == '0' && skip_kernel_env[1] == '\0');
     if(skip_kernel)
     {
-        std::printf("[aiter][mi400][debug] skipping kernel launch because AITER_MLA_DEBUG_SKIP_KERNEL=%s\n",
+        std::printf("[aiter][gfx1250][debug] skipping kernel launch because AITER_MLA_DEBUG_SKIP_KERNEL=%s\n",
                     skip_kernel_env);
     }
     else
     {
-        std::printf("[aiter][mi400][debug] launching kernel.\n");
+        std::printf("[aiter][gfx1250][debug] launching kernel.\n");
     }
     std::fflush(stdout);
 #endif
@@ -599,13 +599,13 @@ static void mla_decode_mi400_dispatch(
     impl_ptr->launch_kernel({kernarg_ptr, &arg_size, gdx, gdy, gdz, bdx, bdy, bdz, stream});
 #ifdef ASM_DEBUG
         hipError_t launch_status = hipGetLastError();
-        std::printf("[aiter][mi400][debug] after launch enqueue: hipGetLastError=%s (%d)\n",
+        std::printf("[aiter][gfx1250][debug] after launch enqueue: hipGetLastError=%s (%d)\n",
                     hipGetErrorString(launch_status),
                     static_cast<int>(launch_status));
-        std::printf("[aiter][mi400][debug] before hipDeviceSynchronize after stage1 launch.\n");
+        std::printf("[aiter][gfx1250][debug] before hipDeviceSynchronize after stage1 launch.\n");
         std::fflush(stdout);
         hipError_t sync_status = hipDeviceSynchronize();
-        std::printf("[aiter][mi400][debug] after hipDeviceSynchronize: status=%s (%d)\n",
+        std::printf("[aiter][gfx1250][debug] after hipDeviceSynchronize: status=%s (%d)\n",
                     hipGetErrorString(sync_status),
                     static_cast<int>(sync_status));
         std::fflush(stdout);
@@ -620,21 +620,21 @@ static void mla_decode_mi400_dispatch(
     if(dump_env != nullptr && dump_env[0] != '\0')
     {
         const std::string dump_dir(dump_env);
-        mla_dump_mi400_debug_buffer(dump_dir, "q", Q);
-        mla_dump_mi400_debug_buffer(dump_dir, "kv_buffer", KV);
-        mla_dump_mi400_debug_buffer(dump_dir, "qo_indptr", qo_indptr);
-        mla_dump_mi400_debug_buffer(dump_dir, "kv_indptr", kv_indptr);
-        mla_dump_mi400_debug_buffer(dump_dir, "kv_page_indices", kv_page_indices);
-        mla_dump_mi400_debug_buffer(dump_dir, "kv_last_page_lens", kv_last_page_lens);
-        mla_dump_mi400_debug_buffer(dump_dir, "num_kv_splits_indptr", num_kv_splits_indptr);
-        mla_dump_mi400_debug_buffer(dump_dir, "q_scale", q_scale);
-        mla_dump_mi400_debug_buffer(dump_dir, "kv_scale", kv_scale);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "q", Q);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "kv_buffer", KV);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "qo_indptr", qo_indptr);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "kv_indptr", kv_indptr);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "kv_page_indices", kv_page_indices);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "kv_last_page_lens", kv_last_page_lens);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "num_kv_splits_indptr", num_kv_splits_indptr);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "q_scale", q_scale);
+        mla_dump_gfx1250_debug_buffer(dump_dir, "kv_scale", kv_scale);
         if(!skip_kernel)
         {
-            mla_dump_mi400_debug_buffer(dump_dir, "splitData", splitData);
-            mla_dump_mi400_debug_buffer(dump_dir, "splitLse", splitLse);
+            mla_dump_gfx1250_debug_buffer(dump_dir, "splitData", splitData);
+            mla_dump_gfx1250_debug_buffer(dump_dir, "splitLse", splitLse);
         }
-        std::printf("[aiter][mi400][debug] dumped raw stage1 buffers to %s\n", dump_dir.c_str());
+        std::printf("[aiter][gfx1250][debug] dumped raw stage1 buffers to %s\n", dump_dir.c_str());
         std::fflush(stdout);
     }
 #endif
@@ -684,7 +684,7 @@ void mla_decode_stage1_asm_fwd(
     std::string arch_id = get_gpu_arch();
     if(arch_id == "gfx1250")
     {
-        return mla_decode_mi400_dispatch(Q,
+        return mla_decode_gfx1250_dispatch(Q,
                                          KV,
                                          qo_indptr,
                                          kv_indptr,

@@ -19,7 +19,7 @@
  * / opus::sync_threads() etc.
  *
  * Usage:
- *   #include <opus/hip_minimal.hpp>   // both passes — drop-in replacement
+ *   #include <opus/hip_minimal.hpp>   // both passes -- drop-in replacement
  *
  * Compile: hipcc kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ ...
  */
@@ -35,6 +35,12 @@
 #define __launch_bounds__(...) \
     __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
 #endif
+#if defined(__gfx1250__)
+#ifndef __cluster_dims__
+#define __cluster_dims__(...) __attribute__((cluster_dims(__VA_ARGS__)))
+#endif
+#endif
+
 #ifndef __shared__
 #define __shared__      __attribute__((shared))
 #endif

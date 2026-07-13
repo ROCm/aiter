@@ -1,10 +1,10 @@
-"""D128 BF16 FMHA Forward Prologue — gfx1250 Pure FlyDSL Implementation.
+"""D128 BF16 FMHA Forward Prologue -- gfx1250 Pure FlyDSL Implementation.
 
 FlyDSL-native implementation of the FMHA prologue with compiler-managed
 VGPR bank allocation via @llvm.amdgcn.set.vgpr.bank intrinsic.
 
-Target: gfx1250 (MI450), wave32, 4 waves per thread-group, 128 threads.
-All phases use FlyDSL — zero inline ASM. 128×128 compute (TDM loads 256).
+Target: gfx1250, wave32, 4 waves per thread-group, 128 threads.
+All phases use FlyDSL -- zero inline ASM. 128x128 compute (TDM loads 256).
 
 Reference: BF16_FMHA_FWD_D128_1TG_4W_32mx4_256nx1_cas_brd_rxy.s
 """
@@ -46,7 +46,7 @@ K_ROW_BYTES = 400
 V_ROW_BYTES = 288
 K_SU_HALF_OFFSET = 0x1900  # 16 * K_ROW_BYTES = 16 * 400 = 6400
 V_SU_HALF_OFFSET = 0x1200
-V_LDS_OFFSET = 0x8800  # after 2 K SUs: 2×0x4400
+V_LDS_OFFSET = 0x8800  # after 2 K SUs: 2x0x4400
 PINGPONG_OFFSET = 0x11800  # one-ping: K(0x8800)+V(0x9000)
 K_SU1_OFFSET = 0x4400
 V_SU1_OFFSET = 0x4800
@@ -91,7 +91,7 @@ ACC_COL_BASE = {
 # power-of-2 pad_interval that fits in one pad per row, so we skip padding to
 # avoid the continuous-stream rotation bug. No bank-conflict padding for K.
 _K_TDM_CONFIG = 1 << 16  # data_size=1 (bf16), pad_enable=0
-# V: dim0=128, pad_interval=128 elems=64dwords → enc_interval=5, 32B pad → enc_amount=7
+# V: dim0=128, pad_interval=128 elems=64dwords -> enc_interval=5, 32B pad -> enc_amount=7
 _V_TDM_CONFIG = (1 << 20) | (5 << 22) | (7 << 25)
 
 # ============================================================================
@@ -110,12 +110,12 @@ def _get_nuw():
 
 
 def _add_nuw(a, b):
-    """arith.addi with nuw flag — enables gfx1250 buffer offset folding."""
+    """arith.addi with nuw flag -- enables gfx1250 buffer offset folding."""
     return arith.unwrap(arith.addi(a, b, overflow_flags=_get_nuw()))
 
 
 def _mul_nuw(a, b):
-    """arith.muli with nuw flag — preserves nuw through constant folding."""
+    """arith.muli with nuw flag -- preserves nuw through constant folding."""
     return arith.unwrap(arith.muli(a, b, overflow_flags=_get_nuw()))
 
 
@@ -192,8 +192,8 @@ def _phase4_q_load_flydsl(
     """Load Q tile (QK_HDIM x TG_Q_ROWS bf16) ->
     q_frags[4][Q_FRAGS_PER_BANK] with bank hints.
 
-    For QK_HDIM=192: 6 loads per bank (3 frags × 2 loads each), bank1 offset=192 bytes.
-    For QK_HDIM=128: 4 loads per bank (2 frags × 2 loads each), bank1 offset=128 bytes.
+    For QK_HDIM=192: 6 loads per bank (3 frags x 2 loads each), bank1 offset=192 bytes.
+    For QK_HDIM=128: 4 loads per bank (2 frags x 2 loads each), bank1 offset=128 bytes.
     """
     lane_lo = arith.andi(lane_id, arith.constant(15, type=T.i32))
     lane_hi = arith.shrui(lane_id, arith.constant(4, type=T.i32))
@@ -268,7 +268,7 @@ def _phase4_q_load_flydsl(
 
 
 def _phase9a_k_lds_addr_gen(lane_id, wave_id):
-    """K LDS addresses — pure FlyDSL arith + bank hints."""
+    """K LDS addresses -- pure FlyDSL arith + bank hints."""
     lane_lo = arith.andi(lane_id, arith.constant(0xF, type=T.i32))
     lane_hi = arith.shrui(lane_id, arith.constant(4, type=T.i32))
     base = arith.addi(
@@ -302,7 +302,7 @@ def _phase9a_k_lds_addr_gen(lane_id, wave_id):
 
 
 def _phase9b_v_lds_addr_gen(lane_id, wave_id):
-    """V LDS addresses — pure FlyDSL arith + bank hints."""
+    """V LDS addresses -- pure FlyDSL arith + bank hints."""
     lane_and_7 = arith.andi(lane_id, arith.constant(7, type=T.i32))
     lane_shr4 = arith.shrui(lane_id, arith.constant(4, type=T.i32))
     row = arith.addi(lane_and_7, arith.shli(lane_shr4, arith.constant(3, type=T.i32)))
@@ -344,12 +344,12 @@ def _phase9b_v_lds_addr_gen(lane_id, wave_id):
 
 
 def _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0):
-    """Load K from LDS → k_frags[4][8].
+    """Load K from LDS -> k_frags[4][8].
 
-    Ordering: half(SU) outer → bank inner, matching lds_K_blk_su pattern.
-    tile0_bank0(8) → tile0_bank1(8) → ... → tile1_bank0(8) → ...
+    Ordering: half(SU) outer -> bank inner, matching lds_K_blk_su pattern.
+    tile0_bank0(8) -> tile0_bank1(8) -> ... -> tile1_bank0(8) -> ...
 
-    Two-pass: all 64 ds_loads → wait + hw barrier → frag building.
+    Two-pass: all 64 ds_loads -> wait + hw barrier -> frag building.
     The s_barrier fence prevents LLVM from scheduling WMMAs between bank loads.
     """
     # Pass 1: issue all 64 ds_loads
@@ -386,9 +386,9 @@ def _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0):
 
 
 def _qk_wmma_64_flydsl(k_frags, q_frags):
-    """64 WMMAs → accs dict {(g_idx, tile): vec<8xf32>} with bank hints.
+    """64 WMMAs -> accs dict {(g_idx, tile): vec<8xf32>} with bank hints.
 
-    QK_WMMA_INTERLEAVE=1 ordering: g_idx → k_step → tile(0,1,2,3).
+    QK_WMMA_INTERLEAVE=1 ordering: g_idx -> k_step -> tile(0,1,2,3).
     g_idx 0,1 = SU0 (frags 0-3), g_idx 2,3 = SU1 (frags 4-7).
     Tile ordering: (acc_pair0,n=0), (acc_pair0,n=1), (acc_pair1,n=0), (acc_pair1,n=1)
     avoids consecutive WMMAs with same SRCC/SRCD bank.
@@ -461,7 +461,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
 
     1. Per-bank max tree (arith.maxnumf)
     2. Cross-lane permlanex16 + cross-bank max reduction
-    3. Per-bank: fma(acc, scale, -max_scaled) → exp2 → row_sum accumulate
+    3. Per-bank: fma(acc, scale, -max_scaled) -> exp2 -> row_sum accumulate
 
     Returns (row_max, row_sum).
     """
@@ -489,7 +489,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
         max_per_bank[bank] = set_vgpr_bank(running_max, bank)
         rocdl.sched_barrier(0)
 
-    # ---- Cross-lane permlanex16 + cross-bank max → global_max ----
+    # ---- Cross-lane permlanex16 + cross-bank max -> global_max ----
     for bank in fx.range_constexpr(4):
         val = max_per_bank[bank]
         xchg = _rocdl_permlanex16(f32, val, val, s_zero, s_zero, False, False)
@@ -500,7 +500,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     global_max = arith.maxnumf(cross01, cross23)
     rocdl.sched_barrier(0)
 
-    # ---- Per-bank: fma(elem, scale, -ms) → exp2 → row_sum ----
+    # ---- Per-bank: fma(elem, scale, -ms) -> exp2 -> row_sum ----
     row_sum = {}
     for bank in fx.range_constexpr(4):
         neg_ms = set_vgpr_bank(
@@ -527,7 +527,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
 
 
 def _phase5_head_index_div_flydsl(workgroup_id, num_heads):
-    """head_index = workgroup_id / num_heads — LLVM auto-generates Newton-Raphson."""
+    """head_index = workgroup_id / num_heads -- LLVM auto-generates Newton-Raphson."""
     quotient = arith.divui(workgroup_id, num_heads)
     return arith.unwrap(rocdl.readfirstlane(T.i32, quotient))
 
@@ -661,7 +661,7 @@ def _phase_first_v_tdm_flydsl(
     stride_v_32,
     wave_id,
 ):
-    """Issue 2 V TDM copies (Global → LDS) for V block 0."""
+    """Issue 2 V TDM copies (Global -> LDS) for V block 0."""
     i64 = ir.IntegerType.get_signless(64)
     v_dgroup1 = _build_tdm_dgroup1(_V_TDM_CONFIG, stride_v_seq)
     v_addr_i64 = _compute_v_global_addr(arg_V, v_offset, wave_id, stride_v_32)

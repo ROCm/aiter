@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Pure-Python arch constants and env-driven build target resolution.
-# No torch dependency — safe to import in build scripts, gen_instances, and tests
+# No torch dependency -- safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
 import os
 
@@ -37,9 +37,9 @@ GFX_MAP = {
 # explicitly alongside GPU_ARCHS to override the default here.
 # Extend this table when adding support for new GPU targets.
 GFX_CU_NUM_MAP = {
-    "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
+    "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 -- use CU_NUM override
     "gfx950": 256,  # MI350
-    "gfx1250": 256,  # MI400 placeholder; set CU_NUM explicitly for the target SKU
+    "gfx1250": 256,  # Gfx1250
 }
 
 
@@ -47,7 +47,7 @@ def _parse_gpu_archs_env(gfx_env: str) -> list[str]:
     """Split a GPU_ARCHS string into a list of non-empty architecture names.
 
     Raises RuntimeError if no valid architecture names remain after splitting
-    on ';' and stripping whitespace — e.g. GPU_ARCHS=" ; " would otherwise
+    on ';' and stripping whitespace -- e.g. GPU_ARCHS=" ; " would otherwise
     silently produce an empty target list and fall back to heuristic kernels.
     """
     archs = [g.strip() for g in gfx_env.split(";") if g.strip()]
@@ -76,7 +76,7 @@ def get_build_targets_env() -> list[tuple[str, int]]:
     for gfx in _parse_gpu_archs_env(gfx_env):
         if gfx not in GFX_CU_NUM_MAP:
             raise RuntimeError(
-                f"Unknown gfx '{gfx}' in GPU_ARCHS — add it to "
+                f"Unknown gfx '{gfx}' in GPU_ARCHS -- add it to "
                 f"GFX_CU_NUM_MAP in build_targets.py. Known targets: "
                 f"{list(GFX_CU_NUM_MAP.keys())}"
             )

@@ -5,6 +5,7 @@ import functools
 import itertools
 import os
 import json
+import warnings
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -90,7 +91,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
     # Schema mirrors sister files like gfx950-MOE-FP8_W8A8.json (BLOCK_SIZE_N,
-    # BLOCK_SIZE_K, num_warps, …) except BLOCK_SIZE_M is omitted because block_m
+    # BLOCK_SIZE_K, num_warps, ...) except BLOCK_SIZE_M is omitted because block_m
     # is the dispatch key, not a tunable (routing decides block_m for the layer).
     tuned = _get_a8w4_dispatch(arch).get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None:
@@ -110,7 +111,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
         }
 
     # Fallback for shapes not in the tuned dispatch JSON.
-    # Look for a tuned entry with the same (N, K) but any block_m — the tile
+    # Look for a tuned entry with the same (N, K) but any block_m -- the tile
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
@@ -208,7 +209,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
 
         else:
             # Cap by N: BN=512 wasted compute on small-N shapes (e.g. N=256
-            # → 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
+            # -> 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
             block_n = min(triton.next_power_of_2(n), 256)
             # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
@@ -246,22 +247,19 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 3
+    num_buffers = 3
     split_k = 1
     block_k = 512
 
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if get_arch() == "gfx1250":
-            # decode (block_m==16): NUM_BUFFERS=3 + block_n=128 restores the
-            # software-pipelined expert GEMM; the #3504 decode kernel's
-            # block_n=256/NUM_BUFFERS=1 regressed conc-1 decode on gfx1250.
+        if n <= 3072:
             block_n = 128
-            num_stages = 3
+            num_buffers = 2
         else:
             block_n = 256
-            num_stages = 1
+            num_buffers = 1
 
     elif block_m == 32:
         if n <= 1024:
@@ -281,57 +279,13 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "block_n": block_n,
         "block_k": block_k,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_buffers": num_buffers,
         "xcd_swizzle": num_xcds,
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
     }
     return ret
-
-
-def swizzle_scales_gfx950(data):
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
-
-
-def swizzle_scales_gfx1250(data):
-    E, K_SCALE, N = data.shape
-    preshuffle_factor = 32
-    num_chunk_n = N // preshuffle_factor
-    SCALE_KWIDTH = 8
-    num_chunk_k = K_SCALE // SCALE_KWIDTH
-
-    data = data.transpose(-1, -2)
-    data = data.view(E, num_chunk_n, 32, num_chunk_k, SCALE_KWIDTH)
-    data = data.permute(0, 1, 3, 2, 4).contiguous()
-    data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
-    data = data.transpose(-1, -2)
-
-    return data
-
-
-def swizzle_scales(data):
-    """Arch-agnostic scale swizzle for moe_gemm_a8w4.
-
-    Returns (swizzled_data, layout_string) where layout_string is the
-    SWIZZLE_MX_SCALE value the kernel expects, or None for unknown arches.
-    """
-    arch = get_arch()
-    if arch == "gfx1250":
-        return swizzle_scales_gfx1250(data), "GFX1250_SCALE"
-    elif arch == "gfx950":
-        return swizzle_scales_gfx950(data), "CDNA4_SCALE"
-    else:
-        return data, None
 
 
 # -----------------------------------------------------------------------------
@@ -357,9 +311,10 @@ def moe_gemm_a8w4(
     alpha=1.0,
     limit=1.0,
     swiglu_add_residual=True,
+    preshuffled=False,
     unpadded_N=None,
     unpadded_K=None,
-    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
+    # Idea 1: emit (fp8 e4m3, ue8m0 per-1x32 scale) directly from the GEMM
     # write-back. When out_mx_quant=True, returns (y_fp8, y_scale_ue8m0).
     # Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
     out_mx_quant: bool = False,
@@ -373,6 +328,10 @@ def moe_gemm_a8w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     use_gluon = get_arch() == "gfx1250"
+    if preshuffled:
+        assert (
+            use_gluon
+        ), "preshuffled weights are only supported by the gluon (gfx1250) kernel"
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
     if x_has_mx:
@@ -387,9 +346,17 @@ def moe_gemm_a8w4(
     num_tokens = x.shape[-2]
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
+    # Temporary: TDM async_gather over mxfp8 activations and prefill is broken on gfx1250
+    if use_gluon and gather_indx is not None and M > 1024 and x_has_mx:
+        warnings.warn(
+            "do_gather (TDM async_gather) is not supported on gfx1250 for M > 1024 with mxfp8 activations."
+        )
+    if preshuffled:
+        # preshuffle layout is (E, K_packed*16, N//16); w.shape[-1] = N//16
+        N = w.shape[-1] * 16
     # Output buffer must be sized to the PADDED N: the kernel writes full
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
-    # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
+    # unpadded_N when block_n doesn't divide it evenly -> OOB on the y buffer.
     padded_N = N
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
@@ -409,6 +376,15 @@ def moe_gemm_a8w4(
     # StridedLayout callers keep their tuned BK<256.
     if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
         config["block_k"] = 256
+    # Fall back to TDM if the scale width is below the gfx1250 direct-to-LDS
+    # floor (32 bits = 4 uint8 scales) or K is uneven
+    X_SCALE_TDM = False
+    if use_gluon and x_has_mx:
+        mx_scale_block_k = config["block_k"] // 32
+        ASYNC_COPY_MIN_SCALE_WIDTH = 16
+        X_SCALE_TDM = (
+            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
+        )
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -516,9 +492,9 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            MASK_K_LIMIT=K % config["block_k"],
+            PRESHUFFLED=preshuffled,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
@@ -568,9 +544,10 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            MASK_K_LIMIT=K % config["block_k"],
+            PRESHUFFLED=preshuffled,
+            X_SCALE_TDM=X_SCALE_TDM,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),

@@ -1,10 +1,8 @@
-import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 
 def map_dims(shape, indices):
@@ -98,9 +96,6 @@ def _sage_fwd_no_mask(
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
             # Bias / alibi live in the scaled domain, so we materialize the
             # scaled qk eagerly to add them, exactly as before.
@@ -114,9 +109,14 @@ def _sage_fwd_no_mask(
                 qk += alibi_block
 
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk += bias
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )
+                qk += bias[None, :]
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             if USE_BIAS:
@@ -297,8 +297,6 @@ def _sage_fwd_blocksparse_nomask(
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
             # Bias / alibi live in the scaled domain, materialize scaled qk.
             qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
@@ -309,9 +307,14 @@ def _sage_fwd_blocksparse_nomask(
                 )
                 qk_scaled += alibi_block
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )
+                qk_scaled += bias[None, :]
 
             m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
             if USE_BIAS:
@@ -468,7 +471,6 @@ def _sage_fwd_blocksparse_mask(
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
             # Bias / alibi live in the scaled domain, materialize scaled qk.
             qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
@@ -479,9 +481,14 @@ def _sage_fwd_blocksparse_mask(
                 )
                 qk_scaled += alibi_block
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )
+                qk_scaled += bias[None, :]
             qk_scaled = tl.where(
                 qk_mask, qk_scaled, float("-inf")
             )  # mask padding before softmax
@@ -765,14 +772,16 @@ def _sage_fwd_mask(
                 causal_mask = offs_m[:, None] >= causal_boundary[None, :]
                 qk = tl.where(causal_mask, qk, float("-inf"))
 
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
-        # compute bias
+        # compute bias (delta_s: constant across Q rows in a block)
         if USE_BIAS:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk += bias
+            offs_kv = tl.arange(0, BLOCK_N)
+            bias_mask = (start_n + offs_kv) < seqlen_k
+            bias = tl.load(
+                bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                mask=bias_mask,
+                other=0.0,
+            )
+            qk += bias[None, :]
 
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -940,7 +949,7 @@ def compute_window_bounds(
 
     # Right boundary
     if IS_CAUSAL:
-        # Causal cap: col ≤ row + diag
+        # Causal cap: col <= row + diag
         right_min = tl.minimum(seqlen_k - 1, q_start + diag)
         right_max = tl.minimum(seqlen_k - 1, q_end + diag)
     else:
@@ -1012,14 +1021,14 @@ def handle_padded_last_block(
         # current 'full' range right edge
         full_right_block = clipped_left + n_full_blocks - 1
 
-        # If last_block is already beyond full_right_block, it's already in back-masked → nothing to do
+        # If last_block is already beyond full_right_block, it's already in back-masked -> nothing to do
         last_already_back_masked = last_block > full_right_block
         if not last_already_back_masked:
             # If the window starts past last_block, it was counted in front-masked
             if clipped_left > last_block:
                 n_front_masked_blocks = tl.maximum(0, n_front_masked_blocks - 1)
             else:
-                # Otherwise it was counted 'full' → move it out of full
+                # Otherwise it was counted 'full' -> move it out of full
                 n_full_blocks = tl.maximum(0, n_full_blocks - 1)
             # In both cases we need one more back-masked block
             n_back_masked_blocks = n_back_masked_blocks + 1
@@ -1036,7 +1045,7 @@ def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
     # K blocks visualization:
     #         Block 0         Block 1         Block 2 (last)
     #         K0 K1 K2 K3    K4 K5 K6 K7     K8 K9 ?? ??
-    #         ↑---------↑    ↑---------↑     ↑---↑ ↑---↑
+    #         ?---------?    ?---------?     ?---? ?---?
     #         full block     full block      valid  pad
     if seqlen_k < BLOCK_N:
         n_extra_tokens = BLOCK_N - seqlen_k
@@ -1089,7 +1098,7 @@ def compute_block_masking(
             IS_CAUSAL,
         )
 
-        # window vanishes → early exit
+        # window vanishes -> early exit
         if right_max < left_min:
             return 0, 0, 0, 0, n_extra_tokens
 
@@ -1128,16 +1137,16 @@ def compute_block_masking(
             # ========== CAUSAL MODE: Classify K Blocks ==========
             # Calculate causal boundary for this Q block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
-            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
-            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q2
-            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  ← Q3
-            #                            ↑ can see up to K5
+            # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q0
+            #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q1
+            #          [ 1  1  1  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q2
+            #          [ 1  1  1  1] [ 1  1  0  0] [ 0  0 -- --]  <- Q3
+            #                            ? can see up to K5
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  ← Q4
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  ← Q5
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  0] [ 0  0 -- --]  <- Q4
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 0  0 -- --]  <- Q5
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  <- Q6
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  <- Q7
 
             # ------------------------------------------------------------
             # 1. figure out, in tokens, the right-most K position
@@ -1145,7 +1154,7 @@ def compute_block_masking(
             # ------------------------------------------------------------
             k_max_token = q_end + diag  # last visible K index
 
-            # this Q-block is entirely above the diagonal ⇒ nothing to do
+            # this Q-block is entirely above the diagonal => nothing to do
             if k_max_token < 0:
                 return 0, 0, 0, 0, n_extra_tokens
 
@@ -1159,12 +1168,12 @@ def compute_block_masking(
 
             # ------------------------------------------------------------
             # 3. classify those visible blocks
-            #    – we *never* skip or mask blocks in front, because causal
+            #    - we *never* skip or mask blocks in front, because causal
             #      attention always starts at K0
-            #    – the back side can require several masked blocks:
-            #         • intersection of the causal diagonal with K-grid
-            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one extra block if this Q-block stops in the
+            #    - the back side can require several masked blocks:
+            #         o intersection of the causal diagonal with K-grid
+            #           (at most  ?BLOCK_M / BLOCK_N? blocks)
+            #         o plus one extra block if this Q-block stops in the
             #           middle of a K-block or the last K-block is padded
             # ------------------------------------------------------------
             padded_last_k = n_extra_tokens != 0
@@ -1181,15 +1190,15 @@ def compute_block_masking(
             # Without causal mask, all positions can attend to all positions
             # Only need to handle the padding in the last block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
-            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
             #
-            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
-            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
+            # Q4-Q7:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
+            #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -? -?]
 
             n_front_skip_blocks = 0  # never skips the left side
             n_front_masked_blocks = 0  # ditto
@@ -1316,10 +1325,10 @@ def sage_fwd(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
-    tl.multiple_of(offs_m, BLOCK_M),
+    (tl.multiple_of(offs_m, BLOCK_M),)
     # N dimension
     offs_n = tl.arange(0, BLOCK_N)
-    tl.multiple_of(offs_n, BLOCK_N),
+    (tl.multiple_of(offs_n, BLOCK_N),)
 
     # D dimensions (MOST IMPORTANT)
     offs_d_qk = tl.max_contiguous(
@@ -1487,14 +1496,7 @@ def sage_fwd(
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
 
     if USE_BIAS:
-        # Note: this might get large enough to overflow on some configs
-        bias_offset = off_h_q * stride_bh
-        bias_ptrs = (
-            bias
-            + bias_offset
-            + offs_m[:, None] * stride_bm
-            + offs_n[None, :] * stride_bn
-        )
+        bias_ptrs = bias + off_z * stride_bz + off_h_q * stride_bh + start_m * stride_bm
     else:
         bias_ptrs = None
 

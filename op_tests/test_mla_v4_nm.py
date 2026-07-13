@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the mi350 v4 'nm' MLA pipeline (mla_decode_fwd_v4_nm).
+"""Tests for the v4 MLA pipeline (mla_decode_fwd_v4_nm).
 Usage:
   pytest -xvs op_tests/test_mla_v4_nm.py
 """
@@ -25,7 +25,9 @@ PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
 DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = 576  # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
+DIM_QK_PACKED = (
+    576  # = args.dim(512) + args.k_rotary(64); matches the kernel stride_Page
+)
 V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 
@@ -38,13 +40,13 @@ def _on_gfx950():
 
 needs_gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or not _on_gfx950(),
-    reason="v4 nm shader is shipped only for gfx950 (mi350); requires GPU",
+    reason="v4 nm shader is shipped only for gfx950; requires GPU",
 )
 
 
 # ---------------------------------------------------------------------------
 # Synthetic input builders. We do NOT replicate the host-side FP8+e8m0 dequant
-# packing here (that's poc_kl/mla_v4.h v4_detail::init_host_buffers). For
+# packing here (that lives in the host-side kernel init). For
 # smoke testing the dispatcher we just need byte-level buffers of the right
 # shape and dtype; numerical correctness is deferred (see file docstring).
 # ---------------------------------------------------------------------------
@@ -53,7 +55,7 @@ def _build_inputs(
 ):
     """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
 
-    Sizes mirror what poc_kl/mi350/mla_asm/mla.cpp computes for the same cmd
+    Sizes mirror what the reference host harness computes for the same cmd
     (only with kv_seq_lens shrunk small for fast pytest):
       total_q = batch * num_heads * q_seq_logical
       num_page = batch * (kv_seq_lens / page_size)
@@ -71,13 +73,13 @@ def _build_inputs(
     # FP8 dtype: use aiter's canonical alias which auto-resolves per arch
     # (gfx942 = e4m3fnuz, gfx950 = e4m3fn). The kernel reads raw bytes (NOPE
     # bytes + e8m0 dup-scale bytes packed by host), so we just need a
-    # 1-byte-per-elem tensor of the right shape — any random byte pattern
+    # 1-byte-per-elem tensor of the right shape -- any random byte pattern
     # will do for smoke testing (numerical correctness lives in
     # test_mla_v4_nm_golden.py).
     fp8_dt = aiter.dtypes.fp8
 
     def _rand_fp8(shape):
-        # numpy seeded RNG (NOT torch.randint — that is non-reproducible
+        # numpy seeded RNG (NOT torch.randint -- that is non-reproducible
         # in this env for uint8 even on CPU; see comment at top of
         # _build_inputs).
         np_arr = rng_np.integers(0, 256, size=shape, dtype=np.uint8)
@@ -140,7 +142,7 @@ def _build_inputs(
     ).fill_(-1)
 
     # sink: required by mla_decode_fwd_v4_nm. -inf = "no sink" math
-    # (exp(-inf) = 0 → virtual K-col contributes 0 to softmax denom).
+    # (exp(-inf) = 0 -> virtual K-col contributes 0 to softmax denom).
     sink = torch.full(
         (num_heads,),
         float("-inf"),
@@ -171,12 +173,12 @@ def _build_inputs(
 # ---------------------------------------------------------------------------
 @needs_gfx950
 def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
-    """Regression guard for the 18-slot v4 nm kernarg layout.
+    """Regression guard for the 21-slot (336B) v4 nm legacy kernarg layout.
 
     Locks in the *scalar* portion (slot 7 scalar_f, slot 8-12 ints, slot 15
     int) of the kernarg buffer produced by csrc/py_itfs_cu/asm_mla_v4.cu for
-    the canonical qh64/(gqa,qseq)∈{(16,4),(64,1),(128,1)}/page=1/passes=1
-    config (single .co; the C++ alias in asm_mla_v4.cu remaps gqa∈{64,128}
+    the canonical qh64/(gqa,qseq)?{(16,4),(64,1),(128,1)}/page=1/passes=1
+    config (single .co; the C++ alias in asm_mla_v4.cu remaps gqa?{64,128}
     to the (gqa=16,qSeqLen=4) CSV row). Any future
     change to the dispatcher that shifts a slot, mis-computes a stride /
     scale, or changes the formula here will trip this test before the golden
@@ -192,31 +194,44 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     torch.cuda.synchronize()
 
     captured = capfd.readouterr()
-    # The dispatcher fprintf's "[aiter kernarg 288B]" then 18 rows of 16
-    # hex bytes. Parse the 18 rows out of stderr.
+    # The dispatcher fprintf's "[aiter kernarg <N>B]" then N/16 rows of 16 hex
+    # bytes. On gfx950 the legacy (non-preload) ABI is 21 slots x 16B = 336B:
+    # slots 0-18 from the original layout + slots 19/20 (valid_split scratch)
+    # added by the kargs-preload change. Parse the rows out of stderr.
     import re
 
     lines = captured.err.splitlines()
-    try:
-        start = next(
-            i for i, line in enumerate(lines) if line.startswith("[aiter kernarg 304B]")
-        )
-    except StopIteration:
+    marker = re.compile(r"^\[aiter kernarg (\d+)B\]$")
+    start = None
+    arg_size = None
+    for i, line in enumerate(lines):
+        m = marker.match(line.strip())
+        if m:
+            start = i
+            arg_size = int(m.group(1))
+            break
+    if start is None:
         pytest.fail(
-            "kernarg hexdump not found in stderr — "
+            "kernarg hexdump not found in stderr -- "
             "AITER_V4_NM_DUMP_KERNARG env var may have been ignored, "
-            "or jinja was changed and the dump code removed.\n"
+            "or the dump code was removed.\n"
             f"stderr was: {captured.err[:500]}"
         )
+    assert arg_size == 336, (
+        f"expected 336B legacy kernarg (21 slots) on gfx950, got {arg_size}B -- "
+        "the MlaV4KernelArgsLegacy layout changed; update this guard."
+    )
+    n_slots = arg_size // 16
     hex_rows = []
-    # 19 slots (PR-2: added ptr_sink at slot 18 / offset 0x120).
-    for line in lines[start + 1 : start + 1 + 19]:
+    for line in lines[start + 1 : start + 1 + n_slots]:
         m = re.match(r"^((?:[0-9a-fA-F]{2}\s*){16})$", line.strip())
         if not m:
             break
         hex_rows.append(bytes.fromhex(line.strip().replace(" ", "")))
 
-    assert len(hex_rows) == 19, f"expected 19 hex rows of kernarg, got {len(hex_rows)}"
+    assert (
+        len(hex_rows) == n_slots
+    ), f"expected {n_slots} hex rows of kernarg, got {len(hex_rows)}"
     kargs = b"".join(hex_rows)
 
     # Each slot is 16 bytes; first 4 bytes carry the payload, rest is padding.
@@ -233,7 +248,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
 
     # scalar_f is computed in jinja with C `float`s (1.0f/sqrtf(512.f)). Mirror
     # that precision here so the byte-exact compare doesn't false-fail on the
-    # FP64→FP32 round-off difference.
+    # FP64->FP32 round-off difference.
     expected_scalar_f_bytes = struct.pack(
         "<f", float(np.float32(1.0) / np.float32(np.sqrt(np.float32(448 + 64))))
     )
@@ -241,7 +256,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     expected_kv_split = 1  # num_kv_splits=1
     expected_log2_page = 0  # log2(page_size=1)
     expected_out16ns = 0  # out_16_nosplit=0
-    # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read — only 17 kernarg
+    # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read -- only 17 kernarg
     # loads, none at offsets 0xA0/0xB0). The dispatcher leaves them at 0
     # via `args = {}` zero-init to skip the per-call D2H readback that
     # used to compute s_total_kv. See the "Dead kernarg slots" block in
@@ -270,11 +285,23 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
         )
 
     # Sanity: pointer slots (0..6, 13, 14, 16, 17, 18) must be non-NULL.
-    # Slot 18 (ptr_sink) is REQUIRED non-NULL — caller must allocate even
+    # Slot 18 (ptr_sink) is REQUIRED non-NULL -- caller must allocate even
     # when they want "no sink" math (-inf works, but the buffer must exist).
     for slot_idx in (0, 1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18):
         ptr = int.from_bytes(slot(slot_idx)[:8], "little")
         assert ptr != 0, f"slot {slot_idx} pointer is NULL"
+
+    # Slots 19/20 are the valid_split scratch added by the kargs-preload change.
+    # On gfx950 the legacy path leaves them zero: the C entry (void)-ignores
+    # valid_split_count / use_valid_split_count_reduce and the shipped .co never
+    # touches the buffer. Lock that contract (it's what makes the wrapper's
+    # torch.empty(valid_split_count) allocation safe here).
+    assert (
+        int.from_bytes(slot(19)[:8], "little") == 0
+    ), "slot 19 (ptr_valid_split) must be NULL on gfx950 (kernel ignores it)"
+    assert (
+        slot_u32(20) == 0
+    ), "slot 20 (s_use_valid_split) must be 0 on gfx950 (kernel ignores it)"
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +327,7 @@ _QUANT_NUM_SCALE_BYTES = _QUANT_NUM_TILES * 2  # 14
 
 
 def _cast_scale_inv_to_ue8m0(t_input, out_dtype=torch.float32):
-    """Round scale to 2^ceil(log2(scale)) — matches e8m0 storage."""
+    """Round scale to 2^ceil(log2(scale)) -- matches e8m0 storage."""
     return torch.pow(2, torch.clamp_min(t_input, 1e-4).log2().ceil()).to(out_dtype)
 
 
@@ -488,8 +515,8 @@ def _asm_attn_decode_bf16(
 
     Stride note: KV.size(3) is the per-token kernel stride in bytes. The
     kernel reads exactly 448 (nope) + 8 (scale) + slack = our 512-byte
-    layout. Padding to 576 (poc_kl's stride_Page) made the kernel read
-    garbage bytes as scale and produced all-NaN — DON'T pad.
+    layout. Padding to 576 (the kernel's stride_Page) made the kernel read
+    garbage bytes as scale and produced all-NaN -- DON'T pad.
     """
     total_q = q_bf16.size(0)
     num_heads = q_bf16.size(1)
@@ -514,7 +541,7 @@ def _asm_attn_decode_bf16(
         device=q_bf16.device,
     )
     # sink: -inf = "no sink" math. Size = num_heads (post-2026-06-01
-    # shrink — kernel reads sink head-only). See aiter/mla.py docstring.
+    # shrink -- kernel reads sink head-only). See aiter/mla.py docstring.
     sink = torch.full(
         (num_heads,),
         float("-inf"),
@@ -541,7 +568,7 @@ def _asm_attn_decode_bf16(
     )
     # logits: [num_seqs, num_kv_splits=1, num_kv_heads=1, gqa*max_seqlen_q=64, D=512]
     # Internal row layout: row = q_token * gqa_ratio + head (empirically verified
-    # by per-row compare against the torch golden — see the comparison test).
+    # by per-row compare against the torch golden -- see the comparison test).
     # Reshape: [num_seqs, q_seq_logical, gqa, D] then flatten to [total_q, H, D].
     out_bf16 = (
         logits[:, 0, 0]
@@ -590,7 +617,7 @@ def _build_bf16_inputs(
     """Build BF16 ground-truth q/kv and the aiter index tables. Output:
     q_bf16:           [total_q = batch*q_seq_logical, num_heads=gqa_ratio, D=512]
     kv_bf16:          [num_page = batch*kv_seq_lens, 1, 1, D=512]
-    qo_indptr/kv_indptr/kv_page_indices/kv_last_page_lens — aiter convention.
+    qo_indptr/kv_indptr/kv_page_indices/kv_last_page_lens -- aiter convention.
 
     `attn_sink`:
       Returns `sink` as a per-head [num_heads] FP32 tensor (one scalar per
@@ -611,7 +638,7 @@ def _build_bf16_inputs(
     # Bare randn (~N(0,1)), matching op_tests/test_mla.py's input convention.
     # No /10 scaling or clamp: under the strict 1% checkAllclose tolerance this
     # leaves some elements over the bound (FP8 quant noise on the full dynamic
-    # range), reported as `failed!` — that is expected and double-checked by eye,
+    # range), reported as `failed!` -- that is expected and double-checked by eye,
     # not a hard gate (checkAllclose does not raise).
     q_bf16 = torch.randn(
         (total_q, gqa_ratio, _QUANT_D), dtype=dtypes.bf16, device=device
@@ -639,7 +666,7 @@ def _build_bf16_inputs(
     kv_last_page_lens.fill_(1)
 
     # sink: per-head [num_heads] attention sink (one scalar per head), consumed
-    # head-only by both the kernel and the torch ref — no q_token tiling.
+    # head-only by both the kernel and the torch ref -- no q_token tiling.
     # Scaled up by 10 (randn * 10) so the sink contributes ~15% to the softmax
     # output vs a no-sink baseline: well above the checkAllclose tolerance, so a
     # dropped / mis-scaled sink in the kernel shows up as a hard mismatch instead
@@ -694,21 +721,37 @@ def _run_one_point(
     # The shipped qh64 .co has a 64 q-row tile; the dispatcher
     # (csrc/py_itfs_cu/asm_mla_v4.cu) selects sub_Q based on (gqa_ratio,
     # max_seqlen_q) and computes gdx = ceil(gqa*max_seqlen_q / sub_Q), so a
-    # single .co covers three (gqa, q_seq_logical) entry points:
-    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → gdx=1
-    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → gdx=1
-    #   (128,1) — 128 heads × 1 logical-Q row = 128 → gdx=2 (two WGs along head)
-    # The CSV alias in asm_mla_v4.cu remaps gqa∈{64,128} to the (16,4) lookup
-    # row so all three find the same kernel symbol.
-    _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
+    # single .co covers these (gqa, q_seq_logical) entry points:
+    #   (16, 4) -- 16 heads x 4 logical-Q rows = 64 -> sub_Q=64, gdx=1
+    #   (64, 1) -- 64 heads x 1 logical-Q row  = 64 -> sub_Q=64, gdx=1
+    #   (128,1) -- 128 heads x 1 logical-Q row = 128 -> sub_Q=64, gdx=2 (2 WGs)
+    #   (16, 1) -- 16 heads x 1 logical-Q row  = 16 -> sub_Q=16, gdx=1; the
+    #             kernel writes a compact 16-row partial (no 64-row tile
+    #             slack -- verified: logits come back [num_seqs,1,16,512]).
+    #   (16, 2) -- 16 heads x 2 logical-Q rows = 32 -> sub_Q=32, gdx=1; the
+    #             kernel writes a compact 32-row partial (2 q_tokens x 16
+    #             heads; logits [num_seqs,1,2,16,512] -> [total_q,16,512]).
+    #   (32, 1) -- 32 heads x 1 logical-Q row  = 32 -> sub_Q=32, gdx=1; compact
+    #             32-row partial (row == head; logits [num_seqs,1,32,512]).
+    # The CSV alias in asm_mla_v4.cu remaps all of these to the single
+    # (Gqa=64, qSeqLen=1) lookup row so they share one kernel symbol.
+    _SHIPPED_TILE_VARIANTS = {
+        (16, 4),
+        (64, 1),
+        (128, 1),
+        (16, 1),
+        (16, 2),
+        (32, 1),
+    }
     assert (gqa_ratio, q_seq_logical) in _SHIPPED_TILE_VARIANTS, (
         f"(gqa_ratio={gqa_ratio}, q_seq_logical={q_seq_logical}) not in shipped "
         f"variants {_SHIPPED_TILE_VARIANTS} for the qh64 .co. The dispatcher "
-        f"picks sub_Q=64 and launches gdx=ceil(gqa*max_seqlen_q/64) WGs along "
-        f"the head dim; only these three pairs are exercised by CSV+dispatcher."
+        f"picks sub_Q from (gqa, max_seqlen_q) and launches "
+        f"gdx=ceil(gqa*max_seqlen_q/sub_Q) WGs along the head dim; only these "
+        f"pairs are exercised by CSV+dispatcher."
     )
 
-    # Auto-pick the split count when the caller passes None — mirrors the
+    # Auto-pick the split count when the caller passes None -- mirrors the
     # production wrapper (aiter/mla.py mla_decode_fwd_v4_nm), which forwards
     # num_kv_splits=None to get_meta_param's CU-occupancy x HBM-efficiency
     # heuristic. We resolve it to a concrete int HERE (before any buffer
@@ -717,7 +760,7 @@ def _run_one_point(
     # and nhead = NUM_KV_HEADS*gqa_ratio.
     if num_kv_splits is None:
         # tg_factor mirrors the wrapper: gqa=128 launches ceil(128/64)=2 WGs
-        # per (seq, split), so its effective CU occupancy is 2x — feed that in
+        # per (seq, split), so its effective CU occupancy is 2x -- feed that in
         # so the heuristic doesn't over-split (bs=64/gqa=128 -> 2, not 4).
         num_heads = NUM_KV_HEADS * gqa_ratio
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
@@ -775,7 +818,7 @@ def _run_one_point(
     # Torch references (CPU-side reference math, not timed). inputs["sink"] is
     # the per-head [num_heads] sink consumed directly by both the torch refs
     # and the asm kernel (the kernel reads per-head sink natively as of the
-    # 2026-06-01 shrink — no q_token tiling needed).
+    # 2026-06-01 shrink -- no q_token tiling needed).
     out_golden, _ = _torch_attn_decode_bf16_golden(
         inputs["q_bf16"],
         inputs["kv_bf16"],
@@ -819,9 +862,9 @@ def _run_one_point(
     )
 
     # ---- timed call (1): torch fp8-dequant reference ----
-    # Same fp8 bytes the kernel reads → isolates kernel math from quant noise,
+    # Same fp8 bytes the kernel reads -> isolates kernel math from quant noise,
     # and gives the speedup baseline. The ref does the dequant inside, so the
-    # us number includes that cost — matches what the asm kernel does on-die.
+    # us number includes that cost -- matches what the asm kernel does on-die.
     (out_fp8_ref, _lse_ref), us_ref = run_perftest(
         _torch_attn_decode_fp8_dequant_ref,
         q_packed,
@@ -843,7 +886,7 @@ def _run_one_point(
     # Times the v4 nm decoder kernel in isolation so the perf number isolates
     # kernel work from the cross-split merge cost. For num_kv_splits=1 this
     # is the only kernel invocation; for num_kv_splits>1 the wrapper would
-    # additionally invoke `_fwd_kernel_stage2_asm` triton on top — see (2b).
+    # additionally invoke `_fwd_kernel_stage2_asm` triton on top -- see (2b).
     _ret, us_asm_kernel = run_perftest(
         aiter.mla_decode_v4_asm,
         q_packed,
@@ -941,7 +984,7 @@ def _run_one_point(
 
     # ---- perf: fp8_ref vs asm ----
     # We report two asm timings:
-    #   asm_k: v4 kernel only (no stage2 merge) — kernel-isolated metric
+    #   asm_k: v4 kernel only (no stage2 merge) -- kernel-isolated metric
     #   asm  : full wrapper end-to-end (kernel + stage2 merge if splits>1)
     # `speedup` uses asm_k since it's the kernel-comparable number; the
     # multi-split merge is a separate cost we want to call out explicitly.
@@ -973,6 +1016,155 @@ def test_v4_nm_accuracy_and_perf():
     _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
 
 
+def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
+    """Accuracy at a RAGGED (per-seq variable kv_len) decode shape with
+    auto-split (num_kv_splits=None).
+
+    Mirrors the production OP5 path (ATOM sparse_attn_v4_paged_decode ->
+    mla_decode_fwd_v4_nm): N seqs, gqa heads, qlen=1, per-seq kv_len from
+    `kv_lens`. get_meta_param picks the split count from the AVERAGE kv_len,
+    so short seqs in a ragged batch get per-split < SUB_KV (32) -- this is the
+    case the kernel's illegal-KV-length guard must handle. Compares the merged
+    asm output against the fp8-dequant torch reference (the kernel-math gate;
+    quant-independent). Reads the result from the correct buffer per the
+    single/multi-split contract (logits[:,0] when resolved==1, else output).
+    """
+    device = "cuda"
+    gqa = gqa_ratio
+    batch = len(kv_lens)
+    total_kv = sum(kv_lens)
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    q_bf16 = torch.randn(batch, gqa, _QUANT_D, dtype=dtypes.bf16, device=device)
+    kv_bf16 = torch.randn(
+        total_kv,
+        PAGE_SIZE,
+        NUM_KV_HEADS,
+        _QUANT_D,
+        dtype=dtypes.bf16,
+        device=device,
+    )
+
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor(
+        [0] + torch.tensor(kv_lens).cumsum(0).tolist(),
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_page_indices = torch.arange(total_kv, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
+    if attn_sink:
+        sink = torch.randn(gqa, dtype=torch.float32, device=device) * 10.0
+    else:
+        sink = torch.full((gqa,), float("-inf"), dtype=torch.float32, device=device)
+
+    qp, qr = _native_to_2buff_for_asm(q_bf16)
+    kp, kr = _native_to_2buff_for_asm(kv_bf16)
+
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        qp,
+        qr,
+        kp,
+        kr,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        sm_scale,
+        attn_sink=(sink if attn_sink else None),
+    )
+
+    output = torch.empty((batch, gqa, V_HEAD_DIM), dtype=dtypes.bf16, device=device)
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        q=qp,
+        qrope=qr.contiguous(),
+        kv_buffer=kp,
+        kvrope=kr.contiguous(),
+        output=output,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        split_indptr=None,
+        max_seqlen_q=1,
+        sink=sink,
+        sm_scale=sm_scale,
+        out_16_nosplit=0,
+        num_kv_splits=None,
+    )
+    # Single/multi-split output contract (see ATOM paged_decode.py:986): the
+    # merged result lands in `output` for resolved splits > 1; the single-pass
+    # fp32 path leaves it in logits[:, 0].
+    resolved = logits.shape[1]
+    out_asm = (output if resolved > 1 else logits[:, 0]).float()
+
+    print(
+        f"\n[v4 nm varlen] gqa={gqa} kv_lens={kv_lens} total_kv={total_kv} "
+        f"resolved_splits={resolved}"
+    )
+    checkAllclose(
+        out_ref.float(),
+        out_asm,
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg=f"mla_v4_nm varlen [fp8_dequant_ref vs asm] kv_lens={kv_lens}",
+    )
+
+
+@needs_gfx950
+def test_v4_nm_varlen_ragged_kv_tail_split_guard():
+    """Ragged (variable per-seq kv_len) decode at the production OP5 shape
+    (gqa=128, qlen=1, N=4, auto-split), where short seqs in the batch get
+    per-split < SUB_KV=32.
+
+    get_meta_param picks the split count from the AVERAGE kv_len, so in a
+    ragged batch the shortest seq's per-split token count drops well below
+    SUB_KV (e.g. kv_lens=[516,300,130,64] -> 8 splits -> the 64-token seq
+    gets 8 tokens/split). This is exactly the tail-split-< SUB_KV case the
+    kernel's illegal-KV-length guard must survive without over-reading the
+    page table; a pre-guard kernel faulted (illegal K address) here. Locks
+    in both no-crash and bit-accuracy across a spread of ragged shapes.
+    """
+    _run_varlen_point([516, 300, 130, 64])  # long..tiny ragged (prod OP5)
+    _run_varlen_point([516, 516, 516, 516])  # uniform max (split=16, ~32/split)
+    _run_varlen_point([500, 250, 100, 40])  # more extreme ragged
+    _run_varlen_point([66, 50, 40, 33])  # all-short
+
+
+@needs_gfx950
+def test_v4_nm_gqa16_qseqlen1_accuracy_and_perf():
+    """Accuracy for the (gqa_ratio=16, q_seq_logical=1) entry point.
+
+    This pair is served by the same single qh64 .co via the
+    `gqa_ratio == 16 && config_max_seqlen_q == 1` normalization branch in
+    asm_mla_v4.cu. Unlike the other three shipped variants it does NOT
+    satisfy gqa*q_seq=64 (here 16*1=16); the dispatcher picks sub_Q=16 and
+    the kernel writes a compact 16-row partial (logits [num_seqs,1,16,512],
+    no 64-row tile slack). _run_one_point's buffers are already sized to
+    num_heads=gqa_ratio so the existing reshape/compare path handles it
+    directly. Run with sink off and on so the sink path is covered too.
+    """
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=False,
+    )
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=True,
+    )
+
+
 @needs_gfx950
 def test_v4_nm_out_16_nosplit_accuracy_and_perf():
     """Exercise the single-pass packed-BF16 direct path (out_16_nosplit=1).
@@ -1002,17 +1194,17 @@ def test_v4_nm_out_16_nosplit_accuracy_and_perf():
 def asm_sparse_attn_v4_paged_decode(
     q,  # [N, H=16, D=512] bf16
     unified_kv,  # [total_pages, D=512] bf16 (page_size=1, single KV head)
-    kv_indices,  # [total_indices] int32 — per-token flat
-    kv_indptr,  # [N+1] int32 — per-token prefix sum
+    kv_indices,  # [total_indices] int32 -- per-token flat
+    kv_indptr,  # [N+1] int32 -- per-token prefix sum
     attn_sink,  # [H] or None
     softmax_scale,
 ):
     """Mirror of ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode.
 
-    Constraints (current asm variant qh64/qseqlen4 — single .co aliased to
-    (gqa,q_seq_logical) ∈ {(16,4),(64,1),(128,1)}):
+    Constraints (current asm variant qh64/qseqlen4 -- single .co aliased to
+    (gqa,q_seq_logical) ? {(16,4),(64,1),(128,1)}):
       - N (== total tokens) must be a multiple of 4.
-      - Tokens are processed in groups of 4 as one "sequence" — tokens [b*4 ..
+      - Tokens are processed in groups of 4 as one "sequence" -- tokens [b*4 ..
         (b+1)*4) MUST share the same kv span (i.e., kv_indptr is constant
         within each group of 4). Caller's responsibility.
       - attn_sink is currently unused (kernel does not honor sink); reserved
@@ -1065,7 +1257,7 @@ def asm_sparse_attn_v4_paged_decode(
 
 
 # ---------------------------------------------------------------------------
-# Multi-pass (num_kv_splits > 1) — opens the path that mirrors V3's
+# Multi-pass (num_kv_splits > 1) -- opens the path that mirrors V3's
 # non-persistent stage1 + stage2 reduce. The .co binary already supports any
 # number of passes via slot 9; this test verifies (a) the dispatcher lookup
 # isn't gated on num_kv_splits, (b) the python wrapper auto-builds
@@ -1076,12 +1268,12 @@ def asm_sparse_attn_v4_paged_decode(
 def test_v4_nm_multi_split():
     """Multi-pass (num_kv_splits>1) path, two checks in one:
 
-    (A) Full-KV coverage: num_kv_splits=4 with kv_seq_lens=256 → 64 tokens
+    (A) Full-KV coverage: num_kv_splits=4 with kv_seq_lens=256 -> 64 tokens
         per split = two full SUB_KV=32 inner-KV passes each. Every split slot
         in `logits` must be written (no SENTINEL leak), proving the dispatcher
         isn't gated on num_kv_splits, the wrapper auto-builds split_indptr
         V3-style, and the kernel doesn't tail-drop any split. Coverage
-        invariant: floor(kv/splits) >= SUB_KV (=32); 256/4=64 ✓.
+        invariant: floor(kv/splits) >= SUB_KV (=32); 256/4=64 ?.
 
     (B) Rejection: multi-pass + out_16_nosplit=1 is unsupported (bf16-direct
         is single-pass only); the wrapper must raise BEFORE the kernel.
@@ -1140,7 +1332,7 @@ def test_v4_nm_multi_split():
 # Sink interface (PR-2: sink-aware .co + slot 18 plumbed end-to-end)
 # ---------------------------------------------------------------------------
 # These tests pin down the behavioural contract: We assert that
-#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes — proves the
+#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes -- proves the
 #       sink data actually reaches the kernel and modulates the softmax
 #       denominator,
 #   (b) sink=-inf does NOT produce extra NaNs vs a near-equivalent finite
@@ -1200,9 +1392,9 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
 def test_v4_nm_sink():
     """Sink contract, three checks in one:
 
-    (A) sink=-inf vs sink=10.0 produce DIFFERENT output bytes — proves sink
+    (A) sink=-inf vs sink=10.0 produce DIFFERENT output bytes -- proves sink
         reaches the kernel via slot 18 (offset 0x120) and modulates softmax.
-    (B) sink=-inf introduces NO extra NaN vs a finite -1e9 control — the
+    (B) sink=-inf introduces NO extra NaN vs a finite -1e9 control -- the
         documented "no sink" convention is -inf-stable.
     (C) malformed sink (wrong dtype/size/stride/device) is rejected by the
         wrapper BEFORE the dispatcher can mis-stride into garbage memory.
@@ -1227,7 +1419,7 @@ def test_v4_nm_sink():
     # is kernel-written.
     finite_both = torch.isfinite(logits_a[:, 0]) & torch.isfinite(logits_b[:, 0])
     assert finite_both.any(), (
-        "All output cells were NaN/inf under both sink values — the quant "
+        "All output cells were NaN/inf under both sink values -- the quant "
         "pipeline returned junk OR sink=10 pushed the running max into a "
         "saturating regime. Re-check _native_to_2buff_for_asm or lower "
         "sink_b's magnitude."
@@ -1268,7 +1460,7 @@ def test_v4_nm_sink():
         f"sink=-inf introduced {extra_nans} NaN cells over the -1e9 "
         f"control. The sink merge in 3_13.s is not -inf-stable; the "
         f"wrapper docstring's recommendation to use -inf for 'no sink' "
-        f"is no longer safe — switch the convention to a large finite "
+        f"is no longer safe -- switch the convention to a large finite "
         f"negative (e.g. -1e9)."
     )
 
@@ -1304,14 +1496,14 @@ def test_v4_nm_sink():
     with pytest.raises(ValueError, match="sink.*numel"):
         aiter.mla.mla_decode_fwd_v4_nm(**args_over)
 
-    # Non-contiguous sink (slice/transpose) — kernel reads flat fp32, so
+    # Non-contiguous sink (slice/transpose) -- kernel reads flat fp32, so
     # any stride mismatch silently scrambles the per-head sink layout.
     args_strided = dict(args)
     args_strided["sink"] = torch.full(
         (expected * 2,), float("-inf"), dtype=torch.float32, device=device
     )[
         ::2
-    ]  # numel == expected but stride=2 → non-contiguous
+    ]  # numel == expected but stride=2 -> non-contiguous
     assert args_strided["sink"].numel() == expected
     with pytest.raises(ValueError, match="sink.*contiguous"):
         aiter.mla.mla_decode_fwd_v4_nm(**args_strided)
@@ -1330,14 +1522,10 @@ if __name__ == "__main__":
     import itertools
     import sys
 
-    # The v4 nm kernel ships only for gfx950 (mi350). CI runs every op_tests
-    # file via `python3 <file>` (not pytest), which bypasses the per-test
-    # @needs_gfx950 skipif marker and would execute this driver — loading the
-    # gfx950-only .co — on a gfx942 (mi300) runner and fail. Guard the driver
-    # so it cleanly no-ops (exit 0) anywhere that isn't gfx950.
+    # The v4 nm kernel ships only for gfx950.
     if not torch.cuda.is_available() or not _on_gfx950():
         print(
-            "[v4 nm] skip: shipped only for gfx950 (mi350); "
+            "[v4 nm] skip: shipped only for gfx950; "
             "current device is not gfx950. Exiting 0."
         )
         sys.exit(0)
@@ -1389,11 +1577,11 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="num_heads / num_kv_heads. Must satisfy (gqa_ratio, q_seq_logical) "
-        "in {(16,4), (64,1), (128,1)} — the three entry points the qh64 .co's "
+        "in {(16,4), (64,1), (128,1)} -- the three entry points the qh64 .co's "
         "tile (64 q-rows) covers via the dispatcher's sub_Q=64 + "
         "gdx=ceil(gqa*max_seqlen_q/64) launch geometry. The CSV in "
         "hsa/gfx950/mla_v4/mla_v4_asm.csv ships a single (gqa=16, qSeqLen=4) "
-        "row; asm_mla_v4.cu remaps gqa∈{64,128} to that row at lookup time.",
+        "row; asm_mla_v4.cu remaps gqa?{64,128} to that row at lookup time.",
     )
     parser.add_argument(
         "--attn-sink",

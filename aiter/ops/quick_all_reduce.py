@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from typing import Optional
@@ -25,6 +25,21 @@ def qr_all_reduce(
     fa: int,
     inp: torch.Tensor,
     out: torch.Tensor,
+    quant_level: int,
+    cast_bf2half: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_quick_all_reduce")
+def qr_all_reduce_rmsnorm(
+    fa: int,
+    inp: torch.Tensor,
+    residual_inp: torch.Tensor,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    hidden_dim: int,
     quant_level: int,
     cast_bf2half: bool = False,
 ) -> None: ...

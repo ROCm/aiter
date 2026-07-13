@@ -77,7 +77,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
 
 # ---------------------------------------------------------------------------
 # View transforms for preshuffled data in LDS
-# These are zero-cost (no data movement) — they just reindex the LDS view
+# These are zero-cost (no data movement) -- they just reindex the LDS view
 # so load_shared_relaxed reads bytes in the order WMMA expects.
 # ---------------------------------------------------------------------------
 
@@ -88,8 +88,9 @@ def depreshuffle_scales(
     BLOCK_M: gl.constexpr,
     K_GROUPS: gl.constexpr,
 ):
-    # Inverse of host shuffle_scales_gfx1250: PRESHUFFLE_FACTOR rows are packed
-    # per stripe, SCALE_KWIDTH scale-groups contiguous per row.
+    # Inverse of host aiter.ops.triton.utils.shuffle.shuffle_scale_gemm
+    # (gfx1250 path): PRESHUFFLE_FACTOR rows are packed per stripe, SCALE_KWIDTH
+    # scale-groups contiguous per row.
     PRESHUFFLE_FACTOR: gl.constexpr = 16
     SCALE_KWIDTH: gl.constexpr = 4
     NUM_STRIPES: gl.constexpr = K_GROUPS // SCALE_KWIDTH
@@ -173,7 +174,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
     # Scale preshuffle: PRESHUFFLE_FACTOR rows packed per stripe, SCALE_KWIDTH
-    # scale-groups contiguous per row (must match the host shuffle_scales_gfx1250).
+    # scale-groups contiguous per row (must match the host
+    # aiter.ops.triton.utils.shuffle.shuffle_scale_gemm, gfx1250 path).
     PRESHUFFLE_FACTOR: gl.constexpr = 16
     SCALE_KWIDTH: gl.constexpr = 4
 
@@ -307,7 +309,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         layout=b_scale_layout
     )
 
-    # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
+    # --- 3. Main loop: WMMA(cur) -> TDM(future) -> wait -> pre-load(next) ---
     main_iters = k_tiles - (NUM_BUFFERS)
     for _ in range(main_iters):
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -376,7 +378,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
 
     # =====================================================================
-    # Store output via TDM: accumulator → shared memory → global memory.
+    # Store output via TDM: accumulator -> shared memory -> global memory.
     # =====================================================================
 
     c_buffer = gl.allocate_shared_memory(

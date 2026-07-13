@@ -31,7 +31,7 @@ def _lds_vec_type(memref, total_bits):
 
 
 def lds_load_b128(memref, elem_off):
-    """Load 16 bytes from LDS as ``vector<4×i32>``.
+    """Load 16 bytes from LDS as ``vector<4xi32>``.
 
     Automatically adapts to the memref element type (f16, bf16, f32, etc.).
     Produces ``ds_load_b128``.
@@ -56,10 +56,21 @@ def lds_store_b128(memref, elem_off, data):
     Args:
         memref: LDS memref (any 16-bit or 32-bit element type, address-space 3).
         elem_off: Element offset in memref element units.
-        data: Any 128-bit vector (``vec<4×i32>``, ``vec<4×f32>``,
-              ``vec<8×f16>``, ``vec<8×bf16>``).
+        data: Any 128-bit vector (``vec<4xi32>``, ``vec<4xf32>``,
+              ``vec<8xf16>``, ``vec<8xbf16>``).
     """
     vec_ty = _lds_vec_type(memref, 128)
+    typed_vec = vector.bitcast(vec_ty, data)
+    vector.store(typed_vec, memref, [elem_off])
+
+
+def lds_store_b64(memref, elem_off, data):
+    """Store 8 bytes to LDS (``ds_store_b64``).
+
+    Bitcasts *data* (any 64-bit vector, e.g. ``vec<4xbf16>`` / ``vec<2xi32>``)
+    to match the memref element type, then ``vector.store``.
+    """
+    vec_ty = _lds_vec_type(memref, 64)
     typed_vec = vector.bitcast(vec_ty, data)
     vector.store(typed_vec, memref, [elem_off])
 
@@ -196,15 +207,15 @@ def store_acc_vec8_to_lds(memref, base_elem_off, imm_elem_off, acc_vec8, out_ele
     """Write one 8-element f32 accumulator sub-vector to LDS.
 
     For half output (out_elem = T.f16 or T.bf16):
-        trunc_f → bitcast(vec<4×i32>) → 1 × lds_store_b128  (16 bytes)
+        trunc_f -> bitcast(vec<4xi32>) -> 1 x lds_store_b128  (16 bytes)
     For f32 output (out_elem = None):
-        extract×4 → from_elements(vec<4×f32>) → 2 × lds_store_b128  (32 bytes)
+        extractx4 -> from_elements(vec<4xf32>) -> 2 x lds_store_b128  (32 bytes)
 
     Args:
         memref: D-output LDS memref (f16 element type).
         base_elem_off: Per-lane base element offset (VGPR).
         imm_elem_off: Compile-time element offset for this sub-tile.
-        acc_vec8: ``vector<8×f32>`` accumulator values.
+        acc_vec8: ``vector<8xf32>`` accumulator values.
         out_elem: Output element type (``T.f16``, ``T.bf16``, or ``None`` for f32).
     """
     off = base_elem_off + arith.index(imm_elem_off)
@@ -230,12 +241,12 @@ def store_acc_vec8_to_buffer(
     """Write one 8-element f32 accumulator sub-vector to global memory.
 
     For half output (out_elem = T.f16 or T.bf16):
-        trunc_f → bitcast(vec<4×i32>) → 1 × buffer_store (16 bytes)
+        trunc_f -> bitcast(vec<4xi32>) -> 1 x buffer_store (16 bytes)
     For f32 output (out_elem = None):
-        extract×4 → from_elements(vec<4×f32>) → 2 × buffer_store (16 bytes each)
+        extractx4 -> from_elements(vec<4xf32>) -> 2 x buffer_store (16 bytes each)
 
     Args:
-        acc_vec8: ``vector<8×f32>`` accumulator values.
+        acc_vec8: ``vector<8xf32>`` accumulator values.
         c_rsrc: Buffer resource descriptor for the output matrix.
         addr: Pre-computed address (single value for half, list of 2 for f32).
         out_elem: Output element type (``T.f16``, ``T.bf16``, or ``None`` for f32).
