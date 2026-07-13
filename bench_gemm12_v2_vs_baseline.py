@@ -42,6 +42,7 @@ from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage2,
     get_flydsl_kernel_params,
     flydsl_kernel_name,
+    _run_moe_reduction,
 )
 from aiter.fused_moe import parse_flydsl_v2_gemm2_kernel
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
@@ -376,12 +377,6 @@ def time_baseline(d, token, topk, params):
     return us, ok
 
 
-def _stage2_out_for_check(out, mode, token, topk, model_dim):
-    if mode == "reduce":
-        return out.view(token, topk, model_dim).sum(dim=1)
-    return out
-
-
 def _print_tensor(name, tensor):
     torch.cuda.synchronize()
     print(f"\n{name}:")
@@ -407,12 +402,10 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None, print_outpu
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
     mode = params.get("mode", "atomic")
     stage2_adtype = b.get("a2_dtype", params.get("a_dtype", b.get("adtype", "fp8")))
-    out_shape = (
-        (token, model_dim)
-        if is_opus2 else
-        ((token, topk, model_dim) if mode == "reduce" else (token, model_dim))
-    )
-    out = torch.empty(out_shape, dtype=dtypes.bf16, device="cuda")
+    # gemm2 final output is always [token, model_dim]. flydsl reduce mode writes a
+    # per-slot [token, topk, model_dim] buffer that _run_moe_reduction reduces below
+    # (timed together, mirroring the v2 path); opus route mode reduces in its wrapper.
+    out = torch.empty((token, model_dim), dtype=dtypes.bf16, device="cuda")
 
     if is_opus2:
         opus_values = _opus_a8w4.stage2_cfg_values(row, row.get("block_m", params["tile_m"]))
@@ -448,14 +441,22 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None, print_outpu
         _, us = run_perftest(fn, num_warmup=WARMUP, num_iters=ITERS)
         return us, ok
 
+    is_reduce = mode == "reduce"
+    inter = (
+        torch.empty((token, topk, model_dim), dtype=dtypes.bf16, device="cuda")
+        if is_reduce
+        else None
+    )
+    gemm2_out = inter if is_reduce else out
+
     def fn():
-        return flydsl_moe_stage2(
+        flydsl_moe_stage2(
             inter_states=b["a2_qt"],
             w2=b["w2_qt_shuf"],
             sorted_token_ids=b["sorted_ids"],
             sorted_expert_ids=b["sorted_expert_ids"],
             num_valid_ids=b["num_valid_ids"],
-            out=out,
+            out=gemm2_out,
             topk=topk,
             tile_m=params["tile_m"],
             tile_n=params["tile_n"],
@@ -472,15 +473,18 @@ def time_baseline_gemm2(d, token, model_dim, topk, params, row=None, print_outpu
             waves_per_eu=params.get("waves_per_eu", None),
             b_nt=params.get("b_nt", 0),
             xcd_swizzle=params.get("xcd_swizzle", 0),
-            return_per_slot=(mode == "reduce"),
+            return_per_slot=is_reduce,
         )
+        if is_reduce:
+            _run_moe_reduction(inter, out, token, topk, model_dim)
+        return out
 
-    if mode != "reduce":
+    if not is_reduce:
         out.zero_()
     fn()
     torch.cuda.synchronize()
     ref = d["ref2"].float()
-    got = _stage2_out_for_check(out, mode, token, topk, model_dim).float()
+    got = out.float()
     if print_output:
         _print_close_stats("gemm2 baseline vs torch ref", ref, got)
         _print_tensor("torch ref gemm2 output", ref)
@@ -671,11 +675,21 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
         )
         torch.cuda.synchronize()
 
-    out_shape = (token, topk, model_dim) if epilog == "reduce" else (token, model_dim)
-    out = torch.empty(out_shape, dtype=dtypes.bf16, device="cuda")
+    # The real cost of the reduce epilog = gemm2 (writes per-slot [token,topk,model_dim])
+    # + _run_moe_reduction (reduces to [token,model_dim]), matching the real v2 pipeline
+    # (_flydsl_v2_stage2_wrapper). Both steps are counted in fn so it is a fair comparison
+    # against atomic's single kernel that writes [token,model_dim] directly.
+    is_reduce = epilog == "reduce"
+    out = torch.empty((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    inter = (
+        torch.empty((token, topk, model_dim), dtype=dtypes.bf16, device="cuda")
+        if is_reduce
+        else None
+    )
+    gemm2_out = inter if is_reduce else out
 
     def fn():
-        return mxfp4_moe_gemm2(
+        mxfp4_moe_gemm2(
             inter_sorted_quant=v["isq"],
             inter_sorted_shuffled_scale=v["iss"],
             w2_u8=v["w2u8"],
@@ -684,7 +698,7 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
             cumsum_tensor=v["cumsum"],
             sorted_token_ids=v["sti"],
             sorted_weights=v["swt"],
-            out=out,
+            out=gemm2_out,
             M_logical=token,
             max_sorted=v["max_sorted"],
             NE=E,
@@ -701,13 +715,16 @@ def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_
             model_dim_pad=0,
             inter_dim_pad=0,
         )
+        if is_reduce:
+            _run_moe_reduction(inter, out, token, topk, model_dim)
+        return out
 
-    if epilog != "reduce":
+    if not is_reduce:
         out.zero_()
     fn()
     torch.cuda.synchronize()
     ref = d["ref2"].float()
-    got = _stage2_out_for_check(out, epilog, token, topk, model_dim).float()
+    got = out.float()
     if print_output:
         _print_close_stats("gemm2 v2 vs torch ref", ref, got)
         _print_tensor("torch ref gemm2 output", ref)

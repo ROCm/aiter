@@ -1279,7 +1279,10 @@ def gemm2_body_v2(
                 n += 1
         return n
 
-    straight_line_k2 = is_f8_a and use_reduce and g2_bf16_lds and (BM == 64) and (K_TILES_MAX == 2)
+    # Straight-line K=2 unroll (compile-time INTER_MAX==512 -> K_TILES_MAX==2): range_constexpr instead of
+    # scf.for drops the loop-carry (C/B regs freed -> lower VGPR) and collapses the per-tile barrier to one.
+    # fp8 needs the bf16-lds epilog; fp4 uses the c_frags epilog (mma_one_j is dtype-generic), no bf16-lds req.
+    straight_line_k2 = use_reduce and (BM == 64) and (K_TILES_MAX == 2) and (g2_bf16_lds if is_f8_a else True)
     if const_expr(straight_line_k2):
         gpu.barrier()
         for kt in range_constexpr(2):

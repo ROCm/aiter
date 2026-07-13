@@ -264,22 +264,38 @@ def gemm2_use_nt(experts, topk, tokens, bm_stage2):
 _GEMM2_TUNED_TABLE = {
     # NOTE: one inner dict per sig; do NOT repeat the sig key (dup keys overwrite).
     (6144, 512, 257): {  # (bm_s2, epilog, persist, use_nt)
-        1: (32, 'reduce', False, True),  # 4.985us ok100% sbm32
-        2: (32, 'atomic', False, False),  # 5.946us ok100% sbm32
-        4: (32, 'reduce', False, True),  # 12.726us ok100% sbm32
-        8: (32, 'reduce', False, False),  # 20.457us ok100% sbm32
-        16: (32, 'atomic', False, False),  # 36.226us ok100% sbm32
-        32: (32, 'atomic', False, True),  # 64.799us ok100% sbm32
-        64: (64, 'reduce', False, True),  # 84.535us ok100% sbm64
-        128: (32, 'atomic', False, True),  # 70.371us ok100% sbm32
-        256: (64, 'atomic', False, True),  # 90.692us ok100% sbm64
-        512: (32, 'atomic', True, True),  # 83.007us ok100% sbm32
-        1024: (64, 'reduce', True, True),  # 104.510us ok100% sbm64
-        2048: (64, 'reduce', True, False),  # 170.830us ok100% sbm128
-        4096: (64, 'reduce', True, False),  # 248.961us ok100% sbm64
-        8192: (64, 'reduce', True, False),  # 410.807us ok100% sbm64
-        16384: (64, 'reduce', True, False),  # 789.103us ok100% sbm128
-        32768: (64, 'reduce', True, False),  # 1484.276us ok100% sbm128
+        # 1: (32, 'reduce', False, True),  # 4.985us ok100% sbm32
+        # 2: (32, 'atomic', False, False),  # 5.946us ok100% sbm32
+        # 4: (32, 'reduce', False, True),  # 12.726us ok100% sbm32
+        # 8: (32, 'reduce', False, False),  # 20.457us ok100% sbm32
+        # 16: (32, 'atomic', False, False),  # 36.226us ok100% sbm32
+        # 32: (32, 'atomic', False, True),  # 64.799us ok100% sbm32
+        # 64: (64, 'reduce', False, True),  # 83.815us ok100% sbm64
+        # 128: (32, 'atomic', False, True),  # 70.371us ok100% sbm32
+        # 256: (64, 'atomic', False, True),  # 90.692us ok100% sbm64
+        # 512: (32, 'atomic', True, True),  # 83.007us ok100% sbm32
+        # 1024: (64, 'reduce', True, True),  # 104.510us ok100% sbm64
+        # 2048: (64, 'reduce', True, False),  # 170.830us ok100% sbm128
+        # 4096: (64, 'reduce', True, False),  # 248.961us ok100% sbm64
+        # 8192: (64, 'reduce', True, False),  # 410.807us ok100% sbm64
+        # 16384: (64, 'reduce', True, False),  # 789.103us ok100% sbm128
+        # 32768: (64, 'reduce', True, False),  # 1484.276us ok100% sbm128
+        1: (32, 'atomic', False, False),  # 4.318us ok100% sbm32
+        2: (32, 'atomic', False, False),  # 6.305us ok100% sbm32
+        4: (32, 'atomic', False, True),  # 12.615us ok100% sbm32
+        8: (32, 'atomic', False, False),  # 20.526us ok100% sbm32
+        16: (32, 'atomic', False, False),  # 36.722us ok100% sbm32
+        32: (32, 'atomic', False, True),  # 65.429us ok100% sbm32
+        64: (64, 'reduce', False, True),  # 85.183us ok100% sbm64
+        128: (32, 'atomic', False, True),  # 68.822us ok100% sbm32
+        256: (64, 'reduce', False, True),  # 89.203us ok100% sbm64
+        512: (32, 'atomic', False, True),  # 80.653us ok100% sbm32
+        1024: (64, 'atomic', False, True),  # 117.670us ok100% sbm64
+        2048: (64, 'reduce', True, False),  # 202.098us ok100% sbm128
+        4096: (64, 'reduce', True, False),  # 311.413us ok100% sbm64
+        8192: (64, 'reduce', True, False),  # 539.506us ok100% sbm64
+        16384: (64, 'reduce', True, False),  # 1089.024us ok100% sbm128
+        32768: (64, 'reduce', True, False),  # 1999.693us ok100% sbm128
     },
 }
 
