@@ -210,6 +210,16 @@ jobs:
                   "Failed to replace all ATOMesh Spur runner labels in: "
                   + ", ".join(remaining)
               )
+          submit_path = Path(".github/scripts/atomesh/pd_submit.sh")
+          text = submit_path.read_text(encoding="utf-8")
+          nodes_line = "#SBATCH --nodes=${NUM_NODES}\n"
+          ntasks_line = "#SBATCH --ntasks=${NUM_NODES}\n"
+          if ntasks_line not in text:
+              if nodes_line not in text:
+                  raise SystemExit("Failed to find Spur submit SBATCH nodes directive")
+              text = text.replace(nodes_line, nodes_line + ntasks_line, 1)
+              submit_path.write_text(text, encoding="utf-8")
+          print(f"{submit_path}: patched explicit Spur Slurm task count")
 
           server_path = Path(".github/scripts/atomesh/pd_server_atom.sh")
           text = server_path.read_text(encoding="utf-8")
