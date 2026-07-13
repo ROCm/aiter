@@ -2,6 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "v1_comm.cuh"
+#include "mla_metadata.h"
 
 template <int32_t kPackedQoLenPerWg_,
           bool kQoSplits_,
@@ -747,6 +748,40 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     }
 }
 
+// HK MLA m16x4 kernel runs at occupancy=2 (gfx950 + 64 q-tokens per tile, gated on
+// AITER_ENABLE_EXPERIMENTAL same as the dispatch in aiter/mla.py:use_hk). When it
+// applies, the m16x4 launch site spawns 2*num_cu workgroups; the work distribution
+// here must produce work_indptr sized to match so the second occupancy slot actually
+// receives work. Detection mirrors hk_decode_fwd dispatch (num_heads * max_seqlen_qo
+// == 64) and uses ORIGINAL num_heads/max_seqlen_qo (pre-fold). V32 uses fp8 across
+// nope+rope; V40 uses fp8 nope + bf16 rope.
+static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id,
+                                                       const bool enable_experimental,
+                                                       const int32_t num_heads,
+                                                       const int32_t max_seqlen_qo,
+                                                       const MlaVersion mla_version,
+                                                       const at::ScalarType q_nope_dtype,
+                                                       const at::ScalarType q_rope_dtype,
+                                                       const at::ScalarType kv_nope_dtype,
+                                                       const at::ScalarType kv_rope_dtype)
+{
+    auto is_fp8 = [](const at::ScalarType dtype) {
+        return dtype == at::ScalarType::Float8_e4m3fnuz || dtype == at::ScalarType::Float8_e4m3fn;
+    };
+    auto is_bf16 = [](const at::ScalarType dtype) { return dtype == at::ScalarType::BFloat16; };
+
+    const bool dtype_ok =
+        ((mla_version == MlaVersion::V32) && is_fp8(q_nope_dtype) && is_fp8(q_rope_dtype) &&
+         is_fp8(kv_nope_dtype) && is_fp8(kv_rope_dtype)) ||
+        ((mla_version == MlaVersion::V40) && is_fp8(q_nope_dtype) && is_bf16(q_rope_dtype) &&
+         is_fp8(kv_nope_dtype) && is_bf16(kv_rope_dtype));
+
+    const bool is_hk_m16x4 = enable_experimental && (arch_id == "gfx950") &&
+                             (num_heads * max_seqlen_qo == 64) && dtype_ok;
+
+    return is_hk_m16x4 ? 2 : 1;
+}
+
 void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
                                   const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
                                   const torch::Tensor& kv_last_page_lens, // [batch size]
@@ -761,7 +796,10 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t max_split_per_batch,
                                   const at::ScalarType q_dtype,
                                   const at::ScalarType kv_dtype,
+                                  const at::ScalarType q_rope_dtype,
+                                  const at::ScalarType kv_rope_dtype,
                                   const bool is_cp_round_robin,
+                                  const MlaVersion mla_version,
                                   torch::Tensor& work_metadata_ptrs,
                                   torch::Tensor& work_info_set,
                                   torch::Tensor& work_indptr,
@@ -769,7 +807,6 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     hipDevice_t dev;
@@ -797,19 +834,18 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool enable_experimental = std::getenv("AITER_ENABLE_EXPERIMENTAL") != nullptr &&
                                      std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
 
-    // HK MLA m16x4 kernel runs at occupancy=2 (gfx950 + fp8/fp8 + 64 q-tokens per
-    // tile, gated on AITER_ENABLE_EXPERIMENTAL same as the dispatch in
-    // aiter/mla.py:use_hk). The m16x4 launch site spawns 2*num_cu workgroups; the
-    // work distribution here must produce work_indptr sized to match so the second
-    // occupancy slot actually receives work. Detection mirrors hk_decode_fwd
-    // dispatch (num_heads * max_seqlen_qo == 64) and uses ORIGINAL
-    // num_heads/max_seqlen_qo (pre-fold).
-    const bool is_hk_m16x4 = (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-                             (num_heads * max_seqlen_qo == 64) && enable_experimental;
-    const int32_t cluster_multiplier = is_hk_m16x4 ? 2 : 1;
+    const int32_t cluster_multiplier = mla_metadata_cluster_multiplier(arch_id,
+                                                                        enable_experimental,
+                                                                        num_heads,
+                                                                        max_seqlen_qo,
+                                                                        mla_version,
+                                                                        q_dtype,
+                                                                        q_rope_dtype,
+                                                                        kv_dtype,
+                                                                        kv_rope_dtype);
     const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
 
-    // Gate on arch_id consistent with hk_mla_decode_fwd dispatch (gfx942/gfx950).
+    // Gate on arch_id consistent with hk_mla_v32_decode_fwd dispatch (gfx942/gfx950).
     // Otherwise this would mark shapes as natively supported on archs where the
     // HK kernels are unavailable, producing metadata that downstream kernels
     // cannot consume.
