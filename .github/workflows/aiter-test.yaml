@@ -351,6 +351,8 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && needs.check-signal.outputs.prechecks_passed == 'true' }}
     runs-on: ubuntu-latest
     needs: [check-signal, build_aiter_wheels]
+    permissions:
+      contents: read
     outputs:
       shard_count: 8
     steps:
@@ -372,6 +374,7 @@ jobs:
   prepare_triton_wheel:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && needs.check-signal.outputs.prechecks_passed == 'true' }}
     needs: check-signal
+    permissions: {}
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
       docker-image: rocm/pytorch:latest
