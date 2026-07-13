@@ -166,28 +166,46 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         ref,
         *rest,
     ) = group_task[0]
-    _prev_ref_key = (id(ref_func), ref_args)
-
     pid = mp.current_process().pid
     gpuID = GPUIDMap[pid]
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
-    data = (
-        gen_data(*gen_args, device=device)
-        if not input_data and gen_data is not None
-        else input_data
-    )
-
     assert ref_func is not None or ref is not None or fast_mode != 0
     # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
     # ref=None & fast_mode=0: ref_func should be given and return best result
     # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
     # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
-    if ref is None and not fast_mode or (ref_func is not None and fast_mode):
-        ref_data_keys, *rest = ([], *ref_args) if not data else ref_args
-        updated_ref_args = tuple(data[k] for k in ref_data_keys) + tuple(rest)
-        ref = ref_func(*updated_ref_args, **ref_kwargs)
-        torch.cuda.synchronize()
+    data = None
+    data_key = None
+    cached_ref = ref
+    cached_ref_key = None
+
+    def make_data_key(cur_gen_data, cur_gen_args):
+        def normalize(arg):
+            if isinstance(arg, torch.Tensor):
+                return ("tensor", arg.data_ptr(), tuple(arg.shape), str(arg.dtype))
+            if isinstance(arg, (tuple, list)):
+                return tuple(normalize(el) for el in arg)
+            if isinstance(arg, dict):
+                return tuple(
+                    sorted((key, normalize(value)) for key, value in arg.items())
+                )
+            return arg
+
+        return (id(cur_gen_data), normalize(cur_gen_args))
+
+    def ensure_data(cur_gen_data, cur_gen_args):
+        nonlocal data, data_key, cached_ref_key
+        cur_data_key = make_data_key(cur_gen_data, cur_gen_args)
+        if cur_data_key != data_key:
+            data = (
+                cur_gen_data(*cur_gen_args, device=device)
+                if not input_data and cur_gen_data is not None
+                else input_data
+            )
+            data_key = cur_data_key
+            cached_ref_key = None
+        return data
 
     try:
         # Retrieve GPU ID from the map
@@ -226,6 +244,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 *rest,
             ) = group_task[i]
             # either gen_data func or inpur data
+            data = ensure_data(gen_data, gen_args)
 
             new_args = (
                 (tuple(data[k] for k in args[0]) + tuple(args[1:]))
@@ -236,13 +255,19 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             if ref_noused is not None:
                 ref = ref_noused
             else:
-                _cur_key = (id(ref_func), ref_args)
-                if _cur_key != _prev_ref_key:
+                ref = cached_ref
+                _cur_key = (id(ref_func), ref_args, data_key)
+                if (
+                    ref is None
+                    and not fast_mode
+                    or (ref_func is not None and fast_mode)
+                ) and _cur_key != cached_ref_key:
                     ref_data_keys_i, *rest_i = ref_args
                     updated = tuple(data[k] for k in ref_data_keys_i) + tuple(rest_i)
                     ref = ref_func(*updated, **ref_kwargs)
                     torch.cuda.synchronize()
-                    _prev_ref_key = _cur_key
+                    cached_ref = ref
+                    cached_ref_key = _cur_key
 
             # Extract rtol, atol from rest if available, otherwise use defaults.
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).

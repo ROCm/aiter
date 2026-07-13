@@ -3,16 +3,23 @@
 
 """Tests for flydsl ``fused_compress_attn`` kernels (V4-Pro / V4-Flash).
 
+Single test for every arch: the ``flydsl_fused_compress_attn`` /
+``flydsl_hca_compress_attn`` wrappers dispatch internally by ``get_gfx()`` —
+wave64 on the gfx9 family (gfx942/gfx950) and wave32 on gfx1250 — so we drive
+the public wrapper and never import an arch-specific kernel directly. gfx1250
+uses the linear FP8 layout, so ``preshuffle`` is forced off there.
+
 Three shape configs cover both models (they share compressor geometry; the
 model_dim difference 7168 vs 4096 is invisible to the kernel):
 
     CSA Main    : D=512, RD=64, ratio=4,   overlap=True,  BF16
-    CSA Indexer : D=128, RD=64, ratio=4,   overlap=True,  FP8 + ue8m0 + preshuffle
+    CSA Indexer : D=128, RD=64, ratio=4,   overlap=True,  FP8 + ue8m0 + preshuffle*
     HCA Main    : D=512, RD=64, ratio=128, overlap=False, BF16
+    (*preshuffle only on wave64; gfx1250 forces it off.)
 
-Each shape is swept across batch sizes {1,2,4,8,16,32,65,128,256,512} and
-speculative-decode step counts {0,3} (MTP3). The HCA Main shape is
-additionally cross-checked against the 2-kernel split launcher.
+Each shape is swept across batch sizes and speculative-decode step counts {0,3}
+(MTP3). The HCA Main shape is additionally cross-checked against the 2-kernel
+split launcher. The fp8 nm-asm cross-checks run on wave64 only.
 """
 
 import argparse
@@ -29,8 +36,13 @@ from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
+
+# The flydsl wrappers dispatch by arch internally, so one test covers wave64
+# (gfx9 family) and wave32 (gfx1250). The fp8 nm-asm cross-checks are wave64-only.
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 # (label, head_dim, rope_head_dim, ratio, overlap, quant, use_ue8m0, preshuffle)
 SHAPES = [
@@ -60,10 +72,10 @@ def _shape_by_label(label):
 def _build_inputs(shape, bs, mtp, mode):
     """Build a synthetic plan + tensors for one (shape, bs, mtp, mode) case.
 
-    ``mode`` ∈ {"decode", "prefill"}:
+    ``mode`` ? {"decode", "prefill"}:
 
     * decode (CG decode-step path):
-        - num_per_seq = max(1, ceil((mtp+1)/ratio)) boundaries — each
+        - num_per_seq = max(1, ceil((mtp+1)/ratio)) boundaries -- each
           boundary needs ``ratio`` new tokens, so MTP3 with ratio=4
           generates at most 1/seq, with ratio=128 generates at most
           1/seq (sparsely). Matches production CG worst-case.
@@ -78,7 +90,7 @@ def _build_inputs(shape, bs, mtp, mode):
         - boundary s_in_seq in seq b: position = (s_in_seq+1)*ratio - 1
         - ragged_id = b * PREFILL_CONTEXT_LEN + position  (one row per input
           token in the ragged stream)
-        - window_len = max(0, K_pool - 1 - ragged_id)  → natural state-cache
+        - window_len = max(0, K_pool - 1 - ragged_id)  -> natural state-cache
           reads only for the first 1-2 boundaries of seq 0 (overlap shapes);
           all other boundaries pure input phase
 
@@ -86,13 +98,15 @@ def _build_inputs(shape, bs, mtp, mode):
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
     label, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    if get_gfx() == "gfx1250":
+        preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
     dim_full = (2 if overlap else 1) * D
     K_pool = (2 if overlap else 1) * ratio
 
     if mode == "decode":
         # Each boundary needs ratio new tokens; in one decode fwd a seq
         # generates at most ceil((mtp+1)/ratio) boundaries. For all our
-        # (mtp ∈ {0,3}, ratio ∈ {4,128}) this collapses to 1.
+        # (mtp ? {0,3}, ratio ? {4,128}) this collapses to 1.
         num_per_seq = max(1, -(-(mtp + 1) // ratio))
         num_compress = bs * num_per_seq
         extra_pad = K_pool - 1
@@ -159,10 +173,10 @@ def _build_inputs(shape, bs, mtp, mode):
                 window_len = max(0, K_pool - 1 - position_in_seq)
             plan[pid, 0] = ragged_id
             plan[pid, 1] = b
-            plan[pid, 2] = (s + 1) * ratio - 1  # position → comp slot = s
+            plan[pid, 2] = (s + 1) * ratio - 1  # position -> comp slot = s
             plan[pid, 3] = window_len
 
-    # paged cache: one block per seq is enough (num_per_seq ≤ K_PER_BLOCK).
+    # paged cache: one block per seq is enough (num_per_seq <= K_PER_BLOCK).
     blocks_per_seq = (num_per_seq + K_PER_BLOCK - 1) // K_PER_BLOCK
     total_blocks = bs * blocks_per_seq + 4
     if quant:
@@ -176,7 +190,17 @@ def _build_inputs(shape, bs, mtp, mode):
         for j in range(blocks_per_seq):
             block_tables[b, j] = b * blocks_per_seq + j
 
+    # Dominant memory traffic (this kernel is bandwidth-bound): per compressed
+    # boundary it pools K_pool source tokens from kv_in + score_in (each dim_full
+    # wide, bf16) and writes D compressed elements to kv_cache. state-cache reads
+    # vary with window_len and are treated as a secondary term.
+    nbytes = num_compress * (
+        K_pool * dim_full * 2 * kv_in.element_size()  # kv_in + score_in pooled reads
+        + D * kv_cache.element_size()  # compressed cache write (fp8=1B / bf16=2B)
+    )
+
     return dict(
+        nbytes=nbytes,
         kv_in=kv_in,
         score_in=score_in,
         kv_state=kv_state,
@@ -238,13 +262,13 @@ def _run_kernel(inp, *, use_2kernel):
 
 @benchmark()
 def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
-    """One case. ``mode`` ∈ {'decode','prefill'}, ``path`` ∈ {'single','2kernel'}."""
+    """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
 
-    # Two cache clones — kernel writes to ``inp``, reference to ``ref_inp``.
+    # Two cache clones -- kernel writes to ``inp``, reference to ``ref_inp``.
     ref_inp = dict(inp)
     ref_inp["kv_cache"] = inp["kv_cache"].clone()
     ref_inp["cache_scale"] = (
@@ -275,7 +299,7 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
         quant=quant,
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
-        preshuffle=preshuffle,
+        preshuffle=inp["preshuffle"],  # arch-adjusted (False on gfx1250)
     )
 
     msg = f"{shape_label}/{mode}/{path} bs={bs} mtp={mtp}"
@@ -300,12 +324,12 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
             msg=f"{msg} cache_scale(bit-exact)",
         )
     else:
-        # BF16 kv_cache: rare rounding-boundary flips at ≤1 ulp because online
+        # BF16 kv_cache: rare rounding-boundary flips at <=1 ulp because online
         # softmax (kernel) and torch.softmax (reference) sum in different
-        # orders. Prefill processes 10-100× more boundaries per case than
-        # decode → more chances to land on a rounding boundary, so the
-        # element-mismatch ratio scales. Tolerate ≤2%; bound max delta at
-        # 2 ulp of bf16 ≈ 2e-2 at unit magnitude.
+        # orders. Prefill processes 10-100x more boundaries per case than
+        # decode -> more chances to land on a rounding boundary, so the
+        # element-mismatch ratio scales. Tolerate <=2%; bound max delta at
+        # 2 ulp of bf16 ? 2e-2 at unit magnitude.
         err = checkAllclose(
             inp["kv_cache"].to(dtypes.fp32),
             ref_inp["kv_cache"].to(dtypes.fp32),
@@ -314,74 +338,414 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
             tol_err_ratio=0.02,
             msg=f"{msg} kv_cache(bf16)",
         )
-    return {"us_kernel": us_kernel, "err_pct": err}
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": inp["nbytes"] / us_kernel / 1e6,
+        "err_pct": err,
+    }
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-s",
-    "--shapes",
-    type=str,
-    nargs="*",
-    default=[s[0] for s in SHAPES],
-    choices=[s[0] for s in SHAPES],
-    help="""Shape labels to run.
-    e.g.: -s csa_main hca_main""",
-)
-parser.add_argument(
-    "-b",
-    "--bs",
-    type=int,
-    nargs="*",
-    default=[1, 2, 4, 8, 16, 32, 65, 128, 256, 512],
-    help="""Batch sizes.
-    e.g.: -b 1 32 512""",
-)
-parser.add_argument(
-    "-m",
-    "--mtp",
-    type=int,
-    nargs="*",
-    default=[0, 3],
-    help="""Speculative-decode step counts (decode mode: num_per_seq = mtp+1).
-    Ignored in prefill mode.
-    e.g.: -m 0 3""",
-)
-parser.add_argument(
-    "--prefill-bs",
-    type=int,
-    nargs="*",
-    default=[1, 4, 32],
-    help="""Batch sizes for prefill mode (prefill ragged tokens = bs*context_len
-    grows fast; trimmed list by default).
-    e.g.: --prefill-bs 1 4 32""",
-)
-parser.add_argument(
-    "--modes",
-    type=str,
-    nargs="*",
-    default=["decode", "prefill"],
-    choices=["decode", "prefill"],
-    help="""Which modes to sweep.""",
-)
+def _hca_cos_sin(max_pos, rope_dim):
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim)
+    )
+    freqs = torch.outer(torch.arange(max_pos, dtype=torch.float32), inv_freq)
+    return (
+        freqs.cos().to(torch.bfloat16).contiguous(),
+        freqs.sin().to(torch.bfloat16).contiguous(),
+    )
 
-args = parser.parse_args()
 
-df = []
-for mode in args.modes:
-    bs_list = args.bs if mode == "decode" else args.prefill_bs
-    mtp_list = args.mtp if mode == "decode" else [0]  # prefill: mtp irrelevant
-    # Sweep order (slowest → fastest changing): shape → mtp → bs.
-    # Within each shape, all bs cases for mtp=0 print first, then mtp=3,
-    # which makes the perf-vs-bs trend easy to read off the summary table.
-    for shape_label, mtp, bs in itertools.product(args.shapes, mtp_list, bs_list):
-        df.append(test_flydsl_compress_attn(shape_label, bs, mtp, mode, "single"))
-        if shape_label == "hca_main":
-            df.append(test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel"))
-df = pd.DataFrame(df)
-aiter.logger.info(
-    "flydsl_compress_attn summary (markdown):\n%s", df.to_markdown(index=False)
-)
+def _gather_nm_fp8(nope_scale, rope, block_table, bs, nope_dim, n_groups):
+    """Gather per-boundary (nope fp8, e8m0 group scale, rope bf16) from the V4 nm-asm
+    paged buffers (ci=0 -> physical block_table[i,0]); asserts the dup scale byte.
+    Both the flydsl kernel and the torch reference emit this identical layout."""
+    g_nope = torch.empty(bs, nope_dim, dtype=dtypes.fp8)
+    g_sc = torch.empty(bs, n_groups, dtype=torch.uint8)
+    g_pe = torch.empty(bs, rope.shape[-1], dtype=torch.bfloat16)
+    for i in range(bs):
+        pb = int(block_table[i, 0].item())
+        row_u8 = nope_scale[pb, 0].view(torch.uint8)
+        pair = row_u8[nope_dim : nope_dim + 2 * n_groups].reshape(n_groups, 2)
+        assert (pair[:, 0] == pair[:, 1]).all(), "fp8 scale byte not duplicated"
+        g_nope[i] = nope_scale[pb, 0, :nope_dim]
+        g_sc[i] = pair[:, 0]
+        g_pe[i] = rope[pb, 0]
+    return g_nope, g_sc, g_pe
+
+
+@benchmark()
+def test_flydsl_hca_fp8(bs, ratio=128, D=512, RD=64, G=64):
+    """FP8 HCA validation (consolidated from test_fused_hca_compress_norm_rope_group_quant):
+    full 2-kernel ``flydsl_hca_compress_attn(quant=True)`` (Kernel A pool + Kernel B
+    fp8 norm/rope/group-quant/scatter, V4 nm layout: nope fp8 + inline dup e8m0 scale +
+    separate bf16 rope) validated against the shared pure-torch
+    ``fused_compress_attn_reference(group_quant=True)`` (same torch pool + norm + rope +
+    e8m0 group-quant used to emit the identical nm-asm layout; no flydsl in the
+    reference path). Exercises the flydsl fp8 Kernel B incl. the k_waves wave-packing
+    path (plan_capacity=bs+1: bs<=31 -> kw4, 32..1022 -> kw1, >=1023 -> kw4).
+    """
+    torch.manual_seed(0)
+    head_dim, rot_dim, group_size = D, RD, G
+    nope_dim = head_dim - rot_dim
+    n_groups = nope_dim // group_size
+    STATE_SIZE = ratio
+    eps = 1e-6
+    entry = head_dim
+    page_size = 1
+
+    cap = bs + 1
+    num_slots = num_blocks = num_tokens = bs
+
+    cos, sin = _hca_cos_sin(ratio + 4, rot_dim)
+    kv_in_bf = (torch.randn(num_tokens, head_dim) * 0.3).bfloat16()
+    score_in_bf = (torch.randn(num_tokens, head_dim) * 0.5).bfloat16()
+    kv_state = (torch.randn(num_slots, STATE_SIZE, head_dim) * 0.3).float()
+    score_state = (torch.randn(num_slots, STATE_SIZE, head_dim) * 0.5).float()
+    ape = (torch.randn(ratio, head_dim) * 0.2).float()
+    k_weight = (torch.randn(head_dim).abs() + 0.5).bfloat16()
+
+    state_slot_mapping = torch.randperm(num_slots).to(torch.int32)
+    block_table = torch.arange(num_blocks).view(num_blocks, 1).to(torch.int32)
+    plan = torch.full((cap, 4), -1, dtype=torch.int32)
+    for i in range(bs):
+        plan[i, 0] = i
+        plan[i, 1] = i
+        plan[i, 2] = ratio - 1  # position -> comp slot ci = (ratio-1)//ratio = 0
+        plan[i, 3] = ratio - 1
+
+    # flydsl fp8 2-kernel: nope+scale fp8 entry buffer + separate bf16 rope buffer.
+    fly_nope_scale = torch.zeros(num_blocks, page_size, entry, dtype=dtypes.fp8)
+    fly_rope = torch.zeros(num_blocks, page_size, rot_dim, dtype=torch.bfloat16)
+    _, us_kernel = run_perftest(
+        flydsl_hca_compress_attn,
+        kv_in=kv_in_bf,
+        score_in=score_in_bf,
+        kv_state=kv_state,
+        score_state=score_state,
+        state_slot_mapping=state_slot_mapping,
+        plan_gpu=plan,
+        ape=ape,
+        rms_weight=k_weight,
+        rms_eps=eps,
+        cos_cache=cos,
+        sin_cache=sin,
+        kv_cache=fly_nope_scale,
+        block_tables=block_table,
+        k_per_block=page_size,
+        ratio=ratio,
+        head_dim=head_dim,
+        rope_head_dim=rot_dim,
+        quant=True,
+        k_rope_cache=fly_rope,
+        quant_group_size=group_size,
+    )
+
+    # Fully-independent pure-torch reference: torch pool + norm + rope + e8m0
+    # group-quant, emitting the SAME nm-asm layout (entry fp8 + separate rope buf).
+    ref_nope_scale = torch.zeros(num_blocks, page_size, entry, dtype=dtypes.fp8)
+    ref_rope = torch.zeros(num_blocks, page_size, rot_dim, dtype=torch.bfloat16)
+    fused_compress_attn_reference(
+        kv_in=kv_in_bf,
+        score_in=score_in_bf,
+        kv_state=kv_state,
+        score_state=score_state,
+        plan_gpu=plan,
+        state_slot_mapping=state_slot_mapping,
+        ape=ape,
+        rms_weight=k_weight,
+        rms_eps=eps,
+        cos_cache=cos,
+        sin_cache=sin,
+        kv_cache=ref_nope_scale,
+        block_tables=block_table,
+        k_per_block=page_size,
+        overlap=False,
+        ratio=ratio,
+        head_dim=head_dim,
+        rope_head_dim=rot_dim,
+        group_quant=True,
+        quant_group_size=group_size,
+        k_rope_buff=ref_rope,
+    )
+
+    fly_nope, fly_sc, fly_pe = _gather_nm_fp8(
+        fly_nope_scale, fly_rope, block_table, bs, nope_dim, n_groups
+    )
+    ref_nope, ref_sc, ref_pe = _gather_nm_fp8(
+        ref_nope_scale, ref_rope, block_table, bs, nope_dim, n_groups
+    )
+
+    fly_sf = (fly_sc.to(torch.int32) << 23).view(torch.float32)
+    ref_sf = (ref_sc.to(torch.int32) << 23).view(torch.float32)
+    fly_deq = fly_nope.float() * fly_sf.unsqueeze(-1).expand(
+        bs, n_groups, group_size
+    ).reshape(bs, nope_dim)
+    ref_deq = ref_nope.float() * ref_sf.unsqueeze(-1).expand(
+        bs, n_groups, group_size
+    ).reshape(bs, nope_dim)
+    msg = f"hca_main/fp8 bs={bs}"
+    # nope: fp8 group-quant -> a few elements near an fp8 code boundary round to the
+    # adjacent code (1-ulp). Gate at <=5% mismatched (matches the quant path tolerance).
+    e_nope = checkAllclose(
+        fly_deq,
+        ref_deq,
+        atol=0.05,
+        rtol=0.02,
+        tol_err_ratio=0.05,
+        msg=f"{msg} nope(fp8 deq)",
+    )
+    # e8m0 group scale: reference mirrors the kernel's RoundUp e8m0, expect +-1 step.
+    checkAllclose(
+        fly_sc.float(), ref_sc.float(), atol=1.0, rtol=0.0, msg=f"{msg} scale(e8m0 +-1)"
+    )
+    checkAllclose(
+        fly_pe.float(), ref_pe.float(), atol=0.02, rtol=0.02, msg=f"{msg} rope(bf16)"
+    )
+    # Dominant traffic: per boundary pool `ratio` tokens from kv + score (bf16),
+    # write the fp8 nope+scale entry + bf16 rope.
+    nbytes = bs * (
+        ratio * head_dim * 2 * kv_in_bf.element_size()
+        + entry * fly_nope_scale.element_size()
+        + rot_dim * fly_rope.element_size()
+    )
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": nbytes / us_kernel / 1e6,
+        "err_pct": e_nope,
+    }
+
+
+@benchmark()
+def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
+    """CSA Main FP8 nm-asm group-quant: single-kernel ``flydsl_fused_compress_attn``
+    (overlap=True, ratio=4, quant_mode='group_fp8') writes the V4 nm layout (nope fp8 +
+    inline dup e8m0 + separate bf16 rope) -- byte-compatible with HCA Main. Validated
+    against the shared pure-torch ``fused_compress_attn_reference(group_quant=True)``.
+    """
+    shape = _shape_by_label("csa_main")
+    _, D, RD, ratio, overlap, *_ = shape
+    G = 64
+    nope_dim = D - RD
+    n_groups = nope_dim // G
+    inp = _build_inputs(shape, bs, mtp, "decode")
+    nb = inp["kv_cache"].shape[0]
+    kpb = inp["k_per_block"]
+
+    common = dict(
+        kv_in=inp["kv_in"],
+        score_in=inp["score_in"],
+        kv_state=inp["kv_state"],
+        score_state=inp["score_state"],
+        plan_gpu=inp["plan_gpu"],
+        state_slot_mapping=inp["state_slot_mapping"],
+        ape=inp["ape"],
+        rms_weight=inp["rms_weight"],
+        rms_eps=inp["rms_eps"],
+        cos_cache=inp["cos_cache"],
+        sin_cache=inp["sin_cache"],
+        block_tables=inp["block_tables"],
+        k_per_block=kpb,
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=D,
+        rope_head_dim=RD,
+    )
+
+    fly_entry = torch.zeros(nb, kpb, D, dtype=dtypes.fp8)
+    fly_rope = torch.zeros(nb, kpb, RD, dtype=torch.bfloat16)
+    _, us_kernel = run_perftest(
+        flydsl_fused_compress_attn,
+        **common,
+        kv_cache=fly_entry,
+        quant=True,
+        quant_mode="group_fp8",
+        preshuffle=False,
+        cache_scale=None,
+        k_rope_cache=fly_rope,
+    )
+
+    ref_entry = torch.zeros(nb, kpb, D, dtype=dtypes.fp8)
+    ref_rope = torch.zeros(nb, kpb, RD, dtype=torch.bfloat16)
+    fused_compress_attn_reference(
+        kv_in=inp["kv_in"],
+        score_in=inp["score_in"],
+        kv_state=inp["kv_state"],
+        score_state=inp["score_state"],
+        plan_gpu=inp["plan_gpu"],
+        state_slot_mapping=inp["state_slot_mapping"],
+        ape=inp["ape"],
+        rms_weight=inp["rms_weight"],
+        rms_eps=inp["rms_eps"],
+        cos_cache=inp["cos_cache"],
+        sin_cache=inp["sin_cache"],
+        kv_cache=ref_entry,
+        block_tables=inp["block_tables"],
+        k_per_block=kpb,
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=D,
+        rope_head_dim=RD,
+        group_quant=True,
+        quant_group_size=G,
+        k_rope_buff=ref_rope,
+    )
+
+    bt = inp["block_tables"]
+    fly_nope, fly_sc, fly_pe = _gather_nm_fp8(
+        fly_entry, fly_rope, bt, bs, nope_dim, n_groups
+    )
+    ref_nope, ref_sc, ref_pe = _gather_nm_fp8(
+        ref_entry, ref_rope, bt, bs, nope_dim, n_groups
+    )
+    fly_sf = (fly_sc.to(torch.int32) << 23).view(torch.float32)
+    ref_sf = (ref_sc.to(torch.int32) << 23).view(torch.float32)
+    fly_deq = fly_nope.float() * fly_sf.unsqueeze(-1).expand(bs, n_groups, G).reshape(
+        bs, nope_dim
+    )
+    ref_deq = ref_nope.float() * ref_sf.unsqueeze(-1).expand(bs, n_groups, G).reshape(
+        bs, nope_dim
+    )
+    msg = f"csa_main/nm_asm_fp8 bs={bs}"
+    e_nope = checkAllclose(
+        fly_deq, ref_deq, atol=0.05, rtol=0.02, tol_err_ratio=0.05, msg=f"{msg} nope"
+    )
+    checkAllclose(
+        fly_sc.float(), ref_sc.float(), atol=1.0, rtol=0.0, msg=f"{msg} scale(e8m0 +-1)"
+    )
+    checkAllclose(
+        fly_pe.float(), ref_pe.float(), atol=0.02, rtol=0.02, msg=f"{msg} rope(bf16)"
+    )
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": inp["nbytes"] / us_kernel / 1e6,
+        "err_pct": e_nope,
+    }
+
+
+def main():
+    # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
+    # outside the validated set.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl compress_attn unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-s",
+        "--shapes",
+        type=str,
+        nargs="*",
+        default=[s[0] for s in SHAPES],
+        choices=[s[0] for s in SHAPES],
+        help="""Shape labels to run.
+        e.g.: -s csa_main hca_main""",
+    )
+    parser.add_argument(
+        "-b",
+        "--bs",
+        type=int,
+        nargs="*",
+        default=[1, 2, 4, 8, 16, 32, 65, 128, 256, 512],
+        help="""Batch sizes.
+        e.g.: -b 1 32 512""",
+    )
+    parser.add_argument(
+        "-m",
+        "--mtp",
+        type=int,
+        nargs="*",
+        default=[0, 3],
+        help="""Speculative-decode step counts (decode mode: num_per_seq = mtp+1).
+        Ignored in prefill mode.
+        e.g.: -m 0 3""",
+    )
+    parser.add_argument(
+        "--prefill-bs",
+        type=int,
+        nargs="*",
+        default=[1, 4, 32],
+        help="""Batch sizes for prefill mode (prefill ragged tokens = bs*context_len
+        grows fast; trimmed list by default).
+        e.g.: --prefill-bs 1 4 32""",
+    )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        nargs="*",
+        default=["decode", "prefill"],
+        choices=["decode", "prefill"],
+        help="""Which modes to sweep.""",
+    )
+    parser.add_argument(
+        "--fp8-bs",
+        type=int,
+        nargs="*",
+        default=[1, 16, 32, 64, 256, 1024],
+        help="""Batch sizes for the HCA fp8 cross-check (flydsl 2-kernel fp8 vs C++).
+        plan_capacity=bs+1 -> spans the k_waves packing policy (bs<=31 kw4,
+        32..1022 kw1, >=1023 kw4). Set to empty to skip the fp8 sweep.
+        e.g.: --fp8-bs 1 64 1024""",
+    )
+    parser.add_argument(
+        "--csa-fp8-bs",
+        type=int,
+        nargs="*",
+        default=[1, 16, 64, 256],
+        help="""Batch sizes for the CSA Main nm-asm fp8 group-quant check (flydsl
+        single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
+    )
+
+    args = parser.parse_args()
+
+    def summarize(name, rows):
+        if rows:
+            aiter.logger.info(
+                "%s summary (markdown):\n%s",
+                name,
+                pd.DataFrame(rows).to_markdown(index=False),
+            )
+
+    # --- Table 1: bf16/fp8 compress_attn sweep (decode + prefill) ---
+    main_rows = []
+    for mode in args.modes:
+        bs_list = args.bs if mode == "decode" else args.prefill_bs
+        mtp_list = args.mtp if mode == "decode" else [0]  # prefill: mtp irrelevant
+        # Sweep order (slowest -> fastest changing): shape -> mtp -> bs.
+        for shape_label, mtp, bs in itertools.product(args.shapes, mtp_list, bs_list):
+            main_rows.append(
+                test_flydsl_compress_attn(shape_label, bs, mtp, mode, "single")
+            )
+            if shape_label == "hca_main":
+                main_rows.append(
+                    test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel")
+                )
+    summarize("flydsl_compress_attn", main_rows)
+
+    # The fp8 nm-asm cross-checks have their own arg shape, so each gets its own
+    # table (forcing them into the main table would just scatter NaN columns).
+    # They are wave64-only (never validated on gfx1250/wave32).
+    if get_gfx() == "gfx1250":
+        aiter.logger.warning("gfx1250: skipping wave64-only fp8 nm-asm cross-checks")
+        return
+
+    # --- Table 2: HCA fp8 (flydsl 2-kernel fp8 vs pure-torch reference) ---
+    summarize("flydsl_hca_fp8", [test_flydsl_hca_fp8(bs) for bs in args.fp8_bs])
+
+    # --- Table 3: CSA Main nm-asm fp8 (flydsl single-kernel group-quant vs torch) ---
+    summarize(
+        "flydsl_csa_nm_asm_fp8",
+        [test_flydsl_csa_nm_asm_fp8(bs) for bs in args.csa_fp8_bs],
+    )
+
+
+if __name__ == "__main__":
+    main()

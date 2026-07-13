@@ -235,15 +235,6 @@ def bwd(
             "softcap is not supported in the AMD Triton FA2 interface (expected 0.0)."
         )
 
-    # Check for sliding window - backward doesn't support it yet
-    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
-    if is_sliding_window:
-        raise NotImplementedError(
-            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
-            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
-            f"Use window_size=(-1, -1) for full attention."
-        )
-
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
@@ -328,6 +319,8 @@ def bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
 
     if DEBUG:
@@ -582,14 +575,6 @@ def varlen_bwd(
             "softcap is not supported in varlen_bwd (expected 0.0)."
         )
 
-    is_sliding_window = (window_size_left >= 0) or (window_size_right >= 0)
-    if is_sliding_window:
-        raise NotImplementedError(
-            f"Sliding window attention is not yet supported in the AMD Triton backward pass "
-            f"(window_size_left={window_size_left}, window_size_right={window_size_right}). "
-            f"Use window_size=(-1, -1) for full attention."
-        )
-
     if DEBUG:
         print()
         print("varlen_bwd")
@@ -676,6 +661,8 @@ def varlen_bwd(
         philox_offset=philox_offset,
         use_exp2=USE_EXP2,
         mode=BWD_MODE,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
     )
 
     if DEBUG:

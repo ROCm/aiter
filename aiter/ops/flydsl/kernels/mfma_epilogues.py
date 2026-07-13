@@ -223,7 +223,7 @@ def c_shuffle_epilog(
         # -- read phase (each group reads from its own LDS buffer) --
         tx_local = tx - arith.select(_is_group_b, _half_thr_idx, _zero_idx)
         c_nlane_s = arith.constant(CShuffleNLane_s, index=True)
-        m_lane_s = tx_local / c_nlane_s
+        m_lane_s = tx_local // c_nlane_s
         n_lane_s = tx_local % c_nlane_s
         c_evec = arith.constant(EVec, index=True)
 
