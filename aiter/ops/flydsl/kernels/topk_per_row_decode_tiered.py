@@ -65,6 +65,8 @@ from flydsl.expr.typing import T
 BLOCK_THREADS = 1024
 WARP_SIZE = 64
 LOAD_VEC = 4
+# Default histogram-scan staging (one of 1/2/4/8)
+SCAN_STAGES = 2
 
 # 128B-spaced inter-workgroup counter groups (32 int32 == 128B each), kept in the int32 workspace.
 COUNTER_STRIDE = 32
@@ -116,7 +118,7 @@ def create_topk_per_row_decode_tiered_kernel(
     *,
     top_k: int,
     bits_per_pass: int = 11,
-    scan_stages: int = 2,
+    scan_stages: int = SCAN_STAGES,
     tiered: bool = True,
     tiered_short_max: int = 16384,
     tiered_mid_cap: int = 16,

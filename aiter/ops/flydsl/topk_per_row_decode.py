@@ -10,6 +10,9 @@ import torch
 
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode_tiered import (
+    BLOCK_THREADS as _TIERED_BLOCK_THREADS,
+    LOAD_VEC as _TIERED_LOAD_VEC,
+    SCAN_STAGES as _TIERED_SCAN_STAGES,
     create_topk_per_row_decode_tiered_kernel,
     needs_workspace_zero,
     topk_workspace_slots,
@@ -20,11 +23,6 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 
 ##################################
-
-SUPPORTED_TOP_KS = (256, 512, 1024, 2048)
-_TIERED_BLOCK_THREADS = 1024
-_TIERED_LOAD_VEC = 4
-_TIERED_SCAN_STAGES = 2
 
 # Independent of K: K only affects the final O(K) index scatter, negligible vs
 # the O(L) scan.
@@ -311,11 +309,8 @@ def _validate_inputs(
         raise ValueError(f"numRows={numRows} exceeds logits rows={logits.shape[0]}")
     if numRows > indices.shape[0]:
         raise ValueError(f"numRows={numRows} exceeds indices rows={indices.shape[0]}")
-    if k not in SUPPORTED_TOP_KS:
-        raise NotImplementedError(
-            f"FlyDSL decode TopK only accepts compile-time k in "
-            f"{SUPPORTED_TOP_KS}, got {k}"
-        )
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
     if ordered:
         raise ValueError(
             "FlyDSL decode TopK returns unordered set output only; "

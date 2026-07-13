@@ -198,6 +198,13 @@ _EQUIVALENCE_SCENARIOS = {
     "nextn4-k512-short-rows8": (512, 8, 4, 4096, "random", True),
     "nextn4-k2048-mid-rows8": (2048, 8, 4, 32769, "random", True),
     "nextn2-k1024-long-rows4": (1024, 4, 2, 120003, "ties", True),
+    # arbitrary (non-power-of-2) K -- the kernel is k-independent; tiny / odd /
+    # >2048 K across short, long, and direct-fill (L <= k) tiers.
+    "arbitrary-k1-long": (1, 1, 1, 120003, "random", True),
+    "arbitrary-k7-short": (7, 1, 1, 8192, "random", True),
+    "arbitrary-k777-long": (777, 1, 1, 120003, "random", True),
+    "arbitrary-k3000-long": (3000, 1, 1, 120003, "random", True),
+    "arbitrary-k3000-directfill": (3000, 1, 1, 2000, "random", True),
 }
 
 
@@ -345,10 +352,10 @@ def test_num_rows_subset_leaves_extra_untouched():
     ("logits_dtype", "call_kwargs", "exc"),
     [
         (torch.float32, {"k": 512, "ordered": True}, ValueError),
-        (torch.float32, {"k": 777}, NotImplementedError),
+        (torch.float32, {"k": 0}, ValueError),
         (torch.float16, {"k": 512}, TypeError),
     ],
-    ids=["ordered-true", "unsupported-k", "fp16-logits"],
+    ids=["ordered-true", "nonpositive-k", "fp16-logits"],
 )
 def test_invalid_args_rejected(logits_dtype, call_kwargs, exc):
     k = call_kwargs["k"]
