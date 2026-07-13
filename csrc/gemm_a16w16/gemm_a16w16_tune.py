@@ -52,7 +52,10 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../opus_gemm")
     if _opus_csrc not in sys.path:
         sys.path.insert(0, os.path.abspath(_opus_csrc))
-    from opus_gemm_common import kernels_list as _opus_kernels_list
+    from opus_gemm_common import (
+        SPLITK_KIDS as _opus_splitk_kids,
+        kernels_list as _opus_kernels_list,
+    )
     from opus_gemm_tune import (
         candidate_kids_for_shape as _opus_candidate_kids_for_shape,
         candidate_splitK as _opus_candidate_splitK,
@@ -68,6 +71,7 @@ try:
 except Exception as _opus_exc:
     _opus_gemm_a16w16_tune = None
     _opus_all_kernels = None
+    _opus_splitk_kids = frozenset()
     _opus_candidate_kids_for_shape = None
     _opus_kid_rejects_shape = None
     _opus_kid_rejects_bias = None
@@ -84,6 +88,17 @@ try:
 except Exception as _hipb_exc:
     HipblasltGemm = None
     HIPBLASLT_TUNE_ERROR = str(_hipb_exc)
+
+# ---------------------------------------------------------------------------
+# Tolerance helpers
+# ---------------------------------------------------------------------------
+
+
+def _default_tol(outdtype):
+    """Return (rtol, atol) for the given output dtype."""
+    tol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+    return tol, tol
+
 
 # ---------------------------------------------------------------------------
 # Data generation & reference
@@ -505,8 +520,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     eval(indtype),
                     eval(outdtype),
                 )
-                _atol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
-                _rtol = _atol
+                _rtol, _atol = _default_tol(eval(outdtype))
                 err_ratio = checkAllclose(
                     out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
                 )
@@ -582,8 +596,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             return []
         asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_fp32bf16.csv"
         asm_kernels = get_asm_kernels(asm_kernel_list_csv, is_shuffle)
-        rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
-        atol = rtol
+        rtol, atol = _default_tol(outdtype)
         tasks = []
         solidx = 0
         for key in asm_kernels.keys():
@@ -652,6 +665,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
         cu_num = get_cu_num()
+        rtol, atol = _default_tol(outdtype)
         cand_kids = _opus_candidate_kids_for_shape(M, N, K, has_bias, cu_num)
         tasks = []
         for kid in sorted(cand_kids):
@@ -662,7 +676,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
-            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+            if kid in _opus_splitk_kids:
                 splitK_range = _opus_candidate_splitK(M, N, K, 1, cu_num, k_inst)
             else:
                 splitK_range = [0]
@@ -684,8 +698,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         ),
                         {},
                         None,
-                        2e-2,
-                        1.0,
+                        rtol,
+                        atol,
                         None,
                         None,
                         ("out_asm",),
@@ -703,8 +717,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         if scaleAB or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
-        atol = rtol
+        rtol, atol = _default_tol(outdtype)
         flydsl_catalog = get_flydsl_bf16_catalog(M, N, K)
         weight_key = "shuffleweights" if is_shuffle else "weights"
         min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
@@ -767,7 +780,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         _, _, native_is_skinny = get_native_gemm_funcs()
         if not native_is_skinny(M, N, K, indtype):
             return []
-        rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        rtol, _ = _default_tol(outdtype)
         info = (info_keys, 2, 0, "sol2", "skinny", is_shuffle)
         return [
             (
@@ -794,7 +807,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         if indtype not in [dtypes.fp16, dtypes.bf16, dtypes.fp8]:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        rtol, _ = _default_tol(outdtype)
         info = (info_keys, 0, 0, "native", "torch", is_shuffle)
         return [
             (
@@ -819,7 +832,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         if scaleAB or is_shuffle or outdtype == dtypes.fp32 or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        rtol, _ = _default_tol(outdtype)
         info = (info_keys, 0, 0, "auto", "triton", is_shuffle)
         return [
             (
@@ -856,6 +869,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
             return []
         indtype = eval(ds["dtype"])
         outdtype = eval(ds["outdtype"])
+        rtol, atol = _default_tol(outdtype)
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         gemmobj = HipblasltGemm(
@@ -873,6 +887,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
             num_warmup=10,
             timeout=args.timeout,
             verbose=args.verbose,
+            rtol=rtol,
+            atol=atol,
         )
         rets = gemmobj.run_solutions()
         gemmobj.cleanup()

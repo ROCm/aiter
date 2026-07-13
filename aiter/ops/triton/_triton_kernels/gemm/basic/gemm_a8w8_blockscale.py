@@ -349,18 +349,26 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_b_scale_n = offs_bsn // GROUP_N
+        # When the scale block covers the whole tile (GROUP_N >= BLOCK_SIZE_N and
+        # GROUP_K >= BLOCK_SIZE_K) every element shares one scalar b_scale.
+        if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
+            offs_b_scale_n = (pid_n * BLOCK_SIZE_N) // GROUP_N
+        else:
+            offs_b_scale_n = offs_bsn // GROUP_N
         b_scale_ptrs = (
             b_scale_ptr
             + offs_k_scale * stride_bscale_k
             + offs_b_scale_n * stride_bscale_n
         )
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+            # Load the per-K-tile block scales up-front
+            a_scale = tl.load(a_scale_ptrs)
+            b_scale = tl.load(b_scale_ptrs)
+
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -388,16 +396,18 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
                 .trans(1, 0)
             )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
-
-            # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+            if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
+                accumulator += tl.dot(a, b) * (a_scale * b_scale)[:, None]
+            else:
+                accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale[None, :])
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
 
+            offs_ks_step = (
+                k + 1
+            ) * BLOCK_SIZE_K // GROUP_K - k * BLOCK_SIZE_K // GROUP_K
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
@@ -421,8 +431,9 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
+    backend: str | None = None,
 ):
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
 
-    return get_gemm_config(config_name, M, N, K)
+    return get_gemm_config(config_name, M, N, K, backend=backend)

@@ -445,7 +445,7 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = arch_info.get_arch() == "gfx1250"
+    use_gluon = False  # arch_info.get_arch() == "gfx1250" TODO: (Satya) revert after upstream triton is fixed
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
@@ -564,6 +564,7 @@ def gemm_afp4wfp4_preshuffle(
         ),
     )
 
+    config.pop("NUM_BUFFERS", None)
     _triton_gemm_afp4wfp4_preshuffle_kernel[grid](
         x_fp4,
         w_preshuf,
