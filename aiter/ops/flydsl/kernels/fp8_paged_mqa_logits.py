@@ -411,7 +411,7 @@ def flydsl_fp8_paged_mqa_logits(
     *,
     Preshuffle=False,
     KVBlockSize=1,
-    ChunkK=256,
+    ChunkK=_BLOCK_KV,
     SplitKV=None,
     WavePerEU=2,
     TotalCuCount=None,
@@ -440,8 +440,8 @@ def flydsl_fp8_paged_mqa_logits(
                   own disjoint, gap-free BKV-aligned column ranges (one writer
                   per column, no cross-CTA reduction).
     WavePerEU/TotalCuCount: inputs to the auto-SplitKV formula.
-    ChunkK:       accepted for Triton-contract parity; ignored here (the FlyDSL
-                  kernel tiles the KV window at a fixed ``block_kv`` width).
+    ChunkK:       KV tile width (must be a multiple of MFMA_N=32). Mirrors
+                  the Triton ChunkK parameter. Defaults to 128.
 
     Returns the same ``out_logits`` tensor (written in place).
     """
@@ -453,6 +453,10 @@ def flydsl_fp8_paged_mqa_logits(
         raise NotImplementedError(
             "FlyDSL paged fp8_mqa_logits supports KVBlockSize==1 only "
             f"(got KVBlockSize={KVBlockSize})."
+        )
+    if ChunkK % MFMA_N != 0:
+        raise ValueError(
+            f"ChunkK={ChunkK} must be a multiple of MFMA_N={MFMA_N}."
         )
 
     batch_size, next_n, num_heads, head_size = q_fp8.shape
@@ -507,7 +511,7 @@ def flydsl_fp8_paged_mqa_logits(
     launcher = compile_fp8_paged_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
-        block_kv=_BLOCK_KV,
+        block_kv=ChunkK,
         variant=variant,
         scale_mul=scale_mul,
         convert_q_fn=convert_q_fn,
