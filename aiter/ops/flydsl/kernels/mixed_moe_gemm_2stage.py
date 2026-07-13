@@ -3003,25 +3003,14 @@ def compile_mixed_moe_gemm2(
 
     out_s = str(out_dtype).strip().lower()
     if const_expr(
-        out_s
-        not in (
-            "f16",
-            "fp16",
-            "half",
-            "bf16",
-            "bfloat16",
-            "f32",
-            "fp32",
-            "float",
-            "fp8",
-        )
+        out_s not in ("f16", "fp16", "half", "bf16", "bfloat16", "f32", "fp32", "float", "fp8")
     ):
         raise ValueError(
             f"out_dtype must be 'f16', 'bf16', 'f32', or 'fp8', got {out_dtype!r}"
         )
     out_is_f32 = out_s in ("f32", "fp32", "float")
-    out_is_bf16 = out_s in ("bf16", "bfloat16")
     need_fp8_out = out_s == "fp8"
+    out_is_bf16 = out_s in ("bf16", "bfloat16") or need_fp8_out
     if const_expr(need_fp8_out and bool(accumulate)):
         raise ValueError(
             "compile_mixed_moe_gemm2 fp8 output requires accumulate=False (reduce path)"
@@ -3103,11 +3092,8 @@ def compile_mixed_moe_gemm2(
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}{cumul_tag}{xcd_tag}{acc_tag}"
     ).replace("-", "_")
-    cshuffle_elem_bytes = 2
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-    lds_out_bytes = (
-        cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
-    )
+    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes + lds_tw_bytes
@@ -3251,9 +3237,7 @@ def compile_mixed_moe_gemm2(
                 SmemPtr(
                     base_ptr,
                     lds_x_ptr.byte_offset,
-                    # fp8 output stages bf16 in LDS (re-widened to f32 in the
-                    # epilogue before quantization); f16 output stages f16.
-                    (T.bf16 if (need_fp8_out or out_is_bf16) else T.f16),
+                    (T.bf16 if out_is_bf16 else T.f16),
                     shape=(tile_m * tile_n,),
                 ).get()
                 if _use_cshuffle_epilog
@@ -3261,11 +3245,7 @@ def compile_mixed_moe_gemm2(
             )
 
             lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-            lds_out_b = (
-                cshuffle_elem_bytes * int(tile_m) * int(tile_n)
-                if _use_cshuffle_epilog
-                else 0
-            )
+            lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
             lds_tid_off = max(lds_x_b, lds_out_b)
             lds_tid = SmemPtr(
                 base_ptr, lds_x_ptr.byte_offset + lds_tid_off, T.i32, shape=(tile_m,)
@@ -3301,23 +3281,22 @@ def compile_mixed_moe_gemm2(
             out_row_bytes_const = int(model_dim) * int(out_elem_bytes) + int(
                 scale_bytes_per_row
             )
+            out_nbytes_idx = (
+                tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
+            )
+            if const_expr(not bool(accumulate)):
+                out_nbytes_idx = (
+                    tokens_in
+                    * arith.index(topk)
+                    * n_in
+                    * arith.constant(out_elem_bytes, index=True)
+                )
             if const_expr(need_fp8_out):
                 out_nbytes_idx = (
                     tokens_in
                     * arith.index(topk)
                     * arith.constant(out_row_bytes_const, index=True)
                 )
-            else:
-                out_nbytes_idx = (
-                    tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
-                )
-                if const_expr(not bool(accumulate)):
-                    out_nbytes_idx = (
-                        tokens_in
-                        * arith.index(topk)
-                        * n_in
-                        * arith.constant(out_elem_bytes, index=True)
-                    )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
             out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
 
@@ -4585,11 +4564,8 @@ def compile_mixed_moe_gemm2(
                             v = v * tw
 
                         lds_idx = row_base_lds + col_local
-                        # fp8 output stages bf16 (re-widened to f32 + quantized
-                        # in store_pair); bf16/f16 stage their own dtype.
-                        stage_elem = T.bf16 if need_fp8_out else out_elem()
-                        v_out = arith.trunc_f(stage_elem, v)
-                        vec1_out = T.vec(1, stage_elem)
+                        v_out = arith.trunc_f(out_elem(), v)
+                        vec1_out = T.vec(1, out_elem())
                         v1 = vector.from_elements(vec1_out, [v_out])
                         vector.store(v1, lds_out, [lds_idx], alignment=2)
 
@@ -4783,9 +4759,7 @@ def compile_mixed_moe_gemm2(
                     n_tile_base=n_tile_base,
                     lds_out=lds_out,
                     frag_elem_type=(
-                        ir.BF16Type.get()
-                        if (need_fp8_out or out_is_bf16)
-                        else ir.F16Type.get()
+                        ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get()
                     ),
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
