@@ -92,6 +92,25 @@ void fused_qk_norm_rope_1way(aiter_tensor_t& q,
                              aiter_tensor_t& out_q,
                              aiter_tensor_t& out_k);
 
+void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
+                                               aiter_tensor_t& k,
+                                               aiter_tensor_t& w_q,
+                                               aiter_tensor_t& w_k,
+                                               aiter_tensor_t& cos_sin,
+                                               int64_t batch_size,
+                                               int64_t num_tokens,
+                                               int64_t num_heads_q,
+                                               int64_t num_heads_k,
+                                               int64_t head_size,
+                                               bool is_interleaved,
+                                               double eps,
+                                               aiter_tensor_t& q_fp8,
+                                               aiter_tensor_t& k_fp8,
+                                               aiter_tensor_t& q_descale,
+                                               aiter_tensor_t& k_descale,
+                                               aiter_tensor_t& q_unquantized,
+                                               aiter_tensor_t& k_unquantized);
+
 // Same signature as the pertensor variant, but writes per-(batch, head) descales:
 //   q_descale shape [batch_size, num_heads_q]
 //   k_descale shape [batch_size, num_heads_k]
@@ -125,6 +144,11 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
 // v0/v1: [B, T0/T1, H, D]; v_fp8: [B, T0+T1, H, D]; v_descale: [B, H].
 void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
                                aiter_tensor_t& v1,
+                               aiter_tensor_t& v_fp8,
+                               aiter_tensor_t& v_descale);
+
+// Per-(batch, head) FP8 quant for single-stream V [B, T, H, D].
+void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
                                aiter_tensor_t& v_fp8,
                                aiter_tensor_t& v_descale);
 
