@@ -257,16 +257,22 @@ kernels_list_cktile_95x = {
      7:   tileKernelInstance(   256,     256,      128,     4,        2,       1,        16,            16,      "Intrawave",        False,            True,            False,             2,     ),
 }
 
-arch = get_gfx()
-if arch.startswith("gfx95"):
-    kernels_list_cktile = kernels_list_cktile_95x
-else:
-    kernels_list_cktile = kernels_list_cktile_942
+default_kernels_dict_cktile_942 = {
+    (-1):  tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,      "Intrawave",        False,            False,           False,             1      ),
+}
 
-default_kernels_dict_cktile = {
+default_kernels_dict_cktile_95x = {
     (-1):  tileKernelInstance(    16,     128,      256,     1,        4,       1,        16,            16,      "Intrawave",        False,            False,           False,             1      ),
     (-2):  tileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,      "Intrawave",        False,            True,            False,             2,     ),
     (-3):  tileKernelInstance(   256,     256,      128,     4,        2,       1,        16,            16,      "Intrawave",        False,            True,            False,             2,     ),
 }
+
+arch = get_gfx()
+if arch.startswith("gfx95"):
+    kernels_list_cktile = kernels_list_cktile_95x
+    default_kernels_dict_cktile = default_kernels_dict_cktile_95x
+else:
+    kernels_list_cktile = kernels_list_cktile_942
+    default_kernels_dict_cktile = default_kernels_dict_cktile_942
 
 # fmt: on
