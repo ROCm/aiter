@@ -721,9 +721,10 @@ def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
         return {}
     shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant_mode, ue8m0, _ = shape
-    assert quant_mode in ("fp8", "fp4"), (
-        f"{shape_label} quant_mode={quant_mode!r} is not a quantized indexer shape"
-    )
+    assert quant_mode in (
+        "fp8",
+        "fp4",
+    ), f"{shape_label} quant_mode={quant_mode!r} is not a quantized indexer shape"
 
     def _check(out_cache, out_scale, ref_cache, ref_scale, m):
         if quant_mode == "fp4":
