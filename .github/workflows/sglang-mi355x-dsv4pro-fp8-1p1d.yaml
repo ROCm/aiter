@@ -170,8 +170,12 @@ jobs:
           hostname
           whoami
           pwd
-          command -v salloc
-          salloc --help | head -80 || true
+          if command -v salloc >/dev/null 2>&1; then
+            command -v salloc
+            salloc --help | head -80 || true
+          else
+            echo "salloc not found; this runner may expose only the SPUR-compatible srun path"
+          fi
           command -v srun
           srun --help | head -80 || true
           command -v squeue
@@ -260,8 +264,13 @@ jobs:
             echo "RUNNER_NAME unset; skipping stale cleanup"
             exit 0
           fi
+          list_user_jobs() {
+            squeue -u "${USER}" --noheader --format="%i %200j" 2>/dev/null \
+              || squeue -u "${USER}" 2>/dev/null \
+              || true
+          }
           STALE_JOBS="$(
-            squeue -u "${USER}" --noheader --format="%i %200j" \
+            list_user_jobs \
               | grep -F "mi355x-ci-${RUNNER_NAME}-" \
               | awk '{print $1}' || true
           )"
@@ -361,9 +370,14 @@ jobs:
             echo "RUNNER_NAME unset; skipping Slurm cleanup"
             exit 0
           fi
+          list_user_jobs() {
+            squeue -u "${USER}" --noheader --format="%i %200j" 2>/dev/null \
+              || squeue -u "${USER}" 2>/dev/null \
+              || true
+          }
           JOB_TAG="mi355x-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-dsv4pro-fp8-mi355x-sglang"
           ACTIVE_JOBS="$(
-            squeue -u "${USER}" --noheader --format="%i %200j" \
+            list_user_jobs \
               | grep -F "${JOB_TAG}" \
               | awk '{print $1}' || true
           )"

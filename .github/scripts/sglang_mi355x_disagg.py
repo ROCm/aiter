@@ -154,10 +154,178 @@ PARTITION_ARG=()
     )
     text = replace_once(
         text,
+        """WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
+mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+PNODES=("${NODES[@]:0:PW}")
+DNODES=("${NODES[@]:PW:DW}")
+PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
+PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
+DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+""",
+        """WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
+
+DRIVE_LOCK="$WORKDIR/drive.lock"
+if ! mkdir "$DRIVE_LOCK" 2>/dev/null; then
+  echo "[drive] another launcher instance already owns $DRIVE_LOCK; exiting duplicate task"
+  exit 0
+fi
+trap 'rmdir "$DRIVE_LOCK" 2>/dev/null || true' EXIT
+
+expand_nodelist() {
+  local raw="$1"
+  if command -v scontrol >/dev/null 2>&1; then
+    scontrol show hostnames "$raw" 2>/dev/null && return 0
+  fi
+  python3 - "$raw" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+
+def split_top(value: str) -> list[str]:
+    parts, buf, depth = [], [], 0
+    for ch in value:
+        if ch == "," and depth == 0:
+            if buf:
+                parts.append("".join(buf))
+                buf = []
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]" and depth:
+            depth -= 1
+        buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+def expand_one(item: str) -> list[str]:
+    match = re.fullmatch(r"([^\\[]*)\\[([^\\]]+)\\](.*)", item)
+    if not match:
+        return [item] if item else []
+    prefix, body, suffix = match.groups()
+    expanded = []
+    for piece in body.split(","):
+        range_match = re.fullmatch(r"(\\d+)-(\\d+)", piece)
+        if range_match:
+            start_s, end_s = range_match.groups()
+            width = max(len(start_s), len(end_s))
+            start, end = int(start_s), int(end_s)
+            step = 1 if end >= start else -1
+            expanded.extend(
+                f"{prefix}{value:0{width}d}{suffix}"
+                for value in range(start, end + step, step)
+            )
+        else:
+            expanded.append(f"{prefix}{piece}{suffix}")
+    return expanded
+
+for part in split_top(raw):
+    for node in expand_one(part.strip()):
+        print(node)
+PY
+}
+
+RAW_NODELIST="${SLURM_JOB_NODELIST:-${SLURM_NODELIST:-${SPUR_JOB_NODELIST:-${SPUR_NODELIST:-}}}}"
+if [[ -z "$RAW_NODELIST" ]]; then
+  echo "[drive] ERROR: no Slurm/SPUR nodelist env found" >&2
+  env | sort | grep -E '^(SLURM|SPUR)_' >&2 || true
+  exit 1
+fi
+mapfile -t NODES < <(expand_nodelist "$RAW_NODELIST")
+if (( ${#NODES[@]} < PW + DW )); then
+  echo "[drive] ERROR: need $((PW + DW)) nodes, got ${#NODES[@]} from $RAW_NODELIST: ${NODES[*]}" >&2
+  exit 1
+fi
+PNODES=("${NODES[@]:0:PW}")
+DNODES=("${NODES[@]:PW:DW}")
+PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
+PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
+DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
+PIP="${PIP:-$PNODE}"
+DIP="${DIP:-$DNODE}"
+
+run_on_node() {
+  local node="$1"
+  shift
+  local self_full self_short
+  self_full="$(hostname)"
+  self_short="$(hostname -s 2>/dev/null || hostname)"
+  if [[ "$node" == "$self_full" || "$node" == "$self_short" ]]; then
+    "$@"
+  else
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=30 "$node" "$@"
+  fi
+}
+""",
+    )
+    text = replace_once(
+        text,
+        """for n in "${PNODES[@]}"; do
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1
+    echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
+done
+for n in "${DNODES[@]}"; do
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1
+    echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
+done
+sleep 5
+""",
+        """for n in "${PNODES[@]}"; do
+  ( run_on_node "$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1
+    echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
+done
+for n in "${DNODES[@]}"; do
+  ( run_on_node "$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1
+    echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
+done
+sleep 5
+""",
+    )
+    text = replace_once(
+        text,
+        """# Each server's srun runs here on the login node and returns exactly when its
+# compute-node container exits. Wrap it so the return code lands in a marker
+# file on shared NFS. The monitor then watches for markers instead of polling
+# PIDs -- unambiguous (no zombie/kill -0 guesswork) and it records which role
+# died and with what code. (A hung-but-alive server is NOT caught here; that is
+# bounded by bench.sh's health-wait timeout.)
+""",
+        """# SPUR does not fully match Slurm's nested srun/--overlap behavior, so dispatch
+# per-node work through SSH after the outer srun reserves the nodes. Wrap each
+# command so the return code lands in a marker file on shared NFS. The monitor
+# then watches for markers instead of polling PIDs and records which role died.
+""",
+    )
+    text = replace_once(
+        text,
+        """( srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
+  echo $? > "$WORKDIR/bench_exit" ) &
+""",
+        """( run_on_node "$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
+  echo $? > "$WORKDIR/bench_exit" ) &
+""",
+    )
+    text = replace_once(
+        text,
+        """for n in "${PNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
+for n in "${DNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_decode  >/dev/null 2>&1 || true; done
+""",
+        """for n in "${PNODES[@]}"; do run_on_node "$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
+for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/null 2>&1 || true; done
+""",
+    )
+    text = replace_once(
+        text,
         """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
-        """srun "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+        """SINGLE_TASK_ARG=()
+if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])(-n,|--ntasks)'; then
+    SINGLE_TASK_ARG=(--ntasks=1)
+fi
+srun "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${SINGLE_TASK_ARG[@]}" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
     )
