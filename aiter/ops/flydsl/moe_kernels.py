@@ -220,6 +220,59 @@ def get_flydsl_stage2_kernels(
     return kernels
 
 
+def build_flydslv2_gemm2_name(
+    a_dtype, b_dtype, out_dtype, *, tm, epilog, persist, use_nt, sbm=0
+):
+    """反向拼 flydslv2 gemm2 kernel 名; tn/tk 固定 256 (非可 tune, 见 design 4.2)。
+    格式须与 mxfp4_kname._FLYDSL_V2_GEMM2_RE 一致。"""
+    name = f"flydslv2_moe2_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tm}x256x256_{epilog}"
+    if persist:
+        name += "_persist"
+    if use_nt:
+        name += "_nt"
+    if sbm:
+        name += f"_sbm{sbm}"
+    return name
+
+
+def get_flydsl_stage2_v2_kernels(a_dtype, b_dtype, out_dtype, block_m):
+    """flydslv2 gemm2 候选 (design 4.2). knob: tile_m(整除 block_m) x epilog x
+    use_nt x persist(fp4:{F,T}, fp8:{F}); tn=tk=256 固定; sbm=block_m。"""
+    kernels = {}
+    bms = [b for b in (16, 32, 64, 128) if b <= block_m and block_m % b == 0]
+    persists = [False, True] if a_dtype == "fp4" else [False]
+    for tm in bms:
+        for epilog in ("atomic", "reduce"):
+            for use_nt in (True, False):
+                for persist in persists:
+                    name = build_flydslv2_gemm2_name(
+                        a_dtype,
+                        b_dtype,
+                        out_dtype,
+                        tm=tm,
+                        epilog=epilog,
+                        persist=persist,
+                        use_nt=use_nt,
+                        sbm=block_m,
+                    )
+                    # NOTE: this params dict is an enumeration artifact; the kernel NAME is the canonical contract (v2 consumers re-parse the name via parse_flydsl_v2_gemm2_kernel).
+                    kernels[name] = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": 256,
+                        "tile_k": 256,
+                        "epilog": epilog,
+                        "use_nt": use_nt,
+                        "persist": persist,
+                        "sort_block_m": block_m,
+                        "v2": True,
+                    }
+    return kernels
+
+
 def _register_production_variants_stage2(
     kernels: dict[str, dict], a_dtype: str, b_dtype: str, out_dtype: str
 ) -> None:

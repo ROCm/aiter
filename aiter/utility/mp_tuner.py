@@ -91,7 +91,10 @@ def worker(
             ]
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
-                    if res[i].shape != ref[i].shape:
+                    # Skip generic reshape when a custom compare_fn is given: it
+                    # handles shape/dtype itself (e.g. v2 stage1 compares fp4-packed
+                    # uint8 res against unpacked bf16 ref -- different numel by design).
+                    if compare_fn is None and res[i].shape != ref[i].shape:
                         res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
                     if compare_fn is not None:
                         err_ratio = compare_fn(
