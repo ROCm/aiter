@@ -14,6 +14,8 @@ skewed sequence lengths.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -25,6 +27,8 @@ BLOCK_N = 128
 BLOCK_K = 64
 STAGES_A = 2
 THREADS = 256
+LDS_BYTES = 65536
+K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
 
 NXCD = 8
 XCD_W = 8
@@ -71,7 +75,8 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     return row, col
 
 
-_COMPILED_CACHE: dict = {}
+_COMPILED_CACHE_MAX = 64  # skew compact keys include tot; bound growth
+_COMPILED_CACHE: OrderedDict = OrderedDict()
 
 
 def _build_launcher(
@@ -117,9 +122,7 @@ def _build_launcher(
             if fx.const_expr(XCD_C > 1):
                 total_occ = fx.Int32(fx.grid_dim.x)
                 raw_xy = fx.Int32(raw_b) * total_occ + fx.Int32(pid_mn)
-                tile_row, n_col = _xcd_remap(
-                    raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W
-                )
+                tile_row, n_col = _xcd_remap(raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W)
                 tile_row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), tile_row))
                 block_n_idx = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), n_col))
             else:
@@ -473,6 +476,20 @@ def _drop_leaked_ir_contexts() -> None:
         pass
 
 
+def _cache_get(key):
+    cf = _COMPILED_CACHE.get(key)
+    if cf is not None:
+        _COMPILED_CACHE.move_to_end(key)
+    return cf
+
+
+def _cache_put(key, cf):
+    _COMPILED_CACHE[key] = cf
+    _COMPILED_CACHE.move_to_end(key)
+    while len(_COMPILED_CACHE) > _COMPILED_CACHE_MAX:
+        _COMPILED_CACHE.popitem(last=False)
+
+
 def jagged_dense_bmm(
     C,
     A,
@@ -505,6 +522,21 @@ def jagged_dense_bmm(
             block_k = BLOCK_K
     else:
         block_k = int(block_k)
+        if block_k <= 0 or block_k % K_TILE_GRAN != 0:
+            raise ValueError(
+                f"block_k must be a positive multiple of {K_TILE_GRAN}, got {block_k}"
+            )
+        if not use_mfma_k32 and block_k < 64:
+            raise ValueError(f"block_k must be >= 64 for MFMA 16x16x16, got {block_k}")
+        a_smem = BLOCK_M * block_k * STAGES_A * 2
+        epi_smem = max(a_smem, BLOCK_M * BLOCK_N * 2)
+        if epi_smem > LDS_BYTES:
+            raise ValueError(
+                f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
+                f"A-stage staging is {a_smem} bytes"
+            )
+        if K % block_k != 0:
+            raise ValueError(f"block_k={block_k} must divide K={K}")
     if xcd_c is None:
         if not uniform_seqlen:
             xcd_c = 1
@@ -544,7 +576,7 @@ def jagged_dense_bmm(
     )
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
 
-    cached = _COMPILED_CACHE.get(key)
+    cached = _cache_get(key)
     if cached is not None:
         return cached(*launch_args)
 
@@ -566,9 +598,9 @@ def jagged_dense_bmm(
         compact,
     )
     try:
-        _COMPILED_CACHE[key] = flyc.compile(launch, *launch_args)
+        _cache_put(key, flyc.compile(launch, *launch_args))
         return None
     except Exception:
+        # Mirrors moe_kernels._run_compiled: cleanup leaked ir.Context, re-raise.
         _drop_leaked_ir_contexts()
-        _COMPILED_CACHE[key] = launch
-        return launch(*launch_args)
+        raise
