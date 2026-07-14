@@ -3,6 +3,9 @@ name: Nightly SGLang MI355X DSV4Pro FP8 1P1D
 on:
   schedule:
     - cron: "43 18 * * *"
+  pull_request:
+    types: [labeled]
+    branches: [main]
   workflow_dispatch:
     inputs:
       sglang_ref:
@@ -88,6 +91,11 @@ env:
 
 jobs:
   sglang-dsv4pro-fp8-1p1d:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (github.event.label.name == 'ci:sglang' ||
+      github.event.label.name == 'ci:all'))
     runs-on: [self-hosted, aiter-di-ci-spur-login-sglang]
     timeout-minutes: 240
 
