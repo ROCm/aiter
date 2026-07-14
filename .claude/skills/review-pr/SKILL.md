@@ -113,6 +113,7 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
 - [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?)
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
+- [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 
 ---
 
@@ -402,6 +403,26 @@ Real example (PR#3773): `max_seqlen=-1` added in aiter; fix never activated unti
 PR changes KV layout, function signature, or data structure that `deepseek_v4_bridge.py` / `sglang_bridge.py` read directly.
 Real example (ATOM#1423): paged-SWA layout changed; bridge still used old layout.
 → `⚠️ E3: [structure] changed — plugin bridge sync needed`
+
+**E4 — Downstream CI skipped on a change downstream consumes** 🔴
+aiter's downstream tests (ATOM, SGLang, vLLM) are SKIPPED BY DEFAULT and only run when a label is added — `ci:atom` (DeepSeek-R1-0528, GPT-OSS-120B), `ci:sglang` (DeepSeek-R1-MXFP4, Qwen 3.5), `ci:vllm` (GPT-OSS-120B, DeepSeek-R1-0528, Kimi-K2.5), `ci:all` (all of the above), or `ci:atom_full` (ATOM accuracy suite; only for FlyDSL/Triton upgrades). A PR that changes an op a downstream consumes can pass every *aiter* check with the downstream job skipped, merge green, and break the downstream silently — visible only after merge.
+Which label (be precise, do not reflexively pick `ci:all`):
+1. **Dispatch reachability** — is the changed/new kernel wired into a default dispatch path? A pure-additive, arch-gated kernel not in any default path is unreachable by downstream → exempt, no label needed.
+2. **Map activation → model** — if reachable, read the branch's activation condition (arch × dtype × shape × model gate) and map it to a model (e.g. 128-head fp8 MLA decode on gfx950 → DeepSeek-V4).
+3. **Minimal label set** — DeepSeek is exercised by atom+sglang+vllm (≈ `ci:all`); Qwen 3.5 → `ci:sglang` only; Kimi-K2.5 → `ci:vllm` only; GPT-OSS-120B → `ci:atom`+`ci:vllm`.
+Fallback: if you cannot trace the activation to a specific model but the diff changes the behavior of an mla/fused_moe/attention/quant/gemm/jit-core path, default to `ci:all` — a wasted CI run is far cheaper than a broken downstream.
+Check: in the PR's statusCheckRollup, if `Atom Test` / `Kimi Downstream` / `Sglang Downstream` is `skipped` AND the diff touches a downstream-consumed op, coverage is missing.
+Real example (aiter#3459): a DeepSeek-V4 128-head MLA decode kernel passed Aiter Test (success) with Atom Test SKIPPED and no `ci:*` label; after merge the Atom Test went red — the MLA change broke ATOM, invisible pre-merge.
+→ `🔴 E4: [op] is consumed by [ATOM/SGLang/vLLM] but its downstream CI is skipped — add ci:all (or the minimal ci:atom/sglang/vllm) and require it green before merge`
+
+**E5 — Stable core-API change needs owner sign-off, not just CI + one approve** 🔴
+Modifying the BEHAVIOR / SIGNATURE / DEFAULT DISPATCH / NUMERIC SEMANTICS of a long-lived, widely-consumed API — `fused_moe.py`, `mla.py`, `ops/attention.py`, `ops/mha.py`, `ops/quant.py`, `gemm_op_a8w8.py`, `moe_op.py`, `jit/core.py` — must not be self-merged by a contributor or landed on a single reviewer's approval. These are downstream contracts; green CI (even `ci:all`) only covers the models/shapes it knows, not every downstream version or call path — necessary but not sufficient.
+Trigger: diff changes the behavior/signature/default-path of a Step-4 Tier-1/Tier-2 file — NOT a pure-additive, arch-gated, behavior-preserving change (those are exempt; see E4 step 1).
+Who signs off: aiter has **no CODEOWNERS file**, so ownership is de-facto — the top committer of the path is the effective gatekeeper:
+`git log --format='%an' -- <file> | sort | uniq -c | sort -rn | head`
+For `fused_moe.py` / core MoE dispatch this is currently @valarLip (top committer, and the maintainer who reverted #3593 and gates MoE PRs). Get their sign-off BEFORE merge, not a revert after. Re-derive per file — MLA / attention / quant may have a different top committer.
+Real example (aiter#3593): a `fused_moe.py` env knob merged on CI + one approval, then reverted by a maintainer within the hour — it should have had owner sign-off before merge.
+→ `🔴 E5: [file] is a stable downstream-facing contract — do NOT self-merge; get sign-off from its de-facto owner (git top-committer; @valarLip for fused_moe) before merge, on top of ci:all`
 
 ---
 
