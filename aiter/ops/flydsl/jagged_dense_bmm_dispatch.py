@@ -323,6 +323,7 @@ def jagged_dense_bmm_dispatched(
             xcd_w=sc_xcd_w,
             use_mfma_k32=cfg["use_mfma_k32"],
             uniform_seqlen=False,
+            block_k=cfg.get("block_k"),
             tile_map=tile_map,
             total_occ_tiles=ub,
         )
@@ -342,6 +343,7 @@ def jagged_dense_bmm_dispatched(
             xcd_w=8,
             use_mfma_k32=cfg["use_mfma_k32"],
             uniform_seqlen=False,
+            block_k=cfg.get("block_k"),
         )
 
     return jagged_dense_bmm(
@@ -359,6 +361,7 @@ def jagged_dense_bmm_dispatched(
         uniform_seqlen=uniform_seqlen,
         block_m=cfg.get("tile_m") if uniform_seqlen else None,
         block_n=cfg.get("tile_n") if uniform_seqlen else None,
+        block_k=cfg.get("block_k"),
         waves_per_eu=int(cfg.get("waves_per_eu") or 0) if uniform_seqlen else 0,
         threads=_coerce(cfg.get("threads"), int) if uniform_seqlen else None,
     )

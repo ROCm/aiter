@@ -14,8 +14,6 @@ skewed sequence lengths.
 
 from __future__ import annotations
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -35,59 +33,37 @@ XCD_C_LARGE_K = 120
 
 
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
-    total = num_rows * num_cols  # compile-time
-    period = nXCD * C  # compile-time
-    prefix = total - (total % period)  # largest [0,prefix) divisible by period
     xy = fx.Int32(xy)
     cnXCD = fx.Int32(nXCD)
     cC = fx.Int32(C)
+    cW = fx.Int32(W)
+    c_num_cols = fx.Int32(num_cols)
+    c_num_rows = fx.Int32(num_rows)
 
     xcd = xy % cnXCD
     local = xy // cnXCD
     chunk_idx = local // cC
     pos = local % cC
     xy_g_remap = chunk_idx * (cnXCD * cC) + xcd * cC + pos
-    if fx.const_expr(prefix == total):
-        xy_g = xy_g_remap
-    else:
-        xy_g = (xy < fx.Int32(prefix)).select(xy_g_remap, xy)
 
-    cW = fx.Int32(W)
-    c_num_rows = fx.Int32(num_rows)
-    c_num_cols = fx.Int32(num_cols)
+    if isinstance(num_rows, int):
+        total = num_rows * num_cols  # compile-time
+        period = nXCD * C  # compile-time
+        prefix = total - (total % period)  # largest [0,prefix) divisible by period
+        if fx.const_expr(prefix == total):
+            xy_g = xy_g_remap
+        else:
+            xy_g = (xy < fx.Int32(prefix)).select(xy_g_remap, xy)
+    else:
+        total = c_num_rows * c_num_cols  # runtime: total launched blocks
+        period = fx.Int32(nXCD * C)  # compile-time product
+        prefix = total - (total % period)  # runtime largest multiple of period <= total
+        xy_g = (xy < prefix).select(xy_g_remap, xy)
+
     tids_per_grp = cW * c_num_cols
     group_id = xy_g // tids_per_grp
     first_row = group_id * cW
     remaining = c_num_rows - first_row
-    win_h = (remaining < cW).select(remaining, cW)
-    tid_in_grp = xy_g % tids_per_grp
-    row = first_row + (tid_in_grp % win_h)
-    col = tid_in_grp // win_h
-    return row, col
-
-
-def _xcd_remap_compact(xy, num_rows_rt, num_cols, C, W, nXCD=NXCD):
-    xy = fx.Int32(xy)
-    nrows = fx.Int32(num_rows_rt)
-    c_num_cols = fx.Int32(num_cols)
-    cnXCD = fx.Int32(nXCD)
-    cC = fx.Int32(C)
-    total = nrows * c_num_cols  # runtime: total launched blocks
-    period = fx.Int32(nXCD * C)  # compile-time product
-    prefix = total - (total % period)  # runtime largest multiple of period <= total
-
-    xcd = xy % cnXCD
-    local = xy // cnXCD
-    chunk_idx = local // cC
-    pos = local % cC
-    xy_g_remap = chunk_idx * (cnXCD * cC) + xcd * cC + pos
-    xy_g = (xy < prefix).select(xy_g_remap, xy)
-
-    cW = fx.Int32(W)
-    tids_per_grp = cW * c_num_cols
-    group_id = xy_g // tids_per_grp
-    first_row = group_id * cW
-    remaining = nrows - first_row
     win_h = (remaining < cW).select(remaining, cW)  # last window may be short
     tid_in_grp = xy_g % tids_per_grp
     row = first_row + (tid_in_grp % win_h)
@@ -95,7 +71,9 @@ def _xcd_remap_compact(xy, num_rows_rt, num_cols, C, W, nXCD=NXCD):
     return row, col
 
 
-@functools.lru_cache(maxsize=None)
+_COMPILED_CACHE: dict = {}
+
+
 def _build_launcher(
     N,
     K,
@@ -139,7 +117,7 @@ def _build_launcher(
             if fx.const_expr(XCD_C > 1):
                 total_occ = fx.Int32(fx.grid_dim.x)
                 raw_xy = fx.Int32(raw_b) * total_occ + fx.Int32(pid_mn)
-                tile_row, n_col = _xcd_remap_compact(
+                tile_row, n_col = _xcd_remap(
                     raw_xy, total_occ, N_BLOCKS, XCD_C, XCD_W
                 )
                 tile_row = fx.Int32(fx.rocdl.readfirstlane(fx.T.i32(), tile_row))
@@ -485,6 +463,16 @@ def _build_launcher(
     return _launch
 
 
+def _drop_leaked_ir_contexts() -> None:
+    try:
+        from flydsl._mlir import ir
+
+        while ir.Context.current is not None:
+            ir.Context.current.__exit__(None, None, None)
+    except Exception:
+        pass
+
+
 def jagged_dense_bmm(
     C,
     A,
@@ -500,6 +488,7 @@ def jagged_dense_bmm(
     uniform_seqlen: bool = True,
     block_m: int | None = None,
     block_n: int | None = None,
+    block_k: int | None = None,
     waves_per_eu: int = 0,
     threads: int | None = None,
     tile_map=None,
@@ -509,10 +498,13 @@ def jagged_dense_bmm(
     K = B.shape[1]
     if use_mfma_k32 is None:
         use_mfma_k32 = False
-    if use_mfma_k32:
-        block_k = 128 if K <= 256 else BLOCK_K
+    if block_k is None:
+        if use_mfma_k32:
+            block_k = 128 if K <= 256 else BLOCK_K
+        else:
+            block_k = BLOCK_K
     else:
-        block_k = BLOCK_K
+        block_k = int(block_k)
     if xcd_c is None:
         if not uniform_seqlen:
             xcd_c = 1
@@ -528,6 +520,34 @@ def jagged_dense_bmm(
     b_stages = 2 if use_mfma_k32 else 3
     nthreads = THREADS if threads is None else threads
     compact = tile_map is not None
+
+    tmap = SEQ_OFFSETS if tile_map is None else tile_map
+    tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
+
+    key = (
+        N,
+        K,
+        bmn,
+        bnn,
+        block_k,
+        STAGES_A,
+        nthreads,
+        bm,
+        n_groups,
+        tot,
+        xcd_c,
+        xcd_w,
+        use_mfma_k32,
+        waves_per_eu,
+        b_stages,
+        compact,
+    )
+    launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
+
+    cached = _COMPILED_CACHE.get(key)
+    if cached is not None:
+        return cached(*launch_args)
+
     launch = _build_launcher(
         N,
         K,
@@ -545,8 +565,10 @@ def jagged_dense_bmm(
         b_stages,
         compact,
     )
-    tmap = SEQ_OFFSETS if tile_map is None else tile_map
-    tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
-    return launch(
-        C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream=stream
-    )
+    try:
+        _COMPILED_CACHE[key] = flyc.compile(launch, *launch_args)
+        return None
+    except Exception:
+        _drop_leaked_ir_contexts()
+        _COMPILED_CACHE[key] = launch
+        return launch(*launch_args)
