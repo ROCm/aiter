@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: "/data/csrikris/logs/"
+      spur_nodelist:
+        description: "Optional comma-separated Spur nodes for the 2-node smoke job"
+        required: false
+        type: string
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15"
       image:
         description: "Docker image passed to run_xPyD disagg Slurm script"
         required: false
@@ -64,6 +69,7 @@ jobs:
       VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
       MODEL_NAME_DEFAULT: mini-max-fp8
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/csrikris/logs/
+      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
       SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
       WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
@@ -93,6 +99,7 @@ jobs:
               "DISAGG_SCRIPTS_STAGE="
               + value("disagg_scripts_stage", "DISAGG_SCRIPTS_STAGE_DEFAULT")
           )
+          print(f"SPUR_NODELIST={value('spur_nodelist', 'SPUR_NODELIST_DEFAULT')}")
           print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
           print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
           print(
@@ -137,6 +144,7 @@ jobs:
             echo "- vLLM SHA: \`$(git rev-parse HEAD)\`"
             echo "- MODEL_NAME: \`${MODEL_NAME}\`"
             echo "- DISAGG_SCRIPTS_STAGE: \`${DISAGG_SCRIPTS_STAGE}\`"
+            echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
             echo "- IMAGE: \`${IMAGE}\`"
             echo "- Requested Slurm script: \`${SLURM_SCRIPT}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -167,18 +175,25 @@ jobs:
             exit 1
           fi
 
-          mkdir -p "${DISAGG_SCRIPTS_STAGE}"
+          log_root="${DISAGG_SCRIPTS_STAGE%/}"
+          mkdir -p "${DISAGG_SCRIPTS_STAGE}" "${log_root}"
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
           squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
           : > "${squeue_log}"
           : > "${sacct_log}"
 
-          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} IMAGE=${IMAGE} sbatch ${script}"
-          MODEL_NAME="${MODEL_NAME}" \
+          sbatch_args=()
+          if [[ -n "${SPUR_NODELIST}" ]]; then
+            sbatch_args+=(--nodelist "${SPUR_NODELIST}")
+          fi
+
+          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
+          LOG_ROOT="${log_root}" \
+            MODEL_NAME="${MODEL_NAME}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             IMAGE="${IMAGE}" \
-            sbatch "${script}" | tee "${submit_log}"
+            sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
 
           job_id="$(
             python3 - "${submit_log}" <<'PY'
@@ -229,16 +244,16 @@ jobs:
           if command -v sacct >/dev/null 2>&1; then
             for _ in 1 2 3 4 5; do
               sacct -j "${job_id}" \
-                --format=JobID,JobName%40,State,ExitCode,Elapsed,NodeList%80 \
-                -P | tee "${sacct_log}" || true
-              if grep -E "^${job_id}[|]" "${sacct_log}" >/dev/null 2>&1; then
+                --format=JobID,State,ExitCode,Elapsed,NodeList \
+                | tee "${sacct_log}" || true
+              if awk -v job="${job_id}" '$1 == job { found=1 } END { exit !found }' "${sacct_log}" >/dev/null 2>&1; then
                 break
               fi
               sleep 10
             done
 
             state="$(
-              awk -F'|' -v job="${job_id}" '$1 == job { print $3; exit }' "${sacct_log}"
+              awk -v job="${job_id}" '$1 == job { print $2; exit }' "${sacct_log}"
             )"
             echo "Slurm job ${job_id} final state: ${state:-unknown}"
             if [[ "${state}" != COMPLETED* ]]; then
