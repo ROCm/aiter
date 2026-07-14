@@ -36,7 +36,7 @@ aiter_lib = Library("aiter", "FRAGMENT")
 # Arches whose prebuilt HIP CK blockscale modules ship matching code objects.
 # Other arches (e.g. gfx1201) SIGSEGV uncatchably at kernel launch, so gate
 # before the HIP call rather than try/except. Extend when prebuilts add archs.
-_BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
+_BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950", "gfx1250"})
 
 
 def _hip_blockscale_supported() -> bool:
@@ -931,6 +931,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
 
+    # temporarily guard scale that are not fp32.
+    if x_scale.dtype == dtypes.fp8_e8m0:
+        x_scale = x_scale.to(dtypes.fp32)
+    if w_scale.dtype == dtypes.fp8_e8m0:
+        w_scale = w_scale.to(dtypes.fp32)
+
     if not _hip_blockscale_supported():
         # No CK code object for this arch -> triton preshuffle. WQ is already
         # (16,16)-shuffled (the only blockscale layout) == triton's (N//16, K*16)
@@ -969,7 +975,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if config is not None and config["libtype"] == "triton":
+    if config is not None and config["libtype"] == "triton" or get_gfx() == "gfx1250":
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
