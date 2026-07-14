@@ -215,7 +215,17 @@ jobs:
                   raise SystemExit("Failed to find Spur submit SBATCH nodes directive")
               text = text.replace(nodes_line, nodes_line + ntasks_line, 1)
               submit_path.write_text(text, encoding="utf-8")
-          print(f"{submit_path}: patched explicit Spur Slurm task count")
+          spur_exec = "    printf 'exec %q\\n' \"${JOB_SCRIPT}\"\n"
+          spur_unset = (
+              "    printf 'unset SPUR_TASK_OFFSET SPUR_PEER_NODES SPUR_NODELIST\\n'\n"
+              + spur_exec
+          )
+          if spur_unset not in text:
+              if spur_exec not in text:
+                  raise SystemExit("Failed to find Spur submit exec directive")
+              text = text.replace(spur_exec, spur_unset, 1)
+              submit_path.write_text(text, encoding="utf-8")
+          print(f"{submit_path}: patched explicit Spur Slurm task count and cleared Spur rank env")
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
           if "  GLM-5.2-FP8:" not in text:
