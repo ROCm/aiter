@@ -10,7 +10,7 @@ from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
 )
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
     validate_hstu_attention_bwd,
-    build_hstu_attention_bwd,
+    build_hstu_attention_bwd_dvdk,
     NUM_GRID_GROUPS,
 )
 from aiter.ops.flydsl.kernels.hstu_attention_bwd_dq import (
@@ -493,20 +493,20 @@ def _validate_bwd_inputs(
     return batch, num_heads, head_dim, hidden_dim, dtype_str
 
 
-# Backward tuned-config plumbing. The backward is three single-writer, fully
-# tile-parallel kernels: dV and dK (KV-owned, reduce over the query index) and dQ
-# (Q-owned, reduce over the key index). dV and dK were originally one fused kernel,
-# but profiling (2026-07-08) showed it was pinned at 1 wave/SIMD because it carried
-# both accumulator families (~336 AGPR). Splitting into single-family kernels halves
-# the accumulators and lifts occupancy (recompute-over-occupancy trade: each
-# recomputes S). All three have *different* optimal tile configs, so the tuned CSV
-# carries a `kernel` discriminator column ("dv" | "dk" | "dq") and each resolves its
-# own config independently. There is no dQ read-modify-write to synchronize and thus
-# no sequence-parallel knob to tune.
-_BWD_KERNEL_DV = "dv"
-_BWD_KERNEL_DK = "dk"
+# Backward tuned-config plumbing. The backward is two single-writer, fully
+# tile-parallel kernels: a fused dV+dK kernel (KV-owned, both reduce over the query
+# index and share one S recompute) and dQ (Q-owned, reduces over the key index).
+# dV and dK were once split into two single-family kernels to lift occupancy, but at
+# the deployment regime (d=64, N=16384) the fused kernel at a smaller occupancy-
+# preserving tile (num_waves=2, block_m=96) wins ~12-13% on dV+dK by paying one S
+# recompute instead of two (see docs/2026-07-13_more_ideas.md, Exp 5-7). The two
+# kernels have *different* optimal tile configs, so the tuned CSV carries a `kernel`
+# discriminator column ("dvdk" | "dq") and each resolves its own config
+# independently. There is no dQ read-modify-write to synchronize and thus no
+# sequence-parallel knob to tune.
+_BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
-_BWD_KERNELS = (_BWD_KERNEL_DV, _BWD_KERNEL_DK, _BWD_KERNEL_DQ)
+_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
 
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
@@ -530,7 +530,7 @@ _BWD_CSV_COLUMNS: list[str] = [
 
 @functools.lru_cache()
 def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
-    def _parse_row(row: dict) -> tuple[tuple, float, dict]:
+    def _parse_row(row: dict) -> Optional[tuple[tuple, float, dict]]:
         if set(row.keys()) != set(_BWD_CSV_COLUMNS):
             raise KeyError(
                 f"unexpected columns: {set(row.keys()) ^ set(_BWD_CSV_COLUMNS)}"
@@ -552,7 +552,11 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
         )
         kernel = row["kernel"].strip().lower()
         if kernel not in _BWD_KERNELS:
-            raise ValueError(f"unexpected kernel discriminator: {kernel!r}")
+            # A discriminator from a different kernel decomposition (e.g. the old
+            # split "dv"/"dk" rows now that dV+dK are fused into one "dvdk" kernel).
+            # Silently ignore rather than warn — the CSV can carry both while a
+            # retune is pending.
+            return None
         kernel_config = dict(
             block_m=int(row["block_m"]),
             block_n=int(row["block_n"]),
@@ -573,12 +577,16 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
     with tuned_file_path.open(mode="r", encoding="utf-8") as f:
         for row_idx, row in enumerate(csv.DictReader(f)):
             try:
-                problem_key, duration, kernel_config = _parse_row(row)
+                parsed = _parse_row(row)
             except (KeyError, ValueError, TypeError) as exc:
                 logger.warning(
                     f"[FlyDSL HSTU Bwd] skipping invalid tuned row {row_idx} in {tuned_file_path}: {exc}"
                 )
                 continue
+
+            if parsed is None:  # row for a kernel discriminator this build doesn't use
+                continue
+            problem_key, duration, kernel_config = parsed
 
             if duration <= 0.0:
                 continue
@@ -655,12 +663,20 @@ def _build_balance_perm(
 def _get_bwd_default_config(kernel: str) -> dict:
     """Conservative heuristic default when no tuned entry exists.
 
-    This tile is valid across every supported shape (including asymmetric and
-    non-64-divisible dims) and is what the correctness suite runs against.
-    Per-kernel tuned CSV entries override it. Both kernels share the same
-    conservative default (a known-valid tile); the per-kernel win comes from the
+    These tiles are valid across every supported shape (including asymmetric and
+    non-64-divisible dims) and are what the correctness suite runs against.
+    Per-kernel tuned CSV entries override them; the per-kernel win comes from the
     tuned CSV, whose entries are validated per shape.
+
+    The fused dV+dK kernel uses block_m=128 (vs dQ's 64): at block_m=64 the fused
+    kernel's two accumulator families collapse occupancy and it runs ~40% slower
+    than the old split kernels, whereas block_m=128 (same bn/num_waves, so same
+    divisibility contract — valid wherever block_m=64 is) is ~break-even. It is a
+    safe untuned default; the deployment win (num_waves=2, block_m=96) comes from
+    the tuned CSV.
     """
+    if kernel == _BWD_KERNEL_DVDK:
+        return dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=0)
     return dict(block_m=64, block_n=32, num_waves=4, waves_per_eu=0)
 
 
@@ -684,12 +700,12 @@ def _compile_bwd_launcher(
     waves_per_eu: Optional[int],
     has_perm: bool = False,
 ) -> tuple[Callable, Callable]:
-    """Builds the (dV, dK, dQ) launcher triple, resolving tuned -> default -> custom
+    """Builds the (dV+dK, dQ) launcher pair, resolving tuned -> default -> custom
     per kernel.
 
-    Returns three launchers: the two KV-owned kernels producing dV and dK (each a
-    single accumulator family, reducing over the query index) and the Q-owned kernel
-    producing dQ. Each resolves its own tile config independently.
+    Returns two launchers: the fused KV-owned kernel producing BOTH dV and dK from
+    one S recompute (reducing over the query index) and the Q-owned kernel producing
+    dQ. Each resolves its own tile config independently.
     """
     # Explicit overrides apply to BOTH kernels (this is what the block-size
     # override tests and the tuner's per-kernel timing rely on).
@@ -735,16 +751,13 @@ def _compile_bwd_launcher(
         max_seq_len=max_seq_len,
         has_perm=has_perm,
     )
-    dv_launcher = build_hstu_attention_bwd(
-        **common_kwargs, which="dv", **_resolve(_BWD_KERNEL_DV)
-    )
-    dk_launcher = build_hstu_attention_bwd(
-        **common_kwargs, which="dk", **_resolve(_BWD_KERNEL_DK)
+    dvdk_launcher = build_hstu_attention_bwd_dvdk(
+        **common_kwargs, **_resolve(_BWD_KERNEL_DVDK)
     )
     dq_launcher = build_hstu_attention_bwd_dq(
         **common_kwargs, **_resolve(_BWD_KERNEL_DQ)
     )
-    return dv_launcher, dk_launcher, dq_launcher
+    return dvdk_launcher, dq_launcher
 
 
 def flydsl_hstu_attention_bwd(
@@ -783,11 +796,11 @@ def flydsl_hstu_attention_bwd(
         num_targets=num_targets,
     )
 
-    # Three single-writer kernels (no atomics): dV and dK reduce over the query
-    # index (KV-owned), dQ over the key index (Q-owned). dV/dK are split so each
-    # carries one accumulator family (higher occupancy).
+    # Two single-writer kernels (no atomics): the fused dV+dK kernel reduces over
+    # the query index (KV-owned) and produces both families from one S recompute;
+    # dQ reduces over the key index (Q-owned).
     # Config precedence: explicit overrides > per-kernel tuned CSV > default heuristic.
-    dv_launcher, dk_launcher, dq_launcher = _compile_bwd_launcher(
+    dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,
         max_seq_len=N,
         num_heads=num_heads,
@@ -831,7 +844,7 @@ def flydsl_hstu_attention_bwd(
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
     with torch.cuda.device(q.device.index):
         _run_compiled(
-            dv_launcher,
+            dvdk_launcher,
             q_c,
             k_c,
             v_c,
@@ -840,17 +853,6 @@ def flydsl_hstu_attention_bwd(
             nt_c,
             perm_c,
             dv,
-            fx.Stream(launch_stream),
-        )
-        _run_compiled(
-            dk_launcher,
-            q_c,
-            k_c,
-            v_c,
-            do_c,
-            so_c,
-            nt_c,
-            perm_c,
             dk,
             fx.Stream(launch_stream),
         )
@@ -900,7 +902,7 @@ def _make_bwd_kernel_runners(
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q, k=k, v=v, dout=dout, seq_offsets=seq_offsets, num_targets=num_targets,
     )
-    dv_launcher, dk_launcher, dq_launcher = _compile_bwd_launcher(
+    dvdk_launcher, dq_launcher = _compile_bwd_launcher(
         batch=batch,
         max_seq_len=N,
         num_heads=num_heads,
@@ -941,17 +943,10 @@ def _make_bwd_kernel_runners(
 
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
 
-    def run_dv():
+    def run_dvdk():
         with torch.cuda.device(q.device.index):
             _run_compiled(
-                dv_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c, dv,
-                fx.Stream(launch_stream),
-            )
-
-    def run_dk():
-        with torch.cuda.device(q.device.index):
-            _run_compiled(
-                dk_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c, dk,
+                dvdk_launcher, q_c, k_c, v_c, do_c, so_c, nt_c, perm_c, dv, dk,
                 fx.Stream(launch_stream),
             )
 
@@ -962,7 +957,7 @@ def _make_bwd_kernel_runners(
                 fx.Stream(launch_stream),
             )
 
-    return {_BWD_KERNEL_DV: run_dv, _BWD_KERNEL_DK: run_dk, _BWD_KERNEL_DQ: run_dq}
+    return {_BWD_KERNEL_DVDK: run_dvdk, _BWD_KERNEL_DQ: run_dq}
 
 
 class FlydslHstuAttention(torch.autograd.Function):
