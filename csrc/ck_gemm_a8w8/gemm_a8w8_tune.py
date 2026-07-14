@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
+from aiter.jit.core import AITER_CONFIG_GEMM_A8W8, get_asm_dir
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import (
     kernels_list,
@@ -76,7 +76,13 @@ def get_tuned_gemm_list(tuned_gemm_file):
 
 
 def generate_data(
-    m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, device="cuda"
+    m,
+    n,
+    k,
+    seed,
+    dtype=dtypes.bf16,
+    q_dtype_w=dtypes.fp8,
+    device="cuda",
 ):
     torch.manual_seed(seed)
 
@@ -115,6 +121,39 @@ def run_gemm_a8w8_cktile(x, weight, x_scale, w_scale, out, kernelId, splitK):
     return out
 
 
+def run_gemm_a8w8_asm(
+    x,
+    weight,
+    x_scale,
+    w_scale,
+    out,
+    kernel_name,
+    splitK,
+):
+    return aiter.gemm_a8w8_cktile_asm(
+        x,
+        weight,
+        x_scale,
+        w_scale,
+        out,
+        kernel_name,
+        splitK=splitK,
+    )
+
+
+def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
+    """Return splitK exponents where k_batch=2^splitK yields valid TileK-aligned partitions."""
+    valid = []
+    for splitK in range(0, max_splitK + 1):
+        k_batch = 1 << splitK
+        k_per_split = (K + k_batch - 1) // k_batch
+        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
+        actual_k_batch = (K + k_per_split_aligned - 1) // k_per_split_aligned
+        if actual_k_batch == k_batch:
+            valid.append(splitK)
+    return valid if valid else [0]
+
+
 class GemmA8W8Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -139,6 +178,35 @@ class GemmA8W8Tuner(GemmCommonTuner):
             return None
 
         return kernels.get(kernelId).name
+
+    def get_asm_kernels(self, file):
+        if not os.path.exists(file):
+            print(f"ASM kernel list file not exist: {file}")
+            return {}
+        df = pd.read_csv(file)
+        if "bpreshuffle" in df.columns:
+            non_preshuf_df = df[df["bpreshuffle"] == 0]
+            selected_df = non_preshuf_df if len(non_preshuf_df) > 0 else df
+        else:
+            selected_df = df
+        # Current ASM launcher packs QuantGemmKernelArgs (NumDTensor=0).
+        # Skip kernels requiring QuantGemmMultiDKernelArgs<1> (or others).
+        if "knl_name" in selected_df.columns:
+            il0_df = selected_df[
+                selected_df["knl_name"].astype(str).str.contains(
+                    "QuantGemmMultiDKernelArgsILi0"
+                )
+            ]
+            if len(il0_df) > 0:
+                selected_df = il0_df
+        shuffle_df = selected_df.reset_index().sort_values(
+            by=["tile_m", "tile_n", "splitK"]
+        )
+        return (
+            shuffle_df.groupby(["tile_m", "tile_n", "splitK"])["knl_name"]
+            .apply(list)
+            .to_dict()
+        )
 
     def get_gemm_a8w8_ck_tune_task(
         self,
@@ -242,6 +310,65 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 )
         return tasks_cktile
 
+    def get_gemm_a8w8_asm_tune_task(
+        self,
+        info_keys,
+        useSplitK,
+        seed,
+        run_kwargs,
+    ):
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+
+        asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm_cktile/i8gemm_cktile.csv"
+        asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
+        asm_tiles = [key for key in asm_kernels.keys()]
+
+        gemm_asm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        tasks_asm = []
+        asm_kernel_id = 0
+
+        for key in asm_tiles:
+            tile_m, tile_n, splitk = key
+            kernel_names = asm_kernels.get((tile_m, tile_n, splitk), [])
+            if len(kernel_names) == 0:
+                continue
+
+            if useSplitK and splitk != 0:
+                splitK_list = get_valid_asm_splitK_list(K, 8)
+            else:
+                splitK_list = [0]
+
+            for kernel_name in kernel_names:
+                for splitK in splitK_list:
+                    info = (info_keys, asm_kernel_id, splitK, kernel_name, "asm")
+                    tasks_asm.append(
+                        (
+                            info,
+                            generate_data,
+                            (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
+                            run_gemm_a8w8_asm,
+                            (
+                                gemm_asm_keys,
+                                kernel_name,
+                                splitK,
+                            ),
+                            run_kwargs,
+                            gemm_a8w8_ref,
+                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
+                            {},
+                            None,
+                            1e-2,
+                            1e-2,
+                            None,
+                            None,
+                            ("out",),
+                        )
+                    )
+                    asm_kernel_id += 1
+
+        return tasks_asm
+
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
 
@@ -258,9 +385,9 @@ class GemmA8W8Tuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="all",
-            choices=["ck", "cktile", "all", "both"],
+            choices=["ck", "cktile", "asm", "all", "both"],
             required=False,
-            help="CK gemm a8w8 type to tune: ck, cktile, both or all (covers all supported backends across standard/preshuffleB modes)",
+            help="CK gemm a8w8 type to tune: ck, cktile, asm, both or all (covers all supported backends across standard/preshuffleB modes)",
         )
 
         self.parser.add_argument(
@@ -380,6 +507,15 @@ class GemmA8W8Tuner(GemmCommonTuner):
                         useSplitK,
                         seed,
                         block_per_cu,
+                        run_kwargs,
+                    )
+                )
+            if lib in ("asm", "all"):
+                task.extend(
+                    self.get_gemm_a8w8_asm_tune_task(
+                        info_keys,
+                        useSplitK,
+                        seed,
                         run_kwargs,
                     )
                 )

@@ -247,6 +247,43 @@ def gemm_a8w8_asm(
     return Out
 
 
+@compile_ops(
+    "module_gemm_a8w8_cktile_asm",
+    fc_name="gemm_a8w8_cktile_asm",
+    ffi_type="ctypes",
+)
+def _gemm_a8w8_cktile_asm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    kernelName: Optional[str] = None,
+    splitK: int = -1,
+) -> None: ...
+
+
+def gemm_a8w8_cktile_asm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    kernelName: str = "",
+    splitK: Optional[int] = None,
+) -> Tensor:
+    _gemm_a8w8_cktile_asm(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Out,
+        kernelName if kernelName else None,
+        splitK if splitK is not None else -1,
+    )
+    return Out
+
+
 def gen_gemm_a8w8_blockscale_ck_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
