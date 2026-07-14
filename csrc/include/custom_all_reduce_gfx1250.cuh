@@ -718,6 +718,12 @@ public:
     std::vector<void*> graph_unreg_input_buffers_;
     std::vector<void*> graph_unreg_output_buffers_;
 
+    // Opened hipIpc handles, kept so they can be closed at destruction. Only
+    // populated on the IPC transport path (ROCm >= 7.15, where hipIpc works on
+    // gfx1250). Empty on the VMM path — the destructor is then a no-op.
+    using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
+    std::map<IPC_KEY, char*> ipc_handles_;
+
     // gfx1250: hipIpc is not available. Instead, each rank's Signal buffer
     // is a torch-shared tensor whose device pointer is exchanged via the
     // distributed store.  The constructor receives the remote pointers
@@ -738,6 +744,64 @@ public:
         for(int i = 0; i < world_size_; i++)
         {
             sg_.signals[i] = reinterpret_cast<Signal*>(all_meta_ptrs[i]);
+        }
+    }
+
+    // IPC transport overload (ROCm >= 7.15): hipIpc works on gfx1250, so peer
+    // meta buffers are shared via IPC handles instead of VMM-exported fds. This
+    // mirrors the old-arch path — resolve each remote handle to a local VA via
+    // hipIpcOpenMemHandle and add its offset. The kernel is unchanged; only how
+    // the peer pointers are obtained differs.
+    CustomAllreduce(Signal* meta,
+                    void* rank_data,
+                    size_t rank_data_sz,
+                    const hipIpcMemHandle_t* handles,
+                    const std::vector<int64_t>& offsets,
+                    int rank,
+                    bool fully_connected = true)
+        : rank_(rank),
+          world_size_(offsets.size()),
+          full_nvlink_(fully_connected),
+          self_sg_(meta),
+          d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
+          d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData))
+    {
+        for(int i = 0; i < world_size_; i++)
+        {
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle(&handles[i]);
+                handle += offsets[i];
+                sg_.signals[i] = reinterpret_cast<Signal*>(handle);
+            }
+            else
+            {
+                sg_.signals[i] = self_sg_;
+            }
+        }
+    }
+
+    char* open_ipc_handle(const void* ipc_handle)
+    {
+        auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
+        if(new_handle)
+        {
+            char* ipc_ptr;
+            HIP_CALL(hipIpcOpenMemHandle((void**)&ipc_ptr,
+                                         *((const hipIpcMemHandle_t*)ipc_handle),
+                                         hipIpcMemLazyEnablePeerAccess));
+            it->second = ipc_ptr;
+        }
+        return it->second;
+    }
+
+    ~CustomAllreduce()
+    {
+        // No-op on the VMM path (ipc_handles_ empty); closes opened peer
+        // handles on the IPC path.
+        for(auto [_, ptr] : ipc_handles_)
+        {
+            HIP_CALL(hipIpcCloseMemHandle(ptr));
         }
     }
 
@@ -780,6 +844,55 @@ public:
         RankData data;
         for(int i = 0; i < world_size_; i++)
             data.ptrs[i] = (i != rank_) ? (void*)all_ptrs[i] : self;
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        output_buffers_[self] = d_data;
+    }
+
+    // IPC transport overloads (ROCm >= 7.15): resolve peer handles to VAs.
+    void register_input_buffer(const hipIpcMemHandle_t* handles,
+                               const int64_t* offsets,
+                               void* self)
+    {
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
+        {
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle((void*)&handles[i]);
+                handle += offsets[i];
+                data.ptrs[i] = handle;
+            }
+            else
+            {
+                data.ptrs[i] = self;
+            }
+        }
+        auto d_data = d_rank_data_base_++;
+        HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
+        input_buffer[self] = d_data;
+    }
+
+    void register_output_buffer(const hipIpcMemHandle_t* handles,
+                                const int64_t* offsets,
+                                void* self)
+    {
+        check_rank_data_capacity();
+        RankData data;
+        for(int i = 0; i < world_size_; i++)
+        {
+            if(i != rank_)
+            {
+                char* handle = open_ipc_handle((void*)&handles[i]);
+                handle += offsets[i];
+                data.ptrs[i] = handle;
+            }
+            else
+            {
+                data.ptrs[i] = self;
+            }
+        }
         auto d_data = d_rank_data_base_++;
         HIP_CALL(hipMemcpy(d_data, &data, sizeof(RankData), hipMemcpyHostToDevice));
         output_buffers_[self] = d_data;
