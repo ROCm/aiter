@@ -58,6 +58,39 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
+# --- Temporary aiter-local shim: `warp_base` for make_tensor_descriptor_2d ---
+# The balanced WST TDM load needs a wave sub-group (e.g. waves {2,3}) to
+# partition a tile as a local pair. make_tensor_descriptor_2d partitions by the
+# raw hardware wave_id; `warp_base` shifts it to (wave_id - warp_base). To avoid
+# depending on a patched flydsl install, add `warp_base` here by transiently
+# shifting the wave_id source during the (trace-time) descriptor build. No-op if
+# the installed flydsl already supports `warp_base`.
+import inspect as _inspect
+from flydsl.expr import rocdl as _fly_rocdl_mod
+
+if "warp_base" not in _inspect.signature(tdm_ops.make_tensor_descriptor_2d).parameters:
+    _orig_make_tensor_descriptor_2d = tdm_ops.make_tensor_descriptor_2d
+
+    def _make_tensor_descriptor_2d_warp_base(*args, warp_base=0, **kwargs):
+        if not warp_base:
+            return _orig_make_tensor_descriptor_2d(*args, **kwargs)
+        # Shift the wave_id the descriptor reads internally so a group of waves
+        # starting at `warp_base` partitions the tile as local {0, 1, ...}.
+        _orig_wave_id = _fly_rocdl_mod.wave_id
+
+        def _shifted_wave_id():
+            return arith.subi(
+                _orig_wave_id(), arith.constant(int(warp_base), type=T.i32)
+            )
+
+        _fly_rocdl_mod.wave_id = _shifted_wave_id
+        try:
+            return _orig_make_tensor_descriptor_2d(*args, **kwargs)
+        finally:
+            _fly_rocdl_mod.wave_id = _orig_wave_id
+
+    tdm_ops.make_tensor_descriptor_2d = _make_tensor_descriptor_2d_warp_base
+
 # Common constants
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
