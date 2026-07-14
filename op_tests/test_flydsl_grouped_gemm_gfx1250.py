@@ -638,29 +638,6 @@ def _run_graph_scenario(
     tol: float = LOGITS_DIFF_TOL,
     seed: int = 0,
 ) -> list[tuple[int, float, float, bool]]:
-    """Build a CUDA graph per token count in a sweep and verify each replay.
-
-    The grouped MoE bakes its per-expert token grouping / grouped-GEMM launch
-    metadata at capture time, so a single graph can only be replayed correctly
-    for the exact problem it was captured on. This scenario therefore captures a
-    fresh graph for every token count ``m in range(1, max_tokens, step)``, replays
-    it, and compares the replayed output against a PyTorch reference for the same
-    ``m`` tokens -- validating that the CUDA-graph (production) path is correct
-    across the token sweep. The (token-independent) weights are built once and
-    reused; only the ``m``-token activations and routing change per graph.
-
-    Args:
-        data_format: "a4w4" or "a8w4".
-        experts, topk, model_dim, inter_dim, layout, activation, swiglu_limit,
-            use_bias: grouped-MoE problem definition (same meaning as run_moe).
-        max_tokens: upper bound of the verified token sweep (the "build" size).
-        step: stride of the sweep ``range(1, max_tokens, step)``.
-        tol: logits_diff gate for each token count.
-        seed: base RNG seed; the per-count problem uses ``seed + m``.
-
-    Returns:
-        One ``(m, logits_diff, rel_l2, passed)`` tuple per verified token count.
-    """
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
     if layout not in ("gguu", "gugu"):
@@ -671,8 +648,6 @@ def _run_graph_scenario(
     k_pack = k_dim // 2
     inter_pack = inter // 2
 
-    # Token-independent logical GGUU weights/scales/bias, built once and reused
-    # for every captured graph in the sweep.
     torch.manual_seed(seed)
     w1_logical = _pattern_packed(experts, 2 * inter, k_pack)
     w2_logical = _pattern_packed(experts, k_dim, inter_pack)
@@ -713,59 +688,77 @@ def _run_graph_scenario(
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)
         w2_arg = w2_grouped.view(dtypes.fp4x2)
-    else:  # a8w4
+    else:
         w1_arg = w1_grouped
         w2_arg = w2_grouped
 
     tag = f"{data_format} {layout} graph(build={max_tokens})"
     results: list[tuple[int, float, float, bool]] = []
-    for m in range(1, max_tokens, step):
+
+    hidden_buf = torch.zeros((max_tokens, k_dim), dtype=torch.bfloat16)
+    topk_id_buf = torch.zeros((max_tokens, topk), dtype=torch.int32)
+    topk_w_buf = torch.zeros((max_tokens, topk), dtype=torch.bfloat16)
+
+    def _call() -> torch.Tensor:
+        return fused_moe(
+            hidden_buf,
+            w1_arg,
+            w2_arg,
+            topk_w_buf,
+            topk_id_buf,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            bias1=bias1_phys if use_bias else None,
+            bias2=bias2 if use_bias else None,
+            gate_mode=gate_mode.value,
+            dtype=dtypes.bf16,
+            swiglu_limit=swiglu_limit,
+        )
+
+    def _fill(m: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         torch.manual_seed(seed + m)
-        # Static graph inputs for this token count (captured by reference).
-        hidden_buf = (torch.randn((m, k_dim)) * 0.5).to(torch.bfloat16)
-        topk_id_buf, topk_w_buf = _make_topk(hidden_buf, experts, topk)
-        topk_w_buf = topk_w_buf.to(torch.bfloat16)
+        hidden_m = (torch.randn((m, k_dim)) * 0.5).to(torch.bfloat16)
+        id_m, w_m = _make_topk(hidden_m, experts, topk)
+        w_m = w_m.to(torch.bfloat16)
+        hidden_buf[:m].copy_(hidden_m)
+        topk_id_buf[:m].copy_(id_m)
+        topk_w_buf[:m].copy_(w_m)
+        return hidden_m, id_m, w_m
 
-        def _call() -> torch.Tensor:
-            return fused_moe(
-                hidden_buf,
-                w1_arg,
-                w2_arg,
-                topk_w_buf,
-                topk_id_buf,
-                activation=activation,
-                quant_type=QuantType.per_1x32,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                bias1=bias1_phys if use_bias else None,
-                bias2=bias2 if use_bias else None,
-                gate_mode=gate_mode.value,
-                dtype=dtypes.bf16,
-                swiglu_limit=swiglu_limit,
-            )
+    _fill(max_tokens)
+    for _ in range(2):
+        _call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_buf = _call()
+    torch.cuda.synchronize()
 
-        # Prime JIT/autotune/workspace before capture (a graph cannot compile or
-        # allocate), then capture and replay this m-token problem.
-        for _ in range(2):
-            _call()
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out_buf = _call()
+    hidden_buf.zero_()
+    topk_id_buf.zero_()
+    topk_w_buf.zero_()
+
+    sweep = list(range(1, max_tokens, step))
+    if not sweep or sweep[-1] != max_tokens:
+        sweep.append(max_tokens)
+    for m in sweep:
+        hidden_m, id_m, w_m = _fill(m)
         graph.replay()
         torch.cuda.synchronize()
-        out_m = out_buf.clone()
+        out_m = out_buf[:m].clone()
 
         ref_m = _torch_moe_ref(
-            hidden_buf,
+            hidden_m,
             w1_logical,
             w1_scale_raw,
             bias1,
             w2_logical,
             w2_scale_raw,
             bias2,
-            topk_w_buf,
-            topk_id_buf,
+            w_m,
+            id_m,
             data_format=data_format,
             activation=activation,
             swiglu_limit=swiglu_limit,
@@ -779,7 +772,7 @@ def _run_graph_scenario(
             flush=True,
         )
         results.append((m, ld, rel, passed))
-        del graph  # free this graph's private memory pool before the next capture
+    del graph
     return results
 
 
