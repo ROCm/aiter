@@ -3,6 +3,7 @@
 
 import torch
 import aiter
+import functools
 import pandas as pd
 import os
 import sys
@@ -66,6 +67,12 @@ except ImportError:
 
 if is_flydsl_available():
     try:
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+            gen as _v2_gen,
+            build_v2_inputs as _v2_build_inputs,
+            populate_baseline_v2_intermediate as _v2_populate,
+            v2_stage1_sorted_ref as _v2_stage1_ref,
+        )
         from aiter.ops.flydsl.moe_kernels import (
             get_flydsl_stage1_kernels,
             get_flydsl_stage2_kernels,
@@ -73,6 +80,7 @@ if is_flydsl_available():
             get_flydsl_stage2_kernels_int4_bf16,
             flydsl_moe_stage1,
             flydsl_moe_stage2,
+            get_flydsl_stage2_v2_kernels,
         )
     except ImportError:
 
@@ -713,6 +721,133 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+        )
+
+    @staticmethod
+    def generate_v2_stage1_data(
+        token, model_dim, inter_dim, expert, topk, blockM, adtype, device="cuda"
+    ):
+        # Build the SAME inputs the runtime v2 gemm1 path consumes:
+        # aiter/fused_moe.py:_flydsl_stage1_wrapper -> flydsl_moe_stage1(
+        #   a=a1_qt, w1=w1_qt_shuf, w1_scale=w1_scale_shuf, a1_scale=a1_scale_sort,
+        #   v2_output_layout=True, ...). Recipe mirrors
+        # mxfp4_v2_tune_utils.populate_baseline_v2_intermediate.
+        d = _v2_gen(token, model_dim, inter_dim, expert, topk, blockM, adtype=adtype)
+        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        # Precompute the sorted A-scale here so it is NOT timed in the run func.
+        a1_scale_sort = moe_mxfp4_sort(
+            d["a1_scale"][:token, :].view(token, 1, -1),
+            sorted_ids=v["sti"],
+            num_valid_ids=v["cumsum"],
+            token_num=token,
+            block_size=blockM,
+        )
+        return {
+            "a1_qt": d["a1_qt"],
+            "w1_shuf": d["base"]["w1_qt_shuf"],
+            "w1_scale_shuf": d["base"]["w1_scale_shuf"],
+            "a1_scale_sort": a1_scale_sort,
+            "sti": v["sti"], "sei": v["sei"], "cumsum": v["cumsum"],
+            "isq": v["isq"], "n": v["n"],
+            "ref1": d["ref1"], "topk_ids": d["topk_ids"],
+        }
+
+    @staticmethod
+    def run_flydsl_v2_stage1_out(
+        a1_qt, w1_shuf, w1_scale_shuf, a1_scale_sort, sti, sei, cumsum, isq, n,
+        model_dim, inter_dim, expert, topk, blockM, adtype, kparams,
+    ):
+        # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
+        # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
+        out, _scale = flydsl_moe_stage1(
+            a=a1_qt,
+            w1=w1_shuf,
+            out=isq,
+            sorted_token_ids=sti,
+            sorted_expert_ids=sei,
+            num_valid_ids=cumsum,
+            topk=topk,
+            tile_m=kparams["tile_m"],
+            tile_n=kparams["tile_n"],
+            tile_k=kparams["tile_k"],
+            a_dtype=kparams["a_dtype"],
+            b_dtype=kparams["b_dtype"],
+            out_dtype=kparams["out_dtype"],
+            act="silu",
+            w1_scale=w1_scale_shuf,
+            a1_scale=a1_scale_sort,
+            sorted_weights=None,
+            use_async_copy=True,
+            k_batch=1,
+            waves_per_eu=kparams.get("waves_per_eu", 3),
+            b_nt=kparams.get("b_nt", 2),
+            gate_mode=kparams.get("gate_mode", "separated"),
+            a_scale_one=kparams.get("a_scale_one", False),
+            xcd_swizzle=kparams.get("xcd_swizzle", 0),
+            k_wave=kparams.get("k_wave", 1),
+            v2_output_layout=True,
+        )
+        return out.view(torch.uint8).view_as(isq)
+
+    @staticmethod
+    def generate_v2_stage2_data(
+        token, model_dim, inter_dim, expert, topk, blockM, adtype, device="cuda"
+    ):
+        d = _v2_gen(token, model_dim, inter_dim, expert, topk, blockM, adtype=adtype)
+        v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
+        # Fixed baseline gemm1 producer params used only to fill the sorted-row isq intermediate the v2 gemm2 candidate consumes; not tuned and not timed.
+        prod_params = {"tile_m": blockM, "tile_n": 64 if adtype == "fp4" else 128,
+                       "tile_k": 256, "k_batch": 1, "waves_per_eu": 3,
+                       "b_nt": 2, "k_wave": 1}
+        _v2_populate(d, v, token, topk, prod_params, blockM)
+        return {
+            "isq": v["isq"], "iss": v["iss"], "w2u8": v["w2u8"], "w2sc": v["w2sc"],
+            "sei": v["sei"], "cumsum": v["cumsum"], "sti": v["sti"], "swt": v["swt"],
+            "n": v["n"], "max_sorted": v["max_sorted"], "ref2": d["ref2"],
+        }
+
+    @staticmethod
+    def run_flydsl_v2_stage2_out(
+        isq, iss, w2u8, w2sc, sei, cumsum, sti, swt, n, max_sorted, ref2,
+        model_dim, inter_dim, expert, topk, kparams,
+    ):
+        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+        token = ref2.shape[0]
+        epilog = kparams["epilog"]
+        bm_s2 = kparams["tile_m"]
+        sbm = kparams["sort_block_m"]
+        out = torch.empty((token, model_dim), dtype=dtypes.bf16, device=isq.device)
+        inter = (
+            torch.empty((token, topk, model_dim), dtype=dtypes.bf16, device=isq.device)
+            if epilog == "reduce" else None
+        )
+        gemm2_out = inter if epilog == "reduce" else out
+        if epilog != "reduce":
+            out.zero_()
+        mxfp4_moe_gemm2(
+            inter_sorted_quant=isq, inter_sorted_shuffled_scale=iss,
+            w2_u8=w2u8, w2_scale_u8=w2sc, sorted_expert_ids=sei,
+            cumsum_tensor=cumsum, sorted_token_ids=sti, sorted_weights=swt,
+            out=gemm2_out, M_logical=token, max_sorted=max_sorted, NE=expert,
+            D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk, BM=bm_s2,
+            use_nt=kparams["use_nt"], a_dtype=kparams["a_dtype"], epilog=epilog,
+            SBM=sbm, persist=kparams["persist"], n_sorted_padded=n,
+            model_dim_pad=0, inter_dim_pad=0,
+        )
+        if epilog == "reduce":
+            from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+            _run_moe_reduction(inter, out, token, topk, model_dim)
+        return out
+
+    @staticmethod
+    def run_v2_stage2_ref(ref2):
+        return ref2
+
+    @staticmethod
+    def run_v2_stage1_sorted_ref(ref1, topk_ids, sti, sei, n, token, inter_dim, bm_s1):
+        return _v2_stage1_ref(
+            ref1, topk_ids, sti, sei, n, token=token, inter_dim=inter_dim,
+            bm_s1=bm_s1, max_sorted=sti.numel(),
         )
 
     @staticmethod
@@ -3165,6 +3300,95 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    def gen_flydsl_v2_2stages_task(self, info, blockMs):
+        tasks = []
+        if not is_flydsl_available():
+            return tasks
+        (gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype,
+         q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1) = info
+        # gate: per_1x32, fp4 weight + fp4/fp8 activation (fused), use_g1u1 (design 4.3)
+        if q_type != QuantType.per_1x32 or not use_g1u1:
+            return tasks
+        if q_dtype_w != dtypes.fp4x2:
+            return tasks
+        adtype = "fp4" if q_dtype_a == dtypes.fp4x2 else (
+            "fp8" if q_dtype_a == dtypes.fp8 else None)
+        if adtype is None:
+            return tasks
+
+        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
+
+        # v2 always fuses quant; dtype is bf16 out layout at the flydsl kernel level.
+        out_dtype_str = "bf16"
+        s1_kernels = get_flydsl_stage1_kernels(adtype, "fp4", out_dtype_str)
+
+        for blockM in blockMs:
+            if blockM not in (32, 64, 128):
+                continue
+            # ---- v2 stage1 tasks: sweep the FULL fused stage1 candidate set ----
+            # Mirror gen_flydsl_2stages_task's fused-variant construction so
+            # label == timed config == runtime config (kname1 encodes
+            # tile_n/waves/b_nt/gate_mode/xcd_swizzle/k_wave). v2 requires
+            # non-splitk (k_batch==1: _v2_output_layout = _fuse_any_quant and
+            # not _is_splitk, moe_kernels.py:1179) and tile_m == blockM.
+            s1_compare = functools.partial(
+                v2_stage1_dequant_cosine_err, inter_dim=inter_dim, adtype=adtype)
+            for kname, kparams in s1_kernels.items():
+                if kparams.get("tile_m") != blockM:
+                    continue
+                if kparams.get("k_batch", 1) != 1:
+                    continue
+                # Only the FUSED variant (v2 always fuses quant). Fused name and
+                # params exactly as gen_flydsl_2stages_task builds them.
+                if adtype == "fp8":
+                    s1_name = kname + "_fp8"
+                    s1_params = {
+                        **kparams,
+                        "out_dtype": "fp8",
+                        "a_scale_one": True,
+                        "gate_mode": "interleave",
+                    }
+                else:
+                    s1_name = kname + "_fp4"
+                    s1_params = {**kparams, "out_dtype": "fp4"}
+                # info tag: (..., blockM, flat_flag=0, v2=1) -- tail[3]=flat (post_process int(tail[3]) default), tail[4]=v2 marker
+                tasks.append((
+                    (info, "stage1", s1_name, blockM, 0, 1),
+                    FmoeTuner.generate_v2_stage1_data,
+                    (token, model_dim, inter_dim, expert, topk, blockM, adtype),
+                    FmoeTuner.run_flydsl_v2_stage1_out,
+                    (["a1_qt", "w1_shuf", "w1_scale_shuf", "a1_scale_sort",
+                      "sti", "sei", "cumsum", "isq", "n"],
+                     model_dim, inter_dim, expert, topk, blockM, adtype, s1_params),
+                    {},
+                    FmoeTuner.run_v2_stage1_sorted_ref,
+                    (["ref1", "topk_ids", "sti", "sei", "n"], token, inter_dim, blockM),
+                    {},
+                    None,
+                    0.1, 0.1, s1_compare,
+                ))
+            # ---- v2 stage2 tasks ----
+            for kn2, kp in get_flydsl_stage2_v2_kernels(
+                    adtype, "fp4", "bf16", blockM).items():
+                kp = {**kp, "a_dtype": adtype}
+                # flat=0, v2=1
+                tasks.append((
+                    (info, "stage2", kn2, blockM, 0, 1),
+                    FmoeTuner.generate_v2_stage2_data,
+                    (token, model_dim, inter_dim, expert, topk, blockM, adtype),
+                    FmoeTuner.run_flydsl_v2_stage2_out,
+                    (["isq", "iss", "w2u8", "w2sc", "sei", "cumsum", "sti", "swt",
+                      "n", "max_sorted", "ref2"],
+                     model_dim, inter_dim, expert, topk, kp),
+                    {},
+                    FmoeTuner.run_v2_stage2_ref,
+                    (["ref2"],),
+                    {},
+                    None,
+                    0.1, 0.1, cosine_diff_compare,
+                ))
+        return tasks
+
     def gen_opus_2stages_task(
         self,
         info,
@@ -3976,6 +4200,8 @@ class FmoeTuner(TunerCommon):
                 tasks_ck.extend(self.gen_2stages_task(info, blockMs))
             if _want("flydsl"):
                 tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            if _want("flydslv2"):
+                tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
@@ -4125,6 +4351,7 @@ class FmoeTuner(TunerCommon):
                 kernelName = tail[1]
                 block_m = tail[2]
                 flat_flag = int(tail[3]) if len(tail) > 3 else 0
+                v2_flag = int(tail[4]) if len(tail) > 4 else 0
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
                 row_ksplit = 0
                 sk_match = re.search(r"_sk(\d+)$", str(kernelName))
@@ -4156,6 +4383,7 @@ class FmoeTuner(TunerCommon):
                         tflops,
                         bw,
                         flat_flag,
+                        v2_flag,
                     ]
                 )
 
@@ -4173,6 +4401,7 @@ class FmoeTuner(TunerCommon):
                     "tflops",
                     "bw",
                     "flat",
+                    "v2",
                 ],
             )
             prorfiles.append(profileDF)
@@ -4186,14 +4415,15 @@ class FmoeTuner(TunerCommon):
             ]
             # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
             # penalty below is applied only to non-fused, so dedup must not drop the
-            # fused kernel by raw us before that penalty runs.
+            # fused kernel by raw us before that penalty runs. Keep v2 and non-v2
+            # candidates separate as well because they use different layouts.
             profileDF["_is_fused"] = (
                 profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
             )
             profileDF = (
                 profileDF.sort_values("us")
                 .drop_duplicates(
-                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
+                    ["stage", "block_m", "flat", "v2", "_is_fused"], keep="first"
                 )
                 .drop(columns=["_is_fused"])
             )
@@ -4256,6 +4486,10 @@ class FmoeTuner(TunerCommon):
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )
             asm_1stage_profileDF["run_1stage"] = 1
+            # v2 in the merge key isolates v2 gemm1<->v2 gemm2 pairing (and
+            # normal<->normal); it is a per-row constant tag (0 for all
+            # normal/asm rows, 1 for v2), so adding it to the key leaves
+            # normal-path grouping unchanged.
             profileDF = pd.merge(
                 stage1_profileDF,
                 stage2_profileDF,
@@ -4275,6 +4509,7 @@ class FmoeTuner(TunerCommon):
                     "use_g1u1",
                     "doweight_stage1",
                     "block_m",
+                    "v2",
                 ],
                 how="inner",
             )
@@ -4367,11 +4602,14 @@ class FmoeTuner(TunerCommon):
                             f"  quant_sort benchmark: blockM={bm_int}, us={us_qs_cache[bm]}"
                         )
                     profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
-                    # _fp4 kernels already fuse the fp4-quant+sort; skip cost addition
+                    # _fp4 kernels already fuse the fp4-quant+sort; skip cost addition.
+                    # v2 pairs also fuse fp4-quant+sort into gemm1 -> skip.
                     is_fp4 = profileDF["kernelName1"].astype(str).str.endswith("_fp4")
-                    profileDF.loc[~is_fp4, "us1"] = (
-                        profileDF.loc[~is_fp4, "us1"]
-                        + profileDF.loc[~is_fp4, "us_quant_sort"]
+                    is_v2 = profileDF["v2"].astype(int) == 1
+                    add_qs = ~is_fp4 & ~is_v2
+                    profileDF.loc[add_qs, "us1"] = (
+                        profileDF.loc[add_qs, "us1"]
+                        + profileDF.loc[add_qs, "us_quant_sort"]
                     )
                     profileDF.drop(columns=["us_quant_sort"], inplace=True)
                 elif q_dtype_a == dtypes.fp8:
@@ -4397,9 +4635,11 @@ class FmoeTuner(TunerCommon):
                         us_qs_cache[bm] = us_fp8_cast
                     profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
                     is_fp8 = profileDF["kernelName1"].astype(str).str.endswith("_fp8")
-                    profileDF.loc[~is_fp8, "us1"] = (
-                        profileDF.loc[~is_fp8, "us1"]
-                        + profileDF.loc[~is_fp8, "us_quant_sort"]
+                    is_v2 = profileDF["v2"].astype(int) == 1
+                    add_cast = ~is_fp8 & ~is_v2
+                    profileDF.loc[add_cast, "us1"] = (
+                        profileDF.loc[add_cast, "us1"]
+                        + profileDF.loc[add_cast, "us_quant_sort"]
                     )
                     profileDF.drop(columns=["us_quant_sort"], inplace=True)
 
@@ -4640,6 +4880,14 @@ class FmoeTuner(TunerCommon):
                         "falling back to additive fairness"
                     )
 
+            # v2 is a transient tuning-time pairing marker; the persistent v2
+            # marker is kernelName2's ``flydslv2_`` prefix. Drop it before the
+            # best-row selection so it never reaches the tuned CSV. (It still
+            # appears in the profile_fmoe.csv debug dump, since prorfiles
+            # captured the pre-strip DataFrame by reference; that is fine -- the
+            # dump already carries internal columns like stage/flat/ksplit.)
+            if "v2" in profileDF.columns:
+                profileDF = profileDF.drop(columns=["v2"])
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
