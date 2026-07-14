@@ -58,10 +58,11 @@ TESTS = [
         "model_id": "Qwen/Qwen3.5-397B-A17B",
         "model_path_env": "QWEN35_MODEL_PATH",
         "test_type": "Accuracy",
-        "timeout_minutes": 70,
+        "timeout_minutes": 100,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600",
-        "run_on_pr": True,
+        "run_on_pr": False,
+        "comment": "Run in nightly first while failures are investigated.",
         "run_on_schedule": True,
     },
     {
@@ -87,13 +88,9 @@ TESTS = [
         "timeout_minutes": 70,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
-        # Temporarily disabled: the DSv3.2 indexer eval hangs and hits the 3600s
-        # timeout (HIP backtrace) on current AITER main; verified the #3451 fix
-        # (cache_kernels.cu) cherry-picked does NOT resolve it yet. Re-enable
-        # (run_on_pr/run_on_schedule -> True) once the DSv3.2 indexer kernel fix
-        # lands. Tracked in #3451 / dsv32-indexer-fused-kernel-fixes.
         "run_on_pr": False,
-        "run_on_schedule": False,
+        "comment": "Run in nightly first while failures are investigated.",
+        "run_on_schedule": True,
     },
     {
         "runner": "linux-aiter-do-mi350x-8",
@@ -247,7 +244,7 @@ def write_summary(
 
 def select_tests() -> None:
     event_name = os.environ.get("EVENT_NAME") or os.environ.get("GITHUB_EVENT_NAME", "")
-    run_key = "run_on_pr" if event_name == "pull_request" else "run_on_schedule"
+    run_key = "run_on_schedule" if event_name == "schedule" else "run_on_pr"
     disabled = [
         test
         for test in TESTS

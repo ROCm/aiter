@@ -28,9 +28,11 @@ import torch
 import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
+from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 
 __all__ = [
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_varlen_func",
 ]
 
 
@@ -204,3 +206,69 @@ def flydsl_flash_attn_func(
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
     return o_p
+
+
+def flydsl_flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    out=None,
+    sink=None,
+):
+    """FlyDSL MHA forward, varlen THD layout.
+
+    Returns the result if FlyDSL can handle this configuration,
+    otherwise returns None so the caller falls through to Triton/CK.
+    """
+    from ...jit.utils.chip_info import get_gfx
+
+    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
+    # dropout, sliding window, paging, probs/deterministic) falls through to
+    # CK/Triton instead of being silently dropped.
+    supported = (
+        get_gfx() == "gfx1250"
+        and q.shape[-1] == 192
+        and v.shape[-1] == 128
+        and q.dtype == torch.bfloat16
+        and dropout_p == 0.0
+        and tuple(window_size[:2]) == (-1, -1)
+        and block_table is None
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and not deterministic
+        and not return_attn_probs
+    )
+    if not supported:
+        return None
+
+    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
+    if out is None:
+        out = torch.empty_like(q[:, :, : v.shape[-1]])
+    return flash_attn_varlen_d192_gfx1250(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out,
+        return_lse=return_lse,
+    )

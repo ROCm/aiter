@@ -116,14 +116,24 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
 
     if constexpr(WarpSize > 4)
     {
+#if defined(__GFX9__)
         // row_half_mirror
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(local), local);
+#else
+        // row_xmask:7
+        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x167>(local), local);
+#endif
     }
 
     if constexpr(WarpSize > 8)
     {
+#if defined(__GFX9__)
         // row_mirror
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(local), local);
+#else
+        // row_xmask:15
+        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x16f>(local), local);
+#endif
     }
 
     if constexpr(WarpSize > 16)
@@ -187,9 +197,9 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
+#if defined(__GFX9__)
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
-#if defined(__GFX9__)
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142, 0xa>(data), data);
         if constexpr(threadBroadcast)
         {
@@ -198,6 +208,8 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
         }
 #else
         // data = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x167>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x16f>(data), data);
         data = reduce_op(warp_permlanex16(data), data);
 #endif
     }
