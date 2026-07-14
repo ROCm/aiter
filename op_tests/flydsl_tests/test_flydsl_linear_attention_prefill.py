@@ -8,6 +8,7 @@ Usage:
     export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
     FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
     FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-32k-aws" -v -s
+    bash op_tests/flydsl_tests/run_test_flydsl_gdr_k5_prefill.sh
 """
 
 from __future__ import annotations
@@ -73,6 +74,12 @@ try:
 except Exception:
     chunk_gated_delta_rule_fwd_h_hip_fn = None
     _HAS_HIP_K5 = False
+
+# When True, ``test_consistency_flydsl_mfma16_hip_vs_hip`` requires the
+# flydsl-hip fork to match HIP/C++ BIT-FOR-BIT (torch.equal). Until the LDS /
+# layout / (optionally) numeric alignment work fully lands it stays False and
+# the test only records the gap + asserts a loose same-algorithm band.
+_MFMA16_HIP_VS_HIP_BITEXACT = False
 
 torch.set_default_device("cuda")
 
@@ -1778,14 +1785,6 @@ def _run_perf_comparison(args: PrefillArgs):
     fly_vs_vllm = (
         us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
     )
-    # FlyDSL_mfma16_hip speedup vs Triton_vk.
-    fly_hip_vs_vk = (
-        us_triton_vk / us_fly_mfma16_hip if (us_fly_mfma16_hip > 0 and us_fly_mfma16_hip == us_fly_mfma16_hip) else float("nan")
-    )
-    # FlyDSL_mfma16_3wave_opt2 speedup vs Triton_vk.
-    fly_3w_vs_vk = (
-        us_triton_vk / us_fly_mfma16_3wave_opt2 if (us_fly_mfma16_3wave_opt2 > 0 and us_fly_mfma16_3wave_opt2 == us_fly_mfma16_3wave_opt2) else float("nan")
-    )
     # HIP speedup vs Triton_vk (>1 means HIP is faster than Triton_vk).
     hip_vs_vk = (
         us_triton_vk / us_hip if (us_hip > 0 and us_hip == us_hip) else float("nan")
@@ -1815,8 +1814,6 @@ def _run_perf_comparison(args: PrefillArgs):
             "flydsl_vs_vk": fly_vs_vk,
             "flydsl_vs_origin_opt": fly_vs_origin_opt,
         "flydsl_vs_vllm": fly_vs_vllm,
-        "fly_hip_vs_vk": fly_hip_vs_vk,
-        "fly_3w_vs_vk": fly_3w_vs_vk,
         "hip_vs_vk": hip_vs_vk,
         "flydsl_opt_vs_vk": fly_opt_vs_vk,
         }
@@ -1933,10 +1930,8 @@ def _print_perf_table():
         ("Tri_vk", "Triton_vk(us)", 6),
         ("vLLM", "vLLM_vk(us)", 6),
         ("fly/vk", "flydsl_vs_vk", 6),
-        ("fh/vk", "fly_hip_vs_vk", 6),
         ("hip/vk", "hip_vs_vk", 6),
         ("2w/vk", "flydsl_opt_vs_vk", 6),
-        ("3w/vk", "fly_3w_vs_vk", 6),
     ]
 
     def _fmt_cell(val, key, width):
