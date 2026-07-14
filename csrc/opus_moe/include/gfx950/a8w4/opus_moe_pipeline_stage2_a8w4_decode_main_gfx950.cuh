@@ -209,11 +209,9 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
     using Schedule = OpusMoeStage2A8W4DecodeSchedule<T>;
     using MainloopSchedule = OpusMoeStage2A8W4DecodeMainloopSchedule;
 
-    constexpr bool OddK = (T::K_TILES & 1) != 0;
-    constexpr int TailTiles = T::K_TILES == 2 ? 0 : (OddK ? 1 : 2);
-    constexpr int PairTileEnd = T::K_TILES - TailTiles;
-    constexpr int PairCount = PairTileEnd / 2;
-    static_assert(PairTileEnd >= 2 && (PairTileEnd & 1) == 0);
+    constexpr bool HasOddTail = (T::K_TILES & 1) != 0;
+    constexpr int PairCount = T::K_TILES / 2;
+    static_assert(PairCount >= 1);
 
     constexpr int k0 = 0;
     constexpr int k1 = T::K_STEP_PACKED;
@@ -316,7 +314,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
             compute_streamed_tile(1_I, 1_I, 2 * pair + 1, b_scale, a_scale);
         }
 
-        if constexpr(OddK)
+        if constexpr(HasOddTail)
         {
             constexpr int TailTile = T::K_TILES - 1;
             constexpr int TailPair = TailTile / 2;
@@ -339,11 +337,14 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
 
         auto run_odd_tile = [&](auto stage,
                                 auto prefetch_next,
+                                auto wait_for_pending_b_half0,
                                 int tile_base,
                                 const int (&a_scale)[T::M_MFMA_PER_WAVE],
                                 const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE]) {
             constexpr int Stage = decltype(stage)::value;
             constexpr bool PrefetchNext = decltype(prefetch_next)::value != 0;
+            constexpr bool WaitForPendingBHalf0 =
+                decltype(wait_for_pending_b_half0)::value != 0;
             static_assert((Stage & 1) == 1);
             static_assert(!PrefetchNext || Stage + 1 < T::K_TILES);
 
@@ -355,6 +356,9 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
             load_a_payload(stage, v_a_odd);
             load_b_half(0, tile_base, v_b_half0);
             load_b_half(1, tile_base, v_b_half1);
+
+            if constexpr(WaitForPendingBHalf0)
+                s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
 
             __builtin_amdgcn_s_setprio(1);
             compute_half(1_I, 0_I, v_a_odd, a_scale, b_scale, v_b_half0);
@@ -382,13 +386,19 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
                 load_b_half(1, b_tile_base0, v_b_half1);
 
                 load_scale_pair(0_I, b_scale, a_scale);
-                wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS +
-                                      T::HALF_N_MFMA_PER_WAVE +
-                                      T::M_MFMA_PER_WAVE +
-                                      2 * T::HALF_N_MFMA_PER_WAVE>{});
+                if constexpr(PrefetchNext)
+                    wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS +
+                                          T::HALF_N_MFMA_PER_WAVE +
+                                          T::M_MFMA_PER_WAVE +
+                                          2 * T::HALF_N_MFMA_PER_WAVE>{});
+                else
+                    wait_a_payload(0_I);
 
                 V_A v_a_even[T::M_MFMA_PER_WAVE];
                 load_a_payload(0_I, v_a_even);
+
+                if constexpr(!PrefetchNext)
+                    s_waitcnt_vmcnt(0_I);
 
                 __builtin_amdgcn_s_setprio(1);
                 compute_half(0_I, 0_I, v_a_even, a_scale, b_scale, v_b_half0);
@@ -397,69 +407,71 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
             }
             else
             {
-                wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS>{});
+                if constexpr(PrefetchNext)
+                    wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS>{});
+                else
+                    wait_a_payload(0_I);
                 load_scale_pair(0_I, b_scale, a_scale);
-                compute_tile(0_I, 0_I, 0_I, b_tile_base0, b_scale, a_scale);
+                compute_tile(
+                    0_I,
+                    number<!PrefetchNext>{},
+                    0_I,
+                    b_tile_base0,
+                    b_scale,
+                    a_scale);
             }
 
-            run_odd_tile(1_I, number<PrefetchNext>{}, b_tile_base1, a_scale, b_scale);
+            run_odd_tile(
+                1_I,
+                number<PrefetchNext>{},
+                number<!PrefetchNext>{},
+                b_tile_base1,
+                a_scale,
+                b_scale);
         };
 
-        if constexpr(T::K_TILES == 2)
+        auto run_middle_pair = [&](auto pair) {
+            constexpr int Pair = decltype(pair)::value;
+            constexpr int EvenStage = 2 * Pair;
+            constexpr int OddStage = EvenStage + 1;
+            constexpr bool PrefetchNext = OddStage + 1 < T::K_TILES;
+            static_assert(Pair > 0);
+            static_assert(OddStage < T::K_TILES);
+
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            load_scale_pair(pair, b_scale, a_scale);
+            compute_prefetched_even_tile(
+                b_tile_base_for(number<EvenStage>{}),
+                v_a_prefetched_even,
+                a_scale,
+                b_scale);
+            run_odd_tile(
+                number<OddStage>{},
+                number<PrefetchNext>{},
+                0_I,
+                b_tile_base_for(number<OddStage>{}),
+                a_scale,
+                b_scale);
+        };
+
+        constexpr bool HasRemainingAfterFirstPair = T::K_TILES > 2;
+        run_first_pair(number<HasRemainingAfterFirstPair>{});
+        static_for<PairCount - 1>([&](auto local_pair) {
+            run_middle_pair(number<local_pair.value + 1>{});
+        });
+        if constexpr(HasOddTail)
         {
-            run_first_pair(0_I);
-        }
-        else
-        {
-            auto run_middle_pair = [&](auto pair) {
-                constexpr int Pair = decltype(pair)::value;
-                constexpr int EvenStage = 2 * Pair;
-                constexpr int OddStage = EvenStage + 1;
-                static_assert(Pair > 0);
-                static_assert(OddStage < PairTileEnd);
-
-                int b_scale[T::HALF_N_MFMA_PER_WAVE];
-                int a_scale[T::M_MFMA_PER_WAVE];
-                load_scale_pair(pair, b_scale, a_scale);
-                compute_prefetched_even_tile(
-                    b_tile_base_for(number<EvenStage>{}),
-                    v_a_prefetched_even,
-                    a_scale,
-                    b_scale);
-                run_odd_tile(
-                    number<OddStage>{},
-                    1_I,
-                    b_tile_base_for(number<OddStage>{}),
-                    a_scale,
-                    b_scale);
-            };
-
-            auto run_tail = [&]() {
-                constexpr int TailStage = PairTileEnd;
-                constexpr int TailPair = TailStage / 2;
-                int b_scale[T::HALF_N_MFMA_PER_WAVE];
-                int a_scale[T::M_MFMA_PER_WAVE];
-                load_scale_pair(number<TailPair>{}, b_scale, a_scale);
-                compute_prefetched_even_tile(
-                    b_tile_base_for(number<TailStage>{}),
-                    v_a_prefetched_even,
-                    a_scale,
-                    b_scale);
-
-                if constexpr(!OddK)
-                    run_odd_tile(
-                        number<TailStage + 1>{},
-                        0_I,
-                        b_tile_base_for(number<TailStage + 1>{}),
-                        a_scale,
-                        b_scale);
-            };
-
-            run_first_pair(1_I);
-            static_for<PairCount - 1>([&](auto local_pair) {
-                run_middle_pair(number<local_pair.value + 1>{});
-            });
-            run_tail();
+            constexpr int TailStage = 2 * PairCount;
+            constexpr int TailPair = PairCount;
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            load_scale_pair(number<TailPair>{}, b_scale, a_scale);
+            compute_prefetched_even_tile(
+                b_tile_base_for(number<TailStage>{}),
+                v_a_prefetched_even,
+                a_scale,
+                b_scale);
         }
     }
 }
@@ -1205,7 +1217,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         static_cast<unsigned int>(static_cast<unsigned long long>(token_num) *
                                   static_cast<unsigned long long>(kargs.stride_a_t));
     const unsigned int a_scale_size_bytes =
-        static_cast<unsigned int>(static_cast<unsigned long long>(sorted_rows) *
+        static_cast<unsigned int>(static_cast<unsigned long long>(kargs.a_scale_rows) *
                                   static_cast<unsigned long long>(kargs.stride_a_scale_route));
     auto g_a = make_gmem(inter_states, a_size_bytes);
     auto g_a_scale = make_gmem(a2_scale, a_scale_size_bytes);

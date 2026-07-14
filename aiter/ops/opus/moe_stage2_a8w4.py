@@ -51,6 +51,17 @@ def _pad_scale_cols(tensor: Tensor, cols: int) -> Tensor:
     return padded
 
 
+def _pad_scale_rows(tensor: Tensor, rows: int) -> Tensor:
+    if tensor.shape[0] >= rows:
+        return tensor
+    padded = torch.empty(
+        (rows, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[: tensor.shape[0], :] = tensor
+    padded[tensor.shape[0] :, :] = tensor[-1:, :]
+    return padded
+
+
 def _route_out_mode_from_dtype(route_out_dtype: Optional[str]) -> int:
     if route_out_dtype is None:
         return OPUS_A8W4_OUT_MODE_FP8
@@ -200,6 +211,13 @@ def opus_moe_stage2_a8w4_decode_fwd(
         route_out_fp8 = opus_a8w4_kid_is_fp8(kernel_id)
     if shape_family is not None:
         scale_cols = _packed_scale_cols(shape_family)
+        scale_row_pack = 2 * OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.mfma_m
+        scale_rows = (
+            (int(sorted_token_ids.shape[0]) + scale_row_pack - 1)
+            // scale_row_pack
+            * scale_row_pack
+        )
+        a2_scale = _pad_scale_rows(a2_scale, scale_rows)
         a2_scale = _pad_scale_cols(a2_scale, scale_cols)
         w2_scale = _pad_scale_cols(w2_scale, scale_cols)
     md = w2.shape[1]

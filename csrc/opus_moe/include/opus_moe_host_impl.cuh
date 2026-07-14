@@ -451,6 +451,7 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.num_experts = num_experts;
     kargs.model_dim = model_dim;
     kargs.sorted_blocks = sorted_blocks;
+    kargs.a_scale_rows = static_cast<int>(a2_scale.size(0));
     // Keep a runtime route-out guard: the MXFP8 path codegen is measurably more
     // stable than making route-out a pure compile-time else branch.
     kargs.route_out_fp8 = route_out_fp8 ? 1 : 0;

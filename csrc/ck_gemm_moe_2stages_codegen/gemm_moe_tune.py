@@ -1696,23 +1696,30 @@ class FmoeTuner(TunerCommon):
     def run_torch_moe_stage2_opus_eff(*args, **kwargs):
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
             OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
+            opus_a8w4_shape_family,
             opus_a8w4_shape_family_for_shape,
         )
 
         # Opus A8W4 ref slices padded inter dim before deferring to
         # run_torch_moe_stage2, matching the decode shape family and kernel layout.
+        shape_family_name = kwargs.pop("shape_family", None)
         a2_qt, w1_qt, w2_qt, *rest = args
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=w2_qt.shape[1],
-            inter_dim=a2_qt.shape[-1],
-            expert=w2_qt.shape[0],
-            topk=a2_qt.shape[1],
-        )
+        shape_family = None
+        if shape_family_name is not None:
+            shape_family = opus_a8w4_shape_family(shape_family_name)
+        if shape_family is None:
+            shape_family = opus_a8w4_shape_family_for_shape(
+                model_dim=w2_qt.shape[1],
+                inter_dim=a2_qt.shape[-1],
+                expert=w2_qt.shape[0],
+                topk=a2_qt.shape[1],
+            )
         if shape_family is None:
             raise ValueError(
                 "unsupported Opus A8W4 shape for reference: "
                 f"model_dim={w2_qt.shape[1]}, inter_dim={a2_qt.shape[-1]}, "
-                f"expert={w2_qt.shape[0]}, topk={a2_qt.shape[1]}"
+                f"expert={w2_qt.shape[0]}, topk={a2_qt.shape[1]}, "
+                f"shape_family={shape_family_name}"
             )
         kernel_contract = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
         eff = shape_family.effective_inter_dim
@@ -3301,7 +3308,7 @@ class FmoeTuner(TunerCommon):
                         {},
                         FmoeTuner.run_torch_moe_stage2_opus_eff,
                         s2_ref_args,
-                        {},
+                        {"shape_family": shape_family.name},
                         None,
                         0.01,
                         0.01,
