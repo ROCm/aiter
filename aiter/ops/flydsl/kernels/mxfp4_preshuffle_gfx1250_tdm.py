@@ -3,6 +3,8 @@
 
 """Strided-batched A8W4 (MXFP8 E4M3 A x MXFP4 B) preshuffle GEMM for gfx1250"""
 
+from collections import namedtuple
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
@@ -160,52 +162,55 @@ def launch_gemm_a8w4_tdm(
         b_off0 = b_outer_row * Kp16
         sa_off0 = sa_super_off * SA_OUTER_STRIDE + sa_batch_off
         sb_off0 = sb_super_off * SB_OUTER_STRIDE + sb_batch_off
-        # Wave-specialized TDM: A->waves(0,1), B->(2,3); scales on (4,5)/(6,7)
-        # with >=8 waves, else reusing (0,1)/(2,3). Each loader wave moves one M/N
-        # half of its tensor alone (num_warps=1 -> no wave-partition).
-        HM, HB = tile_m // 2, (tile_n // 16) // 2
-        HSA, HSB = SA_SUPERS // 2, SB_SUPERS // 2
         WS8 = num_waves >= 8
-        W_A, W_B = (0, 1), (2, 3)
-        W_SA = (4, 5) if WS8 else (0, 1)
-        W_SB = (6, 7) if WS8 else (2, 3)
+        # Wave-specialized TDM (A->(0,1) B->(2,3) scales->(4,5)/(6,7) or reuse A/B pairs): split each tile's outer dim across a loader-wave pair (num_warps=1); else one cooperative all-wave copy.
+        WAVE_SPEC = num_waves >= 4 and tile_m >= 64 and tile_n >= 64
+        if const_expr(WAVE_SPEC):
+            waves = [(0, 1), (2, 3), (4, 5) if WS8 else (0, 1), (6, 7) if WS8 else (2, 3)]
+            nw, _sh = 1, fx.AddressSpace.Shared
+            # per-half sub-offsets are only 16B-aligned -> view the shared base as such
+            _p8 = fx.PointerType.get(elem_ty=fx.Int8.ir_type, address_space=_sh, alignment=16)
+            base_i32 = fx.recast_iter(
+                fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=_sh, alignment=16), base_ptr)
+        else:
+            waves, nw, _p8 = [(None,)] * 4, num_waves, None
+            base_i32 = fx.recast_iter(fx.Int32, base_ptr)
 
-        def _tdm1(gt, outer, stride):
-            return fx.rocdl.make_tdm_atom(gt, [outer, None], strides=[stride, None], num_warps=1)
+        # One TDM copy job per loader-wave segment. `on_i32`: LDS base is the i32 scale
+        # view (True) or the i8 A/B ring slot (False). `wave` None = all-wave copy.
+        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
+        jobs = []
 
-        gA_h, atomA_h, gB_h, atomB_h = [], [], [], []
-        gSA_h, atomSA_h, gSB_h, atomSB_h = [], [], [], []
-        for h in range_constexpr(2):
-            ga = _gv(gA_base, a_off0 + fx.Int64(h * HM) * A_OUTER_STRIDE, (HM, A_ROW_B), (A_ROW_B, 1))
-            gA_h.append(ga)
-            atomA_h.append(fx.rocdl.make_tdm_atom(
-                ga, [mn_oob - h * HM, None], strides=[A_OUTER_STRIDE, None],
-                num_warps=1, pad_interval=A_ROW_B, pad_amount=LDS_PAD_A))
-            gb = _gv(gB_base, b_off0 + fx.Int64(h * HB) * Kp16, (HB, PACK_TK * 16), (PACK_TK * 16, 1))
-            gB_h.append(gb); atomB_h.append(_tdm1(gb, None, Kp16))
-            gsa = _gv(gSA_base, sa_off0 + fx.Int64(h * HSA) * SA_OUTER_STRIDE, (HSA, SC_INNER), (SC_INNER, 1))
-            gSA_h.append(gsa); atomSA_h.append(_tdm1(gsa, sa_oob - h * HSA, SA_OUTER_STRIDE))
-            gsb = _gv(gSB_base, sb_off0 + fx.Int64(h * HSB) * SB_OUTER_STRIDE, (HSB, SC_INNER), (SC_INNER, 1))
-            gSB_h.append(gsb); atomSB_h.append(_tdm1(gsb, None, SB_OUTER_STRIDE))
-        _adv = fx.rocdl.advance_tdm_atom
-        base_i32 = fx.recast_iter(fx.Int32, base_ptr)
+        def _add_tdm_loads(g_base, g_off, g_stride, oob, inner, outer, *, on_i32, lds_off, lds_row, k_adv, wv, pad=None):
+            seg = outer // len(wv)  # split the tile's outer dim across the loader waves
+            for i in range_constexpr(len(wv)):
+                gt = _gv(g_base, g_off + fx.Int64(i * seg) * g_stride, (seg, inner), (inner, 1))
+                ext = None if oob is None else oob - i * seg
+                pad_kw = dict(pad_interval=pad[0], pad_amount=pad[1]) if pad else {}
+                atom = fx.rocdl.make_tdm_atom(gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw)
+                jobs.append(Job(atom, gt, on_i32, lds_off + i * seg * lds_row, lds_row, inner, seg, k_adv, wv[i]))
 
-        def _wcopy(w, atom, gt, lv):
-            if wave == w:
-                fx.copy(atom, gt, lv)
+        _add_tdm_loads(gA_base, a_off0, A_OUTER_STRIDE, mn_oob, A_ROW_B, tile_m,
+                       on_i32=False, lds_off=0, lds_row=A_LDS_ROW, k_adv=A_ROW_B, wv=waves[0], pad=(A_ROW_B, LDS_PAD_A))
+        _add_tdm_loads(gB_base, b_off0, Kp16, None, PACK_TK * 16, tile_n // 16,
+                       on_i32=False, lds_off=STAGE_A, lds_row=B_LDS_ROW, k_adv=PACK_TK * 16, wv=waves[1])
+        _add_tdm_loads(gSA_base, sa_off0, SA_OUTER_STRIDE, sa_oob, SC_INNER, SA_SUPERS,
+                       on_i32=True, lds_off=SA_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[2])
+        _add_tdm_loads(gSB_base, sb_off0, SB_OUTER_STRIDE, None, SC_INNER, SB_SUPERS,
+                       on_i32=True, lds_off=SB_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[3])
 
-        def issue(s, kt):
-            pa = _buf_ptr(s)
-            so4 = s * (PITCH // 4)
-            for h in range_constexpr(2):
-                _wcopy(W_A[h], _adv(atomA_h[h], kt * A_ROW_B), gA_h[h],
-                       _lv(fx.add_offset(pa, h * HM * A_LDS_ROW), (HM, A_ROW_B), (A_LDS_ROW, 1)))
-                _wcopy(W_B[h], _adv(atomB_h[h], kt * (PACK_TK * 16)), gB_h[h],
-                       _lv(fx.add_offset(pa, STAGE_A + h * HB * B_LDS_ROW), (HB, PACK_TK * 16), (B_LDS_ROW, 1)))
-                _wcopy(W_SA[h], _adv(atomSA_h[h], kt * (SC_INNER * 4)), gSA_h[h],
-                       _lv(fx.add_offset(base_i32, so4 + SA_OFF // 4 + h * HSA * SC_INNER), (HSA, SC_INNER), (SC_INNER, 1)))
-                _wcopy(W_SB[h], _adv(atomSB_h[h], kt * (SC_INNER * 4)), gSB_h[h],
-                       _lv(fx.add_offset(base_i32, so4 + SB_OFF // 4 + h * HSB * SC_INNER), (HSB, SC_INNER), (SC_INNER, 1)))
+        def issue(s, kt):  # load K-tile kt into ring slot s (advance each atom's imm_offset)
+            pa = fx.recast_iter(_p8, _buf_ptr(s)) if const_expr(WAVE_SPEC) else _buf_ptr(s)
+            so4 = s * (PITCH // 4)  # slot base offset in i32 words (for the scale views)
+            for j in jobs:
+                base = base_i32 if j.on_i32 else pa
+                dst = _lv(fx.add_offset(base, j.lds_off + (so4 if j.on_i32 else 0)), (j.outer, j.inner), (j.lds_row, 1))
+                off = fx.Int64(kt * j.k_adv)  # global K-tile byte offset for this atom
+                if const_expr(j.wave is None):
+                    fx.copy(j.atom, j.gt, dst, imm_offset=off)
+                else:
+                    if wave == j.wave:
+                        fx.copy(j.atom, j.gt, dst, imm_offset=off)
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -312,7 +317,8 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(_BS_DS)
             rocdl.sched_barrier(0)
 
-        TDM_PER = 1 if WS8 else 2  # per-wave loads/K-tile (scales share A/B waves at <8)
+        # per-wave TDM loads per K-tile: cooperative=4; wave-spec=1 (>=8 waves) or 2.
+        TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
         # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
         # compute into the slot the fence just freed (one fence/barrier per K-tile).
         for i in range_constexpr(num_buffers - 1):

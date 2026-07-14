@@ -170,9 +170,12 @@ def _run_gfx1250(
 
     # Regime dispatch. The TDM kernel serves every gfx1250 batched shape now:
     #  - large-M compute-bound: tuned 256x256x256 w4x2 (nb2) config (~4900 TF; beats
-    #    the old direct-buffer-load path and gemm_fp8fp4);
-    #  - weight-BW-bound / small-M (MoE, decode): overlap DMA with compute via a deeper
-    #    ring on small tile_m.
+    #    the old direct-buffer-load path and gemm_fp8fp4). Wave-specialized TDM
+    #    (A/B/scaleA/scaleB each on a dedicated loader-wave pair) drives it;
+    #  - weight-BW-bound / small-M (MoE, decode): cooperative all-wave TDM on a small
+    #    tile_m with a deeper (nb3) ring to overlap DMA with compute. Mem-bound perf,
+    #    a8w4 bmn 32x64x7168x2048 (tile 64x256x128, w1x2, nb3): ~29.6 us, ~9.5 TB/s
+    #    HBM (~2030 TF); the ~283 MB weight+scale stream is the limiter.
     compute_bound = (M >= 1024) and not bw_bound
     if compute_bound and N % 256 == 0:
         tile_m, tile_n = 256, 256
