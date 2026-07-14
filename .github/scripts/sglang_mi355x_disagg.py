@@ -321,7 +321,12 @@ for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/nu
         """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
-        """SINGLE_TASK_ARG=()
+        """if [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]] && ! srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])--exclusive([=[:space:]]|$)'; then
+    echo "srun does not support --exclusive; skipping exclusive node request"
+    EXCLUSIVE_ARG=()
+fi
+
+SINGLE_TASK_ARG=()
 if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])(-n,|--ntasks)'; then
     SINGLE_TASK_ARG=(--ntasks=1)
 fi
