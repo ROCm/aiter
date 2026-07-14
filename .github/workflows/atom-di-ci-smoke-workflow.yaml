@@ -50,7 +50,7 @@ on:
         description: "Optional comma-separated Spur nodes; empty lets Spur allocate"
         required: false
         type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-1,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15"
       conc_list:
         description: "Concurrency list for the smoke benchmark"
         required: false
@@ -76,7 +76,7 @@ env:
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
   ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
   ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
-  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13
+  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-1,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
   ISL_LIST_DEFAULT: "8192"
   OSL_DEFAULT: "1"
   CONC_LIST_DEFAULT: "64"
