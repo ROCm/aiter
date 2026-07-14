@@ -1301,7 +1301,7 @@ def mxfp4_moe_gemm2(
         raise AssertionError(f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}")
     if D_HIDDEN > HIDDEN_MAX_DEFAULT:
         raise AssertionError(f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX_DEFAULT})")
-    inter_max = int(os.environ.get("MXFP4_G2_INTER_MAX", str(INTER_MAX_DEFAULT)))
+    inter_max = 512 if D_INTER == 512 else INTER_MAX_DEFAULT
     launch = get_g2(
         BM,
         use_nt,
