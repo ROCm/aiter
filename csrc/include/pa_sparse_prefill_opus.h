@@ -733,18 +733,6 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale;});
 }
 
-template<typename V>
-__device__ inline void pin_output_tile(V& v_o) {
-    using chunk_t = opus::vector_t<float, 8>;
-    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
-    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto& chunks = reinterpret_cast<chunk_t(&)[num_chunks]>(v_o);
-    #pragma unroll
-    for (int i = 0; i < num_chunks; i++) {
-        asm volatile("" : "+v"(chunks[i]) ::);
-    }
-}
-
 template<int THR_X, int THR_Y>
 __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_inf_vgpr,
                                           opus::u32_t& x_ref, opus::u32_t& y_ref) {
@@ -1245,7 +1233,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1300,7 +1287,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -1366,7 +1352,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1417,7 +1402,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1472,7 +1456,6 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -2459,18 +2442,6 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale; });
 }
 
-template<typename V>
-__device__ inline void pin_output_tile(V& v_o) {
-    using chunk_t = opus::vector_t<float, 8>;
-    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
-    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
-    auto& chunks = reinterpret_cast<chunk_t(&)[num_chunks]>(v_o);
-    #pragma unroll
-    for (int i = 0; i < num_chunks; i++) {
-        asm volatile("" : "+v"(chunks[i]) ::);
-    }
-}
-
 template<typename T, typename V>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
     using D_ACC = typename T::D_ACC;
@@ -2723,6 +2694,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         constexpr int mxscl_chunk = T::D_NOPE_SIZE / T::D_128B_NOPE_SIZE;
         constexpr int mxscl_col   = T::D_NOPE_SIZE % T::D_128B_NOPE_SIZE;
         auto v_k_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}));
+        v_k_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[3];
+        v_k_mxscl[7] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_k_mxscl[7];
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
@@ -2761,7 +2734,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ROPE>(v_s);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_barrier();
@@ -2882,7 +2854,12 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     };
 
     auto load_mxscl = [&](auto slot_off) {
-        return load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}) + slot_off);
+        auto v_mxscl = load<1>(s_k_nope, u_rk_mxscl + mxscl_col + sk_nope_slice(number<mxscl_chunk>{}) + slot_off);
+        if (lane_id >= 32) {
+            v_mxscl[3] = static_cast<D_NOPE>(0);
+            v_mxscl[7] = static_cast<D_NOPE>(0);
+        }
+        return v_mxscl;
     };
 
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto& scale_q_, auto& scale_k_, auto rk_offset) {
@@ -3198,7 +3175,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -3259,7 +3235,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -3331,7 +3306,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_s[1]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -3389,7 +3363,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_s[0]) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -3450,7 +3423,6 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
         asm volatile("" : "+v"(v_p) ::);
         __builtin_amdgcn_sched_barrier(0);
         scale_output_tile<T>(v_o, rescale_m);
-        pin_output_tile(v_o);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -3508,6 +3480,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     // NoPE mx scales.
     auto u_q_mxscl = make_layout_q_mxscl<T>(warp_id, lane_id);
     auto v_q_mxscl = load<1>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
+    v_q_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_q_mxscl[3];
     int scale_q = reinterpret_cast<int&>(v_q_mxscl);
 
     // RoPE tile (bf16)
@@ -4029,6 +4002,8 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         static_for([&](auto i) { v_k_nope[i.value] = static_cast<D_NOPE>(0); }, number<k_nope_vals>{}, number<k_nope_len>{});
 
         auto v_k_mxscl = load<T::VEC_KV_NOPE>(g_k_nope, kv_nope_offset(kv_page) + T::D_NOPE_SIZE);
+        v_k_mxscl[14] = static_cast<D_NOPE>(0);
+        v_k_mxscl[15] = static_cast<D_NOPE>(0);
         reorder_mxscl_for_opsel<T>(v_k_mxscl);
 
         // ──── GEMM0: S = Q·Kᵀ  (NoPE MXFP8) ────
@@ -4143,6 +4118,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     // NoPE mx scales (fp8 E8M0, one per 32-elem K block).
     auto u_q_mxscl = make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<1>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
+    v_q_mxscl[3] = (lane_id >= 32) ? static_cast<D_NOPE>(0) : v_q_mxscl[3];
     int scale_q = reinterpret_cast<int&>(v_q_mxscl);
 
     // Output accumulator and online-softmax state.
