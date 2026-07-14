@@ -258,15 +258,22 @@ __global__ void add_rmsnorm_quant_kernel(
                         {
                             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
                             uint8_t exponent = (__builtin_bit_cast(uint32_t, quant_scale) >> 23) & 0b11111111;
-                            int scaleN_pad = n / group_size;
+                            int scaleN = n / group_size;
                             if(shuffle_scale)
                             {
-                                scaleN_pad = (scaleN_pad + 7) / 8 * 8;
-                                x = aiter::mx_scale_shuffle_idx(scaleN_pad, x, y);
+                                if(group_size == 32)
+                                {
+                                    int scaleN_pad = (scaleN + 7) / 8 * 8;
+                                    x = aiter::mx_scale_shuffle_idx(scaleN_pad, x, y);
+                                }
+                                else
+                                {
+                                    x = y * m + x;
+                                }
                             }
                             else
                             {
-                                x = x * scaleN_pad + y;
+                                x = x * scaleN + y;
                             }
                             tmp[x] = exponent;
                         }
