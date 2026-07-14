@@ -123,16 +123,18 @@ attention. The kernel's job is to make those many Q rows reuse each KV load.
 
 ### 2.2 The mfma tile and "m=16"
 
-We use the gfx950 fp8 mfma `v_mfma_f32_16x16x32_fp8_fp8` of shape
+We use the gfx950 bf16 mfma `v_mfma_f32_16x16x32_bf16` of shape
 
 $$
 (16 \times 32) \cdot (32 \times 16) \to (16 \times 16)
 $$
 
-for QK and the bf16 mfma `v_mfma_f32_16x16x32_f16` of the same shape for
-PV (after the fp8 P from softmax is cast to bf16). Both have the same
-m=16 / n=16 shape, so the per-ptile accumulator is a 16-row × 16-column
-fp32 tile.
+for **both** QK and PV. Although Q/K/V arrive as fp8 on disk, the QManager /
+KvManager cvt the operands to bf16 *before* the GEMM (`mfma_ab_t = hk::bf16`;
+P from softmax is likewise cast to bf16), so there is **no fp8 MFMA in this
+kernel** — QK and PV emit the identical `v_mfma_f32_16x16x32_bf16`. Both have
+the same m=16 / n=16 shape, so the per-ptile accumulator is a 16-row ×
+16-column fp32 tile.
 
 The "**m=16**" in the kernel name refers to this m dim: each ptile holds
 16 rows of $Q$ in its mfma accumulators. Those 16 rows are the work items
@@ -282,7 +284,7 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
    │  q_lds window Ph.B)│  │  3 tiles for N=64)   │
    └─────────┬──────────┘  └──────────┬───────────┘
              │                        │
-             └─── v_mfma_f32_16x16x32_fp8_fp8 ───┘   ← QK
+             └─── v_mfma_f32_16x16x32_bf16 ───┘   ← QK (operands cvt fp8→bf16 first)
                               │
                               ▼
                   ┌─────────────────────┐
@@ -300,7 +302,7 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
                   └─────────┬───────────┘
                             │   ── reuses KV-LDS pong as V via transpose-read
                             ▼
-              ── v_mfma_f32_16x16x32_f16 ──   ← PV
+              ── v_mfma_f32_16x16x32_bf16 ──   ← PV (same instr as QK)
                             │   (interleaved with v_mul_f32 rescale)
                             ▼
                   ┌─────────────────────┐
@@ -323,8 +325,7 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
 
 Key sp3 ops to remember:
 
-- **`v_mfma_f32_16x16x32_fp8_fp8`** — QK (single 16×32 × 32×16 → 16×16 fp32).
-- **`v_mfma_f32_16x16x32_f16`** — PV (same shape, bf16 inputs).
+- **`v_mfma_f32_16x16x32_bf16`** — **both** QK and PV (single 16×32 × 32×16 → 16×16 fp32). Operands are cvt fp8→bf16 before the GEMM, so this is the only MFMA in the kernel; there is no fp8 MFMA.
 - **`ds_read_b128`** — vanilla bf16 read for QK A-tile.
 - **`ds_read_b64_tr_b16`** — transpose-read for V → mfma A-operand layout (Ch. 10.2).
 - **`buffer_load_lds`** — direct vmem → LDS bypassing VGPRs (RoPE path + Q Phase 1 staging).
@@ -1656,7 +1657,7 @@ and read `oaccu` as $O^\top$ (col-major), `kv` as $V^\top$ in A-operand
 layout, `p_mfma` as $P^\top$ in B-operand layout. This is identical to
 how QK was already running ($K^\top Q^\top = S^\top$).
 
-The mfma is `v_mfma_f32_16x16x32_f16` of shape
+The mfma is `v_mfma_f32_16x16x32_bf16` of shape
 
 $$
 (16 \times 32) \cdot (32 \times 16) \to (16 \times 16)
@@ -1723,7 +1724,7 @@ One PV iter, canonical case (`kIsFirstIter == false`, `has_next == true`):
 So per PV iter:
 
 - 4× `ds_read_b64_tr_b16` (V load)
-- 2× `v_mfma_f32_16x16x32_f16` (the PV mfmas)
+- 2× `v_mfma_f32_16x16x32_bf16` (the PV mfmas)
 - 4× `v_mul_f32` rescaling the NEXT iter's oaccu base tile +0/+1 (interleaved with ds_read)
 - 4× `v_mul_f32` rescaling the NEXT iter's oaccu base tile +2/+3 (1 mul_pair per mfma slot)
 - 2× `s_waitcnt`
@@ -1776,7 +1777,7 @@ beyond the one ballot).
 ### 10.5 Why this pattern hides everything
 
 The numbers work out because gfx950's mfma occupancy budget per lane is
-generous: each `v_mfma_f32_16x16x32_f16` issue spends ~32 cycles in the
+generous: each `v_mfma_f32_16x16x32_bf16` issue spends ~32 cycles in the
 mfma pipe, during which the VALU is free. The pattern fills both halves:
 
 | Time slice within one PV iter | mfma pipe | VALU | LDS |
