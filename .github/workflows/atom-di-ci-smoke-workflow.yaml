@@ -89,6 +89,7 @@ env:
   ATOMESH_SLURM_PARTITION: ""
   ATOMESH_MODEL_ROOT: /data/models2
   ATOMESH_1P1D_NODES: ""
+  ATOMESH_PD_RANK_MAPPING_POLICY: idx2idx
 
 jobs:
   load-config:
