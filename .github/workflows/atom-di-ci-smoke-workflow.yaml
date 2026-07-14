@@ -15,7 +15,7 @@ on:
         description: "ROCm/ATOM ref with ATOMesh Spur support"
         required: false
         type: string
-        default: "pull/1501/head"
+        default: "jiaolyu/atomesh-pd-dp-rank-request"
       atomesh_image:
         description: "ATOM image used by the ATOMesh benchmark"
         required: false
@@ -70,7 +70,7 @@ permissions:
   contents: read
 
 env:
-  ATOM_REF_DEFAULT: pull/1501/head
+  ATOM_REF_DEFAULT: jiaolyu/atomesh-pd-dp-rank-request
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
@@ -173,7 +173,7 @@ jobs:
           fi
           git rev-parse HEAD
 
-      - name: Patch ATOMesh Spur submit runner label
+      - name: Patch ATOMesh smoke config
         run: |
           set -euo pipefail
           cd ATOM
@@ -204,43 +204,6 @@ jobs:
                   "Failed to replace all ATOMesh Spur runner labels in: "
                   + ", ".join(remaining)
               )
-          submit_path = Path(".github/scripts/atomesh/pd_submit.sh")
-          text = submit_path.read_text(encoding="utf-8")
-          nodes_line = "#SBATCH --nodes=${NUM_NODES}\n"
-          ntasks_line = "#SBATCH --ntasks=${NUM_NODES}\n"
-          if ntasks_line not in text:
-              if nodes_line not in text:
-                  raise SystemExit("Failed to find Spur submit SBATCH nodes directive")
-              text = text.replace(nodes_line, nodes_line + ntasks_line, 1)
-              submit_path.write_text(text, encoding="utf-8")
-          print(f"{submit_path}: patched explicit Spur Slurm task count")
-
-          server_path = Path(".github/scripts/atomesh/pd_server_atom.sh")
-          text = server_path.read_text(encoding="utf-8")
-          sync_old = 'apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"\n'
-          sync_new = (
-              'apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"\n'
-              'ATOM_PD_RANK_MAPPING_POLICY="${ATOMESH_ENV_ATOM_PD_RANK_MAPPING_POLICY:-${ATOM_PD_RANK_MAPPING_POLICY}}"\n'
-          )
-          if sync_new not in text:
-              if sync_old not in text:
-                  raise SystemExit("Failed to find ATOMESH_ENV apply point")
-              text = text.replace(sync_old, sync_new, 1)
-
-          policy_old = '    --policy "${ROUTER_POLICY}"\n'
-          policy_new = (
-              '    --policy "${ROUTER_POLICY}"\n'
-              '    --dp-aware\n'
-              '    --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"\n'
-          )
-          if policy_new not in text:
-              if policy_old not in text:
-                  raise SystemExit("Failed to find router policy argument")
-              text = text.replace(policy_old, policy_new, 1)
-
-          server_path.write_text(text, encoding="utf-8")
-          print(f"{server_path}: patched ATOM PD rank mapping policy argument")
-
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
           if "  GLM-5.2-FP8:" not in text:
@@ -319,52 +282,6 @@ jobs:
           else:
               print(f"{models_path}: GLM-5.2-FP8 already exists")
 
-          router_path = Path("atom/mesh/src/routers/http_pd_router.rs")
-          text = router_path.read_text(encoding="utf-8")
-          rank_patch = """                        if let Some(prefill_dp_rank) = prefill.dp_rank() {
-                            if let Some(obj) = prefill_request_json.as_object_mut() {
-                                obj.insert(
-                                    "data_parallel_rank".to_string(),
-                                    serde_json::json!(prefill_dp_rank),
-                                );
-                            }
-                        }
-                        if let Some(decode_dp_rank) = decode.dp_rank() {
-                            if let Some(obj) = decode_request_json.as_object_mut() {
-                                obj.insert(
-                                    "data_parallel_rank".to_string(),
-                                    serde_json::json!(decode_dp_rank),
-                                );
-                            }
-                        }
-          """
-          marker = "                        let correlation_id = self.adapter.correlation_id(&ctx);\n"
-
-          def insert_rank_patch(source, function_name):
-              fn_anchor = f"    async fn {function_name}"
-              fn_pos = source.find(fn_anchor)
-              if fn_pos < 0:
-                  raise SystemExit(f"Failed to find {function_name}")
-              next_fn_pos = source.find("\n    async fn ", fn_pos + len(fn_anchor))
-              section_end = next_fn_pos if next_fn_pos >= 0 else len(source)
-              section = source[fn_pos:section_end]
-              if rank_patch in section:
-                  return source, False
-              marker_pos = source.find(marker, fn_pos, section_end)
-              if marker_pos < 0:
-                  raise SystemExit(f"Failed to find {function_name} correlation_id marker")
-              return source[:marker_pos] + rank_patch + source[marker_pos:], True
-
-          patched_functions = []
-          for function_name in ("execute_vllm_mooncake", "execute_atom_relay"):
-              text, changed = insert_rank_patch(text, function_name)
-              if changed:
-                  patched_functions.append(function_name)
-          router_path.write_text(text, encoding="utf-8")
-          print(
-              f"{router_path}: patched explicit ATOM PD data_parallel_rank injection "
-              f"for {patched_functions or 'already-patched functions'}"
-          )
           PY
 
       - name: Install matrix dependencies
