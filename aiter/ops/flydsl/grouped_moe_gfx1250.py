@@ -737,6 +737,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     _grouped_dbg(f"routing max_m={max_m}")
 
+    # EP dead-tail dynamic bounds (capture-safe device scalars, no host sync). The
+    # dispatch buffer is padded to a static token_num, but only the first
+    # num_local_tokens (= total_recv) rows are valid. Route-indexed kernels
+    # (g2l route map, contiguous psum-remap, quant+preshuffle) are bounded by
+    # nvr = total_recv*topk; the token-indexed gather-reduce is bounded by nvt =
+    # total_recv. When there is no truncation (non-EP), pass the full extents so
+    # every route/token stays valid (no behavior change).
+    if _is_ep and num_local_tokens is not None:
+        _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        ).contiguous()
+        _ep_nvr = (_ep_nvt * int(topk)).contiguous()
+    else:
+        _ep_nvt = torch.tensor([token_num], dtype=torch.int32, device=device)
+        _ep_nvr = torch.tensor([token_num * topk], dtype=torch.int32, device=device)
+
     # Fast path: fused route+quant+scatter; naive path: torch fallback for debug.
     fused_quant_mode = "fp4" if data_format == "fp4" else "fp8"
     grouped_a1 = None
@@ -865,7 +881,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             )
             _grouped_dbg("route done, start psum+remap")
             _starts_t, psum_t, _ = contiguous_psum_remap(
-                masked_m, topids_to_rows, n_route_buckets, max_m, tile_m
+                masked_m, topids_to_rows, n_route_buckets, max_m, tile_m,
+                num_valid_routes=_ep_nvr,
             )
             m_tile_map = psum_t
             rows_to_tokens = None
@@ -883,6 +900,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 source_topk=topk,
                 row_starts=None,
                 route_max_m=0,
+                num_valid_routes=_ep_nvr,
             )
             _grouped_dbg("route-indexed quant+preshuffle done")
         else:
@@ -1132,6 +1150,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             quant_mode=fused_quant_mode,
             masked_m=_fused_masked_m,
             topids_to_rows=_fused_topids_to_rows,
+            # Same dead-tail bound as stage1: the route-branch reads topids_to_rows
+            # (dead tail is unwritten -> must skip to avoid OOB dest-row writes).
+            num_valid_routes=(_ep_nvr if _fused_topids_to_rows is not None else None),
         )
         if _grouped_sync_dbg:
             torch.cuda.synchronize()
@@ -1290,7 +1311,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 else gather_weight.to(dtype)
             )
         )
-        flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
+        flydsl_moe_gather_reduce(
+            grouped_out, topids_to_rows, gather_w, out=moe_out,
+            num_valid_tokens=_ep_nvt,
+        )
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
@@ -1458,6 +1482,7 @@ def contiguous_psum_remap(
     experts: int,
     route_max_m: int,
     tile_m: int,
+    num_valid_routes: Optional[torch.Tensor] = None,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap."""
     device = masked_m.device
@@ -1467,6 +1492,16 @@ def contiguous_psum_remap(
     psum = torch.empty(experts, dtype=torch.int32, device=device)
     contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
     topids_flat = topids_to_rows.reshape(-1)
+    # Only remap the valid routes; dead-tail rows are unwritten and must not be
+    # used as a row index. Default (no truncation) covers every route.
+    if num_valid_routes is None:
+        num_valid_routes_i32 = torch.tensor(
+            [int(topids_flat.numel())], dtype=torch.int32, device=device
+        )
+    else:
+        num_valid_routes_i32 = num_valid_routes.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        ).contiguous()
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),
@@ -1478,6 +1513,7 @@ def contiguous_psum_remap(
         experts,
         int(route_max_m),
         int(tile_m),
+        ptr_arg(num_valid_routes_i32),
         stream=torch.cuda.current_stream(),
     )
     return starts, psum, contiguous_m_t
@@ -1514,6 +1550,7 @@ def flydsl_moe_gather_reduce(
     topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
     gather_w: torch.Tensor,  # (token_num, topk) route weight, f32/bf16/f16
     out: Optional[torch.Tensor] = None,
+    num_valid_tokens: Optional[torch.Tensor] = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -1555,6 +1592,16 @@ def flydsl_moe_gather_reduce(
         model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
+    # Skip dead-tail output tokens whose route map is unwritten. Default (no
+    # truncation) processes every token.
+    if num_valid_tokens is None:
+        num_valid_tokens_i32 = torch.tensor(
+            [token_num], dtype=torch.int32, device=device
+        )
+    else:
+        num_valid_tokens_i32 = num_valid_tokens.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        ).contiguous()
     launch(
         ptr_arg(grouped_out_flat),
         ptr_arg(topids_to_rows),
@@ -1562,6 +1609,7 @@ def flydsl_moe_gather_reduce(
         ptr_arg(out),
         token_num,
         slice_stride_dw,
+        ptr_arg(num_valid_tokens_i32),
         stream=torch.cuda.current_stream(),
     )
     return out

@@ -1310,6 +1310,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_starts: fx.Pointer,  # (E,) int32, read iff remap_rows
         route_max_m: Int32,  # masked route stride, read iff remap_rows
         numel: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
     ):
         i32 = T.i32
         f32 = T.f32
@@ -1343,7 +1344,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         lane = tid - warp_in_block * c_wave
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        # Dynamic EP token count (capture-safe, no host sync): grid is launched over
+        # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
+        # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
+        # When truncation is disabled the caller passes numel, so nothing is skipped.
+        nvr = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+            )
+        )
+        route_in_range = arith.cmpi(CmpIPredicate.ult, route, nvr)
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
             rows_rsrc = ptr_rsrc(topids_to_rows)
@@ -1443,6 +1453,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_starts: fx.Pointer,
         route_max_m: fx.Int32,
         numel: fx.Int32,
+        num_valid_routes: fx.Pointer,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -1456,6 +1467,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             row_starts,
             route_max_m,
             numel,
+            num_valid_routes,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),

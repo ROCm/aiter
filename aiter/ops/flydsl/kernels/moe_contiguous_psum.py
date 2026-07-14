@@ -193,6 +193,7 @@ def build_moe_contiguous_psum_remap_module():
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
     ):
         i32 = T.i32
         tid = ArithValue(fx.thread_idx.x)
@@ -279,10 +280,22 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
+        # Only remap valid routes ([0, nvr)); dead-tail routes (>= num_valid_routes)
+        # hold unwritten/garbage rows from the route kernel and must NOT be used as
+        # a row index (would OOB-read starts[expert]). They are never read
+        # downstream. When truncation is disabled the caller passes numel == nvr.
+        nvr = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes),
+                arith.constant(0, type=i32),
+                vec_width=1,
+                dtype=i32,
+            )
+        )
         tid_idx = arith.index_cast(T.index, tid)
-        numel_idx = arith.index_cast(T.index, ArithValue(numel))
+        nvr_idx = arith.index_cast(T.index, ArithValue(nvr))
         stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
-        remap_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
+        remap_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
         with ir.InsertionPoint(remap_loop.body):
             route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
             row = ArithValue(
@@ -306,6 +319,7 @@ def build_moe_contiguous_psum_remap_module():
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
+        num_valid_routes: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -322,6 +336,7 @@ def build_moe_contiguous_psum_remap_module():
             experts,
             route_max_m,
             tile_m,
+            num_valid_routes,
         ).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),

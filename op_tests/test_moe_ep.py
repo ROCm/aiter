@@ -389,10 +389,17 @@ summary_table = []
 
 
 def test_fmoe_ep_mxfp4(
-    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8
+    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8, pad_factor=1
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
-    quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}."""
+    quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
+
+    pad_factor>1 simulates the MoRI/network dispatch usage: the input token
+    tensor is over-allocated to (token*pad_factor) rows (padded dispatch buffer);
+    only the first `token` rows are real and are signalled to the kernel via
+    num_local_tokens. The dead-tail rows carry valid random routing so a missing
+    dead-tail guard would either OOB or shift the contiguous layout and corrupt
+    the valid outputs. Reference and comparison use only the first `token` rows."""
     _gfx = get_gfx()
     if _gfx not in ["gfx950", "gfx1250"]:
         print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
@@ -411,29 +418,40 @@ def test_fmoe_ep_mxfp4(
     expert_mask[E:-1] = 1
 
     dtype = dtypes.bf16
-    input_ = torch.randn((token, model_dim), dtype=dtype, device="cuda")
-    score = torch.randn((token, E), dtype=dtype, device="cuda")
+    pad_factor = max(1, int(pad_factor))
+    buf_token = token * pad_factor  # padded dispatch buffer (network sim)
+    input_ = torch.randn((buf_token, model_dim), dtype=dtype, device="cuda")
+    score = torch.randn((buf_token, E), dtype=dtype, device="cuda")
 
     total_topk_ids = torch.empty(
-        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+        (buf_token, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
     )
     ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
     shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
-    for i in range(ep_id, MAX_TOKENS, ep):
+    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * buf_token
+    for i in range(ep_id, buf_token, ep):
         s_topk_ids_list[i] = shared_expert_ids
     s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device="cuda")
 
     total_topk_weights = torch.empty(
-        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+        (buf_token, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
     )
     ns_topk_weights, s_topk_weights = total_topk_weights.split(
         [topk, shared_E + 1], dim=1
     )
     s_topk_weights[:] = 0.1
     fused_topk(input_, score, topk, True, ns_topk_ids, ns_topk_weights)
-    topk_ids = total_topk_ids[:token]
-    topk_weights = total_topk_weights[:token]
+    # Full padded dispatch buffer goes to the kernel; only the first `token` rows
+    # are real (signalled via num_local_tokens). Reference uses just those rows.
+    topk_ids = total_topk_ids[:buf_token]
+    topk_weights = total_topk_weights[:buf_token]
+    ref_input = input_[:token]
+    ref_topk_ids = total_topk_ids[:token]
+    ref_topk_weights = total_topk_weights[:token]
+    if pad_factor > 1:
+        num_local_tokens = torch.tensor([token], dtype=dtypes.i32, device="cuda")
+    else:
+        num_local_tokens = None
 
     total_local = local_E + shared_E
     w1 = (
@@ -461,11 +479,11 @@ def test_fmoe_ep_mxfp4(
     w1_deq = _dequant(w1_qt, w1_scale, w1.shape)
     w2_deq = _dequant(w2_qt, w2_scale, w2.shape)
     ref, _ = torch_moe_test(
-        input_,
+        ref_input,
         w1_deq,
         w2_deq,
-        topk_weights,
-        topk_ids,
+        ref_topk_weights,
+        ref_topk_ids,
         expert_mask=expert_mask,
     )
 
@@ -524,10 +542,13 @@ def test_fmoe_ep_mxfp4(
         quant_type=QuantType.per_1x32,
         w1_scale=w1_s,
         w2_scale=w2_s,
+        num_local_tokens=num_local_tokens,
         num_warmup=3,
         num_iters=16,
     )
 
+    # Padded buffer -> compare only the valid prefix against the reference.
+    out = out[:token]
     diff = (ref - out).float()
     abs_err = diff.abs()
     abs_mean = abs_err.mean().item()
@@ -666,6 +687,16 @@ parser.add_argument(
     help="""Expert Parallelism.
     e.g.: -ep 8""",
 )
+parser.add_argument(
+    "-pf",
+    "--pad_factor",
+    type=int,
+    nargs="?",
+    default=1,
+    help="""Dispatch-buffer padding factor (network/MoRI simulation).
+    Allocates token*pad_factor input rows and passes the real count via
+    num_local_tokens. 1 = no padding (default). e.g.: -pf 10""",
+)
 
 args = parser.parse_args()
 gpu_arch = get_gfx()
@@ -802,6 +833,7 @@ for test in args.test:
                             args.topk,
                             shared_E=0,
                             ep=ep,
+                            pad_factor=args.pad_factor,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
