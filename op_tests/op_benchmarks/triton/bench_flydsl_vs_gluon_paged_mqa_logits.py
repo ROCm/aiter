@@ -91,12 +91,14 @@ def parity_mask(context_lens, batch_size, next_n, max_model_len):
     )
     row_indices = torch.arange(batch_size * next_n, device="cuda") // next_n
     next_n_offset = torch.arange(batch_size * next_n, device="cuda") % next_n
-    return positions <= (
-        context_lens[row_indices] - next_n + next_n_offset
-    ).unsqueeze(1)
+    return positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(
+        1
+    )
 
 
-def build_inputs(batch_size, next_n, heads, index_dim, kv_length, seed=0, var_ratio=0.0):
+def build_inputs(
+    batch_size, next_n, heads, index_dim, kv_length, seed=0, var_ratio=0.0
+):
     """Paged input builder (blocksize==1).
 
     ``var_ratio`` controls the per-sequence context-length spread around
@@ -205,7 +207,10 @@ def run_shape(
 
     # ---- reference (production Gluon/Triton), production defaults ----
     out_ref = torch.full(
-        (batch_size * next_n, max_model_len), neg_inf, device="cuda", dtype=torch.float32
+        (batch_size * next_n, max_model_len),
+        neg_inf,
+        device="cuda",
+        dtype=torch.float32,
     )
 
     def fn_ref():
@@ -225,7 +230,10 @@ def run_shape(
 
     # ---- FlyDSL (KVBlockSize==1, auto SplitKV) ----
     out_fly = torch.full(
-        (batch_size * next_n, max_model_len), neg_inf, device="cuda", dtype=torch.float32
+        (batch_size * next_n, max_model_len),
+        neg_inf,
+        device="cuda",
+        dtype=torch.float32,
     )
 
     def fn_fly():
@@ -267,7 +275,9 @@ def run_shape(
         "fly_ms": fly_med / 1e3,
         "fly_min_ms": fly_min / 1e3,
         "fly_max_ms": fly_max / 1e3,
-        "fly/ref": (fly_med / ref_med) if ref_med == ref_med and ref_med > 0 else float("nan"),
+        "fly/ref": (
+            (fly_med / ref_med) if ref_med == ref_med and ref_med > 0 else float("nan")
+        ),
         "ref_diff": ref_diff,
         "fly_diff": fly_diff,
         "ref_mask": ref_mask_ok,
@@ -309,17 +319,19 @@ def main():
         return
 
     len_mode = "exact" if args.var_ratio == 0.0 else f"uniform +/-{args.var_ratio:g}"
-    print(f"# arch={get_gfx()} fp8={get_fp8_e4m3_dtype()} "
-          f"repeats={args.repeats} num_iters={args.num_iters} "
-          f"ref_chunk_k={REF_CHUNK_K} ref_wave_per_eu={REF_WAVE_PER_EU} "
-          f"ctx_len={len_mode} max_model_len=2*kv_len blocksize=1")
+    print(
+        f"# arch={get_gfx()} fp8={get_fp8_e4m3_dtype()} "
+        f"repeats={args.repeats} num_iters={args.num_iters} "
+        f"ref_chunk_k={REF_CHUNK_K} ref_wave_per_eu={REF_WAVE_PER_EU} "
+        f"ctx_len={len_mode} max_model_len=2*kv_len blocksize=1"
+    )
     header = (
         "B nn grid H D kv_len | ref_ms[min-max] fly_ms[min-max] fly/ref | "
         "ref_diff fly_diff ref_mask fly_mask ref_pass fly_pass"
     )
     print(header)
     rows = []
-    for (B, nn, H, D, kv_len) in default_shapes():
+    for B, nn, H, D, kv_len in default_shapes():
         r = run_shape(
             B, nn, H, D, kv_len, args.repeats, args.num_iters, var_ratio=args.var_ratio
         )

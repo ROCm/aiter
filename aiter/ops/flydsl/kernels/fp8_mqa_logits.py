@@ -48,7 +48,6 @@ from ._mqa_logits_common import (
     mfma_head_reduce,
 )
 
-
 # Default KV tile width (columns processed per inner-loop iteration).
 _BLOCK_KV = 128
 # Don't split a row's KV window into chunks smaller than this many BKV tiles --

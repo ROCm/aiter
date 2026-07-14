@@ -109,7 +109,9 @@ def ref_fp8_paged_mqa_logits(
         p = torch.arange(context_len, device=q.device)
         q_lim = (
             context_len - next_n + torch.arange(next_n, device=q.device)
-        ).unsqueeze(1)  # [next_n, 1]
+        ).unsqueeze(
+            1
+        )  # [next_n, 1]
         s = torch.where(p[None, :] <= q_lim, s, float("-inf"))
         logits[i * next_n : (i + 1) * next_n, :context_len] = s
     return logits
@@ -181,7 +183,13 @@ def test_fp8_paged_mqa_logits(
 
     with torch.inference_mode():
         ref = ref_fp8_paged_mqa_logits(
-            q, kv_cache_fp8, weights, context_lens, block_tables, max_model_len, fp8_dtype
+            q,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            fp8_dtype,
         )
     ref_mask = ref == float("-inf")
 
@@ -225,9 +233,7 @@ def test_fp8_paged_mqa_logits(
             printLog=False,
         )
 
-    total_flops = (
-        2 * next_n * heads * head_dim * context_lens.float().sum().item()
-    )
+    total_flops = 2 * next_n * heads * head_dim * context_lens.float().sum().item()
     return {
         "gfx": get_gfx(),
         "split_kv": "auto" if split_kv == 0 else split_kv,

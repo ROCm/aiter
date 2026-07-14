@@ -52,12 +52,11 @@ from ._mqa_logits_common import (
     DEFAULT_COMPILE_HINTS,
     Vec,
     device_cu_count,
-    load_pack_i64,
     load_pack_v8i32,
-    fn_to_fnuz_i64,
     make_out_row_view,
     mfma_head_reduce,
 )
+
 
 def _auto_split_kv(batch_size, next_n, wave_per_eu, device_index, total_cu=None):
     """Production host SplitKV formula (mirrors deepgemm_fp8_paged_mqa_logits):
@@ -72,6 +71,7 @@ def _auto_split_kv(batch_size, next_n, wave_per_eu, device_index, total_cu=None)
         total_cu = device_cu_count(device_index)
     split_kv = ((max(1, total_cu // tile_q_count) + 4) // 5 * 5) * wave_per_eu
     return max(1, int(split_kv))
+
 
 # Default KV tile width (columns processed per MFMA inner-loop iteration).
 _BLOCK_KV = 128
@@ -336,9 +336,7 @@ def _build_paged_kernel(
             index_dim,
             max_block_len,
             stride_out,
-        ).launch(
-            grid=(gx, 1, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream
-        )
+        ).launch(grid=(gx, 1, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_paged_mqa_logits
 
@@ -455,25 +453,21 @@ def flydsl_fp8_paged_mqa_logits(
             f"(got KVBlockSize={KVBlockSize})."
         )
     if ChunkK % MFMA_N != 0:
-        raise ValueError(
-            f"ChunkK={ChunkK} must be a multiple of MFMA_N={MFMA_N}."
-        )
+        raise ValueError(f"ChunkK={ChunkK} must be a multiple of MFMA_N={MFMA_N}.")
 
     batch_size, next_n, num_heads, head_size = q_fp8.shape
     assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
     assert head_size & (head_size - 1) == 0, "head size should be power of 2."
 
     num_blocks, block_size, one, index_dim = kv_cache.shape
-    assert block_size == 1, (
-        f"kv_cache KVBlockSize dim must be 1; got {block_size}."
-    )
+    assert block_size == 1, f"kv_cache KVBlockSize dim must be 1; got {block_size}."
     assert one == 1, f"kv_cache head dim must be 1; got {one}."
-    assert index_dim >= head_size + 4, (
-        f"index_dim={index_dim} must hold {head_size} fp8 bytes + 4 scale bytes."
-    )
-    assert kv_cache.dtype == torch.uint8, (
-        f"kv_cache must be uint8 co-packed bytes; got {kv_cache.dtype}."
-    )
+    assert (
+        index_dim >= head_size + 4
+    ), f"index_dim={index_dim} must hold {head_size} fp8 bytes + 4 scale bytes."
+    assert (
+        kv_cache.dtype == torch.uint8
+    ), f"kv_cache must be uint8 co-packed bytes; got {kv_cache.dtype}."
 
     # i32 gather-offset ceiling: the per-token byte base physical*index_dim is
     # computed in i32 (it rides the buffer voffset), so the whole cache pool must
@@ -493,9 +487,10 @@ def flydsl_fp8_paged_mqa_logits(
 
     _fnuz = torch.float8_e4m3fnuz
     _fn = torch.float8_e4m3fn
-    assert q_fp8.dtype in (_fnuz, _fn), (
-        f"q_fp8 must be e4m3 fp8 (fnuz or fn); got {q_fp8.dtype}"
-    )
+    assert q_fp8.dtype in (
+        _fnuz,
+        _fn,
+    ), f"q_fp8 must be e4m3 fp8 (fnuz or fn); got {q_fp8.dtype}"
 
     # gfx942 fp8 MFMA reads operands as e4m3 FNUZ (bias 8). Q may arrive as FN
     # (OCP, bias 7); patch its 0x80 byte and undo the implied 2x via scale_mul.

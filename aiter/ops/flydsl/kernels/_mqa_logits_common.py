@@ -42,18 +42,23 @@ MFMA_M = 32
 MFMA_N = 32
 MFMA_K = 64
 
+
 # The scaled 32x32x64 MFMA: A/B are vector<8xi32>, same D-reg layout as 32x32x16.
 # operands: [a128, b128, c, cbsz=0, blgp=0, opsel_a=0, scale_a, opsel_b=0, scale_b]
 # where a128/b128 are Vec(8xi32) (4 i64s packed), scale_a/scale_b are i32 values
 # with 4 packed e8m0 bytes. Neutral: 0x7F7F7F7F (all 1.0).
 def _mfma_scale_f32_32x32x64_fp8(result_type, operands):
     from flydsl.expr.rocdl import _unwrap_mfma_operand
-    a = _unwrap_mfma_operand(operands[0])   # vector<8xi32>
-    b = _unwrap_mfma_operand(operands[1])   # vector<8xi32>
-    c = _unwrap_mfma_operand(operands[2])   # vector<16xf32>
+
+    a = _unwrap_mfma_operand(operands[0])  # vector<8xi32>
+    b = _unwrap_mfma_operand(operands[1])  # vector<8xi32>
+    c = _unwrap_mfma_operand(operands[2])  # vector<16xf32>
     # Neutral scale: 0x7F7F7F7F = 4 packed e8m0 bytes, each 127 → 2^(127-127)=1.0
     neutral = arith.constant(0x7F7F7F7F, type=T.i32)
-    return rocdl.mfma_scale_f32_32x32x64_f8f6f4_(result_type, a, b, c, 0, 0, 0, neutral, 0, neutral)
+    return rocdl.mfma_scale_f32_32x32x64_f8f6f4_(
+        result_type, a, b, c, 0, 0, 0, neutral, 0, neutral
+    )
+
 
 MFMA_FN = _mfma_scale_f32_32x32x64_fp8
 
@@ -102,15 +107,18 @@ def load_pack_v8i32(i32_view, byte_off_i32, lane8):
     for the first K-group. ``lane8 = lane_div_N * 8`` is the within-K-group offset.
     Returns a vector<8xi32> value (MLIR Value).
     """
+
     def _load_i64(off):
-        dw = fx.Int32(arith.divui(_to_raw(byte_off_i32 + lane8 + off), _to_raw(fx.Int32(4))))
+        dw = fx.Int32(
+            arith.divui(_to_raw(byte_off_i32 + lane8 + off), _to_raw(fx.Int32(4)))
+        )
         v2 = i32_view.vec_load((dw,), vec_size=2)
         return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
-    i64_0 = _load_i64(0)      # K-group 0: k = lane_div_N*8 + 0..7
-    i64_1 = _load_i64(16)     # K-group 1: k = lane_div_N*8 + 16..23
-    i64_2 = _load_i64(32)     # K-group 2: k = lane_div_N*8 + 32..39
-    i64_3 = _load_i64(48)     # K-group 3: k = lane_div_N*8 + 48..55
+    i64_0 = _load_i64(0)  # K-group 0: k = lane_div_N*8 + 0..7
+    i64_1 = _load_i64(16)  # K-group 1: k = lane_div_N*8 + 16..23
+    i64_2 = _load_i64(32)  # K-group 2: k = lane_div_N*8 + 32..39
+    i64_3 = _load_i64(48)  # K-group 3: k = lane_div_N*8 + 48..55
     return Vec.from_elements([i64_0, i64_1, i64_2, i64_3], fx.Int64).bitcast(fx.Int32)
 
 
@@ -166,9 +174,7 @@ def make_out_row_view(logits, stride_i64, row_i32):
     mis-writing.
     """
     _ri64 = arith.extui(T.i64, _to_raw(row_i32))
-    _byte = arith.muli(
-        arith.muli(_ri64, stride_i64), arith.constant(4, type=T.i64)
-    )
+    _byte = arith.muli(arith.muli(_ri64, stride_i64), arith.constant(4, type=T.i64))
     _idx = arith.index_cast(T.index, _byte)
     return GTensor(logits, dtype=T.f32, shape=(-1,), static_bytes_offset_i64=_idx)
 
