@@ -143,6 +143,7 @@ def compile_moe_gemm1(
     swiglu_limit: float = 0.0,
     act: str = "silu",
     waves_per_eu: int = 0,
+    zero_stage2_output: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -379,7 +380,7 @@ def compile_moe_gemm1(
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}{_act_tag}"
-        f"_abi10"
+        f"_abi11"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -411,12 +412,14 @@ def compile_moe_gemm1(
 
     # Pre-compute swiglu effective limit (7.0 when swiglu_limit==0, per aiter convention).
     _swiglu_eff_limit = float(swiglu_limit) if swiglu_limit != 0.0 else 7.0
+    _zero_n_tiles = (inter_dim * (2 if gate_up_interleave else 1)) // tile_n
 
     if True:
 
         @flyc.kernel
         def moe_gemm1(
             arg_out: fx.Pointer,
+            arg_stage2_out: fx.Pointer,
             arg_x: fx.Pointer,
             arg_w: fx.Pointer,
             arg_scale_x: fx.Pointer,
@@ -541,6 +544,29 @@ def compile_moe_gemm1(
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
             by = gpu.block_id("x")  # tile along inter_dim
             bx = gpu.block_id("y")  # tile along sorted M
+
+            if const_expr(zero_stage2_output):
+                zero_elems = tokens_in * fx.Index(model_dim)
+                zero_nbytes = zero_elems * fx.Index(2)
+                zero_rsrc = _ptr_buffer_resource(arg_stage2_out, zero_nbytes)
+                zero_start = (
+                    (bx * fx.Index(_zero_n_tiles) + by) * fx.Index(256) + tx
+                )
+                zero_stride = (
+                    size_expert_ids_in * fx.Index(_zero_n_tiles) * fx.Index(256)
+                )
+                zero_value = arith.trunc_f(out_mlir(), fx.Float32(0.0))
+                zero_loop = scf.ForOp(zero_start, zero_elems, zero_stride)
+                zero_ip = ir.InsertionPoint(zero_loop.body)
+                zero_ip.__enter__()
+                zero_idx = zero_loop.induction_variable
+                buffer_ops.buffer_store(
+                    zero_value,
+                    zero_rsrc,
+                    arith.index_cast(T.i32, zero_idx),
+                )
+                scf.YieldOp([])
+                zero_ip.__exit__(None, None, None)
 
             if const_expr(_is_splitk):
                 bz = gpu.block_id("z")  # K-batch id
@@ -2503,6 +2529,7 @@ def compile_moe_gemm1(
     @flyc.jit
     def launch_moe_gemm1(
         arg_out: fx.Pointer,
+        arg_stage2_out: fx.Pointer,
         arg_x: fx.Pointer,
         arg_w: fx.Pointer,
         arg_scale_x: fx.Pointer,
@@ -2532,6 +2559,7 @@ def compile_moe_gemm1(
 
         moe_gemm1(
             arg_out,
+            arg_stage2_out,
             arg_x,
             arg_w,
             arg_scale_x,
