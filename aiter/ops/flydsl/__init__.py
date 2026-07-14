@@ -45,6 +45,7 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4,
     )
     from .kernels.pa_mqa_logits_fp4_prefill import (
+        compute_varqlen_windows,
         flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
@@ -66,6 +67,7 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
+        "compute_varqlen_windows",
         "flydsl_fp8_mqa_logits",
         "FP8_MQA_LOGITS_VARIANTS",
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
