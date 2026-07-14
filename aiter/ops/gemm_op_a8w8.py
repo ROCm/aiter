@@ -975,7 +975,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if config is not None and config["libtype"] == "triton" or get_gfx() == "gfx1250":
+    if (config is not None and config["libtype"] == "triton") or get_gfx() == "gfx1250":
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
@@ -985,7 +985,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
         )
 
-        kernelName = str(config.get("kernelName", ""))
+        kernelName = str(config.get("kernelName", "")) if config is not None else ""
         backend = kernelName if kernelName in ("triton", "gluon") else None
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
