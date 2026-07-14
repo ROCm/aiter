@@ -88,9 +88,8 @@ def launch_gemm_a8w4_tdm(
         i32_n: fx.Int32,
         i32_k: fx.Int32,
     ):
-        rocdl.disable_xdl_arb_stall()  # SCHED_MODE: back-to-back WMMA issue
+        rocdl.disable_xdl_arb_stall()  # SCHED_MODE bit[4]: allow back-to-back WMMA issue
 
-        # Runtime-K: K-tile loop bound + dynamic A/B/scale outer strides.
         K_TILES = i32_k // tile_k
         k64 = fx.Int64(i32_k)
         A_KROW, Kp16, K4 = k64 // A_PACK, (k64 // 2) * 16, k64 // 4
@@ -154,8 +153,6 @@ def launch_gemm_a8w4_tdm(
         sa_super_off = blk_m64 // 32
         sb_super_off = blk_n64 // 32
 
-        AT, BT = (tile_m, A_ROW_B), (tile_n // 16, PACK_TK * 16)
-        SAT, SBT = (SA_SUPERS, SC_INNER), (SB_SUPERS, SC_INNER)
         if const_expr(layout_mbn):
             a_off0 = blk_m64 * (batch * A_KROW) + bz64 * A_KROW
         else:
@@ -163,32 +160,52 @@ def launch_gemm_a8w4_tdm(
         b_off0 = b_outer_row * Kp16
         sa_off0 = sa_super_off * SA_OUTER_STRIDE + sa_batch_off
         sb_off0 = sb_super_off * SB_OUTER_STRIDE + sb_batch_off
-        # Views carry a STATIC placeholder layout stride (runtime make_layout stride
-        # segfaults); the real runtime K stride goes to the atom via `strides=`.
-        gtA0 = _gv(gA_base, a_off0, AT, (A_ROW_B, 1))
-        gtB0 = _gv(gB_base, b_off0, BT, (PACK_TK * 16, 1))
-        gtSA0 = _gv(gSA_base, sa_off0, SAT, (SC_INNER, 1))
-        gtSB0 = _gv(gSB_base, sb_off0, SBT, (SC_INNER, 1))
-        atomA = fx.rocdl.make_tdm_atom(
-            gtA0, [mn_oob, None], strides=[A_OUTER_STRIDE, None], num_warps=num_waves,
-            pad_interval=A_ROW_B, pad_amount=LDS_PAD_A,
-        )
-        atomB = _tdm(gtB0, None, Kp16)
-        atomSA, atomSB = _tdm(gtSA0, sa_oob, SA_OUTER_STRIDE), _tdm(gtSB0, None, SB_OUTER_STRIDE)
+        # Wave-specialized TDM: A->waves(0,1), B->(2,3); scales on (4,5)/(6,7)
+        # with >=8 waves, else reusing (0,1)/(2,3). Each loader wave moves one M/N
+        # half of its tensor alone (num_warps=1 -> no wave-partition).
+        HM, HB = tile_m // 2, (tile_n // 16) // 2
+        HSA, HSB = SA_SUPERS // 2, SB_SUPERS // 2
+        WS8 = num_waves >= 8
+        W_A, W_B = (0, 1), (2, 3)
+        W_SA = (4, 5) if WS8 else (0, 1)
+        W_SB = (6, 7) if WS8 else (2, 3)
+
+        def _tdm1(gt, outer, stride):
+            return fx.rocdl.make_tdm_atom(gt, [outer, None], strides=[stride, None], num_warps=1)
+
+        gA_h, atomA_h, gB_h, atomB_h = [], [], [], []
+        gSA_h, atomSA_h, gSB_h, atomSB_h = [], [], [], []
+        for h in range_constexpr(2):
+            ga = _gv(gA_base, a_off0 + fx.Int64(h * HM) * A_OUTER_STRIDE, (HM, A_ROW_B), (A_ROW_B, 1))
+            gA_h.append(ga)
+            atomA_h.append(fx.rocdl.make_tdm_atom(
+                ga, [mn_oob - h * HM, None], strides=[A_OUTER_STRIDE, None],
+                num_warps=1, pad_interval=A_ROW_B, pad_amount=LDS_PAD_A))
+            gb = _gv(gB_base, b_off0 + fx.Int64(h * HB) * Kp16, (HB, PACK_TK * 16), (PACK_TK * 16, 1))
+            gB_h.append(gb); atomB_h.append(_tdm1(gb, None, Kp16))
+            gsa = _gv(gSA_base, sa_off0 + fx.Int64(h * HSA) * SA_OUTER_STRIDE, (HSA, SC_INNER), (SC_INNER, 1))
+            gSA_h.append(gsa); atomSA_h.append(_tdm1(gsa, sa_oob - h * HSA, SA_OUTER_STRIDE))
+            gsb = _gv(gSB_base, sb_off0 + fx.Int64(h * HSB) * SB_OUTER_STRIDE, (HSB, SC_INNER), (SC_INNER, 1))
+            gSB_h.append(gsb); atomSB_h.append(_tdm1(gsb, None, SB_OUTER_STRIDE))
         _adv = fx.rocdl.advance_tdm_atom
+        base_i32 = fx.recast_iter(fx.Int32, base_ptr)
 
-        base_i32 = fx.recast_iter(fx.Int32, base_ptr)  # aligned base for i32 scale views
+        def _wcopy(w, atom, gt, lv):
+            if wave == w:
+                fx.copy(atom, gt, lv)
 
-        def issue(s, kt):  # load K-tile kt into ring slot s (advance atom imm_offset)
+        def issue(s, kt):
             pa = _buf_ptr(s)
             so4 = s * (PITCH // 4)
-            fx.copy(_adv(atomA, kt * A_ROW_B), gtA0, _lv(pa, AT, (A_LDS_ROW, 1)))
-            fx.copy(_adv(atomB, kt * (PACK_TK * 16)), gtB0,
-                    _lv(fx.add_offset(pa, STAGE_A), BT, (B_LDS_ROW, 1)))
-            fx.copy(_adv(atomSA, kt * (SC_INNER * 4)), gtSA0,
-                    _lv(fx.add_offset(base_i32, so4 + SA_OFF // 4), SAT, (SC_INNER, 1)))
-            fx.copy(_adv(atomSB, kt * (SC_INNER * 4)), gtSB0,
-                    _lv(fx.add_offset(base_i32, so4 + SB_OFF // 4), SBT, (SC_INNER, 1)))
+            for h in range_constexpr(2):
+                _wcopy(W_A[h], _adv(atomA_h[h], kt * A_ROW_B), gA_h[h],
+                       _lv(fx.add_offset(pa, h * HM * A_LDS_ROW), (HM, A_ROW_B), (A_LDS_ROW, 1)))
+                _wcopy(W_B[h], _adv(atomB_h[h], kt * (PACK_TK * 16)), gB_h[h],
+                       _lv(fx.add_offset(pa, STAGE_A + h * HB * B_LDS_ROW), (HB, PACK_TK * 16), (B_LDS_ROW, 1)))
+                _wcopy(W_SA[h], _adv(atomSA_h[h], kt * (SC_INNER * 4)), gSA_h[h],
+                       _lv(fx.add_offset(base_i32, so4 + SA_OFF // 4 + h * HSA * SC_INNER), (HSA, SC_INNER), (SC_INNER, 1)))
+                _wcopy(W_SB[h], _adv(atomSB_h[h], kt * (SC_INNER * 4)), gSB_h[h],
+                       _lv(fx.add_offset(base_i32, so4 + SB_OFF // 4 + h * HSB * SC_INNER), (HSB, SC_INNER), (SC_INNER, 1)))
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -240,7 +257,7 @@ def launch_gemm_a8w4_tdm(
         _FRONT = list(range(front_wm))
         _BACK = list(range(front_wm, wmma_m_rep))
 
-        def _emit(wm_list, act, wt, sa_k, sb_k):
+        def _mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
                 wm = wm_list[i]
                 for wn_raw in range_constexpr(wmma_n_rep):
@@ -253,32 +270,38 @@ def launch_gemm_a8w4_tdm(
         DS_B = 2
         _BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
 
-        def _load_bs(buf, ksl):
+        def _load_b_scales(buf, ksl):
             wt = [_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
             sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def _stream(buf, ksl, wt, sb_k, sa_k, nxt_ksl, mid_cb=None):
+        def _kstep(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
+            # Partial front drain keeps back-A ds_reads in flight so the front WMMAs
+            # hide them; prefetch_kt (next K-tile TDM) is issued between front/back
+            # WMMA groups so its DMA overlaps the back WMMAs.
             act_f = [_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in _FRONT]
-            rocdl.s_wait_dscnt(0)
-            _emit(_FRONT, act_f, wt, sa_k, sb_k)
-            if const_expr(mid_cb is not None):
-                rocdl.sched_barrier(0)
-                mid_cb()
-                rocdl.sched_barrier(0)
             if const_expr(len(_BACK) > 0):
                 act_b = [_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in _BACK]
+                rocdl.s_wait_dscnt(len(_BACK) * DS_A)
+            else:
                 rocdl.s_wait_dscnt(0)
-                _emit(_BACK, act_b, wt, sa_k, sb_k)
-            return _load_bs(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
+            _mma_rows(_FRONT, act_f, wt, sa_k, sb_k)
+            if const_expr(prefetch_kt is not None):
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % num_buffers, prefetch_kt)
+                rocdl.sched_barrier(0)
+            if const_expr(len(_BACK) > 0):
+                rocdl.s_wait_dscnt(0)
+                _mma_rows(_BACK, act_b, wt, sa_k, sb_k)
+            return _load_b_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
 
-        def compute_stream(buf, mid_cb):
-            prev = _load_bs(buf, 0)
+        def compute_ktile(buf, prefetch_kt):
+            prev = _load_b_scales(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                cb = mid_cb if const_expr(ksl == 0) else None
-                prev = _stream(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, mid_cb=cb)
+                pk = prefetch_kt if const_expr(ksl == 0) else None
+                prev = _kstep(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, prefetch_kt=pk)
             _fr, _bk = front_wm * wmma_n_rep, len(_BACK) * wmma_n_rep
             for _ks in range_constexpr(KWS):
                 rocdl.sched_dsrd((_BS_DS if _ks == 0 else 0) + front_wm * DS_A)
@@ -289,30 +312,24 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(_BS_DS)
             rocdl.sched_barrier(0)
 
-        TDM_PER = 4
-        # Prologue: preload the first (num_buffers-1) K-tiles (constexpr count).
+        TDM_PER = 1 if WS8 else 2  # per-wave loads/K-tile (scales share A/B waves at <8)
+        # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
+        # compute into the slot the fence just freed (one fence/barrier per K-tile).
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
-        # Steady state (runtime scf.for): compute ring slot kt%nb while issuing tile
-        # kt+nb-1 mid-compute; the fence keeps (nb-2) tiles' TDMs in flight.
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
             pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-
-            def _mid():
-                nk = kt + (num_buffers - 1)
-                issue(nk % num_buffers, nk)
-
-            compute_stream(buf, _mid)
-        # Tail: last (num_buffers-1) tiles are already resident; drain progressively.
+            compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
+        # Tail: last (num_buffers-1) tiles are resident; drain progressively.
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
             pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
-            compute_stream(buf, None)
+            compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
