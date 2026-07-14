@@ -244,6 +244,7 @@ def write_summary(
 
 def select_tests() -> None:
     event_name = os.environ.get("EVENT_NAME") or os.environ.get("GITHUB_EVENT_NAME", "")
+    test_filter = os.environ.get("TEST_FILTER", "").strip().lower()
     run_key = "run_on_schedule" if event_name == "schedule" else "run_on_pr"
     disabled = [
         test
@@ -251,7 +252,20 @@ def select_tests() -> None:
         if not test.get("run_on_pr", False) and not test.get("run_on_schedule", False)
     ]
     runnable = [test for test in TESTS if test not in disabled]
-    selected = [test for test in runnable if test.get(run_key, False)]
+    if event_name == "workflow_dispatch" and test_filter:
+        selected = [
+            test
+            for test in runnable
+            if test_filter in " ".join(
+                [
+                    test.get("model", ""),
+                    test.get("test_type", ""),
+                    test.get("test_command", ""),
+                ]
+            ).lower()
+        ]
+    else:
+        selected = [test for test in runnable if test.get(run_key, False)]
     skipped = [test for test in runnable if not test.get(run_key, False)]
 
     write_output("matrix", json.dumps({"include": selected}, separators=(",", ":")))
