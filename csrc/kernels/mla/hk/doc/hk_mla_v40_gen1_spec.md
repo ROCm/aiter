@@ -1792,6 +1792,65 @@ The schedule is dense — there's no slot where mfma is idle waiting on
 VALU or LDS. The rescale, naïvely a 128-mul standalone phase before PV,
 is fully hidden.
 
+### 10.5.1 The cross-wave PV ping-pong (why 6-deep PV + warp specialization + deferred B+C exist)
+
+§10.5 hides the rescale *within* one wave. But PV itself — a deep mfma
+sequence — saturates the **shared MFMA + LDS pipeline** for the wave running
+it. On m16x8 two waves share each SIMD (8 waves/workgroup over 4 SIMDs =
+2 waves/SIMD; `kOccupancy_ = 1`, so this is intra-workgroup, *not* two
+resident workgroups). While one wave is in PV, its SIMD-mate physically
+cannot issue MFMA/LDS work — it can only run non-MFMA work (softmax VALU,
+dispatch-ladder SALU, next-KV vmem loads). So the *only* way to hide a PV is
+to have the partner wave doing that other work underneath it.
+
+Three design choices exist purely to make this cross-wave overlap work — they
+are not independent optimizations, they all serve the same ping-pong:
+
+1. **PV is made deep (contracts both sub-tiles A+B in one merged call, §10.1)**
+   so one wave's PV window is *long enough to cover the partner's entire
+   non-MFMA workload* (softmax + dispatch SALU + next-KV load). The depth is
+   chosen for the hiding-window length, not that wave's own throughput; too
+   shallow and the partner's work spills past the window and becomes exposed.
+
+2. **Warp specialization (`WarpTypeM16x8` Lo/Hi, §3.5) keeps the two
+   SIMD-mate waves out of phase.** `kPvAtEnd = (kWarpType == LoNoPEWarp)`:
+   lo runs PV at call end, hi *defers* PV by one tile (`kHasPv`, runs the
+   previous tile's PV at the next call's start). If both waves ran the same
+   schedule they would hit PV simultaneously, contend for the one MFMA+LDS
+   pipe, and have nothing to overlap. The offset guarantees that at any moment
+   one wave is in PV while the other is in non-MFMA work.
+
+3. **Deferring part of lo's Phase B+C behind PV (deferred strip-3 cvt+store,
+   §8.13)** does two things: (a) it packs that non-MFMA KV cvt/store work
+   *into* the partner's PV window instead of leaving it as exposed serial
+   time; and (b) with less B+C ahead of lo's PV, **lo starts its PV earlier**,
+   returning the shared MFMA+LDS pipe to hi sooner. hi's wait on lo's PV is a
+   **resource dependency on the shared pipe, not an `s_barrier`** — hi stalls
+   because the pipe is busy, so pulling lo's PV earlier lets hi acquire the
+   pipe sooner *and* slides lo's PV window earlier so it overlaps more of hi's
+   softmax. It is a critical-path move, not just window-packing.
+
+Net per-tile picture (the two waves offset by ~half a tile): while one wave
+runs PV (owning MFMA+LDS), its partner runs softmax + dispatch-ladder
+SALU/branch + next-KV load + deferred B+C; the next tile the roles swap. This
+is why an instruction trace shows a *higher* per-wave stall% yet a busier CU
+(lower idle) — the "stall" is a wave parked on the shared pipe, and that gap
+is filled by the partner's useful work.
+
+**Why m16x4 does not use this scheme.** m16x4 also puts 2 waves on each SIMD,
+but differently: `kOccupancy_ = 2` runs **two whole workgroups** per CU
+(4 waves/tg × 2 tgs = 8 waves), so a SIMD's two waves belong to *different
+workgroups*. `s_barrier` only synchronizes waves within one workgroup, so
+there is no way to keep those two SIMD-mates in a deliberate PV/non-PV phase
+relationship — the mate's scheduling is uncontrollable across the workgroup
+boundary. m16x4 therefore forgoes the ping-pong; it just issues the next-KV
+load earlier. That is the right trade for m16x4 because, *compared to m16x8*,
+it leans more toward memory-bound — though whether either partition is
+actually memory-bound in a given run depends on the real situation (HW state,
+and what other programs / tgs are co-resident in the grid), not always. The
+deliberate cross-wave PV overlap is an m16x8-only design, enabled by both
+SIMD-mates living in the *same* workgroup.
+
 ### 10.6 `pv_v_aux` is dead in Gen.1
 
 The pinned VGPR map in Ch. 5 lists `pv_v_aux` v104..v111 as "second
