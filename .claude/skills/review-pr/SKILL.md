@@ -58,6 +58,15 @@ for c in comments:
 
 Read the diff and PR body before proceeding.
 
+**Cross-file verification — do this before reporting any kernel/dispatch finding.** The diff shows changed lines, not the whole story. Grep the *entire* symbol family, not just files in the diff:
+- Sync/fence/atomics, or the "other half" of a scatter, may live in a `.cuh`/`.h` rather than the `.cu` in the diff. Grep `.cu` + `.cuh` + `.h` together before claiming "no synchronization" or "no bounds check." (aiter#3802: a "kernel has no sync" finding was a false positive — the signal barrier was in the `.cuh`.)
+- Read the actual function in the head file, not just the diff hunk, before claiming a branch/else is missing. (aiter#4098: a "compares raw uint8 vs float" finding was false — the reader had a conditional `maybe_view_fp8()` the diff never showed.)
+
+**Classify every CI failure before blaming the PR.** A red check is not automatically the PR's fault:
+- Read the failed *step*. `check-signal` / "Wait for Checks" timeouts, "Expected exactly one wheel artifact", and dep-resolver noise are **infra flakes**, not code failures (aiter#3593, #4171).
+- Compare against main: if main fails the same shard in the same window, it's baseline/flaky, not a regression introduced here.
+- Expired logs (`HTTP 410 Gone`) on old runs mean the failure is months-stale and meaningless against today's main — ask for a rebase + fresh run instead of quoting it (aiter#2565).
+
 ---
 
 ## Step 2 — Semantic Understanding (answer all 5 before rules)
@@ -539,6 +548,11 @@ Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
 2. **Impact** — what goes wrong at runtime if this is not fixed (wrong output / crash / perf regression)
 3. **Action** — end with a verb phrase: "**Author must** [do X]" or "**Reviewer should ask** [Y]" — no verb = incomplete finding, do not include
+
+**Tag every finding [verified] or [inferred], and never ship a root cause you only inferred.**
+- `[verified]` — traced to the actual code/evidence chain (aiter#4029: fp4 auto-K-split confirmed by following `_is_csa_indexer_fp4` → the auto branch → no gate rejects it).
+- `[inferred]` — plausible but unconfirmed; say so and downgrade to "worth checking," do not assert it as the cause (aiter#2565: "w1/w2 shuffle asymmetry is the MI35X root cause" was inferred and likely wrong — it may be a legitimate stage1/stage2 layout difference).
+A finding that stops at "likely / probably the root cause" without an evidence chain is not shippable — either trace it to [verified] or label it [inferred] and frame it as a question.
 
 Do NOT use rule codes (P1, D4, A1…) in output — they are internal labels only.
 
