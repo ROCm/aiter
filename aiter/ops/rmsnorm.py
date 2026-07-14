@@ -513,7 +513,11 @@ def rmsnorm2d_fwd_with_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
-    if group_size == 0 and not shuffle_scale:
+    # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
+    # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
+    # e8m0 scale must be routed to rmsnorm_quant regardless of group_size.
+    is_e8m0 = yscale.element_size() == 1
+    if group_size == 0 and not shuffle_scale and not is_e8m0:
         if _use_hip_common(input, use_model_sensitive_rmsnorm):
             rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast HIP
         else:
@@ -521,7 +525,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
                 out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
             )
     else:
-        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        # grouped / shuffle / e8m0 quant lives in the shared module_rmsnorm_quant (n<=8192).
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm dynamicquant supports hidden<=8192"
@@ -540,7 +544,11 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
-    if group_size == 0 and not shuffle_scale:
+    # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
+    # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
+    # e8m0 scale must be routed to add_rmsnorm_quant regardless of group_size.
+    is_e8m0 = yscale.element_size() == 1
+    if group_size == 0 and not shuffle_scale and not is_e8m0:
         if _use_hip_common(input, use_model_sensitive_rmsnorm):
             add_rmsnorm_quant(  # fast HIP
                 out, input, residual_in, residual_out, yscale, weight, epsilon
@@ -557,7 +565,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
                 use_model_sensitive_rmsnorm,
             )
     else:
-        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        # grouped / shuffle / e8m0 quant lives in the shared module_rmsnorm_quant (n<=8192).
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm add_dynamicquant supports hidden<=8192"
