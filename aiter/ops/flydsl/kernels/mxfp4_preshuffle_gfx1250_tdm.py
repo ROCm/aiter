@@ -319,22 +319,32 @@ def launch_gemm_a8w4_tdm(
 
         # per-wave TDM loads per K-tile: cooperative=4; wave-spec=1 (>=8 waves) or 2.
         TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
-        # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
-        # compute into the slot the fence just freed (one fence/barrier per K-tile).
-        for i in range_constexpr(num_buffers - 1):
+        # Prologue preloads nb K-tiles; the steady loop issues tile kt+nb
+        # after compute drains the slot (post-compute issue avoids WAR hazard).
+        for i in range_constexpr(num_buffers):
             issue(i, i)
-        n_steady = K_TILES - (num_buffers - 1)
+        n_steady = K_TILES - num_buffers
+
+        # pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-            compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
-        # Tail: last (num_buffers-1) tiles are resident; drain progressively.
-        for j in range_constexpr(num_buffers - 1):
+            # -- pre-compute: wait TDM into slot s, then barrier so all waves see it --
+            tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+            workgroup_barrier()
+            compute_ktile(buf, None)
+            # -- post-compute: barrier so all waves finish reading slot s before re-issue --
+            workgroup_barrier()
+            # tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+            issue(s, kt + num_buffers)
+        # Tail: last num_buffers tiles are resident; drain progressively.
+        #  pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+        for j in range_constexpr(num_buffers):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
