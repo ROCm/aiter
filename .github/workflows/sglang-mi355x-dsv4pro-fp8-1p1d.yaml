@@ -26,10 +26,12 @@ on:
         type: string
         default: "/data/xinhuang/sglang-aiter-ci"
       slurm_nodelist:
-        description: "Comma-separated two-node override. Set to auto to let Slurm allocate."
+        description: "Comma-separated Slurm nodes. Must be a subset of the approved fabric nodes."
         required: false
         type: string
-        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14"
+        default: >-
+          ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
+          ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
       slurm_partition:
         description: "Optional Slurm partition. Empty omits -p."
         required: false
@@ -72,7 +74,12 @@ env:
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
-  SLURM_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
+  SLURM_NODELIST_DEFAULT: >-
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  SLURM_NODELIST_ALLOWED: >-
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
   SLURM_PARTITION_DEFAULT: ""
   SLURM_EXCLUSIVE_DEFAULT: "1"
   CONC_LIST_DEFAULT: "1,8,16,32,64,128,256"
@@ -122,8 +129,32 @@ jobs:
               "RUN_ACCURACY": value("run_accuracy", "RUN_ACCURACY_DEFAULT"),
               "TIME_LIMIT_OVERRIDE": value("time_limit", "TIME_LIMIT_DEFAULT"),
           }
-          if pairs["SLURM_NODELIST_OVERRIDE"].strip().lower() == "auto":
-              pairs["SLURM_NODELIST_OVERRIDE"] = ""
+
+          allowed_nodes = {
+              node.strip()
+              for node in os.environ["SLURM_NODELIST_ALLOWED"].split(",")
+              if node.strip()
+          }
+          requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
+          if requested_nodes_raw.lower() == "auto":
+              raise SystemExit("slurm_nodelist=auto is disabled; use approved nodes only")
+          requested_nodes = [
+              node.strip()
+              for node in requested_nodes_raw.split(",")
+              if node.strip()
+          ]
+          if not requested_nodes:
+              raise SystemExit("slurm_nodelist must include at least one approved node")
+          unknown_nodes = [
+              node for node in requested_nodes if node not in allowed_nodes
+          ]
+          if unknown_nodes:
+              raise SystemExit(
+                  "slurm_nodelist contains non-approved nodes: "
+                  + ", ".join(unknown_nodes)
+              )
+          pairs["SLURM_NODELIST_OVERRIDE"] = ",".join(requested_nodes)
+
           for key, val in pairs.items():
               print(f"{key}={val}")
           PY
