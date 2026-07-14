@@ -310,6 +310,31 @@ def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
     return err
 
 
+def _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
+    """Compare an FP8 (e4m3 + fp32 per-row scale) paged cache against the
+    reference: kv_cache allclose within tol; cache_scale bit-exact (the reference
+    mirrors the kernel's exact fp32 ops — am_safe * inv_fp8_max + ue8m0 ceil-pow2
+    — so the scale per row must match to the bit). Returns the kv_cache err %.
+    Shared by the shape sweep and the dedicated K-split coverage test."""
+    err = checkAllclose(
+        out_cache.to(dtypes.fp32),
+        ref_cache.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        tol_err_ratio=0.05,
+        msg=f"{msg} kv_cache(fp8)",
+    )
+    checkAllclose(
+        out_scale,
+        ref_scale,
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0.0,
+        msg=f"{msg} cache_scale(bit-exact)",
+    )
+    return err
+
+
 @benchmark()
 def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
@@ -364,24 +389,12 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
             msg,
         )
     elif quant:
-        err = checkAllclose(
-            inp["kv_cache"].to(dtypes.fp32),
-            ref_inp["kv_cache"].to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            tol_err_ratio=0.05,
-            msg=f"{msg} kv_cache(fp8)",
-        )
-        # cache_scale: bit-exact. Reference mirrors the kernel's exact fp32
-        # ops (am_safe * inv_fp8_max constant + ue8m0 ceil-pow2), so the
-        # scale per row must match to the bit.
-        checkAllclose(
+        err = _check_fp8_cache(
+            inp["kv_cache"],
             inp["cache_scale"],
+            ref_inp["kv_cache"],
             ref_inp["cache_scale"],
-            rtol=0,
-            atol=0,
-            tol_err_ratio=0.0,
-            msg=f"{msg} cache_scale(bit-exact)",
+            msg,
         )
     else:
         # BF16 kv_cache: rare rounding-boundary flips at <=1 ulp because online
@@ -687,35 +700,44 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
 
 
 @benchmark()
-def test_flydsl_csa_indexer_fp4_ksplit(bs=2, mtp=0):
-    """FP4 CSA-indexer AUTO K-split coverage.
+def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
+    """CSA-indexer AUTO K-split coverage for the FP8 and FP4 scatter paths.
 
-    The K-split FP4 scatter (amax/e8m0/pack) in ``_build_kernel_ksplit`` mirrors
-    the single-wave ``_build_kernel`` emitter but runs on a different wave layout
-    (K-split lid 0-63 with a different group-reduce span), so it needs its own
-    coverage. This test drives ``flydsl_fused_compress_attn`` on the
-    ``csa_indexer_fp4`` shape WITHOUT an explicit ``k_split_num_waves`` and:
+    The K-split scatter (amax/e8m0/pack) in ``_build_kernel_ksplit`` mirrors the
+    single-wave ``_build_kernel`` emitter but runs on a different wave layout
+    (K-split lid 0-63 with a different group-reduce span), so each quantized
+    scatter (``csa_indexer`` fp8, ``csa_indexer_fp4`` fp4) needs its own
+    coverage. This drives ``flydsl_fused_compress_attn`` on ``shape_label``
+    WITHOUT an explicit ``k_split_num_waves`` and:
 
       1. asserts the auto-pick actually engages the multi-wave kernel (NW>1) for
          this plan_capacity — i.e. the auto path is the K-split path, not legacy;
-      2. validates that auto (K-split) FP4 cache matches the pure-torch reference;
-      3. validates the forced-legacy (NW=1) FP4 cache matches the reference too,
-         so the two wave layouts are cross-checked against a common oracle.
+      2. validates that the auto (K-split) cache matches the pure-torch reference;
+      3. validates the forced-legacy (NW=1) cache matches the reference too, so
+         the two wave layouts are cross-checked against a common oracle.
     """
     if get_gfx() == "gfx942":
-        aiter.logger.info("gfx942 unsupported for fp4")
+        aiter.logger.info("gfx942 unsupported for fp8/fp4 indexer scatter")
         return {}
-    shape = _shape_by_label("csa_indexer_fp4")
+    shape = _shape_by_label(shape_label)
     _, D, RD, ratio, overlap, quant_mode, ue8m0, _ = shape
+    assert quant_mode in ("fp8", "fp4"), (
+        f"{shape_label} quant_mode={quant_mode!r} is not a quantized indexer shape"
+    )
+
+    def _check(out_cache, out_scale, ref_cache, ref_scale, m):
+        if quant_mode == "fp4":
+            return _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, m)
+        return _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, m)
 
     inp = _build_inputs(shape, bs, mtp, "decode")
     plan_capacity = inp["plan_gpu"].shape[0]
     # The kernel's auto-pick is `use_ksplit = csa_ksplit_num_waves(plan_capacity)
-    # > 1` for this shape (has_block_table, non-nm_asm fp4). Assert it here so the
-    # run below is GUARANTEED to exercise the K-split kernel, not single-wave.
+    # > 1` for these shapes (has_block_table, non-nm_asm fp8/fp4). Assert it here
+    # so the run below is GUARANTEED to exercise the K-split kernel, not single-wave.
     nw = csa_ksplit_num_waves(plan_capacity)
     assert nw > 1, (
-        f"csa_indexer_fp4 bs={bs} mtp={mtp} plan_capacity={plan_capacity} did NOT "
+        f"{shape_label} bs={bs} mtp={mtp} plan_capacity={plan_capacity} did NOT "
         f"auto-engage K-split (NW={nw}); test would silently only cover single-wave"
     )
 
@@ -771,7 +793,7 @@ def test_flydsl_csa_indexer_fp4_ksplit(bs=2, mtp=0):
         head_dim=D,
         rope_head_dim=RD,
         quant=True,
-        quant_mode="fp4",
+        quant_mode=quant_mode,
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
         preshuffle=inp["preshuffle"],
@@ -779,12 +801,12 @@ def test_flydsl_csa_indexer_fp4_ksplit(bs=2, mtp=0):
 
     # (1)+(2) AUTO path (no k_split_num_waves) -> K-split (asserted above) vs ref.
     _, us_kernel = run_perftest(_run, inp)
-    err = _check_fp4_cache(
+    err = _check(
         inp["kv_cache"],
         inp["cache_scale"],
         ref_inp["kv_cache"],
         ref_inp["cache_scale"],
-        f"csa_indexer_fp4/ksplit(auto NW={nw}) bs={bs} mtp={mtp}",
+        f"{shape_label}/ksplit(auto NW={nw}) bs={bs} mtp={mtp}",
     )
 
     # (3) Forced-legacy (NW=1, single-wave) on fresh inputs vs the same ref.
@@ -792,18 +814,16 @@ def test_flydsl_csa_indexer_fp4_ksplit(bs=2, mtp=0):
     leg_inp["kv_cache"] = torch.zeros_like(inp["kv_cache"])
     leg_inp["cache_scale"] = torch.zeros_like(inp["cache_scale"])
     _run(leg_inp, k_split_num_waves=1)
-    _check_fp4_cache(
+    _check(
         leg_inp["kv_cache"],
         leg_inp["cache_scale"],
         ref_inp["kv_cache"],
         ref_inp["cache_scale"],
-        f"csa_indexer_fp4/legacy(NW=1) bs={bs} mtp={mtp}",
+        f"{shape_label}/legacy(NW=1) bs={bs} mtp={mtp}",
     )
 
     return {
         "gfx": get_gfx(),
-        "bs": bs,
-        "mtp": mtp,
         "plan_capacity": plan_capacity,
         "auto_nw": nw,
         "us_kernel": us_kernel,
@@ -889,13 +909,13 @@ def main():
         single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
     )
     parser.add_argument(
-        "--fp4-ksplit-bs",
+        "--ksplit-bs",
         type=int,
         nargs="*",
         default=[2, 8],
-        help="""Batch sizes for the FP4 CSA-indexer AUTO K-split coverage check
-        (asserts auto-pick engages NW>1 without an explicit k_split_num_waves, then
-        validates the K-split FP4 scatter vs the torch ref + forced-legacy). These
+        help="""Batch sizes for the CSA-indexer AUTO K-split coverage check (fp8 +
+        fp4): asserts auto-pick engages NW>1 without an explicit k_split_num_waves,
+        then validates the K-split scatter vs the torch ref + forced-legacy. These
         small bs keep plan_capacity in the K-split regime. Empty to skip.""",
     )
 
@@ -941,10 +961,15 @@ def main():
         [test_flydsl_csa_nm_asm_fp8(bs) for bs in args.csa_fp8_bs],
     )
 
-    # --- Table 4: FP4 CSA-indexer AUTO K-split coverage (auto NW>1 + vs torch) ---
+    # --- Table 4: CSA-indexer AUTO K-split coverage (fp8 + fp4): auto NW>1 + vs
+    # torch ref + forced-legacy cross-check. ---
     summarize(
-        "flydsl_csa_indexer_fp4_ksplit",
-        [test_flydsl_csa_indexer_fp4_ksplit(bs) for bs in args.fp4_ksplit_bs],
+        "flydsl_csa_indexer_ksplit",
+        [
+            test_flydsl_csa_indexer_ksplit(shape_label, bs)
+            for shape_label in ("csa_indexer", "csa_indexer_fp4")
+            for bs in args.ksplit_bs
+        ],
     )
 
 
