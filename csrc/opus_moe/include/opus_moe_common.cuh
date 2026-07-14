@@ -85,6 +85,7 @@ struct opus_moe_stage2_a8w4_kargs
     int64_t stride_a_t;
     int64_t stride_a_k;
     int64_t stride_w_e;
+    int64_t stride_w_h;
     int64_t stride_a_scale_route;
     int64_t stride_w_scale_row;
     int64_t stride_o_t;

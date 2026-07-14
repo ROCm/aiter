@@ -10,6 +10,7 @@ from torch import Tensor
 
 from ...jit.core import compile_ops
 from .moe_stage2_a8w4_meta import (
+    OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_BF16,
     OPUS_A8W4_OUT_MODE_FP8,
     opus_a8w4_best_atomic_kid,
@@ -24,12 +25,30 @@ from .moe_stage2_a8w4_meta import (
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1
 
 
+def _packed_scale_cols(shape_family) -> int:
+    k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+    k_step_packed = k.bk_logical // k.fp4_values_per_byte
+    k_tiles = shape_family.effective_inter_dim // k_step_packed
+    return ((k_tiles + 1) // 2) * k.scale_groups_per_row_pack
+
+
 def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
 def _optional_contiguous(tensor: Optional[Tensor]) -> Optional[Tensor]:
     return None if tensor is None else _contiguous(tensor)
+
+
+def _pad_scale_cols(tensor: Tensor, cols: int) -> Tensor:
+    if tensor.shape[1] >= cols:
+        return tensor
+    padded = torch.empty(
+        (*tensor.shape[:-1], cols), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[..., : tensor.shape[-1]] = tensor
+    padded[..., tensor.shape[-1] :] = tensor[..., -1:]
+    return padded
 
 
 def _route_out_mode_from_dtype(route_out_dtype: Optional[str]) -> int:
@@ -146,6 +165,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
         inter_dim=inter_states.shape[2],
         expert=w2.shape[0],
         topk=inter_states.shape[1],
+        inter_dim_pad=inter_dim_pad,
     )
     shape_family_name = None if shape_family is None else shape_family.name
     if kernel_id == -1 and shape_family_name is None:
@@ -178,6 +198,10 @@ def opus_moe_stage2_a8w4_decode_fwd(
             )
         route_out = kid_route_out
         route_out_fp8 = opus_a8w4_kid_is_fp8(kernel_id)
+    if shape_family is not None:
+        scale_cols = _packed_scale_cols(shape_family)
+        a2_scale = _pad_scale_cols(a2_scale, scale_cols)
+        w2_scale = _pad_scale_cols(w2_scale, scale_cols)
     md = w2.shape[1]
     if out is None:
         if route_out_fp8:

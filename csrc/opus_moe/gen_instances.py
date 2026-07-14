@@ -115,12 +115,17 @@ def _cpp_name_suffix(name: str) -> str:
     )
 
 
-def _cpp_contract_alias(name: str) -> str:
-    alias_name = str(name)
-    if alias_name.startswith("a8w4_"):
-        alias_name = alias_name[len("a8w4_") :]
-    suffix = _cpp_name_suffix(alias_name)
-    return f"OpusMoeStage2A8W4{suffix}Contract"
+def _cpp_effective_contract_alias(effective_inter_dim: int) -> str:
+    return f"OpusMoeStage2A8W4Eff{effective_inter_dim}Contract"
+
+
+def _unique_effective_contracts(contracts):
+    by_effective = {}
+    for contract in contracts:
+        current = by_effective.get(contract.effective_inter_dim)
+        if current is None or contract.logical_inter_dim > current.logical_inter_dim:
+            by_effective[contract.effective_inter_dim] = contract
+    return tuple(by_effective[effective] for effective in sorted(by_effective))
 
 
 # ---- A8W4 metadata and dispatch manifests ---------------------------------
@@ -130,92 +135,11 @@ def _emit_a8w4_meta_header() -> str:
     lines = [A8W4_META_HEADER]
     k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
     default_family = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT
-    shape_families = sorted(
-        OPUS_A8W4_SHAPE_FAMILY_CONTRACTS.values(), key=lambda s: s.name
-    )
+    shape_families = OPUS_A8W4_SHAPE_FAMILY_CONTRACTS
+    effective_families = _unique_effective_contracts(shape_families)
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
-    unsupported_shape_families = sorted(
-        {
-            inst.shape_family
-            for inst in a8w4_kernels
-            if inst.shape_family not in OPUS_A8W4_SHAPE_FAMILY_CONTRACTS
-        }
-    )
-    if unsupported_shape_families:
-        raise ValueError(
-            "unsupported Opus A8W4 shape family contract(s): "
-            + ", ".join(unsupported_shape_families)
-        )
-    unsupported_kernel_contracts = sorted(
-        {
-            inst.kernel_contract
-            for inst in a8w4_kernels
-            if inst.kernel_contract != k.name
-        }
-    )
-    if unsupported_kernel_contracts:
-        raise ValueError(
-            "unsupported Opus A8W4 kernel contract(s): "
-            + ", ".join(unsupported_kernel_contracts)
-        )
     block_ms = sorted({inst.block_m for inst in a8w4_kernels})
     block_ns = sorted({inst.block_n for inst in a8w4_kernels})
-    mode_default_keys = [
-        (inst.shape_family, inst.out_mode, inst.block_m)
-        for inst in a8w4_kernels
-        if inst.mode_default
-    ]
-    duplicate_mode_defaults = sorted(
-        {key for key in mode_default_keys if mode_default_keys.count(key) > 1}
-    )
-    if duplicate_mode_defaults:
-        raise ValueError(
-            "duplicate Opus A8W4 mode default(s): "
-            + ", ".join(
-                f"shape_family={shape_family},out_mode={out_mode},block_m={block_m}"
-                for shape_family, out_mode, block_m in duplicate_mode_defaults
-            )
-        )
-    k_step_packed = k.bk_logical // k.fp4_values_per_byte
-    if k.bk_logical % k.fp4_values_per_byte != 0:
-        raise ValueError(
-            "Opus A8W4 kernel contract requires bk_logical divisible by "
-            "fp4_values_per_byte"
-        )
-    for family in shape_families:
-        if family.logical_inter_dim % k.scale_group_logical_k != 0:
-            raise ValueError(
-                f"shape family {family.name} logical_inter_dim must be divisible "
-                f"by scale_group_logical_k={k.scale_group_logical_k}"
-            )
-        if family.effective_inter_dim <= 0:
-            raise ValueError(
-                f"shape family {family.name} effective_inter_dim must be positive"
-            )
-        if family.effective_inter_dim % k_step_packed != 0:
-            raise ValueError(
-                f"shape family {family.name} effective_inter_dim must be divisible "
-                f"by K_STEP_PACKED={k_step_packed}"
-            )
-    auto_reduce_model_dims = [
-        model_dim
-        for inst in OPUS_A8W4_ROUTE_REDUCE_INSTANCES
-        for model_dim in inst.auto_model_dims
-    ]
-    duplicate_auto_reduce_model_dims = sorted(
-        {
-            model_dim
-            for model_dim in auto_reduce_model_dims
-            if auto_reduce_model_dims.count(model_dim) > 1
-        }
-    )
-    if duplicate_auto_reduce_model_dims:
-        raise ValueError(
-            "duplicate Opus A8W4 route-reduce auto model_dim(s): "
-            + ", ".join(
-                str(model_dim) for model_dim in duplicate_auto_reduce_model_dims
-            )
-        )
 
     lines.extend(
         [
@@ -228,21 +152,16 @@ def _emit_a8w4_meta_header() -> str:
             "};\n\n",
         ]
     )
-    for family in shape_families:
+    for family in effective_families:
         lines.append(
-            f"using {_cpp_contract_alias(family.name)} = "
+            f"using {_cpp_effective_contract_alias(family.effective_inter_dim)} = "
             "OpusMoeStage2A8W4DecodeContract<"
             f"{family.logical_inter_dim}, {family.inter_dim_pad}>;\n"
         )
     lines.extend(
         [
             "using OpusMoeStage2A8W4DefaultContract = "
-            f"{_cpp_contract_alias(default_family.name)};\n\n",
-            f"constexpr int kStage2MXFP4ScaleGroupLogicalK = {k.scale_group_logical_k};\n",
-            "constexpr int kStage2A8W4DecodeLogicalInterDim = "
-            "OpusMoeStage2A8W4DefaultContract::DECODE_LOGICAL_INTER_DIM;\n",
-            "constexpr int kStage2A8W4DecodeInterDimPad = "
-            "OpusMoeStage2A8W4DefaultContract::DECODE_INTER_DIM_PAD;\n",
+            f"{_cpp_effective_contract_alias(default_family.effective_inter_dim)};\n\n",
         ]
     )
     for block_m in block_ms:
@@ -263,7 +182,7 @@ def _emit_a8w4_meta_header() -> str:
             f"constexpr int kStage2A8W4DecodeFp4ValuesPerByte = {k.fp4_values_per_byte};\n",
             f"constexpr int kStage2A8W4DecodeVectorBytes = {k.vector_bytes};\n",
             "constexpr int kStage2A8W4DecodeScaleGroupLogicalK = "
-            "kStage2MXFP4ScaleGroupLogicalK;\n",
+            f"{k.scale_group_logical_k};\n",
             "constexpr int kStage2A8W4DecodeScaleGroupsPerRowPack = "
             f"{k.scale_groups_per_row_pack};\n",
             "constexpr int kStage2A8W4DecodeScaleWordsPerGroupPack = "
@@ -318,13 +237,6 @@ def _emit_a8w4_meta_header() -> str:
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
-        "constexpr bool stage2_a8w4_block_m_is_valid(int block_m)\n{\n    switch(block_m)\n    {\n"
-    )
-    for block_m in block_ms:
-        lines.append(f"    case {block_m}:\n")
-    lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
-
-    lines.append(
         "constexpr bool stage2_a8w4_kid_is_valid(int kid)\n{\n    switch(kid)\n    {\n"
     )
     for inst in a8w4_kernels:
@@ -346,36 +258,28 @@ def _emit_a8w4_meta_header() -> str:
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
-        "constexpr int stage2_a8w4_kid_sort_block_m(int kid)\n{\n    switch(kid)\n    {\n"
+        "constexpr bool stage2_a8w4_inter_dim_contract_is_supported("
+        "int logical_inter_dim, int inter_dim_pad)\n"
+        "{\n    switch(logical_inter_dim)\n    {\n"
     )
-    for inst in a8w4_kernels:
-        lines.append(f"    case {inst.kid}: return {inst.sort_block_m};\n")
-    lines.append("    default: return -1;\n    }\n}\n\n")
-
-    kid_family_fields = (
-        ("logical_inter_dim", "logical_inter_dim"),
-        ("inter_dim_pad", "inter_dim_pad"),
-        ("effective_inter_dim", "effective_inter_dim"),
-    )
-    for fn_suffix, attr in kid_family_fields:
-        lines.append(
-            f"constexpr int stage2_a8w4_kid_{fn_suffix}(int kid)\n"
-            "{\n    switch(kid)\n    {\n"
+    for logical_inter_dim in sorted(
+        {family.logical_inter_dim for family in shape_families}
+    ):
+        pads = sorted(
+            {
+                family.inter_dim_pad
+                for family in shape_families
+                if family.logical_inter_dim == logical_inter_dim
+            }
         )
-        for inst in a8w4_kernels:
-            family = OPUS_A8W4_SHAPE_FAMILY_CONTRACTS[inst.shape_family]
-            lines.append(f"    case {inst.kid}: return {getattr(family, attr)};\n")
-        lines.append("    default: return -1;\n    }\n}\n\n")
-
-    lines.append(
-        "constexpr int stage2_a8w4_kid_k_tiles(int kid)\n{\n    switch(kid)\n    {\n"
-    )
-    for inst in a8w4_kernels:
-        family = OPUS_A8W4_SHAPE_FAMILY_CONTRACTS[inst.shape_family]
+        lines.append(f"    case {logical_inter_dim}:\n")
+        lines.append("        switch(inter_dim_pad)\n        {\n")
+        for pad in pads:
+            lines.append(f"        case {pad}:\n")
         lines.append(
-            f"    case {inst.kid}: return {family.effective_inter_dim // k_step_packed};\n"
+            "            return true;\n        default: return false;\n        }\n"
         )
-    lines.append("    default: return -1;\n    }\n}\n\n")
+    lines.append("    default: return false;\n    }\n}\n\n")
 
     lines.append(
         "constexpr bool stage2_a8w4_kid_uses_route_out(int kid)\n{\n    switch(kid)\n    {\n"
@@ -401,11 +305,14 @@ def _emit_a8w4_meta_header() -> str:
     lines.append(
         "constexpr int stage2_a8w4_auto_direct_atomic_kid("
         "int logical_inter_dim, int inter_dim_pad, int block_m)\n{\n"
+        "    const int effective_inter_dim = logical_inter_dim - inter_dim_pad;\n"
+        "    if(!stage2_a8w4_inter_dim_contract_is_supported("
+        "logical_inter_dim, inter_dim_pad))\n"
+        "        return -1;\n"
     )
-    for family in shape_families:
+    for family in effective_families:
         lines.append(
-            f"    if(logical_inter_dim == {family.logical_inter_dim} && "
-            f"inter_dim_pad == {family.inter_dim_pad})\n"
+            f"    if(effective_inter_dim == {family.effective_inter_dim})\n"
             "    {\n"
             "        switch(block_m)\n"
             "        {\n"
@@ -429,6 +336,7 @@ def _emit_a8w4_meta_header() -> str:
 def _emit_a8w4_manifest_header() -> str:
     lines = [A8W4_MANIFEST_HEADER]
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
+    effective_contracts = _unique_effective_contracts(OPUS_A8W4_SHAPE_FAMILY_CONTRACTS)
 
     lines.append(
         f"#define OPUS_MOE_STAGE2_A8W4_DECODE_LOOKUP_SIZE {len(a8w4_kernels)}\n"
@@ -440,21 +348,30 @@ def _emit_a8w4_manifest_header() -> str:
     lines.append("#define GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES \\\n")
     for idx, inst in enumerate(a8w4_kernels):
         suffix = " \\\n" if idx != len(a8w4_kernels) - 1 else "\n"
+        contract_cases = []
+        for family in effective_contracts:
+            effective_dim = family.effective_inter_dim
+            contract_cases.append(
+                f"case {effective_dim}: "
+                "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
+                "OpusMoeStage2A8W4DecodeShape<"
+                f"opus_moe::{_cpp_effective_contract_alias(effective_dim)}, "
+                f"{inst.block_m}, "
+                f"{inst.block_n}, "
+                f"{inst.sort_block_m}, "
+                f"{_cpp_bool(inst.direct_atomic)}, "
+                f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
+                f"{inst.block_threads}, "
+                f"{inst.min_blocks_per_cu}, "
+                f"{inst.cachectl_b}, "
+                f"{inst.cachectl_wscale}"
+                ">>(kargs, stream);"
+            )
         lines.append(
-            f"    case {inst.kid}: "
-            "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
-            "OpusMoeStage2A8W4DecodeShape<"
-            f"opus_moe::{_cpp_contract_alias(inst.shape_family)}, "
-            f"{inst.block_m}, "
-            f"{inst.block_n}, "
-            f"{inst.sort_block_m}, "
-            f"{_cpp_bool(inst.direct_atomic)}, "
-            f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
-            f"{inst.block_threads}, "
-            f"{inst.min_blocks_per_cu}, "
-            f"{inst.cachectl_b}, "
-            f"{inst.cachectl_wscale}"
-            ">>(kargs, stream);" + suffix
+            f"    case {inst.kid}: switch(effective_inter_dim) {{ "
+            + " ".join(contract_cases)
+            + " default: break; } break;"
+            + suffix
         )
     lines.append("\n")
     return "".join(lines)
