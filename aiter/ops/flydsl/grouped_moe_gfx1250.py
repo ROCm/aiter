@@ -566,7 +566,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
-        topk=topk,
+        # In EP each rank only holds a subset of experts, so the caller-visible
+        # topk is not a stable tuning key; use -1 to match EP-agnostic CSV rows.
+        topk=(-1 if _is_ep else topk),
         activation=activation,
         dtype=dtype,
         q_dtype_a=q_dtype_a,
