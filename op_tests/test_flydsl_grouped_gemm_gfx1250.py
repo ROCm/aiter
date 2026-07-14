@@ -622,6 +622,167 @@ def run_moe(
     return metrics
 
 
+def _run_graph_scenario(
+    data_format: str,
+    *,
+    experts: int,
+    max_tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    layout: str = "gguu",
+    activation: ActivationType = ActivationType.Swiglu,
+    swiglu_limit: float = 7.0,
+    use_bias: bool = True,
+    step: int = 3,
+    tol: float = LOGITS_DIFF_TOL,
+    seed: int = 0,
+) -> list[tuple[int, float, float, bool]]:
+    """Build a CUDA graph per token count in a sweep and verify each replay.
+
+    The grouped MoE bakes its per-expert token grouping / grouped-GEMM launch
+    metadata at capture time, so a single graph can only be replayed correctly
+    for the exact problem it was captured on. This scenario therefore captures a
+    fresh graph for every token count ``m in range(1, max_tokens, step)``, replays
+    it, and compares the replayed output against a PyTorch reference for the same
+    ``m`` tokens -- validating that the CUDA-graph (production) path is correct
+    across the token sweep. The (token-independent) weights are built once and
+    reused; only the ``m``-token activations and routing change per graph.
+
+    Args:
+        data_format: "a4w4" or "a8w4".
+        experts, topk, model_dim, inter_dim, layout, activation, swiglu_limit,
+            use_bias: grouped-MoE problem definition (same meaning as run_moe).
+        max_tokens: upper bound of the verified token sweep (the "build" size).
+        step: stride of the sweep ``range(1, max_tokens, step)``.
+        tol: logits_diff gate for each token count.
+        seed: base RNG seed; the per-count problem uses ``seed + m``.
+
+    Returns:
+        One ``(m, logits_diff, rel_l2, passed)`` tuple per verified token count.
+    """
+    if data_format not in ("a4w4", "a8w4"):
+        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+    if layout not in ("gguu", "gugu"):
+        raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
+
+    k_dim = model_dim
+    inter = inter_dim
+    k_pack = k_dim // 2
+    inter_pack = inter // 2
+
+    # Token-independent logical GGUU weights/scales/bias, built once and reused
+    # for every captured graph in the sweep.
+    torch.manual_seed(seed)
+    w1_logical = _pattern_packed(experts, 2 * inter, k_pack)
+    w2_logical = _pattern_packed(experts, k_dim, inter_pack)
+    w1_scale_raw = init_weight_scales(experts, 2 * inter, k_dim // SCALE_BLOCK)
+    w2_scale_raw = init_weight_scales(experts, k_dim, inter // SCALE_BLOCK)
+    if use_bias:
+        bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
+        bias2 = (torch.randn((experts, k_dim)) * 1e-3).float()
+    else:
+        bias1 = torch.zeros((experts, 2 * inter))
+        bias2 = torch.zeros((experts, k_dim))
+
+    if layout == "gugu":
+        bias1_phys = _gguu_to_gugu_rows(bias1)
+        gate_mode = GateMode.INTERLEAVE
+    else:
+        bias1_phys = bias1
+        gate_mode = GateMode.SEPARATED
+
+    w1_grouped = moe_shuffle_weight(
+        w1_logical,
+        experts_cnt=experts,
+        is_guinterleave=(layout == "gugu"),
+        gate_up=True,
+    )
+    w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
+    if layout == "gugu":
+        w1_scale = moe_shuffle_scale(
+            w1_scale_raw.contiguous(),
+            experts_cnt=experts,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+    else:
+        w1_scale = moe_shuffle_scale(w1_scale_raw.contiguous(), experts_cnt=experts)
+    w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
+
+    if data_format == "a4w4":
+        w1_arg = w1_grouped.view(dtypes.fp4x2)
+        w2_arg = w2_grouped.view(dtypes.fp4x2)
+    else:  # a8w4
+        w1_arg = w1_grouped
+        w2_arg = w2_grouped
+
+    tag = f"{data_format} {layout} graph(build={max_tokens})"
+    results: list[tuple[int, float, float, bool]] = []
+    for m in range(1, max_tokens, step):
+        torch.manual_seed(seed + m)
+        # Static graph inputs for this token count (captured by reference).
+        hidden_buf = (torch.randn((m, k_dim)) * 0.5).to(torch.bfloat16)
+        topk_id_buf, topk_w_buf = _make_topk(hidden_buf, experts, topk)
+        topk_w_buf = topk_w_buf.to(torch.bfloat16)
+
+        def _call() -> torch.Tensor:
+            return fused_moe(
+                hidden_buf,
+                w1_arg,
+                w2_arg,
+                topk_w_buf,
+                topk_id_buf,
+                activation=activation,
+                quant_type=QuantType.per_1x32,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                bias1=bias1_phys if use_bias else None,
+                bias2=bias2 if use_bias else None,
+                gate_mode=gate_mode.value,
+                dtype=dtypes.bf16,
+                swiglu_limit=swiglu_limit,
+            )
+
+        # Prime JIT/autotune/workspace before capture (a graph cannot compile or
+        # allocate), then capture and replay this m-token problem.
+        for _ in range(2):
+            _call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out_buf = _call()
+        graph.replay()
+        torch.cuda.synchronize()
+        out_m = out_buf.clone()
+
+        ref_m = _torch_moe_ref(
+            hidden_buf,
+            w1_logical,
+            w1_scale_raw,
+            bias1,
+            w2_logical,
+            w2_scale_raw,
+            bias2,
+            topk_w_buf,
+            topk_id_buf,
+            data_format=data_format,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        ).to(out_m.dtype)
+        ld = _logits_diff(out_m, ref_m)
+        rel = _rel_l2(out_m, ref_m)
+        passed = ld < tol
+        print(
+            f"[graph {tag}] m={m}: logits_diff={ld:.4e} rel_l2={rel:.4e} "
+            f"{'PASS' if passed else 'FAIL'} (gate<{tol})",
+            flush=True,
+        )
+        results.append((m, ld, rel, passed))
+        del graph  # free this graph's private memory pool before the next capture
+    return results
+
+
 # model_dim=512 (not the 256 default): the grouped mxscale kernel needs
 # num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
@@ -730,11 +891,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("bench", "verify", "kernel"),
+        choices=("bench", "verify", "kernel", "graph"),
         default="bench",
         help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
         "correctness only. kernel: time the gemm1 and gemm2 kernels in "
-        "isolation (loop each launch alone).",
+        "isolation (loop each launch alone). graph: capture one CUDA graph at "
+        "each --token value and verify replays for token counts "
+        "range(1, token, --graph-step).",
+    )
+    parser.add_argument(
+        "--graph-step",
+        type=int,
+        default=3,
+        help="stride of the verified token sweep in the graph scenario: each "
+        "captured graph (built at --token) is replayed and checked for "
+        "range(1, token, graph_step). Default 3.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
@@ -838,6 +1009,53 @@ def main() -> None:
             print(f"\n===== tokens={_tok} =====", flush=True)
 
         tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+
+        # graph scenario: build one CUDA graph at this token count, then verify
+        # replays for range(1, token, graph_step). Each verified count becomes a
+        # row (tokens=m) so it flows through the shared summary/gate below.
+        if args.scenario == "graph":
+            run_only = (
+                run_only_env()
+                if not args.no_check_aot_cache
+                else nullcontext()
+            )
+            with run_only:
+                graph_results = _run_graph_scenario(
+                    args.data_format,
+                    experts=args.experts,
+                    max_tokens=_tok,
+                    topk=args.topk,
+                    model_dim=args.model_dim,
+                    inter_dim=args.inter_dim,
+                    layout=args.layout,
+                    activation=activation,
+                    swiglu_limit=args.swiglu_limit,
+                    use_bias=not args.no_bias,
+                    step=args.graph_step,
+                    tol=LOGITS_DIFF_TOL,
+                )
+            for m, ld, rel, passed in graph_results:
+                rows.append(
+                    {
+                        "data_format": args.data_format,
+                        "layout": args.layout,
+                        "act": args.act,
+                        "init": "random",
+                        "experts": args.experts,
+                        "tokens": m,
+                        "topk": args.topk,
+                        "model_dim": args.model_dim,
+                        "inter_dim": args.inter_dim,
+                        "logits_diff": ld,
+                        "rel_l2": rel,
+                        "pass": passed,
+                        "us": None,
+                        "gemm1_us": None,
+                        "gemm2_us": None,
+                    }
+                )
+            continue
+
         # raise_on_fail=False so one out-of-gate token does not abort the
         # sweep; the failure is recorded and reported after the table.
         metrics = run_moe(
