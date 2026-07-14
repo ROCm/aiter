@@ -141,7 +141,7 @@ TESTS = [
         "extra_exec_args": "",
         "test_command": "python3 registered/amd/test_moriep_small.py TestLowLatency",
         "run_on_pr": False,
-        "run_on_schedule": False,
+        "run_on_schedule": True,
     },
 ]
 
