@@ -2241,6 +2241,7 @@ def flydsl_moe_fused_quant_preshuffle(
     route_max_m: int = 0,
     out_payload: Optional[torch.Tensor] = None,  # (E, max_m, Pb) uint8
     out_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    num_valid_routes: Optional[torch.Tensor] = None,  # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -2308,6 +2309,17 @@ def flydsl_moe_fused_quant_preshuffle(
             source_topk=source_topk,
             remap_rows=remap_rows,
         )
+        # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
+        # padding rows of the dispatch buffer and are not gathered/quantized. When
+        # not provided, pass numel so every route stays valid (no behavior change).
+        if num_valid_routes is None:
+            num_valid_routes_i32 = torch.tensor(
+                [numel], dtype=torch.int32, device=device
+            )
+        else:
+            num_valid_routes_i32 = (
+                num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+            ).contiguous()
         launch(
             ptr_arg(grouped_in.contiguous().view(-1)),
             ptr_arg(out_payload.view(-1)),
@@ -2316,6 +2328,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ptr_arg(row_starts_i32),
             route_max_m_arg,
             numel,
+            ptr_arg(num_valid_routes_i32),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )

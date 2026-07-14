@@ -438,10 +438,16 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         nvr_rsrc = ptr_rsrc(num_valid_routes)
         nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
 
+        # Iterate only the valid routes ([0, nvr)); the dead-tail padding routes
+        # (>= num_valid_routes) are skipped entirely, so topids_to_rows/gather_w
+        # for those slots are left unwritten. Every downstream consumer of the
+        # route buffers (contiguous_psum_remap, preshuffle route-ksplit,
+        # gather-reduce) is bounded by the same nvr/nvt, so the dead tail is never
+        # read. When truncation is disabled the caller passes numel == nvr.
         tid_idx = arith.index_cast(T.index, tid)
-        numel_idx = arith.index_cast(T.index, ArithValue(numel))
+        nvr_idx = arith.index_cast(T.index, ArithValue(nvr))
         stride_idx = arith.index(MAX_G2L_EXPERTS)
-        route_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
+        route_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
         with ir.InsertionPoint(route_loop.body):
             route = arith.index_cast(i32, route_loop.induction_variable)
             is_oob = arith.cmpi(CmpIPredicate.uge, route, ArithValue(nvr))
