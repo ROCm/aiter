@@ -321,7 +321,17 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
             (void)hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev);
             return n > 0 ? n : 256;
         }();
-        const long long want = (long long)cu_count * 8;
+        // AITER_FMHA_SOLO_WGS overrides the launched-WG count (A/B the persistent grid-stride): >=total
+        // => one WG per tile (non-persistent full grid); default cu_count*8 (the persistent grid-stride).
+        static const long long solo_wgs_env = []() {
+            const char* e = getenv("AITER_FMHA_SOLO_WGS");
+            return e ? atoll(e) : 0LL;
+        }();
+        // Launch exactly the resident-WG count. The ACC-heavy solo kernel is VGPR-bound to 1 wave/SIMD
+        // = 4 WG/CU (the stale "8 WG/CU" over-launched 2x -> ~0.4% slower + a launch/exit tail). Swept
+        // optimum @ b1 hq5 sq75520: cu*4=2830 > cu*8=2820 > full-grid=2704 TFLOPS. AITER_FMHA_SOLO_WGS
+        // overrides (>=total => non-persistent one-WG-per-tile grid) for A/B.
+        const long long want = solo_wgs_env > 0 ? solo_wgs_env : (long long)cu_count * 4;
         const int launch_wgs = static_cast<int>((want < total) ? want : total);
         static uint32_t* g_counter_solo = nullptr;
         if(g_counter_solo == nullptr)
