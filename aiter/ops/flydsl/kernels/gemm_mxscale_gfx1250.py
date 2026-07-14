@@ -2769,18 +2769,21 @@ def compile_mxscale_gemm(
             if const_expr(wave_specialized_tdm):
                 # WST family unified over `tdm_args_per_rounds`: plain WST issues
                 # one round per step, balanced issues two (round1 B/Bs, round2
-                # A/As). Each entry holds the loop-invariant TDM issue args for
-                # one round -- (per-buffer LDS addr list, global addr_hi, dgroup1,
-                # per-step advance). The mutable global addr_lo per round is
-                # carried separately in `init_addr_los`. dgroup0[1]=LDS addr,
-                # [2]/[3]=global lo/hi -- all already per-wave-partitioned by the
-                # descriptor (num_warps/warp_base baked in at build time).
-                def _glo(d):
+                # A/As). Each entry holds the loop-invariant TDM issue args for one
+                # round -- (per-buffer LDS addr list, dgroup1, per-step advance).
+                # The mutable global address per round is carried separately in
+                # `init_addr_pairs` as [lo, hi] and advanced with a carry-
+                # propagating 64-bit add, so a low-dword overflow correctly carries
+                # into the high dword (e.g. when a tile base sits just below a
+                # 2**32 boundary). dgroup0[1]=LDS addr, [2]/[3]=global lo/hi -- all
+                # already per-wave-partitioned by the descriptor (num_warps/
+                # warp_base baked in at build time).
+                def _global_addr_lo(d):
                     return vector.extract(
                         d.dgroup0, static_position=[2], dynamic_position=[]
                     )
 
-                def _ghi(d):
+                def _global_addr_hi(d):
                     return vector.extract(
                         d.dgroup0, static_position=[3], dynamic_position=[]
                     )
@@ -2792,7 +2795,6 @@ def compile_mxscale_gemm(
                                 _select_r1(stages_b_lds_addr[i], stages_bs_lds_addr[i])
                                 for i in range_constexpr(num_buffers)
                             ],
-                            _select_r1(_ghi(desc_b_init), _ghi(desc_bs_init)),
                             _select_r1(desc_b_init.dgroup1, desc_bs_init.dgroup1),
                             _select_r1(adv_b_i32, adv_bs_i32),
                         ),
@@ -2801,14 +2803,31 @@ def compile_mxscale_gemm(
                                 _select_r2(stages_a_lds_addr[i], stages_as_lds_addr[i])
                                 for i in range_constexpr(num_buffers)
                             ],
-                            _select_r2(_ghi(desc_a_init), _ghi(desc_as_init)),
                             _select_r2(desc_a_init.dgroup1, desc_as_init.dgroup1),
                             _select_r2(adv_a_i32, adv_as_i32),
                         ),
                     ]
-                    init_addr_los = [
-                        _select_r1(_glo(desc_b_init), _glo(desc_bs_init)),
-                        _select_r2(_glo(desc_a_init), _glo(desc_as_init)),
+                    init_addr_pairs = [
+                        [
+                            _select_r1(
+                                _global_addr_lo(desc_b_init),
+                                _global_addr_lo(desc_bs_init),
+                            ),
+                            _select_r1(
+                                _global_addr_hi(desc_b_init),
+                                _global_addr_hi(desc_bs_init),
+                            ),
+                        ],
+                        [
+                            _select_r2(
+                                _global_addr_lo(desc_a_init),
+                                _global_addr_lo(desc_as_init),
+                            ),
+                            _select_r2(
+                                _global_addr_hi(desc_a_init),
+                                _global_addr_hi(desc_as_init),
+                            ),
+                        ],
                     ]
                 else:
                     tdm_args_per_rounds = [
@@ -2823,12 +2842,6 @@ def compile_mxscale_gemm(
                                 for i in range_constexpr(num_buffers)
                             ],
                             _select_wave_tdm_value(
-                                _ghi(desc_a_init),
-                                _ghi(desc_b_init),
-                                _ghi(desc_as_init),
-                                _ghi(desc_bs_init),
-                            ),
-                            _select_wave_tdm_value(
                                 desc_a_init.dgroup1,
                                 desc_b_init.dgroup1,
                                 desc_as_init.dgroup1,
@@ -2839,36 +2852,50 @@ def compile_mxscale_gemm(
                             ),
                         ),
                     ]
-                    init_addr_los = [
-                        _select_wave_tdm_value(
-                            _glo(desc_a_init),
-                            _glo(desc_b_init),
-                            _glo(desc_as_init),
-                            _glo(desc_bs_init),
-                        ),
+                    init_addr_pairs = [
+                        [
+                            _select_wave_tdm_value(
+                                _global_addr_lo(desc_a_init),
+                                _global_addr_lo(desc_b_init),
+                                _global_addr_lo(desc_as_init),
+                                _global_addr_lo(desc_bs_init),
+                            ),
+                            _select_wave_tdm_value(
+                                _global_addr_hi(desc_a_init),
+                                _global_addr_hi(desc_b_init),
+                                _global_addr_hi(desc_as_init),
+                                _global_addr_hi(desc_bs_init),
+                            ),
+                        ],
                     ]
                 n_tdm_rounds = len(tdm_args_per_rounds)
 
-                def issue_tdm(load_stage, addr_los):
+                def _flatten_pairs(pairs):
+                    # [[lo0,hi0],[lo1,hi1]] -> [lo0,hi0,lo1,hi1] for scf state.
+                    return [_v for _p in pairs for _v in _p]
+
+                def _unflatten_pairs(flat):
+                    return [
+                        [flat[2 * _r], flat[2 * _r + 1]]
+                        for _r in range_constexpr(n_tdm_rounds)
+                    ]
+
+                def issue_tdm(load_stage, addr_pairs):
                     # One TDM op per round for this wave; advance each round's
-                    # addr_lo in place. n_tdm_rounds==1 -> byte-identical to plain
-                    # WST; ==2 -> balanced (round1 B/Bs, round2 A/As).
+                    # (lo, hi) with a carry-propagating add. n_tdm_rounds==1 ->
+                    # plain WST; ==2 -> balanced (round1 B/Bs, round2 A/As).
                     for _r in range_constexpr(n_tdm_rounds):
-                        _lds_addr, _addr_hi, _dgroup1, _adv_i32 = tdm_args_per_rounds[
-                            _r
-                        ]
+                        _lds_addr, _dgroup1, _adv_i32 = tdm_args_per_rounds[_r]
+                        _lo, _hi = addr_pairs[_r]
                         dg0 = vector.from_elements(
                             T.vec(4, T.i32),
-                            [
-                                pred_const,
-                                _lds_addr[load_stage],
-                                addr_los[_r],
-                                _addr_hi,
-                            ],
+                            [pred_const, _lds_addr[load_stage], _lo, _hi],
                         )
                         tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, _dgroup1))
-                        addr_los[_r] = arith.addi(addr_los[_r], _adv_i32)
-                    return addr_los
+                        addr_pairs[_r] = list(
+                            tdm_ops.add_addr_with_carry(_lo, _hi, _adv_i32)
+                        )
+                    return addr_pairs
 
             else:
                 addr_lo_a = vector.extract(
@@ -2939,11 +2966,11 @@ def compile_mxscale_gemm(
 
             # Prologue
             if const_expr(wave_specialized_tdm):
-                # One pipeline over `tdm_args_per_rounds`; `addr_los` (one addr_lo
-                # per round) is advanced by issue_tdm and carried into the loop.
-                addr_los = list(init_addr_los)
+                # One pipeline over `tdm_args_per_rounds`; `addr_pairs` (one
+                # [lo, hi] per round) is advanced by issue_tdm and carried on.
+                addr_pairs = [list(_p) for _p in init_addr_pairs]
                 for i in range_constexpr(pre_loaded):
-                    addr_los = issue_tdm(i, addr_los)
+                    addr_pairs = issue_tdm(i, addr_pairs)
             else:
                 for i in range_constexpr(pre_loaded):
                     dg0_a = vector.from_elements(
@@ -3041,12 +3068,15 @@ def compile_mxscale_gemm(
             if const_expr(loop_iters > 0):
                 if const_expr(wave_specialized_tdm):
                     # One pipeline for plain WST (1 round) and balanced (2 rounds);
-                    # carry one global addr_lo per round in the scf state.
-                    init_args = list(accs) + list(addr_los)
+                    # carry one (lo, hi) global-address pair per round in the scf
+                    # state (flattened to 2*n_tdm_rounds scalars).
+                    init_args = list(accs) + _flatten_pairs(addr_pairs)
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
-                        cur_addr_los = list(state[n_accs : n_accs + n_tdm_rounds])
+                        cur_addr_pairs = _unflatten_pairs(
+                            state[n_accs : n_accs + 2 * n_tdm_rounds]
+                        )
 
                         for buf_idx in range_constexpr(num_buffers):
                             load_stage = (buf_idx + num_buffers - 1) % num_buffers
@@ -3083,7 +3113,7 @@ def compile_mxscale_gemm(
                             # sched_barrier(0) pins them above the ds_loads. The L2
                             # prefetch still rides the mid-compute callback.
                             rocdl.sched_barrier(0)
-                            cur_addr_los = issue_tdm(load_stage, cur_addr_los)
+                            cur_addr_pairs = issue_tdm(load_stage, cur_addr_pairs)
                             rocdl.sched_barrier(0)
                             accs_in = compute_tile_scheduled(
                                 accs_in,
@@ -3095,10 +3125,12 @@ def compile_mxscale_gemm(
                             )
                             hot_loop_scheduler_scheduled()
 
-                        results = yield list(accs_in) + list(cur_addr_los)
+                        results = yield list(accs_in) + _flatten_pairs(cur_addr_pairs)
 
                     accs = list(results[:n_accs])
-                    addr_los = list(results[n_accs : n_accs + n_tdm_rounds])
+                    addr_pairs = _unflatten_pairs(
+                        results[n_accs : n_accs + 2 * n_tdm_rounds]
+                    )
                 else:
                     if const_expr(stage1_dual_b):
                         init_args = (
@@ -3489,10 +3521,10 @@ def compile_mxscale_gemm(
                     if const_expr(_load_stage is not None):
                         _tail_had_load = True
                         if const_expr(wave_specialized_tdm):
-                            # Re-seed from the persisted addr_los each tail step;
+                            # Re-seed from the persisted addr_pairs each tail step;
                             # issue_tdm issues all rounds and advances the local
                             # copy, which is written back below.
-                            _tail_box = [list(addr_los)]
+                            _tail_box = [[list(_p) for _p in addr_pairs]]
 
                             def _tail_mid_ws(_ls=_load_stage, _box=_tail_box):
                                 _box[0] = issue_tdm(_ls, _box[0])
@@ -3573,7 +3605,7 @@ def compile_mxscale_gemm(
 
                     if const_expr(_load_stage is not None):
                         if const_expr(wave_specialized_tdm):
-                            addr_los = list(_tail_box[0])
+                            addr_pairs = [list(_p) for _p in _tail_box[0]]
                         else:
                             addr_lo_a = _tail_ab[0][0]
                             addr_lo_b = _tail_ab[1][0]
