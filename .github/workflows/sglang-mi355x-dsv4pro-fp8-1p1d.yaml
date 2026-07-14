@@ -29,12 +29,15 @@ on:
         type: string
         default: "/data/xinhuang/sglang-aiter-ci"
       slurm_nodelist:
-        description: "Comma-separated Slurm nodes. Must be a subset of the approved fabric nodes."
+        description: "Optional comma-separated Slurm nodes. Empty uses the Slurm reservation."
         required: false
         type: string
-        default: >-
-          ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
-          ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+        default: ""
+      slurm_reservation:
+        description: "Optional Slurm reservation. Empty omits --reservation."
+        required: false
+        type: string
+        default: "aiter_atom"
       slurm_partition:
         description: "Optional Slurm partition. Empty omits -p."
         required: false
@@ -77,9 +80,8 @@ env:
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
-  SLURM_NODELIST_DEFAULT: >-
-    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
-    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  SLURM_NODELIST_DEFAULT: ""
+  SLURM_RESERVATION_DEFAULT: aiter_atom
   SLURM_NODELIST_ALLOWED: >-
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
@@ -130,6 +132,9 @@ jobs:
                   "shared_workspace_root", "SHARED_WORKSPACE_ROOT_DEFAULT"
               ),
               "SLURM_NODELIST_OVERRIDE": value("slurm_nodelist", "SLURM_NODELIST_DEFAULT"),
+              "SLURM_RESERVATION_OVERRIDE": value(
+                  "slurm_reservation", "SLURM_RESERVATION_DEFAULT"
+              ),
               "SLURM_PARTITION_OVERRIDE": value("slurm_partition", "SLURM_PARTITION_DEFAULT"),
               "SLURM_EXCLUSIVE_OVERRIDE": value("slurm_exclusive", "SLURM_EXCLUSIVE_DEFAULT"),
               "CONC_LIST": value("conc_list", "CONC_LIST_DEFAULT"),
@@ -150,8 +155,6 @@ jobs:
               for node in requested_nodes_raw.split(",")
               if node.strip()
           ]
-          if not requested_nodes:
-              raise SystemExit("slurm_nodelist must include at least one approved node")
           unknown_nodes = [
               node for node in requested_nodes if node not in allowed_nodes
           ]
@@ -246,6 +249,7 @@ jobs:
             echo "- SGLang: \`${SGLANG_REPOSITORY}@${SGLANG_REF}\`"
             echo "- Model path: \`${MODEL_PATH_OVERRIDE}\`"
             echo "- Slurm nodes: \`${SLURM_NODELIST_OVERRIDE:-scheduler allocated}\`"
+            echo "- Slurm reservation: \`${SLURM_RESERVATION_OVERRIDE:-none}\`"
             echo "- Shared workspace: \`${SHARED_ROOT}\`"
             echo "- Concurrency list: \`${CONC_LIST}\`"
             echo "- GSM8K gate: \`${RUN_ACCURACY}\`"
@@ -290,6 +294,7 @@ jobs:
           export MODEL_MOUNT_ROOTS="${MODEL_MOUNT_ROOTS}"
           export IMAGE_OVERRIDE="${IMAGE_OVERRIDE}"
           export SLURM_NODELIST="${SLURM_NODELIST_OVERRIDE}"
+          export SLURM_RESERVATION="${SLURM_RESERVATION_OVERRIDE}"
           export SLURM_PARTITION="${SLURM_PARTITION_OVERRIDE}"
           export SLURM_EXCLUSIVE="${SLURM_EXCLUSIVE_OVERRIDE}"
           export TIME_LIMIT="${TIME_LIMIT_OVERRIDE}"
@@ -337,7 +342,8 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts"
           cp -a "${GITHUB_WORKSPACE}"/*.json "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts/" 2>/dev/null || true
           if [ -n "${SHARED_WORKDIR_ROOT:-}" ] && [ -d "${SHARED_WORKDIR_ROOT}" ]; then
-            cp -a "${SHARED_WORKDIR_ROOT}" "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts/shared-workdir"
+            cp -R --no-preserve=mode,ownership,timestamps \
+              "${SHARED_WORKDIR_ROOT}" "${GITHUB_WORKSPACE}/sglang-mi355x-artifacts/shared-workdir"
           fi
 
       - name: Upload benchmark artifacts

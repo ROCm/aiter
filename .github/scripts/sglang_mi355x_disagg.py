@@ -139,7 +139,14 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
 [[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
 """,
         """NODELIST_ARG=()
-[[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
+if [[ -n "${SLURM_RESERVATION:-}" ]]; then
+    NODELIST_ARG=()
+elif [[ -n "${SLURM_NODELIST:-}" ]]; then
+    NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
+fi
+
+RESERVATION_ARG=()
+[[ -n "${SLURM_RESERVATION:-}" ]] && RESERVATION_ARG=(--reservation "$SLURM_RESERVATION")
 
 PARTITION_ARG=()
 [[ -n "${SLURM_PARTITION:-}" ]] && PARTITION_ARG=(-p "$SLURM_PARTITION")
@@ -150,7 +157,7 @@ PARTITION_ARG=()
         """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
-        """salloc "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+        """salloc "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
     )
