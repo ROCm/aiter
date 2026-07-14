@@ -2095,10 +2095,12 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
-    is_flydsl2_v2 = isinstance(kernelName2, str) and kernelName2.startswith("flydslv2_")
+    is_flydsl2_layout = isinstance(kernelName2, str) and kernelName2.startswith(
+        "flydsl_moe2_layout_"
+    )
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
-    if (is_flydsl1 or is_flydsl2 or is_flydsl2_v2) and is_flydsl_available():
+    if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
@@ -2123,7 +2125,7 @@ def get_2stage_cfgs(
             )
 
         flydsl_v2_stage2_cfg = None
-        if is_flydsl2_v2:
+        if is_flydsl2_layout:
             flydsl_v2_stage2_cfg = parse_flydsl_v2_gemm2_kernel(kernelName2)
             if flydsl_v2_stage2_cfg is None:
                 raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName2}")
@@ -2179,8 +2181,8 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=enable_bias and is_flydsl1,
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias and is_flydsl2,
-            skip_inter_quant=is_flydsl2_v2,
+            stage2_has_bias=enable_bias and is_flydsl2 and not is_flydsl2_layout,
+            skip_inter_quant=is_flydsl2_layout,
             **route_bucket_metadata,
         )
     if (

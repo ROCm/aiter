@@ -553,7 +553,7 @@ def time_v2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, use_nt, BN, k_wav
 def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
     """Run baseline gemm1 into v2's sorted-row fp8/fp4 buffers.
 
-    flydslv2_* GEMM2 consumes the v2 sorted-row payload. This path lets
+    flydsl_moe2_layout_* GEMM2 consumes the v2 sorted-row payload. This path lets
     --stage gemm2 compare v2 GEMM2 on a baseline GEMM1 producer.
     """
     a1_scale_sort = moe_mxfp4_sort(
@@ -653,9 +653,9 @@ def print_gemm1_v2_layout_compare(d, v, token, model_dim, inter_dim, E, topk,
 
 def time_v2_gemm2(d, v, token, model_dim, inter_dim, E, topk, BM_S1, BM_S2, use_nt,
                   epilog, persist, BN, k_wave, base_gemm1_params=None,
-                  print_output=False, use_flydslv2_producer=False):
+                  print_output=False, use_layout_producer=False):
     stage2_adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
-    if use_flydslv2_producer:
+    if use_layout_producer:
         if base_gemm1_params is None:
             raise ValueError("base_gemm1_params is required for FlyDSL v2 layout")
         populate_baseline_v2_intermediate(d, v, token, topk, base_gemm1_params, BM_S1)
@@ -806,8 +806,8 @@ def main():
         sort_bm = params1["tile_m"]
 
         kn2 = r.get("kernelName2", "")
-        # A gemm2 row can pin itself to the v2 kernel via a flydslv2_moe2_* name in
-        # kernelName2. When it does (and we're benching gemm2), the v2 config is
+        # A gemm2 row can pin itself to the v2 kernel via a flydsl_moe2_layout_* name
+        # in kernelName2. When it does (and we're benching gemm2), the v2 config is
         # read from the name and the baseline flydsl/opus side is skipped for
         # that row -- the CSV row IS the "use v2 for moe2" decision.
         v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2) if args.stage == "gemm2" else None
@@ -926,7 +926,7 @@ def main():
                     args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog, persist,
                     BN_v2, KW_v2, base_gemm1_params=params1,
                     print_output=args.print_output,
-                    use_flydslv2_producer=v2_g2 is not None,
+                    use_layout_producer=v2_g2 is not None,
                 )
                 if v2_g2 is not None:
                     # The CSV's chosen gemm2 is this same v2 kernel, so the
@@ -936,7 +936,7 @@ def main():
                         d, v, token, args.model_dim, args.inter_dim,
                         args.experts, args.topk, BM_S1, BM_v2, use_nt, epilog,
                         persist, BN_v2, KW_v2, base_gemm1_params=params1,
-                        use_flydslv2_producer=True,
+                        use_layout_producer=True,
                     )
         except Exception as e:
             v2_us, v2_nz = float("nan"), -1
