@@ -575,6 +575,8 @@ def fused_moe_(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    if gate_mode == GateMode.SEPARATED and getattr(w1, "is_guinterleave", False):
+        gate_mode = GateMode.INTERLEAVE
 
     global_E = E
     if expert_mask is not None:
@@ -1225,6 +1227,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    klane_inner=False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1273,6 +1276,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        klane_inner=klane_inner,
     )
 
 
@@ -1725,7 +1729,11 @@ def get_2stage_cfgs(
         df = pd.read_csv(tune_file)
         df = _ensure_gfx_column(df)
         if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") != "flydsl_fallback"]
+            df = df[df["_tag"].fillna("") == ""]
+        for col in ("topk", "expert", "cu_num"):
+            if col in df.columns:
+                df = df[pd.to_numeric(df[col], errors="coerce").notna()]
+                df[col] = df[col].astype(int)
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -2078,6 +2086,51 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and is_flydsl2,
             **route_bucket_metadata,
+        )
+    if (
+        not kernelName1  # only fire when CSV produced no match; a CSV hit returns above
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        and gate_mode
+        == GateMode.SEPARATED  # INTERLEAVE falls through to ck2stages below
+        and is_flydsl_available()
+    ):
+        # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
+        # INTERLEAVE shapes always use CSV rows; unmatched INTERLEAVE falls through to ck2stages.
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = 128
+        _tile_k = 128
+        _gui_tag = ""
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = (
+            flydsl_kernel_name(
+                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
+            )
+            + _gui_tag
+        )
+        kn2 = flydsl_kernel_name(
+            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,  # no split-K for fp4_bf16 (not yet tuned)
+            False,
         )
     if (
         gate_mode != GateMode.SEPARATED
@@ -2462,6 +2515,10 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # fp4_bf16 INTERLEAVE: q_dtype_a is bf16 (set above). For INTERLEAVE, get_inter_dim
+    # returns inter_dim*2 (physical weight dim); correct it so CSV lookup uses the right shape.
+    if gate_mode == GateMode.INTERLEAVE and w1.dtype == dtypes.fp4x2:
+        inter_dim = w1.shape[1] // 2
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -2526,6 +2583,15 @@ def fused_moe_2stages(
                 sorted_weights=sorted_weights,
             )
 
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
+    ):
+        # fp4_bf16 SEPARATED/INTERLEAVE: MXFP4 weights, bf16 activations; no activation quant
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
         a1 = hidden_states.to(dtype)
@@ -2597,9 +2663,12 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
-    if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
-        extra_stage2_args["expert_mask"] = expert_mask
-        extra_stage2_args["topk_ids"] = topk_ids
+    if stage2_func is _flydsl_stage2_wrapper:
+        if gate_mode == GateMode.INTERLEAVE and stage1_kernel_params and stage1_kernel_params.get("b_dtype") == "fp4bf16":
+            extra_stage2_args["klane_inner"] = True
+        if expert_mask is not None:
+            extra_stage2_args["expert_mask"] = expert_mask
+            extra_stage2_args["topk_ids"] = topk_ids
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
@@ -2682,6 +2751,14 @@ def fused_moe_2stages(
         else:
             a2 = a2.to(dtypes.fp8)
             a2_scale = a1_scale
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a not in (dtypes.fp4x2, dtypes.fp8)
+        and gate_mode in (GateMode.SEPARATED, GateMode.INTERLEAVE)
+    ):
+        # fp4_bf16 SEPARATED/INTERLEAVE: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
@@ -2716,6 +2793,13 @@ def fused_moe_2stages(
             num_rows_factor=topk,
         )
         a2 = a2.view(token_num, topk, inter_dim)
+
+    # FlyDSL stage2 uses atomic accumulation (mode='atomic') and expects a
+    # zeroed output buffer. moe_out comes from moe_sorting (torch.empty, not
+    # zeroed), so zero it here when the stage2 function is our FlyDSL wrapper.
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    if stage2_func is _flydsl_stage2_wrapper:
+        moe_out.zero_()
 
     stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
     _stage2_call = functools.partial(

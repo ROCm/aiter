@@ -208,8 +208,41 @@ def shuffle_weight(
     return x_
 
 
-def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
-    """Backward-compatible wrapper around `shuffle_weight(..., is_guinterleave=True)`."""
+def shuffle_weight_a16w4(
+    src: torch.Tensor, NLane: int, gate_up: bool, klane_inner: bool = False
+) -> torch.Tensor:
+    """Backward-compatible wrapper around `shuffle_weight(..., is_guinterleave=True)`.
+
+    When *klane_inner* is True (gate_up only), the KPack dimension is split into
+    two L_sub halves and KLane is placed at dword-contiguous stride so that each
+    lane's 4-byte words are packed together, enabling buffer_load_dwordx4.
+    """
+    if klane_inner:
+        x_type = src.dtype
+        if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+            src = src.view(torch.uint8)
+        experts_cnt, N_full, K_pk = src.shape
+        KPack = 16
+        KLane = 64 // NLane
+        L_sub = 4  # KPack = L_sub * L_sub = 16
+        if gate_up:
+            N = N_full // 2
+            N0 = N // NLane
+            K0 = K_pk // (KLane * KPack)
+            x_ = src.view(experts_cnt, 2, N0, NLane, K0, KLane, L_sub, L_sub)
+            x_ = x_.permute(0, 2, 1, 4, 3, 6, 5, 7).contiguous()
+        else:
+            N0 = N_full // NLane
+            K0 = K_pk // (KLane * KPack)
+            x_ = src.view(experts_cnt, N0, NLane, K0, KLane, KPack)
+            x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
+            x_ = x_.view(experts_cnt, N0, K0, KLane, NLane, L_sub, L_sub)
+            x_ = x_.permute(0, 1, 2, 5, 4, 3, 6).contiguous()
+        x_ = x_.view(*src.shape).contiguous().view(x_type)
+        x_.is_shuffled = True
+        if gate_up:
+            x_.is_guinterleave = True
+        return x_
     return shuffle_weight(
         src, layout=(NLane, 16), is_guinterleave=True, gate_up=gate_up
     )
@@ -431,9 +464,33 @@ def moe_shuffle_scale(
 
 
 def shuffle_scale_a16w4(
-    src: torch.Tensor, experts_cnt: int, gate_up: bool
+    src: torch.Tensor, experts_cnt: int, gate_up: bool, klane_inner: bool = False
 ) -> torch.Tensor:
-    """Backward-compatible wrapper around `shuffle_scale(..., is_guinterleave=True)`."""
+    """Backward-compatible wrapper around `shuffle_scale(..., is_guinterleave=True)`.
+
+    When *klane_inner* is True (gate_up only), KLane is placed at stride-1
+    (byte-innermost) and NLane at stride 4, matching the klane_inner weight layout.
+    """
+    if klane_inner:
+        if src is None:
+            return src
+        K_Pack = 2
+        N_Lane = 16
+        K_Lane = 64 // N_Lane  # 4
+        n_experts, k_ = src.shape
+        n_ = n_experts // experts_cnt
+        K1 = k_ // K_Pack // K_Lane
+        if gate_up:
+            N_Pack = 2
+            N1 = n_ // N_Lane // N_Pack
+            shfl_scale = src.view(experts_cnt, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane)
+            shfl_scale = shfl_scale.permute(0, 2, 4, 3, 6, 5, 1).contiguous()
+        else:
+            N_Pack = 2
+            N1 = n_ // N_Lane // N_Pack
+            shfl_scale = src.view(experts_cnt, N1, N_Pack, N_Lane, K1, K_Pack, K_Lane)
+            shfl_scale = shfl_scale.permute(0, 1, 4, 3, 6, 5, 2).contiguous()
+        return shfl_scale.view(*src.shape).contiguous()
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
     )

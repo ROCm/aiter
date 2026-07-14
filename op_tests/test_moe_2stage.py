@@ -298,9 +298,10 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 / a8w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+    ):  # a16w4
+        gate_up = GateMode(gateMode) == GateMode.INTERLEAVE
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, gate_up)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, gate_up)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
@@ -712,6 +713,16 @@ parser.add_argument(
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
 )
+parser.add_argument(
+    "--gate-mode",
+    choices=["interleave", "separated"],
+    default=None,
+    help=(
+        "Override gate mode for a16w4/a8w4 (fp4x2 weight) quant types. "
+        "Default: interleave (matches physical weight layout from shuffle_weight_a16w4). "
+        "Use 'separated' to benchmark the SEPARATED FlyDSL kernel path."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -867,9 +878,8 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
-    # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
-    # property (not a tuned-config key); request INTERLEAVE here for them.
+    if args.gate_mode is not None and wq_dtype == dtypes.fp4x2:
+        return GateMode(args.gate_mode).value
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
@@ -950,23 +960,7 @@ def _iter_legacy_cases():
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
 
-        if triple == _PER1X32_BF16_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
-        elif triple == _PER1X32_FP8_FP4:
+        if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for act_type in args.act:
                     for m in args.tokenNum:
