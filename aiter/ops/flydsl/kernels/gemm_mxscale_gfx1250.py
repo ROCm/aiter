@@ -897,8 +897,17 @@ def compile_mxscale_gemm(
                 c_rows = arith.index(split_k * batch_count * M)
             else:
                 c_rows = m_idx * arith.index(split_k)
-            c_nrec = c_rows * n_stride * arith.index(elem_bytes_d)
-            c_rsrc = build_buffer_resource_from_ptr(arg_c, num_records_bytes=c_nrec)
+            c_row_byte_i64 = (
+                arith.index_cast(T.i64, flat_m_base)
+                * arith.index_cast(T.i64, n_stride)
+                * arith.constant(elem_bytes_d, type=T.i64)
+            )
+            c_base_i64 = arith.index_cast(T.i64, ptrtoint(arg_c)) + c_row_byte_i64
+            c_rem_clamped = arith.minsi(c_rows - flat_m_base, arith.index(tile_m))
+            c_nrec = c_rem_clamped * n_stride * arith.index(elem_bytes_d)
+            c_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                c_base_i64, num_records_bytes=c_nrec
+            )
             if const_expr(epilogue_bias_mode):
                 bias_rsrc = build_buffer_resource_from_ptr(arg_bias)
             zero_i32 = arith.constant(0, type=T.i32)
@@ -1789,7 +1798,7 @@ def compile_mxscale_gemm(
                 addrs = []
                 _bf16_out = out_dtype in ("bf16", "f16")
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
+                    row = warp_m_base + arith.index(m_off) + lane16
                     col_base = (
                         blk_n
                         + warp_n_base
@@ -1995,7 +2004,7 @@ def compile_mxscale_gemm(
                     raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
                     raw_sub8 = _add_bias_vec8(raw_sub8, wn)
                     row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
-                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
+                    row = warp_m_base + arith.index(m_off) + lane16
                     raw_col_base = (
                         blk_n
                         + warp_n_base
