@@ -8,6 +8,7 @@
 import copy
 import importlib
 import importlib.abc
+import importlib.util
 import os
 import re
 import shlex
@@ -143,7 +144,21 @@ def _find_rocm_home() -> Optional[str]:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2
+        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
+        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
+        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
+        # wrapper, not a real binary — realpath() can't recover the SDK
+        # root from it.
+        try:
+            spec = importlib.util.find_spec("_rocm_sdk_devel")
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            candidate = spec.submodule_search_locations[0]
+            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+                rocm_home = candidate
+    if rocm_home is None:
+        # Guess #3
         hipcc_path = shutil.which("hipcc")
         if hipcc_path is not None:
             rocm_home = os.path.dirname(os.path.dirname(os.path.realpath(hipcc_path)))
@@ -151,7 +166,7 @@ def _find_rocm_home() -> Optional[str]:
             if os.path.basename(rocm_home) == "hip":
                 rocm_home = os.path.dirname(rocm_home)
         else:
-            # Guess #3
+            # Guess #4
             fallback_path = "/opt/rocm"
             if os.path.exists(fallback_path):
                 rocm_home = fallback_path
@@ -1226,7 +1241,18 @@ def _jit_compile(
         name = f"{name}_v{version}"
 
     baton = FileBaton(os.path.join(build_directory, "lock"))
-    if baton.try_acquire():
+    need_build = True
+    while True:
+        if baton.try_acquire():
+            break  # we own the lock; fall through and build below
+        # Another process holds the lock. wait() returns True if that holder
+        # finished normally (module is built — just import it), or False if we
+        # broke a stale lock left by a dead holder, in which case we loop and
+        # re-acquire so we build it ourselves instead of importing nothing.
+        if baton.wait():
+            need_build = False
+            break
+    if need_build:
         try:
             if version != old_version:
                 with GeneratedFileCleaner(
@@ -1294,8 +1320,6 @@ def _jit_compile(
                 )
         finally:
             baton.release()
-    else:
-        baton.wait()
 
     if verbose:
         print(f"Loading extension module {name}...", file=sys.stderr)

@@ -7,6 +7,7 @@ from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
     _triton_gather_kv_b_proj,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 
 def gather_kv_b_proj(
@@ -111,6 +112,11 @@ def gather_kv_b_proj(
     padded_k = _next_pow2(qk_nope_head_dim)
     padded_v = _next_pow2(v_head_dim)
 
+    num_stages = 3
+    # To avoid out of LDS limit for gfx942
+    if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
+        num_stages = 1
+
     grid = (batch_size * tp_k_head_num_k,)
     if is_fp4_weight:
         # Use the actual output token count, not kv_indices capacity. Serving
@@ -144,7 +150,7 @@ def gather_kv_b_proj(
             Fp4ScaleKGranularity=fp4_scale_k_granularity,
             WEIGHT_PRESHUFFLE=weight_preshuffle,
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
-            num_stages=3,
+            num_stages=num_stages,
         )
         return
 
@@ -173,5 +179,5 @@ def gather_kv_b_proj(
         PER_ROW_SCALE=per_row_scale,
         NO_SCALE=no_scale,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
-        num_stages=3,
+        num_stages=num_stages,
     )
