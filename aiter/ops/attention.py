@@ -602,7 +602,12 @@ def _pa_fp8_v2_splits(num_seqs: int, num_kv_heads: int, mtp: int) -> int:
         elif bs <= 48:  nf = 12
         elif bs <= 96:  nf = 10
         else:           nf = 6
-    return max(1, nf)
+    # nf doubled for ql=2 (mtp==2) only: more splits => finer-grained
+    # partitions to fill the GPU / shorten each CTA's k-loop, which helps the
+    # low-bs long-ctx regime.  mtp==1 keeps the original tuned nf.  The v2
+    # reduce derives active partitions from the runtime context, so empty tail
+    # partitions early-exit and correctness is unchanged.
+    return max(1, (2 if mtp == 2 else 1) * nf)
 
 
 def pa_fp8_gqa_decode(
