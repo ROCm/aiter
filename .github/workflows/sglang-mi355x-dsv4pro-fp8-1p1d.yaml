@@ -177,6 +177,8 @@ jobs:
           pwd
           command -v salloc
           salloc --help | head -80 || true
+          command -v srun
+          srun --help | head -80 || true
           command -v squeue
           squeue --help | head -80 || true
           command -v scancel

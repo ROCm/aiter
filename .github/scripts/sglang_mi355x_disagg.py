@@ -157,7 +157,7 @@ PARTITION_ARG=()
         """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
-        """salloc "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+        """srun "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
     )
