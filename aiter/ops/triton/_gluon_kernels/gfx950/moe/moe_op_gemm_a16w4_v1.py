@@ -322,10 +322,10 @@ def _moe_gemm_a16w4(
         #Convert Layouts
         x = gl.convert_layout(x, DOT_LAYOUT_X)
         w = gl.convert_layout(w, DOT_LAYOUT_W_PACKED)
-        #w_scales = gl.convert_layout(w_scales, REG_WS_CONSUME_LAYOUT)
         
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
+
         w_scales = w_scales.trans(1, 0)
         w_scales = (
             w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
@@ -333,7 +333,7 @@ def _moe_gemm_a16w4(
             .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
         )
         w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
-          
+
         #Scaled upcast to bf16
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
 

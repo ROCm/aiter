@@ -147,6 +147,8 @@ def _moe_gemm_a16w4(
     NUM_BUFFERS: gl.constexpr,
     # Must be None: the kernel takes pre-expanded e8m0 scales (one byte per fp4 element).
     SWIZZLE_MX_SCALE: gl.constexpr,
+    MASK_K_LIMIT: gl.constexpr,
+    NUM_FULL_K: gl.constexpr,
     SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
@@ -306,8 +308,10 @@ def _moe_gemm_a16w4(
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA_LAYOUT)
 
-    num_k_iter = gl.cdiv(K, BLOCK_K)
-    for k in range(num_k_iter):
+    #num_k_iter = gl.cdiv(K, BLOCK_K)
+    #for k in range(num_k_iter):
+
+    for k in range(NUM_FULL_K):
         #Load x, w and w_scales into regs
         x = gl.amd.cdna3.buffer_load(X_base, x_offsets)
         w = gl.amd.cdna3.buffer_load(W_base, w_offsets, cache=W_CACHE_MODIFIER)
