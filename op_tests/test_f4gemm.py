@@ -42,6 +42,20 @@ pd.set_option("display.width", 1000)
 SUPPORTED_GFX = ["gfx1250"]  # gfx1250-only F4GEMM (preload SGPR) path
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
+SUBK = 256  # asm inner-K step: the ONLY hard shape constraint is K % SUBK == 0
+
+PERF_SHAPES = [(16384, 16384, 16384)]
+
+FUNC_SHAPES = [
+    (1024, 1024, 256),  # K == SUBK (smallest legal K)
+    (1024, 1024, 512),  # K = 2*SUBK
+    (1024, 1024, 768),  # K = 3*SUBK (not a power of two)
+    (1024, 1024, 1280),  # K = 5*SUBK
+    (2048, 1024, 256),  # non-square M>N, min K
+    (1024, 2048, 768),  # non-square N>M, K not %1024
+    (2048, 2048, 2048),  # mid square
+    (4096, 4096, 512),  # larger M/N, small K
+]
 
 # checkAllclose returns 0 when all-close, else the mismatch fraction. Its own
 # verdict thresholds: pass (0) / warning (<= tol_err_ratio) / failed (above).
@@ -147,8 +161,20 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
 
 
 @benchmark()  # (intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed) -> cols
-def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed=0,
-              mode="perf", dtype=dtypes.bf16):
+def test_gemm(
+    intype,
+    M,
+    N,
+    K,
+    apre,
+    scale,
+    outtype,
+    data_init,
+    scale_init,
+    seed=0,
+    mode="perf",
+    dtype=dtypes.bf16,
+):
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
     # scale=0 selects the *_noscale kernel: per-block scales are ignored (HW
@@ -224,7 +250,15 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
             aiter.logger.warning(
                 "f4gemm not supported: intype=%s outtype=%s scale=%s apre=%s "
                 "M=%s N=%s K=%s [%s.co]: %s",
-                intype, outtype, scale, apre, M, N, K, base, e,
+                intype,
+                outtype,
+                scale,
+                apre,
+                M,
+                N,
+                K,
+                base,
+                e,
             )
             ret[f"{name} us"] = float("nan")
             ret[f"{name} TFLOPS"] = float("nan")
@@ -239,7 +273,9 @@ def test_gemm(intype, M, N, K, apre, scale, outtype, data_init, scale_init, seed
             err = checkAllclose(
                 fp4_utils.mxfp4_to_f32(ref),
                 fp4_utils.mxfp4_to_f32(out),
-                rtol=0, atol=0, msg=f"{intype} {name} fp4",
+                rtol=0,
+                atol=0,
+                msg=f"{intype} {name} fp4",
             )
         else:
             err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
@@ -354,10 +390,19 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         # cluster(4x4)+persistent friendly for the 256x256 tile: M%1024, N%1024.
-        default=[(16384, 16384, 16384)],
-        help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384",
+        # Default is mode-dependent (resolved below): FUNC_SHAPES for --mode func
+        # (broad coverage), PERF_SHAPES for perf/profile (one steady-state shape).
+        default=None,
+        help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384\n"
+        "default: func -> a small multi-shape coverage sweep (K multiples of "
+        f"{SUBK}); perf/profile -> {PERF_SHAPES[0]}",
     )
     args = parser.parse_args()
+
+    # Mode-dependent default shapes: func favors coverage, perf/profile favor a
+    # single steady-state shape. An explicit -mnk always wins for either mode.
+    if args.shape is None:
+        args.shape = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
 
     # DATA and SCALE init are paired position-wise (NOT crossed), so the default
     # runs exactly two configs: constant+constant and uniform+auto. A length-1
@@ -378,18 +423,31 @@ def main():
         # init pair is the OUTERMOST product term -> rows are grouped by
         # (data_init,scale_init) within the single summary table.
         rows = [
-            test_gemm(intype, M, N, K, apre, sc, ot, di, si, seed=args.seed,
-                      mode=args.mode, dtype=dtype)
+            test_gemm(
+                intype,
+                M,
+                N,
+                K,
+                apre,
+                sc,
+                ot,
+                di,
+                si,
+                seed=args.seed,
+                mode=args.mode,
+                dtype=dtype,
+            )
             for (di, si), intype, apre, sc, ot, (M, N, K) in itertools.product(
                 init_pairs, args.intype, args.apre, args.scale, args.outtype, args.shape
             )
         ]
-        if args.mode != "func":
-            df = pd.DataFrame(rows)
-            aiter.logger.info(
-                "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
-                df.to_markdown(index=False),
-            )
+
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "gemm_a4w4 (F4GEMM) %s summary (markdown):\n%s",
+            args.mode,
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":
