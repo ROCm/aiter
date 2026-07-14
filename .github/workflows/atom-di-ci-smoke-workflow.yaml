@@ -464,6 +464,13 @@ jobs:
               cell["runner"]["slurm_account"] = ""
               cell["runner"]["slurm_partition"] = ""
               cell["runner"]["log_root"] = os.environ["ATOMESH_LOG_ROOT"]
+              if cfg["model"] == "DeepSeek-V4-Pro":
+                  for role in ("prefill", "decode"):
+                      service_role = cell.setdefault("service", {}).setdefault(role, {})
+                      extra_args = service_role.get("extra_args", "")
+                      service_role["extra_args"] = " ".join(
+                          arg for arg in extra_args.split() if arg != "--enable-tbo"
+                      )
 
               required_nodes = int(cell["num_nodes"])
               if node_list:
@@ -549,6 +556,7 @@ jobs:
           set -euo pipefail
           original_workspace="${GITHUB_WORKSPACE}"
           result_dir="${original_workspace}/atomesh-results"
+          rm -rf "${result_dir}"
           mkdir -p "${result_dir}"
 
           cancel_helper=""
@@ -589,6 +597,11 @@ jobs:
             cd "${shared_workspace}"
             chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
             cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
+            rm -rf "${result_dir}/${cell_id}" \
+                   "${result_dir}/${cell_id}-summary.md" \
+                   "${result_dir}/${cell_id}-benchmark-action.json" \
+                   "${result_dir}/${cell_id}.slurm-job-id" \
+                   "${result_dir}/${cell_id}.slurm-cancel.sh"
 
             bash .github/scripts/atomesh/pd_submit.sh \
               --cell-json "$(cat "${cell_json}")" \
