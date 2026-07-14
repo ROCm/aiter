@@ -233,6 +233,18 @@ class AttentionConfig:
     NUM_MASKED_TILES: gl.constexpr
     NUM_BUFFERS: gl.constexpr
     MFMA_DIM: gl.constexpr
+    # KV-cache / block-table strides: constexpr so the fixed (allocated-once) vLLM
+    # cache strides get baked in (constant-folded addressing). Routed via the config
+    # like gfx1250; the loaders read self.cfg.stride_*.
+    stride_k_cache_0: gl.constexpr
+    stride_k_cache_1: gl.constexpr
+    stride_k_cache_2: gl.constexpr
+    stride_k_cache_3: gl.constexpr
+    stride_v_cache_0: gl.constexpr
+    stride_v_cache_1: gl.constexpr
+    stride_v_cache_2: gl.constexpr
+    stride_v_cache_3: gl.constexpr
+    block_table_stride: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -257,6 +269,15 @@ class AttentionConfig:
         CAUSAL,
         NUM_BUFFERS,
         MFMA_DIM,
+        stride_k_cache_0,
+        stride_k_cache_1,
+        stride_k_cache_2,
+        stride_k_cache_3,
+        stride_v_cache_0,
+        stride_v_cache_1,
+        stride_v_cache_2,
+        stride_v_cache_3,
+        block_table_stride,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -337,6 +358,15 @@ class AttentionConfig:
         )
         self.Q_CACHE_MODIFIER = gl.constexpr(".cg")
         self.KV_CACHE_MODIFIER = gl.constexpr(".cg") if ALL_DECODE else gl.constexpr("")
+        self.stride_k_cache_0 = gl.constexpr(stride_k_cache_0)
+        self.stride_k_cache_1 = gl.constexpr(stride_k_cache_1)
+        self.stride_k_cache_2 = gl.constexpr(stride_k_cache_2)
+        self.stride_k_cache_3 = gl.constexpr(stride_k_cache_3)
+        self.stride_v_cache_0 = gl.constexpr(stride_v_cache_0)
+        self.stride_v_cache_1 = gl.constexpr(stride_v_cache_1)
+        self.stride_v_cache_2 = gl.constexpr(stride_v_cache_2)
+        self.stride_v_cache_3 = gl.constexpr(stride_v_cache_3)
+        self.block_table_stride = gl.constexpr(block_table_stride)
 
 
 @aggregate
@@ -375,9 +405,6 @@ class AsyncKVLoader:
     v_shared: gl.shared_memory_descriptor
     k_base_offset: gl.tensor
     v_base_offset: gl.tensor
-    stride_k_cache_0: gl.tensor
-    stride_v_cache_0: gl.tensor
-    block_table_stride: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -391,9 +418,6 @@ class AsyncKVLoader:
         v_shared,
         k_base_offset,
         v_base_offset,
-        stride_k_cache_0,
-        stride_v_cache_0,
-        block_table_stride,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -404,9 +428,6 @@ class AsyncKVLoader:
         self.k_base_offset = k_base_offset
         self.v_base_offset = v_base_offset
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
-        self.stride_k_cache_0 = stride_k_cache_0
-        self.stride_v_cache_0 = stride_v_cache_0
-        self.block_table_stride = block_table_stride
 
     @gluon.jit
     def initialize(
@@ -414,17 +435,8 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         num_blocks,
-        stride_k_cache_0,
-        stride_k_cache_1,
-        stride_k_cache_2,
-        stride_k_cache_3,
-        stride_v_cache_0,
-        stride_v_cache_1,
-        stride_v_cache_2,
-        stride_v_cache_3,
         REMOVE_INDIRECT_ACCESS,
     ):
         kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
@@ -447,9 +459,9 @@ class AsyncKVLoader:
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
         )[None, :]
         k_base_offset = (
-            kv_head_idx * stride_k_cache_2
-            + offs_d_k * stride_k_cache_3
-            + offs_n_k * stride_k_cache_1
+            kv_head_idx * cfg.stride_k_cache_2
+            + offs_d_k * cfg.stride_k_cache_3
+            + offs_n_k * cfg.stride_k_cache_1
         )
 
         offs_d_v = gl.arange(
@@ -459,9 +471,9 @@ class AsyncKVLoader:
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
         )[:, None]
         v_base_offset = (
-            kv_head_idx * stride_v_cache_2
-            + offs_d_v * stride_v_cache_3
-            + offs_n_v * stride_v_cache_1
+            kv_head_idx * cfg.stride_v_cache_2
+            + offs_d_v * cfg.stride_v_cache_3
+            + offs_n_v * cfg.stride_v_cache_1
         )
 
         return AsyncKVLoader(
@@ -474,9 +486,6 @@ class AsyncKVLoader:
             v_shared,
             k_base_offset,
             v_base_offset,
-            stride_k_cache_0,
-            stride_v_cache_0,
-            block_table_stride,
         )
 
     @gluon.jit
@@ -536,15 +545,22 @@ class AsyncKVLoader:
     @gluon.jit
     def load_block_ids(self, i):
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
-            return i * self.stride_k_cache_0
+            blk = i
         else:
             # Decode-only: clamp to the last column so the loop's j+2 prefetch
             # never reads past the (padded) block table; the over-read tile is
             # loaded but never consumed. Prefill keeps the original unclamped load
             # so its inner loop is byte-identical.
             if self.cfg.ALL_DECODE:
-                i = gl.minimum(i, self.block_table_stride - 1)
-            return gl.load(self.block_tables_ptr_shifted + i) * self.stride_k_cache_0
+                i = gl.minimum(i, self.cfg.block_table_stride - 1)
+            blk = gl.load(self.block_tables_ptr_shifted + i)
+        # Block-base byte offset. For >2 GB caches (not USE_LOAD_BUFFER_OP) this is
+        # the one term that can exceed int32 — widen the *index* (the stride is now a
+        # baked-in constexpr); the per-tile k_base_offset stays small so int32 is fine.
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            return blk * self.cfg.stride_k_cache_0
+        else:
+            return blk.to(gl.int64) * self.cfg.stride_k_cache_0
 
 
 @aggregate
@@ -567,14 +583,9 @@ class AsyncGatherKVLoader:
     v_shared: gl.shared_memory_descriptor
     k_head_d_offset: gl.tensor
     v_head_d_offset: gl.tensor
-    stride_k_cache_0: gl.tensor
-    stride_k_cache_1: gl.tensor
-    stride_v_cache_0: gl.tensor
-    stride_v_cache_1: gl.tensor
     offs_n_k: gl.tensor
     offs_n_v: gl.tensor
     num_blocks: gl.tensor
-    block_table_stride: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -588,14 +599,9 @@ class AsyncGatherKVLoader:
         v_shared,
         k_head_d_offset,
         v_head_d_offset,
-        stride_k_cache_0,
-        stride_k_cache_1,
-        stride_v_cache_0,
-        stride_v_cache_1,
         offs_n_k,
         offs_n_v,
         num_blocks,
-        block_table_stride,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -606,14 +612,9 @@ class AsyncGatherKVLoader:
         self.v_shared = v_shared
         self.k_head_d_offset = k_head_d_offset
         self.v_head_d_offset = v_head_d_offset
-        self.stride_k_cache_0 = stride_k_cache_0
-        self.stride_k_cache_1 = stride_k_cache_1
-        self.stride_v_cache_0 = stride_v_cache_0
-        self.stride_v_cache_1 = stride_v_cache_1
         self.offs_n_k = offs_n_k
         self.offs_n_v = offs_n_v
         self.num_blocks = num_blocks
-        self.block_table_stride = block_table_stride
 
     @gluon.jit
     def initialize(
@@ -621,17 +622,8 @@ class AsyncGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         num_blocks,
-        stride_k_cache_0,
-        stride_k_cache_1,
-        stride_k_cache_2,
-        stride_k_cache_3,
-        stride_v_cache_0,
-        stride_v_cache_1,
-        stride_v_cache_2,
-        stride_v_cache_3,
         REMOVE_INDIRECT_ACCESS,
     ):
         kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
@@ -654,7 +646,7 @@ class AsyncGatherKVLoader:
         offs_n_k = gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
         )[None, :]
-        k_head_d_offset = kv_head_idx * stride_k_cache_2 + offs_d_k * stride_k_cache_3
+        k_head_d_offset = kv_head_idx * cfg.stride_k_cache_2 + offs_d_k * cfg.stride_k_cache_3
 
         offs_d_v = gl.arange(
             0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
@@ -662,7 +654,7 @@ class AsyncGatherKVLoader:
         offs_n_v = gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
         )[:, None]
-        v_head_d_offset = kv_head_idx * stride_v_cache_2 + offs_d_v * stride_v_cache_3
+        v_head_d_offset = kv_head_idx * cfg.stride_v_cache_2 + offs_d_v * cfg.stride_v_cache_3
 
         return AsyncGatherKVLoader(
             cfg,
@@ -674,14 +666,9 @@ class AsyncGatherKVLoader:
             v_shared,
             k_head_d_offset,
             v_head_d_offset,
-            stride_k_cache_0,
-            stride_k_cache_1,
-            stride_v_cache_0,
-            stride_v_cache_1,
             offs_n_k,
             offs_n_v,
             num_blocks,
-            block_table_stride,
         )
 
     @gluon.jit
@@ -690,15 +677,18 @@ class AsyncGatherKVLoader:
         # physical block and within-block row, then gather.
         seq_offset_k = k_offset * self.cfg.TILE_SIZE + self.offs_n_k
         block_table_idx = gl.minimum(
-            seq_offset_k // self.cfg.BLOCK_SIZE, self.block_table_stride - 1
+            seq_offset_k // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
         )
-        within_block_k = (seq_offset_k % self.cfg.BLOCK_SIZE) * self.stride_k_cache_1
+        within_block_k = (seq_offset_k % self.cfg.BLOCK_SIZE) * self.cfg.stride_k_cache_1
         block_ids = gl.amd.cdna4.buffer_load(
             ptr=self.block_tables_ptr_shifted, offsets=block_table_idx
         )
-        k_offset_tensor = (
-            self.k_head_d_offset + within_block_k + block_ids * self.stride_k_cache_0
-        )
+        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            block_base_k = block_ids * self.cfg.stride_k_cache_0
+        else:
+            block_base_k = block_ids.to(gl.int64) * self.cfg.stride_k_cache_0
+        k_offset_tensor = self.k_head_d_offset + within_block_k + block_base_k
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.k_shared.index(buffer_id),
@@ -718,15 +708,18 @@ class AsyncGatherKVLoader:
     def load_v_to_shared(self, v_offset, buffer_id=0):
         seq_offset_v = v_offset * self.cfg.TILE_SIZE + self.offs_n_v
         block_table_idx = gl.minimum(
-            seq_offset_v // self.cfg.BLOCK_SIZE, self.block_table_stride - 1
+            seq_offset_v // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
         )
-        within_block_v = (seq_offset_v % self.cfg.BLOCK_SIZE) * self.stride_v_cache_1
+        within_block_v = (seq_offset_v % self.cfg.BLOCK_SIZE) * self.cfg.stride_v_cache_1
         block_ids = gl.amd.cdna4.buffer_load(
             ptr=self.block_tables_ptr_shifted, offsets=block_table_idx
         )
-        v_offset_tensor = (
-            self.v_head_d_offset + within_block_v + block_ids * self.stride_v_cache_0
-        )
+        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            block_base_v = block_ids * self.cfg.stride_v_cache_0
+        else:
+            block_base_v = block_ids.to(gl.int64) * self.cfg.stride_v_cache_0
+        v_offset_tensor = self.v_head_d_offset + within_block_v + block_base_v
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.v_shared.index(buffer_id),
@@ -1135,7 +1128,6 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
         v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype, buffer_id=0)
         acc = pgm.compute_pv(p, v, acc)
-        gl.thread_barrier()
 
     # Last tile is always masked
     j = pgm.tile_end - 1
@@ -1184,24 +1176,24 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
         acc = pgm.compute_pv(p, v, acc)
         buffer_id = 1 - buffer_id
         next_physical_block_idx = next2_physical_block_idx
+    if not pgm.cfg.ALL_DECODE:
+        # ---- Masked tiles (causal boundary) ----
+        for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
+            k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
+            kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+            kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
-    # ---- Masked tiles (causal boundary) ----
-    for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
-        next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
-        k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
-        kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
-        kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+            S = pgm.compute_qk(k)
+            S = pgm.apply_mask_qk(S, j)
+            S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+            p, alpha, M = pgm.softmax_part0(S, M)
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
 
-        S = pgm.compute_qk(k)
-        S = pgm.apply_mask_qk(S, j)
-        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
-        p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-
-        v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
-        acc = pgm.compute_pv(p, v, acc)
-        buffer_id = 1 - buffer_id
-        next_physical_block_idx = next2_physical_block_idx
+            v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
+            acc = pgm.compute_pv(p, v, acc)
+            buffer_id = 1 - buffer_id
+            next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
     k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
@@ -1259,15 +1251,15 @@ def kernel_unified_attention_2d(
     USE_SINKS: gl.constexpr,  # bool
     SLIDING_WINDOW: gl.constexpr,  # int
     num_blocks,
-    stride_k_cache_0: gl.int32,
-    stride_k_cache_1: gl.int32,
-    stride_k_cache_2: gl.int32,
+    stride_k_cache_0: gl.constexpr,
+    stride_k_cache_1: gl.constexpr,
+    stride_k_cache_2: gl.constexpr,
     stride_k_cache_3: gl.constexpr,
-    stride_v_cache_0: gl.int32,
-    stride_v_cache_1: gl.int32,
-    stride_v_cache_2: gl.int32,
+    stride_v_cache_0: gl.constexpr,
+    stride_v_cache_1: gl.constexpr,
+    stride_v_cache_2: gl.constexpr,
     stride_v_cache_3: gl.constexpr,
-    block_table_stride: gl.int32,
+    block_table_stride: gl.constexpr,
     num_seqs: gl.constexpr,
     SCALE: gl.constexpr,
     NUM_QUERY_HEADS: gl.constexpr,
@@ -1330,17 +1322,20 @@ def kernel_unified_attention_2d(
         CAUSAL,
         NUM_BUFFERS,
         MFMA_DIM,
+        stride_k_cache_0,
+        stride_k_cache_1,
+        stride_k_cache_2,
+        stride_k_cache_3,
+        stride_v_cache_0,
+        stride_v_cache_1,
+        stride_v_cache_2,
+        stride_v_cache_3,
+        block_table_stride,
     )
 
-    # Cast strides to int64 when not using buffer ops
-    if not USE_LOAD_BUFFER_OP:
-        stride_k_cache_0 = stride_k_cache_0.to(gl.int64)
-        stride_k_cache_1 = stride_k_cache_1.to(gl.int64)
-        stride_k_cache_2 = stride_k_cache_2.to(gl.int64)
-        stride_v_cache_0 = stride_v_cache_0.to(gl.int64)
-        stride_v_cache_1 = stride_v_cache_1.to(gl.int64)
-        stride_v_cache_2 = stride_v_cache_2.to(gl.int64)
-
+    # KV/block-table strides are constexpr (baked in via cfg); the one term that can
+    # exceed int32 for >2 GB caches (the block-base) is widened inside the loader.
+    # Output strides stay runtime, so widen them to int64 for >2 GB outputs.
     if not USE_STORE_BUFFER_OP:
         output_stride_0 = output_stride_0.to(gl.int64)
         output_stride_1 = output_stride_1.to(gl.int64)
@@ -1452,23 +1447,13 @@ def kernel_unified_attention_2d(
     else:
         KVLoader: gl.constexpr = AsyncGatherKVLoader
 
-    last_block_idx = block_table_stride - 1
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         num_blocks,
-        stride_k_cache_0,
-        stride_k_cache_1,
-        stride_k_cache_2,
-        stride_k_cache_3,
-        stride_v_cache_0,
-        stride_v_cache_1,
-        stride_v_cache_2,
-        stride_v_cache_3,
         REMOVE_INDIRECT_ACCESS,
     )
 
