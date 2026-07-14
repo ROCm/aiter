@@ -42,7 +42,7 @@ nothing and need no branch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, vector
+from flydsl.expr import arith, ptrtoint, range_constexpr, vector
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -153,7 +153,6 @@ def build_moe_gather_reduce_module(
 
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
-        row_dwords_i32 = arith.constant(row_dwords, type=i32)
         vec_i32 = arith.constant(VEC, type=i32)
         num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
@@ -162,10 +161,23 @@ def build_moe_gather_reduce_module(
         tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
-            in_rsrc = ptr_rsrc(grouped_out_flat)
             rows_rsrc = ptr_rsrc(topids_to_rows)
             w_rsrc = ptr_rsrc(gather_w)
             out_rsrc = ptr_rsrc(out)
+            in_base_i64 = arith.index_cast(T.i64, ptrtoint(grouped_out_flat))
+            row_bytes_i64 = arith.constant(model_dim * 2, type=T.i64)
+            slice_stride_by_i64 = arith.extui(
+                T.i64, slice_stride_dw_i32
+            ) * arith.constant(4, type=T.i64)
+
+            def src_row_rsrc(row_i32, sk):
+                base = in_base_i64 + arith.extui(T.i64, row_i32) * row_bytes_i64
+                if sk != 0:
+                    base = base + arith.constant(sk, type=T.i64) * slice_stride_by_i64
+                return buffer_ops.create_buffer_resource_from_addr(
+                    base, num_records_bytes=model_dim * 2
+                )
+
             thread_id = ArithValue(tid)
             iter_idx_i32 = ArithValue(fx.block_idx.y)
 
@@ -210,16 +222,14 @@ def build_moe_gather_reduce_module(
 
                     for k in range_constexpr(topk):
                         row_i32, w_f32 = _load_row_weight(k)
-                        src_dw_base = row_i32 * row_dwords_i32 + dw_base
                         red = [
                             ArithValue(arith.constant(0.0, type=f32))
                             for _ in range(2 * VEC)
                         ]
                         for sk in range_constexpr(split_k):
-                            sk_off = arith.constant(sk, type=i32) * slice_stride_dw_i32
                             raw_vec = buffer_ops.buffer_load(
-                                in_rsrc,
-                                src_dw_base + sk_off,
+                                src_row_rsrc(row_i32, sk),
+                                dw_base,
                                 vec_width=VEC,
                                 dtype=i32,
                             )
@@ -265,18 +275,13 @@ def build_moe_gather_reduce_module(
                             acc_hi = ArithValue(arith.constant(0.0, type=f32))
                             for k in range_constexpr(topk):
                                 row_i32, w_f32 = _load_row_weight(k)
-                                src_dw_base = row_i32 * row_dwords_i32 + dw_idx
                                 red_lo = ArithValue(arith.constant(0.0, type=f32))
                                 red_hi = ArithValue(arith.constant(0.0, type=f32))
                                 for sk in range_constexpr(split_k):
-                                    sk_off = (
-                                        arith.constant(sk, type=i32)
-                                        * slice_stride_dw_i32
-                                    )
                                     raw_dw = ArithValue(
                                         buffer_ops.buffer_load(
-                                            in_rsrc,
-                                            src_dw_base + sk_off,
+                                            src_row_rsrc(row_i32, sk),
+                                            dw_idx,
                                             vec_width=1,
                                             dtype=i32,
                                         )
