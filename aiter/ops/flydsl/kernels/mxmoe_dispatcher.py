@@ -724,7 +724,7 @@ def compile_gemm2_a4w4_port(
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
-        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and use_reduce and is_f8
+        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and use_reduce
     g2_bf16_lds = bool(g2_bf16_lds) and use_reduce
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
@@ -1121,12 +1121,7 @@ def get_g2(
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    _bf16_fp4 = os.environ.get("MXFP4_G2_BF16_LDS_FP4", "0") == "1"  # experimental: bf16 C-slab for fp4 (occupancy lever)
-    g2_bf16_lds = (
-        os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1"
-        and epilog == "reduce"
-        and (a_dtype == "fp8" or (a_dtype == "fp4" and _bf16_fp4))
-    )
+    g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and epilog == "reduce"
     key = (
         BM,
         use_nt,
