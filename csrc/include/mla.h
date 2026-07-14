@@ -109,3 +109,29 @@ void hk_mla_decode_fwd(
     torch::Tensor& split_output,  // Output: [batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& split_lse,     // Output: [batch_size, num_kv_splits, num_heads,  1]
     torch::Tensor& final_output); // Output: [batch_size, num_heads, v_head_dim]
+
+// DSA v3.2 (ds_32) MLA decode fp8 (OpFoundry opus_attn/dsa_v32). gfx950 only.
+// Stage1 only: reuses aiter metadata (work_indptr/work_info_set) and reduce
+// (mla_reduce_v1). Writes per-split partials to logits/attn_lse, or final o for
+// no-split work items (partial_qo_loc < 0).
+void mla_decode_stage1_opus_fwd_ds32(
+    torch::Tensor& q_nope,  // [B, H, D_NOPE]          fp8
+    torch::Tensor& q_rope,  // [B, H, D_ROPE]          bf16
+    torch::Tensor& kv_nope, // [total_tokens, D_NOPE]  fp8
+    torch::Tensor& kv_rope, // [total_tokens, D_ROPE]  bf16
+    const torch::Tensor& qo_indptr,
+    const torch::Tensor& kv_indptr,
+    const torch::Tensor& kv_indices,
+    const torch::Tensor& kv_last_page_lens,
+    const torch::Tensor& work_indptr,
+    const torch::Tensor& work_info_set,
+    const int max_seqlen_q,
+    const int page_size,
+    const int nhead_kv,
+    const double softmax_scale,
+    torch::Tensor& logits,   // aiter split_output [num_partials,1,H,D_NOPE] fp32
+    torch::Tensor& attn_lse, // aiter split_lse    [num_partials,1,H,1]      fp32
+    torch::Tensor& out,      // final [B, H, D_NOPE] bf16
+    torch::Tensor& final_lse,
+    torch::Tensor& q_scale,   // [B, H, D_SCALE]         uint8 (E8M0)
+    torch::Tensor& kv_scale); // [total_tokens, D_SCALE] uint8

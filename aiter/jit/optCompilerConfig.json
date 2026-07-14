@@ -1584,6 +1584,22 @@
         ],
         "is_experimental": "True"
     },
+    "module_ds32_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/dsa_v32_splitkv.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/defs.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_topk_plain": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_plain_pybind.cu'",
