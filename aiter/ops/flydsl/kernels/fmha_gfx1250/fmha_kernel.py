@@ -6,7 +6,7 @@ Integrates:
   - Core loop (fmha_core_loop.py): GEMM1(QK) + GEMM2(PV) interleaved
   - Dynamic scf.for_ loop over KV tiles (tile_n=128, variable kv_seq_len)
 
-Target: gfx1250 (MI450), wave32, 4 waves per TG (1TG), 1024 shared VGPRs.
+Target: gfx1250, wave32, 4 waves per TG (1TG), 1024 shared VGPRs.
 Causal mask always on. num_tiles = bx + 1 (triangular).
 
     core_loop

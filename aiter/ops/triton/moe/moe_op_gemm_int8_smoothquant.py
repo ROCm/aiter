@@ -14,6 +14,7 @@ from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant imp
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -34,46 +35,27 @@ def should_upcast_indices(*args):
 
 def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
     """
-    Preshuffle int8 weight from (E, K, N) to MFMA-friendly layout (E, N//16, K*16).
+    Preshuffle int8 weight from (E, K, N) to the MFMA-friendly tile layout
+    (E, K*16, N//16).
 
-    Matches the shuffle_weight pattern from aiter.ops.shuffle for INT8:
-      layout=(16, 16), BK=32, K_lane=16, BN=16
-
-    The transformation:
-      1. Transpose to (E, N, K)
-      2. View as (E, N//16, 16, K//32, 2, 16) - decompose into MFMA tile blocks
-      3. Permute to (E, N//16, K//32, 2, 16, 16) - reorder for register layout
-      4. View as (E, N//16, K*16) - flatten K dimension
+    This is the same transpose-first per-expert (16, 16) tiling that
+    ``aiter.ops.triton.utils.shuffle.shuffle_weight`` produces on its gfx1250
+    path, so the host-side shuffle stays single-sourced in
+    ``aiter.ops.triton.utils.shuffle``. The matching in-kernel inverse is
+    ``unshuffle_weights`` in the int8 smoothquant kernel.
 
     Args:
-        w: int8 weight tensor of shape (E, K, N) where
-           - E = number of experts
-           - K = input dimension (must be divisible by 32)
-           - N = output dimension (must be divisible by 16)
+        w: int8 weight tensor of shape (E, K, N) where K % 32 == 0 and N % 16 == 0.
 
     Returns:
-        Preshuffled weight tensor of shape (E, K * 16, N // 16)
+        Preshuffled weight tensor of shape (E, K * 16, N // 16).
     """
     assert w.dtype == torch.int8, f"Expected int8 weights, got {w.dtype}"
     assert w.ndim == 3, f"Expected 3D weight tensor (E, K, N), got {w.ndim}D"
     E, K, N = w.shape
-    assert K % 32 == 0, f"K ({K}) must be divisible by 32 for MFMA preshuffling"
-    assert N % 16 == 0, f"N ({N}) must be divisible by 16 for MFMA preshuffling"
-
-    # Transpose to (E, N, K)
-    w = w.transpose(1, 2)
-
-    # Preshuffle
-    w = w.view(E, N // 16, 16, K // 32, 2, 16)
-    w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
-
-    # Reshape to (E, N // 16, K * 16)
-    w = w.view(E, N // 16, K * 16)
-
-    # Transpose back to (E, K, N)
-    w = w.transpose(1, 2)
-
-    return w
+    # shuffle_weight returns the (E, K, N) shuffled weight; reshape to the
+    # (E, K*16, N//16) TDM layout the int8 smoothquant kernel consumes.
+    return shuffle_weight(w, arch="gfx1250").view(E, N // 16, K * 16).transpose(-1, -2)
 
 
 def allocate_output(

@@ -84,6 +84,11 @@ def _relu(x):
     return tl.maximum(0.0, x)
 
 
+@triton.jit
+def _relu6(x):
+    return tl.minimum(tl.maximum(0.0, x), 6.0)
+
+
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
@@ -91,6 +96,7 @@ def _get_activation_from_str(activation: str):
         "silu": _silu,
         "silu_exp2": _silu_exp2,
         "relu": _relu,
+        "relu6": _relu6,
     }
     return mapping[activation]
 
@@ -107,6 +113,8 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _silu_exp2(x)
     elif activation == "relu":
         return _relu(x)
+    elif activation == "relu6":
+        return _relu6(x)
     else:
         return x  # No activation if it is not recognized
 

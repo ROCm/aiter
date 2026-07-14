@@ -62,10 +62,23 @@ def init_dist_env(
         # hack custom_allreduce
         tp_grp = get_tp_group()
         ca_comm = tp_grp.device_communicator.ca_comm
-        # Only wire up the IPC input buffer when custom all-reduce is live. On
-        # non-XGMI (PCIe) boxes ca_comm is disabled and never allocated its IPC
-        # pool
-        if ca_comm is not None and not ca_comm.disabled:
+        # Only wire up the IPC input buffer when custom all-reduce is live and
+        # actually uses the IPC pool:
+        # - On non-XGMI (PCIe) boxes ca_comm is disabled and never allocated its
+        #   IPC pool, so skip it there.
+        # - gfx1250 (MI450) uses a VMM-based custom allreduce whose input buffer
+        #   is already registered in CustomAllreduce._init_gfx1250(). The extra
+        #   register_input_buffer(signal) below routes through
+        #   get_external_ipc_meta, whose vmm_exchange rendezvous key is
+        #   process-local (id(self)+data_ptr), so it can never align across TP
+        #   ranks and deadlocks at startup. The `signal`/`buffer` attributes set
+        #   here are never read anywhere, so skip the whole block on gfx1250.
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and not getattr(ca_comm, "_is_gfx1250", False)
+        ):
+            # signal
             signal = torch.zeros(
                 tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
             )

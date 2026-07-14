@@ -11,7 +11,8 @@ void mhc_pre_gemm_sqrsum(torch::Tensor& out,    // (split_k, m, hc_mult3) / (m, 
                          torch::Tensor& sqrsum, // (split_k, m) / (m)
                          torch::Tensor& x,      // (m, hc_hidden_size)
                          torch::Tensor& fn,     // (hc_mult3, hc_hidden_size)
-                         int tile_k = 128);
+                         int tile_k = 128,
+                         int is_fn_pack_bf16 = 0);
 void mhc_pre_big_fuse(torch::Tensor& post_mix,        // (m, hc_mult)
                       torch::Tensor& comb_mix,        // (m, hc_mult * hc_mult)
                       torch::Tensor& layer_input,     // (m, hidden_size)
@@ -70,5 +71,6 @@ void mhc_fused_post_pre_gemm_sqrsum(
     torch::Tensor& fn,              // (hc_mult3, hc_mult * hidden_size)
     int tile_m                       = 16,
     int tile_n                       = 32,
-    int tile_k                       = 32);
+    int tile_k                       = 32,
+    int is_fn_pack_bf16              = 0);
 } // namespace aiter

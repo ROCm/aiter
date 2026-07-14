@@ -79,9 +79,15 @@ def build_silu_and_mul_fq_module(
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
-    VEC = max(ELEMS_PER_THREAD, 2)
-    if VEC % 2 != 0:
-        VEC += 1
+    # VEC (a thread's contiguous vector) must be a power of two so it evenly
+    # divides both the 32-element quant block and the 16-element gate/up block;
+    # round up to the next power of two (even isn't enough: inter_dim=1536 gives
+    # VEC=6, which divides neither). Cap at 8 (dwordx4/128-bit); VEC=16 fails
+    # instruction selection. Wider inter_dim uses more COLS_PER_ITER iterations.
+    VEC = 2
+    while VEC < ELEMS_PER_THREAD:
+        VEC *= 2
+    VEC = min(VEC, 8)
     assert 32 % VEC == 0, f"VEC={VEC} must divide 32 evenly"
     if gui_layout:
         assert VEC <= 16, f"VEC={VEC} must be <=16 for block-interleave layout"

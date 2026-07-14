@@ -243,6 +243,21 @@ l_shape = [
     # threshold: 64 MB (2 GPU) / 32 MB (4 GPU) / 16 MB (8 GPU)
     # this shape = 4097*8192*2 bytes ≈ 64.015 MB, exceeds even the 2-GPU threshold
     (4097, 8192),
+    # --- gfx1250 unrolled-allgather tail-coverage repro ---
+    # The gfx1250 ag_gfx1250_lastdim / ag_gfx1250_naive_unroll4 kernels loop
+    # with guard `idx + blockDim.x*(unroll-1) < size`, so any tail shorter than
+    # blockDim.x*unroll packed elements is never written (output is
+    # torch.empty -> garbage). Triggered only when the packed element count is
+    # NOT a multiple of that stride. Existing shapes all divide evenly so they
+    # never hit the tail; these do.
+    #
+    # dim=-1 (LM head geometry): DeepSeek-V4 vocab=129280, tp=4 -> per-rank
+    # shard 32320. packed last_dim = 32320/8 = 4040; size = 65*4040 = 262600,
+    # which is NOT a multiple of 512*4 = 2048 -> lastdim kernel drops the tail.
+    (65, 32320),
+    # dim=0 path: size = 65*7168/8 = 58240, NOT a multiple of 256*4 = 1024 ->
+    # naive_unroll4 kernel drops the tail.
+    (65, 7168),
 ]
 
 parser = argparse.ArgumentParser(description="config input of test")
@@ -265,6 +280,14 @@ parser.add_argument(
     default=None,
     help="shape. e.g. -s 128,8192",
 )
+parser.add_argument(
+    "-t",
+    "--tp_size",
+    type=int,
+    choices=[2, 4, 8],
+    default=4,
+    help="tensor-parallel world size (default: 4)",
+)
 
 
 if __name__ == "__main__":
@@ -276,6 +299,7 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    tp_size = args.tp_size
     l_dim = [0, -1]
     df = []
     for dtype in l_dtype:
@@ -283,7 +307,7 @@ if __name__ == "__main__":
             for dim in l_dim:
                 for use_custom in [False, True]:
                     ret = allgather_perftest(
-                        8,
+                        tp_size,
                         1,
                         shape,
                         dtype,

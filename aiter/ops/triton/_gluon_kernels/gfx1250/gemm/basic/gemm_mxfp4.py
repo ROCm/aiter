@@ -88,8 +88,9 @@ def depreshuffle_scales(
     BLOCK_M: gl.constexpr,
     K_GROUPS: gl.constexpr,
 ):
-    # Inverse of host shuffle_scales_gfx1250: PRESHUFFLE_FACTOR rows are packed
-    # per stripe, SCALE_KWIDTH scale-groups contiguous per row.
+    # Inverse of host aiter.ops.triton.utils.shuffle.shuffle_scale_gemm
+    # (gfx1250 path): PRESHUFFLE_FACTOR rows are packed per stripe, SCALE_KWIDTH
+    # scale-groups contiguous per row.
     PRESHUFFLE_FACTOR: gl.constexpr = 16
     SCALE_KWIDTH: gl.constexpr = 4
     NUM_STRIPES: gl.constexpr = K_GROUPS // SCALE_KWIDTH
@@ -173,7 +174,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
     # Scale preshuffle: PRESHUFFLE_FACTOR rows packed per stripe, SCALE_KWIDTH
-    # scale-groups contiguous per row (must match the host shuffle_scales_gfx1250).
+    # scale-groups contiguous per row (must match the host
+    # aiter.ops.triton.utils.shuffle.shuffle_scale_gemm, gfx1250 path).
     PRESHUFFLE_FACTOR: gl.constexpr = 16
     SCALE_KWIDTH: gl.constexpr = 4
 

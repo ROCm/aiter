@@ -1241,7 +1241,18 @@ def _jit_compile(
         name = f"{name}_v{version}"
 
     baton = FileBaton(os.path.join(build_directory, "lock"))
-    if baton.try_acquire():
+    need_build = True
+    while True:
+        if baton.try_acquire():
+            break  # we own the lock; fall through and build below
+        # Another process holds the lock. wait() returns True if that holder
+        # finished normally (module is built — just import it), or False if we
+        # broke a stale lock left by a dead holder, in which case we loop and
+        # re-acquire so we build it ourselves instead of importing nothing.
+        if baton.wait():
+            need_build = False
+            break
+    if need_build:
         try:
             if version != old_version:
                 with GeneratedFileCleaner(
@@ -1309,8 +1320,6 @@ def _jit_compile(
                 )
         finally:
             baton.release()
-    else:
-        baton.wait()
 
     if verbose:
         print(f"Loading extension module {name}...", file=sys.stderr)
