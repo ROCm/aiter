@@ -265,8 +265,8 @@ class PagedAttention:
             and num_kv_heads == 1
             and num_heads == 8
             and head_size == 128
-            and block_size == 16
-            and mtp in (1, 2)
+            and block_size in (16, 64)
+            and mtp in (1, 2, 3)
         ):
             output_dtype = dtypes.bf16
         output = out if out is not None else torch.empty_like(

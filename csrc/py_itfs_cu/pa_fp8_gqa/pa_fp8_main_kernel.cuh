@@ -97,6 +97,19 @@ shared_logits_index(int warp, int t, int lane16, int rowid)
          + lane16 * kRowsPerWarp + (rowid ^ lane16);
 }
 
+// Bank-conflict-free index for P-phase uint32_t overlay on shared_logits.
+// Uses 4-byte (uint32_t) accesses instead of 8-byte (_T8x8) to halve the
+// bank footprint.  Layout: lane16 + rowid*16 within each (warp,t) block
+// of kSlotsPerWarpT slots.  With 32 banks and 4-byte elements, each of
+// the 32 threads in a half-wave maps to a unique bank (0 conflicts).
+// Used by the multi-group kernel (pa_fp8_main_kernel_v2_mg.cuh).
+__host__ __device__ __forceinline__ constexpr int
+shared_p32_index(int warp, int t, int lane16, int rowid)
+{
+    return (warp * kTLoop + t) * kSlotsPerWarpT
+         + lane16 + rowid * 16;
+}
+
 // V tile bookkeeping (V cache layout
 // [num_blocks, num_kv_heads, head_size, block_size] fp8).
 //   - kVtLoop : warps-worth (4) of kv-token sub-tiles in head_dim dimension

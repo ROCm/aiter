@@ -530,6 +530,34 @@ def _pa_fp8_decode_v2(
 ) -> None: ...
 
 
+@compile_ops("module_pa_fp8_gqa", fc_name="pa_fp8_decode_v2_mg")
+def _pa_fp8_decode_v2_mg(
+    output: torch.Tensor,
+    tmp_out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    p_scale: torch.Tensor,
+    p_scale_inv: torch.Tensor,
+    num_seqs: int,
+    num_kv_heads: int,
+    num_q_heads: int,
+    head_size: int,
+    block_size: int,
+    num_fat_partitions: int,
+    scale: float,
+    query_length: int,
+    qtoken_base: int,
+) -> None: ...
+
+
 def _pa_fp8_p_scale_tensors(
     p_scale: Optional[torch.Tensor | float],
     p_scale_inv: Optional[torch.Tensor | float],
@@ -591,7 +619,7 @@ def _pa_fp8_v2_splits(num_seqs: int, num_kv_heads: int, mtp: int) -> int:
         elif bs <= 64:  nf = 10
         elif bs <= 128: nf = 10
         else:           nf = 8
-    else:
+    elif mtp == 2:
         if   bs <= 1:   nf = 160
         elif bs <= 2:   nf = 128
         elif bs <= 4:   nf = 64
@@ -602,9 +630,21 @@ def _pa_fp8_v2_splits(num_seqs: int, num_kv_heads: int, mtp: int) -> int:
         elif bs <= 48:  nf = 12
         elif bs <= 96:  nf = 10
         else:           nf = 6
+    else:
+        # mtp>=3 (ql>=3): the multi-group (mg) kernel processes 2+ groups per
+        # CTA, heavier VGPR footprint limits occupancy, so fewer partitions
+        # avoid reduce overhead while the mg kernel's K/V reuse already
+        # saturates HBM bandwidth.  Tuned on MI308X (geak _v2_recommended_splits
+        # mtp>=3 branch); bs>64 keeps nf=5 for wave-alignment (4 CTAs/CU waves).
+        if   bs <= 1:   nf = 160
+        elif bs <= 2:   nf = 96
+        elif bs <= 4:   nf = 48
+        elif bs <= 8:   nf = 20
+        elif bs <= 16:  nf = 10
+        else:           nf = 5
     # nf doubled for ql=2 (mtp==2) only: more splits => finer-grained
     # partitions to fill the GPU / shorten each CTA's k-loop, which helps the
-    # low-bs long-ctx regime.  mtp==1 keeps the original tuned nf.  The v2
+    # low-bs long-ctx regime.  mtp==1 / mtp>=3 keep their tuned nf.  The v2
     # reduce derives active partitions from the runtime context, so empty tail
     # partitions early-exit and correctness is unchanged.
     return max(1, (2 if mtp == 2 else 1) * nf)
@@ -634,7 +674,13 @@ def pa_fp8_gqa_decode(
     num_seqs = num_query_tokens // mtp
     assert num_query_tokens % mtp == 0
     assert num_kv_heads == 1 and num_q_heads == 8
-    assert head_size == 128 and block_size == 16 and partition_size == 256
+    assert head_size == 128 and partition_size == 256
+    # block_size 16 is supported by all paths; block_size 64 only by the mg
+    # (mtp>=3) kernel.  The v2 path (mtp<=2) is block_size=16 only.
+    assert block_size in (16, 64)
+    assert block_size == 16 or mtp >= 3, (
+        "block_size=64 is only supported by the mtp>=3 (multi-group) path"
+    )
 
     assert k_scale.dtype == torch.float32, (
         "k_scale must be the fp32 view of the packed FP8 scales; call "
@@ -674,33 +720,71 @@ def pa_fp8_gqa_decode(
         dtype=out.dtype,
         device=out.device,
     )
-    _pa_fp8_decode_v2(
-        out,
-        tmp_out,
-        exp_sums,
-        max_logits,
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
-        context_lens,
-        q_scale,
-        k_scale,
-        v_scale,
-        p_scale,
-        p_scale_inv,
-        p_scale_value,
-        p_scale_inv_value,
-        num_seqs,
-        num_kv_heads,
-        num_q_heads,
-        head_size,
-        block_size,
-        mtp,
-        num_fat_partitions,
-        num_kblocks_per_fat_part,
-        scale,
-    )
+    if mtp <= 2:
+        _pa_fp8_decode_v2(
+            out,
+            tmp_out,
+            exp_sums,
+            max_logits,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lens,
+            q_scale,
+            k_scale,
+            v_scale,
+            p_scale,
+            p_scale_inv,
+            p_scale_value,
+            p_scale_inv_value,
+            num_seqs,
+            num_kv_heads,
+            num_q_heads,
+            head_size,
+            block_size,
+            mtp,
+            num_fat_partitions,
+            num_kblocks_per_fat_part,
+            scale,
+        )
+    else:
+        # ql>=3: single-pass multi-group kernel (fp8 OR bf16 query, block 16/64).
+        # bf16 query is quantised in-kernel (q_scale ignored, forwarded empty),
+        # matching the v2 path.  query_length == mtp (tx-aiter convention),
+        # qtoken_base=0.  The mg C++ takes only tensor p_scale/p_scale_inv.
+        assert query.dtype in (dtypes.fp8, dtypes.bf16), (
+            "the mtp>=3 (multi-group) path requires fp8 or bf16 query"
+        )
+        assert p_scale_value == 0.0 and p_scale_inv_value == 0.0, (
+            "scalar p_scale is not supported on the mtp>=3 path; pass per-head "
+            "p_scale tensors or None"
+        )
+        _pa_fp8_decode_v2_mg(
+            out,
+            tmp_out,
+            exp_sums,
+            max_logits,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lens,
+            q_scale,
+            k_scale,
+            v_scale,
+            p_scale,
+            p_scale_inv,
+            num_seqs,
+            num_kv_heads,
+            num_q_heads,
+            head_size,
+            block_size,
+            num_fat_partitions,
+            scale,
+            mtp,
+            0,
+        )
 
 
 def _pa_fp8_gqa_eligible(
@@ -719,6 +803,17 @@ def _pa_fp8_gqa_eligible(
         return False
     fp8 = dtypes.fp8
     query_is_fp8 = query.dtype == fp8
+    # Per-mtp config gate:
+    #   mtp in {1,2} -> v2 kernel: block_size=16, fp8 OR bf16 query.
+    #   mtp == 3     -> mg kernel: block_size in {16,64}, fp8 query only.
+    if mtp in (1, 2):
+        config_ok = block_size == 16
+    elif mtp == 3:
+        # mg kernel accepts fp8 OR bf16 query (bf16 quantised in-kernel),
+        # same as the v2 path; block_size 16 or 64.
+        config_ok = block_size in (16, 64)
+    else:
+        config_ok = False
     return (
         (query_is_fp8 or query.dtype == dtypes.bf16)
         and key_cache.dtype == fp8
@@ -730,9 +825,8 @@ def _pa_fp8_gqa_eligible(
         and num_kv_heads == 1
         and query.shape[1] == 8
         and query.shape[2] == 128
-        and block_size == 16
+        and config_ok
         and partition_size == 256
-        and mtp in (1, 2)
         and alibi_slopes is None
         and fp8_out_scale is None
         # fp8 query needs an external per-(token, head) q_scale; bf16 query is
