@@ -495,7 +495,7 @@ def run_varqlen_case(
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
-        _build_varqlen_mtp_windows,
+        compute_varqlen_windows,
         compute_prefill_schedule,
     )
 
@@ -562,7 +562,7 @@ def run_varqlen_case(
 
     # ---- unit-check the device builder against the independent python windows ----
     rb_ref, ls_ref, le_ref = _mtp_windows_ref(qlens, ctxs)
-    rb_k, ls_k, le_k = _build_varqlen_mtp_windows(cu_seq_q, context_lens, total_q)
+    rb_k, ls_k, le_k = compute_varqlen_windows(cu_seq_q, context_lens, total_q)
     assert rb_k.tolist() == rb_ref, f"row_to_batch: {rb_k.tolist()} != {rb_ref}"
     assert ls_k.tolist() == ls_ref, "local_starts mismatch"
     assert le_k.tolist() == le_ref, f"local_ends: {le_k.tolist()} != {le_ref}"
@@ -581,14 +581,32 @@ def run_varqlen_case(
         kv_scale,
         block_tables,
         weights,
-        cu_seq_q,
-        context_lens,
         max_seq_len,
+        cu_seq_q=cu_seq_q,
+        context_lens=context_lens,
         weight_scale=weight_scale,
         block_k=block_k,
         kv_block_size=kv_block_size,
     )
     torch.cuda.synchronize()
+
+    # "build once, reuse" path: passing prebuilt windows must match the
+    # cu_seq_q path bit-for-bit (windows are built once, kernel called many).
+    out_reuse = flydsl_pa_mqa_logits_fp4_varqlen(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        max_seq_len,
+        windows=(rb_k, ls_k, le_k),
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_reuse), "windows= reuse path differs from cu_seq_q path"
 
     m = ~torch.isneginf(ref_fp4)
     cos_exact = _cos(out[m], ref_fp4[m]).item()
