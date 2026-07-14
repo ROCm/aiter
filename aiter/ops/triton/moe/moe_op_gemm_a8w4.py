@@ -14,6 +14,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
+    _moe_gemm_a8w4_decode_persistent as _moe_gemm_a8w4_decode_persistent_gluon,
     _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
@@ -255,7 +256,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         block_k = 512
         num_warps = 4
         if k <= 1024:
-            block_n = 512
+            block_n = 128
             block_k = 256
             num_buffers = 2
         elif n <= 1536:
@@ -457,7 +458,69 @@ def moe_gemm_a8w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if use_gluon and block_m == 16:
+    use_persistent = (
+        use_gluon
+        and block_m == 16
+        and grid_n >= 2
+        and os.environ.get("AITER_MOE_A8W4_PERSISTENT", "0") == "1"
+    )
+    if use_persistent:
+        N_ITERS = 3
+        n_groups = triton.cdiv(grid_n, N_ITERS)
+        persistent_grid = grid_m * n_groups
+        _moe_gemm_a8w4_decode_persistent_gluon[(persistent_grid,)](
+            y,
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=config["num_buffers"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            PRESHUFFLED=preshuffled,
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
+            N_ITERS=N_ITERS,
+            num_warps=config["num_warps"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
             y.stride(1),
@@ -510,7 +573,7 @@ def moe_gemm_a8w4(
             waves_per_eu=config["waves_per_eu"],
         )
     elif use_gluon:
-        _moe_gemm_a8w4_prefill_gluon[(grid,)](
+        _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
             y.stride(1),
             y.stride(2),
@@ -556,7 +619,7 @@ def moe_gemm_a8w4(
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
-            X_SCALE_TDM=X_SCALE_TDM,
+            #X_SCALE_TDM=X_SCALE_TDM,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
