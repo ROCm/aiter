@@ -384,9 +384,9 @@ def get_kernel_config_triton(m, n, k, routing_data):
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
-    num_buffers = 3
+    num_buffers = 2
 
-    l2_prefetch_distance = 2
+    l2_prefetch_distance = 0
 
     if block_m == 16:
         block_n = 128
@@ -503,7 +503,6 @@ def moe_gemm_a4w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    config=None,
     backend=None,  # "triton" | "gluon"
 ):
     """
@@ -542,11 +541,10 @@ def moe_gemm_a4w4(
         K = unpadded_K
 
     # compute optimization flags
-    if config is None:
-        if use_gluon:
-            config = get_kernel_config_gluon(M, N, K, routing_data)
-        else:
-            config = get_kernel_config_triton(M, N, K, routing_data)
+    if use_gluon:
+        config = get_kernel_config_gluon(M, N, K, routing_data)
+    else:
+        config = get_kernel_config_triton(M, N, K, routing_data)
 
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
