@@ -28,7 +28,6 @@
 #include "quant_utils.cuh"
 #include "mx_quant_utils.h"  // fp_f32_to_e8m0_scale (MX RoundUp E8M0 block scale)
 #include "rope/rope_common.h"
-#include "vec_convert.h"
 
 #define CHECK_TYPE(x, st)                     \
     AITER_CHECK(x.dtype() == st,              \
@@ -367,7 +366,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
     int64_t block_idx    = slot_id / page_size;
     int64_t block_offset = slot_id % page_size;
     __shared__ float shared_max[num_kv_heads];
-    float dtype_max = ck_tile::type_convert<float>(ck_tile::numeric<kv_cache_scalar_t>::max());
+    float dtype_max = static_cast<float>(opus::finfo<kv_cache_scalar_t>::max());
     float warp_max  = elements[0];
 
     // If quantization is required, compute the max abs value across the head_dim * num_heads
@@ -408,7 +407,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
             else
             {
                 k_cache[offset] =
-                    ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
+                    opus::cast<kv_cache_scalar_t>(float(elements[i]) / k_scale_val);
             }
         }
     }
@@ -438,7 +437,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
             else
             {
                 v_cache[offset] =
-                    ck_tile::type_convert<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
+                    opus::cast<kv_cache_scalar_t>(float(elements[i]) / v_scale_val);
             }
         }
     }
@@ -3728,7 +3727,7 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
                 (int)num_tokens,
                 (int)num_heads_k,
                 (int)head_size);
-        });
+    });
 }
 
 void fused_qk_norm_rope_cache_block_quant_shuffle(
@@ -4259,9 +4258,9 @@ void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
             v_1way_per_head_quant_tiled_kernel<scalar_t, TILE_T, HEAD_SIZE>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<scalar_t*>(v.data_ptr()),
                                             (int)num_tokens,
-                                            (int)num_heads,
-                                            reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_fp8.data_ptr()),
-                                            reinterpret_cast<float*>(v_descale.data_ptr()));
+                    (int)num_heads,
+                    reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_fp8.data_ptr()),
+                    reinterpret_cast<float*>(v_descale.data_ptr()));
         });
 }
 

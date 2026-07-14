@@ -4455,7 +4455,7 @@ __launch_bounds__(256, 8) __global__
 template <int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
           bool Is2D,
-          typename scalar_t = ck_tile::fp16_t>
+          typename scalar_t = opus::fp16_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                          const int32_t size_s_w,
                                                          const int32_t size_b,
@@ -7398,7 +7398,7 @@ struct alignas(sizeof(T) * vec_size) vec_t
             }
             else
             {
-                data[i] = ck_tile::type_convert<T>(ck_tile::type_convert<float>(src[i]) / scale);
+                data[i] = static_cast<T>(static_cast<float>(src[i]) / scale);
             }
         }
     }
