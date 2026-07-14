@@ -217,7 +217,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
     // 6 = 0b110 -> reverse_kv=0, double_q=1, remap_xy=1.  Must match how the
     // shipped VARLEN .co was built.
-    args.opt        = 4;
+    args.opt        = 7;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
     args.sink_addr  = sink ? sink->data_ptr() : nullptr;
