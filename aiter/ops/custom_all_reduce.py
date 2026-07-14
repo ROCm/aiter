@@ -319,6 +319,35 @@ def register_output_buffer_gfx1250(
 ) -> None: ...
 
 
+# ---- gfx1250 IPC transport (ROCm >= 7.15) ----
+# Same signatures as the old-arch IPC ops (handles + offsets), so the Python
+# IPC init/register path is shared; only the C++ symbol (gfx1250 kernel) differs.
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_custom_ar_ipc", develop=True)
+def init_custom_ar_gfx1250_ipc(
+    meta_ptr: int,
+    rank_data_ptr: int,
+    rank_data_sz: int,
+    ipc_handle_ptrs: List[int],
+    offsets: List[int],
+    rank: int,
+    fully_connected: bool,
+) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer_ipc", develop=True)
+def register_input_buffer_gfx1250_ipc(
+    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="register_output_buffer_ipc", develop=True)
+def register_output_buffer_gfx1250_ipc(
+    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="get_graph_buffer_count", develop=True)
 def get_graph_buffer_count_gfx1250(_fa: int) -> int: ...
 
