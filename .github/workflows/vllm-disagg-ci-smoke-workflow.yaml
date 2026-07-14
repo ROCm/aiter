@@ -57,7 +57,7 @@ permissions:
 
 jobs:
   vllm-disagg-smoke:
-    runs-on: [self-hosted, aiter-di-ci-spur-login]
+    runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
     timeout-minutes: 480
     env:
       VLLM_REPOSITORY_DEFAULT: itej89/vllm
