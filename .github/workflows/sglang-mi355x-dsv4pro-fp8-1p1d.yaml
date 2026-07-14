@@ -28,11 +28,6 @@ on:
         required: false
         type: string
         default: "/data/xinhuang/sglang-aiter-ci"
-      slurm_nodelist:
-        description: "Optional comma-separated Slurm nodes. Empty uses the Slurm reservation."
-        required: false
-        type: string
-        default: ""
       slurm_reservation:
         description: "Optional Slurm reservation. Empty omits --reservation."
         required: false
