@@ -331,20 +331,24 @@ def launch_gemm_a8w4_tdm(
         TDM_PER = 1 if WS8 else 2  # per-wave loads/K-tile (scales share A/B waves at <8)
         # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
         # compute into the slot the fence just freed (one fence/barrier per K-tile).
+        if const_expr(use_cluster):
+            cluster.cluster_barrier()
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2), use_cluster=use_cluster)
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2), use_cluster=False)
             compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
+            if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
+                cluster.cluster_barrier()
         # Tail: last (num_buffers-1) tiles are resident; drain progressively.
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j), use_cluster=use_cluster)
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j), use_cluster=False)
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
@@ -358,7 +362,7 @@ def launch_gemm_a8w4_tdm(
                 h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
                 i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
-        workgroup_barrier(use_cluster=use_cluster)
+        workgroup_barrier(use_cluster=False)
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
