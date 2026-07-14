@@ -10,6 +10,8 @@
 #define OPUS_FP32_to_BF16_DEFAULT 2
 #endif
 #include "opus/opus.hpp"
+#include "opus/rmsnorm_opus_io.hpp"
+#include "opus/rmsnorm_opus_quant_detail.hpp"
 
 namespace aiter {
 
@@ -61,11 +63,47 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out,
                                        float qmax,
                                        int model_sensitive);
 
+// opus port of add_rmsnorm_quant_kernel (one row/block, coalesced IO). Per-token
+// (group==0) loads interleaved; grouped keeps contiguous ownership (ILV=false) so a group =
+// group_size/TDS contiguous lanes. Covers no-quant/int8/fp8/fp4, add, gemma, shuffle, strided.
+template <typename In, typename Out, int Blk, int Tds, bool Interleave>
+struct arq_opus_traits
+{
+    using in_t                = In;
+    using out_t               = Out;
+    static constexpr int BLK  = Blk;
+    static constexpr int TDS  = Tds;
+    static constexpr bool ILV = Interleave;
+};
+template <typename Traits>
+__global__ void add_rmsnorm_quant_opus(void* __restrict__ out,
+                                       void* __restrict__ rout,
+                                       void* __restrict__ scale,
+                                       const void* __restrict__ in,
+                                       const void* __restrict__ rin,
+                                       const void* __restrict__ weight,
+                                       const void* __restrict__ xscale,
+                                       float epsilon,
+                                       int m,
+                                       int n,
+                                       float qmax,
+                                       int in_s,
+                                       int rin_s,
+                                       int rout_s,
+                                       int out_s,
+                                       int group_size,
+                                       int shuffle,
+                                       int gemma);
 
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
 template <typename Traits, bool OOP>
 __global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, void*, float, int, int, int, int)
+{
+}
+template <typename Traits>
+__global__ void add_rmsnorm_quant_opus(void*, void*, void*, const void*, const void*, const void*,
+                                       const void*, float, int, int, float, int, int, int, int, int, int, int)
 {
 }
 template <typename Traits, bool OOP>
@@ -106,6 +144,99 @@ __device__ inline float block_reduce(float v)
         opus::sync_threads();
     }
     return s[base];
+}
+
+// Cross-lane partner (lane ^ LG/2) within an aligned lanegroup of size LG. Real v_mov_b32_dpp
+// for LG<=16 (no LDS): quad_perm for 2/4; upd_dpp with uninitialized old + complementary bank
+// masks for 8/16 (gcnasm warp_sort_bitonic trick; else falls back to ds_bpermute). 32/64: shfl.
+template <typename T, int LG>
+__device__ inline T warp_swap_(const T& x, int lane)
+{
+    if constexpr(LG == 2)
+        return opus::mov_dpp(x, opus::number<0xb1>{}); // quad_perm:[1,0,3,2]
+    else if constexpr(LG == 4)
+        return opus::mov_dpp(x, opus::number<0x4e>{}); // quad_perm:[2,3,0,1]
+    else if constexpr(LG == 8)
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuninitialized"
+        T r;
+        r = opus::upd_dpp(r, x, opus::number<260>{}, opus::number<0xf>{}, opus::number<0b0101>{}); // row_shl:4
+        r = opus::upd_dpp(r, x, opus::number<276>{}, opus::number<0xf>{}, opus::number<0b1010>{}); // row_shr:4
+#pragma clang diagnostic pop
+        return r;
+    }
+    else if constexpr(LG == 16)
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuninitialized"
+        T r;
+        r = opus::upd_dpp(r, x, opus::number<264>{}, opus::number<0xf>{}, opus::number<0b0011>{}); // row_shl:8
+        r = opus::upd_dpp(r, x, opus::number<280>{}, opus::number<0xf>{}, opus::number<0b1100>{}); // row_shr:8
+#pragma clang diagnostic pop
+        return r;
+    }
+    else if constexpr(LG == 32)
+        return opus::shfl(x, lane ^ 16);
+    else // LG == 64
+        return opus::shfl(x, lane ^ 32);
+}
+
+// Wave64 intra-warp all-reduce. The row_shr / row_bcast controls fuse into v_add_f32_dpp /
+// v_mov_b32_dpp (real single-cycle DPP, no ds_bpermute); result broadcast via readlane.
+// (A quad_perm+shfl butterfly would add ds_bpermute for the 32/64 span, so keep this form.)
+template <bool IS_MAX>
+__device__ inline float warp_reduce_dpp(float v)
+{
+    auto op = [](float a, float b) { return IS_MAX ? fmaxf(a, b) : a + b; };
+    v       = op(v, opus::mov_dpp(v, opus::number<0x111>{})); // row_shr:1
+    v       = op(v, opus::mov_dpp(v, opus::number<0x112>{})); // row_shr:2
+    v       = op(v, opus::mov_dpp(v, opus::number<0x114>{})); // row_shr:4
+    v       = op(v, opus::mov_dpp(v, opus::number<0x118>{})); // row_shr:8
+    v = op(v, opus::mov_dpp(v, opus::number<0x142>{}, opus::number<0xa>{})); // row_bcast:15
+    v = op(v, opus::mov_dpp(v, opus::number<0x143>{}, opus::number<0xc>{})); // row_bcast:31
+    return __builtin_bit_cast(float,
+                              __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), 63));
+}
+
+// Fast 1D block reduction: DPP wave64 all-reduce, then one serial LDS exchange across warps
+// (no ds_bpermute); wins on memory-light per-token/no-add paths. NWARP=BLK/warp is compile-time.
+template <bool IS_MAX, int BLK>
+__device__ inline float block_reduce_1d(float v)
+{
+    constexpr int W     = opus::get_warp_size();
+    constexpr int NWARP = BLK / W;
+    if constexpr(W == 64)
+        v = warp_reduce_dpp<IS_MAX>(v);
+    else
+    {
+        const int lane = opus::lane_id();
+#pragma unroll
+        for(int k = W >> 1; k > 0; k >>= 1)
+        {
+            float o = opus::shfl(v, lane ^ k);
+            v       = IS_MAX ? fmaxf(v, o) : v + o;
+        }
+    }
+    if constexpr(NWARP == 1)
+        return v;
+    else
+    {
+        // Each <IS_MAX,BLK> instantiation owns a distinct __shared__ array, so the sum
+        // and max reduces never race on it -> no leading barrier needed (one per reduce,
+        // matching the reference; barrier count is on the critical path at small n).
+        __shared__ float s[NWARP];
+        const int lane = opus::lane_id();
+        const int warp = opus::thread_id_x() / W;
+        if(lane == 0)
+            s[warp] = v;
+        opus::sync_threads();
+        float r = s[0]; // every thread combines the NWARP partials from LDS
+#pragma unroll
+        for(int w = 1; w < NWARP; ++w)
+            r = IS_MAX ? fmaxf(r, s[w]) : r + s[w];
+        return r;
+    }
 }
 
 template <typename scalar_t, int width>
@@ -405,6 +536,195 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
     }
     for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
         quant(reload_ni(idx), idx);
+}
+
+template <typename Traits>
+__global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
+                                       void* __restrict__ rout_,
+                                       void* __restrict__ scale_,
+                                       const void* __restrict__ in_,
+                                       const void* __restrict__ rin_,
+                                       const void* __restrict__ w_,
+                                       const void* __restrict__ xscale_,
+                                       float epsilon,
+                                       int m,
+                                       int n,
+                                       float qmax,
+                                       int in_s,
+                                       int rin_s,
+                                       int rout_s,
+                                       int out_s,
+                                       int group_size,
+                                       int shuffle,
+                                       int gemma)
+{
+    using in_t         = typename Traits::in_t;
+    using out_t        = typename Traits::out_t;
+    constexpr int BLK  = Traits::BLK;
+    constexpr int TDS  = Traits::TDS;
+    constexpr bool ILV = Traits::ILV;
+    constexpr bool FP4 = std::is_same_v<out_t, opus::fp4_t>;
+    constexpr bool QNT = !std::is_same_v<out_t, in_t>; // quant when out dtype != in
+    const bool ADD     = rin_ != nullptr;              // fused-add when residual given
+    (void)xscale_;                                     // smooth quant lives in module_rmsnorm
+    const int row      = opus::block_id_x();
+    if(row >= m)
+        return;
+    const int tid    = opus::thread_id_x();
+    const float goff = gemma ? 1.0f : 0.0f;
+
+    // Vectorized coalesced IO, mirroring add_rmsnorm_quant_kernel (rmsnorm_opus_io).
+    using out_store_t = std::conditional_t<FP4, uint8_t, out_t>;
+    constexpr int load_chunk_bytes = (sizeof(in_t) * TDS % 16 == 0) ? 16 : 8;
+    constexpr int load_vec_size    = load_chunk_bytes / sizeof(in_t);
+    constexpr int num_load_inst    = TDS / load_vec_size;
+    constexpr int load_aux         = (num_load_inst > 1 && !ILV) ? RT : GROUP_NT;
+    constexpr int ISZ              = opus::get_warp_size(); // interleave_thread_size
+    constexpr int ooba_i           = 4 / sizeof(in_t);
+    const int oob_i                = (n + ooba_i - 1) / ooba_i * ooba_i;
+
+    // Interleaved (per-token) layout permutes each thread's columns for coalescing;
+    // contiguous (grouped) layout keeps tid's TDS columns adjacent for group reduction.
+    const int row_offset = (ILV && num_load_inst > 1)
+                               ? (tid % ISZ * load_vec_size + tid / ISZ * ISZ * TDS)
+                               : (tid * TDS);
+    const int col0 = tid * TDS; // logical first column (grouped layout / guards)
+
+    auto buf_i = opus::make_gmem<in_t>(reinterpret_cast<const in_t*>(in_) + (size_t)row * in_s,
+                                       oob_i * sizeof(in_t));
+    auto buf_w = opus::make_gmem<in_t>(reinterpret_cast<const in_t*>(w_), oob_i * sizeof(in_t));
+    auto td_i  = load_vector_nbytes<in_t, TDS, load_chunk_bytes, load_aux, ILV, ISZ>(buf_i, row_offset);
+    auto td_w  = load_vector_nbytes<in_t, TDS, load_chunk_bytes, RT, ILV, ISZ>(buf_w, row_offset);
+
+    opus::vector_t<float, TDS> f; // fp32 norm-input; residual stored as round(x+res)
+    if(ADD)
+    {
+        auto buf_r = opus::make_gmem<in_t>(reinterpret_cast<const in_t*>(rin_) + (size_t)row * rin_s,
+                                           oob_i * sizeof(in_t));
+        auto td_r =
+            load_vector_nbytes<in_t, TDS, load_chunk_bytes, load_aux, ILV, ISZ>(buf_r, row_offset);
+#pragma unroll
+        for(int j = 0; j < TDS; ++j)
+            f[j] = opus::cast<float>(td_i[j]) + opus::cast<float>(td_r[j]);
+        auto buf_ro = opus::make_gmem<in_t>(reinterpret_cast<in_t*>(rout_) + (size_t)row * rout_s,
+                                            oob_i * sizeof(in_t));
+        store_vector<in_t, float, TDS, load_aux, ILV, ISZ, num_load_inst, in_t>(buf_ro, f,
+                                                                                row_offset);
+    }
+    else
+    {
+#pragma unroll
+        for(int j = 0; j < TDS; ++j)
+            f[j] = opus::cast<float>(td_i[j]);
+    }
+
+    // scalar square-sum (v_fmac) + packed normalize (v_pk_mul_f32), matching the reference.
+    auto* f2 = reinterpret_cast<opus::fp32x2_t*>(&f);
+    float sq = 0.0f;
+#pragma unroll
+    for(int j = 0; j < TDS; ++j)
+        sq += f[j] * f[j];
+    // mean via fast reciprocal of n (v_rcp_iflag), avoiding a full IEEE divide.
+    float inv = rsqrtf(block_reduce_1d<false, BLK>(sq) * __builtin_amdgcn_rcpf((float)n) + epsilon);
+
+    const opus::fp32x2_t invv{inv, inv};
+#pragma unroll
+    for(int j = 0; j < TDS / 2; ++j) // normalized: (f*inv) * (w + goff)
+    {
+        opus::fp32x2_t wv{opus::cast<float>(td_w[2 * j]) + goff,
+                          opus::cast<float>(td_w[2 * j + 1]) + goff};
+        f2[j] = pk_mul_f32(pk_mul_f32(f2[j], invv), wv);
+    }
+
+    // Output OOB bound in store elements: fp4 packs 2 values/byte so a row is n/2 bytes,
+    // not n. Using n here let OOB threads (n < BLK*TDS, e.g. n=5120/6144) store past the
+    // fp4 output row into adjacent memory. Size the buffer by the real element count.
+    constexpr int ooba_o  = 4 / sizeof(out_store_t);
+    const int out_elems   = FP4 ? n / 2 : n;
+    const int oob_o       = (out_elems + ooba_o - 1) / ooba_o * ooba_o;
+
+    if constexpr(!QNT)
+    {
+        auto buf_o = opus::make_gmem<out_store_t>(
+            reinterpret_cast<out_store_t*>(out_) + (size_t)row * out_s, oob_o * sizeof(out_store_t));
+        store_vector<out_store_t, float, TDS, RT, ILV, ISZ, num_load_inst, out_t>(buf_o, f,
+                                                                                  row_offset);
+        return;
+    }
+
+    float tmax = 1e-10f;
+#pragma unroll
+    for(int j = 0; j < TDS; ++j)
+        tmax = fmaxf(tmax, fabsf(f[j]));
+
+    // Reciprocal quant scaling, matching the reference (max*(1/qmax), quantize via
+    // v_rcp(scale)): avoids full IEEE divides (~10 VALU each) that dominate the
+    // latency-bound small-n paths. qmax_ carries the EXACT host-computed 1/qmax so the
+    // stored scale is bit-accurate (an approximate rcpf here flips int8 roundings).
+    const float iqm = FP4 ? 0.0f : qmax; // qmax param = 1/qmax (unused for fp4)
+    float inv_ys; // store scale factor passed to store_vector (fp4: forward e8m0)
+    if(group_size == 0)
+    {
+        float gmax = block_reduce_1d<true, BLK>(tmax);
+        float ys   = gmax * iqm;
+        inv_ys     = ys > 0.0f ? __builtin_amdgcn_rcpf(ys) : 0.0f;
+        if(tid == 0 && scale_)
+            reinterpret_cast<float*>(scale_)[row] = ys;
+    }
+    else
+    {
+        // group-max over rts contiguous lanes via the warp_swap_ butterfly: real DPP for
+        // rts<=16 (no ds_bpermute), so the grouped small-n path stops paying LDS latency.
+        const int rts  = group_size / TDS;
+        const int lane = opus::lane_id();
+        if(rts >= 2)
+            tmax = fmaxf(tmax, warp_swap_<float, 2>(tmax, lane));
+        if(rts >= 4)
+            tmax = fmaxf(tmax, warp_swap_<float, 4>(tmax, lane));
+        if(rts >= 8)
+            tmax = fmaxf(tmax, warp_swap_<float, 8>(tmax, lane));
+        if(rts >= 16)
+            tmax = fmaxf(tmax, warp_swap_<float, 16>(tmax, lane));
+        if(rts >= 32)
+            tmax = fmaxf(tmax, warp_swap_<float, 32>(tmax, lane));
+        float ys;
+        if constexpr(FP4)
+        {
+            ys     = fp4_e8m0_scale(tmax);
+            inv_ys = ys; // opus fp4 packer takes the forward scale
+        }
+        else
+        {
+            ys     = tmax * iqm;
+            inv_ys = ys > 0.0f ? __builtin_amdgcn_rcpf(ys) : 0.0f;
+        }
+        // rts is a power of two, so the per-group store predicate is a cheap mask, not a
+        // runtime integer modulo (which all threads would otherwise pay every launch).
+        if((tid & (rts - 1)) == 0 && col0 < n && scale_)
+        {
+            // rts and group_size are powers of two -> shifts, not runtime integer divides
+            // (which the compiler may hoist so every thread pays).
+            int y      = tid >> __builtin_ctz(rts);
+            int groups = n >> __builtin_ctz(group_size);
+            if constexpr(FP4)
+            {
+                int sp    = shuffle ? (groups + 7) / 8 * 8 : groups;
+                size_t si = shuffle ? (size_t)mx_scale_shuffle_idx(sp, row, y) : (size_t)row * sp + y;
+                reinterpret_cast<unsigned char*>(scale_)[si] = e8m0_byte(ys);
+            }
+            else
+            {
+                size_t si = shuffle ? (size_t)y * m + row : (size_t)row * groups + y;
+                reinterpret_cast<float*>(scale_)[si] = ys;
+            }
+        }
+    }
+
+    const int store_off = FP4 ? row_offset / 2 : row_offset;
+    auto buf_o          = opus::make_gmem<out_store_t>(
+        reinterpret_cast<out_store_t*>(out_) + (size_t)row * out_s, oob_o * sizeof(out_store_t));
+    store_vector<out_store_t, float, TDS, RT, ILV, ISZ, num_load_inst, out_t>(buf_o, f, store_off,
+                                                                              inv_ys);
 }
 
 #endif // __HIP_DEVICE_COMPILE__

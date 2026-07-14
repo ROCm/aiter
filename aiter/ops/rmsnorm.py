@@ -8,8 +8,8 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from .quant import get_dtype_max
 from typing import Optional
 
-# opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
-# shuffle_scale quant and exotic dtypes fall back to module_rmsnorm_quant.
+# opus (module_rmsnorm) is the sole rmsnorm backend for every path -- plain norm,
+# fused-add, and dynamic/smooth/grouped/MXFP4 quant (fp16/bf16/fp32, any hidden).
 _DTYPE_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 
 
@@ -140,11 +140,26 @@ def fused_add_rms_norm_opus(
 
 
 # opus mirrors of the public rmsnorm entrypoints (same signatures).
+def _use_arq_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
+    # Common case (fp16/bf16, non-T5, hidden <= 8192, 2-D): the opus arq kernel -- the
+    # bit-exact port of the HIP add_rmsnorm_quant_kernel -- is the hand-tuned fast path.
+    # The generic rmsnorm_quant_opus kernel handles the rest (fp32, T5, hidden>8192, non-2-D).
+    return (
+        use_model_sensitive_rmsnorm == 0
+        and input.dim() == 2
+        and input.element_size() == 2
+        and input.shape[-1] <= 8192
+    )
+
+
 def rmsnorm2d_fwd_opus(
     input: Tensor, weight: Tensor, epsilon: float, use_model_sensitive_rmsnorm: int = 0
 ) -> Tensor:
     out = torch.empty_like(input)
-    rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
+    if _use_arq_common(input, use_model_sensitive_rmsnorm):
+        rmsnorm(out, input, weight, epsilon)
+    else:
+        rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
     return out
 
 
@@ -164,6 +179,9 @@ def rmsnorm2d_fwd_with_add_opus(
     path vLLM/SGLang/ATOM call, so staging copies were a ~2x regression.
     """
     hidden = input.shape[-1]
+    if _use_arq_common(input, use_model_sensitive_rmsnorm):
+        add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
+        return
     # kernel takes an input row stride; only a non-unit last-dim stride needs materializing.
     if input.stride(-1) != 1:
         input = input.contiguous()
@@ -350,8 +368,6 @@ def rmsnorm2d_fwd_with_add_smoothquant_opus(
     )
 
 
-# opus is ctypes (reads .data_ptr()), so torch.compile must not trace in -- wrap each
-# entrypoint as an opaque aiter custom op with a fake impl (as the CK ops were).
 @torch_compile_guard(mutates_args=["out"], gen_fake=lambda *a, **k: None)
 def rms_norm_cu(
     out: Tensor,
@@ -376,6 +392,8 @@ def fused_add_rms_norm_cu(
     fused_add_rms_norm_opus(input, residual_in, weight, epsilon)
 
 
+# opus is ctypes (reads .data_ptr()), so torch.compile must not trace in -- wrap each
+# entrypoint as an opaque aiter custom op with a fake impl (as the CK ops were).
 def _rms_norm_fwd_fake(
     input: Tensor,
     weight: Tensor,
@@ -385,33 +403,6 @@ def _rms_norm_fwd_fake(
     return torch.empty_like(input)
 
 
-def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
-    # main routed the bf16/fp16, hidden<=8192, non-T5, 2-D case to the hand-tuned HIP
-    # module_rmsnorm_quant (add_rmsnorm_quant_kernel); opus handles the rest (fp32, T5,
-    # hidden>8192, non-2-D) that the CK module_rmsnorm used to cover. Keeping the hot path
-    # on the HIP kernel avoids a perf regression vs main (opus generic is slower here).
-    return (
-        use_model_sensitive_rmsnorm == 0
-        and input.dim() == 2
-        and input.element_size() == 2
-        and input.shape[-1] <= 8192
-    )
-
-
-def _rms_norm_fwd_dispatch(
-    input, weight, epsilon, use_model_sensitive_rmsnorm
-) -> Tensor:
-    # Flat one-guard dispatch: common (bf16/fp16, hidden<=8192, non-T5, 2-D) -> fast HIP
-    # module_rmsnorm_quant; opus generic otherwise. rms_norm and rmsnorm2d_fwd both call this
-    # directly (not each other) so the vLLM no-add path pays a single torch_compile_guard.
-    out = torch.empty_like(input)
-    if _use_hip_common(input, use_model_sensitive_rmsnorm):
-        rmsnorm(out, input, weight, epsilon)
-    else:
-        rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
-    return out
-
-
 @torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
 def rms_norm(
     input: Tensor,
@@ -419,8 +410,8 @@ def rms_norm(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    """rmsnorm (fast HIP for the common case; opus for fp32/T5/hidden>8192)."""
-    return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    """rmsnorm (opus; fp16/bf16/fp32)."""
+    return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
@@ -430,7 +421,7 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 @torch_compile_guard(
@@ -446,11 +437,6 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
-    if _use_hip_common(input, use_model_sensitive_rmsnorm):
-        add_rmsnorm(  # fast HIP module_rmsnorm_quant
-            out, input, residual_in, residual_out, weight, epsilon, gemma_norm
-        )
-        return
     rmsnorm2d_fwd_with_add_opus(
         out,
         input,
@@ -514,14 +500,14 @@ def rmsnorm2d_fwd_with_dynamicquant(
     shuffle_scale: bool = False,
 ) -> None:
     if group_size == 0 and not shuffle_scale:
-        if _use_hip_common(input, use_model_sensitive_rmsnorm):
-            rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast HIP
+        if _use_arq_common(input, use_model_sensitive_rmsnorm):
+            rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast opus arq
         else:
             rmsnorm2d_fwd_with_dynamicquant_opus(
                 out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
             )
     else:
-        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        # grouped / shuffle quant (n<=8192) also runs on the opus arq kernel.
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm dynamicquant supports hidden<=8192"
@@ -541,8 +527,8 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     shuffle_scale: bool = False,
 ) -> None:
     if group_size == 0 and not shuffle_scale:
-        if _use_hip_common(input, use_model_sensitive_rmsnorm):
-            add_rmsnorm_quant(  # fast HIP
+        if _use_arq_common(input, use_model_sensitive_rmsnorm):
+            add_rmsnorm_quant(  # fast opus arq
                 out, input, residual_in, residual_out, yscale, weight, epsilon
             )
         else:
@@ -557,7 +543,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
                 use_model_sensitive_rmsnorm,
             )
     else:
-        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        # grouped / shuffle quant runs on the opus arq kernel (n<=8192).
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm add_dynamicquant supports hidden<=8192"
@@ -574,51 +560,179 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         )
 
 
-@compile_ops("module_rmsnorm_quant")
-def add_rmsnorm_quant(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    scale: Tensor,
-    weight: Tensor,
+# ---------------------------------------------------------------------------
+# The former module_rmsnorm_quant API surface, now served by opus (add_rmsnorm_quant_opus).
+# out_code: -1 no-quant, 0 int8, 1 fp8, 2 fp4x2. Grouped/shuffle/fp4 + strided.
+# ---------------------------------------------------------------------------
+@compile_ops("module_rmsnorm", fc_name="add_rmsnorm_quant_opus_raw", ffi_type="ctypes")
+def _add_rmsnorm_quant_opus_raw(
+    out: int,
+    rout: int,
+    scale: int,
+    input: int,
+    rin: int,
+    weight: int,
+    xscale: int,
     epsilon: float,
-    group_size: int = 0,
-    shuffle_scale: bool = False,
-    gemma_norm: bool = False,
+    m: int,
+    n: int,
+    qmax: float,
+    in_code: int,
+    out_code: int,
+    in_s: int,
+    rin_s: int,
+    rout_s: int,
+    out_s: int,
+    group_size: int,
+    shuffle: int,
+    gemma: int,
+    cu_num: int,
+    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+def _out_code_qmax(out_dtype):
+    if out_dtype == torch.int8:
+        return 0, 127.0
+    if out_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return 1, float(get_dtype_max(out_dtype))
+    return 2, 6.0  # fp4x2 (MXFP4, e8m0 block scale)
+
+
+# Cache the CU count per device: get_device_properties() is an expensive host query
+# that would otherwise dominate the small-n kernels (few-us) on every call.
+_CU_NUM: dict = {}
+
+
+def _cu_num(device) -> int:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cu = _CU_NUM.get(idx)
+    if cu is None:
+        cu = torch.cuda.get_device_properties(idx).multi_processor_count
+        _CU_NUM[idx] = cu
+    return cu
+
+
+def _arq(
+    out,
+    input,
+    weight,
+    epsilon,
+    out_code,
+    qmax,
+    scale=None,
+    residual_in=None,
+    residual_out=None,
+    group_size=0,
+    shuffle_scale=False,
+    gemma_norm=False,
+):
+    assert input.dtype in _DTYPE_CODE
+    # kernel takes a row stride (in_s); only materialize when the last dim is strided.
+    if input.stride(-1) != 1:
+        input = input.contiguous()
+    n = input.shape[-1]
+    m = input.numel() // n
+    add = residual_in is not None
+    cu = _cu_num(input.device)
+    # pass the EXACT reciprocal of qmax: the kernel scales by it (max*(1/qmax)); an
+    # in-kernel approximate reciprocal would flip int8 roundings at boundaries.
+    inv_qmax = 1.0 / qmax if qmax > 0 else 0.0
+    _add_rmsnorm_quant_opus_raw(
+        out.data_ptr(),
+        residual_out.data_ptr() if add else 0,
+        scale.data_ptr() if scale is not None else 0,
+        input.data_ptr(),
+        residual_in.data_ptr() if add else 0,
+        weight.data_ptr(),
+        0,
+        float(epsilon),
+        m,
+        n,
+        float(inv_qmax),
+        _DTYPE_CODE[input.dtype],
+        out_code,
+        input.stride(0),
+        residual_in.stride(0) if add else 0,
+        residual_out.stride(0) if add else 0,
+        out.stride(0),
+        int(group_size),
+        int(shuffle_scale),
+        int(gemma_norm),
+        int(cu),
+        torch.cuda.current_stream().cuda_stream,
+    )
+
+
+def rmsnorm(out, input, weight, epsilon, gemma_norm=False):
+    _arq(out, input, weight, epsilon, -1, 0.0, gemma_norm=gemma_norm)
+
+
 def add_rmsnorm(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    weight: Tensor,
-    epsilon: float,
-    gemma_norm: bool = False,
-) -> None: ...
+    out, input, residual_in, residual_out, weight, epsilon, gemma_norm=False
+):
+    _arq(
+        out,
+        input,
+        weight,
+        epsilon,
+        -1,
+        0.0,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        gemma_norm=gemma_norm,
+    )
 
 
-@compile_ops("module_rmsnorm_quant")
 def rmsnorm_quant(
-    out: Tensor,
-    input: Tensor,
-    scale: Tensor,
-    weight: Tensor,
-    epsilon: float,
-    group_size: int = 0,
-    shuffle_scale: bool = False,
-    gemma_norm: bool = False,
-) -> None: ...
+    out,
+    input,
+    scale,
+    weight,
+    epsilon,
+    group_size=0,
+    shuffle_scale=False,
+    gemma_norm=False,
+):
+    oc, qmax = _out_code_qmax(out.dtype)
+    _arq(
+        out,
+        input,
+        weight,
+        epsilon,
+        oc,
+        qmax,
+        scale=scale,
+        group_size=group_size,
+        shuffle_scale=shuffle_scale,
+        gemma_norm=gemma_norm,
+    )
 
 
-@compile_ops("module_rmsnorm_quant")
-def rmsnorm(
-    out: Tensor,
-    input: Tensor,
-    weight: Tensor,
-    epsilon: float,
-    gemma_norm: bool = False,
-) -> None: ...
+def add_rmsnorm_quant(
+    out,
+    input,
+    residual_in,
+    residual_out,
+    scale,
+    weight,
+    epsilon,
+    group_size=0,
+    shuffle_scale=False,
+    gemma_norm=False,
+):
+    oc, qmax = _out_code_qmax(out.dtype)
+    _arq(
+        out,
+        input,
+        weight,
+        epsilon,
+        oc,
+        qmax,
+        scale=scale,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        group_size=group_size,
+        shuffle_scale=shuffle_scale,
+        gemma_norm=gemma_norm,
+    )

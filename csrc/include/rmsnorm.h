@@ -38,7 +38,6 @@ inline std::pair<dim3, dim3> pick_dims(int rows, int vhid)
     return {dim3((unsigned)tpr, (unsigned)rpb), dim3((unsigned)nblocks)};
 }
 
-
 // rmsnorm (+ fused add when residual != nullptr), generic kernel (<=2 ulp).
 template <typename scalar_t>
 inline void launch_norm(void* out,
@@ -165,5 +164,70 @@ inline void launch_quant(void* out,
     }
 #undef OPUS_QUANT
 }
+
+// module_rmsnorm_quant replacement: no-quant/per-token/grouped/fp4, add, gemma, smooth,
+// shuffle, strided (n<=8192). Mirrors the reference per-n (BLK,TDS) dispatch; grouped by cu_num.
+// out_code: -1 no-quant, 0 int8, 1 fp8, 2 fp4x2. in_code: 0 fp16, 1 bf16.
+template <typename in_t, typename out_t>
+inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, const void* rin,
+                          const void* w, const void* xsc, float epsilon, int m, int n, float qmax,
+                          int in_s, int rin_s, int rout_s, int out_s, int group, int shuffle,
+                          int gemma, int cu_num, hipStream_t s)
+{
+    constexpr bool QUANT = !std::is_same_v<out_t, in_t>;
+#define ARQ(BLK, TDS, ILV)                                                                        \
+    hipLaunchKernelGGL((add_rmsnorm_quant_opus<arq_opus_traits<in_t, out_t, BLK, TDS, ILV>>),     \
+                       dim3(m), dim3(BLK), 0, s, out, rout, scale, in, rin, w, xsc, epsilon, m,   \
+                       n, qmax, in_s, rin_s, rout_s, out_s, group, shuffle, gemma)
+    // interleave: coalesced strided layout. Grouped quant with TDS>8 keeps the
+    // contiguous layout (ILV=false) for group locality; everything else interleaves.
+#define ARQ2(BLK, TDS)                                                                             \
+    do                                                                                             \
+    {                                                                                              \
+        if constexpr((TDS) > 8 && QUANT)                                                           \
+        {                                                                                          \
+            if(group > 0)                                                                          \
+                ARQ(BLK, TDS, false);                                                              \
+            else                                                                                   \
+                ARQ(BLK, TDS, true);                                                               \
+        }                                                                                          \
+        else                                                                                       \
+            ARQ(BLK, TDS, true);                                                                   \
+    } while(0)
+    // Grouped needs TDS to divide group_size. The per-token (256,24)/(256,32) tiles for n>4096
+    // don't divide 128/32, so grouped switches to (512,16)/(1024,8) for ALL n>4096 -- else the
+    // scale store goes OOB (GPU fault at n=5120/6144).
+    if(group > 0)
+    {
+        if(n <= 512)
+            ARQ2(64, 8);
+        else if(n <= 1024)
+            ARQ2(128, 8);
+        else if(n <= 2048)
+            ARQ2(256, 8);
+        else if(n <= 4096)
+            ARQ2(256, 16);
+        else if(cu_num < 160)
+            ARQ(512, 16, false);
+        else
+            ARQ(1024, 8, true);
+    }
+    else if(n <= 512)
+        ARQ2(64, 8);
+    else if(n <= 1024)
+        ARQ2(128, 8);
+    else if(n <= 2048)
+        ARQ2(256, 8);
+    else if(n <= 4096)
+        ARQ2(256, 16);
+    else if(n <= 6144)
+        ARQ2(256, 24);
+    else
+        ARQ(256, 32, true);
+#undef ARQ2
+#undef ARQ
+}
+
+// out_code dispatch lives in the per-out-dtype arq TUs (kernels/rmsnorm/rmsnorm_opus_arq_*.cu).
 
 } // namespace aiter
