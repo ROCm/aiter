@@ -8,6 +8,11 @@ kernels' caller contract.
 This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
 + pipelined-K-loop variant suitable for sparse decode (e.g. V4 top-k gather)
 where each token's K range is an unordered subset of a unified KV pool.
+
+On gfx950 (CDNA4) DeepSeek-V4 sparse-MLA decode has a dedicated gluon
+implementation (bottom of this module): ``pa_decode_sparse`` routes there for
+the OCP-fp8 / bf16 uniform pool, and ``sparse_mla_decode`` serves the
+vLLM-native packed ``fp8_ds_mla`` cache directly.
 """
 
 from typing import Optional
@@ -91,6 +96,24 @@ def pa_decode_sparse(
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
+
+    # gfx950: route to the DSv4 sparse-MLA gluon kernel (OCP fp8 + fp32 kv_scales,
+    # or bf16; single merged index). fnuz-fp8 and the block_h/kv_splits/skip_reduce
+    # overrides fall through to the triton path below.
+    if (
+        DEVICE_ARCH == "gfx950"
+        and block_h is None
+        and kv_splits is None
+        and not skip_reduce
+    ):
+        _fp8_ocp = unified_kv.dtype in (torch.float8_e4m3fn, torch.uint8)
+        if (kv_scales is not None and _fp8_ocp) or (
+            kv_scales is None and unified_kv.dtype == q.dtype
+        ):
+            pool = unified_kv.view(torch.uint8) if kv_scales is not None else unified_kv
+            return sparse_mla_decode_uniform(
+                q, pool, kv_scales, kv_indices, kv_indptr, softmax_scale, attn_sink
+            )
 
     quant_kv = kv_scales is not None
     if quant_kv:
@@ -310,3 +333,393 @@ def pa_decode_sparse(
         waves_per_eu=reduce_waves_per_eu,
     )
     return out
+
+
+# gfx950 / CDNA4 DeepSeek-V4 sparse-MLA decode (gluon): packed fp8_ds_mla / bf16
+# cache -> sparse_mla_decode; uniform fp8 pool -> sparse_mla_decode_uniform. The raw
+# kernels are imported lazily in each launcher to keep them off the gfx1250 path.
+_DSV4_SPARSE_NOPE_DIM = 448
+_DSV4_SPARSE_ROPE_DIM = 64
+
+# Tuned launch config (gfx950 / MI355). BLOCK_M = heads per tile (one MFMA M tile);
+# BLOCK_K = KV tile; NUM_WARPS = BLOCK_K // 16 since warps tile the dot-N (MFMA N=16).
+_BLOCK_M = 16
+_BLOCK_K = 64
+_NUM_WARPS = _BLOCK_K // 16
+_MFMA_K = 16
+_WAVES_PER_EU = 0
+
+# buffer_load's offset is 32-bit (2 GB cap); a larger cache gathers via 64-bit
+# gl.load instead (see _cache_load in the gfx950 kernel module).
+_MAX_BUFFER_LOAD_BYTES = 2**31 - 1
+
+
+def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
+    if x.dtype == torch.int32 and x.ndim == 1 and x.is_contiguous():
+        return x
+    return x.to(torch.int32).contiguous()
+
+
+def _decode_cu_count() -> int:
+    try:
+        return torch.cuda.get_device_properties(0).multi_processor_count
+    except Exception:
+        return 256
+
+
+def _decode_num_splits(num_queries, heads_blocks, avg_len=0.0, block_k=64):
+    base = max(1, num_queries * heads_blocks)
+    cu = max(1, _decode_cu_count())
+    mu = 0.04
+    best_splits, best_cost = 1, None
+    for splits in range(1, 17):
+        waves = (base * splits + cu - 1) // cu
+        cost = waves * (1.0 / splits + mu)
+        if best_cost is None or cost < best_cost - 1e-9:
+            best_splits, best_cost = splits, cost
+    return best_splits
+
+
+def sparse_mla_decode(
+    q: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_indptr: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor | None,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    extra_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Packed DSv4 sparse-MLA decode (vLLM-native cache). Format is picked from
+    ``main_cache.dtype``:
+      uint8 -> fp8_ds_mla  ([nb, block, 584]: 448 NoPE fp8 e4m3 OCP + embedded
+                            UE8M0 per-64 scale + 64 RoPE bf16)
+      bf16  -> bf16 cache  ([nb, block, head_dim])
+    q is bf16/fp16; head_dim == nope_head_dim + rope_head_dim (448 + 64). Pass the
+    ``extra_*`` tensors for the two-loop (SWA main + top-k extra), or omit them for
+    a single segment. Aliased ``_rocm_sparse_attn_decode_ragged_triton``."""
+    assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
+    assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
+        _pa_decode_sparse,
+        _pa_decode_sparse_reduce,
+    )
+
+    num_queries, num_heads, head_dim = q.shape
+    assert (
+        nope_head_dim == _DSV4_SPARSE_NOPE_DIM
+        and rope_head_dim == _DSV4_SPARSE_ROPE_DIM
+    )
+    assert head_dim == nope_head_dim + rope_head_dim
+
+    main_indices = _as_int32_contiguous_1d(main_indices)
+    main_indptr = _as_int32_contiguous_1d(main_indptr)
+    has_sink = attn_sink is not None
+    if attn_sink is None:
+        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
+    else:
+        attn_sink = attn_sink.contiguous().to(torch.float32)
+
+    has_extra = (
+        extra_cache is not None
+        and extra_indices is not None
+        and extra_indptr is not None
+    )
+    if has_extra:
+        extra_indices = _as_int32_contiguous_1d(extra_indices)
+        extra_indptr = _as_int32_contiguous_1d(extra_indptr)
+    else:
+        # HAS_EXTRA=False -> the kernel skips the extra segment, so reuse the main
+        # tensors as unread placeholders (no alloc, no zeroing memset launch).
+        extra_cache = main_cache
+        extra_indices = main_indices
+        extra_indptr = main_indptr
+
+    main_is_fp8 = main_cache.dtype == torch.uint8
+    extra_is_fp8 = extra_cache.dtype == torch.uint8
+    use_buffer_load = (
+        main_cache.nelement() * main_cache.element_size() <= _MAX_BUFFER_LOAD_BYTES
+        and extra_cache.nelement() * extra_cache.element_size()
+        <= _MAX_BUFFER_LOAD_BYTES
+    )
+
+    # bf16 view of each cache (for the fp8 RoPE gather; harmless alias for bf16).
+    main_bf16 = main_cache.view(torch.bfloat16) if main_is_fp8 else main_cache
+    extra_bf16 = extra_cache.view(torch.bfloat16) if extra_is_fp8 else extra_cache
+
+    BLOCK_M, BLOCK_K, num_warps, mfma_k = _BLOCK_M, _BLOCK_K, _NUM_WARPS, _MFMA_K
+    waves_per_eu = _WAVES_PER_EU
+    HEAD_ALIGNED = num_heads % BLOCK_M == 0
+    heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+
+    inv_q = 1.0 / max(1, num_queries)
+    avg_len = (main_indices.numel() + extra_indices.numel()) * inv_q
+    num_splits = _decode_num_splits(num_queries, heads_blocks, avg_len, BLOCK_K)
+    # Cap splits at the tile count: extra splits just fragment short token lists
+    # into sub-tile masked chunks (matters for tiny top-k / small merged ctx).
+    avg_tiles = max(1, int((avg_len + BLOCK_K - 1) // BLOCK_K))
+    num_splits = min(num_splits, avg_tiles)
+
+    main_num_rows = main_cache.shape[0] * main_cache.shape[1]
+    extra_num_rows = extra_cache.shape[0] * extra_cache.shape[1]
+
+    if num_splits > 1:
+        part_m = torch.empty(
+            (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
+        )
+        part_l = torch.empty_like(part_m)
+        part_acc = torch.empty(
+            (num_queries, num_splits, num_heads, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        pm_stride0, pm_stride_s = part_m.stride(0), part_m.stride(1)
+        pa_stride0, pa_stride_s, pa_stride_h = (
+            part_acc.stride(0),
+            part_acc.stride(1),
+            part_acc.stride(2),
+        )
+    else:
+        part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
+        pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
+
+    grid = (num_queries, num_splits, heads_blocks)
+    _pa_decode_sparse[grid](
+        q,
+        main_cache,
+        main_bf16,
+        main_indices,
+        main_indptr,
+        extra_cache,
+        extra_bf16,
+        extra_indices,
+        extra_indptr,
+        attn_sink,
+        out,
+        part_m,
+        part_l,
+        part_acc,
+        scale,
+        q.stride(0),
+        q.stride(1),
+        out.stride(0),
+        out.stride(1),
+        main_cache.stride(0),
+        extra_cache.stride(0),
+        main_num_rows,
+        extra_num_rows,
+        pm_stride0,
+        pm_stride_s,
+        pa_stride0,
+        pa_stride_s,
+        pa_stride_h,
+        num_heads,
+        HAS_EXTRA=has_extra,
+        HAS_SINK=has_sink,
+        MAIN_IS_FP8=main_is_fp8,
+        EXTRA_IS_FP8=extra_is_fp8,
+        MAIN_BLOCK_SIZE=main_cache.shape[1],
+        EXTRA_BLOCK_SIZE=extra_cache.shape[1],
+        NOPE_DIM=nope_head_dim,
+        ROPE_DIM=rope_head_dim,
+        HEAD_SIZE=head_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        NUM_SPLITS=num_splits,
+        HEAD_ALIGNED=HEAD_ALIGNED,
+        MFMA_K=mfma_k,
+        UNIFORM=False,
+        USE_BUFFER_LOAD=use_buffer_load,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+
+    if num_splits > 1:
+        rgrid = (num_queries, heads_blocks)
+        _pa_decode_sparse_reduce[rgrid](
+            part_m,
+            part_l,
+            part_acc,
+            attn_sink,
+            out,
+            out.stride(0),
+            out.stride(1),
+            pm_stride0,
+            pm_stride_s,
+            pa_stride0,
+            pa_stride_s,
+            pa_stride_h,
+            num_heads,
+            scale,
+            HAS_SINK=has_sink,
+            HEAD_SIZE=head_dim,
+            BLOCK_M=BLOCK_M,
+            NUM_SPLITS=num_splits,
+            HEAD_ALIGNED=HEAD_ALIGNED,
+            num_warps=4,
+        )
+    return out
+
+
+def sparse_mla_decode_uniform(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,  # [pages, D] fp8 (uint8-bits) or bf16
+    kv_scales: torch.Tensor | None,  # [pages, D//64] fp32 (fp8 only)
+    kv_indices: torch.Tensor,  # [total] int32 flat
+    kv_indptr: torch.Tensor,  # [N+1] int32 prefix sum
+    scale: float,
+    attn_sink: torch.Tensor | None,
+) -> torch.Tensor:
+    """Uniform-pool DSv4 sparse-MLA decode (pa_decode_sparse layout, single merged
+    index). Format is picked from ``unified_kv.dtype`` + ``kv_scales``:
+      uint8 + kv_scales  -> fp8 (OCP e4m3), kv_scales [pages, head_dim//64] fp32
+      bf16  + None       -> bf16
+    ``unified_kv`` is a page_size=1 flat pool [pages, head_dim]; q is bf16/fp16."""
+    assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
+    assert DEVICE_ARCH == "gfx950", "gluon decode kernel is gfx950-only"
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
+        _pa_decode_sparse,
+        _pa_decode_sparse_reduce,
+    )
+
+    num_queries, num_heads, head_dim = q.shape
+
+    main_indices = _as_int32_contiguous_1d(kv_indices)
+    main_indptr = _as_int32_contiguous_1d(kv_indptr)
+    has_sink = attn_sink is not None
+    attn_sink = (
+        attn_sink.contiguous().to(torch.float32)
+        if has_sink
+        else torch.empty(1, device=q.device, dtype=torch.float32)
+    )
+
+    main_is_fp8 = unified_kv.dtype == torch.uint8
+    use_buffer_load = (
+        unified_kv.nelement() * unified_kv.element_size() <= _MAX_BUFFER_LOAD_BYTES
+    )
+    # page_size=1 flat pool -> block_idx=slot, pos=0. The bf16-ptr slot carries
+    # the fp32 kv_scales for fp8 (aliased to the pool for bf16; unused there).
+    if main_is_fp8:
+        assert kv_scales is not None and kv_scales.dtype == torch.float32
+        main_bf16 = kv_scales.contiguous()
+    else:
+        main_bf16 = unified_kv
+    # HAS_EXTRA=False -> the extra segment is skipped; pass the main tensors as
+    # unread placeholders (no alloc, no zeroing memset launch).
+    extra = main_indices
+    extra_indptr = main_indptr
+
+    BLOCK_M, BLOCK_K, num_warps, mfma_k = _BLOCK_M, _BLOCK_K, _NUM_WARPS, _MFMA_K
+    waves_per_eu = _WAVES_PER_EU
+    HEAD_ALIGNED = num_heads % BLOCK_M == 0
+    heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+
+    avg_len = main_indices.numel() / max(1, num_queries)
+    num_splits = _decode_num_splits(num_queries, heads_blocks, avg_len, BLOCK_K)
+    num_splits = min(num_splits, max(1, int((avg_len + BLOCK_K - 1) // BLOCK_K)))
+
+    pages = unified_kv.shape[0]
+    if num_splits > 1:
+        part_m = torch.empty(
+            (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
+        )
+        part_l = torch.empty_like(part_m)
+        part_acc = torch.empty(
+            (num_queries, num_splits, num_heads, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        pm_stride0, pm_stride_s = part_m.stride(0), part_m.stride(1)
+        pa_stride0, pa_stride_s, pa_stride_h = (
+            part_acc.stride(0),
+            part_acc.stride(1),
+            part_acc.stride(2),
+        )
+    else:
+        part_m = part_l = part_acc = out
+        pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
+
+    grid = (num_queries, num_splits, heads_blocks)
+    _pa_decode_sparse[grid](
+        q,
+        unified_kv,
+        main_bf16,
+        main_indices,
+        main_indptr,
+        unified_kv,
+        main_bf16,
+        extra,
+        extra_indptr,
+        attn_sink,
+        out,
+        part_m,
+        part_l,
+        part_acc,
+        scale,
+        q.stride(0),
+        q.stride(1),
+        out.stride(0),
+        out.stride(1),
+        unified_kv.stride(0),
+        unified_kv.stride(0),
+        pages,
+        pages,
+        pm_stride0,
+        pm_stride_s,
+        pa_stride0,
+        pa_stride_s,
+        pa_stride_h,
+        num_heads,
+        HAS_EXTRA=False,
+        HAS_SINK=has_sink,
+        MAIN_IS_FP8=main_is_fp8,
+        EXTRA_IS_FP8=main_is_fp8,
+        MAIN_BLOCK_SIZE=1,
+        EXTRA_BLOCK_SIZE=1,
+        NOPE_DIM=head_dim,
+        ROPE_DIM=64,
+        HEAD_SIZE=head_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        NUM_SPLITS=num_splits,
+        HEAD_ALIGNED=HEAD_ALIGNED,
+        MFMA_K=mfma_k,
+        UNIFORM=True,
+        USE_BUFFER_LOAD=use_buffer_load,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
+    if num_splits > 1:
+        rgrid = (num_queries, heads_blocks)
+        _pa_decode_sparse_reduce[rgrid](
+            part_m,
+            part_l,
+            part_acc,
+            attn_sink,
+            out,
+            out.stride(0),
+            out.stride(1),
+            pm_stride0,
+            pm_stride_s,
+            pa_stride0,
+            pa_stride_s,
+            pa_stride_h,
+            num_heads,
+            scale,
+            HAS_SINK=has_sink,
+            HEAD_SIZE=head_dim,
+            BLOCK_M=BLOCK_M,
+            NUM_SPLITS=num_splits,
+            HEAD_ALIGNED=HEAD_ALIGNED,
+            num_warps=4,
+        )
+    return out
+
+
+# vLLM-compat alias (the vLLM DSv4 backend calls this name).
+_rocm_sparse_attn_decode_ragged_triton = sparse_mla_decode
