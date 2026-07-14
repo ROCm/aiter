@@ -1063,7 +1063,7 @@ def _metadata_emit(batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_
         page_size=_META_PAGE_SIZE, kv_granularity=_META_KV_GRAN,
         max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=True,
         max_split_per_batch=max_split_per_batch,
-        dtype_q=torch.bfloat16, dtype_kv=torch.bfloat16,
+        dtype_q_nope=torch.bfloat16, dtype_kv_nope=torch.bfloat16,
         reduce_max_split=rms,
     )
     torch.cuda.synchronize()

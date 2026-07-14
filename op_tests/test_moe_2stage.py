@@ -3,6 +3,7 @@
 
 import torch
 import itertools
+import gc
 from contextlib import nullcontext
 import aiter
 from aiter import dtypes
@@ -52,6 +53,21 @@ torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+
+
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def parse_num_expert_activated():
+    try:
+        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+    except ValueError:
+        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+    if val < 0:
+        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
 @benchmark()
@@ -109,7 +125,22 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
-    if AITER_MOE_EXPERT_BALANCE:
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other E-n experts are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > E or n_act > token * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
+                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+            )
+        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        slot = torch.arange(token * topk) % n_act  # round-robin over active set
+        rows = torch.arange(token).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
         end_col = topk
@@ -267,7 +298,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4 / a8w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -646,6 +677,13 @@ parser.add_argument(
     help="Skip validating flydsl shapes from tuned fmoe CSVs.",
 )
 parser.add_argument(
+    "--csv-filter",
+    nargs="*",
+    default=None,
+    help="Only run CSV rows whose kernelName1/2 contain any of these substrings "
+    "(e.g. --csv-filter abf16_wbf16 to validate just bf16-dense flydsl rows).",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -773,6 +811,10 @@ def _iter_csv_cases():
         kernel_name2 = str(row.get("kernelName2", "") or "")
         if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
             continue
+        if args.csv_filter:
+            _kn = kernel_name1 + " " + kernel_name2
+            if not any(sub in _kn for sub in args.csv_filter):
+                continue
         try:
             kwargs = _row_to_kwargs(row)
         except Exception as e:
@@ -808,7 +850,9 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        kwargs["check_aot_cache"] = True
+        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
+        # configs have no pre-registered AOT cache entry).
+        kwargs["check_aot_cache"] = args.csv_filter is None
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
@@ -823,6 +867,9 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
+    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
+    # property (not a tuned-config key); request INTERLEAVE here for them.
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
@@ -1041,6 +1088,9 @@ for kwargs, extras in case_iter:
                 os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
             else:
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
+        # Reclaim per-case VRAM to avoid OOM under fragmentation.
+        gc.collect()
+        torch.cuda.empty_cache()
     if ret is None:
         continue
     ret.update(extras)
