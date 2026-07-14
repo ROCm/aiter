@@ -3,13 +3,23 @@
 //
 // gfx1250 F4GEMM ASM dispatch (preload SGPR mode).
 // Two entrypoints:
-//   - mxfp4_gemm_asm: D[M,N] bf16 = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
-//   - nvfp4_gemm_asm: D[M,N] bf16 = A[M,K/2] nvfp4 * B[N,K/2] nvfp4 (e4m3 scales + GlobalScale)
+//   - mxfp4_gemm_asm: D = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
+//   - nvfp4_gemm_asm: D = A[M,K/2] nvfp4 * B[N,K/2] nvfp4 (e4m3 scales + GlobalScale)
+// Output D is bf16 [M,N], packed FP4 [M,N/2] (fp4x2, cvt_scale=1), or mxfp8:
+// FP8 e4m3 [M,N] data + a per-128-block E8M0 scale [M,N/128] (out_scale).
 //
 // KernelArgs uses the ROCm kernarg-preload layout (sgpr_mode==1): pointers
-// first (dw 0..9, MEM-first), then 4B-tight scalars. Bytes shipped to HW:
-//   MXFP4: 80B (struct minus the 2 trailing persistent log2 dwords)
-//   NVFP4: 88B (full struct incl. GlobalScaleA/B + trailing log2)
+// first (dw 0..9, MEM-first), then 4B-tight scalars. Bytes shipped to HW,
+// keyed by intype (dw18..21 layout) and whether the output is mxfp8:
+//   MXFP4        : 80B (struct minus the 2 trailing persistent log2 dwords)
+//   MXFP4 + mxfp8: 88B (ScaleD overlaid on the unused dw20/21 log2 slots)
+//   NVFP4        : 88B (full struct incl. GlobalScaleA/B + trailing log2)
+//   NVFP4 + mxfp8: 96B (full struct + dedicated dw22/23 ScaleD pointer)
+//
+// The mxfp8 output-scale pointer reuses the exact per-intype overlay trick that
+// log2 does: NVFP4 gets its own dedicated slot (dw22/23), while MXFP4 -- which
+// has no GlobalScale and parks log2 in dw18/19 -- overlays ScaleD onto its still
+// -unused dw20/21 slots. Each .co reads ScaleD from its intype's agreed offset.
 //
 // Launch is cluster- and persistent-aware:
 //   - cluster_x/cluster_y are compile-time per .co and read from the CSV; a
@@ -22,6 +32,7 @@
 #include "aiter_ctypes_error.h"
 #include "asm_f4gemm_configs.hpp"
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <hip/hip_runtime.h>
@@ -50,11 +61,13 @@ struct __attribute__((packed)) KernelArgs
     unsigned int K;                // dw 17     (off 0x44)
     float        GlobalScaleA;     // dw 18     (off 0x48) NVFP4 only
     float        GlobalScaleB;     // dw 19     (off 0x4C) NVFP4 only
-    unsigned int log2_grid_x;      // dw 20     persistent only (unused -> 0)
-    unsigned int log2_grid_y;      // dw 21     persistent only (unused -> 0)
+    unsigned int log2_grid_x;      // dw 20     NVFP4 persistent; MXFP4+mxfp8: ScaleD low
+    unsigned int log2_grid_y;      // dw 21     NVFP4 persistent; MXFP4+mxfp8: ScaleD high
+    void*        ptr_ScaleD;       // dw 22..23 (off 0x58) NVFP4+mxfp8 output E8M0 scale
 };
-// 5 ptrs (40B) + 8 scalars (32B) + GlobalScaleA/B (8B) + 2 log2 (8B) = 88B.
-static_assert(sizeof(KernelArgs) == 88, "f4gemm preload KernelArgs must be 88B");
+// 5 ptrs (40B) + 8 scalars (32B) + GlobalScaleA/B (8B) + 2 log2 (8B) + ScaleD (8B) = 96B.
+// Only mxfp8 outputs ship ScaleD; other outputs ship 80B (MXFP4) / 88B (NVFP4).
+static_assert(sizeof(KernelArgs) == 96, "f4gemm preload KernelArgs must be 96B");
 
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, int intype, int a_preshuffle, CFG* cfgs)
@@ -141,6 +154,7 @@ static void f4gemm_launch(aiter_tensor_t* A,
                                 aiter_tensor_t* ScaleA,
                                 aiter_tensor_t* ScaleB,
                                 aiter_tensor_t* out,
+                                aiter_tensor_t* out_scale,   // mxfp8 output E8M0 scale (null otherwise)
                                 const char*     kernelName,
                                 int             intype,
                                 int             a_preshuffle,
@@ -148,10 +162,15 @@ static void f4gemm_launch(aiter_tensor_t* A,
                                 float           GlobalScaleB,
                                 hipStream_t     stream)
 {
-    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 || out->dtype() == AITER_DTYPE_fp4x2,
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16 || out->dtype() == AITER_DTYPE_fp4x2 ||
+                    out->dtype() == AITER_DTYPE_fp8,
                 __func__,
-                " only supports BFloat16 or packed FP4 (fp4x2) output");
-    const bool out_is_fp4 = (out->dtype() == AITER_DTYPE_fp4x2);
+                " only supports BFloat16, packed FP4 (fp4x2) or FP8 (mxfp8) output");
+    const bool out_is_fp4   = (out->dtype() == AITER_DTYPE_fp4x2);
+    const bool out_is_mxfp8 = (out->dtype() == AITER_DTYPE_fp8);
+    AITER_CHECK(!out_is_mxfp8 || out_scale != nullptr,
+                __func__,
+                " mxfp8 output requires an out_scale (E8M0) tensor");
     AITER_CHECK(intype == F4_INTYPE_MXFP4 || intype == F4_INTYPE_NVFP4,
                 __func__,
                 " unsupported intype ",
@@ -175,11 +194,12 @@ static void f4gemm_launch(aiter_tensor_t* A,
     unsigned int stride_a = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
     unsigned int stride_b = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
     // Output row stride in bytes: bf16 = Ndim*2; packed fp4 (e2m1, 2 vals/byte,
-    // cvt_scale=1) = Ndim/2. Output format is compile-time per .co; the host only
-    // needs the matching stride + buffer dtype.
+    // cvt_scale=1) = Ndim/2; mxfp8 (fp8 e4m3, 1 byte/val) = Ndim. Output format is
+    // compile-time per .co; the host only needs the matching stride + buffer dtype.
     unsigned int stride_d = out_is_fp4
                                 ? static_cast<unsigned int>(Ndim / 2)
-                                : static_cast<unsigned int>(Ndim) * 2;
+                                : (out_is_mxfp8 ? static_cast<unsigned int>(Ndim)
+                                                : static_cast<unsigned int>(Ndim) * 2);
     unsigned int stride_sa = static_cast<unsigned int>(Kdim / scale_block);
     unsigned int stride_sb = static_cast<unsigned int>(Kdim / scale_block);
 
@@ -203,12 +223,21 @@ static void f4gemm_launch(aiter_tensor_t* A,
         args.GlobalScaleB = GlobalScaleB;
     }
 
-    // Bytes shipped to HW:
-    //   NVFP4: full struct (5 ptrs + 8 scalars + GlobalScaleA/B + 2 log2) = 88B
-    //   MXFP4: drop the 2 trailing persistent log2 dwords                 = 80B
-    size_t arg_size = (intype == F4_INTYPE_NVFP4)
-                          ? sizeof(KernelArgs)
-                          : (sizeof(KernelArgs) - 2 * sizeof(unsigned int));
+    // Bytes shipped to HW -- each .co declares a matching kernarg segment size,
+    // so this must be exact (HIP validates buffer size against it). offsetof keeps
+    // the non-mxfp8 sizes byte-identical to the original 80B/88B layout:
+    //   MXFP4        : dw0..19            = 80B (drop trailing log2 dwords)
+    //   MXFP4 + mxfp8: dw0..21            = 88B (ScaleD overlaid at dw20/21)
+    //   NVFP4        : dw0..21            = 88B (through log2_grid_y)
+    //   NVFP4 + mxfp8: dw0..23 full struct= 96B (dedicated ScaleD at dw22/23)
+    size_t arg_size;
+    if(out_is_mxfp8)
+        arg_size = (intype == F4_INTYPE_NVFP4) ? sizeof(KernelArgs)
+                                               : offsetof(KernelArgs, ptr_ScaleD);
+    else
+        arg_size = (intype == F4_INTYPE_NVFP4)
+                       ? offsetof(KernelArgs, ptr_ScaleD)
+                       : (offsetof(KernelArgs, ptr_ScaleD) - 2 * sizeof(unsigned int));
 
     const HipDeviceGuard device_guard(A->device_id);
 
@@ -340,6 +369,18 @@ static void f4gemm_launch(aiter_tensor_t* A,
         }
     }
 
+    // mxfp8 output E8M0 scale pointer. Mirrors the log2 overlay above: NVFP4 has
+    // its own dw22/23 slot; MXFP4 (log2 already parked in dw18/19) overlays ScaleD
+    // onto its still-unused dw20/21 log2 slots. Set after the persistent block so
+    // it can't be clobbered by the log2 writes.
+    if(out_is_mxfp8)
+    {
+        if(intype == F4_INTYPE_NVFP4)
+            args.ptr_ScaleD = out_scale->ptr;
+        else
+            std::memcpy(&args.log2_grid_x, &out_scale->ptr, sizeof(void*));
+    }
+
     const int bdx = 128; // 4 wave * 32 thread on gfx1250
 
     impl_ptr->launch_kernel(
@@ -350,37 +391,39 @@ AITER_CTYPES_ERROR_DEF
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mxfp4_gemm_asm,
-    (aiter_tensor_t* A,        // A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
-     aiter_tensor_t* B,        // B:[N, K/2] fp4x2 (always preshuffled)
-     aiter_tensor_t* ScaleA,   // ScaleA:[M, K/32] e8m0 (shuffled)
-     aiter_tensor_t* ScaleB,   // ScaleB:[N, K/32] e8m0 (shuffled)
-     aiter_tensor_t* out,      // Out:[M, N] bf16
+    (aiter_tensor_t* A,         // A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
+     aiter_tensor_t* B,         // B:[N, K/2] fp4x2 (always preshuffled)
+     aiter_tensor_t* ScaleA,    // ScaleA:[M, K/32] e8m0 (shuffled)
+     aiter_tensor_t* ScaleB,    // ScaleB:[N, K/32] e8m0 (shuffled)
+     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+     aiter_tensor_t* out_scale, // mxfp8 only: E8M0 [M, N/128] (null otherwise)
      const char*     kernelName,
      int             a_preshuffle,
      hipStream_t     stream),
-    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
+    (A, B, ScaleA, ScaleB, out, out_scale, kernelName, a_preshuffle, stream))
 {
-    f4gemm_launch(A, B, ScaleA, ScaleB, out,
+    f4gemm_launch(A, B, ScaleA, ScaleB, out, out_scale,
                         kernelName, F4_INTYPE_MXFP4, a_preshuffle,
                         0.0f, 0.0f, stream);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     nvfp4_gemm_asm,
-    (aiter_tensor_t* A,        // A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
-     aiter_tensor_t* B,        // B:[N, K/2] fp4x2 (always preshuffled)
-     aiter_tensor_t* ScaleA,   // ScaleA:[M, K/32] e4m3 (shuffled)
-     aiter_tensor_t* ScaleB,   // ScaleB:[N, K/32] e4m3 (shuffled)
+    (aiter_tensor_t* A,         // A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
+     aiter_tensor_t* B,         // B:[N, K/2] fp4x2 (always preshuffled)
+     aiter_tensor_t* ScaleA,    // ScaleA:[M, K/32] e4m3 (shuffled)
+     aiter_tensor_t* ScaleB,    // ScaleB:[N, K/32] e4m3 (shuffled)
      float           GlobalScaleA,
      float           GlobalScaleB,
-     aiter_tensor_t* out,      // Out:[M, N] bf16
+     aiter_tensor_t* out,       // Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+     aiter_tensor_t* out_scale, // mxfp8 only: E8M0 [M, N/128] (null otherwise)
      const char*     kernelName,
      int             a_preshuffle,
      hipStream_t     stream),
     (A, B, ScaleA, ScaleB, GlobalScaleA, GlobalScaleB,
-     out, kernelName, a_preshuffle, stream))
+     out, out_scale, kernelName, a_preshuffle, stream))
 {
-    f4gemm_launch(A, B, ScaleA, ScaleB, out,
+    f4gemm_launch(A, B, ScaleA, ScaleB, out, out_scale,
                         kernelName, F4_INTYPE_NVFP4, a_preshuffle,
                         GlobalScaleA, GlobalScaleB, stream);
 }

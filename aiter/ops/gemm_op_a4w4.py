@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import pandas as pd
 import torch
@@ -164,6 +164,11 @@ def gemm_a4w4(
                 dtype=dtype,
                 a_preshuffle=bool(apreshuffle),
             )
+        # mxfp8 output returns (fp8 data, e8m0 scale); restore the batched leading
+        # dims on both. All other outtypes return a single tensor.
+        if isinstance(out, tuple):
+            o, s = out
+            return o.view(*out_shape), s.view(*A.shape[:-1], s.shape[-1])
         return out.view(*out_shape)
     out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
     if gfx_arch in ["gfx942"]:
@@ -270,7 +275,8 @@ def _mxfp4_gemm_asm(
     B: Tensor,  # B:[N, K/2] fp4x2 (preshuffled)
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
-    out: Tensor,  # Out:[M, N] bf16
+    out: Tensor,  # Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+    out_scale: Optional[Tensor] = None,  # mxfp8 only: E8M0 [M, N/128] (None otherwise)
     kernelName: Optional[str] = None,
     a_preshuffle: int = 1,
 ) -> None: ...
@@ -288,19 +294,49 @@ def _nvfp4_gemm_asm(
     ScaleB: Tensor,  # e4m3 (shuffled)
     GlobalScaleA: float,
     GlobalScaleB: float,
-    out: Tensor,
+    out: Tensor,  # Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
+    out_scale: Optional[Tensor] = None,  # mxfp8 only: E8M0 [M, N/128] (None otherwise)
     kernelName: Optional[str] = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 
 
+# gfx1250 f4gemm mxfp8-output block size along N: the kernel dynamically
+# quantizes each 128-wide output block to fp8 e4m3 and emits one E8M0 scale.
+MXFP8_OUT_SCALE_BLOCK = 128
+
+
+def _is_mxfp8_out(dtype: torch.dtype) -> bool:
+    """mxfp8 output == fp8 e4m3 data + a per-block E8M0 scale (dtypes.fp8)."""
+    return dtype == dtypes.fp8
+
+
 def _alloc_f4gemm_out(M: int, N: int, dtype: torch.dtype, device) -> Tensor:
     """Allocate the F4GEMM output. Packed FP4 (e2m1) output is 2 values/byte, so
-    it is a ``[M, N//2]`` ``fp4x2`` tensor; bf16 output is a plain ``[M, N]``."""
+    it is a ``[M, N//2]`` ``fp4x2`` tensor; bf16 output is a plain ``[M, N]``;
+    mxfp8 output is a plain ``[M, N]`` fp8 (its E8M0 scale is a separate tensor,
+    see :func:`_alloc_f4gemm_out_scale`)."""
     if dtype == dtypes.fp4x2:
         assert N % 2 == 0, "packed fp4 output requires even N"
         return torch.empty((M, N // 2), dtype=dtypes.fp4x2, device=device)
     return torch.empty((M, N), dtype=dtype, device=device)
+
+
+def _alloc_f4gemm_out_scale(
+    M: int, N: int, dtype: torch.dtype, device
+) -> Optional[Tensor]:
+    """Allocate the mxfp8 output E8M0 block-scale ``[M, N//128]``; ``None`` for
+    bf16/fp4 outputs, which carry no output scale (fp4 uses cvt_scale=1)."""
+    if not _is_mxfp8_out(dtype):
+        return None
+    assert (
+        N % MXFP8_OUT_SCALE_BLOCK == 0
+    ), f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
+    # Output-scale packed layout (M/64, scaleN, 16, 4) requires M % 64 == 0.
+    assert M % 64 == 0, f"mxfp8 output-scale packing requires M % 64 == 0, got M={M}"
+    return torch.empty(
+        (M, N // MXFP8_OUT_SCALE_BLOCK), dtype=dtypes.fp8_e8m0, device=device
+    )
 
 
 def gemm_mxfp4_asm(
@@ -308,25 +344,29 @@ def gemm_mxfp4_asm(
     B: Tensor,  # B:[N, K/2] fp4x2
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0
-    dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp4x2 (packed e2m1)
+    dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16, fp4x2 (packed e2m1), or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
-) -> Tensor:
-    """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales; output is bf16
-    ``[M,N]`` or packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1), chosen by ``dtype``."""
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales. Output is chosen
+    by ``dtype``: bf16 ``[M,N]``, packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1), or
+    mxfp8 (``dtype=dtypes.fp8``) which returns ``(out_fp8 [M,N], scale_e8m0
+    [M,N//128])`` -- the kernel quantizes each 128-wide output block on the fly."""
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
     _mxfp4_gemm_asm(
         A,
         B,
         ScaleA,
         ScaleB,
         out,
+        out_scale,
         kernelName if kernelName else None,
         int(bool(a_preshuffle)),
     )
-    return out
+    return (out, out_scale) if out_scale is not None else out
 
 
 def gemm_nvfp4_asm(
@@ -336,15 +376,18 @@ def gemm_nvfp4_asm(
     ScaleB: Tensor,  # e4m3
     GlobalScaleA: float,
     GlobalScaleB: float,
-    dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp4x2 (packed e2m1)
+    dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16, fp4x2 (packed e2m1), or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
-) -> Tensor:
-    """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas;
-    output is bf16 ``[M,N]`` or packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1)."""
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas.
+    Output is chosen by ``dtype``: bf16 ``[M,N]``, packed FP4 ``[M,N//2]`` fp4x2
+    (cvt_scale=1), or mxfp8 (``dtype=dtypes.fp8``) which returns ``(out_fp8 [M,N],
+    scale_e8m0 [M,N//128])`` -- the kernel quantizes each 128-wide block on the fly."""
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device)
+    out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
     _nvfp4_gemm_asm(
         A,
         B,
@@ -353,10 +396,11 @@ def gemm_nvfp4_asm(
         float(GlobalScaleA),
         float(GlobalScaleB),
         out,
+        out_scale,
         kernelName if kernelName else None,
         int(bool(a_preshuffle)),
     )
-    return out
+    return (out, out_scale) if out_scale is not None else out
 
 
 def _as_global_scale(scale) -> float:
