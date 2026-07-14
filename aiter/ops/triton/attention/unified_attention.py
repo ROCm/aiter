@@ -87,7 +87,6 @@ def select_2d_config(
     # base prefill, for short cases
     if not all_decode:
         if head_size >= 512 and not arch.is_rdna:
-            BLOCK_M = max(16, triton.next_power_of_2(num_queries_per_kv))
             num_warps, num_stages_2d = 4, 2
             TILE_SIZE = 16
         elif head_size >= 256 and not arch.is_rdna:
@@ -213,13 +212,11 @@ def select_3d_config(
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
         if head_size >= 512 and not arch.is_rdna:
             MIN_SEGMENTS = min(16, MAX_SEGMENTS)
-        MIN_SEGMENTS = triton.next_power_of_2(MIN_SEGMENTS)
         if num_segments == 0:
             num_segments = math.ceil(target_num_prgms / num_2d_prgms)
             num_segments = min(num_segments, MAX_SEGMENTS)
-            num_segments = triton.next_power_of_2(num_segments)
-            num_segments = min(num_segments, 128)
             num_segments = max(num_segments, MIN_SEGMENTS)
+            num_segments = triton.next_power_of_2(num_segments)
 
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
