@@ -169,12 +169,11 @@ def build_silu_and_mul_fq_module(
         scale_rsrc = _ptr_buffer_resource(out_scale_sorted)
         tid_rsrc = _ptr_buffer_resource(sorted_ids)
         nv_rsrc = _ptr_buffer_resource(num_valid_ids)
-        if enable_bias:
-            topk_rsrc = _ptr_buffer_resource(topk_ids)
-            bias_rsrc = _ptr_buffer_resource(bias)
+        topk_rsrc = _ptr_buffer_resource(topk_ids)
+        bias_rsrc = _ptr_buffer_resource(bias)
 
-            def _load_bias_scalar(offset):
-                return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
+        def _load_bias_scalar(offset):
+            return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
 
         num_valid = buffer_ops.buffer_load(nv_rsrc, c0_i32, vec_width=1, dtype=i32)
         token_num_i32 = ArithValue(token_num)
@@ -213,13 +212,10 @@ def build_silu_and_mul_fq_module(
                 _if_valid = scf.IfOp(is_valid, has_else=True)
                 with ir.InsertionPoint(_if_valid.then_block):
                     in_row = token_id * topk_i32 + slot_id
-                    if enable_bias:
-                        # sorted_ids encodes token and slot, not expert. Use topk_ids
-                        # to recover the expert-specific bias row for this token slot.
-                        expert_id = buffer_ops.buffer_load(
-                            topk_rsrc, in_row, vec_width=1, dtype=i32
-                        )
-                        bias_row = expert_id * inter_dim2_i32
+                    expert_id = buffer_ops.buffer_load(
+                        topk_rsrc, in_row, vec_width=1, dtype=i32
+                    )
+                    bias_row = expert_id * inter_dim2_i32
                     in_row_byte_base = in_row * arith.constant(
                         inter_dim * 2 * elem_bytes_bf16, type=i32
                     )
