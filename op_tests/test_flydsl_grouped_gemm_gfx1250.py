@@ -43,7 +43,7 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.utility import fp4_utils
 from aiter.utility import dtypes
 
@@ -58,6 +58,21 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+
+
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def parse_num_expert_activated():
+    try:
+        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+    except ValueError:
+        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+    if val < 0:
+        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
@@ -232,15 +247,25 @@ def init_weight_scales(
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
 
-def _make_topk(
-    hidden_states: torch.Tensor, experts: int, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route via ``fused_topk``: normal (random gating) by default; round-robin
-    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
-    op_tests/test_moe_2stage.py). Returns ``(topk_ids, topk_weights)`` on the
-    same device as ``hidden_states``."""
-    tokens = hidden_states.shape[0]
-    if AITER_MOE_EXPERT_BALANCE:
+def _make_routing_score(tokens: int, experts: int, topk: int) -> torch.Tensor:
+    """Build the ``(tokens, experts)`` gating score honoring the routing env
+    controls: ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest priority) activates
+    n randomly-chosen experts (round-robin balanced); ``AITER_MOE_EXPERT_BALANCE``
+    round-robins over all experts; otherwise random gating. Shared by the FlyDSL
+    (``_make_topk``) and gluon routing paths so both react to the same env."""
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > experts or n_act > tokens * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
+                f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
+            )
+        sel = torch.randperm(experts)[:n_act]  # random active expert ids
+        score = torch.full((tokens, experts), float("-inf"), dtype=torch.float32)
+        slot = torch.arange(tokens * topk) % n_act  # round-robin over active set
+        rows = torch.arange(tokens).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((tokens, experts), dtype=torch.float32)
         start_col, end_col = 0, topk
         for token_id in range(tokens):
@@ -249,6 +274,19 @@ def _make_topk(
             end_col = start_col + topk
     else:
         score = torch.randn((tokens, experts), dtype=torch.float32)
+    return score
+
+
+def _make_topk(
+    hidden_states: torch.Tensor, experts: int, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route via ``fused_topk``: normal (random gating) by default; round-robin
+    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
+    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
+    priority) restricts topk to the first n experts. Returns
+    ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
+    tokens = hidden_states.shape[0]
+    score = _make_routing_score(tokens, experts, topk)
     topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
     return topk_id.to(torch.int32), topk_w
 
@@ -345,16 +383,21 @@ def _run_grouped_via_fused_moe(
     # Stage1 weight/scale/bias get rearranged to physical ``layout``; stage2
     # has no GUGU/GGUU concept (single N=hidden GEMM).
     if layout == "gugu":
-        w1_phys = _gguu_to_gugu_rows(w1_logical)
         bias1_phys = _gguu_to_gugu_rows(bias1)
         gate_mode = GateMode.INTERLEAVE
     else:
-        w1_phys = w1_logical
         bias1_phys = bias1
         gate_mode = GateMode.SEPARATED
 
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
-    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
+    # Arch-aware stage weight shuffle: GUGU interleaves gate/up rows internally
+    # (moe_shuffle_weight), so pass the logical GGUU weight either way.
+    w1_grouped = moe_shuffle_weight(
+        w1_logical,
+        experts_cnt=experts,
+        is_guinterleave=(layout == "gugu"),
+        gate_up=True,
+    )
+    w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
     if layout == "gugu":
         # GUGU B-scale is always built the production way: feed the RAW GGUU
         # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
@@ -773,6 +816,8 @@ def main() -> None:
     os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
+    # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
+    # K tiles).
     if args.model_dim < 512 or args.inter_dim < 512:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
@@ -791,6 +836,7 @@ def main() -> None:
         args.tokens = _tok
         if len(token_list) > 1:
             print(f"\n===== tokens={_tok} =====", flush=True)
+
         tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
         # raise_on_fail=False so one out-of-gate token does not abort the
         # sweep; the failure is recorded and reported after the table.
