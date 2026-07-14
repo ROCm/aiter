@@ -7,8 +7,10 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
+    run_torch,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
@@ -34,6 +36,7 @@ def bench_gemm_fn(
     layout: str,
     impl: callable,
     shuffle: bool = False,
+    test: bool = False,
 ):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
@@ -56,6 +59,12 @@ def bench_gemm_fn(
     else:
         bench_weight = weight
         bench_x_scale = x_scale
+
+    if test:
+        ref = run_torch(x, weight, x_scale, w_scale, c_dtype)
+        out = impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y)
+        checkAllclose(ref, out, msg=f"M={M},N={N},K={K}")
+
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
@@ -117,7 +126,7 @@ def run_model_benchmark(args, impl):
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle, test=args.test
         )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
@@ -131,7 +140,7 @@ def run_shape_benchmark(args, impl):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle, test=args.test
         )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
@@ -181,6 +190,12 @@ def parse_args(args: list[str] | None = None):
         "-preshuffle",
         action="store_true",
         help="Use preshuffle implementation",
+    )
+    parser.add_argument(
+        "-test",
+        action="store_true",
+        help="Run a correctness check for each benchmarked shape against a "
+        "torch reference (mirrors op_tests/test_gemm_a8w8_blockscale.py).",
     )
     return get_ff_args(parser, args=args)
 
