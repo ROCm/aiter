@@ -411,7 +411,17 @@ jobs:
 
               cell_env = cell.setdefault("env", {})
               for scope in ("common", "prefill", "decode"):
-                  cell_env.setdefault(scope, {})["ATOM_PD_RANK_MAPPING_POLICY"] = "idx2idx"
+                  scope_env = cell_env.setdefault(scope, {})
+                  scope_env["ATOM_PD_RANK_MAPPING_POLICY"] = "idx2idx"
+                  # Pin Mooncake KV-transfer RoCE to the RoCE v2 IPv4 GID (index 1)
+                  # and the same lossless traffic class NCCL uses (NCCL_IB_TC=104).
+                  # The Mooncake engine reads MC_GID_INDEX / MC_IB_TC; without them it
+                  # falls back to a link-local GID (cross-node QP handshake times out,
+                  # "modify QP to RTR ... check gid") and traffic class 0 (the
+                  # PFC-congested class, so bulk KV writes stall and hit the 30s
+                  # transfer timeout). ATOM sets neither today.
+                  scope_env["MC_GID_INDEX"] = "1"
+                  scope_env["MC_IB_TC"] = "104"
 
               cell_path = cells_dir / f"{cell['id']}.json"
               cell_path.write_text(json.dumps(cell, indent=2), encoding="utf-8")
