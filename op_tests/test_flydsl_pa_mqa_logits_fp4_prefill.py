@@ -2,12 +2,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""aiter op-test for ``flydsl_pa_mqa_logits_fp4_prefill``.
+"""aiter op-test for ``flydsl_pa_mqa_logits_fp4_prefill`` and
+``flydsl_pa_mqa_logits_fp4_varqlen``.
 
 Validates the ragged-prefill FP4 paged MQA logits kernel (gfx950) against a
 pure-torch reference. Each query row owns a seq-local window
 ``[local_start, local_end)`` into its sequence's paged FP4 KV cache, read
 straight from ``block_tables`` (no cp_gather staging).
+
+The variable-qlen path (``flydsl_pa_mqa_logits_fp4_varqlen``) is the same kernel
+driven by a ``cu_seq_q`` (per-batch qlen prefix-sum) adapter with MTP tail-causal
+windows ``[0, ctx_b - qlen_b + n]``; those cases also report TFLOPS / GB/s.
 
 Accuracy (torch ref):
   - vs exact FP4-dequant ref  -> kernel correctness (cos ~ 1.0)
@@ -456,6 +461,223 @@ def _bench_vs_atom(
     print()
 
 
+# ── Variable-qlen (per-batch MTP) via cu_seq_q ───────────────────────
+
+_VARQLEN_PERF_SUMMARY = []
+
+
+def _mtp_windows_ref(qlens, ctxs):
+    """Independent (python) construction of the MTP tail-causal windows, used
+    both for the torch reference and to unit-check the device-side builder."""
+    rb, ls, le = [], [], []
+    for b, (ql, ctx) in enumerate(zip(qlens, ctxs)):
+        for n in range(ql):
+            rb.append(b)
+            ls.append(0)
+            le.append(max(0, ctx - ql + n + 1))
+    return rb, ls, le
+
+
+def run_varqlen_case(
+    qlens,
+    ctxs,
+    heads=64,
+    head_dim=128,
+    kv_block_size=64,
+    block_k=256,
+    seed=0,
+    bench=True,
+    iters=50,
+    warmup=10,
+):
+    from aiter.ops.flydsl import (
+        flydsl_pa_mqa_logits_fp4_prefill,
+        flydsl_pa_mqa_logits_fp4_varqlen,
+    )
+    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+        _build_varqlen_mtp_windows,
+        compute_prefill_schedule,
+    )
+
+    torch.manual_seed(seed)
+    bs = len(qlens)
+    assert len(ctxs) == bs
+    total_q = int(sum(qlens))
+
+    max_end = max(ctxs)
+    max_blocks_per_seq = max(
+        (max_end + block_k - 1) // block_k * (block_k // kv_block_size),
+        block_k // kv_block_size,
+    )
+    t_max = max_blocks_per_seq * kv_block_size
+    max_seq_len = t_max
+    num_blocks = max_blocks_per_seq * bs
+
+    # ---- paged FP4 KV (dense per-batch cache, contiguous block_tables) ----
+    kv_bf16 = torch.randn(bs, t_max, head_dim, dtype=torch.bfloat16, device=dev)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(
+        bs, max_blocks_per_seq
+    )
+    kv_fp4_d, kv_e8_d = fp4_quant_e2m1_with_e8m0(kv_bf16.reshape(-1, head_dim))
+    kv_dq = fp4_dequant_e2m1_with_e8m0(
+        kv_fp4_d.reshape(bs, t_max, head_dim // 2),
+        kv_e8_d.reshape(bs, t_max, head_dim // 32),
+    )
+    k_flat = kv_bf16.reshape(bs * t_max, head_dim)
+    tb = torch.arange(bs, device=dev).repeat_interleave(t_max)
+    tt = torch.arange(t_max, device=dev).repeat(bs)
+    phys = block_tables[tb, tt // kv_block_size].long()
+    slot_mapping = (phys * kv_block_size + (tt % kv_block_size)).to(torch.int32)
+    k_tiles = head_dim // 128
+    kv_cache = torch.zeros(
+        num_blocks, k_tiles, 4, kv_block_size, 16, dtype=torch.uint8, device=dev
+    )
+    kv_scale = torch.zeros(
+        num_blocks, k_tiles, 4, kv_block_size, dtype=torch.uint8, device=dev
+    )
+    indexer_k_fp4_paged_preshuffle(
+        k_flat, slot_mapping, kv_cache, kv_scale, kv_block_size
+    )
+
+    # ---- packed (ragged) Q / weights: [total_q, ...] ----
+    q_bf16 = torch.randn(total_q, heads, head_dim, dtype=torch.bfloat16, device=dev)
+    weights = (torch.randn(total_q, heads, dtype=torch.float32, device=dev) * 0.1).to(
+        torch.bfloat16
+    )
+    weight_scale = 1.5
+    q_fp4, q_scale = quant_q_fp4_preshuffle(q_bf16)
+    q_e8 = fp4_quant_e2m1_with_e8m0(q_bf16.reshape(total_q * heads, head_dim))[
+        1
+    ].reshape(total_q, heads, head_dim // 32)
+    q_dq = fp4_dequant_e2m1_with_e8m0(
+        q_fp4.reshape(total_q, heads, head_dim // 2), q_e8
+    )
+
+    # ---- cu_seq_q (prefix-sum of per-batch qlen) + per-batch KV length ----
+    cu = [0]
+    for ql in qlens:
+        cu.append(cu[-1] + ql)
+    cu_seq_q = torch.tensor(cu, dtype=torch.int32, device=dev)
+    context_lens = torch.tensor(ctxs, dtype=torch.int32, device=dev)
+
+    # ---- unit-check the device builder against the independent python windows ----
+    rb_ref, ls_ref, le_ref = _mtp_windows_ref(qlens, ctxs)
+    rb_k, ls_k, le_k = _build_varqlen_mtp_windows(cu_seq_q, context_lens, total_q)
+    assert rb_k.tolist() == rb_ref, f"row_to_batch: {rb_k.tolist()} != {rb_ref}"
+    assert ls_k.tolist() == ls_ref, "local_starts mismatch"
+    assert le_k.tolist() == le_ref, f"local_ends: {le_k.tolist()} != {le_ref}"
+
+    ref_fp4 = ref_prefill_logits(
+        q_dq, kv_dq, weights, rb_ref, ls_ref, le_ref, max_seq_len, weight_scale
+    )
+    ref_bf16 = ref_prefill_logits(
+        q_bf16, kv_bf16, weights, rb_ref, ls_ref, le_ref, max_seq_len, weight_scale
+    )
+
+    out = flydsl_pa_mqa_logits_fp4_varqlen(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        cu_seq_q,
+        context_lens,
+        max_seq_len,
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+    )
+    torch.cuda.synchronize()
+
+    m = ~torch.isneginf(ref_fp4)
+    cos_exact = _cos(out[m], ref_fp4[m]).item()
+    cos_bf16 = _cos(out[m], ref_bf16[m]).item()
+    oob_ok = bool(torch.isneginf(out[~m]).all().item()) if (~m).any() else True
+    print(
+        f"  qlens={qlens} ctxs={ctxs} heads={heads} total_q={total_q} "
+        f"cos_exact={cos_exact:.6f} cos_bf16={cos_bf16:.6f} oob_neginf={oob_ok}"
+    )
+    assert cos_exact > 0.99, f"kernel vs FP4-dequant ref cos {cos_exact:.4f} < 0.99"
+    assert cos_bf16 > 0.95, f"kernel vs bf16 ref cos {cos_bf16:.4f} < 0.95"
+    assert oob_ok, "OOB cells were not left at -inf"
+
+    if not bench:
+        return
+
+    # ---- Perf: isolate the kernel launch (precompute the schedule once) ----
+    pun = total_q * max(1, (max_seq_len + block_k - 1) // block_k)
+    _, cta_info, n_ctas = compute_prefill_schedule(
+        rb_k, ls_k, le_k, block_k, pun, max_seq_len
+    )
+    out_buf = torch.full(
+        (total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    def run_fp4():
+        flydsl_pa_mqa_logits_fp4_prefill(
+            q_fp4,
+            q_scale,
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            rb_k,
+            ls_k,
+            le_k,
+            max_seq_len,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+            parallel_unit_num=pun,
+            out=out_buf,
+            cta_info=cta_info,
+            n_ctas=n_ctas,
+        )
+
+    _, us = run_perftest(run_fp4, num_iters=iters, num_warmup=warmup)
+
+    # USEFUL work (exact ragged): (row, token) pairs = sum of window lengths.
+    # Bytes: Q/weights/out counted once; KV as the per-batch unique footprint
+    # (max window over the batch's rows), i.e. assuming cross-row KV reuse (L2).
+    head_dim_packed, head_dim_scales = head_dim // 2, head_dim // 32
+    win = [int(e - s) for s, e in zip(ls_ref, le_ref)]
+    pairs = sum(win)
+    kv_uni = {}
+    for b, e in zip(rb_ref, le_ref):
+        kv_uni[b] = max(kv_uni.get(b, 0), int(e))
+    kv_tokens = sum(kv_uni.values())
+    flops = pairs * heads * (2 * head_dim + 3)
+    bytes_total = (
+        total_q * heads * (head_dim_packed + head_dim_scales)  # Q fp4 + scale
+        + kv_tokens * (head_dim_packed + head_dim_scales)  # KV fp4 + scale
+        + total_q * heads * 2  # weights bf16
+        + bs * max_blocks_per_seq * 4  # block_tables i32
+        + pairs * 4  # out fp32 (written window)
+    )
+    sec = us * 1e-6
+    tflops = flops / sec / 1e12
+    gbps = bytes_total / sec / 1e9
+    _VARQLEN_PERF_SUMMARY.append((total_q, heads, pairs, kv_tokens, us, tflops, gbps))
+
+
+def _print_varqlen_perf_summary():
+    print("\n" + "=" * 80)
+    print("Perf summary (flydsl varqlen FP4; kernel-only, useful FLOPs/bytes)")
+    print("=" * 80)
+    print(
+        f"  {'total_q':>7} | {'heads':>5} | {'pairs':>8} | {'kv_tok':>7} | "
+        f"{'us':>9} | {'TFLOPS':>7} | {'GB/s':>7}"
+    )
+    print("  " + "-" * 68)
+    for total_q, heads, pairs, kv_tokens, us, tflops, gbps in _VARQLEN_PERF_SUMMARY:
+        print(
+            f"  {total_q:>7} | {heads:>5} | {pairs:>8} | {kv_tokens:>7} | "
+            f"{us:>9.2f} | {tflops:>7.2f} | {gbps:>7.1f}"
+        )
+    print()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", action="store_true")
@@ -499,6 +721,31 @@ def main():
             iters=args.iters,
             warmup=args.warmup,
         )
+
+    # ── Variable-qlen (per-batch MTP via cu_seq_q) sweep + TFLOPS/bandwidth ──
+    print("=" * 80)
+    print("[test] FP4 paged variable-qlen (per-batch MTP) MQA logits")
+    print("=" * 80)
+    varqlen_cfgs = [
+        ([3, 1, 2], [512, 320, 768], 64, 0),
+        ([10, 1, 5, 2], [1024, 256, 2048, 512], 64, 1),  # incl a qlen=10 batch
+        ([2, 0, 3], [384, 256, 640], 64, 2),  # empty batch (qlen=0)
+        ([4, 3], [512, 768], 128, 3),
+        ([16, 8, 24, 4], [4096, 2048, 4096, 1024], 64, 4),  # larger (repr. perf)
+    ]
+    for qlens, ctxs, vheads, seed in varqlen_cfgs:
+        run_varqlen_case(
+            qlens,
+            ctxs,
+            heads=vheads,
+            seed=seed,
+            bench=args.bench,
+            iters=args.iters,
+            warmup=args.warmup,
+        )
+    if _VARQLEN_PERF_SUMMARY:
+        _print_varqlen_perf_summary()
+
     print("  PASS")
 
 

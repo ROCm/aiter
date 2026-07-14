@@ -756,3 +756,70 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         stream,
     )
     return out
+
+
+def _build_varqlen_mtp_windows(cu_seq_q, context_lens, total_q):
+    """Build ragged-row metadata for per-batch variable query length (MTP)."""
+    dev = cu_seq_q.device
+    cu = cu_seq_q.to(torch.int32)
+    B = context_lens.shape[0]
+    r = torch.arange(total_q, device=dev, dtype=torch.int32)
+    # row -> batch = number of batch-ends (cu[1:]) that are <= r.
+    row_to_batch = torch.searchsorted(cu[1:].contiguous(), r, right=True).to(
+        torch.int32
+    )
+    row_to_batch = row_to_batch.clamp_(max=max(B - 1, 0))
+    n = r - cu[:-1][row_to_batch]  # in-batch position
+    qlen = (cu[1:] - cu[:-1])[row_to_batch]
+    ctx = context_lens.to(torch.int32)[row_to_batch]
+    local_starts = torch.zeros(total_q, device=dev, dtype=torch.int32)
+    local_ends = (ctx - qlen + n + 1).clamp_(min=0).to(torch.int32)
+    return row_to_batch, local_starts, local_ends
+
+
+def flydsl_pa_mqa_logits_fp4_varqlen(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    weight_scale: float = 1.0,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    parallel_unit_num: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    """Variable-qlen (per-batch MTP) FP4 paged MQA logits (gfx950)."""
+    total_q = q_fp4.shape[0]
+    row_to_batch, local_starts, local_ends = _build_varqlen_mtp_windows(
+        cu_seq_q, context_lens, total_q
+    )
+    if parallel_unit_num is None:
+        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
+        parallel_unit_num = total_q * chunks_per_seq
+    return flydsl_pa_mqa_logits_fp4_prefill(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_to_batch,
+        local_starts,
+        local_ends,
+        max_seq_len,
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        num_warps=num_warps,
+        parallel_unit_num=parallel_unit_num,
+        out=out,
+        stream=stream,
+    )
