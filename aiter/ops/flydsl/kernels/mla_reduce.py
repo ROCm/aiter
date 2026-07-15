@@ -149,9 +149,7 @@ def _if_then(if_op):
             yield if_op.then_block
         finally:
             blk = if_op.then_block
-            if (not blk.operations) or not isinstance(
-                blk.operations[-1], scf.YieldOp
-            ):
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
                 scf.YieldOp([])
 
 
@@ -165,9 +163,7 @@ def _if_else(if_op):
             yield if_op.else_block
         finally:
             blk = if_op.else_block
-            if (not blk.operations) or not isinstance(
-                blk.operations[-1], scf.YieldOp
-            ):
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
                 scf.YieldOp([])
 
 
@@ -313,10 +309,7 @@ def compile_mla_reduce(
                 return
             out_vec = fx.vector.from_elements(
                 out_vt,
-                [
-                    _to_raw(elems_f32[i].truncf(out_t))
-                    for i in fx.range_constexpr(VEC)
-                ],
+                [_to_raw(elems_f32[i].truncf(out_t)) for i in fx.range_constexpr(VEC)],
             )
             g.vec_store((off_idx,), out_vec, VEC)
 
@@ -348,9 +341,7 @@ def compile_mla_reduce(
             scalarizable, so the sentinel becomes an ``s_load_dword``.
             """
             idx_index = fx.arith.index_cast(T.index, _to_raw(idx))
-            byte_off = fx.arith.muli(
-                idx_index, fx.arith.constant(4, index=True)
-            )
+            byte_off = fx.arith.muli(idx_index, fx.arith.constant(4, index=True))
             addr_i64 = g_indptr.get_llvm_ptr(reduce_indptr, byte_off)
             addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _to_raw(addr_i64))
             # invariant=True -> !invariant.load: reduce_indptr is read-only in
@@ -427,12 +418,8 @@ def compile_mla_reduce(
 
             if fx.const_expr(not disable_guards):
                 q_valid = fx.arith.andi(
-                    fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)
-                    ),
-                    fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.slt, q_start, num_final_rows
-                    ),
+                    fx.arith.cmpi(fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)),
+                    fx.arith.cmpi(fx.arith.CmpIPredicate.slt, q_start, num_final_rows),
                 )
                 has_work = fx.arith.andi(has_work, q_valid)
                 q_end_oob = fx.arith.cmpi(
@@ -453,9 +440,7 @@ def compile_mla_reduce(
                 row_i32 = pmap_i32 + local_seq
                 if fx.const_expr(not disable_guards):
                     in_bounds = fx.arith.andi(
-                        fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.sge, row_i32, fx.Int32(0)
-                        ),
+                        fx.arith.cmpi(fx.arith.CmpIPredicate.sge, row_i32, fx.Int32(0)),
                         fx.arith.cmpi(
                             fx.arith.CmpIPredicate.slt,
                             row_i32,
@@ -468,9 +453,7 @@ def compile_mla_reduce(
                         fx.arith.CmpIPredicate.eq, fx.Int32(0), fx.Int32(0)
                     )
                     safe_row_i32 = row_i32
-                row_idx = fx.arith.index_cast(
-                    ir.IndexType.get(), _to_raw(safe_row_i32)
-                )
+                row_idx = fx.arith.index_cast(ir.IndexType.get(), _to_raw(safe_row_i32))
                 return row_idx, in_bounds
 
             def pmap_value(split_i32, direct_pmap: bool = False):
@@ -604,9 +587,7 @@ def compile_mla_reduce(
                 make.
                 """
                 neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
-                is_wave0 = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.eq, wave, fx.Int32(0)
-                )
+                is_wave0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, wave, fx.Int32(0))
                 if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_w0.then_block):
                     local_lses = []
@@ -631,9 +612,7 @@ def compile_mla_reduce(
                         max_lse = fx.arith.maximumf(max_lse, peer)
                     sum_e = fx.arith.constant(0.0, type=T.f32)
                     for j in fx.range_constexpr(nlse):
-                        sum_e = sum_e + _exp(
-                            local_lses[j] - max_lse, use_exp2
-                        )
+                        sum_e = sum_e + _exp(local_lses[j] - max_lse, use_exp2)
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = mlir_gpu.ShuffleOp(
                             _to_raw(sum_e),
@@ -648,9 +627,7 @@ def compile_mla_reduce(
                             sum_e,
                             fx.arith.constant(0.0, type=T.f32),
                         ),
-                        fx.arith.cmpf(
-                            fx.arith.CmpFPredicate.UNO, sum_e, sum_e
-                        ),
+                        fx.arith.cmpf(fx.arith.CmpFPredicate.UNO, sum_e, sum_e),
                     )
                     inf = fx.arith.constant(float("inf"), type=T.f32)
                     global_lse = bad.select(inf, _log(sum_e) + max_lse)
@@ -670,9 +647,7 @@ def compile_mla_reduce(
                         )
                         if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
                         with ir.InsertionPoint(if_l0.then_block):
-                            lse_off = (
-                                seq_i32 * fx.Int32(H) + fx.Int32(head)
-                            )
+                            lse_off = seq_i32 * fx.Int32(H) + fx.Int32(head)
                             g_flse[fx.Index(lse_off)] = global_lse
                             scf.YieldOp([])
                     scf.YieldOp([])
@@ -795,9 +770,7 @@ def compile_mla_reduce(
                 sc_g0 = load_scales(fx.Int32(0), valid_g0)
                 init_os = []
                 for j in fx.range_constexpr(GRP):
-                    init_os += [
-                        _to_raw(os_g0[j][k]) for k in fx.range_constexpr(VEC)
-                    ]
+                    init_os += [_to_raw(os_g0[j][k]) for k in fx.range_constexpr(VEC)]
                 init_regs = [_to_raw(zero_f) for _ in fx.range_constexpr(VEC)]
                 init_sc = [_to_raw(sc_g0[j]) for j in fx.range_constexpr(GRP)]
                 init_state = init_os + init_regs + init_sc
@@ -821,9 +794,7 @@ def compile_mla_reduce(
                         [state[j * VEC + k] for k in fx.range_constexpr(VEC)]
                         for j in fx.range_constexpr(GRP)
                     ]
-                    regs = [
-                        state[GRP * VEC + k] for k in fx.range_constexpr(VEC)
-                    ]
+                    regs = [state[GRP * VEC + k] for k in fx.range_constexpr(VEC)]
                     sc_g = [state[_sbase + j] for j in fx.range_constexpr(GRP)]
                     return os_g, regs, sc_g
 
@@ -852,9 +823,7 @@ def compile_mla_reduce(
                         ]
                     next_sc = [_to_raw(n_sc[j]) for j in fx.range_constexpr(GRP)]
                     results = yield (
-                        next_os_flat
-                        + [_to_raw(r) for r in new_regs]
-                        + next_sc
+                        next_os_flat + [_to_raw(r) for r in new_regs] + next_sc
                     )
 
                 os_g, regs, sc_g = unpack(results)
@@ -878,9 +847,7 @@ def compile_mla_reduce(
                             n_splits,
                             fx.Int32(64),
                         )
-                        if_le64 = scf.IfOp(
-                            is_le_64, results_=[], has_else=True
-                        )
+                        if_le64 = scf.IfOp(is_le_64, results_=[], has_else=True)
                         with _if_then(if_le64):
                             if fx.const_expr(M64_HI_THR > 0):
                                 # Runtime M64 sub-split: high-split M64 tiles
@@ -893,9 +860,7 @@ def compile_mla_reduce(
                                     n_splits,
                                     fx.Int32(M64_HI_THR),
                                 )
-                                if_hi = scf.IfOp(
-                                    is_hi, results_=[], has_else=True
-                                )
+                                if_hi = scf.IfOp(is_hi, results_=[], has_else=True)
                                 with _if_then(if_hi):
                                     emit_massive_body(
                                         seq_i32,
@@ -921,9 +886,7 @@ def compile_mla_reduce(
                                 n_splits,
                                 fx.Int32(256),
                             )
-                            if_le256 = scf.IfOp(
-                                is_le_256, results_=[], has_else=True
-                            )
+                            if_le256 = scf.IfOp(is_le_256, results_=[], has_else=True)
                             with _if_then(if_le256):
                                 emit_massive_body(
                                     seq_i32, local_seq, 4, direct_pmap=direct_pmap
@@ -938,9 +901,7 @@ def compile_mla_reduce(
                 elif fx.const_expr(not is_massive):
                     emit_simple_body(seq_i32, local_seq, direct_pmap)
                 else:
-                    emit_massive_body(
-                        seq_i32, local_seq, NLSE, direct_pmap=direct_pmap
-                    )
+                    emit_massive_body(seq_i32, local_seq, NLSE, direct_pmap=direct_pmap)
 
             def run_seq_loop(direct_pmap: bool = False):
                 for seq in range(seq0, ub_seq, ntg, init=None):
@@ -978,9 +939,7 @@ def compile_mla_reduce(
             after = ir.Block.create_at_start(w.after, [T.i32])
             with ir.InsertionPoint(before):
                 work_idx = fx.Int32(before.arguments[0])
-                in_range = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.slt, work_idx, tot_work
-                )
+                in_range = fx.arith.cmpi(fx.arith.CmpIPredicate.slt, work_idx, tot_work)
                 scf.ConditionOp(in_range, [before.arguments[0]])
             with ir.InsertionPoint(after):
                 work_idx = fx.Int32(after.arguments[0])
@@ -992,15 +951,11 @@ def compile_mla_reduce(
                 # Uniform sentinel -> scalar s_load_dword (reduce.cu:688), not a
                 # per-lane buffer_load + s_waitcnt lgkmcnt(0) (the traversal floor).
                 tile_start = _scalar_indptr(tile)
-                is_past_end = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.eq, tile_start, last
-                )
+                is_past_end = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tile_start, last)
                 not_past_end = fx.arith.cmpi(
                     fx.arith.CmpIPredicate.ne, tile_start, last
                 )
-                if_has_work = scf.IfOp(
-                    not_past_end, results_=[], has_else=False
-                )
+                if_has_work = scf.IfOp(not_past_end, results_=[], has_else=False)
                 with ir.InsertionPoint(if_has_work.then_block):
                     process_work_item(head, block_idx, tile, num_thread_group)
                     # LDS (lds_pmap, lds_scale) is reused per work item; fence
@@ -1008,9 +963,7 @@ def compile_mla_reduce(
                     fx.gpu.barrier()
                     scf.YieldOp([])
 
-                next_work = is_past_end.select(
-                    tot_work, work_idx + grid_stride
-                )
+                next_work = is_past_end.select(tot_work, work_idx + grid_stride)
                 scf.YieldOp([_to_raw(next_work)])
         else:
             head = fx.block_idx.x
@@ -1151,9 +1104,7 @@ def plan_splitk(*, active_tiles, H, max_seqlen_q, max_splits, num_cu):
         os.environ.get("MLA_SPLITK_MIN_SPLITS", _SPLITK_MIN_SPLITS_DEFAULT)
     )
     max_active = int(
-        os.environ.get(
-            "MLA_SPLITK_MAX_ACTIVE_TILES", _SPLITK_MAX_ACTIVE_TILES_DEFAULT
-        )
+        os.environ.get("MLA_SPLITK_MAX_ACTIVE_TILES", _SPLITK_MAX_ACTIVE_TILES_DEFAULT)
     )
     if max_seqlen_q != 1:
         return False, 1, 0  # decode-only prototype (NTG == 1)
@@ -1180,8 +1131,6 @@ def derive_actual_max_splits(reduce_indptr) -> int:
     is a one-time host read of the true per-tile split width; phase 2 replaces
     this helper with a scalar emitted directly by the metadata kernel.
     """
-    import torch
-
     if reduce_indptr.numel() < 2:
         return 0
     diffs = reduce_indptr[1:] - reduce_indptr[:-1]
@@ -1240,9 +1189,7 @@ def plan_splitk_capture_safe(
     if max_seqlen_q != 1:
         return False, 1, 0  # decode-only prototype (NTG == 1)
     engage_splits = (
-        int(num_kv_splits)
-        if actual_max_splits is None
-        else int(actual_max_splits)
+        int(num_kv_splits) if actual_max_splits is None else int(actual_max_splits)
     )
     if engage_splits < min_splits:
         return False, 1, 0  # perf heuristic: too few splits to amortize combine
@@ -1370,15 +1317,13 @@ def compile_mla_reduce_splitk(
         for s, state in range(lo_idx, hi_idx, fx.Index(1), init=init):
             regs = [state[i] for i in fx.range_constexpr(VEC)]
             m = state[VEC]
-            l = state[VEC + 1]
+            lse_acc = state[VEC + 1]
             s_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(s)))
             split_i32 = t0 + s_i32
             pmap_v = fx.Int32(g_pmap[fx.Index(split_i32)])
             in_b = fx.arith.andi(
                 fx.arith.cmpi(fx.arith.CmpIPredicate.sge, pmap_v, fx.Int32(0)),
-                fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.slt, pmap_v, num_partial_rows
-                ),
+                fx.arith.cmpi(fx.arith.CmpIPredicate.slt, pmap_v, num_partial_rows),
             )
             safe_row = in_b.select(pmap_v, fx.Int32(0))
             row_idx = fx.arith.index_cast(T.index, _to_raw(safe_row))
@@ -1392,19 +1337,19 @@ def compile_mla_reduce_splitk(
                 _to_raw(regs[i] * c_old + os[i] * c_new)
                 for i in fx.range_constexpr(VEC)
             ]
-            new_l = l * c_old + c_new
+            new_l = lse_acc * c_old + c_new
             results = yield new_regs + [_to_raw(new_m), _to_raw(new_l)]
 
         regs = [results[i] for i in fx.range_constexpr(VEC)]
         m = results[VEC]
-        l = results[VEC + 1]
+        lse_acc = results[VEC + 1]
         prow = fx.Index(w)
         _f32_vec_store(g_acc, prow, col, regs)
         is_t0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
         if_t0 = scf.IfOp(is_t0, results_=[], has_else=False)
         with ir.InsertionPoint(if_t0.then_block):
             g_ml[prow, fx.Index(0)] = m
-            g_ml[prow, fx.Index(1)] = l
+            g_ml[prow, fx.Index(1)] = lse_acc
             scf.YieldOp([])
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
@@ -1440,9 +1385,7 @@ def compile_mla_reduce_splitk(
         q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
         q_valid = fx.arith.andi(
             fx.arith.cmpi(fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)),
-            fx.arith.cmpi(
-                fx.arith.CmpIPredicate.slt, q_start, num_final_rows
-            ),
+            fx.arith.cmpi(fx.arith.CmpIPredicate.slt, q_start, num_final_rows),
         )
 
         neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
@@ -1473,9 +1416,7 @@ def compile_mla_reduce_splitk(
         if_q = scf.IfOp(q_valid, results_=[], has_else=False)
         with ir.InsertionPoint(if_q.then_block):
             store_off = (
-                q_start * stride_s_o
-                + head * stride_h_o
-                + fx.Int32(tid) * fx.Int32(VEC)
+                q_start * stride_s_o + head * stride_h_o + fx.Int32(tid) * fx.Int32(VEC)
             )
             if fx.const_expr(VEC == 1):
                 g_fo[fx.Index(store_off)] = out_elems[0].truncf(_out_t_local)
@@ -1490,16 +1431,12 @@ def compile_mla_reduce_splitk(
                 g_fo.vec_store((fx.Index(store_off),), out_vec, VEC)
             if fx.const_expr(output_lse):
                 bad = fx.arith.ori(
-                    fx.arith.cmpf(
-                        fx.arith.CmpFPredicate.OEQ, den, zero_f
-                    ),
+                    fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, den, zero_f),
                     fx.arith.cmpf(fx.arith.CmpFPredicate.UNO, den, den),
                 )
                 inf = fx.arith.constant(float("inf"), type=T.f32)
                 lse_val = bad.select(inf, _log(den) + M)
-                is_l0 = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.eq, tid, fx.Int32(0)
-                )
+                is_l0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
                 if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_l0.then_block):
                     lse_off = q_start * c_H + head

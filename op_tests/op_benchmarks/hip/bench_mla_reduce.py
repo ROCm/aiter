@@ -20,23 +20,35 @@ def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, M=1, device="cuda", se
         num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(num_partial_rows, H, dtype=torch.float32, device=device, generator=g) * 2.0
+        torch.randn(
+            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
+        * 2.0
     )
     reduce_indptr = torch.arange(
         0, num_partial_rows + 1, num_splits, dtype=torch.int32, device=device
     )
-    reduce_partial_map = torch.arange(num_partial_rows, dtype=torch.int32, device=device)
+    reduce_partial_map = torch.arange(
+        num_partial_rows, dtype=torch.int32, device=device
+    )
     q_start = torch.arange(num_tiles, dtype=torch.int32, device=device) * M
     reduce_final_map = torch.stack([q_start, q_start + M], dim=1).contiguous()
     final_output = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=device)
     final_lse = torch.zeros(num_tiles * M, H, dtype=torch.float32, device=device)
     return (
-        partial_output, partial_lse, reduce_indptr, reduce_final_map,
-        reduce_partial_map, final_output, final_lse,
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        final_output,
+        final_lse,
     )
 
 
-def build_irregular_inputs(splits_per_tile, H, Dv, out_dtype, M=1, gap_stride=1, device="cuda", seed=0):
+def build_irregular_inputs(
+    splits_per_tile, H, Dv, out_dtype, M=1, gap_stride=1, device="cuda", seed=0
+):
     g = torch.Generator(device=device).manual_seed(seed)
     num_tiles = len(splits_per_tile)
     total_splits = sum(int(s) for s in splits_per_tile)
@@ -59,7 +71,10 @@ def build_irregular_inputs(splits_per_tile, H, Dv, out_dtype, M=1, gap_stride=1,
         num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(num_partial_rows, H, dtype=torch.float32, device=device, generator=g) * 2.0
+        torch.randn(
+            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
+        * 2.0
     )
 
     q_start = torch.arange(num_tiles, dtype=torch.int32, device=device) * M
@@ -72,8 +87,13 @@ def build_irregular_inputs(splits_per_tile, H, Dv, out_dtype, M=1, gap_stride=1,
     final_output = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=device)
     final_lse = torch.zeros(num_tiles * M, H, dtype=torch.float32, device=device)
     return (
-        partial_output, partial_lse, reduce_indptr, reduce_final_map,
-        reduce_partial_map, final_output, final_lse,
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        final_output,
+        final_lse,
     )
 
 
@@ -127,7 +147,9 @@ def _bench_and_print(run, indptr, H, Dv, out_dtype, M, label):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["uniform", "irregular", "replay"], default="uniform")
+    ap.add_argument(
+        "--mode", choices=["uniform", "irregular", "replay"], default="uniform"
+    )
     ap.add_argument("--H", type=int, default=128)
     ap.add_argument("--Dv", type=int, default=512)
     ap.add_argument("--M", type=int, default=1)
@@ -141,7 +163,9 @@ def main():
     ap.add_argument("--splits-list-file", default=None)
     ap.add_argument("--gap-stride", type=int, default=1)
     # replay
-    ap.add_argument("--meta", default=None, help="path to .pt from dump_decode_metadata.py")
+    ap.add_argument(
+        "--meta", default=None, help="path to .pt from dump_decode_metadata.py"
+    )
     args = ap.parse_args()
 
     _dt = {"bf16": torch.bfloat16, "fp16": torch.float16}
@@ -149,7 +173,9 @@ def main():
 
     if args.mode == "uniform":
         H, Dv, T, S, M = args.H, args.Dv, args.tiles, args.splits, args.M
-        po, pl, indptr, fmap, pmap, fout, flse = build_inputs(T, S, H, Dv, out_dtype, M=M)
+        po, pl, indptr, fmap, pmap, fout, flse = build_inputs(
+            T, S, H, Dv, out_dtype, M=M
+        )
 
         def run():
             aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, 0, fout, flse)
@@ -160,15 +186,23 @@ def main():
         H, Dv, M = args.H, args.Dv, args.M
         if args.splits_list_file:
             with open(args.splits_list_file) as f:
-                splits_per_tile = [int(l.strip()) for l in f if l.strip()]
+                splits_per_tile = [int(line.strip()) for line in f if line.strip()]
         elif args.splits_per_tile:
             splits_per_tile = [int(x) for x in args.splits_per_tile.split(",")]
         else:
-            ap.error("--mode irregular requires --splits-per-tile or --splits-list-file")
+            ap.error(
+                "--mode irregular requires --splits-per-tile or --splits-list-file"
+            )
         po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-            splits_per_tile, H, Dv, out_dtype, M=M, gap_stride=args.gap_stride,
+            splits_per_tile,
+            H,
+            Dv,
+            out_dtype,
+            M=M,
+            gap_stride=args.gap_stride,
         )
-        fout.zero_(); flse.zero_()
+        fout.zero_()
+        flse.zero_()
 
         def run():
             aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, 0, fout, flse)
@@ -186,12 +220,19 @@ def main():
         M = args.M
 
         indptr = meta["reduce_indptr"].cuda()
-        fmap   = meta["reduce_final_map"].cuda()
-        pmap   = meta["reduce_partial_map"].cuda()
+        fmap = meta["reduce_final_map"].cuda()
+        pmap = meta["reduce_partial_map"].cuda()
 
         g = torch.Generator(device="cuda").manual_seed(0)
-        po = torch.randn(num_partial_rows, H, Dv, dtype=torch.float32, device="cuda", generator=g)
-        pl = torch.randn(num_partial_rows, H, dtype=torch.float32, device="cuda", generator=g) * 2.0
+        po = torch.randn(
+            num_partial_rows, H, Dv, dtype=torch.float32, device="cuda", generator=g
+        )
+        pl = (
+            torch.randn(
+                num_partial_rows, H, dtype=torch.float32, device="cuda", generator=g
+            )
+            * 2.0
+        )
         fout = torch.zeros(num_final_rows, H, Dv, dtype=out_dtype, device="cuda")
         flse = torch.zeros(num_final_rows, H, dtype=torch.float32, device="cuda")
 
