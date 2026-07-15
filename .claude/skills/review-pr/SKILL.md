@@ -106,7 +106,8 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Dispatch logic change** → B1 (silent bypass), B3 (string normalization), B4 (new value unhandled?), A3 (scope too broad)
 - [ ] **Replaces existing kernel as default** → D2 (rollback env-var)
 - [ ] **Core file change** (see Tier table below) → full Step 4 risk assessment
-- [ ] **Refactor / rename** → HK2 (unrelated files), variable name mismatch check
+- [ ] **API signature change** (param added / removed / renamed, default changed, return dtype or arity changed) → B6 (propagation to all receivers), E1 (linked consumer PR?), E5 (owner sign-off if stable core API)
+- [ ] **Refactor / rename** → HK2 (unrelated files), variable name mismatch check, B6 (rename breaks all importers)
 - [ ] **FP8 / quantization path** → C1 (fnuz by dtype), C2 (fp8_max hardcoded), D1 (atomic zero-init)
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
@@ -266,13 +267,14 @@ When an API surface changes in dimension X, all downstream receivers (Y) must be
 | Sub-type | X (what changed) | Y (downstream not updated) | Z (failure) | Sev |
 |----------|-----------------|---------------------------|-------------|-----|
 | param-discard | new param in signature | function body | value accepted but never used | ⚠️/🔴 |
-| param-removed | param removed from call | same-file call sites | TypeError at call time | 🔴 |
+| param-removed | param removed from signature | all call sites (cross-repo if public) | TypeError at call time | 🔴 |
 | repr-key | new Gluon constexpr | kernel repr key list | stale JIT binary served | 🔴 |
 | arch-discard | arch-specific kwarg | non-target-arch path | kwarg silently discarded | ⚠️ |
 | dispatch-silent | multi-backend fallback | caller logging | backend switch with no diagnostic | ⚠️ |
-| rename | public symbol renamed | all importers | AttributeError at import time | 🔴 |
+| rename | public symbol renamed | all importers (cross-repo if public) | AttributeError at import/call time | 🔴 |
 
 Severity (param-discard): 🔴 if param controls output correctness (`expert_mask`, `q_scale`, `kv_scale`); ⚠️ for performance knobs or optional features with working defaults.
+**Public-API scope:** if the changed symbol is a public op (`from aiter import X`, or lives in `aiter/ops/*.py` / `aiter/__init__.py`), param-removed and rename break cross-repo consumers (ATOM / SGLang / vLLM), not just same-file call sites — the downstream to check is every repo that imports it. Also apply E1 (is a linked consumer PR mentioned?) and E5 (owner sign-off for a stable core-API contract).
 Exception: method override where base class forces the signature but subclass legitimately ignores the param — flag as 📝 (structural discard, not a bug).
 Real examples (param-discard): `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `v_scale` strides never computed — `sc_off` indexes v_scale_ptr using k_scale strides, wrong scale on non-contiguous tensors (aiter#3959); `gate_up` discarded when `is_guinterleave=False` (aiter#4167).
 → `🔴/⚠️ B6-[sub-type]: [what changed] — [downstream not updated] — [failure]`
