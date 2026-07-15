@@ -1115,6 +1115,28 @@ _META_FIELDS = (
 )
 
 
+def _call_get_mla_metadata_v1(*args, **kwargs):
+    """Wraps ``aiter.get_mla_metadata_v1``, working around a pre-existing
+    ``check_args()`` bug: its enum-annotation regex only strips a module
+    qualifier that contains "aiter", but this op's module is
+    ``module_mla_metadata``, so the first call raises
+    ``NameError: name 'module_mla_metadata' is not defined``. Retry once
+    after exposing the module under ``aiter`` so the wildcard import in
+    ``check_args()`` can resolve it.
+    """
+    import aiter
+
+    try:
+        return aiter.get_mla_metadata_v1(*args, **kwargs)
+    except NameError as e:
+        if "module_mla_metadata" not in str(e):
+            raise
+        from aiter.jit.core import get_module
+
+        aiter.module_mla_metadata = get_module("module_mla_metadata")
+        return aiter.get_mla_metadata_v1(*args, **kwargs)
+
+
 def _metadata_emit(
     batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_PER_BATCH
 ):
@@ -1143,7 +1165,7 @@ def _metadata_emit(
         for name, (sz, t) in zip(_META_FIELDS, sizes)
     }
     rms = torch.zeros(1, dtype=torch.int32, device="cuda")
-    aiter.get_mla_metadata_v1(
+    _call_get_mla_metadata_v1(
         qo,
         kv,
         klp,
@@ -1261,18 +1283,17 @@ def test_dispatch_does_not_thread_actual_max_splits(monkeypatch):
     )
     assert "actual_max_splits" not in inspect.signature(mla.mla_decode_fwd).parameters
 
+    # _flydsl_mla_reduce_enabled() re-reads the env var on every call (no
+    # lru_cache on the gate itself), so monkeypatch.setenv takes effect
+    # immediately -- no cache_clear() needed.
     monkeypatch.setenv("AITER_MLA_REDUCE_FLYDSL", "1")
-    mla._flydsl_mla_reduce_enabled.cache_clear()
     captured = {}
 
     def _capture(*args, **kwargs):
         captured["kwargs"] = kwargs
 
     monkeypatch.setattr(flydsl, "flydsl_mla_reduce_v1", _capture)
-    try:
-        mla._mla_reduce_v1_dispatch(None, None, None, None, None, 1, 0, None, None)
-    finally:
-        mla._flydsl_mla_reduce_enabled.cache_clear()
+    mla._mla_reduce_v1_dispatch(None, None, None, None, None, 1, 0, None, None)
     assert "actual_max_splits" not in captured["kwargs"]
     assert captured["kwargs"].get("num_kv_splits") == 0
 

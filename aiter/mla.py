@@ -17,23 +17,35 @@ from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 
 @functools.lru_cache(maxsize=1)
+def _flydsl_mla_reduce_available() -> bool:
+    """Whether FlyDSL is importable and supports this device's arch. Cached
+    for the process lifetime (install/arch are fixed at runtime)."""
+    try:
+        from aiter.ops.flydsl import is_flydsl_available
+
+        return is_flydsl_available()
+    except Exception:
+        return False
+
+
 def _flydsl_mla_reduce_enabled() -> bool:
     """Opt-in gate for the FlyDSL MLA reduce fallback.
 
     Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
     Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
-    Falls back silently to HIP if FlyDSL is not installed/compatible.
+    Falls back silently to HIP if FlyDSL is not installed/compatible. Not
+    memoized, so the env var can be toggled at runtime; only the availability
+    probe above is cached.
     """
     try:
         from flydsl.utils.env import EnvManager, OptBool
-        from aiter.ops.flydsl import is_flydsl_available
 
         class _Env(EnvManager):
             enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
 
         if not _Env().enabled:
             return False
-        return is_flydsl_available()
+        return _flydsl_mla_reduce_available()
     except Exception:
         return False
 
