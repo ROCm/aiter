@@ -123,16 +123,18 @@ attention. The kernel's job is to make those many Q rows reuse each KV load.
 
 ### 2.2 The mfma tile and "m=16"
 
-We use the gfx950 fp8 mfma `v_mfma_f32_16x16x32_fp8_fp8` of shape
+We use the gfx950 bf16 mfma `v_mfma_f32_16x16x32_bf16` of shape
 
 $$
 (16 \times 32) \cdot (32 \times 16) \to (16 \times 16)
 $$
 
-for QK and the bf16 mfma `v_mfma_f32_16x16x32_f16` of the same shape for
-PV (after the fp8 P from softmax is cast to bf16). Both have the same
-m=16 / n=16 shape, so the per-ptile accumulator is a 16-row × 16-column
-fp32 tile.
+for **both** QK and PV. Although Q/K/V arrive as fp8 on disk, the QManager /
+KvManager cvt the operands to bf16 *before* the GEMM (`mfma_ab_t = hk::bf16`;
+P from softmax is likewise cast to bf16), so there is **no fp8 MFMA in this
+kernel** — QK and PV emit the identical `v_mfma_f32_16x16x32_bf16`. Both have
+the same m=16 / n=16 shape, so the per-ptile accumulator is a 16-row ×
+16-column fp32 tile.
 
 The "**m=16**" in the kernel name refers to this m dim: each ptile holds
 16 rows of $Q$ in its mfma accumulators. Those 16 rows are the work items
@@ -282,7 +284,7 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
    │  q_lds window Ph.B)│  │  3 tiles for N=64)   │
    └─────────┬──────────┘  └──────────┬───────────┘
              │                        │
-             └─── v_mfma_f32_16x16x32_fp8_fp8 ───┘   ← QK
+             └─── v_mfma_f32_16x16x32_bf16 ───┘   ← QK (operands cvt fp8→bf16 first)
                               │
                               ▼
                   ┌─────────────────────┐
@@ -300,7 +302,7 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
                   └─────────┬───────────┘
                             │   ── reuses KV-LDS pong as V via transpose-read
                             ▼
-              ── v_mfma_f32_16x16x32_f16 ──   ← PV
+              ── v_mfma_f32_16x16x32_bf16 ──   ← PV (same instr as QK)
                             │   (interleaved with v_mul_f32 rescale)
                             ▼
                   ┌─────────────────────┐
@@ -323,8 +325,7 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
 
 Key sp3 ops to remember:
 
-- **`v_mfma_f32_16x16x32_fp8_fp8`** — QK (single 16×32 × 32×16 → 16×16 fp32).
-- **`v_mfma_f32_16x16x32_f16`** — PV (same shape, bf16 inputs).
+- **`v_mfma_f32_16x16x32_bf16`** — **both** QK and PV (single 16×32 × 32×16 → 16×16 fp32). Operands are cvt fp8→bf16 before the GEMM, so this is the only MFMA in the kernel; there is no fp8 MFMA.
 - **`ds_read_b128`** — vanilla bf16 read for QK A-tile.
 - **`ds_read_b64_tr_b16`** — transpose-read for V → mfma A-operand layout (Ch. 10.2).
 - **`buffer_load_lds`** — direct vmem → LDS bypassing VGPRs (RoPE path + Q Phase 1 staging).
@@ -1656,7 +1657,7 @@ and read `oaccu` as $O^\top$ (col-major), `kv` as $V^\top$ in A-operand
 layout, `p_mfma` as $P^\top$ in B-operand layout. This is identical to
 how QK was already running ($K^\top Q^\top = S^\top$).
 
-The mfma is `v_mfma_f32_16x16x32_f16` of shape
+The mfma is `v_mfma_f32_16x16x32_bf16` of shape
 
 $$
 (16 \times 32) \cdot (32 \times 16) \to (16 \times 16)
@@ -1723,7 +1724,7 @@ One PV iter, canonical case (`kIsFirstIter == false`, `has_next == true`):
 So per PV iter:
 
 - 4× `ds_read_b64_tr_b16` (V load)
-- 2× `v_mfma_f32_16x16x32_f16` (the PV mfmas)
+- 2× `v_mfma_f32_16x16x32_bf16` (the PV mfmas)
 - 4× `v_mul_f32` rescaling the NEXT iter's oaccu base tile +0/+1 (interleaved with ds_read)
 - 4× `v_mul_f32` rescaling the NEXT iter's oaccu base tile +2/+3 (1 mul_pair per mfma slot)
 - 2× `s_waitcnt`
@@ -1776,7 +1777,7 @@ beyond the one ballot).
 ### 10.5 Why this pattern hides everything
 
 The numbers work out because gfx950's mfma occupancy budget per lane is
-generous: each `v_mfma_f32_16x16x32_f16` issue spends ~32 cycles in the
+generous: each `v_mfma_f32_16x16x32_bf16` issue spends ~32 cycles in the
 mfma pipe, during which the VALU is free. The pattern fills both halves:
 
 | Time slice within one PV iter | mfma pipe | VALU | LDS |
@@ -1791,6 +1792,65 @@ mfma pipe, during which the VALU is free. The pattern fills both halves:
 The schedule is dense — there's no slot where mfma is idle waiting on
 VALU or LDS. The rescale, naïvely a 128-mul standalone phase before PV,
 is fully hidden.
+
+### 10.5.1 The cross-wave PV ping-pong (why 6-deep PV + warp specialization + deferred B+C exist)
+
+§10.5 hides the rescale *within* one wave. But PV itself — a deep mfma
+sequence — saturates the **shared MFMA + LDS pipeline** for the wave running
+it. On m16x8 two waves share each SIMD (8 waves/workgroup over 4 SIMDs =
+2 waves/SIMD; `kOccupancy_ = 1`, so this is intra-workgroup, *not* two
+resident workgroups). While one wave is in PV, its SIMD-mate physically
+cannot issue MFMA/LDS work — it can only run non-MFMA work (softmax VALU,
+dispatch-ladder SALU, next-KV vmem loads). So the *only* way to hide a PV is
+to have the partner wave doing that other work underneath it.
+
+Three design choices exist purely to make this cross-wave overlap work — they
+are not independent optimizations, they all serve the same ping-pong:
+
+1. **PV is made deep (contracts both sub-tiles A+B in one merged call, §10.1)**
+   so one wave's PV window is *long enough to cover the partner's entire
+   non-MFMA workload* (softmax + dispatch SALU + next-KV load). The depth is
+   chosen for the hiding-window length, not that wave's own throughput; too
+   shallow and the partner's work spills past the window and becomes exposed.
+
+2. **Warp specialization (`WarpTypeM16x8` Lo/Hi, §3.5) keeps the two
+   SIMD-mate waves out of phase.** `kPvAtEnd = (kWarpType == LoNoPEWarp)`:
+   lo runs PV at call end, hi *defers* PV by one tile (`kHasPv`, runs the
+   previous tile's PV at the next call's start). If both waves ran the same
+   schedule they would hit PV simultaneously, contend for the one MFMA+LDS
+   pipe, and have nothing to overlap. The offset guarantees that at any moment
+   one wave is in PV while the other is in non-MFMA work.
+
+3. **Deferring part of lo's Phase B+C behind PV (deferred strip-3 cvt+store,
+   §8.13)** does two things: (a) it packs that non-MFMA KV cvt/store work
+   *into* the partner's PV window instead of leaving it as exposed serial
+   time; and (b) with less B+C ahead of lo's PV, **lo starts its PV earlier**,
+   returning the shared MFMA+LDS pipe to hi sooner. hi's wait on lo's PV is a
+   **resource dependency on the shared pipe, not an `s_barrier`** — hi stalls
+   because the pipe is busy, so pulling lo's PV earlier lets hi acquire the
+   pipe sooner *and* slides lo's PV window earlier so it overlaps more of hi's
+   softmax. It is a critical-path move, not just window-packing.
+
+Net per-tile picture (the two waves offset by ~half a tile): while one wave
+runs PV (owning MFMA+LDS), its partner runs softmax + dispatch-ladder
+SALU/branch + next-KV load + deferred B+C; the next tile the roles swap. This
+is why an instruction trace shows a *higher* per-wave stall% yet a busier CU
+(lower idle) — the "stall" is a wave parked on the shared pipe, and that gap
+is filled by the partner's useful work.
+
+**Why m16x4 does not use this scheme.** m16x4 also puts 2 waves on each SIMD,
+but differently: `kOccupancy_ = 2` runs **two whole workgroups** per CU
+(4 waves/tg × 2 tgs = 8 waves), so a SIMD's two waves belong to *different
+workgroups*. `s_barrier` only synchronizes waves within one workgroup, so
+there is no way to keep those two SIMD-mates in a deliberate PV/non-PV phase
+relationship — the mate's scheduling is uncontrollable across the workgroup
+boundary. m16x4 therefore forgoes the ping-pong; it just issues the next-KV
+load earlier. That is the right trade for m16x4 because, *compared to m16x8*,
+it leans more toward memory-bound — though whether either partition is
+actually memory-bound in a given run depends on the real situation (HW state,
+and what other programs / tgs are co-resident in the grid), not always. The
+deliberate cross-wave PV overlap is an m16x8-only design, enabled by both
+SIMD-mates living in the *same* workgroup.
 
 ### 10.6 `pv_v_aux` is dead in Gen.1
 
