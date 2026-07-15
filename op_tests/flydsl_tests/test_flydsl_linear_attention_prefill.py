@@ -349,6 +349,14 @@ _PREFILL_GROUPS = [
         output_final_state=False,
         max_num_batched_tokens="full_prompt_len",
     ),
+    PrefillGroup(
+        model_name="Qwen3.5-397B-ptpc-ali",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[8192],
+        is_varlen=False,
+        max_num_batched_tokens="full_prompt_len",
+    ),
     # varlen + final_state (default path), TP=4 / TP=8 share everything
     # else, so they collapse into a single group. Original rows left
     # max_num_batched_tokens at the PrefillArgs default of 32768, which
@@ -360,6 +368,13 @@ _PREFILL_GROUPS = [
         Hv=64,
         tps=[4, 8],
         full_prompt_lens=[1024, 2048, 4096, 8192],
+        max_num_batched_tokens=32768,
+    ),
+    PrefillGroup(
+        model_name="varlen-32k-qwen-ptpc-ali",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[8192],
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
@@ -630,6 +645,24 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
+def _is_gfx950() -> bool:
+    """Whether the current GPU is CDNA4 / gfx950 (MI350).
+
+    The baseline / ``naive`` / ``naive_opt`` FlyDSL K5 forks emit the
+    ``mfma_f32_16x16x32_bf16`` (K=32 bf16) MFMA and ``mfma32_vk`` emits
+    ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
+    (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
+    abort, so the perf harness skips them there. The remaining forks
+    (``kv`` / ``mfma16_hip`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
+    use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
+    """
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return "gfx950" in arch
+
+
 def _hip_k5_supported(args: PrefillArgs) -> bool:
     """The HIP K5 kernel only handles K=V=128, bf16 inputs, chunk_size=64."""
     return (
@@ -665,7 +698,6 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
     shared with the PyTorch reference (the kernel then applies the LOG2E
     scale internally).
     """
-    B = w.shape[0]
     H = w.shape[1]
     T_flat = w.shape[2]
 
@@ -769,9 +801,7 @@ def _assert_mean_abs_within(out, ref, *, mean_atol, label):
     )
 
 
-def _assert_close_lowmem(
-    a, b, *, atol, rtol, msg, chunk_rows=1 << 22
-):
+def _assert_close_lowmem(a, b, *, atol, rtol, msg, chunk_rows=1 << 22):
     """Memory-frugal elementwise ``|a-b| <= atol + rtol*|b|`` check.
 
     Equivalent in semantics to ``torch.testing.assert_close(a, b, atol, rtol)``
@@ -1368,18 +1398,27 @@ class TestCorrectness:
         # assert_close's mismatch-report path) and OOM. ``_assert_close_lowmem``
         # streams the ``|a-b| <= atol + rtol*|b|`` check in chunks instead.
         _assert_close_lowmem(
-            h_kvn, h_vk, atol=atol, rtol=rtol,
+            h_kvn,
+            h_vk,
+            atol=atol,
+            rtol=rtol,
             msg="mfma16_2wave_opt1 vs triton_vk: h mismatch",
         )
         # v_new is head-major [B,H,T,V] in both backends; compare as-is (the
         # shared permutation to [B,T,H,V] is a no-op for an elementwise check).
         _assert_close_lowmem(
-            vn_kvn, vn_vk, atol=atol, rtol=rtol,
+            vn_kvn,
+            vn_vk,
+            atol=atol,
+            rtol=rtol,
             msg="mfma16_2wave_opt1 vs triton_vk: v_new mismatch",
         )
         if args.output_final_state:
             _assert_close_lowmem(
-                fs_kvn, fs_vk, atol=atol, rtol=rtol,
+                fs_kvn,
+                fs_vk,
+                atol=atol,
+                rtol=rtol,
                 msg="mfma16_2wave_opt1 vs triton_vk: final_state mismatch",
             )
         else:
@@ -1548,7 +1587,9 @@ class TestCorrectness:
             msg="triton_origin_opt: v_new mismatch",
         )
         _assert_mean_abs_within(
-            vn_origin_opt, vn_ref, mean_atol=mean_atol,
+            vn_origin_opt,
+            vn_ref,
+            mean_atol=mean_atol,
             label="triton_origin_opt v_new",
         )
         if args.output_final_state:
@@ -1560,7 +1601,9 @@ class TestCorrectness:
                 msg="triton_origin_opt: final_state mismatch",
             )
             _assert_mean_abs_within(
-                fs_origin_opt_vk, fs_ref, mean_atol=mean_atol,
+                fs_origin_opt_vk,
+                fs_ref,
+                mean_atol=mean_atol,
                 label="triton_origin_opt final_state",
             )
 
@@ -1751,26 +1794,59 @@ def _run_perf_comparison(args: PrefillArgs):
     # converge the autotuner on long-T shapes. Pre-warm it once here
     # for parity with FlyDSL so that ``us_vllm`` reflects steady-state
     # kernel time, not the autotune sweep.
-    flydsl_launch()
-    flydsl_kv_launch()
-    flydsl_mfma16_hip_launch()
-    flydsl_mfma16_3wave_opt2_launch()
-    flydsl_mfma16_2wave_opt1_launch()
-    flydsl_naive_launch()
-    flydsl_naive_opt_launch()
+    # gfx950-only forks. These fail on gfx942 with an UNRECOVERABLE process
+    # abort (not a catchable Python exception), so they must be hard-gated
+    # behind the arch check rather than wrapped in try/except:
+    #   * baseline / naive / naive_opt -> K=32 bf16 MFMA (mfma_f32_16x16x32_bf16),
+    #     which LLVM cannot select on gfx942 ("Cannot select ... Aborted").
+    #   * mfma16_2wave_opt1 -> over-budget on gfx942 for K=V=128 (~70KB LDS >
+    #     64KB).
+    # The kv / mfma16_hip / mfma16_3wave_opt2 forks use the K=16 MFMA and fit
+    # the 64KB budget, so they run on both gfx942 and gfx950.
+    _gfx950 = _is_gfx950()
+
+    ok_fly = ok_naive = ok_naive_opt = ok_mfma16_2wave_opt1 = _gfx950
+    ok_kv = ok_mfma16_hip = ok_mfma16_3wave_opt2 = True
+
+    if ok_fly:
+        flydsl_launch()
+    if ok_kv:
+        flydsl_kv_launch()
+    if ok_mfma16_hip:
+        flydsl_mfma16_hip_launch()
+    if ok_mfma16_3wave_opt2:
+        flydsl_mfma16_3wave_opt2_launch()
+    if ok_mfma16_2wave_opt1:
+        flydsl_mfma16_2wave_opt1_launch()
+    if ok_naive:
+        flydsl_naive_launch()
+    if ok_naive_opt:
+        flydsl_naive_opt_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
     if hip_supported:
         hip_launch()
     torch.cuda.synchronize()
 
-    us_fly = _bench_fn(flydsl_launch)
-    us_fly_kv = _bench_fn(flydsl_kv_launch)
-    us_fly_mfma16_hip = _bench_fn(flydsl_mfma16_hip_launch)
-    us_fly_mfma16_3wave_opt2 = _bench_fn(flydsl_mfma16_3wave_opt2_launch)
-    us_fly_mfma16_2wave_opt1 = _bench_fn(flydsl_mfma16_2wave_opt1_launch)
-    us_fly_naive = _bench_fn(flydsl_naive_launch)
-    us_fly_naive_opt = _bench_fn(flydsl_naive_opt_launch)
+    us_fly = _bench_fn(flydsl_launch) if ok_fly else float("nan")
+    us_fly_kv = _bench_fn(flydsl_kv_launch) if ok_kv else float("nan")
+    us_fly_mfma16_hip = (
+        _bench_fn(flydsl_mfma16_hip_launch) if ok_mfma16_hip else float("nan")
+    )
+    us_fly_mfma16_3wave_opt2 = (
+        _bench_fn(flydsl_mfma16_3wave_opt2_launch)
+        if ok_mfma16_3wave_opt2
+        else float("nan")
+    )
+    us_fly_mfma16_2wave_opt1 = (
+        _bench_fn(flydsl_mfma16_2wave_opt1_launch)
+        if ok_mfma16_2wave_opt1
+        else float("nan")
+    )
+    us_fly_naive = _bench_fn(flydsl_naive_launch) if ok_naive else float("nan")
+    us_fly_naive_opt = (
+        _bench_fn(flydsl_naive_opt_launch) if ok_naive_opt else float("nan")
+    )
     us_triton_vk = _bench_fn(triton_vk_launch)
     us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
     us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
@@ -1779,7 +1855,9 @@ def _run_perf_comparison(args: PrefillArgs):
     fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
     # fly_opt (mfma16_2wave_opt1) speedup vs Triton_vk (>1 means fly_opt is faster).
     fly_opt_vs_vk = (
-        us_triton_vk / us_fly_mfma16_2wave_opt1 if us_fly_mfma16_2wave_opt1 > 0 else float("inf")
+        us_triton_vk / us_fly_mfma16_2wave_opt1
+        if us_fly_mfma16_2wave_opt1 > 0
+        else float("inf")
     )
     fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
     fly_vs_vllm = (
@@ -1788,6 +1866,12 @@ def _run_perf_comparison(args: PrefillArgs):
     # HIP speedup vs Triton_vk (>1 means HIP is faster than Triton_vk).
     hip_vs_vk = (
         us_triton_vk / us_hip if (us_hip > 0 and us_hip == us_hip) else float("nan")
+    )
+    # fly_hip (mfma16_hip) speedup vs Triton_vk (>1 means fly_hip is faster).
+    fly_hip_vs_vk = (
+        us_triton_vk / us_fly_mfma16_hip
+        if (us_fly_mfma16_hip > 0 and us_fly_mfma16_hip == us_fly_mfma16_hip)
+        else float("nan")
     )
 
     _perf_results.append(
@@ -1813,9 +1897,10 @@ def _run_perf_comparison(args: PrefillArgs):
             "HIP_vk(us)": us_hip,
             "flydsl_vs_vk": fly_vs_vk,
             "flydsl_vs_origin_opt": fly_vs_origin_opt,
-        "flydsl_vs_vllm": fly_vs_vllm,
-        "hip_vs_vk": hip_vs_vk,
-        "flydsl_opt_vs_vk": fly_opt_vs_vk,
+            "flydsl_vs_vllm": fly_vs_vllm,
+            "hip_vs_vk": hip_vs_vk,
+            "flydsl_opt_vs_vk": fly_opt_vs_vk,
+            "fly_hip_vs_vk": fly_hip_vs_vk,
         }
     )
 
@@ -1912,8 +1997,13 @@ def _print_perf_table():
     if not _perf_results:
         return
 
+    # Size the Model column to the widest model name so long names (e.g.
+    # "Qwen3.5-397B-ptpc-ali") don't overflow the fixed width and shift the
+    # whole data row out of alignment with the header.
+    _model_w = max([len("Model")] + [len(str(r["Model"])) for r in _perf_results])
+
     cols = [
-        ("Model", "Model", 14),
+        ("Model", "Model", _model_w),
         ("TP", "TP", 2),
         ("Hg", "Hg", 2),
         ("H", "H", 2),
@@ -1932,6 +2022,7 @@ def _print_perf_table():
         ("fly/vk", "flydsl_vs_vk", 6),
         ("hip/vk", "hip_vs_vk", 6),
         ("2w/vk", "flydsl_opt_vs_vk", 6),
+        ("fly_hip/vk", "fly_hip_vs_vk", 10),
     ]
 
     def _fmt_cell(val, key, width):
@@ -2058,7 +2149,9 @@ class TestStateDtypeBF16:
                 msg="bf16-state vs f32-state: v_new mismatch",
             )
             _assert_mean_abs_within(
-                vn_bf16, vn_f32, mean_atol=mean_atol,
+                vn_bf16,
+                vn_f32,
+                mean_atol=mean_atol,
                 label="bf16-state vs f32-state v_new",
             )
         if args.output_final_state:
@@ -2070,7 +2163,9 @@ class TestStateDtypeBF16:
                 msg="bf16-state vs f32-state: final_state mismatch",
             )
             _assert_mean_abs_within(
-                fs_bf16, fs_f32, mean_atol=mean_atol,
+                fs_bf16,
+                fs_f32,
+                mean_atol=mean_atol,
                 label="bf16-state vs f32-state final_state",
             )
 

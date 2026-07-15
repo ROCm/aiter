@@ -38,6 +38,7 @@ from .kernels.chunk_gated_delta_h_naive import compile_chunk_gated_delta_h_naive
 from .kernels.chunk_gated_delta_h_naive_opt import (
     compile_chunk_gated_delta_h_naive_opt,
 )
+
 # KV forks: ``kv`` is the WITH-lds_g variant (OPT-C(g) g-staging), ``mfma16_2wave_opt1``
 # is the stripped no-lds_g variant (gating reads g inline from HBM). File names,
 # symbol names and the host ``_fork`` selector all agree.
@@ -54,6 +55,7 @@ from .kernels.chunk_gated_delta_h_mfma16_2wave_opt1 import (
 from .kernels.chunk_gated_delta_h_mfma32_vk import (
     compile_chunk_gated_delta_h_mfma32_vk,
 )
+
 try:
     from .kernels.chunk_gated_delta_h_hipport import (
         compile_chunk_gated_delta_h_hipport,
@@ -878,16 +880,38 @@ def _get_or_compile_mfma16_2wave_opt1(
 
 @functools.lru_cache(maxsize=None)
 def _get_or_compile_mfma32_vk(
-    K, V, BT, BV, H, Hg, use_g, use_gk, use_h0, store_fs, save_vn,
-    is_varlen, wu_contig, state_bf16=False, g_log2_scaled=False,
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
 ):
     """编译 mfma32 VK 基础版 K5 kernel。"""
     return compile_chunk_gated_delta_h_mfma32_vk(
-        K=K, V=V, BT=BT, BV=BV, H=H, Hg=Hg,
-        USE_G=use_g, USE_GK=use_gk,
-        USE_INITIAL_STATE=use_h0, STORE_FINAL_STATE=store_fs,
-        SAVE_NEW_VALUE=save_vn, IS_VARLEN=is_varlen,
-        WU_CONTIGUOUS=wu_contig, STATE_DTYPE_BF16=state_bf16,
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
         G_IS_LOG2_SCALED=g_log2_scaled,
     )
 
@@ -999,7 +1023,16 @@ def _resolve_state_dtype(initial_state, state_dtype):
 # maps to its own compiled kernel + cache namespace (see the dispatch in the
 # wrapper body). ``None`` (not listed here) means the baseline kernel.
 _K5_FORKS = frozenset(
-    {"kv", "mfma16_hip", "mfma16_2wave_opt1", "mfma16_3wave_opt2", "mfma32_vk", "naive", "naive_opt", "hipport"}
+    {
+        "kv",
+        "mfma16_hip",
+        "mfma16_2wave_opt1",
+        "mfma16_3wave_opt2",
+        "mfma32_vk",
+        "naive",
+        "naive_opt",
+        "hipport",
+    }
 )
 
 
@@ -1031,7 +1064,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
       * ``"kv"``        -> KV fork (coalesced [..., K, V] h-store); BV==64 only.
       * ``"mfma16_hip"`` -> mfma16 / HIP-aligned fork (public [..., V, K]
         layout; 16x16x16 MFMA + HIP split-M warp partition; NON-VWARP only);
-        BV==64 only.
+        BV in {16, 32, 64} (N_REPEAT = BV // 16).
       * ``"mfma16_3wave_opt2"`` -> exact copy of mfma16_2wave_opt1 (KV-in /
         VK-out fork); divergence base for a 3-wave variant.
       * ``"mfma16_2wave_opt1"``  -> un-pipelined KV fork; BV==64 only.
@@ -1170,9 +1203,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     if _fork == "mfma32_vk":
         BV = 64
         if V % BV != 0:
-            raise ValueError(
-                f"FlyDSL K5 mfma32_vk: requires V % 64 == 0; got V={V}."
-            )
+            raise ValueError(f"FlyDSL K5 mfma32_vk: requires V % 64 == 0; got V={V}.")
     elif _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2"):
         # ``kv`` is still BV=64-only. ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``
         # are VWARP-parameterized (BV = NUM_WARPS*16, NUM_WARPS in {1,2,4}), so
@@ -1188,6 +1219,19 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             raise ValueError(
                 f"FlyDSL K5 {_fork}: requires V % BV == 0; got V={V}, BV={BV}."
             )
+    elif _fork == "mfma16_hip":
+        # mfma16_hip accepts BV in {16,32,64}; it normally uses the tuned/
+        # heuristic BV. Allow an env override for A/B BV sweeps (mirrors
+        # FLYDSL_K5_KVNAIVE_BV). The hand-tuned HIP K5 reference is fixed at
+        # BV=16, so FLYDSL_K5_MFMA16HIP_BV=16 reproduces the HIP tiling.
+        _bv_env = os.environ.get("FLYDSL_K5_MFMA16HIP_BV")
+        if _bv_env:
+            BV = int(_bv_env)
+            assert BV in (16, 32, 64), "mfma16_hip BV must be in {16,32,64}"
+            if V % BV != 0:
+                raise ValueError(
+                    f"FlyDSL K5 mfma16_hip: requires V % BV == 0; got V={V}, BV={BV}."
+                )
 
     # Fork routing. Each fork maps to its OWN compiled kernel (distinct
     # ``_get_or_compile*`` cache namespace) -- no shared flag dispatch:
@@ -1203,11 +1247,21 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # mfma16_2wave_opt1 is VWARP-parameterized (BV in {16,32,64} -> NUM_WARPS in {1,2,4}).
     _mfma16_2wave_opt1_gate = BV in (16, 32, 64)
     _kv_opt_active = (_fork == "kv") and _vwarp_gate
-    _mfma16_2wave_opt1_active = (_fork == "mfma16_2wave_opt1") and _mfma16_2wave_opt1_gate
-    _mfma16_hip_active = (_fork == "mfma16_hip") and _vwarp_gate
+    _mfma16_2wave_opt1_active = (
+        _fork == "mfma16_2wave_opt1"
+    ) and _mfma16_2wave_opt1_gate
+    # mfma16_hip is fully BV-parameterized (N_REPEAT = BV // 16, with distinct
+    # BV==16 and BV>=32 schedules), so accept BV in {16,32,64} directly instead
+    # of only BV==64. This keeps every BV on the mfma16_hip K=16 kernel and
+    # avoids the baseline fallback (which emits the gfx950-only K=32 bf16 MFMA
+    # and aborts on gfx942 for the BV!=64 shapes, e.g. Hv=64 qwen).
+    _mfma16_hip_gate = BV in (16, 32, 64)
+    _mfma16_hip_active = (_fork == "mfma16_hip") and _mfma16_hip_gate
     # mfma16_3wave_opt2 is a copy of mfma16_2wave_opt1 (same KV-in/VK-out fork).
     _mfma16_3wave_opt2_gate = BV in (16, 32, 64)
-    _mfma16_3wave_opt2_active = (_fork == "mfma16_3wave_opt2") and _mfma16_3wave_opt2_gate
+    _mfma16_3wave_opt2_active = (
+        _fork == "mfma16_3wave_opt2"
+    ) and _mfma16_3wave_opt2_gate
     _hipport_active = (_fork == "hipport") and _vwarp_gate
     _mfma32_vk_active = (_fork == "mfma32_vk") and (BV == 64)
     _naive_active = _fork == "naive"
@@ -1217,7 +1271,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # (h-b128 coalesced store via lds_ht), so it is NOT in the transpose set --
     # only the optimized ``kv`` fork still writes [..., K, V] and needs the view.
     # mfma32_vk 也直接写 VK layout，且 k 是 token-major（不需要 pre-transpose）。
-    _kv_active = _kv_opt_active or _mfma16_2wave_opt1_active or _mfma16_3wave_opt2_active
+    _kv_active = (
+        _kv_opt_active or _mfma16_2wave_opt1_active or _mfma16_3wave_opt2_active
+    )
     _kv_needs_transpose = _kv_opt_active
     if _mfma32_vk_active:
         _compile_fn = _get_or_compile_mfma32_vk
@@ -1503,8 +1559,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma32_vk(
     """mfma32 VK 基础版 K5 kernel。k 使用 token-major [B, T, Hg, K]（不需要 pre-transpose）。
     h 直接写 VK layout [V, K]。BV=64 固定。"""
     return chunk_gated_delta_rule_fwd_h_flydsl(
-        k, w, u,
-        g=g, gk=gk,
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,

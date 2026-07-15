@@ -1,4 +1,4 @@
-# bash op_tests/flydsl_tests/run_test_flydsl_gdr_k5_prefill.sh 2>&1 | tee /workspace/docs_flydsl_k5_0709/test_flydsl_gdr_k5_prefill_0713.txt
+# bash op_tests/flydsl_tests/run_test_flydsl_gdr_k5_prefill.sh 2>&1 | tee /workspace/perf_flydsl_k5_0715/test_flydsl_gdr_k5_prefill_0713.txt
 export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
 export HIP_VISIBLE_DEVICES=7
 # rm -rf ~/.triton/cache
