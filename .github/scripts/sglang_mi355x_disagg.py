@@ -396,9 +396,22 @@ fi
 
 JOB_ID="\\${SLURM_JOB_ID:-\\${SPUR_JOB_ID:-batch}}"
 RANK_LOG="$WORKDIR/rank-\\${RANK}.log"
-exec > "\\$RANK_LOG" 2>&1
+LOCAL_LOG="/tmp/sglang-\\${JOB_ID}-rank\\${RANK}.log"
+STARTUP_LOG="$WORKDIR/startup.log"
+{
+    echo "startup job=\\$JOB_ID raw_rank=\\$RAW_RANK rank=\\$RANK host=\\$(hostname) local_log=\\$LOCAL_LOG shared_log=\\$RANK_LOG"
+    env | sort | grep -E '^(SLURM|SPUR)_' || true
+} >> "\\$STARTUP_LOG" 2>/dev/null || true
+if : >> "\\$RANK_LOG" 2>/dev/null; then
+    exec > >(tee -a "\\$LOCAL_LOG" "\\$RANK_LOG") 2>&1
+else
+    exec > "\\$LOCAL_LOG" 2>&1
+    echo "WARNING: cannot write shared rank log \\$RANK_LOG; using local log \\$LOCAL_LOG"
+fi
 
 echo "=== SGLang SPUR batch rank \\$RANK raw_rank=\\$RAW_RANK job=\\$JOB_ID host=\\$(hostname) ==="
+echo "local_log=\\$LOCAL_LOG"
+echo "shared_log=\\$RANK_LOG"
 env | sort | grep -E '^(SLURM|SPUR)_' || true
 
 IPS=()
