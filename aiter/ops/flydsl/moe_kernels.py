@@ -1192,11 +1192,7 @@ def flydsl_moe_stage1(
     _is_splitk = k_batch > 1
     gate_up_interleave = gate_mode == "interleave"
 
-    _v2_output_layout = (
-        _fuse_any_quant
-        and not _is_splitk
-        and v2_output_layout
-    )
+    _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
 
     dev = a.device
     _splitk_fp4 = _is_splitk and _need_fp4

@@ -16,7 +16,6 @@ from .mxmoe_gemm_v2 import (
     BN,
     HIDDEN_MAX_DEFAULT,
     INTER_MAX_DEFAULT,
-    NE,
     gemm2_body_v2,
     global_typed_ptr,
     issue_a_load_lds_dt,
@@ -39,7 +38,11 @@ def _get_cu_num() -> int:
     try:
         import torch
 
-        return int(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
+        return int(
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        )
     except Exception:
         return 304
 
@@ -82,22 +85,22 @@ _GEMM2_TUNED_TABLE = {
         # 8192: (64, 'reduce', True, False),  # 410.807us ok100% sbm64
         # 16384: (64, 'reduce', True, False),  # 789.103us ok100% sbm128
         # 32768: (64, 'reduce', True, False),  # 1484.276us ok100% sbm128
-        1: (32, 'atomic', False, False),  # 4.318us ok100% sbm32
-        2: (32, 'atomic', False, False),  # 6.305us ok100% sbm32
-        4: (32, 'atomic', False, True),  # 12.615us ok100% sbm32
-        8: (32, 'atomic', False, False),  # 20.526us ok100% sbm32
-        16: (32, 'atomic', False, False),  # 36.722us ok100% sbm32
-        32: (32, 'atomic', False, True),  # 65.429us ok100% sbm32
-        64: (32, 'atomic', False, True),  # 68.020us ok100% sbm32
-        128: (32, 'atomic', False, True),  # 68.822us ok100% sbm32
-        256: (64, 'reduce', False, True),  # 89.203us ok100% sbm64
-        512: (32, 'atomic', False, True),  # 80.653us ok100% sbm32
-        1024: (64, 'atomic', False, True),  # 117.670us ok100% sbm64
-        2048: (64, 'reduce', True, False),  # 202.098us ok100% sbm128
-        4096: (64, 'reduce', True, False),  # 311.413us ok100% sbm64
-        8192: (64, 'reduce', True, False),  # 539.506us ok100% sbm64
-        16384: (64, 'reduce', True, False),  # 1089.024us ok100% sbm128
-        32768: (64, 'reduce', True, False),  # 1999.693us ok100% sbm128
+        1: (32, "atomic", False, False),  # 4.318us ok100% sbm32
+        2: (32, "atomic", False, False),  # 6.305us ok100% sbm32
+        4: (32, "atomic", False, True),  # 12.615us ok100% sbm32
+        8: (32, "atomic", False, False),  # 20.526us ok100% sbm32
+        16: (32, "atomic", False, False),  # 36.722us ok100% sbm32
+        32: (32, "atomic", False, True),  # 65.429us ok100% sbm32
+        64: (32, "atomic", False, True),  # 68.020us ok100% sbm32
+        128: (32, "atomic", False, True),  # 68.822us ok100% sbm32
+        256: (64, "reduce", False, True),  # 89.203us ok100% sbm64
+        512: (32, "atomic", False, True),  # 80.653us ok100% sbm32
+        1024: (64, "atomic", False, True),  # 117.670us ok100% sbm64
+        2048: (64, "reduce", True, False),  # 202.098us ok100% sbm128
+        4096: (64, "reduce", True, False),  # 311.413us ok100% sbm64
+        8192: (64, "reduce", True, False),  # 539.506us ok100% sbm64
+        16384: (64, "reduce", True, False),  # 1089.024us ok100% sbm128
+        32768: (64, "reduce", True, False),  # 1999.693us ok100% sbm128
     },
 }
 
@@ -208,7 +211,9 @@ def compile_gemm2_a4w4_port(
     g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
     g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
     if g2_spart > 0 and (g2_group_num < 1 or g2_m01 < 1):
-        raise AssertionError(f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)")
+        raise AssertionError(
+            f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
+        )
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
@@ -222,7 +227,9 @@ def compile_gemm2_a4w4_port(
     c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     # N_OUT = model_dim/hidden is a runtime arg (i32_hidden); num_n_blocks = N_OUT//256 is computed runtime in the body/launch (HIDDEN_MAX only caps host checks).
-    assert HIDDEN_MAX % BK == 0, f"HIDDEN_MAX must be a multiple of {BK}, got {HIDDEN_MAX}"
+    assert (
+        HIDDEN_MAX % BK == 0
+    ), f"HIDDEN_MAX must be a multiple of {BK}, got {HIDDEN_MAX}"
 
     # Kernel-name tags empty on the default so its name/IR stays byte-identical (each variant distinct).
     atag = "_a8" if is_f8 else ""
@@ -237,7 +244,9 @@ def compile_gemm2_a4w4_port(
             "Use persist only with a_dtype='fp4', or run a8w4 with persist=False."
         )
     persist_tag = "" if not persist else f"_persist_cu{cu_num}"
-    pad_tag = "_pad" if has_pad else ""  # has_pad adds the runtime pad kernarg + weight-OOB pad-skip
+    pad_tag = (
+        "_pad" if has_pad else ""
+    )  # has_pad adds the runtime pad kernarg + weight-OOB pad-skip
     ks_tag = "" if g2_kstages == 1 else f"_g2ks{g2_kstages}"
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
@@ -272,10 +281,18 @@ def compile_gemm2_a4w4_port(
         i32_npad,
     ):
         # Shared body for both has_pad variants (@flyc.jit -> rewriter recurses scf if / grid-stride); default passes i32_kpad/i32_npad=0 (no kernarg), folding pad math away.
-        num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(256)  # N_OUT//256 runtime (i32_hidden = model_dim)
-        k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)  # A row stride bytes (runtime)
-        aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(fx.Int32(BM) * k_bytes)
-        aq_rsrc = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_aq)), num_records_bytes=aq_num)
+        num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(
+            256
+        )  # N_OUT//256 runtime (i32_hidden = model_dim)
+        k_bytes = fx.Int32(i32_inter) // fx.Int32(
+            1 if is_f8 else 2
+        )  # A row stride bytes (runtime)
+        aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
+            fx.Int32(BM) * k_bytes
+        )
+        aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num
+        )
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
@@ -371,7 +388,9 @@ def compile_gemm2_a4w4_port(
             diff = total_m_blocks - m_tile0
             rem = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
             n_iters = (rem + c_stride - fx.Int32(1)) // c_stride
-            for _it in range(fx.Index(0), ArithValue(_raw(n_iters)).index_cast(T.index), fx.Index(1)):
+            for _it in range(
+                fx.Index(0), ArithValue(_raw(n_iters)).index_cast(T.index), fx.Index(1)
+            ):
                 m_block = m_tile0 + fx.Int32(_it) * c_stride
                 unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
                 issue_all_a_loads(m_block * fx.Int32(BM))
@@ -445,7 +464,9 @@ def compile_gemm2_a4w4_port(
             stream: fx.Stream,
         ):
             # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks; num_n_blocks = N_OUT//256 runtime.
-            num_n_blocks = arith.index_cast(T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256)))
+            num_n_blocks = arith.index_cast(
+                T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256))
+            )
             grid_x = arith.index_cast(T.index, i32_grid_blocks) * num_n_blocks
             gemm2_kernel(
                 arg_aq,
@@ -533,7 +554,9 @@ def compile_gemm2_a4w4_port(
             arg_out_scale: fx.Int64,
             stream: fx.Stream,
         ):
-            num_n_blocks = arith.index_cast(T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256)))
+            num_n_blocks = arith.index_cast(
+                T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256))
+            )
             grid_x = arith.index_cast(T.index, i32_grid_blocks) * num_n_blocks
             gemm2_kernel(
                 arg_aq,
@@ -562,7 +585,17 @@ G2_CACHE = {}
 
 
 def get_g2(
-    BM, use_nt, HIDDEN_MAX, epilog, INTER_MAX, a_dtype, topk=1, SBM=None, persist=False, cu_num=0, has_pad=False
+    BM,
+    use_nt,
+    HIDDEN_MAX,
+    epilog,
+    INTER_MAX,
+    a_dtype,
+    topk=1,
+    SBM=None,
+    persist=False,
+    cu_num=0,
+    has_pad=False,
 ):
     # Cache key = compile-time dims; inter_dim + model_dim/hidden runtime (INTER_MAX/HIDDEN_MAX cap them), topk keyed only for reduce.
     SBM = _norm_sbm(SBM, BM)
@@ -653,9 +686,13 @@ def mxfp4_moe_gemm2(
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
     if D_HIDDEN % 256 != 0:
-        raise AssertionError(f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}")
+        raise AssertionError(
+            f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}"
+        )
     if D_HIDDEN > HIDDEN_MAX_DEFAULT:
-        raise AssertionError(f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX_DEFAULT})")
+        raise AssertionError(
+            f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX_DEFAULT})"
+        )
     inter_max = 512 if D_INTER == 512 else INTER_MAX_DEFAULT
     launch = get_g2(
         BM,
@@ -671,13 +708,17 @@ def mxfp4_moe_gemm2(
         has_pad=has_pad,
     )
     if D_INTER > inter_max:
-        raise AssertionError(f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({inter_max})")
+        raise AssertionError(
+            f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({inter_max})"
+        )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
         grid_blocks = cu_num
     else:
-        grid_blocks = max_m_blocks if n_sorted_padded is None else (n_sorted_padded // BM)
+        grid_blocks = (
+            max_m_blocks if n_sorted_padded is None else (n_sorted_padded // BM)
+        )
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
     # has_pad threads the runtime i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) after i32_inter.
     pad_args = (int(inter_dim_pad), int(model_dim_pad)) if has_pad else ()
