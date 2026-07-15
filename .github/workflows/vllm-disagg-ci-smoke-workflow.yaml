@@ -196,64 +196,6 @@ jobs:
             exit 1
           fi
           cp -f "${proxy_src}" "${DISAGG_SCRIPTS_STAGE}/moriio_toy_proxy_server.py"
-          cat > "${DISAGG_SCRIPTS_STAGE}/aiter_vllm_quant_patch.py" <<'PY'
-          """CI-only quantization compatibility for the pinned ROCm vLLM image."""
-
-          def apply():
-              import vllm.model_executor.layers.quantization as _q
-
-              orig_get_quantization_config = _q.get_quantization_config
-
-              def get_quantization_config(quantization):
-                  if quantization == "mxfp8":
-                      return orig_get_quantization_config("modelopt_mxfp8")
-                  return orig_get_quantization_config(quantization)
-
-              _q.get_quantization_config = get_quantization_config
-
-              import vllm.model_executor.model_loader.weight_utils as _wu
-
-              _wu.get_quantization_config = get_quantization_config
-          PY
-          cat > "${DISAGG_SCRIPTS_STAGE}/sitecustomize.py" <<'PY'
-          try:
-              from aiter_vllm_quant_patch import apply
-              apply()
-          except Exception as exc:
-              import sys
-              sys.stderr.write(f"AITER CI: vLLM quant patch failed in sitecustomize: {exc}\n")
-          PY
-          cat > "${DISAGG_SCRIPTS_STAGE}/aiter_vllm_cli.py" <<'PY'
-          """CI-only vLLM CLI wrapper for the pinned ROCm image."""
-          import os
-          import sys
-
-          script_dir = os.path.dirname(__file__)
-          os.environ["PYTHONPATH"] = script_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
-
-          from aiter_vllm_quant_patch import apply
-          apply()
-
-          from vllm.entrypoints.cli.main import main
-
-          sys.stderr.write("AITER CI: mapped checkpoint quant_method=mxfp8 to modelopt_mxfp8\n")
-          sys.argv = ["vllm", *sys.argv[1:]]
-          main()
-          PY
-          python3 - "${DISAGG_SCRIPTS_STAGE}/vllm_disagg.sh" <<'PY'
-          from pathlib import Path
-          import sys
-
-          path = Path(sys.argv[1])
-          text = path.read_text(encoding="utf-8")
-          old = '    CMD=(vllm serve "${MODEL_PATH}")'
-          new = '    CMD=(python3 "${SCRIPT_DIR}/aiter_vllm_cli.py" serve "${MODEL_PATH}")'
-          if new not in text:
-              if old not in text:
-                  raise SystemExit("Could not find vllm serve command to wrap")
-              text = text.replace(old, new, 1)
-              path.write_text(text, encoding="utf-8")
-          PY
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
           squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
