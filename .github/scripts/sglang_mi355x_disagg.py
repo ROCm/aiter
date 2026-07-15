@@ -379,7 +379,7 @@ RANK=-1
 CURRENT_HOST="\\$(hostname)"
 CURRENT_SHORT="\\$(hostname -s 2>/dev/null || hostname)"
 for idx in "\\${!REQUESTED_NODES[@]}"; do
-    node="\\${REQUESTED_NODES[$idx]}"
+    node="\\${REQUESTED_NODES[\\$idx]}"
     node_short="\\${node%%.*}"
     if [[ "\\$CURRENT_HOST" == "\\$node" || "\\$CURRENT_SHORT" == "\\$node_short" ]]; then
         RANK="\\$idx"
