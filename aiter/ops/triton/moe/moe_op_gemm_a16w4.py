@@ -2,13 +2,18 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+import os
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4,
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_triton,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -25,6 +30,13 @@ def can_overflow_int32(tensor: torch.Tensor):
 
 def should_upcast_indices(*args):
     return any(tensor is not None and can_overflow_int32(tensor) for tensor in args)
+
+
+def _env_config_int(prefix: str, name: str, k: int, default: int) -> int:
+    value = os.environ.get(f"{prefix}_{name}_K{k}", os.environ.get(f"{prefix}_{name}"))
+    if value is None:
+        return default
+    return int(value)
 
 
 def allocate_output(
@@ -124,19 +136,108 @@ def get_kernel_config(m, n, k, routing_data):
 
     ret = {
         "block_m": block_m,
-        "block_n": block_n,
-        "block_k": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "group_m": group_m,
-        "xcd_swizzle": xcd_swizzle,
+        "block_n": _env_config_int("AITER_MOE_A16W4_TRITON", "BLOCK_N", k, block_n),
+        "block_k": _env_config_int("AITER_MOE_A16W4_TRITON", "BLOCK_K", k, block_k),
+        "num_warps": _env_config_int(
+            "AITER_MOE_A16W4_TRITON", "NUM_WARPS", k, num_warps
+        ),
+        "num_stages": _env_config_int(
+            "AITER_MOE_A16W4_TRITON", "NUM_STAGES", k, num_stages
+        ),
+        "group_m": _env_config_int("AITER_MOE_A16W4_TRITON", "GROUP_M", k, group_m),
+        "xcd_swizzle": _env_config_int(
+            "AITER_MOE_A16W4_TRITON", "XCD_SWIZZLE", k, xcd_swizzle
+        ),
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": waves_per_eu,
-        "matrix_instr_nonkdim": 16,
-        "kpack": kpack,
+        "waves_per_eu": _env_config_int(
+            "AITER_MOE_A16W4_TRITON", "WAVES_PER_EU", k, waves_per_eu
+        ),
+        "matrix_instr_nonkdim": _env_config_int(
+            "AITER_MOE_A16W4_TRITON", "MATRIX_INSTR_NONKDIM", k, 16
+        ),
+        "kpack": _env_config_int("AITER_MOE_A16W4_TRITON", "KPACK", k, kpack),
     }
     return ret
+
+
+def get_kernel_config_gluon(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    group_m = 4
+    xcd_swizzle = 1
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 2
+    split_k = 1
+    block_k = 512
+    num_buffers = 1
+    waves_per_eu = 0
+
+    if block_m == 16:
+        block_n = 128
+        num_warps = 4
+    elif block_m == 32:
+        block_n = 128
+        num_warps = 4
+    else:
+        # Large-block prefill (block_m=128) on gfx1250, re-tuned for the
+        # MiniMax-M3 A16W4 routed GEMMs (N=6144, K in {6144, 3072}, M = routed
+        # prefill tokens in [~6.5k, 131k]) via per-shape CUDA-event sweeps of
+        # each _moe_gemm_a16w4 launch in isolation. A 256-wide N tile with a
+        # 512-deep K tile, 4 warps, 2 pipeline stages and a single buffer beat
+        # every other candidate (incl. the tuned Triton path) consistently
+        # across M -- the grid is >=7968 CTAs so the GPU is saturated and the
+        # optimum is essentially M-independent. ~18% faster per GEMM than tuned
+        # Triton, ~15% end-to-end on the fused path. xcd_swizzle is the only
+        # projection-dependent knob: gate/up (deep K=6144) prefers 2, down
+        # (K=3072) prefers 8.
+        block_n = 256
+        block_k = 512
+        num_warps = 4
+        num_stages = 2
+        waves_per_eu = 0
+        group_m = 4
+        num_buffers = 1
+        xcd_swizzle = 2 if k >= 4096 else 8
+
+    return {
+        "block_m": block_m,
+        "block_n": _env_config_int("AITER_MOE_A16W4_GLUON", "BLOCK_N", k, block_n),
+        "block_k": _env_config_int("AITER_MOE_A16W4_GLUON", "BLOCK_K", k, block_k),
+        "num_warps": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "NUM_WARPS", k, num_warps
+        ),
+        "num_stages": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "NUM_STAGES", k, num_stages
+        ),
+        "group_m": _env_config_int("AITER_MOE_A16W4_GLUON", "GROUP_M", k, group_m),
+        "xcd_swizzle": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "XCD_SWIZZLE", k, xcd_swizzle
+        ),
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "WAVES_PER_EU", k, waves_per_eu
+        ),
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "num_buffers": _env_config_int(
+            "AITER_MOE_A16W4_GLUON", "NUM_BUFFERS", k, num_buffers
+        ),
+    }
+
+
+def _selected_backend() -> str:
+    backend = os.environ.get("AITER_MOE_A16W4_BACKEND")
+    if backend is None:
+        # Default to "auto": gfx1250 large-block (block_m>=64) prefill GEMMs run
+        # on the tuned Gluon path (see get_kernel_config_gluon), while small
+        # block_m decode-style shapes stay on Triton. Set AITER_MOE_A16W4_BACKEND
+        # explicitly to override.
+        backend = "gluon" if os.environ.get("AITER_MOE_A16W4_GLUON") == "1" else "auto"
+    backend = backend.lower()
+    if backend not in {"triton", "gluon", "auto"}:
+        raise ValueError(f"unknown AITER_MOE_A16W4_BACKEND={backend!r}")
+    return backend
 
 
 # -----------------------------------------------------------------------------
@@ -185,7 +286,27 @@ def moe_gemm_a16w4(
         K = unpadded_K
 
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    backend = _selected_backend()
+    # "auto" (the default) only routes to the tuned Gluon path where it has been
+    # validated numerically correct: gfx1250 large-block (block_m>=64) prefill
+    # with no MX-scale preshuffling. The Gluon path has a pre-existing accuracy
+    # bug with swizzled scales (produces inf under swiglu), so swizzled shapes
+    # stay on Triton unless Gluon is requested explicitly.
+    use_gluon = get_arch() == "gfx1250" and (
+        backend == "gluon"
+        or (backend == "auto" and block_m >= 64 and swizzle_mx_scale is None)
+    )
+    config = (
+        get_kernel_config_gluon(M, N, K, routing_data)
+        if use_gluon
+        else get_kernel_config(M, N, K, routing_data)
+    )
+    if os.environ.get("AITER_MOE_A16W4_DEBUG_PRINT"):
+        print(
+            f"moe_gemm_a16w4 backend={backend} use_gluon={use_gluon} "
+            f"M={M} N={N} K={K} swiglu={int(bool(apply_swiglu))} config={config}",
+            flush=True,
+        )
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -230,57 +351,114 @@ def moe_gemm_a16w4(
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    _moe_gemm_a16w4[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scales,
-        w_scales.stride(0),
-        w_scales.stride(1),
-        w_scales.stride(2),
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        apply_swiglu_matmul,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        swiglu_add_residual,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
-        SWIZZLE_MX_SCALE=swizzle_mx_scale,
-        SPLIT_K=config["split_k"],
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+    if use_gluon:
+        w_scales_kernel = w_scales.transpose(1, 2)
+        _moe_gemm_a16w4_gluon[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales_kernel,
+            w_scales_kernel.stride(0),
+            w_scales_kernel.stride(1),
+            w_scales_kernel.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            x.shape[-2],
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=max(
+                1, min(config["num_buffers"], triton.cdiv(K, config["block_k"]))
+            ),
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
+    else:
+        _moe_gemm_a16w4_triton[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+            kpack=config["kpack"],
+        )
 
     # Build grouped reduction inputs in a uniform way
     group_indx = (
