@@ -61,6 +61,78 @@ def _detect_gfx1250() -> bool:
 _IPC_MIN_ROCM = (7, 14)
 
 
+# Default custom-AR size cutoff (bytes): inputs at or below this run on the
+# custom kernels, larger ones fall back to RCCL. 64 MiB == 8192*8192, matching
+# the historical decode threshold.
+_DEFAULT_CAR_MAX_SIZE = 8192 * 8192
+
+# Env var to override the custom-AR size cutoff (in bytes). See
+# _resolve_car_max_size for the semantics.
+_CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
+
+
+def _resolve_car_max_size(pool_size: int) -> int:
+    """Resolve the custom-AR size cutoff (bytes) from ``AITER_CUSTOM_AR_MAX_SIZE``.
+
+    Semantics:
+      * unset / empty / unparyable  -> default (64 MiB), i.e. unchanged behavior.
+      * 0                           -> 0: custom AR disabled, everything uses RCCL.
+      * 0 < v <= pool_size          -> v: custom AR used up to v bytes.
+      * v > pool_size               -> too large: the registered pool cannot hold
+                                       it. Raise (then catch), warn, and fall back
+                                       to the 64 MiB default.
+
+    ``pool_size`` is the registered input-buffer size (``CustomAllreduce.max_size``).
+    """
+    raw = os.environ.get(_CAR_MAX_SIZE_ENV, "").strip()
+    if raw == "":
+        return _DEFAULT_CAR_MAX_SIZE
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using default %d bytes.",
+            _CAR_MAX_SIZE_ENV,
+            raw,
+            _DEFAULT_CAR_MAX_SIZE,
+        )
+        return _DEFAULT_CAR_MAX_SIZE
+    if v < 0:
+        logger.warning(
+            "%s=%d is negative; using default %d bytes.",
+            _CAR_MAX_SIZE_ENV,
+            v,
+            _DEFAULT_CAR_MAX_SIZE,
+        )
+        return _DEFAULT_CAR_MAX_SIZE
+    if v == 0:
+        logger.info(
+            "%s=0: custom allreduce disabled; all sizes fall back to RCCL.",
+            _CAR_MAX_SIZE_ENV,
+        )
+        return 0
+    try:
+        if v > pool_size:
+            raise ValueError(
+                f"{_CAR_MAX_SIZE_ENV}={v} exceeds the custom-AR pool size "
+                f"({pool_size} bytes); the registered buffer cannot hold inputs "
+                f"that large."
+            )
+    except ValueError as e:
+        logger.warning(
+            "%s Falling back to the default %d bytes (64 MiB).",
+            e,
+            _DEFAULT_CAR_MAX_SIZE,
+        )
+        return _DEFAULT_CAR_MAX_SIZE
+    logger.info(
+        "Custom allreduce size cutoff overridden to %d bytes via %s.",
+        v,
+        _CAR_MAX_SIZE_ENV,
+    )
+    return v
+
+
 def _should_use_vmm(is_gfx1250: bool) -> bool:
     """Decide the cross-device buffer transport for gfx1250.
 
@@ -697,6 +769,10 @@ class CustomAllreduce:
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.max_size = max_size
+        # Custom-AR size cutoff (bytes): inputs at or below this run on the
+        # custom kernels; larger ones fall back to RCCL. Overridable via
+        # AITER_CUSTOM_AR_MAX_SIZE (capped at the registered pool size == max_size).
+        self._car_max_size = _resolve_car_max_size(max_size)
         self.rank = rank
         self.world_size = world_size
 
@@ -783,8 +859,10 @@ class CustomAllreduce:
 
         Shared by the old-arch kernel and the gfx1250 kernel (ROCm >= 7.15):
         both consume handle+offset init/register ops. Only the meta buffer
-        layout differs — the gfx1250 kernel is 1-stage, so it needs no trailing
-        2x tmp region after the Signal struct.
+        layout differs — the gfx1250 kernel is 1-stage (no trailing 2x tmp
+        region), but its meta_size() now also carries the LL fast-path staging
+        scratch appended after the Signal struct (see meta_size() in
+        custom_all_reduce_gfx1250.cu).
         """
         # Meta/Signal buffer: uncached device memory (cross-GPU sync flags must
         # bypass the cache), zero-initialized by allocate_meta_buffer, exchanged
@@ -804,12 +882,12 @@ class CustomAllreduce:
         # old arch: meta_size() + 2x tmp region (2-stage kernel) is GB-scale, so
         # it lands in the first regime and exports fine despite meta_size()=5504
         # (not a page multiple).
-        # gfx1250: the 1-stage kernel needs no tmp region, so meta is just
-        # meta_size_gfx1250() (~34 KB, and not a page multiple) -> it would land
-        # in the failing sub-2 MB case. Round the allocation up to 2 MB so it
-        # takes the always-safe coarse-grained path, exactly like the old-arch
-        # buffer. 2 MB is negligible (once per communicator) and the kernel only
-        # ever touches the leading Signal struct.
+        # gfx1250: meta_size_gfx1250() = Signal (~34 KB) + LL staging scratch
+        # (~4 MiB, see kLLScratchOffset/llScratchBytes). That is already well
+        # above 2 MB, so it lands in the always-safe coarse-grained regime; the
+        # round-up to a 2 MB multiple below is a no-op guard that also keeps the
+        # allocation 2 MB-aligned. The kernel touches the leading Signal struct
+        # (sync flags) plus the trailing scratch region (LL fast path).
         _COARSE_GRAIN = 2 * 1024 * 1024
         if self._is_gfx1250:
             meta_size = (
@@ -898,16 +976,19 @@ class CustomAllreduce:
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
+        # AITER_CUSTOM_AR_MAX_SIZE=0 disables custom AR entirely -> RCCL for all.
+        if self._car_max_size <= 0:
+            return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            # decode
+            # decode: env-controlled cutoff (default 64 MiB).
             if not prefill_support:
-                return inp_size <= 8192 * 8192
-            # prefill
+                return inp_size <= self._car_max_size
+            # prefill: also bounded by the 2x tmp buffer (max_size / 2).
             else:
-                return inp_size <= (self.max_size / 2)
+                return inp_size <= min(self._car_max_size, self.max_size / 2)
         return False
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):

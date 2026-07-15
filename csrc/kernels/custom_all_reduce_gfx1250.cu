@@ -92,7 +92,14 @@ void dispose(fptr_t _fa)
     delete fa;
 }
 
-int64_t meta_size() { return sizeof(aiter::Signal); }
+// Shared meta buffer = Signal struct + LL staging scratch appended after it.
+// The LL fast path derives each peer's scratch base as (peer meta) +
+// kLLScratchOffset, reusing the existing cross-rank meta exchange. The whole
+// region is zero-initialized by the caller (which also resets the LL flags).
+int64_t meta_size()
+{
+    return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes());
+}
 
 // ---- Internal dispatch helper ----
 
