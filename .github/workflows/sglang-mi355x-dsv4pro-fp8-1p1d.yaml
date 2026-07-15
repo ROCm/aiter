@@ -93,7 +93,7 @@ jobs:
       github.event.action != 'labeled' ||
       github.event.label.name == 'ci:sglang' ||
       github.event.label.name == 'ci:all'
-    runs-on: [self-hosted, aiter-di-ci-spur-login-sglang]
+    runs-on: [self-hosted, aiter-di-ci-spur-login-sglang-crusoe]
     timeout-minutes: 240
 
     steps:
