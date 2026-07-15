@@ -190,6 +190,39 @@ jobs:
             exit 1
           fi
           cp -f "${proxy_src}" "${DISAGG_SCRIPTS_STAGE}/moriio_toy_proxy_server.py"
+          cat > "${DISAGG_SCRIPTS_STAGE}/sitecustomize.py" <<'PY'
+          """CI-only compatibility shim for vllm/vllm-openai-rocm:v0.23.0."""
+          try:
+              import vllm.model_executor.layers.quantization as _q
+              from vllm.model_executor.layers.quantization.modelopt import (
+                  ModelOptMxFp8Config as _ModelOptMxFp8Config,
+              )
+          except Exception:
+              _q = None
+          if _q is not None:
+              _orig_get_quantization_config = _q.get_quantization_config
+
+              def _aiter_get_quantization_config(quantization):
+                  if quantization == "mxfp8":
+                      return _ModelOptMxFp8Config
+                  return _orig_get_quantization_config(quantization)
+
+              _q.get_quantization_config = _aiter_get_quantization_config
+          PY
+          python3 - "${DISAGG_SCRIPTS_STAGE}/run_xPyD_disagg.slurm" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          needle = '        -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/flydsl_cache \\\n'
+          insert = '        -e PYTHONPATH="${CONTAINER_SCRIPTS}:${PYTHONPATH:-}" \\\n'
+          if insert not in text:
+              if needle not in text:
+                  raise SystemExit("Could not find docker env anchor for PYTHONPATH")
+              text = text.replace(needle, needle + insert, 1)
+              path.write_text(text, encoding="utf-8")
+          PY
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
           squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
