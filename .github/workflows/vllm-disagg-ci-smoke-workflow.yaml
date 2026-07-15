@@ -69,7 +69,7 @@ jobs:
       VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
       MODEL_NAME_DEFAULT: DeepSeek-V3
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
-      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-12,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
+      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-2,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-3
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
       ROUTER_TYPE_DEFAULT: vllm-router
       MORIIO_READ_MODE_DEFAULT: "0"
