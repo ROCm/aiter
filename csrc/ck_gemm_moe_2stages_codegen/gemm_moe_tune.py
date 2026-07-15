@@ -7,6 +7,7 @@ import pandas as pd
 import os
 import sys
 import tempfile
+import traceback
 from aiter import QuantType
 from aiter.jit.core import (
     get_asm_dir,
@@ -3534,7 +3535,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(self, args, target_fused_moe=None, try_extra_ref=False):
+    def run_config(self, args, target_fused_moe=None, try_extra_ref=False, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
 
@@ -3914,6 +3915,9 @@ class FmoeTuner(TunerCommon):
                         }
                     )
             except Exception as e:
+                print(f"\n=== Exception in run_config for {shape_str} {config_string=} ===")
+                traceback.print_exc()
+                print(f"=== End of traceback ===")
                 results.append(
                     {
                         "shape": shape_str,
@@ -4821,6 +4825,7 @@ class FmoeTuner(TunerCommon):
                         target_fused_moe, config_string=config_string
                     ),
                     try_extra_ref=True,
+                    config_string = config_string,
                 )
             except Exception as e:
                 print(f"{RED}Error with config {config_string}: {e}{END}")
@@ -4893,6 +4898,7 @@ class FmoeTuner(TunerCommon):
             # Merge with existing tuned file: keep existing rows that are not
             # being updated, so repeated runs don't lose entries for shapes
             # where the new kernel doesn't beat the baseline.
+            key_cols = []
             if os.path.exists(output_file):
                 existing_df = pd.read_csv(output_file)
                 # Build key for dedup: use the untuned input columns
