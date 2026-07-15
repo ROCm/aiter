@@ -202,15 +202,14 @@ jobs:
           : > "${squeue_log}"
           : > "${sacct_log}"
 
+          # Spur NODE_FAILs (JobLaunchFailure) any job submitted with sbatch CLI
+          # resource flags (--nodelist/--nodes/--ntasks/--gres/...); the proven
+          # invocation passes NONE and relies entirely on the #SBATCH directives
+          # baked into run_xPyD_disagg.slurm (nodes=2, ntasks-per-node=1,
+          # gres=gpu:8, exclusive), letting Slurm schedule free nodes. See the
+          # reference submitter run-slurm-disagg-test.sh. SPUR_NODELIST is now
+          # informational only (node pinning caused every CI job to NODE_FAIL).
           sbatch_args=()
-          if [[ -n "${SPUR_NODELIST}" ]]; then
-            sbatch_args+=(--nodelist "${SPUR_NODELIST}")
-            # Request one task per node so every rank (incl. rank 1 on the
-            # second node) gets a Slurm task; default is NumTasks=1, which
-            # leaves the 2nd node without a task and no rank-1 logs.
-            n_nodes="$(awk -F',' '{print NF}' <<< "${SPUR_NODELIST}")"
-            sbatch_args+=(--nodes "${n_nodes}" --ntasks "${n_nodes}" --ntasks-per-node 1)
-          fi
 
           echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
           LOG_ROOT="${log_root}" \
