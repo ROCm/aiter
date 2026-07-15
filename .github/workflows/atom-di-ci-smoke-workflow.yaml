@@ -32,7 +32,7 @@ on:
         type: string
         default: "/data/models2/GLM-5.2-FP8"
       run_glm_5_2_fp8:
-        description: "Run GLM-5.2-FP8 2P1D TP-only case"
+        description: "Run GLM-5.2-FP8 1P1D TP-only case"
         required: false
         default: true
         type: boolean
@@ -123,9 +123,7 @@ jobs:
                   return raw
               return str(raw).lower() == "true"
 
-          # GLM-5.2-FP8 disabled: atom engine crashes at init with
-          # "NameError: name 'module_mla_metadata' is not defined". Run DeepSeek only.
-          run_glm = bool_input("run_glm_5_2_fp8", False)
+          run_glm = bool_input("run_glm_5_2_fp8", True)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
@@ -527,6 +525,18 @@ jobs:
 
             cd "${shared_workspace}"
             chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+            # Spur sacct compatibility: ATOM pd_submit.sh reads the Slurm exit
+            # code via `sacct -j <id> -X -n -P -o State,ExitCode`, but Spur's
+            # sacct rejects -X/-P and its -j does not filter, so the query
+            # returns empty and the job RC defaults to 1 -- marking runs that
+            # actually succeeded (gsm8k + benchmark) as failed. Rewrite that one
+            # line to a Spur-compatible query (space-separated, awk-filtered).
+            if grep -q -- '-X -n -P -o State,ExitCode' .github/scripts/atomesh/pd_submit.sh; then
+              sed -i "/-X -n -P -o State,ExitCode/c\\sacct_line=\"\$(sacct -j \"\${job_id}\" -n -o JobID,State,ExitCode 2>/dev/null | awk -v job_id=\"\${job_id}\" '\$1==job_id { print \$2 \"|\" \$3; exit }' || true)\"" .github/scripts/atomesh/pd_submit.sh
+              echo "[patch] pd_submit.sh sacct exit-code read made Spur-compatible"
+            else
+              echo "[patch] WARNING: pd_submit.sh sacct anchor not found (ATOM_REF changed?); skipping Spur exit-code patch" >&2
+            fi
             cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
             rm -rf "${result_dir}/${cell_id}" \
                    "${result_dir}/${cell_id}-summary.md" \
