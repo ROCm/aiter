@@ -55,9 +55,9 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
     scales = flat.abs().amax(dim=-1) / fp8_max  # [num_tokens]
     scales = torch.maximum(scales, torch.full_like(scales, 1e-10))
 
-    out_quant = torch.clamp(
-        flat / scales.unsqueeze(-1), -fp8_max, fp8_max
-    ).to(quant_dtype)
+    out_quant = torch.clamp(flat / scales.unsqueeze(-1), -fp8_max, fp8_max).to(
+        quant_dtype
+    )
     return out_quant, scales
 
 
