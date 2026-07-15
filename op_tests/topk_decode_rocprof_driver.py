@@ -50,12 +50,11 @@ KERNEL_ZERO_MATCH = {
     "aiter_hip": re.compile(r"fillBufferAligned"),
 }
 
-KERNEL_ENV = {
-    "flydsl_tiered": {
-        "FLYDSL_TOPK_TIERED": "1",
-        "FLYDSL_TOPK_TIERED_MIN_ROW_LEN": "0",
-    },
-}
+# Per-kernel env overrides merged over os.environ for the runner subprocess.
+# Currently none -- the tiered path's knobs (FLYDSL_TOPK_TIERED_OVERRIDE,
+# _SHORT_MAX, _MASK_NONFINITE, ...) are read straight from the environment, so set
+# them on the command line when benchmarking rather than hard-coding here.
+KERNEL_ENV: dict[str, dict[str, str]] = {}
 
 
 def run_cell(
