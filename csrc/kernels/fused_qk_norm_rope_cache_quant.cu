@@ -5668,6 +5668,10 @@ void fused_qk_norm_rope_group_quant(
                 "paged swa_nope_scale_buff and swa_rope_buff must share num_rows");
     AITER_CHECK(swa_block_tables->dim() == 2 && swa_block_tables->dtype() == AITER_DTYPE_i32,
                 "swa_block_tables must be 2D [bs, max_blocks] int32");
+    AITER_CHECK(swa_block_tables->stride(1) == 1,
+                "swa_block_tables must be contiguous in last dim (stride(1) == 1)");
+    AITER_CHECK(swa_nope_scale_buff->stride(1) == 1 && swa_rope_buff->stride(1) == 1,
+                "paged SWA buffers must be contiguous in last dim (stride(1) == 1)");
     AITER_CHECK(swa_block_size > 0, "swa_block_size must be > 0 for paged SWA");
     mla_params.swa_block_size = static_cast<int>(swa_block_size);
     mla_params.swa_block_tables_stride = static_cast<int>(swa_block_tables->stride(0));
