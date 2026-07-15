@@ -560,6 +560,48 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dt
     _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
 
 
+# sqrtsoftplus token sweep (DeepSeek-V4 default): exercise every dispatch tier
+# from decode to large prefill, which test_topk_softplus_correctness (T in
+# {64,1024,2048}) does not fully cover:
+#   T=1/64/256  -> reg opt (TPW=1) decode
+#   T=1024/2048 -> smem_n / opt_n mid
+#   T>=4096     -> opt_n (E=64 TPW=8) and prefill_n large-prefill paths
+# DeepSeek real dtype: bf16 logits + fp32 correction_bias.
+@pytest.mark.parametrize("num_tokens", [1, 64, 256, 1024, 4096, 8192, 16384])
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
+def test_topk_softplus_token_sweep(num_experts, num_tokens, topk):
+    torch.random.manual_seed(0)
+    route_scale = 2.5
+    dtype = torch.bfloat16
+
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+
+    (w_torch, i_torch), _ = run_torch_softplus(
+        gating_output.clone(), bias, topk, True, route_scale
+    )
+    (w_fused, i_fused), _ = run_fused_softplus(
+        gating_output.clone(), bias, topk, True, route_scale
+    )
+
+    sel = _selection_scores(gating_output, bias, "softplus")
+    n_mism = _count_routing_mismatches(
+        i_fused,
+        i_torch,
+        sel,
+        topk,
+        bias=bias,
+        label=f"softplus-sweep E={num_experts} T={num_tokens} k={topk}",
+    )
+    assert n_mism == 0, (
+        f"E={num_experts},topk={topk},T={num_tokens}: "
+        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+    )
+
+    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
+
+
 # Pytest-parametrized test functions -- topk_sigmoid
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])
