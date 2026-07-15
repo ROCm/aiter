@@ -184,6 +184,12 @@ jobs:
           # the compute-visible shared dir and point DISAGG_SCRIPTS_DIR at it.
           echo "Staging disagg scripts from ${PWD} to ${DISAGG_SCRIPTS_STAGE}"
           cp -rf ./. "${DISAGG_SCRIPTS_STAGE}/"
+          proxy_src="../../examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py"
+          if [[ ! -f "${proxy_src}" ]]; then
+            echo "Missing MoRIIO toy proxy script: ${proxy_src}" >&2
+            exit 1
+          fi
+          cp -f "${proxy_src}" "${DISAGG_SCRIPTS_STAGE}/moriio_toy_proxy_server.py"
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
           squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
@@ -197,7 +203,7 @@ jobs:
             # second node) gets a Slurm task; default is NumTasks=1, which
             # leaves the 2nd node without a task and no rank-1 logs.
             n_nodes="$(awk -F',' '{print NF}' <<< "${SPUR_NODELIST}")"
-            sbatch_args+=(--nodes "${n_nodes}" --ntasks-per-node 1)
+            sbatch_args+=(--nodes "${n_nodes}" --ntasks "${n_nodes}" --ntasks-per-node 1)
           fi
 
           echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
