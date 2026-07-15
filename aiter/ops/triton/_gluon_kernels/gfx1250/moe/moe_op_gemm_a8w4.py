@@ -441,8 +441,8 @@ def _moe_gemm_a8w4_decode_persistent(
 
     # -- Inner loop: N_ITERS consecutive N-tiles --
     for n_iter in gl.static_range(N_ITERS):
-        block_n = pid_n * N_ITERS + n_iter
-        if block_n >= num_blocks_n:
+        block_id_n = pid_n * N_ITERS + n_iter
+        if block_id_n >= num_blocks_n:
             return
 
         # -- Prologue: fill pipeline --
