@@ -108,7 +108,9 @@ jobs:
           python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
           import json
           import os
+          import subprocess
           import sys
+          import time
 
           with open(sys.argv[1], encoding="utf-8") as f:
               event = json.load(f)
@@ -149,11 +151,52 @@ jobs:
           )
           requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
           if requested_nodes_raw.lower() == "auto":
+              wait_seconds = int(os.environ.get("SLURM_NODELIST_WAIT_SECONDS", "7200"))
+              poll_seconds = int(os.environ.get("SLURM_NODELIST_POLL_SECONDS", "60"))
+              deadline = time.monotonic() + wait_seconds
               requested_nodes = []
-              print(
-                  "slurm_nodelist=auto: leaving node selection to SPUR scheduler",
-                  file=sys.stderr,
-              )
+              while True:
+                  try:
+                      sinfo_output = subprocess.check_output(
+                          ["sinfo", "-N"],
+                          text=True,
+                          stderr=subprocess.STDOUT,
+                      )
+                  except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+                      raise SystemExit(f"failed to query sinfo for auto nodelist: {exc}")
+                  node_state = {}
+                  for line in sinfo_output.splitlines():
+                      parts = line.split()
+                      if not parts or parts[0] == "NODELIST" or len(parts) < 4:
+                          continue
+                      node_state[parts[0]] = parts[3].lower()
+                  idle_nodes = [
+                      node
+                      for node in allowed_nodes
+                      if node_state.get(node, "").startswith("idle")
+                  ]
+                  print(
+                      "approved node states: "
+                      + ", ".join(
+                          f"{node}={node_state.get(node, 'missing')}"
+                          for node in allowed_nodes
+                      ),
+                      file=sys.stderr,
+                  )
+                  if len(idle_nodes) >= 2:
+                      requested_nodes = idle_nodes[:2]
+                      break
+                  if time.monotonic() >= deadline:
+                      raise SystemExit(
+                          "timed out waiting for two idle approved nodes. "
+                          f"last idle count={len(idle_nodes)}"
+                      )
+                  print(
+                      "waiting for two idle approved nodes; "
+                      f"found {len(idle_nodes)}, retrying in {poll_seconds}s",
+                      file=sys.stderr,
+                  )
+                  time.sleep(poll_seconds)
           else:
               requested_nodes = [
                   node.strip()
