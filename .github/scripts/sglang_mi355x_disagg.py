@@ -352,19 +352,118 @@ fi
 cat >> "$SBATCH_SCRIPT" <<EOF
 
 set -euo pipefail
-rank="\\${SPUR_TASK_OFFSET:-\\${SLURM_PROCID:-0}}"
-if [[ "\\$rank" == "0" ]]; then
+TOTAL_NODES="$TOTAL_NODES"
+REQUESTED_NODELIST_RAW="\\${SPUR_NODELIST:-${SLURM_NODELIST:-}}"
+REQUESTED_NODES=()
+if [[ -n "\\$REQUESTED_NODELIST_RAW" ]]; then
+    if command -v scontrol >/dev/null 2>&1; then
+        mapfile -t REQUESTED_NODES < <(scontrol show hostnames "\\$REQUESTED_NODELIST_RAW" 2>/dev/null || true)
+    fi
+    if [[ "\\${#REQUESTED_NODES[@]}" -eq 0 ]]; then
+        IFS=',' read -r -a REQUESTED_NODES <<< "\\$REQUESTED_NODELIST_RAW"
+    fi
+fi
+
+RAW_RANK="\\${SPUR_TASK_OFFSET:-\\${SLURM_PROCID:-0}}"
+if [[ ! "\\$RAW_RANK" =~ ^[0-9]+$ ]]; then
+    RAW_RANK=0
+fi
+RANK=-1
+CURRENT_HOST="\\$(hostname)"
+CURRENT_SHORT="\\$(hostname -s 2>/dev/null || hostname)"
+for idx in "\\${!REQUESTED_NODES[@]}"; do
+    node="\\${REQUESTED_NODES[$idx]}"
+    node_short="\\${node%%.*}"
+    if [[ "\\$CURRENT_HOST" == "\\$node" || "\\$CURRENT_SHORT" == "\\$node_short" ]]; then
+        RANK="\\$idx"
+        break
+    fi
+done
+if (( RANK < 0 )); then
+    if (( RAW_RANK >= TOTAL_NODES && RAW_RANK - 1 < TOTAL_NODES )); then
+        RANK=\\$((RAW_RANK - 1))
+    else
+        RANK="\\$RAW_RANK"
+    fi
+fi
+
+JOB_ID="\\${SLURM_JOB_ID:-\\${SPUR_JOB_ID:-batch}}"
+RANK_LOG="$WORKDIR/rank-\\${RANK}.log"
+exec > >(tee -a "\\$RANK_LOG") 2>&1
+
+echo "=== SGLang SPUR batch rank \\$RANK raw_rank=\\$RAW_RANK job=\\$JOB_ID host=\\$(hostname) ==="
+env | sort | grep -E '^(SLURM|SPUR)_' || true
+
+IPS=()
+if (( \\${#REQUESTED_NODES[@]} >= TOTAL_NODES )); then
+    for node in "\\${REQUESTED_NODES[@]:0:$TOTAL_NODES}"; do
+        ip="\\$(getent ahostsv4 "\\$node" | head -1 | awk '{print \\$1}')"
+        IPS+=("\\${ip:-\\$node}")
+    done
+elif [[ -n "\\${SPUR_PEER_NODES:-}" ]]; then
+    IFS=',' read -r -a PEERS <<< "\\$SPUR_PEER_NODES"
+    for peer in "\\${PEERS[@]}"; do
+        IPS+=("\\${peer%%:*}")
+    done
+fi
+
+if (( \\${#IPS[@]} < TOTAL_NODES )); then
+    echo "ERROR: expected \\$TOTAL_NODES peer IPs, got \\${#IPS[@]}: \\${IPS[*]}" >&2
+    echo 1 > "$BATCH_EXIT"
+    exit 1
+fi
+
+PIP="\\${IPS[0]}"
+DIP="\\${IPS[$PW]}"
+echo "peer_ips=\\${IPS[*]}"
+echo "bench targets prefill=\\$PIP decode=\\$DIP"
+
+if (( RANK < $PW )); then
+    ROLE=prefill
+    CONTAINER=mi355x_prefill
+    ROLE_SCRIPT="$WORKDIR/prefill.sh"
+    ROLE_LOG="$WORKDIR/prefill_rank\\${RANK}.log"
+else
+    ROLE=decode
+    CONTAINER=mi355x_decode
+    ROLE_SCRIPT="$WORKDIR/decode.sh"
+    ROLE_LOG="$WORKDIR/decode_rank\\${RANK}.log"
+fi
+
+cleanup_role() {
+    docker kill "\\$CONTAINER" >/dev/null 2>&1 || true
+}
+trap cleanup_role EXIT
+
+echo "starting role=\\$ROLE script=\\$ROLE_SCRIPT log=\\$ROLE_LOG"
+bash "\\$ROLE_SCRIPT" > "\\$ROLE_LOG" 2>&1 &
+ROLE_PID=\\$!
+
+if [[ "\\$RANK" == "0" ]]; then
+    sleep 5
     set +e
-    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+    bash "$WORKDIR/bench.sh" "\\$PIP" "\\$DIP" > "$WORKDIR/bench.log" 2>&1
     rc=\\$?
     echo "\\$rc" > "$BATCH_EXIT"
+    cleanup_role
+    wait "\\$ROLE_PID" >/dev/null 2>&1 || true
     exit "\\$rc"
 fi
 
 while [[ ! -f "$BATCH_EXIT" ]]; do
+    if ! kill -0 "\\$ROLE_PID" >/dev/null 2>&1; then
+        wait "\\$ROLE_PID"
+        rc=\\$?
+        echo "ERROR: role \\$ROLE exited before benchmark completed rc=\\$rc" >&2
+        echo "\\$rc" > "$BATCH_EXIT"
+        exit "\\$rc"
+    fi
     sleep 5
 done
-exit "\\$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
+rc="\\$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
+cleanup_role
+wait "\\$ROLE_PID" >/dev/null 2>&1 || true
+exit "\\$rc"
 EOF
 chmod +x "$SBATCH_SCRIPT"
 
