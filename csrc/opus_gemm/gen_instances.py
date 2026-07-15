@@ -98,23 +98,34 @@ SPLITK_REDUCE_ARCHES = tuple(SPLITK_REDUCE_ABI_MAP)
 LEGACY_OPUS_ARCH = "gfx950"
 
 
-def _splitk_reduce_baseline_instantiations(reduce_kernel, ws_ptr_type, has_oob):
+def _splitk_reduce_baseline_instantiations(
+    reduce_kernel, ws_ptr_type, has_oob, vec=16, block=64, split_ks=(None,), d_ws=None
+):
+    # gfx1250 tunes the reduce to VEC=8/BLOCK=128 (coalesced dwordx4 bf16 store,
+    # no cross-lane shuffle), a bf16 workspace (d_ws="__bf16", half the reduce read
+    # traffic), and a COMPILE-TIME split_k (SPLIT_K_ template) dispatched per
+    # value -> split_ks lists every value the launch helper switches on (0 = the
+    # runtime-`split_k` fallback, 1..16 = fully-unrolled). gfx950/gfx942 keep the
+    # legacy 6-param VEC=16/BLOCK=64 fp32-workspace form (split_ks=(None,)).
     has_oob_str = "true" if has_oob else "false"
-    return (
-        f"// HAS_OOB={has_oob_str} variants\n"
-        f"template __global__ void {reduce_kernel}<16, 64, __bf16, true,  __bf16, {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, __bf16, false, __bf16, {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
-        f"    const __bf16*, int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, float,  true,  float,  {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
-        f"template __global__ void {reduce_kernel}<16, 64, float,  false, float,  {has_oob_str}>(\n"
-        f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
-        f"    const float*,  int);\n"
-    )
+    out = f"// HAS_OOB={has_oob_str} variants\n"
+    for sk in split_ks:
+        tail = "" if sk is None else f", {sk}, {d_ws}"
+        out += (
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, __bf16, true,  __bf16, {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+            f"    const __bf16*, int);\n"
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, __bf16, false, __bf16, {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, __bf16*, int, int, int, int, int, int,\n"
+            f"    const __bf16*, int);\n"
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, float,  true,  float,  {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+            f"    const float*,  int);\n"
+            f"template __global__ void {reduce_kernel}<{vec}, {block}, float,  false, float,  {has_oob_str}{tail}>(\n"
+            f"    {ws_ptr_type}, float*,  int, int, int, int, int, int,\n"
+            f"    const float*,  int);\n"
+        )
+    return out
 
 
 def _pipeline_header_for(k):
@@ -153,6 +164,10 @@ SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
     "a16w16_cluster_tdm_splitk_ws",
     "a16w16_clusterlaunch_tdm_splitk_ws",
+    # fused single-kernel split-K: lookup still forces <fp32_t> (D_C=fp32 traits),
+    # but its launcher NAME avoids the "_splitk_" substring so the reduce-TU
+    # detection (:867 / :799) never emits a reduce kernel for it.
+    "a16w16_clusterlaunch_tdm_splitk_fuse",
     *_SPLITK,
 }
 
@@ -844,6 +859,17 @@ void
             reduce_abi = SPLITK_REDUCE_ABI_MAP[reduce_arch]
             ws_ptr_type = reduce_abi["ws_type"]
             reduce_kernel = reduce_abi["kernel"]
+            # gfx1250 reduce: VEC=8/BLOCK=128 + bf16 workspace + compile-time split_k
+            # (SPLIT_K_ = 0..16, matching the launch-helper switch). Other arches keep
+            # the legacy VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
+            if reduce_arch == "gfx1250":
+                reduce_vec, reduce_block = 8, 128
+                reduce_split_ks = tuple(range(0, 17))  # 0 (runtime) + 1..16 (unrolled)
+                reduce_d_ws = "__bf16"
+            else:
+                reduce_vec, reduce_block = 16, 64
+                reduce_split_ks = (None,)
+                reduce_d_ws = None
             contents = (
                 "// SPDX-License-Identifier: MIT\n"
                 "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
@@ -855,7 +881,13 @@ void
                 f'#include "{reduce_header}"\n'
                 + "".join(
                     _splitk_reduce_baseline_instantiations(
-                        reduce_kernel, ws_ptr_type, has_oob
+                        reduce_kernel,
+                        ws_ptr_type,
+                        has_oob,
+                        reduce_vec,
+                        reduce_block,
+                        reduce_split_ks,
+                        reduce_d_ws,
                     )
                     for has_oob in reduce_abi["baseline_has_oob"]
                 )
@@ -925,10 +957,23 @@ def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
+        cu_num = None
+        try:
+            if torch.cuda.is_available():
+                gpu = torch.cuda.current_device()
+                cu_num = torch.cuda.get_device_properties(gpu).multi_processor_count
+        except Exception:
+            # torch device enumeration is broken on some ROCm nightlies
+            # (device_count()==0 / "Invalid device id"); use rocminfo instead.
+            cu_num = None
+        if cu_num is None:
+            try:
+                from aiter.jit.utils.chip_info import get_cu_num as _rocminfo_cu_num
+
+                cu_num = _rocminfo_cu_num()
+            except Exception:
+                cu_num = None
+        if cu_num is not None:
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
         # Accept either the legacy "kernelId" column or the new "solidx" column.
         kids = _tune_df_kids(tune_df)
