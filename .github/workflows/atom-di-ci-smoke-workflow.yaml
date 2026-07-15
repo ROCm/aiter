@@ -123,7 +123,9 @@ jobs:
                   return raw
               return str(raw).lower() == "true"
 
-          run_glm = bool_input("run_glm_5_2_fp8", True)
+          # GLM-5.2-FP8 disabled: atom engine crashes at init with
+          # "NameError: name 'module_mla_metadata' is not defined". Run DeepSeek only.
+          run_glm = bool_input("run_glm_5_2_fp8", False)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
