@@ -26,7 +26,7 @@ on:
         description: "MODEL_NAME passed to run_xPyD disagg Slurm script"
         required: false
         type: string
-        default: "mini-max-fp8"
+        default: "MiniMax-M3-MXFP8"
       disagg_scripts_stage:
         description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
         required: false
@@ -67,7 +67,7 @@ jobs:
     env:
       VLLM_REPOSITORY_DEFAULT: itej89/vllm
       VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
-      MODEL_NAME_DEFAULT: mini-max-fp8
+      MODEL_NAME_DEFAULT: MiniMax-M3-MXFP8
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
       SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
@@ -193,6 +193,11 @@ jobs:
           sbatch_args=()
           if [[ -n "${SPUR_NODELIST}" ]]; then
             sbatch_args+=(--nodelist "${SPUR_NODELIST}")
+            # Request one task per node so every rank (incl. rank 1 on the
+            # second node) gets a Slurm task; default is NumTasks=1, which
+            # leaves the 2nd node without a task and no rank-1 logs.
+            n_nodes="$(awk -F',' '{print NF}' <<< "${SPUR_NODELIST}")"
+            sbatch_args+=(--nodes "${n_nodes}" --ntasks-per-node 1)
           fi
 
           echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
