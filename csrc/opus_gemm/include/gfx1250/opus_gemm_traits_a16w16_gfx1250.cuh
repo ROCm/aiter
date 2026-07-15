@@ -81,6 +81,39 @@ struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
 };
 #endif
 
+#ifndef OPUS_GEMM_SPLITK_FUSE_KARGS_GFX1250_DEFINED
+#define OPUS_GEMM_SPLITK_FUSE_KARGS_GFX1250_DEFINED
+// Kernel args for the FUSED single-kernel in-cluster split-K reduce pipeline
+// (a16w16_clusterlaunch_tdm_splitk_fuse). No separate reduce kernel: the last
+// split WG folds bias + reduces the DataWs partials in-kernel (cluster-barrier
+// sync) and writes C. The DataWs partial workspace is backed by the shared
+// opus_splitk_ws_handle; there is no semaphore buffer (the cluster barrier
+// replaces it). Defined in the traits header so BOTH the device pipeline pass
+// and the fused HOST TU (which includes only this traits header) see it.
+struct opus_gemm_splitk_fuse_kargs_gfx1250
+{
+    const void* __restrict__ ptr_a;                      // bf16 [M, K]
+    const void* __restrict__ ptr_b;                      // bf16 [N, K] (A @ B^T)
+    const opus_splitk_ws_handle* __restrict__ ws_handle; // DataWs partial workspace
+    void* __restrict__ ptr_c;          // bf16/fp32 [M, N] (written by last split WG)
+    const void* __restrict__ ptr_bias; // bf16 [N] or null (folded once by last WG)
+    int m;
+    int n;
+    int k;
+    int batch;             // = 1 per launch
+    int split_k;           // == compile-time SplitK
+    int stride_a;          // A row pitch (>= K)
+    int stride_b;          // B row pitch (>= K)
+    int stride_c;          // = N
+    int stride_a_batch;    // = M * stride_a
+    int stride_b_batch;    // = N * stride_b
+    int stride_c_batch;    // = M * N
+    int stride_bias_batch; // 0 (broadcast [N]) or N
+    int num_tiles_m;       // ceil(M / B_M)
+    int num_tiles_n;       // ceil(N / B_N)
+};
+#endif
+
 // ── User-facing traits = the SINGLE compile-time config the pipeline reads ──
 //   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_C MUST be float (main kernel
 //   writes the fp32 workspace; the reduce kernel casts to the final Y dtype).
