@@ -339,6 +339,7 @@ Real example (ATOM#860): `needs_independent_noise` returned from `prepare_model(
 
 **D2 — New default path without rollback env-var** ⚠️
 New implementation replaces existing default before wide validation: is there an env var to revert?
+Scope: D2 is about a **temporary rollback kill-switch** for a risky default swap (meant to be removed once validated) — NOT a permanent feature-flag knob. aiter maintainers generally reject new *permanent* env vars (see HK9): a MoE activation knob added in #3593 was reverted in #4225. If the safe path can be auto-derived from dtype/arch/shape instead of an env var, prefer that; reserve the env var for a genuine short-lived rollback.
 Real example (PR#3266): flydsl sort replaced opus sort; reviewer: "gate flydsl behind env var until validated on broader workloads."
 → `⚠️ D2: new default path needs rollback env-var for safe rollout`
 
@@ -511,7 +512,7 @@ Counter-example (does NOT trigger P5): aiter#4166 preshuffles the static weight 
 | No UT for new op | New Triton/HIP op, no `op_tests/test_*.py` | `📝 HK6: new op needs UT following aiter-op-test format` |
 | TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ HK7: [location] — incomplete implementation in new code path` |
 | `develop=True` on new op | `@compile_ops(..., develop=True)` in added code | `⚠️ HK8: develop=True bypasses JIT cache — remove before op leaves experimental` |
-| Undocumented new env var | `os.environ.get("AITER_...` on a `+` line | `📝 HK9: new env var [NAME] not documented — add to README or known knobs list` |
+| New permanent env-var knob | `os.environ.get("AITER_...` on a `+` line that adds a lasting behavioral flag | `⚠️ HK9: new env-var knob [NAME] — aiter generally rejects permanent env flags (AITER_MOE_FORCE_BF16_ACT in #3593 was reverted by #4225); prefer auto-deriving from dtype/arch/shape. Acceptable only as a temporary rollback kill-switch (see D2), and then must be documented.` |
 | Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ HK10: reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
 | New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 HK11: new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
