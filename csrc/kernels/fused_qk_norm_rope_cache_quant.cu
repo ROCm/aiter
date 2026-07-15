@@ -4315,7 +4315,7 @@ namespace aiter {
         //   swa_*[row*swa_*_row_stride + :]
         // Strides are in element units (cache_t for nope, scalar_t for rope). Unused
         // (0) when SWA pointers are null. Ignored by the K-only kernel.
-        int swa_block_size, swa_block_tables_stride;
+        int swa_block_size, swa_block_tables_stride, swa_block_tables_blocks;
         int swa_nope_row_stride, swa_rope_row_stride;
     };
 
@@ -4754,8 +4754,8 @@ namespace aiter {
         const int64_t out_rope_offset =
             static_cast<int64_t>(token_idx) * params.k_pe_out_stride_0;
         // Optional fused SWA scatter (decode-only): write the same post-norm/rope K
-        // row into the paged SWA pool using swa_block_tables. CG-pad tokens (bid < 0)
-        // and window-outside sentinel blocks (phys < 0) are skipped.
+        // row into the paged SWA pool using swa_block_tables. CG-pad tokens (bid < 0),
+        // stale/OOB positions, and window-outside sentinel blocks (phys < 0) are skipped.
         bool write_swa = false;
         int64_t swa_cache_offset = 0, swa_rope_offset = 0;
         if (swa_nope != nullptr) {
@@ -4763,15 +4763,17 @@ namespace aiter {
           if (bid >= 0) {
             const int64_t pos = positions[token_idx];
             const int32_t blk = static_cast<int32_t>(pos / params.swa_block_size);
-            const int32_t phys =
-                swa_block_tables[static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
-            if (phys >= 0) {
-              const int32_t off = static_cast<int32_t>(pos % params.swa_block_size);
-              const int64_t dst_row =
-                  static_cast<int64_t>(phys) * params.swa_block_size + off;
-              write_swa = true;
-              swa_cache_offset = dst_row * params.swa_nope_row_stride;
-              swa_rope_offset  = dst_row * params.swa_rope_row_stride;
+            if (pos >= 0 && blk >= 0 && blk < params.swa_block_tables_blocks) {
+              const int32_t phys =
+                  swa_block_tables[static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
+              if (phys >= 0) {
+                const int32_t off = static_cast<int32_t>(pos % params.swa_block_size);
+                const int64_t dst_row =
+                    static_cast<int64_t>(phys) * params.swa_block_size + off;
+                write_swa = true;
+                swa_cache_offset = dst_row * params.swa_nope_row_stride;
+                swa_rope_offset  = dst_row * params.swa_rope_row_stride;
+              }
             }
           }
         }
@@ -5669,6 +5671,7 @@ void fused_qk_norm_rope_group_quant(
     AITER_CHECK(swa_block_size > 0, "swa_block_size must be > 0 for paged SWA");
     mla_params.swa_block_size = static_cast<int>(swa_block_size);
     mla_params.swa_block_tables_stride = static_cast<int>(swa_block_tables->stride(0));
+    mla_params.swa_block_tables_blocks = static_cast<int>(swa_block_tables->size(1));
     mla_params.swa_nope_row_stride = static_cast<int>(swa_nope_scale_buff->stride(0));
     mla_params.swa_rope_row_stride = static_cast<int>(swa_rope_buff->stride(0));
     swa_block_tables_ptr = swa_block_tables->data_ptr();
