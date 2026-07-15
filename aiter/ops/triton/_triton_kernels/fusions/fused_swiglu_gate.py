@@ -51,9 +51,7 @@ def _fused_swiglu_gate_kernel(
     row_out = row_idx * row_stride_out
 
     gate_ptrs = inp_ptr + row_in[:, None] + col_idx[None, :] * col_stride_in
-    up_ptrs = (
-        inp_ptr + row_in[:, None] + (n_cols + col_idx)[None, :] * col_stride_in
-    )
+    up_ptrs = inp_ptr + row_in[:, None] + (n_cols + col_idx)[None, :] * col_stride_in
     out_ptrs = out_ptr + row_out[:, None] + col_idx[None, :] * col_stride_out
 
     mask = (row_idx < n_rows)[:, None] & (col_idx < n_cols)[None, :]

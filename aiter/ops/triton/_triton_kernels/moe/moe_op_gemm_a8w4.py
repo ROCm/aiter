@@ -402,9 +402,7 @@ def _moe_gemm_a8w4(
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
         if SWIGLU_SEPARATED:
-            out = _swiglu_separated(
-                acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL
-            )
+            out = _swiglu_separated(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         else:
             out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(

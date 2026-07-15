@@ -50,9 +50,7 @@ def run_point_bench(args):
     compiled = _compiled_swiglu_ref(x, _MINIMAX_ALPHA, _MINIMAX_LIMIT)
     _ = fused_swiglu_gate(x, out)
     torch.cuda.synchronize()
-    torch.testing.assert_close(
-        out, compiled.to(dtype), rtol=1e-2, atol=1e-2
-    )
+    torch.testing.assert_close(out, compiled.to(dtype), rtol=1e-2, atol=1e-2)
 
     ms_compile = bench_fn(
         lambda: _compiled_swiglu_ref(x, _MINIMAX_ALPHA, _MINIMAX_LIMIT),

@@ -42,15 +42,11 @@ def torch_swiglu_gate_ref(
 @pytest.mark.parametrize("swiglu_limit", [0.0, 7.0])
 @pytest.mark.parametrize("add_residual", [True, False])
 @pytest.mark.parametrize("use_explicit_out", [False, True])
-def test_fused_swiglu_gate(
-    shape, dtype, swiglu_limit, add_residual, use_explicit_out
-):
+def test_fused_swiglu_gate(shape, dtype, swiglu_limit, add_residual, use_explicit_out):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     x = torch.randn(shape, dtype=dtype, device="cuda")
-    ref = torch_swiglu_gate_ref(
-        x, limit=swiglu_limit, add_residual=add_residual
-    )
+    ref = torch_swiglu_gate_ref(x, limit=swiglu_limit, add_residual=add_residual)
     if use_explicit_out:
         out = torch.empty_like(ref)
         fused_swiglu_gate(
