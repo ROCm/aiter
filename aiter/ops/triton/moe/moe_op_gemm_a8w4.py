@@ -312,6 +312,7 @@ def moe_gemm_a8w4(
     limit=1.0,
     swiglu_add_residual=True,
     preshuffled=False,
+    swiglu_separated_layout=False,
     unpadded_N=None,
     unpadded_K=None,
     # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
@@ -592,6 +593,7 @@ def moe_gemm_a8w4(
             limit,
             reduction_n_matmul,
             swiglu_add_residual,
+            swiglu_separated_layout,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -636,6 +638,7 @@ def moe_gemm_a8w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        swiglu_separated_layout=swiglu_separated_layout,
         residual=residual,
     )
     return y_final
