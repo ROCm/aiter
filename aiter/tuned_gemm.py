@@ -146,6 +146,127 @@ tuned_df = pd.DataFrame(
     ]
 )
 
+unsupported_path = os.environ.get(
+    "AITER_GEMM_UNSUPPORTED_CSV",
+    f"{this_dir}/configs/bf16_unsupported_gemm_gfx1250.csv",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_unsupported_gemm_shapes() -> frozenset:
+    """Load the Triton-only shape set from the unsupported-GEMM CSV."""
+    if not os.path.exists(unsupported_path):
+        return frozenset()
+    try:
+        df = pd.read_csv(unsupported_path).drop_duplicates()
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+        logger.warning(f"could not read unsupported-GEMM CSV {unsupported_path}: {e}")
+        return frozenset()
+    shapes = set()
+    for r in df.itertuples(index=False):
+        shapes.add(
+            (
+                int(r.M),
+                int(r.N),
+                int(r.K),
+                bool(r.bias),
+                str(r.dtype),
+                str(r.outdtype),
+                bool(r.scaleAB),
+                bool(r.bpreshuffle),
+            )
+        )
+    return frozenset(shapes)
+
+
+def is_unsupported_skinny_gfx1250(
+    M, N, K, bias, dtype, otype, scaleAB, bpreshuffle
+) -> bool:
+    """True if this bf16 GEMM shape is recorded as native-unsupported (-> Torch)."""
+    key = (
+        int(M),
+        int(N),
+        int(K),
+        bool(bias),
+        str(dtype),
+        str(otype),
+        bool(scaleAB),
+        bool(bpreshuffle),
+    )
+    return get_gfx() == "gfx1250" and key in _load_unsupported_gemm_shapes()
+
+
+# ---------------------------------------------------------------------------
+# Triton-fallback shape list (gfx1250).
+#
+# Some bf16 GEMM shapes have no safe *native* aiter solution on gfx1250: the
+# skinny kernel device-traps at small M (see bf16_unsupported_gemm_gfx1250.csv),
+# and the generic default falls back to torch -> F.linear -> hipBLASLt, which
+# throws std::bad_variant_access on gfx1250 at large M. Route these shapes to the
+# triton a16w16 kernel instead.
+#
+# Same CSV schema and exact (M, N, K, ...) matching as the unsupported list.
+# Point at a custom file with AITER_GEMM_TRITON_CSV.
+# ---------------------------------------------------------------------------
+triton_fallback_path = os.environ.get(
+    "AITER_GEMM_TRITON_CSV",
+    f"{this_dir}/configs/bf16_triton_gemm_gfx1250.csv",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_triton_gemm_shapes() -> frozenset:
+    """Load the triton-fallback shape set from the triton-GEMM CSV.
+
+    Keyed by the exact ``(M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle)``
+    tuple, mirroring ``_load_unsupported_gemm_shapes``.
+    """
+    if not os.path.exists(triton_fallback_path):
+        return frozenset()
+    try:
+        df = pd.read_csv(triton_fallback_path).drop_duplicates()
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
+        logger.warning(f"could not read triton-GEMM CSV {triton_fallback_path}: {e}")
+        return frozenset()
+    shapes = set()
+    for r in df.itertuples(index=False):
+        shapes.add(
+            (
+                int(r.M),
+                int(r.N),
+                int(r.K),
+                bool(r.bias),
+                str(r.dtype),
+                str(r.outdtype),
+                bool(r.scaleAB),
+                bool(r.bpreshuffle),
+            )
+        )
+    return frozenset(shapes)
+
+
+def is_triton_fallback_gfx1250(
+    M, N, K, bias, dtype, otype, scaleAB, bpreshuffle
+) -> bool:
+    """True if this exact bf16 GEMM shape must be routed to the triton kernel.
+
+    triton_gemm supports neither weight preshuffle nor A/B scaling, so those are
+    excluded up front (they never occur on the plain bf16 a16w16 path anyway).
+    """
+    if get_gfx() != "gfx1250" or bpreshuffle or scaleAB:
+        return False
+    key = (
+        int(M),
+        int(N),
+        int(K),
+        bool(bias),
+        str(dtype),
+        str(otype),
+        bool(scaleAB),
+        bool(bpreshuffle),
+    )
+    return key in _load_triton_gemm_shapes()
+
 
 @functools.lru_cache(maxsize=1)
 def get_GEMM_A16W16_config_():
@@ -254,6 +375,21 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
+        # gfx1250: shapes with no safe native solution (skinny kernel device-traps,
+        # torch/hipBLASLt throws std::bad_variant_access) are routed to the triton
+        # a16w16 kernel. Checked first so it overrides the torch/skinny defaults.
+        if is_triton_fallback_gfx1250(
+            M, N, K, bias, dtype, otype, scaleAB, bpreshuffle
+        ):
+            default_config["libtype"] = "triton"
+            default_config["solidx"] = 0
+            default_config["kernelName"] = ""
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, "
+                f"{scaleAB=}, {bpreshuffle=}, listed in {triton_fallback_path}, "
+                f"using triton solution:0"
+            )
+            return default_config
         if bpreshuffle:
             default_config["bpreshuffle"] = True
             if gfx == "gfx942":
@@ -276,8 +412,17 @@ def get_GEMM_A16W16_config(
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
         elif is_skinny_default_shape(M, N, K, dtype, cu_num):
             # soltype, solution_idx = 3, 2
-            default_config["libtype"] = "skinny"
-            default_config["solidx"] = 2
+            if is_unsupported_skinny_gfx1250(
+                M, N, K, bias, dtype, otype, scaleAB, bpreshuffle
+            ):
+                default_config["libtype"] = "torch"
+                default_config["solidx"] = 0
+                logger.info(
+                    f"unsupported skinny shape: M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, using {default_config['libtype']} solution:{default_config['solidx']}"
+                )
+            else:
+                default_config["libtype"] = "skinny"
+                default_config["solidx"] = 2
             default_config["kernelName"] = ""
         if not default_config:
             default_config["libtype"] = "torch"

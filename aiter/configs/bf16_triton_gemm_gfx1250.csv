@@ -1,0 +1,7 @@
+M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,reason
+13795,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,"MiniMax-M3 lightning-indexer proj; torch->hipBLASLt std::bad_variant_access on gfx1250"
+13795,9856,6144,False,torch.bfloat16,torch.bfloat16,False,False,"MiniMax-M3 fused QKV+indexer; torch->hipBLASLt std::bad_variant_access on gfx1250"
+13795,9216,6144,False,torch.bfloat16,torch.bfloat16,False,False,"MiniMax-M3 attn proj; torch->hipBLASLt std::bad_variant_access on gfx1250"
+13795,24576,6144,False,torch.bfloat16,torch.bfloat16,False,False,"MiniMax-M3 MLP gate_up; torch->hipBLASLt std::bad_variant_access on gfx1250"
+13795,6144,8192,False,torch.bfloat16,torch.bfloat16,False,False,"MiniMax-M3 o_proj/down; torch->hipBLASLt std::bad_variant_access on gfx1250"
+13795,6144,12288,False,torch.bfloat16,torch.bfloat16,False,False,"MiniMax-M3 MLP down; torch->hipBLASLt std::bad_variant_access on gfx1250"

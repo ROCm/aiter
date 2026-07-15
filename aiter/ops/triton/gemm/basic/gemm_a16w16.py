@@ -133,7 +133,7 @@ def gemm_a16w16_(
         N, _ = w.shape
 
         if config is None:
-            config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
+            config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
 
         kernel_type_from_config = config.pop("kernel_type", None)
         if kernel_type_from_config is not None:
