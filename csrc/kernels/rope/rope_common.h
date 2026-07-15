@@ -4481,8 +4481,8 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
         vec_pairs >>= 1;
 
     // Fall back to smaller VP if not enough waves to saturate the GPU.
-    const int32_t gpu_capacity  = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    constexpr int32_t warp_size = 64;
+    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+    const int32_t warp_size    = static_cast<int32_t>(get_warp_size_func());
     while(vec_pairs > 1)
     {
         const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
@@ -7577,7 +7577,11 @@ __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float 
 
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
-warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)
+warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
+               vec_t<T, VEC_SIZE>& gamma,
+               float rms_dim,
+               float rms_eps,
+               bool gemma_norm = false)
 {
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
@@ -7593,7 +7597,8 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_d
 #pragma unroll
     for(int i = 0; i < VEC_SIZE; ++i)
     {
-        input[i] = static_cast<T>((float)input[i] * s_val * (float)gamma[i]);
+        const float weight = gemma_norm ? (1.0f + (float)gamma[i]) : (float)gamma[i];
+        input[i] = static_cast<T>((float)input[i] * s_val * weight);
     }
 }
 
@@ -7783,7 +7788,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int x                    = 0,
                                           int rotary_dim           = 0,
                                           int64_t k_block_stride   = 0,
-                                          int64_t v_block_stride   = 0)
+                                          int64_t v_block_stride   = 0,
+                                          bool gemma_norm          = false)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7880,7 +7886,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     cos_sin_vec.load(&cos_sin[position_ * rotary_dim_ + access_id_in_head]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
                 const int rotary_neighbor_offset = access_id_in_head < half_rotary
@@ -7959,7 +7965,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                         &cos_sin[position_ * rotary_dim_ + access_id_in_head / 2 + half_rotary]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
 #pragma unroll
@@ -8001,8 +8007,26 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
-                const int64_t offset =
-                    (slot_id * num_heads_k + head_id_k) * HEAD_SIZE + access_id_in_head;
+                // block_size == 0 => non-paged cache (flat [num_slots, num_heads_k, HEAD_SIZE]):
+                // index directly by slot. Otherwise the cache is paged and K/V are interleaved
+                // per block, so index with the cache's real per-block stride (k_block_stride):
+                // offset = block_id*block_stride + block_offset*slot_size + head*HEAD_SIZE + elem
+                const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
+                int64_t offset;
+                if(block_size == 0)
+                {
+                    offset = slot_id * slot_size + head_id_k * HEAD_SIZE + access_id_in_head;
+                }
+                else
+                {
+                    const int block_id         = static_cast<int>(slot_id / block_size);
+                    const int block_offset     = static_cast<int>(slot_id % block_size);
+                    const int64_t block_stride = (k_block_stride != 0)
+                                                     ? k_block_stride
+                                                     : static_cast<int64_t>(block_size) * slot_size;
+                    offset = block_id * block_stride + block_offset * slot_size +
+                             head_id_k * HEAD_SIZE + access_id_in_head;
+                }
                 out_kv_vec.store(k_cache + offset);
             }
             if(k_out != nullptr)
@@ -8037,8 +8061,24 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
-            const int64_t offset =
-                (slot_id * num_heads_v + head_id_v) * HEAD_SIZE + access_id_in_head;
+            // Same scheme as the K path above, for the V cache.
+            // block_size == 0 => non-paged cache, index directly by slot.
+            const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            int64_t offset;
+            if(block_size == 0)
+            {
+                offset = slot_id * slot_size + head_id_v * HEAD_SIZE + access_id_in_head;
+            }
+            else
+            {
+                const int block_id         = static_cast<int>(slot_id / block_size);
+                const int block_offset     = static_cast<int>(slot_id % block_size);
+                const int64_t block_stride = (v_block_stride != 0)
+                                                 ? v_block_stride
+                                                 : static_cast<int64_t>(block_size) * slot_size;
+                offset                     = block_id * block_stride + block_offset * slot_size +
+                         head_id_v * HEAD_SIZE + access_id_in_head;
+            }
             out_kv_vec.store(v_cache + offset);
         }
         if(v_out != nullptr)
@@ -8082,7 +8122,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             bool use_shuffle_layout  = false,
                             int64_t block_size       = 0,
                             int64_t x                = 0,
-                            int64_t rotary_dim       = 0)
+                            int64_t rotary_dim       = 0,
+                            bool gemma_norm          = false)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
@@ -8128,7 +8169,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8158,7 +8202,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }
 
     if(is_interleaved)

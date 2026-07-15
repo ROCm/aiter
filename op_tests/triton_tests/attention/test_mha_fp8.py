@@ -125,12 +125,6 @@ def test_mha_varlen(
 ):
     HEAD_SZ: int = 128
 
-    # TO DO: remove once Triton/LLVM async-copy compiler issue is fixed
-    if arch == "gfx950" and CAUSAL:
-        pytest.skip(
-            "Known gfx950 FP8 varlen MHA compiler crash with async copy enabled"
-        )
-
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -301,14 +295,6 @@ def test_mha_backward_varlen(
 
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
-
-    # TO DO: Remove  once the Triton/LLVM async-copy compiler issue is fixed
-    if arch == "gfx950" and (
-        (CAUSAL and not FUSED) or (not CAUSAL and NUM_Q_HEADS == 32)
-    ):
-        pytest.skip(
-            "Known gfx950 FP8 backward varlen MHA compiler crash with async copy enabled"
-        )
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
