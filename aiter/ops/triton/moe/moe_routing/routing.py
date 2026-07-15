@@ -6,6 +6,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
+from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
+    _expt_data_only_kernel,
+)
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
@@ -262,6 +265,116 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
 
 
 # --------------------------
+# expert parallelism (expert_map) routing
+# --------------------------
+
+
+def _compute_expt_data(hist, n_expts_tot, n_gates, block_m):
+    """Build :class:`ExptData` (token_offs_raw/pad, block_pid_map) from a
+    precomputed per-expert histogram via the standalone ``_expt_data_only_kernel``.
+
+    The bitmatrix ``sort_tokens`` path computes ExptData as a side effect of
+    placement, but the expert-parallel path derives its histogram from a
+    counting-sort kernel (``fused_routing_from_topk``) instead of a bitmatrix,
+    so it needs this "hist -> ExptData" step separately.
+    """
+    device = hist.device
+    (
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+        _blocks1,
+        BLOCK_A,
+        block_m_log2,
+    ) = _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device)
+    _expt_data_only_kernel[(n_expts_tot,)](
+        hist,
+        n_expts_tot,
+        token_offs_raw,
+        token_offs_pad,
+        block_pid_map,
+        block_pid_map.shape[0],
+        n_gates,
+        block_m_log2,
+        BLOCK=BLOCK_A,
+        EQUAL_BLOCK=(n_expts_tot == BLOCK_A),
+        num_warps=4,
+    )
+    return ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
+
+
+def _routing_from_topk_torch_expert_map(expt_scal, expt_indx, n_local, expert_map):
+    """Torch counting-sort with global->local expert remap.
+
+    Fallback for ``NK = n_tokens * n_expts_act`` above the single-CTA budget
+    (4096) of :func:`fused_routing_from_topk` (e.g. prefill). Mirrors its
+    semantics exactly: experts whose ``expert_map`` entry is ``< 0`` (non-local)
+    are redirected to local bucket ``0`` with zero weight, and the histogram is
+    sized to ``n_local``.
+    """
+    local_ids = expert_map[expt_indx.long()]  # [n_tokens, k], -1 == non-local
+    invalid = local_ids < 0
+    weights = torch.where(invalid, torch.zeros_like(expt_scal), expt_scal).reshape(-1)
+    local_flat = (
+        torch.where(invalid, torch.zeros_like(local_ids), local_ids)
+        .reshape(-1)
+        .to(torch.int32)
+    )
+    # counting sort by (local) expert id; topk_indx/gate_indx form an inverse
+    # permutation pair, matching fused_routing_from_topk's contract.
+    topk_indx = torch.argsort(local_flat, stable=True)
+    gate_indx = torch.argsort(topk_indx, stable=True)
+    gate_scal = weights[topk_indx]
+    hist = torch.bincount(local_flat, minlength=n_local)[:n_local].to(torch.int32)
+    return (
+        hist,
+        topk_indx.to(torch.int32),
+        gate_indx.to(torch.int32),
+        gate_scal,
+    )
+
+
+def _expert_map_routing(
+    expt_scal, expt_indx, n_local, expert_map, block_m, n_expts_act
+):
+    """Assemble routing output for the expert-parallel path.
+
+    ``expt_scal``/``expt_indx`` are the ``[n_tokens, n_expts_act]`` top-k weights
+    and *global* expert ids from ``topk``/``grouped_topk``. The global->local
+    remap, non-local masking and local-sized histogram all happen inside
+    ``fused_routing_from_topk`` (the tested EP kernels), with a torch fallback
+    for oversized NK. ExptData is then built from the local histogram.
+    """
+    n_tokens, k = expt_scal.shape
+    n_gates = n_tokens * k
+    if n_gates <= 4096:
+        from aiter.ops.triton.fusions.fused_routing_from_topk import (
+            fused_routing_from_topk,
+        )
+
+        hist, topk_indx, gate_indx, gate_scal = fused_routing_from_topk(
+            expt_scal.contiguous(),
+            expt_indx.to(torch.int32).contiguous(),
+            n_local,
+            expert_map=expert_map,
+        )
+    else:
+        hist, topk_indx, gate_indx, gate_scal = _routing_from_topk_torch_expert_map(
+            expt_scal, expt_indx, n_local, expert_map
+        )
+    expt_data = _compute_expt_data(hist, n_local, n_gates, block_m)
+    routing_data = RoutingData(
+        block_m=block_m,
+        gate_scal=gate_scal,
+        expt_hist=hist,
+        n_expts_tot=n_local,
+        n_expts_act=n_expts_act,
+        expt_data=expt_data,
+    )
+    return routing_data, topk_indx, gate_indx
+
+
+# --------------------------
 # routing
 # --------------------------
 
@@ -279,6 +392,8 @@ def routing(
     num_expert_group: int | None = None,
     topk_group: int | None = None,
     expert_group: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    local_num_experts: int | None = None,
 ):
     """Routing entry point. ``score_mode`` selects the path:
 
@@ -294,9 +409,30 @@ def routing(
     ``block_m`` is not supplied by the caller: it is derived internally from the
     raw ``logits`` shape and the originally requested ``n_expts_act``.
 
+    Expert parallelism: when ``expert_map`` (a ``[n_expts_tot]`` int32 global->local
+    table, ``-1`` for experts not held by this rank) is given, ``logits`` are still
+    scored over all global experts, but the selected ids are remapped to local ids,
+    non-local selections are dropped (zero weight, redirected to local bucket 0),
+    and the returned histogram / ``RoutingData.n_expts_tot`` are sized to the local
+    expert count. Pass ``local_num_experts`` to size it explicitly; otherwise it is
+    derived from ``expert_map`` (incurs a device sync).
+
     Returns ``(RoutingData, gather_indx, scatter_indx)``.
     """
     num_tokens, n_expts_tot = logits.shape
+
+    has_expert_map = expert_map is not None
+    if has_expert_map:
+        assert expert_map.dtype == torch.int32, "expert_map must be int32"
+        # expert_map is indexed by global expert id (0..n_expts_tot-1); it must
+        # cover at least that range. Extra trailing entries (e.g. a sentinel for
+        # a fake/non-local expert id) are allowed and simply never indexed here.
+        assert (
+            expert_map.shape[0] >= n_expts_tot
+        ), "expert_map must cover the global expert count (logits.shape[1])"
+        expert_map = expert_map.contiguous()
+        if local_num_experts is None:
+            local_num_experts = int(expert_map.max().item()) + 1
 
     # block_m heuristic from the raw logits shape and the originally requested
     # n_expts_act.
@@ -310,7 +446,12 @@ def routing(
     if score_mode is None:
         # HERD: env-gated fused min-unique routing (decode-sized batches only;
         # prefill / large M falls through to the stock top-k path below).
-        if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M:
+        # HERD has no expert_map support, so EP falls through as well.
+        if (
+            _USE_HERD
+            and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M
+            and not has_expert_map
+        ):
             from .minunique import routing_minunique
 
             return routing_minunique(logits, n_expts_act, sm_first=sm_first)
@@ -325,6 +466,15 @@ def routing(
             apply_softmax=not sm_first,
             HIST_BLOCK_M=HIST_BLOCK_M,
         )
+        if has_expert_map:
+            return _expert_map_routing(
+                expt_scal,
+                expt_indx,
+                local_num_experts,
+                expert_map,
+                block_m,
+                n_expts_act,
+            )
         if num_tokens <= 16:
             HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
             sort_fn = sort_tokens_fused
@@ -352,7 +502,13 @@ def routing(
 
     # HERD: env-gated fused min-unique routing for decode-sized batches.
     # Only for non-grouped-topk (DSv4 flat topk with sqrtsoftplus).
-    if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M and not use_grouped_topk:
+    # HERD has no expert_map support, so EP falls through to the standard path.
+    if (
+        _USE_HERD
+        and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M
+        and not use_grouped_topk
+        and not has_expert_map
+    ):
         from .minunique import routing_minunique_fused
 
         return routing_minunique_fused(
@@ -394,6 +550,11 @@ def routing(
             renorm=renorm,
             routed_scaling_factor=routed_scaling_factor,
             HIST_BLOCK_M=32,
+        )
+
+    if has_expert_map:
+        return _expert_map_routing(
+            expt_scal, expt_indx, local_num_experts, expert_map, block_m, n_expts_act
         )
 
     if num_tokens <= 16:
