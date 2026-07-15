@@ -1,299 +1,168 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """FlyDSL MLA reduce benchmark.
 
-Default (no ``--mode``): GLM-5.2 serving scoreboard — production wrapper path
-with ``final_output=[bs, H, Dv]``, auto-resolved ``actual_max_splits`` (warmup
-cache, same as ``mla_decode_fwd``), adaptive launch, and DA split-K. Backends: ``hip``, ``wrapper``.
+Stage-2 of split-KV MLA decode: merges per-split partial outputs ``O_i`` weighted
+by ``exp(LSE_i - LSE_max)`` (online softmax) into the final bf16/fp16 output.
 
-Synthetic / replay modes (``--mode``):
-  uniform    uniform synthetic workload; all tiles share ``num_splits``
-  irregular  per-tile split list via ``--splits-per-tile`` or ``--splits-list-file``
-  replay     load real metadata from a ``.pt`` file (``dump_decode_metadata.py``)
+The sweep is the GLM-5.2 serving decode grid: a sparse 16384-tile reduce grid
+with active ``(active_tiles, splits)`` decode buckets. ``graph us`` is CUDA-graph
+replay latency; ``TFLOPS`` / ``TB/s`` are derived from it.
 """
 
 import argparse
-import sys
+import itertools
 
-import torch
 import aiter
-
-from aiter.test_common import run_perftest
-from aiter.ops.flydsl.kernels.mla_reduce import (
-    derive_actual_max_splits,
-    plan_splitk_capture_safe,
-    select_tier,
+import pandas as pd
+import torch
+from aiter import dtypes
+from aiter.ops.flydsl import flydsl_mla_reduce_v1
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
 )
+from aiter.jit.utils.chip_info import get_gfx
+
 from op_tests.flydsl_mla_reduce_common import (
+    MLA_REDUCE_SUPPORTED_GFX,
     bench_cudagraph,
-    build_inputs,
-    build_irregular_inputs,
-    make_runner,
-    max_splits_from_indptr,
+    build_serving_decode_inputs,
+    mla_reduce_out_atol,
+    torch_ref_gather,
 )
 
-# --- GLM-5.2 serving scoreboard ------------------------------------------------
+torch.set_default_device("cuda")
 
-SERVING_H, SERVING_DV = 16, 512
-SERVING_NUM_REDUCE_TILE = 16384
-SERVING_PARTIAL_POOL = 606
-SERVING_OUT_DTYPE = torch.bfloat16
-
-SERVING_SCENARIOS = [
-    ("b1_s128", 1, 128),
-    ("b8_s32", 8, 32),
-    ("b8_s26", 8, 26),
-    ("b8_s13", 8, 13),
-    ("b8_s6", 8, 6),
-    ("b8_s5", 8, 5),
-    ("b8_s3", 8, 3),
-    ("b8_s2", 8, 2),
+# (active_tiles, splits) serving decode buckets: 1 tile x 128 splits exercises
+# the split-K path; 8 tiles x N splits exercises the sparse adaptive launch.
+_SERVING_SCENARIOS = [
+    (1, 128),
+    (8, 32),
+    (8, 26),
+    (8, 13),
+    (8, 6),
+    (8, 5),
+    (8, 3),
+    (8, 2),
 ]
 
-SERVING_BACKENDS = ("hip", "wrapper")
 
-
-def _serving_build(active_tiles, splits):
-    active_splits = active_tiles * splits
-    pool_slack = max(0, SERVING_PARTIAL_POOL - active_splits)
-    splits_per_tile = [splits] * active_tiles + [0] * (
-        SERVING_NUM_REDUCE_TILE - active_tiles
+def _roofline(active, splits, H, Dv, out_dtype):
+    """FLOPs (online-softmax weighted-sum FMA) and byte traffic for the reduce."""
+    total_splits = active * splits
+    out_bytes = torch.finfo(out_dtype).bits // 8
+    flops = 2 * total_splits * H * Dv
+    nbytes = (
+        total_splits * H * Dv * 4  # partial_output fp32 read
+        + total_splits * H * 4  # partial_lse   fp32 read
+        + active * H * Dv * out_bytes  # final_output  write
+        + active * H * 4  # final_lse     fp32 write
     )
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        splits_per_tile,
-        SERVING_H,
-        SERVING_DV,
-        SERVING_OUT_DTYPE,
-        M=1,
-        gap_stride=1,
-        pool_slack=pool_slack,
+    return flops, nbytes
+
+
+@benchmark()
+def test_mla_reduce(active, splits, H, Dv, dtype):
+    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
+        active, splits, dtype, H=H, Dv=Dv
     )
-    fout = fout[:active_tiles].contiguous()
-    flse = flse[:active_tiles].contiguous()
-    return po, pl, indptr, fmap, pmap, fout, flse
 
-
-def _make_serving_hip_runner(po, pl, indptr, fmap, pmap, fout, flse, M=1):
-    def run():
-        aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, 0, fout, flse)
-
-    return run
-
-
-def _make_serving_wrapper_runner(po, pl, indptr, fmap, pmap, fout, flse, splits):
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po,
-            pl,
-            indptr,
-            fmap,
-            pmap,
-            1,
-            fout,
-            flse,
-            num_kv_splits=splits,
-        )
-
-    return run
-
-
-def run_serving(backend: str) -> None:
-    num_cu = torch.cuda.get_device_properties(0).multi_processor_count
-    print(
-        f"# GLM-5.2 serving mla_reduce  H={SERVING_H} Dv={SERVING_DV} out=bf16 M=1 "
-        f"grid={SERVING_NUM_REDUCE_TILE} pool={SERVING_PARTIAL_POOL} "
-        f"num_cu={num_cu} backend={backend}"
+    # torch online-softmax reference over the active prefix only (tail tiles are
+    # empty and skipped by both the kernels and the ref).
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr[: active + 1], fmap[:active], pmap, H, Dv, dtype, M=1
     )
-    for label, active, splits in SERVING_SCENARIOS:
-        po, pl, indptr, fmap, pmap, fout, flse = _serving_build(active, splits)
+
+    candidates = {
+        # mla_reduce_v1 signature: (..., max_seqlen_q, num_kv_splits, out, lse)
+        "hip": lambda: aiter.mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, 0, fout, flse
+        ),
+        "wrapper": lambda: flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
+        ),
+    }
+
+    flops, nbytes = _roofline(active, splits, H, Dv, dtype)
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
         fout.zero_()
         flse.zero_()
-        if backend == "hip":
-            run = _make_serving_hip_runner(po, pl, indptr, fmap, pmap, fout, flse)
-            plan = ""
-        else:
-            run = _make_serving_wrapper_runner(
-                po, pl, indptr, fmap, pmap, fout, flse, splits
-            )
-            engage, K, slots = plan_splitk_capture_safe(
-                num_final_rows=int(fout.size(0)),
-                H=SERVING_H,
-                max_seqlen_q=1,
-                num_kv_splits=splits,
-                num_cu=num_cu,
-                actual_max_splits=derive_actual_max_splits(indptr),
-            )
-            plan = (
-                f"splitk K={K} slots={slots} grid_p={slots * K}"
-                if engage
-                else "single-kernel"
-            )
-        _, kernel_us = run_perftest(run, num_warmup=25, num_iters=100)
-        graph_us = bench_cudagraph(run) * 1e3
-        print(
-            f"[{backend}] {label:8s} active={active} splits={splits:3d} "
-            f"kernel={kernel_us:6.1f}us graph={graph_us:6.1f}us  {plan}"
+        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
+        out = fout.clone()
+        lse = flse.clone()
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=mla_reduce_out_atol(dtype),
+            msg=f"{name}: mla_reduce out",
+            printLog=False,
         )
-
-
-# --- uniform / irregular / replay --------------------------------------------
-
-
-def _traffic_bytes(indptr, H, Dv, out_dtype, num_partial_rows):
-    diffs = indptr[1:] - indptr[:-1]
-    total_splits = int(diffs.sum().item())
-    active_tiles = int((diffs > 1).sum().item())
-    bytes_partial_o = total_splits * H * Dv * 4
-    bytes_partial_lse = total_splits * H * 4
-    bytes_final_o = active_tiles * H * Dv * torch.finfo(out_dtype).bits // 8
-    bytes_final_lse = active_tiles * H * 4
-    return bytes_partial_o + bytes_partial_lse + bytes_final_o + bytes_final_lse
-
-
-def _bench_and_print(run, po, indptr, H, Dv, out_dtype, M, label):
-    _, kernel_us = run_perftest(run, num_warmup=25, num_iters=100)
-    graph_us = bench_cudagraph(run) * 1e3
-    total = _traffic_bytes(indptr, H, Dv, out_dtype, po.shape[0])
-    gbps = total / (kernel_us * 1e-6) / 1e9
-    max_s = max_splits_from_indptr(indptr)
-    tier = select_tier(max_s)
-    print(
-        f"[FlyDSL {label}] H={H} Dv={Dv} M={M} max_splits={max_s} "
-        f"tier={tier.value} "
-        f"kernel={kernel_us:.1f}us graph={graph_us:.1f}us "
-        f"BW={gbps:.0f}GB/s ({gbps/5300*100:.0f}% of 5.3TB/s)"
-    )
-
-
-def run_synthetic(args: argparse.Namespace) -> None:
-    out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-
-    if args.mode == "uniform":
-        H, Dv, T, S, M = args.H, args.Dv, args.tiles, args.splits, args.M
-        po, pl, indptr, fmap, pmap, fout, flse = build_inputs(
-            T, S, H, Dv, out_dtype, M=M
+        checkAllclose(
+            ref_lse.to(dtypes.fp32),
+            lse.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-3,
+            msg=f"{name}: mla_reduce lse",
+            printLog=False,
         )
-        fout.zero_()
-        flse.zero_()
-        run = make_runner(
-            po, pl, indptr, pmap, fmap, fout, flse, H, Dv, args.dtype, args.lse, M
-        )
-        _bench_and_print(run, po, indptr, H, Dv, out_dtype, M, "uniform")
-
-    elif args.mode == "irregular":
-        H, Dv, M = args.H, args.Dv, args.M
-        if args.splits_list_file:
-            with open(args.splits_list_file) as f:
-                splits_per_tile = [int(line.strip()) for line in f if line.strip()]
-        elif args.splits_per_tile:
-            splits_per_tile = [int(x) for x in args.splits_per_tile.split(",")]
-        else:
-            raise SystemExit(
-                "--mode irregular requires --splits-per-tile or --splits-list-file"
-            )
-        po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-            splits_per_tile,
-            H,
-            Dv,
-            out_dtype,
-            M=M,
-            gap_stride=args.gap_stride,
-            pool_slack=args.pool_slack,
-        )
-        fout.zero_()
-        flse.zero_()
-        run = make_runner(
-            po, pl, indptr, pmap, fmap, fout, flse, H, Dv, args.dtype, args.lse, M
-        )
-        _bench_and_print(run, po, indptr, H, Dv, out_dtype, M, "irregular")
-
-    else:  # replay
-        if not args.meta:
-            raise SystemExit("--mode replay requires --meta <path.pt>")
-        meta = torch.load(args.meta, map_location="cpu")
-        H = meta.get("H", args.H)
-        Dv = meta.get("Dv", args.Dv)
-        num_partial_rows = meta["num_partial_rows"]
-        num_final_rows = meta["num_final_rows"]
-        M = args.M
-
-        indptr = meta["reduce_indptr"].cuda()
-        fmap = meta["reduce_final_map"].cuda()
-        pmap = meta["reduce_partial_map"].cuda()
-
-        g = torch.Generator(device="cuda").manual_seed(0)
-        po = torch.randn(
-            num_partial_rows, H, Dv, dtype=torch.float32, device="cuda", generator=g
-        )
-        pl = (
-            torch.randn(
-                num_partial_rows, H, dtype=torch.float32, device="cuda", generator=g
-            )
-            * 2.0
-        )
-        fout = torch.zeros(num_final_rows, H, Dv, dtype=out_dtype, device="cuda")
-        flse = torch.zeros(num_final_rows, H, dtype=torch.float32, device="cuda")
-
-        run = make_runner(
-            po,
-            pl,
-            indptr,
-            pmap,
-            fmap,
-            fout,
-            flse,
-            H,
-            Dv,
-            args.dtype,
-            args.lse,
-            M,
-            num_partial_rows=num_partial_rows,
-            num_final_rows=num_final_rows,
-        )
-        _bench_and_print(run, po, indptr, H, Dv, out_dtype, M, f"replay:{args.meta}")
+        # CUDA-graph replay µs (serving path): host dispatch captured once and
+        # amortized away. TFLOPS/TB/s are derived from this, not eager us.
+        graph_us = bench_cudagraph(fn) * 1e3
+        ret[f"{name} us"] = us
+        ret[f"{name} graph us"] = graph_us
+        ret[f"{name} TFLOPS"] = flops / graph_us / 1e6
+        ret[f"{name} TB/s"] = nbytes / graph_us / 1e6
+        ret[f"{name} err"] = err
+    return ret
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] in SERVING_BACKENDS:
-        run_serving(sys.argv[1])
+    if get_gfx() not in MLA_REDUCE_SUPPORTED_GFX:
+        aiter.logger.warning("mla_reduce unsupported on %s; skipping", get_gfx())
         return
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "backend",
-        nargs="?",
-        default="wrapper",
-        choices=SERVING_BACKENDS,
-        help="serving-path backend (default when no --mode)",
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default="bf16,",
+        metavar="{bf16,fp16}",
+        help="Output data type, e.g. -d bf16",
     )
-    ap.add_argument(
-        "--mode",
-        choices=["uniform", "irregular", "replay"],
-        default=None,
-        help="synthetic/replay mode; omit for GLM-5.2 serving scoreboard",
+    parser.add_argument(
+        "--hdv",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(16, 512)],
+        help="(H, Dv) shape, e.g. --hdv 16,512 128,512",
     )
-    ap.add_argument("--H", type=int, default=128)
-    ap.add_argument("--Dv", type=int, default=512)
-    ap.add_argument("--M", type=int, default=1, help="max_seqlen_q")
-    ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
-    ap.add_argument("--lse", action="store_true")
-    ap.add_argument("--tiles", type=int, default=256)
-    ap.add_argument("--splits", type=int, default=8)
-    ap.add_argument(
-        "--splits-per-tile",
-        default=None,
-        help='comma-separated per-tile split counts, e.g. "32,0,32,8"',
+    parser.add_argument(
+        "-s",
+        "--scenario",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=_SERVING_SCENARIOS,
+        help="(active_tiles, splits) decode buckets, e.g. -s 1,128 8,32",
     )
-    ap.add_argument("--splits-list-file", default=None, help="one int per line")
-    ap.add_argument("--gap-stride", type=int, default=1)
-    ap.add_argument("--pool-slack", type=int, default=0)
-    ap.add_argument("--meta", default=None, help="path to .pt from dump_decode_metadata.py")
-    args = ap.parse_args()
+    args = parser.parse_args()
 
-    if args.mode is None:
-        run_serving(args.backend)
-    else:
-        run_synthetic(args)
+    for dtype in args.dtype:
+        df = []
+        for (H, Dv), (active, splits) in itertools.product(args.hdv, args.scenario):
+            df.append(test_mla_reduce(active, splits, H, Dv, dtype))
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "mla_reduce GLM-5.2 serving summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":

@@ -13,10 +13,14 @@ partial buffer is a sparsely-indexed pool.
 import pytest
 import torch
 
+from aiter.test_common import checkAllclose
+from aiter.jit.utils.chip_info import get_gfx
 from op_tests.flydsl_mla_reduce_common import (
+    MLA_REDUCE_SUPPORTED_GFX,
     build_degenerate_inputs,
     build_inputs,
     build_irregular_inputs,
+    build_serving_decode_inputs,
     build_serving_mapped_slack_inputs,
     build_serving_sparse_grid_inputs,
     build_serving_stale_indptr_inputs,
@@ -24,6 +28,8 @@ from op_tests.flydsl_mla_reduce_common import (
     hip_ref,
     hip_ref_like_fout,
     make_runner,
+    mla_reduce_out_atol as _out_atol,
+    mla_reduce_out_dtype as _out_dtype,
     run_cudagraph_replay,
     torch_ref,
     torch_ref_gather,
@@ -39,14 +45,14 @@ _GLM_SHAPE = (8, 256)
 
 # Irregular scenarios: (id, splits_per_tile, gap_stride, M).
 _IRREGULAR_SCENARIOS = [
-    ("tier_mismatch", [8, 304], 1, 1),       # tile 0 small, tile 1 forces MLDS tier
+    ("tier_mismatch", [8, 304], 1, 1),  # tile 0 small, tile 1 forces MLDS tier
     ("variable_splits", [4, 32, 8, 64], 1, 1),  # mixed per-tile counts
-    ("gapped_pmap", [8, 8, 8, 8], 4, 1),     # non-dense gather rows
-    ("empty_middle", [8, 0, 16, 8], 1, 1),   # empty tile + garbage final map
-    ("mlds_boundary", [300], 1, 1),          # MLDS tier just under cap
-    ("mlds_max", [304], 1, 1),               # LDS_MAX_SPLITS
-    ("mtp_irregular", [8, 32, 16], 2, 4),    # MTP (M>1) + gaps
-    ("pool_oversize", [8, 304], 8, 1),       # large slack in partial pool
+    ("gapped_pmap", [8, 8, 8, 8], 4, 1),  # non-dense gather rows
+    ("empty_middle", [8, 0, 16, 8], 1, 1),  # empty tile + garbage final map
+    ("mlds_boundary", [300], 1, 1),  # MLDS tier just under cap
+    ("mlds_max", [304], 1, 1),  # LDS_MAX_SPLITS
+    ("mtp_irregular", [8, 32, 16], 2, 4),  # MTP (M>1) + gaps
+    ("pool_oversize", [8, 304], 8, 1),  # large slack in partial pool
 ]
 
 # fp16 (in addition to the bf16 default) only on the most layout-sensitive cases,
@@ -73,12 +79,12 @@ _TORCH_IDS = [f"{n}_{dt}" for n, _, _, _, dt in _TORCH_CASES]
 # compile tier on both reference paths.
 _SMOKE_TILES = 4
 _SMOKE_CASES = [
-    (_HIP_SHAPE, "hip", 2),     # simple
-    (_HIP_SHAPE, "hip", 8),     # m64
-    (_HIP_SHAPE, "hip", 64),    # m256
-    (_HIP_SHAPE, "hip", 256),   # m256 upper
-    (_GLM_SHAPE, "torch", 2),   # simple (GLM)
-    (_GLM_SHAPE, "torch", 8),   # massive (GLM)
+    (_HIP_SHAPE, "hip", 2),  # simple
+    (_HIP_SHAPE, "hip", 8),  # m64
+    (_HIP_SHAPE, "hip", 64),  # m64 upper
+    (_HIP_SHAPE, "hip", 256),  # m256
+    (_GLM_SHAPE, "torch", 2),  # simple (GLM)
+    (_GLM_SHAPE, "torch", 8),  # m64 (GLM)
     (_GLM_SHAPE, "torch", 32),  # production split cap
     (_GLM_SHAPE, "torch", 256),  # stress
 ]
@@ -101,22 +107,30 @@ _DEGEN_TILES = [2, 4]
 def _require_cuda():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-
-
-def _out_dtype(dt: str) -> torch.dtype:
-    return torch.bfloat16 if dt == "bf16" else torch.float16
-
-
-def _out_atol(dt: str) -> float:
-    return 6.3e-2 if dt == "bf16" else 2e-3
+    if get_gfx() not in MLA_REDUCE_SUPPORTED_GFX:
+        pytest.skip(f"mla_reduce unsupported on {get_gfx()}")
 
 
 def _assert_close(fout, flse, ref_out, ref_lse, dt):
     atol = _out_atol(dt)
-    out_err = (fout.float() - ref_out.float()).abs().max().item()
-    lse_err = (flse - ref_lse).abs().max().item()
-    assert out_err <= atol, f"out max_abs_err={out_err:.3e} > {atol}"
-    assert lse_err <= 1e-3, f"lse max_abs_err={lse_err:.3e}"
+    out_err = checkAllclose(
+        ref_out.float(),
+        fout.float(),
+        rtol=0,
+        atol=atol,
+        msg=f"mla_reduce out ({dt})",
+        printLog=False,
+    )
+    lse_err = checkAllclose(
+        ref_lse.float(),
+        flse.float(),
+        rtol=0,
+        atol=1e-3,
+        msg=f"mla_reduce lse ({dt})",
+        printLog=False,
+    )
+    assert out_err == 0, f"out mismatch ratio={out_err}"
+    assert lse_err == 0, f"lse mismatch ratio={lse_err}"
 
 
 def _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, out_dtype, meta, M=1):
@@ -178,15 +192,25 @@ def _run_guarded(
     return fout.clone(), flse.clone()
 
 
-def _assert_gather_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta):
-    ref_out, ref_lse = _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta)
+def _assert_gather_differential(
+    po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta
+):
+    ref_out, ref_lse = _masking_ref(
+        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
+    )
     on_out, on_lse = _run_guarded(
         po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=False
     )
     off_out, off_lse = _run_guarded(
         po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=True
     )
-    _assert_close(on_out[: meta["logical_final_rows"]], on_lse[: meta["logical_final_rows"]], ref_out[: meta["logical_final_rows"]], ref_lse[: meta["logical_final_rows"]], dt)
+    _assert_close(
+        on_out[: meta["logical_final_rows"]],
+        on_lse[: meta["logical_final_rows"]],
+        ref_out[: meta["logical_final_rows"]],
+        ref_lse[: meta["logical_final_rows"]],
+        dt,
+    )
     atol = _out_atol(dt)
     q_row = meta["gather_q_row"]
     gather_err = (off_out[q_row].float() - ref_out[q_row].float()).abs().max().item()
@@ -197,19 +221,27 @@ def _assert_gather_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, d
 
 
 def _assert_store_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta):
-    ref_out, ref_lse = _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta)
+    ref_out, ref_lse = _masking_ref(
+        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
+    )
     on_out, on_lse = _run_guarded(
         po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=False
     )
     off_out, _ = _run_guarded(
         po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=True
     )
-    _assert_close(on_out[: meta["logical_final_rows"]], on_lse[: meta["logical_final_rows"]], ref_out[: meta["logical_final_rows"]], ref_lse[: meta["logical_final_rows"]], dt)
+    _assert_close(
+        on_out[: meta["logical_final_rows"]],
+        on_lse[: meta["logical_final_rows"]],
+        ref_out[: meta["logical_final_rows"]],
+        ref_lse[: meta["logical_final_rows"]],
+        dt,
+    )
+    atol = _out_atol(dt)
     sq = meta["store_slack_q"]
     seed = meta["fout_slack_seed"]
     on_slack_err = (on_out[sq:].float() - seed).abs().max().item()
-    assert on_slack_err <= _out_atol(dt), f"guards-ON mutated slack: err={on_slack_err:.3e}"
-    atol = _out_atol(dt)
+    assert on_slack_err <= atol, f"guards-ON mutated slack: err={on_slack_err:.3e}"
     off_slack_err = (off_out[sq:].float() - seed).abs().max().item()
     assert off_slack_err > 5 * atol, (
         f"store guard differential failed: guards-OFF slack "
@@ -271,7 +303,17 @@ def test_flydsl_mla_reduce_uniform_smoke(case):
     fout.zero_()
     flse.zero_()
     run = make_runner(
-        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        H,
+        Dv,
+        dt,
+        True,
         tier=select_tier(S),
     )
     run()
@@ -336,7 +378,7 @@ _SERVING_SHAPE = (16, 512)
 
 @pytest.mark.slow
 def test_serving_sparse_grid_vs_hip():
-    """Jin Tao batch=8 layout: 16384-tile grid, 8 active tiles, garbage tail."""
+    """batch=8 layout: 16384-tile grid, 8 active tiles, garbage tail."""
     _require_cuda()
     dt = "bf16"
     out_dtype = _out_dtype(dt)
@@ -345,9 +387,7 @@ def test_serving_sparse_grid_vs_hip():
     )
     fout.zero_()
     flse.zero_()
-    run = make_runner(
-        po, pl, indptr, pmap, fmap, fout, flse, *_SERVING_SHAPE, dt, True
-    )
+    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, *_SERVING_SHAPE, dt, True)
     run()
     torch.cuda.synchronize()
     ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
@@ -365,9 +405,7 @@ def test_serving_sparse_grid_cudagraph_replay():
     )
     fout.zero_()
     flse.zero_()
-    run = make_runner(
-        po, pl, indptr, pmap, fmap, fout, flse, *_SERVING_SHAPE, dt, True
-    )
+    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, *_SERVING_SHAPE, dt, True)
     run_cudagraph_replay(run)
     ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
     _assert_close(fout, flse, ref_out, ref_lse, dt)
@@ -377,8 +415,7 @@ def test_serving_sparse_grid_cudagraph_replay():
 # Split-K cooperative reduction (opt-in): low-tile / high-split decode case.
 # b1_s128 = 1 active tile x H=16 heads = 16 active blocks / 304 CUs, each
 # serially reducing 128 splits. Split-K fans each head's 128 splits across K
-# blocks (partial online-softmax) + a cheap combine. These cases prove the
-# path stays numerically correct (vs torch ref AND HIP) and capture-safe.
+# blocks (partial online-softmax) + a cheap combine.
 # ---------------------------------------------------------------------------
 _SPLITK_H, _SPLITK_DV = 16, 512
 _SPLITK_GRID = 16384
@@ -392,7 +429,7 @@ def _build_splitk_b1_s128(out_dtype):
     )
 
 
-def _assert_splitk_engages(indptr, monkeypatch):
+def _assert_splitk_engages(indptr):
     from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk
 
     diffs = indptr[1:] - indptr[:-1]
@@ -418,11 +455,21 @@ def test_splitk_b1_s128_vs_torch_ref(monkeypatch, K):
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr, monkeypatch)
+    _assert_splitk_engages(indptr)
     fout.zero_()
     flse.zero_()
     run = make_runner(
-        po, pl, indptr, pmap, fmap, fout, flse, _SPLITK_H, _SPLITK_DV, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        _SPLITK_H,
+        _SPLITK_DV,
+        dt,
+        True,
         tier=None,
     )
     run()
@@ -441,11 +488,21 @@ def test_splitk_b1_s128_vs_hip(monkeypatch):
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr, monkeypatch)
+    _assert_splitk_engages(indptr)
     fout.zero_()
     flse.zero_()
     run = make_runner(
-        po, pl, indptr, pmap, fmap, fout, flse, _SPLITK_H, _SPLITK_DV, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        _SPLITK_H,
+        _SPLITK_DV,
+        dt,
+        True,
         tier=None,
     )
     run()
@@ -457,17 +514,27 @@ def test_splitk_b1_s128_vs_hip(monkeypatch):
 @pytest.mark.slow
 def test_splitk_b1_s128_cudagraph_replay(monkeypatch):
     """Split-K (2-kernel) stays correct under CUDA-graph capture + replay, with
-    a pre-allocated scratch buffer — the capture-safety proof."""
+    a pre-allocated scratch buffer."""
     _require_cuda()
     monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr, monkeypatch)
+    _assert_splitk_engages(indptr)
     fout.zero_()
     flse.zero_()
     run = make_runner(
-        po, pl, indptr, pmap, fmap, fout, flse, _SPLITK_H, _SPLITK_DV, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        _SPLITK_H,
+        _SPLITK_DV,
+        dt,
+        True,
         tier=None,
     )
     run_cudagraph_replay(run)
@@ -501,9 +568,14 @@ def test_splitk_disabled_by_default(monkeypatch):
 def _build_da_single_tile(out_dtype, splits, pool=304):
     """One active tile (bs=1: final_output has a single row) with `splits`
     splits, partial pool sized to `pool` so the split count can be MUTATED up to
-    `pool` across CUDA-graph replays (the device-adaptive stress)."""
+    `pool` across CUDA-graph replays."""
     po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        [splits], _SPLITK_H, _SPLITK_DV, out_dtype, M=1, gap_stride=1,
+        [splits],
+        _SPLITK_H,
+        _SPLITK_DV,
+        out_dtype,
+        M=1,
+        gap_stride=1,
         pool_slack=pool - splits,
     )
     pmap = torch.arange(pool, dtype=torch.int32, device=pmap.device)
@@ -533,7 +605,7 @@ def test_da_splitk_no_engage_low_splits():
 
 
 @pytest.mark.slow
-def test_da_splitk_wrapper_vs_hip(monkeypatch):
+def test_da_splitk_wrapper_vs_hip():
     """The default-able wrapper path (DA split-K on) matches HIP for b1_s128."""
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
@@ -557,11 +629,9 @@ def test_da_splitk_wrapper_vs_hip(monkeypatch):
 
 
 @pytest.mark.slow
-def test_da_splitk_capture_safe_varying_splits(monkeypatch):
-    """THE capture-safety proof: ONE CUDA-graph capture (bs=1, grid/K/scratch
-    baked from host num_kv_splits) stays correct across replays whose per-tile
-    split count changes ON-DEVICE. The opt-in plan_splitk cannot do this (its
-    grid/K come from a .item() read of the CSR at capture time)."""
+def test_da_splitk_capture_safe_varying_splits():
+    """One CUDA-graph capture (bs=1, grid/K/scratch baked from host num_kv_splits)
+    stays correct across replays whose per-tile split count changes on-device."""
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
     from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
@@ -574,7 +644,10 @@ def test_da_splitk_capture_safe_varying_splits(monkeypatch):
         out_dtype, pool, pool=pool
     )
     engage, K, slots = plan_splitk_capture_safe(
-        num_final_rows=1, H=_SPLITK_H, max_seqlen_q=1, num_kv_splits=nkv,
+        num_final_rows=1,
+        H=_SPLITK_H,
+        max_seqlen_q=1,
+        num_kv_splits=nkv,
         num_cu=304,
     )
     assert engage and slots == _SPLITK_H, "DA split-K must engage for bs=1"
@@ -613,7 +686,7 @@ def test_da_splitk_capture_safe_varying_splits(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# actual_max_splits gate (closes over-provisioned-budget regression edge)
+# actual_max_splits gate
 # ---------------------------------------------------------------------------
 
 
@@ -652,7 +725,7 @@ def test_derive_actual_max_splits():
 
 
 @pytest.mark.slow
-def test_actual_max_splits_wrapper_loose_budget_correct(monkeypatch):
+def test_actual_max_splits_wrapper_loose_budget_correct():
     """Loose budget (304) + small actual splits stays on single-kernel path and
     matches the torch reference."""
     _require_cuda()
@@ -664,9 +737,7 @@ def test_actual_max_splits_wrapper_loose_budget_correct(monkeypatch):
 
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
-        out_dtype, 8, pool=8
-    )
+    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(out_dtype, 8, pool=8)
     fout = fout[:1].contiguous()
     flse = flse[:1].contiguous()
     actual = derive_actual_max_splits(indptr)
@@ -707,7 +778,7 @@ def test_actual_max_splits_wrapper_loose_budget_correct(monkeypatch):
 
 
 @pytest.mark.slow
-def test_actual_max_splits_wrapper_cudagraph_replay(monkeypatch):
+def test_actual_max_splits_wrapper_cudagraph_replay():
     """Loose budget + actual_max_splits gate stays correct under graph replay."""
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
@@ -747,69 +818,6 @@ def test_actual_max_splits_wrapper_cudagraph_replay(monkeypatch):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("num_kv_splits", [32, 128])
-def test_wrapper_host_tier_dispatch_cudagraph_replay(monkeypatch, num_kv_splits):
-    """Host per-tier dispatch (AITER_MLA_REDUCE_HOST_TIER=1) stays correct under
-    CUDA-graph capture/replay via the production wrapper.
-
-    Proves alt#1: the wrapper picks the tier on the HOST from num_kv_splits (no
-    device read), captures the per-tier kernel into the graph, and replays
-    correctly against the HIP reference. num_kv_splits=32 -> M64 (the mid-tail
-    win); num_kv_splits=128 -> M256 (over-provisioned tier still correct).
-    """
-    _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
-    monkeypatch.setenv("AITER_MLA_REDUCE_HOST_TIER", "1")
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_sparse_grid_inputs(
-        *_SERVING_SHAPE, out_dtype=out_dtype
-    )
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse,
-            num_kv_splits=num_kv_splits,
-        )
-
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
-
-
-@pytest.mark.slow
-def test_wrapper_host_tier_dispatch_heterogeneous_upper_bound(monkeypatch):
-    """Critical safety case: heterogeneous per-tile splits [8, 304] with the
-    host baking the num_kv_splits=304 (MLDS) tier. The MLDS body must correctly
-    reduce the 8-split tile too (select_tier(upper_bound) caps LSE width only;
-    each tile still reduces its actual n_splits)."""
-    _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
-    monkeypatch.setenv("AITER_MLA_REDUCE_HOST_TIER", "1")
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    H, Dv = _HIP_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        [8, 304], H, Dv, out_dtype, M=1, gap_stride=1
-    )
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=304
-        )
-
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
-
-
-@pytest.mark.slow
 def test_serving_stale_indptr_cudagraph_replay():
     """Cudagraph replay after batch-8→batch-1 layout (guards-ON/OFF differential)."""
     _require_cuda()
@@ -818,30 +826,50 @@ def test_serving_stale_indptr_cudagraph_replay():
     po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_stale_indptr_inputs(
         *_SERVING_SHAPE, out_dtype=out_dtype
     )
-    ref_out, ref_lse = _masking_ref(po, pl, indptr, fmap, pmap, *_SERVING_SHAPE, out_dtype, meta)
+    ref_out, ref_lse = _masking_ref(
+        po, pl, indptr, fmap, pmap, *_SERVING_SHAPE, out_dtype, meta
+    )
     on_out = fout.clone()
     on_lse = flse.clone()
     run_on = make_runner(
-        po, pl, indptr, pmap, fmap, on_out, on_lse, *_SERVING_SHAPE, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        on_out,
+        on_lse,
+        *_SERVING_SHAPE,
+        dt,
+        True,
         disable_guards=False,
         num_partial_rows=meta["logical_partial_rows"],
         num_final_rows=meta["logical_final_rows"],
     )
     on_out.zero_()
     on_lse.zero_()
-    on_out[meta["logical_final_rows"]:].fill_(meta["fout_slack_seed"])
+    on_out[meta["logical_final_rows"] :].fill_(meta["fout_slack_seed"])
     run_cudagraph_replay(run_on)
     off_out = fout.clone()
     off_lse = flse.clone()
     run_off = make_runner(
-        po, pl, indptr, pmap, fmap, off_out, off_lse, *_SERVING_SHAPE, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        off_out,
+        off_lse,
+        *_SERVING_SHAPE,
+        dt,
+        True,
         disable_guards=True,
         num_partial_rows=meta["logical_partial_rows"],
         num_final_rows=meta["logical_final_rows"],
     )
     off_out.zero_()
     off_lse.zero_()
-    off_out[meta["logical_final_rows"]:].fill_(meta["fout_slack_seed"])
+    off_out[meta["logical_final_rows"] :].fill_(meta["fout_slack_seed"])
     run_cudagraph_replay(run_off)
     _assert_close(
         on_out[: meta["logical_final_rows"]],
@@ -882,36 +910,59 @@ def test_serving_store_guard_differential():
 
 
 def test_serving_gather_guard_differential_cudagraph_replay():
+    """Gather guard differential holds under CUDA-graph capture/replay."""
     _require_cuda()
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
     po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_mapped_slack_inputs(
         H, Dv, _out_dtype(dt)
     )
-    ref_out, ref_lse = _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta)
+    ref_out, ref_lse = _masking_ref(
+        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
+    )
     on_out = fout.clone()
     on_lse = flse.clone()
     run_on = make_runner(
-        po, pl, indptr, pmap, fmap, on_out, on_lse, H, Dv, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        on_out,
+        on_lse,
+        H,
+        Dv,
+        dt,
+        True,
         disable_guards=False,
         num_partial_rows=meta["logical_partial_rows"],
         num_final_rows=meta["logical_final_rows"],
     )
     on_out.zero_()
     on_lse.zero_()
-    on_out[meta["store_slack_q"]:].fill_(meta["fout_slack_seed"])
+    on_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
     run_cudagraph_replay(run_on)
     off_out = fout.clone()
     off_lse = flse.clone()
     run_off = make_runner(
-        po, pl, indptr, pmap, fmap, off_out, off_lse, H, Dv, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        off_out,
+        off_lse,
+        H,
+        Dv,
+        dt,
+        True,
         disable_guards=True,
         num_partial_rows=meta["logical_partial_rows"],
         num_final_rows=meta["logical_final_rows"],
     )
     off_out.zero_()
     off_lse.zero_()
-    off_out[meta["store_slack_q"]:].fill_(meta["fout_slack_seed"])
+    off_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
     run_cudagraph_replay(run_off)
     _assert_close(
         on_out[: meta["logical_final_rows"]],
@@ -927,34 +978,57 @@ def test_serving_gather_guard_differential_cudagraph_replay():
 
 
 def test_serving_store_guard_differential_cudagraph_replay():
+    """Store guard differential holds under CUDA-graph capture/replay."""
     _require_cuda()
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
     po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_mapped_slack_inputs(
         H, Dv, _out_dtype(dt)
     )
-    ref_out, ref_lse = _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta)
+    ref_out, ref_lse = _masking_ref(
+        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
+    )
     on_out = fout.clone()
     on_lse = flse.clone()
     run_on = make_runner(
-        po, pl, indptr, pmap, fmap, on_out, on_lse, H, Dv, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        on_out,
+        on_lse,
+        H,
+        Dv,
+        dt,
+        True,
         disable_guards=False,
         num_partial_rows=meta["logical_partial_rows"],
         num_final_rows=meta["logical_final_rows"],
     )
     on_out.zero_()
     on_lse.zero_()
-    on_out[meta["store_slack_q"]:].fill_(meta["fout_slack_seed"])
+    on_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
     run_cudagraph_replay(run_on)
     off_out = fout.clone()
     run_off = make_runner(
-        po, pl, indptr, pmap, fmap, off_out, flse.clone(), H, Dv, dt, True,
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        off_out,
+        flse.clone(),
+        H,
+        Dv,
+        dt,
+        True,
         disable_guards=True,
         num_partial_rows=meta["logical_partial_rows"],
         num_final_rows=meta["logical_final_rows"],
     )
     off_out.zero_()
-    off_out[meta["store_slack_q"]:].fill_(meta["fout_slack_seed"])
+    off_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
     run_cudagraph_replay(run_off)
     _assert_close(
         on_out[: meta["logical_final_rows"]],
@@ -984,16 +1058,23 @@ def test_serving_true_oob_no_fault():
     run()
     torch.cuda.synchronize()
     ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, H, Dv, out_dtype,
+        po,
+        pl,
+        indptr,
+        fmap,
+        pmap,
+        H,
+        Dv,
+        out_dtype,
         num_partial_rows=po.size(0),
         num_final_rows=fout.size(0),
     )
-    _assert_close(
-        fout, flse, ref_out[: fout.size(0)], ref_lse[: fout.size(0)], dt
-    )
+    _assert_close(fout, flse, ref_out[: fout.size(0)], ref_lse[: fout.size(0)], dt)
 
 
-@pytest.mark.parametrize("num_tiles", _DEGEN_TILES, ids=[f"tiles{t}" for t in _DEGEN_TILES])
+@pytest.mark.parametrize(
+    "num_tiles", _DEGEN_TILES, ids=[f"tiles{t}" for t in _DEGEN_TILES]
+)
 def test_flydsl_mla_reduce_degenerate_empty_tile(num_tiles):
     """Empty-tile guard: all-empty (n_splits=0) metadata never stores through the
     garbage q-ranges, leaving the output untouched."""
@@ -1015,8 +1096,8 @@ def test_flydsl_mla_reduce_degenerate_empty_tile(num_tiles):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: get_mla_metadata_v1 emits reduce_max_split; it must equal the CSR
-# max tile width and drive the split-K gate end to end (no host CSR reduction).
+# get_mla_metadata_v1 emits reduce_max_split; it must equal the CSR max tile
+# width and drive the split-K gate end to end (no host CSR reduction).
 # ---------------------------------------------------------------------------
 
 _META_NHEAD = 16  # MLA min heads
@@ -1034,7 +1115,9 @@ _META_FIELDS = (
 )
 
 
-def _metadata_emit(batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_PER_BATCH):
+def _metadata_emit(
+    batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_PER_BATCH
+):
     """Run get_mla_metadata_v1 for a uniform decode shape, returning the emitted
     reduce_max_split scalar (int) alongside its reduce_indptr CSR."""
     import os
@@ -1047,8 +1130,13 @@ def _metadata_emit(batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_
     kv[1:] = torch.full((batch,), ctx, dtype=torch.int32, device="cuda").cumsum(0)
     klp = torch.ones(batch, dtype=torch.int32, device="cuda")
     sizes = aiter.get_mla_metadata_info_v1(
-        batch, 1, _META_NHEAD, torch.bfloat16, torch.bfloat16,
-        is_sparse=False, fast_mode=True,
+        batch,
+        1,
+        _META_NHEAD,
+        torch.bfloat16,
+        torch.bfloat16,
+        is_sparse=False,
+        fast_mode=True,
     )
     outs = {
         name: torch.empty(sz, dtype=t, device="cuda")
@@ -1056,14 +1144,26 @@ def _metadata_emit(batch, ctx, *, parallel, max_split_per_batch=_META_MAX_SPLIT_
     }
     rms = torch.zeros(1, dtype=torch.int32, device="cuda")
     aiter.get_mla_metadata_v1(
-        qo, kv, klp,
-        _META_NHEAD // _META_NHEAD_KV, _META_NHEAD_KV, True,
-        outs["work_meta_data"], outs["work_info_set"], outs["work_indptr"],
-        outs["reduce_indptr"], outs["reduce_final_map"], outs["reduce_partial_map"],
-        page_size=_META_PAGE_SIZE, kv_granularity=_META_KV_GRAN,
-        max_seqlen_qo=1, uni_seqlen_qo=1, fast_mode=True,
+        qo,
+        kv,
+        klp,
+        _META_NHEAD // _META_NHEAD_KV,
+        _META_NHEAD_KV,
+        True,
+        outs["work_meta_data"],
+        outs["work_info_set"],
+        outs["work_indptr"],
+        outs["reduce_indptr"],
+        outs["reduce_final_map"],
+        outs["reduce_partial_map"],
+        page_size=_META_PAGE_SIZE,
+        kv_granularity=_META_KV_GRAN,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=True,
         max_split_per_batch=max_split_per_batch,
-        dtype_q_nope=torch.bfloat16, dtype_kv_nope=torch.bfloat16,
+        dtype_q_nope=torch.bfloat16,
+        dtype_kv_nope=torch.bfloat16,
         reduce_max_split=rms,
     )
     torch.cuda.synchronize()
@@ -1100,20 +1200,28 @@ def test_metadata_emitted_scalar_drives_gate():
     assert low < 64 <= hi  # straddle the default min_splits threshold
 
     engage_low, _, _ = plan_splitk_capture_safe(
-        num_final_rows=1, H=16, max_seqlen_q=1,
-        num_kv_splits=304, num_cu=304, actual_max_splits=low,
+        num_final_rows=1,
+        H=16,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
+        actual_max_splits=low,
     )
     engage_hi, K, slots = plan_splitk_capture_safe(
-        num_final_rows=1, H=16, max_seqlen_q=1,
-        num_kv_splits=304, num_cu=304, actual_max_splits=hi,
+        num_final_rows=1,
+        H=16,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
+        actual_max_splits=hi,
     )
     assert not engage_low and engage_hi
 
 
 def test_metadata_gate_closes_over_provisioned_budget_edge():
-    """The regression this whole change targets: on an idle-grid short-context
-    decode the loose num_kv_splits budget (304) makes the legacy gate over-engage
-    DA split-K, but the metadata-emitted true split count declines it."""
+    """On an idle-grid short-context decode the loose num_kv_splits budget (304)
+    makes the legacy gate over-engage DA split-K, but the metadata-emitted true
+    split count declines it."""
     _require_cuda()
     from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
 
@@ -1121,31 +1229,37 @@ def test_metadata_gate_closes_over_provisioned_budget_edge():
     assert emitted < 64
 
     engage_legacy, _, _ = plan_splitk_capture_safe(
-        num_final_rows=1, H=16, max_seqlen_q=1, num_kv_splits=304, num_cu=304,
+        num_final_rows=1,
+        H=16,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
     )
     engage_gated, _, _ = plan_splitk_capture_safe(
-        num_final_rows=1, H=16, max_seqlen_q=1, num_kv_splits=304, num_cu=304,
+        num_final_rows=1,
+        H=16,
+        max_seqlen_q=1,
+        num_kv_splits=304,
+        num_cu=304,
         actual_max_splits=emitted,
     )
     assert engage_legacy and not engage_gated
 
 
 def test_dispatch_does_not_thread_actual_max_splits(monkeypatch):
-    """The mla.py reduce dispatch seam NO LONGER threads actual_max_splits: it is
-    dropped from mla_decode_fwd / _mla_reduce_v1_dispatch and auto-resolved inside
-    the FlyDSL wrapper from reduce_indptr (capture-safe warmup cache)."""
+    """mla_decode_fwd and _mla_reduce_v1_dispatch do not accept or forward
+    actual_max_splits; the FlyDSL wrapper auto-resolves it from reduce_indptr
+    (capture-safe warmup cache)."""
     import inspect
 
     import aiter.mla as mla
     import aiter.ops.flydsl as flydsl
 
-    # Neither public seam exposes the arg anymore.
-    assert "actual_max_splits" not in inspect.signature(
-        mla._mla_reduce_v1_dispatch
-    ).parameters
-    assert "actual_max_splits" not in inspect.signature(
-        mla.mla_decode_fwd
-    ).parameters
+    assert (
+        "actual_max_splits"
+        not in inspect.signature(mla._mla_reduce_v1_dispatch).parameters
+    )
+    assert "actual_max_splits" not in inspect.signature(mla.mla_decode_fwd).parameters
 
     monkeypatch.setenv("AITER_MLA_REDUCE_FLYDSL", "1")
     mla._flydsl_mla_reduce_enabled.cache_clear()
@@ -1156,12 +1270,9 @@ def test_dispatch_does_not_thread_actual_max_splits(monkeypatch):
 
     monkeypatch.setattr(flydsl, "flydsl_mla_reduce_v1", _capture)
     try:
-        mla._mla_reduce_v1_dispatch(
-            None, None, None, None, None, 1, 0, None, None
-        )
+        mla._mla_reduce_v1_dispatch(None, None, None, None, None, 1, 0, None, None)
     finally:
         mla._flydsl_mla_reduce_enabled.cache_clear()
-    # Seam forwards num_kv_splits but never actual_max_splits.
     assert "actual_max_splits" not in captured["kwargs"]
     assert captured["kwargs"].get("num_kv_splits") == 0
 
@@ -1201,9 +1312,8 @@ def test_resolve_actual_max_splits_eager_and_capture():
 
 
 # ---------------------------------------------------------------------------
-# Adaptive launch (prototype): one block per active (tile, head) instead of the
-# persistent grid-stride kernel. Engages via AITER_MLA_REDUCE_ADAPTIVE_LAUNCH=1
-# on the realistic serving shape (final_output trimmed to the active-tile batch).
+# Adaptive launch: one block per active (tile, head) instead of the persistent
+# grid-stride kernel.
 # ---------------------------------------------------------------------------
 _ADAPTIVE_SCENARIOS = [
     ("b8_s32", 8, 32),
@@ -1214,33 +1324,16 @@ _ADAPTIVE_SCENARIOS = [
 ]
 
 
-def _build_adaptive_serving(active_tiles, splits, out_dtype):
-    """Sparse 16384-tile decode grid, final_output trimmed to the active batch
-    (CSR prefix) so the wrapper's adaptive gate engages (mirrors real serving)."""
-    num_reduce_tile = 16384
-    partial_pool = 606
-    active_splits = active_tiles * splits
-    pool_slack = max(0, partial_pool - active_splits)
-    spt = [splits] * active_tiles + [0] * (num_reduce_tile - active_tiles)
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        spt, 16, 512, out_dtype, M=1, gap_stride=1, pool_slack=pool_slack
-    )
-    fout = fout[:active_tiles].contiguous()
-    flse = flse[:active_tiles].contiguous()
-    return po, pl, indptr, fmap, pmap, fout, flse
-
-
 @pytest.mark.parametrize(
     "label,active,splits", _ADAPTIVE_SCENARIOS, ids=[s[0] for s in _ADAPTIVE_SCENARIOS]
 )
-def test_adaptive_launch_wrapper_vs_hip(monkeypatch, label, active, splits):
+def test_adaptive_launch_wrapper_vs_hip(label, active, splits):
     """Adaptive launch (split-K off) matches HIP on the serving decode shapes."""
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
     dt = "bf16"
-    po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
+    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
         active, splits, _out_dtype(dt)
     )
     fout.zero_()
@@ -1258,14 +1351,13 @@ def test_adaptive_launch_wrapper_vs_hip(monkeypatch, label, active, splits):
 
 
 @pytest.mark.slow
-def test_adaptive_launch_cudagraph_replay(monkeypatch):
+def test_adaptive_launch_cudagraph_replay():
     """Adaptive launch stays correct under CUDA-graph capture/replay (b8_s32)."""
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
     dt = "bf16"
-    po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
+    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
         8, 32, _out_dtype(dt)
     )
     fout.zero_()
@@ -1281,14 +1373,13 @@ def test_adaptive_launch_cudagraph_replay(monkeypatch):
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-def test_adaptive_launch_single_tile_uses_persistent(monkeypatch):
+def test_adaptive_launch_single_tile_uses_persistent():
     """bs=1 (num_final_rows==1) must not engage adaptive; still matches HIP."""
     _require_cuda()
     from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
-    monkeypatch.setenv("AITER_MLA_REDUCE_ADAPTIVE_LAUNCH", "1")
     dt = "bf16"
-    po, pl, indptr, fmap, pmap, fout, flse = _build_adaptive_serving(
+    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
         1, 32, _out_dtype(dt)
     )
     fout.zero_()

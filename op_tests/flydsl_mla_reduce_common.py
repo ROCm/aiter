@@ -8,18 +8,23 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
     compile_mla_reduce,
     compile_mla_reduce_splitk,
     plan_splitk,
-    select_tier,
     should_use_persistent_launch,
     splitk_enabled,
     waves_per_eu_from_env,
     _get_splitk_scratch,
 )
 
+SERVING_NUM_REDUCE_TILE = 16384
+SERVING_PARTIAL_POOL = 606
+MLA_REDUCE_SUPPORTED_GFX = ["gfx942", "gfx950"]
 
-def max_splits_from_indptr(indptr: torch.Tensor) -> int:
-    """Worst-case n_splits across all tiles (CSR row widths)."""
-    diffs = indptr[1:] - indptr[:-1]
-    return int(diffs.max().item())
+
+def mla_reduce_out_dtype(dt: str) -> torch.dtype:
+    return torch.bfloat16 if dt == "bf16" else torch.float16
+
+
+def mla_reduce_out_atol(dt: str | torch.dtype) -> float:
+    return 6.3e-2 if dt in ("bf16", torch.bfloat16) else 2e-3
 
 
 def build_irregular_inputs(
@@ -33,25 +38,19 @@ def build_irregular_inputs(
     device="cuda",
     seed=0,
 ):
-    """Build reduce inputs from a per-tile split-count list, a (possibly gapped)
-    gather map, and an over-sized partial pool — mirroring real decode metadata
-    (variable ``n_splits`` per tile, non-dense ``reduce_partial_map``). The
-    dense/uniform layout produced by ``build_inputs`` is just the special case
-    ``splits_per_tile = [S] * num_tiles, gap_stride = 1, pool_slack = 0``.
+    """Build reduce inputs mirroring real decode metadata (variable ``n_splits``
+    per tile, non-dense ``reduce_partial_map``, over-sized pool). ``build_inputs``
+    is the dense special case (``[S]*num_tiles``, ``gap_stride=1``, ``pool_slack=0``).
 
     Args:
-        splits_per_tile: per-tile ``n_splits``; ``0`` (or ``1``) marks an empty
-            tile whose ``reduce_final_map`` q-range is left as garbage so the
-            kernel's empty-tile guard is exercised (it must never deref it).
-        gap_stride: spacing (in split slots) between consecutive partial-pool
-            base rows; ``1`` is dense, ``>1`` leaves unread holes between the
-            gathered row ranges.
-        pool_slack: extra unused rows appended to the partial pool (simulates an
-            over-allocated partial buffer).
+        splits_per_tile: per-tile ``n_splits``; ``0`` (or ``1``) marks an empty tile
+            whose ``reduce_final_map`` q-range is garbage (exercises the empty-tile
+            guard, which must never deref it).
+        gap_stride: spacing between partial-pool base rows (``1`` dense, ``>1`` holes).
+        pool_slack: extra unused rows appended to the pool (over-allocated buffer).
 
-    For ``M > 1`` each split owns ``M`` contiguous partial rows (one per
-    q-position) and each tile's final q-range spans ``[tile*M, tile*M + M)``,
-    matching the ``get_mla_metadata_v1`` layout (aiter/mla.py).
+    For ``M > 1`` each split owns ``M`` contiguous partial rows and each tile's final
+    q-range spans ``[tile*M, tile*M + M)`` (``get_mla_metadata_v1`` layout).
     """
     g = torch.Generator(device=device).manual_seed(seed)
     num_tiles = len(splits_per_tile)
@@ -103,8 +102,7 @@ def build_irregular_inputs(
 
 def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, M=1, device="cuda", seed=0):
     """Dense/uniform reduce inputs: every tile has ``num_splits`` splits and the
-    gather map is contiguous. Thin wrapper over ``build_irregular_inputs`` kept
-    for the bandwidth benches and uniform smoke tests."""
+    gather map is contiguous."""
     return build_irregular_inputs(
         [num_splits] * num_tiles,
         H,
@@ -118,14 +116,52 @@ def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, M=1, device="cuda", se
 
 
 def build_degenerate_inputs(num_tiles, H, Dv, out_dtype, device="cuda", seed=0):
-    """All-empty (``n_splits=0``) metadata for the empty-tile guard regression;
-    a thin wrapper over ``build_irregular_inputs``."""
+    """All-empty (``n_splits=0``) metadata for the empty-tile guard regression."""
     return build_irregular_inputs(
         [0] * num_tiles, H, Dv, out_dtype, gap_stride=1, device=device, seed=seed
     )
 
 
-def torch_ref(partial_output, partial_lse, num_tiles, num_splits, H, Dv, out_dtype, M=1):
+def build_serving_decode_inputs(
+    active_tiles,
+    splits,
+    out_dtype,
+    H=16,
+    Dv=512,
+    num_reduce_tile=SERVING_NUM_REDUCE_TILE,
+    partial_pool=SERVING_PARTIAL_POOL,
+    device="cuda",
+    seed=0,
+):
+    """Sparse serving decode grid with active-sized outputs."""
+    active_splits = active_tiles * splits
+    pool_slack = max(0, partial_pool - active_splits)
+    splits_per_tile = [splits] * active_tiles + [0] * (num_reduce_tile - active_tiles)
+    po, pl, indptr, fmap, pmap, _, _ = build_irregular_inputs(
+        splits_per_tile,
+        H,
+        Dv,
+        out_dtype,
+        M=1,
+        gap_stride=1,
+        pool_slack=pool_slack,
+        device=device,
+        seed=seed,
+    )
+    return (
+        po,
+        pl,
+        indptr,
+        fmap,
+        pmap,
+        torch.empty(active_tiles, H, Dv, dtype=out_dtype, device=device),
+        torch.empty(active_tiles, H, dtype=torch.float32, device=device),
+    )
+
+
+def torch_ref(
+    partial_output, partial_lse, num_tiles, num_splits, H, Dv, out_dtype, M=1
+):
     """Vectorized online-softmax reduce reference (any max_seqlen_q M)."""
     po = partial_output.view(num_tiles, num_splits, M, H, Dv).double()
     pl = partial_lse.view(num_tiles, num_splits, M, H).double()
@@ -139,20 +175,24 @@ def torch_ref(partial_output, partial_lse, num_tiles, num_splits, H, Dv, out_dty
 
 
 def torch_ref_gather(
-    po, pl, indptr, fmap, pmap, H, Dv, out_dtype, M=1,
-    num_partial_rows=None, num_final_rows=None,
+    po,
+    pl,
+    indptr,
+    fmap,
+    pmap,
+    H,
+    Dv,
+    out_dtype,
+    M=1,
+    num_partial_rows=None,
+    num_final_rows=None,
 ):
     """Gather-based online-softmax reference for irregular metadata.
 
-    Unlike ``torch_ref`` (which assumes a dense, uniformly reshaped layout), this
-    follows the kernel's CSR + gather contract: per tile it gathers partial rows
-    via ``pmap[indptr[t]:indptr[t+1]]`` and merges them. Tiles with
-    ``n_splits <= 1`` are skipped, leaving their output rows at zero — matching a
-    zero-initialized final buffer.
-
-    When ``num_partial_rows`` / ``num_final_rows`` are set (logical bounds passed
-    to the guarded kernel), splits with out-of-range pmap rows and tiles with
-  out-of-range q_start are skipped — mirroring guards-ON behavior.
+    Follows the kernel's CSR + gather contract: per tile it gathers partial rows via
+    ``pmap[indptr[t]:indptr[t+1]]`` and merges them; tiles with ``n_splits <= 1`` are
+    skipped (output rows stay zero). When ``num_partial_rows`` / ``num_final_rows``
+    are set, out-of-range pmap rows / q_start are skipped (mirrors guards-ON).
     """
     num_tiles = fmap.shape[0]
     ref_out = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=po.device)
@@ -167,9 +207,7 @@ def torch_ref_gather(
         if s1 - s0 <= 1:
             continue
         q_start = fmap_h[t][0]
-        if num_final_rows is not None and (
-            q_start < 0 or q_start >= num_final_rows
-        ):
+        if num_final_rows is not None and (q_start < 0 or q_start >= num_final_rows):
             continue
         bases = pmap_h[s0:s1]
         for local in range(M):
@@ -184,9 +222,9 @@ def torch_ref_gather(
             if not rows:
                 continue
             o = pod[rows]
-            l = pld[rows]
-            max_lse = l.max(dim=0, keepdim=True).values
-            w = torch.exp(l - max_lse)
+            lg = pld[rows]
+            max_lse = lg.max(dim=0, keepdim=True).values
+            w = torch.exp(lg - max_lse)
             denom = w.sum(dim=0)
             num = (w.unsqueeze(-1) * o).sum(dim=0)
             ref_out[q_start + local] = (num / denom.unsqueeze(-1)).to(out_dtype)
@@ -220,22 +258,22 @@ def build_serving_sparse_grid_inputs(
     device="cuda",
     seed=0,
 ):
-    """Jin Tao batch=8 steady-state: 16384-tile grid, 8 active tiles × 32 splits.
+    """batch=8 steady-state: 16384-tile grid, 8 active tiles × 32 splits.
 
     Mirrors 131K-context serving metadata: partial pool 606 rows, CSR sentinel
     at 256, garbage ``reduce_final_map`` / ``reduce_partial_map`` tail slots.
 
-    Baseline regression only: tail tiles are flat at sentinel (``n_splits == 0``),
-    already skipped by the pre-existing ``n_splits > 1`` clamp. This fixture does
-    **not** discriminate the gather/store guards.
+    Tail tiles are flat at sentinel (``n_splits == 0``), already skipped by the
+    ``n_splits > 1`` clamp, so this fixture does **not** discriminate the
+    gather/store guards.
     """
     g = torch.Generator(device=device).manual_seed(seed)
-    num_reduce_tile = 16384
+    num_reduce_tile = SERVING_NUM_REDUCE_TILE
     active_tiles = 8
     splits_per_active = 32
     total_splits = active_tiles * splits_per_active
     sentinel = total_splits
-    num_partial_rows = 606
+    num_partial_rows = SERVING_PARTIAL_POOL
 
     indptr_host = list(range(0, sentinel + 1, splits_per_active))
     while len(indptr_host) <= num_reduce_tile:
@@ -246,7 +284,9 @@ def build_serving_sparse_grid_inputs(
         num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(num_partial_rows, H, dtype=torch.float32, device=device, generator=g)
+        torch.randn(
+            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
         * 2.0
     )
 
@@ -299,10 +339,8 @@ def build_serving_mapped_slack_inputs(
 
     Allocates ``partial_output`` / ``final_output`` with extra rows but returns
     smaller *logical* ``num_partial_rows`` / ``num_final_rows`` for the kernel.
-
-    Hardening beyond Jin Tao's dump (his tail was flat at sentinel with
-    ``n_splits == 0``). The fake-active staircase here exercises guards one step
-    more adversarially than his observed metadata.
+    The fake-active tail (non-sentinel ``n_splits``) exercises the gather/store
+    guards adversarially.
 
     Returns tensors plus a ``meta`` dict with logical bounds and discriminator
     tile indices for tests.
@@ -314,7 +352,6 @@ def build_serving_mapped_slack_inputs(
     store_splits = 4
     total_active_splits = active_tiles * splits_per_active
     total_splits = total_active_splits + store_splits
-    sentinel = total_splits
 
     indptr_host = [0]
     for _ in range(active_tiles):
@@ -336,13 +373,13 @@ def build_serving_mapped_slack_inputs(
         alloc_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(alloc_partial_rows, H, dtype=torch.float32, device=device, generator=g)
+        torch.randn(
+            alloc_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
         * 2.0
     )
 
-    reduce_partial_map = torch.arange(
-        total_splits, dtype=torch.int32, device=device
-    )
+    reduce_partial_map = torch.arange(total_splits, dtype=torch.int32, device=device)
     # Gather discriminator: one split on tile 0 points into mapped slack.
     slack_p_row = logical_partial_rows
     bad_split = splits_per_active // 2
@@ -432,13 +469,13 @@ def build_serving_true_oob_inputs(
         num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(num_partial_rows, H, dtype=torch.float32, device=device, generator=g)
+        torch.randn(
+            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
         * 2.0
     )
 
-    reduce_partial_map = torch.arange(
-        sentinel, dtype=torch.int32, device=device
-    )
+    reduce_partial_map = torch.arange(sentinel, dtype=torch.int32, device=device)
     tail_t0 = int(reduce_indptr[tail_tile].item())
     for i in range(tail_splits):
         reduce_partial_map[tail_t0 + i] = num_partial_rows + i
@@ -470,13 +507,6 @@ def build_serving_true_oob_inputs(
     )
 
 
-def patch_serving_indptr_batch1(reduce_indptr, splits=128):
-    """Rewrite CSR tile 0 to batch=1 decode without flattening the stale tail."""
-    patched = reduce_indptr.clone()
-    patched[1] = splits
-    return patched
-
-
 def build_serving_stale_indptr_inputs(
     H=16,
     Dv=512,
@@ -486,18 +516,17 @@ def build_serving_stale_indptr_inputs(
 ):
     """Batch-transition metadata: batch=8 sparse grid patched to batch=1 layout.
 
-    Tile 0 becomes ``n_splits=128`` for batch=1; tiles 1..7 keep stale batch=8
-    CSR (``n_splits=32``, pmap rows up to 255, stale fmap q 1..7). Uses the
-    allocation-slack trick so logical bounds are smaller than the buffers.
+    Tile 0 becomes ``n_splits=128`` for batch=1; tiles 1..7 keep stale batch=8 CSR
+    (``n_splits=32``, stale pmap rows beyond the logical bound, stale fmap q 1..7).
+    Uses the allocation-slack trick so logical bounds are smaller than the buffers.
 
     Returns tensors plus ``meta`` with logical bounds for guard differentials.
     """
     g = torch.Generator(device=device).manual_seed(seed)
-    num_reduce_tile = 16384
+    num_reduce_tile = SERVING_NUM_REDUCE_TILE
     active_tiles_batch8 = 8
     splits_per_active = 32
     batch1_splits = 128
-    stale_tail_splits = active_tiles_batch8 * splits_per_active
     sentinel = batch1_splits + (active_tiles_batch8 - 1) * splits_per_active
 
     indptr_host = [0, batch1_splits]
@@ -518,7 +547,9 @@ def build_serving_stale_indptr_inputs(
         alloc_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(alloc_partial_rows, H, dtype=torch.float32, device=device, generator=g)
+        torch.randn(
+            alloc_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
         * 2.0
     )
 
@@ -594,7 +625,7 @@ def make_runner(
     Tier.ALL (production path with device-side runtime tier selection).
     """
     num_tiles = fmap.shape[0]
-    max_splits = torch.cuda.get_device_properties(0).multi_processor_count
+    num_cu = torch.cuda.get_device_properties(0).multi_processor_count
     if tier is None:
         compile_tier = Tier.ALL
     else:
@@ -616,7 +647,7 @@ def make_runner(
             H=H,
             max_seqlen_q=M,
             max_splits=max_splits_val,
-            num_cu=max_splits,
+            num_cu=num_cu,
         )
         if engage:
             lp, lc = compile_mla_reduce_splitk(
@@ -646,7 +677,7 @@ def make_runner(
         H=H,
         max_seqlen_q=M,
         num_reduce_tile=num_tiles,
-        num_cu=max_splits,
+        num_cu=num_cu,
     )
     kernel = compile_mla_reduce(
         H=H,
@@ -669,7 +700,7 @@ def make_runner(
         flse,
         int(fout.stride(0)),
         int(fout.stride(1)),
-        int(max_splits),
+        int(num_cu),
         int(num_tiles),
         int(M),
         int(num_partial_rows),
