@@ -102,7 +102,8 @@ def apply_activation(y: torch.Tensor, activation: str):
 # correctness tests can run on CDNA hardware without being skipped.
 # AITER Triton CI relies on CDNA runners.
 SUPPORTED_ARCHS = {
-    "RDNA": {"gfx1200", "gfx1201", "gfx1250"},
+    "RDNA": {"gfx1100", "gfx1200", "gfx1201", "gfx1250"},
+
     "CDNA": {"gfx942", "gfx950"},
 }
 
