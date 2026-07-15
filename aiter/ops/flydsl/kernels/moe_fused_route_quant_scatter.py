@@ -1215,6 +1215,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
+    route_max_m_const: int | None = None,
 ):
     """Route-indexed K-split grouped quant+preshuffle for small token counts.
 
@@ -1250,12 +1251,20 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows else ""
+    route_max_m_static = (
+        int(route_max_m_const) if route_max_m_const is not None else None
+    )
+    max_m_tag = f"_m{route_max_m_static}" if route_max_m_static is not None else ""
     source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
     source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
+    # Token-level multi-destination quantization: when topk routes share one
+    # source token row, quantize that row once and scatter the result to all
+    # routed destination rows.
+    token_multi_dest = source_topk > 1
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}"
+        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{max_m_tag}"
     )
 
     @flyc.kernel(name=module_name)
@@ -1298,50 +1307,96 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave
-        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+        route_or_token = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        if const_expr(token_multi_dest):
+            route_base = route_or_token * c_source_topk
+            route_in_range = arith.cmpi(
+                CmpIPredicate.ult, route_base, ArithValue(numel)
+            )
+        else:
+            route = route_or_token
+            route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
             rows_rsrc = ptr_rsrc(topids_to_rows)
-            row = ArithValue(
-                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
-            )
-            if const_expr(remap_rows):
-                m = ArithValue(route_max_m)
-                expert = ArithValue(arith.divui(row, m))
-                slot = row - expert * m
-                starts_rsrc = ptr_rsrc(row_starts)
-                row = (
-                    ArithValue(
+
+            def _load_route_row_uniform(route_idx):
+                row_on_lane0 = arith.constant(0, type=i32)
+                if lane == 0:
+                    row_on_lane0 = ArithValue(
                         buffer_ops.buffer_load(
-                            starts_rsrc, expert, vec_width=1, dtype=i32
+                            rows_rsrc, route_idx, vec_width=1, dtype=i32
                         )
                     )
-                    + slot
+                return ArithValue(
+                    rocdl.readlane(i32, _raw(row_on_lane0), _raw(c0_i32))
                 )
-                is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
-                is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
-                _if_store = scf.IfOp(arith.andi(is_lane0, is_k0))
-                with ir.InsertionPoint(_if_store.then_block):
-                    buffer_ops.buffer_store(row, rows_rsrc, route)
-                    scf.YieldOp([])
 
-            scale_tile = arith.divui(row, c_rows_per_tile)
-            row_in_tile = row - scale_tile * c_rows_per_tile
-            wmma_row = arith.divui(row_in_tile, c16_i32)
-            row_lane16 = row_in_tile - wmma_row * c16_i32
-            out_row = scale_tile * c16_i32 + row_lane16
-            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            def _remap_row_uniform(row, route_idx):
+                remapped_on_lane0 = arith.constant(0, type=i32)
+                if lane == 0:
+                    m = (
+                        arith.constant(route_max_m_static, type=i32)
+                        if const_expr(route_max_m_static is not None)
+                        else ArithValue(route_max_m)
+                    )
+                    expert = ArithValue(arith.divui(row, m))
+                    slot = row - expert * m
+                    starts_rsrc = ptr_rsrc(row_starts)
+                    remapped_on_lane0 = (
+                        ArithValue(
+                            buffer_ops.buffer_load(
+                                starts_rsrc, expert, vec_width=1, dtype=i32
+                            )
+                        )
+                        + slot
+                    )
+                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
+                    _if_store = scf.IfOp(is_k0)
+                    with ir.InsertionPoint(_if_store.then_block):
+                        buffer_ops.buffer_store(remapped_on_lane0, rows_rsrc, route_idx)
+                        scf.YieldOp([])
+                return ArithValue(
+                    rocdl.readlane(i32, _raw(remapped_on_lane0), _raw(c0_i32))
+                )
 
-            payload_row_byte_base = row * c_payload_bytes_per_row
+            def _make_dest_uniform(row):
+                payload_base_lane0 = arith.constant(0, type=i32)
+                scale_base_lane0 = arith.constant(0, type=i32)
+                if lane == 0:
+                    payload_base_lane0 = row * c_payload_bytes_per_row
+                    if const_expr(wmma_rep == 1):
+                        scale_base_lane0 = row * c_dst_scale_dwords_per_row
+                    else:
+                        scale_tile = arith.divui(row, c_rows_per_tile)
+                        row_in_tile = row - scale_tile * c_rows_per_tile
+                        wmma_row = arith.divui(row_in_tile, c16_i32)
+                        row_lane16 = row_in_tile - wmma_row * c16_i32
+                        out_row = scale_tile * c16_i32 + row_lane16
+                        scale_base_lane0 = (
+                            out_row * c_dst_scale_dwords_per_row + wmma_row
+                        )
+                return SimpleNamespace(
+                    payload_row_byte_base=ArithValue(
+                        rocdl.readlane(i32, _raw(payload_base_lane0), _raw(c0_i32))
+                    ),
+                    scale_row_dword_base=ArithValue(
+                        rocdl.readlane(i32, _raw(scale_base_lane0), _raw(c0_i32))
+                    ),
+                )
+
             if const_expr(source_topk > 0):
-                if const_expr(source_topk_is_pow2):
-                    source_row = route >> c_source_topk_shift
+                if const_expr(token_multi_dest):
+                    source_row = route_or_token
                 else:
-                    source_row = arith.divui(route, c_source_topk)
+                    if const_expr(source_topk_is_pow2):
+                        source_row = route >> c_source_topk_shift
+                    else:
+                        source_row = arith.divui(route, c_source_topk)
                 feat_elem_base = source_row * c_feat_dim
             else:
+                row = _load_route_row_uniform(route)
                 feat_elem_base = row * c_feat_dim
 
             hidden_rsrc = ptr_rsrc(grouped_in)
@@ -1377,17 +1432,43 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=is_block_lead,
-                dests=[
-                    SimpleNamespace(
-                        payload_row_byte_base=payload_row_byte_base,
-                        scale_row_dword_base=scale_row_dword_base,
-                    )
-                ],
+                dests=[],
                 feat_elem_base=feat_elem_base,
                 hidden_rsrc=hidden_rsrc,
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
             )
+            if const_expr(token_multi_dest):
+                for k in range_constexpr(source_topk):
+                    dst_route = route_base + arith.constant(k, type=i32)
+                    dst_row = _load_route_row_uniform(dst_route)
+                    if const_expr(remap_rows):
+                        dst_row = _remap_row_uniform(dst_row, dst_route)
+                    c.dests.append(_make_dest_uniform(dst_row))
+            else:
+                if const_expr(source_topk > 0):
+                    row = _load_route_row_uniform(route)
+                if const_expr(remap_rows):
+                    m = ArithValue(route_max_m)
+                    expert = ArithValue(arith.divui(row, m))
+                    slot = row - expert * m
+                    starts_rsrc = ptr_rsrc(row_starts)
+                    row = (
+                        ArithValue(
+                            buffer_ops.buffer_load(
+                                starts_rsrc, expert, vec_width=1, dtype=i32
+                            )
+                        )
+                        + slot
+                    )
+                    is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
+                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
+                    _if_store = scf.IfOp(arith.andi(is_lane0, is_k0))
+                    with ir.InsertionPoint(_if_store.then_block):
+                        buffer_ops.buffer_store(row, rows_rsrc, route)
+                        scf.YieldOp([])
+
+                c.dests.append(_make_dest_uniform(row))
             _emit_quant_one_k_group(c, k_group)
             scf.YieldOp([])
 
@@ -1403,7 +1484,18 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_x = arith.index_cast(T.index, grid_route_blocks)
+        if const_expr(token_multi_dest):
+            token_count = arith.divui(
+                ArithValue(numel) + arith.constant(source_topk - 1, type=T.i32),
+                arith.constant(source_topk, type=T.i32),
+            )
+            grid_x_i32 = arith.divui(
+                token_count + arith.constant(warps_per_block - 1, type=T.i32),
+                arith.constant(warps_per_block, type=T.i32),
+            )
+            grid_x = arith.index_cast(T.index, grid_x_i32)
+        else:
+            grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
         fused_kernel(
             grouped_in,

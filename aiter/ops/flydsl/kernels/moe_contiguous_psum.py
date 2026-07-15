@@ -167,12 +167,30 @@ def build_moe_contiguous_psum_module():
     return launch_psum
 
 
-def build_moe_contiguous_psum_remap_module():
+def build_moe_contiguous_psum_remap_module(
+    route_max_m_const: int | None = None,
+    experts_const: int | None = None,
+    tile_m_const: int | None = None,
+):
     """JIT launcher: contiguous psum + in-place masked-to-contiguous row remap."""
+
+    route_max_m_static = (
+        int(route_max_m_const) if route_max_m_const is not None else None
+    )
+    experts_static = int(experts_const) if experts_const is not None else None
+    tile_m_static = int(tile_m_const) if tile_m_const is not None else None
+    name_parts = ["moe_contiguous_psum_remap"]
+    if route_max_m_static is not None:
+        name_parts.append(f"m{route_max_m_static}")
+    if experts_static is not None:
+        name_parts.append(f"e{experts_static}")
+    if tile_m_static is not None:
+        name_parts.append(f"tm{tile_m_static}")
+    module_name = "_".join(name_parts)
 
     gpu_arch = get_rocm_arch()
     allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="moe_contiguous_psum_remap_smem"
+        None, arch=gpu_arch, global_sym_name=f"{module_name}_smem"
     )
     lds0_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds0_off + MAX_EXPERTS_PER_BLOCK * 4
@@ -180,7 +198,7 @@ def build_moe_contiguous_psum_remap_module():
     allocator.ptr = lds1_off + MAX_EXPERTS_PER_BLOCK * 4
 
     @flyc.kernel(
-        name="moe_contiguous_psum_remap",
+        name=module_name,
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def psum_remap_kernel(
@@ -196,7 +214,11 @@ def build_moe_contiguous_psum_remap_module():
     ):
         i32 = T.i32
         tid = ArithValue(fx.thread_idx.x)
-        tile_v = ArithValue(tile_m)
+        tile_v = (
+            arith.constant(tile_m_static, type=i32)
+            if const_expr(tile_m_static is not None)
+            else ArithValue(tile_m)
+        )
         tile_minus_1 = tile_v - arith.constant(1, type=i32)
 
         lds_base = allocator.get_base()
@@ -288,7 +310,11 @@ def build_moe_contiguous_psum_remap_module():
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            m = ArithValue(route_max_m)
+            m = (
+                arith.constant(route_max_m_static, type=i32)
+                if const_expr(route_max_m_static is not None)
+                else ArithValue(route_max_m)
+            )
             expert = ArithValue(arith.divui(row, m))
             slot = row - expert * m
             start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
