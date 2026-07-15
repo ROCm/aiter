@@ -27,7 +27,7 @@ on:
         description: "Shared workspace root visible from the Spur submit and compute nodes"
         required: false
         type: string
-        default: "/data/xinhuang/sglang-aiter-ci"
+        default: "$RUNNER_TEMP/sglang-aiter-ci"
       slurm_nodelist:
         description: "Optional comma-separated Slurm nodes. Use auto to choose two approved nodes."
         required: false
@@ -74,7 +74,7 @@ env:
   IMAGE_OVERRIDE_DEFAULT: ""
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
-  SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
+  SHARED_WORKSPACE_ROOT_DEFAULT: $RUNNER_TEMP/sglang-aiter-ci
   SLURM_NODELIST_DEFAULT: auto
   SLURM_RESERVATION_DEFAULT: ""
   SLURM_NODELIST_ALLOWED: >-
@@ -118,7 +118,8 @@ jobs:
           def value(name: str, default_env: str) -> str:
               raw = inputs.get(name, "")
               default = os.environ[default_env]
-              return raw if raw not in ("", None) else default
+              val = raw if raw not in ("", None) else default
+              return os.path.expandvars(val)
 
           pairs = {
               "SGLANG_REF": value("sglang_ref", "SGLANG_REF_DEFAULT"),
