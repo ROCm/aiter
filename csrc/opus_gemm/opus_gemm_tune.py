@@ -81,15 +81,15 @@ def _patch_flaky_hip_device_count():
 
 
 _patch_flaky_hip_device_count()
-from aiter import dtypes, logger
-from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.opus.gemm_op_a16w16 import (
+from aiter import dtypes, logger  # noqa: E402
+from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME  # noqa: E402
+from aiter.utility.mp_tuner import mp_tuner  # noqa: E402
+from aiter.ops.opus.gemm_op_a16w16 import (  # noqa: E402
     opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
 )
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
-from opus_gemm_common import (
+from opus_gemm_common import (  # noqa: E402
     a16w16_kernels_list,
     a16w16_kernels_list_nooob,
     a16w16_kernels_list_cpol,
