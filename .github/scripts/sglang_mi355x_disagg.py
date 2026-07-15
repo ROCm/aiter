@@ -139,12 +139,10 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
 [[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
 """,
         """NODELIST_ARG=()
-if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])--nodes([=[:space:]]|$)'; then
-    NODELIST_ARG=()
-elif [[ -n "${SLURM_RESERVATION:-}" ]]; then
+if [[ -n "${SLURM_RESERVATION:-}" ]]; then
     NODELIST_ARG=()
 elif [[ -n "${SLURM_NODELIST:-}" ]]; then
-    NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
+    NODELIST_ARG=()
 fi
 
 RESERVATION_ARG=()
@@ -324,13 +322,10 @@ for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/nu
 """,
         """TOTAL_NODES=$((PW + DW))
 
-NODE_COUNT_ARG=(-N"$TOTAL_NODES")
-if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])--nodes([=[:space:]]|$)'; then
-    if [[ -n "${SLURM_NODELIST:-}" && -z "${SLURM_RESERVATION:-}" ]]; then
-        NODE_COUNT_ARG=(--nodes "$SLURM_NODELIST")
-    else
-        NODE_COUNT_ARG=(--nodes "$TOTAL_NODES")
-    fi
+if [[ -n "${SLURM_NODELIST:-}" && -z "${SLURM_RESERVATION:-}" ]]; then
+    NODE_COUNT_ARG=(--nodes "$SLURM_NODELIST")
+else
+    NODE_COUNT_ARG=(-N"$TOTAL_NODES")
 fi
 """,
     )
