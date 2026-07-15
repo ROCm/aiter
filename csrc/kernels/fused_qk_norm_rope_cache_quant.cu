@@ -4291,6 +4291,10 @@ namespace aiter {
         int q_scale_stride_0, q_scale_stride_1;
         int num_tokens;
         int num_heads;  // V4 MQA: num_kv_heads is hardcoded to 1 (blockIdx.y==0 is the K wave)
+        // RoPE cos/sin cache row count (= cos_cache.size(0)). positions[token] is
+        // clamped into [0, max_position) before indexing cos/sin so a stale / OOB
+        // position on a CG-pad token can't index out of bounds. 0 disables the clamp.
+        int max_position;
         // --- K-only paged-cache write (fused_kv_norm_rope_group_quant) ---
         // When the K-only kernel writes into a paged cache via slot_mapping, the
         // dest row is block*block_stride + off*row_stride, with block = slot/page_size,
@@ -4518,7 +4522,11 @@ namespace aiter {
       }
 
       // ---- Step 3 (nope threads only): group-amax -> e8m0 -> fp8 + cache write ----
-      float thread_max = 0.0f;
+      // Init the group-amax accumulator to the FP8-quant absmax floor so the reduced
+      // group max is always >= floor. Guards the e8m0 scale against a zero/near-zero
+      // group amax (zero activations under CG warmup / pad / invalid slots) with no
+      // extra op at the scale call site.
+      float thread_max = kFp8KvQuantAbsmaxFloorF32;
       if (is_nope_thread) {
         if constexpr (kv_dt != vllm::Fp8KVCacheDataType::kAuto) {
           #pragma unroll
@@ -4728,7 +4736,14 @@ namespace aiter {
       const bool is_k_wave = (combined_head_idx == 0);
 
       // RoPE cos/sin pointers (shared between K and Q phases)
-      const int32_t cos_sin_offset = static_cast<int32_t>(positions[token_idx]) * (pe_dim >> 1);
+      // Clamp position into [0, max_position) before indexing the RoPE tables so a
+      // stale / OOB position on a CG-pad token can't read cos/sin out of bounds
+      // (raw-pointer read; a bad index would fault / return garbage).
+      int32_t rope_pos = static_cast<int32_t>(positions[token_idx]);
+      if (params.max_position > 0)
+        rope_pos = rope_pos < 0 ? 0
+                 : (rope_pos >= params.max_position ? params.max_position - 1 : rope_pos);
+      const int32_t cos_sin_offset = rope_pos * (pe_dim >> 1);
       const scalar_t *cos_ptr = cos_cache + cos_sin_offset;
       const scalar_t *sin_ptr = sin_cache + cos_sin_offset;
 
@@ -4902,7 +4917,9 @@ namespace aiter {
           // fp8 + inline duplicated e8m0 scale into q_out (q_nope_scale_buff, 512B), and
           // write the rotated PE as bf16 into the separate q_rope_out (Q-PE NOT quantized).
           const bool is_nope_thr = (tid < nope_vec);  // nope-first
-          float thread_max = 0.0f;
+          // Floor baked into the accumulator init: guards the e8m0 scale against a
+          // zero/near-zero group amax with no extra op at the scale call site.
+          float thread_max = kFp8KvQuantAbsmaxFloorF32;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) thread_max = fmaxf(thread_max, fabsf(rotated[i]));
           // Group-amax over the Q_REDUCE-lane group via __shfl_xor (DPP corrupts some Q
@@ -5090,7 +5107,13 @@ namespace aiter {
       if (token_idx >= params.num_tokens) return;
       const bool is_k_wave = (combined_head_idx == 0);  // V4 MQA: single K wave
 
-      const int32_t cos_sin_offset = static_cast<int32_t>(positions[token_idx]) * (pe_dim >> 1);
+      // Clamp position into [0, max_position) before indexing the RoPE tables so a
+      // stale / OOB position on a CG-pad token can't read cos/sin out of bounds.
+      int32_t rope_pos = static_cast<int32_t>(positions[token_idx]);
+      if (params.max_position > 0)
+        rope_pos = rope_pos < 0 ? 0
+                 : (rope_pos >= params.max_position ? params.max_position - 1 : rope_pos);
+      const int32_t cos_sin_offset = rope_pos * (pe_dim >> 1);
       const scalar_t* cos_ptr = cos_cache + cos_sin_offset;
       const scalar_t* sin_ptr = sin_cache + cos_sin_offset;
 
@@ -5143,8 +5166,10 @@ namespace aiter {
           float factor;
           if constexpr (std::is_same_v<cache_t, opus::fp8_t>) {
             constexpr MxDtype kMxDt = kHwFp8E4m3Dtype;
+            // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
             const E8m0BlockScale s =
-                fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(amax_norm);
+                fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kMxDt>(
+                    fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
             if (is_nope_thread && (tid % reduce_thread_size) == 0) {
               // K NoPE is always group=64 (GROUP_SIZE hardcoded above for the asm reader's
               // 14-byte format); use the generic tid/reduce_thread_size to avoid a magic >>6.
@@ -5266,8 +5291,10 @@ namespace aiter {
       if constexpr (Q_QUANT) {
         const float amax_norm = amax_raw * q_rms_scale;  // == amax(|q_norm|) over the group
         constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
+        // Floor the group amax to guard the e8m0 scale against zero/near-zero input.
         const E8m0BlockScale qs_scale =
-            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(amax_norm);
+            fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(
+                fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
         const float factor = q_rms_scale / qs_scale.dq_scale;  // x_in -> fp8 (rstd folded)
 
         query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
@@ -5609,6 +5636,9 @@ void fused_qk_norm_rope_group_quant(
   }
   mla_params.num_tokens = num_tokens;
   mla_params.num_heads = num_heads;
+  // RoPE table row count; used to clamp positions[token] before indexing cos/sin
+  // so a stale / OOB position on a CG-pad token can't read out of bounds.
+  mla_params.max_position = static_cast<int>(cos_cache.size(0));
 
   // --- Optional fused SWA ring-cache write (decode-only) ---
   // All four SWA tensors must be provided together or all omitted.

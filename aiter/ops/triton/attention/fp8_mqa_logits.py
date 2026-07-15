@@ -61,6 +61,21 @@ def _permute_accepts_constexpr_tuple() -> bool:
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
+# gfx942 (MI300X) LDS size per CU.
+_GFX942_CU_LDS_BYTES = 64 * 1024
+
+
+def _gfx942_tile_fits_lds(
+    block_kv: int, head_size: int, num_stages: int, occupancy: int
+) -> bool:
+    # Only the double-buffered KV tile lives in LDS (Q and the fp32 scores
+    # accumulator stay in registers in Triton 3.6+). Account for `occupancy`
+    # co-resident workgroups and keep a 0.9 safety factor for compiler
+    # overhead.
+    # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
+    lds_bytes = occupancy * num_stages * block_kv * head_size
+    return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
+
 
 def fp8_mqa_logits(
     Q,
@@ -117,7 +132,17 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        block_kv = 128
+        # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
+        # the default (128, 2) tile would not fit two co-resident workgroups
+        # on a CU; keep the default tile otherwise.
+        if arch == "gfx942" and not _gfx942_tile_fits_lds(
+            block_kv=128, head_size=head_size, num_stages=2, occupancy=2
+        ):
+            block_kv = 64
+            num_stages = 1
+        else:
+            block_kv = 128
+            num_stages = 2
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
@@ -163,7 +188,7 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
-            num_stages=2,
+            num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
