@@ -2,15 +2,16 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Test topk_sigmoid operation with various configurations.
+Test topk_gating (topk_sigmoid / topk_softplus / topk_softmax) operations with
+various configurations.
 
 This test can be run in two ways:
 
 1. Using pytest (for automated testing):
-   pytest test_moe_topk_sigmoid.py -v
+   pytest test_moe_topk_gating.py -v
 
 2. Using command line arguments (for benchmarking with summary table):
-   python test_moe_topk_sigmoid.py --num-experts 64,128 --topk 2,4,8 --dtype fp16
+   python test_moe_topk_gating.py --num-experts 64,128 --topk 2,4,8 --dtype fp16
 """
 
 import argparse
@@ -25,18 +26,17 @@ import aiter
 from aiter.test_common import (
     benchmark,
     checkAllclose,
-    perftest,
     run_perftest,
 )
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.dtypes import str2Dtype, str2tuple
 
 # NOTE on correctness metrics by score function:
-# - sigmoid uses element-wise comparison (score_errors/index_errors) because
-#   both torch/topk and fused paths return sorted top-K.
-# - softplus/softmax use set-based ID matching (id_errors/max_weight_err)
-#   because torch references intentionally use `topk(..., sorted=False)` to
-#   mirror routing behavior where top-K order is not semantically required.
+# - sigmoid uses element-wise comparison (score_err/idx_err) because both
+#   torch and the fused kernel return sorted top-K.
+# - softplus/softmax use set-based ID matching (err/max_weight_err) because
+#   torch references intentionally use `topk(..., sorted=False)` to mirror
+#   routing behavior where top-K order is not semantically required.
 #
 # Tie-aware selection: the fused kernel scores experts with hardware-approximate
 # math (exp2f/log2f, ~1e-6 ULP), while the torch reference uses exact libm. When
@@ -52,6 +52,10 @@ from aiter.utility.dtypes import str2Dtype, str2tuple
 # noise (~1e-6 on O(1) scores), so genuine routing bugs (gaps >> 1e-4) are still
 # caught while harmless tie flips are excused.
 _TIE_TOL = 1e-4
+
+# Max abs weight error for matched expert ids (softplus/softmax). ~100x the
+# kernel's exp2f/log2f approximation noise on O(1) weights.
+_WEIGHT_TOL = 1e-4
 
 
 def _selection_scores(
@@ -119,7 +123,7 @@ def _count_routing_mismatches(
     ref_full = ref_mask.sum(dim=1) == topk
     match = (fused_mask == ref_mask).all(dim=1) & fused_full
 
-    extra = fused_mask & ~ref_mask   # kernel-only -> must be >= cutoff - tol
+    extra = fused_mask & ~ref_mask  # kernel-only -> must be >= cutoff - tol
     missing = ref_mask & ~fused_mask  # ref-only    -> must be <= cutoff + tol
     extra_ok = ((~extra) | (sel >= (cutoff - tol))).all(dim=1)
     missing_ok = ((~missing) | (sel <= (cutoff + tol))).all(dim=1)
@@ -159,190 +163,15 @@ def _count_routing_mismatches(
     return mism
 
 
-@perftest(num_iters=10, num_warmup=1)
-def run_torch(gating_output: torch.Tensor, topk: int):
-    # llama4 maverick custom routing function
-    router_scores, router_indices = torch.topk(gating_output, topk, dim=-1)
-    router_scores = torch.sigmoid(router_scores.float())
-    return router_scores, router_indices.to(torch.int32)
-
-
-@perftest(num_iters=100, num_warmup=1)
-def run_fused(gating_output: torch.Tensor, topk: int):
-    tokens, num_experts = gating_output.shape
-    router_scores = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=gating_output.device
+def _make_gating(num_experts, num_tokens, dtype):
+    """Shuffled uniform gating output -- each row has unique values."""
+    gating_output = (
+        torch.arange(-1, 1, 2.0 / num_experts)
+        .repeat((num_tokens, 1))
+        .to(dtype=dtype, device="cuda")
     )
-    router_indices = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    aiter.topk_gating(
-        router_scores,
-        router_indices,
-        gating_output,
-        score_func="sigmoid",
-        need_renorm=False,
-    )
-    return router_scores, router_indices
-
-
-# -- topk_softplus (DeepSeek V4-Pro sqrtsoftplus routing) --------------
-@perftest(num_iters=10, num_warmup=1)
-def run_torch_softplus(
-    gating_output: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    route_scale: float,
-):
-    scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
-    scores_biased = scores + bias.float()
-    topk_ids = scores_biased.topk(topk, dim=-1, sorted=False)[1]
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_weights = topk_weights * route_scale
-    return topk_weights, topk_ids.to(torch.int32)
-
-
-@perftest(num_iters=100, num_warmup=1)
-def run_fused_softplus(
-    gating_output: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    route_scale: float,
-):
-    tokens, _ = gating_output.shape
-    topk_weights = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    aiter.topk_softplus(
-        topk_weights, topk_ids, gating_output, bias, renormalize, route_scale
-    )
-    return topk_weights, topk_ids
-
-
-# -- topk_softmax ( classic MoE softmax routing) --------------
-@perftest(num_iters=10, num_warmup=1)
-def run_torch_softmax(
-    gating_output: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    route_scale: float,
-):
-    scores = torch.softmax(gating_output.float(), dim=-1)
-    scores_biased = scores + bias.float() if bias.numel() > 0 else scores
-    topk_ids = scores_biased.topk(topk, dim=-1, sorted=False)[1]
-    topk_weights = scores.gather(1, topk_ids) * route_scale
-    return topk_weights, topk_ids.to(torch.int32)
-
-
-@perftest(num_iters=100, num_warmup=1)
-def run_fused_softmax(
-    gating_output: torch.Tensor,
-    bias: torch.Tensor,
-    topk: int,
-    route_scale: float,
-):
-    tokens, _ = gating_output.shape
-    topk_weights = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    aiter.topk_gating(
-        topk_weights,
-        topk_ids,
-        gating_output,
-        bias,
-        need_renorm=False,  # softmax is already normalized
-        routed_scaling_factor=route_scale,
-        score_func="softmax",
-    )
-    return topk_weights, topk_ids
-
-
-@perftest(num_iters=100, num_warmup=1)
-def run_vllm_softmax(
-    gating_output: torch.Tensor,
-    topk: int,
-    route_scale: float,
-):
-    """vLLM-adapted topkGatingSoftmax kernel (topk_softmax_kernels.cu)."""
-    tokens, _ = gating_output.shape
-    topk_weights = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    token_expert_indices = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    # need_renorm=True: renorm among top-K (matches softmax-route convention)
-    aiter.topk_softmax(
-        topk_weights, topk_ids, token_expert_indices, gating_output, need_renorm=False
-    )
-    if route_scale != 1.0:
-        topk_weights.mul_(route_scale)
-    return topk_weights, topk_ids
-
-
-def benchmark_topk_sigmoid(
-    num_experts: int = 128,
-    num_tokens: int = 1024,
-    topk: int = 4,
-    dtype: torch.dtype = torch.float16,
-):
-    torch.random.manual_seed(0)
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    # run benchmarks
-    (scores_torch, indices_torch), avg_torch = run_torch(gating_output.clone(), topk)
-    (scores_fused, indices_fused), avg_fused = run_fused(gating_output.clone(), topk)
-
-    # check correctness
-    score_errors = checkAllclose(scores_torch, scores_fused, tol_err_ratio=0.01)
-    index_errors = checkAllclose(indices_torch, indices_fused, tol_err_ratio=0.01)
-
-    # Collect results for summary
-    result = {
-        "num_experts": num_experts,
-        "num_tokens": num_tokens,
-        "topk": topk,
-        "dtype": str(dtype).split(".")[-1],
-        "torch_us": avg_torch,
-        "fused_us": avg_fused,
-        "uplift": avg_torch / avg_fused,
-        "score_errors": score_errors,
-        "index_errors": index_errors,
-    }
-
-    # print some failed rows if errors are significant
-    if score_errors > 0.01 or index_errors > 0.01:
-        failed_rows = (indices_torch != indices_fused).sum(dim=-1) > 0
-        print(
-            f"\n[ERROR] Configuration: num_experts={num_experts}, num_tokens={num_tokens}, topk={topk}, dtype={str(dtype).split('.')[-1]}"
-        )
-        print("Wrong scores:")
-        print(scores_torch[failed_rows][:5])
-        print(scores_fused[failed_rows][:5])
-        print("Wrong indices:")
-        print(indices_torch[failed_rows][:5])
-        print(indices_fused[failed_rows][:5])
-        print("Gating outputs:")
-        failed_values = gating_output[failed_rows][:5]
-        failed_values, _ = failed_values.sort(dim=-1, descending=True)
-        print(failed_values[:, :10])
-        print(
-            f"Number of wrong tokens: {sum(failed_rows)} / {len(failed_rows)}, {100 * sum(failed_rows) / len(failed_rows):.2f} %"
-        )
-
-    return result
+    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
+    return torch.gather(gating_output, dim=-1, index=permutation).contiguous()
 
 
 def _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch):
@@ -371,193 +200,202 @@ def _max_weight_error(w_fused, i_fused, w_torch, i_torch):
     return float(diff[matched].max())
 
 
-def _assert_weights_close(w_fused, i_fused, w_torch, i_torch):
-    """Assert matched expert weights are close; skip tie-swapped experts."""
-    ref, matched = _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch)
-    torch.testing.assert_close(
-        w_fused.to(torch.float32)[matched], ref[matched], atol=1e-5, rtol=1e-4
-    )
+# ---------------------------------------------------------------------------
+# torch references (fp32, untimed -- never enter the perf table, see
+# .claude/skills/aiter-op-test/SKILL.md rule 4)
+# ---------------------------------------------------------------------------
 
 
-def _make_gating(num_experts, num_tokens, dtype):
-    """Shuffled uniform gating output -- each row has unique values."""
-    gating_output = (
-        torch.arange(-1, 1, 2.0 / num_experts)
-        .repeat((num_tokens, 1))
-        .to(dtype=dtype, device="cuda")
-    )
-    permutation = torch.argsort(torch.rand_like(gating_output), dim=-1)
-    return torch.gather(gating_output, dim=-1, index=permutation).contiguous()
+def ref_sigmoid(gating_output: torch.Tensor, topk: int):
+    """Llama4 routing: select top-K by raw logit, weight = sigmoid(selected)."""
+    scores, indices = torch.topk(gating_output, topk, dim=-1)
+    return torch.sigmoid(scores.float()), indices.to(torch.int32)
 
 
-def benchmark_topk_softplus(
-    num_experts: int = 256,
-    num_tokens: int = 1024,
-    topk: int = 8,
-    dtype: torch.dtype = torch.bfloat16,
-    renormalize: bool = True,
-    route_scale: float = 2.5,
+def ref_softplus(
+    gating_output: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    route_scale: float,
 ):
-    torch.random.manual_seed(1)
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = torch.randn(num_experts, dtype=dtype, device="cuda") * 0.1
+    scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
+    scores_biased = scores + bias.float()
+    topk_ids = scores_biased.topk(topk, dim=-1, sorted=False)[1]
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_weights = topk_weights * route_scale
+    return topk_weights, topk_ids.to(torch.int32)
 
-    (w_torch, i_torch), avg_torch = run_torch_softplus(
-        gating_output.clone(), bias, topk, renormalize, route_scale
+
+def ref_softmax(
+    gating_output: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    route_scale: float,
+):
+    scores = torch.softmax(gating_output.float(), dim=-1)
+    scores_biased = scores + bias.float() if bias.numel() > 0 else scores
+    topk_ids = scores_biased.topk(topk, dim=-1, sorted=False)[1]
+    topk_weights = scores.gather(1, topk_ids) * route_scale
+    return topk_weights, topk_ids.to(torch.int32)
+
+
+# ---------------------------------------------------------------------------
+# topk_sigmoid (Llama4 routing, via topk_gating score_func="sigmoid")
+# ---------------------------------------------------------------------------
+
+
+@benchmark()
+def bench_topk_sigmoid(num_experts, num_tokens, topk, dtype):
+    """Single fused candidate. Both torch and the fused kernel return
+    sorted-descending top-K here, so scores/indices compare element-wise."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    ref_scores, ref_idx = ref_sigmoid(gating_output, topk)
+
+    def run_fused():
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device="cuda"
+        )
+        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            score_func="sigmoid",
+            need_renorm=False,
+        )
+        return topk_weights, topk_ids
+
+    candidates = {"fused": run_fused}
+
+    # Memory-bound: reads the [T, E] gating matrix, writes T*topk ids + weights.
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
     )
-    (w_fused, i_fused), avg_fused = run_fused_softplus(
-        gating_output.clone(), bias, topk, renormalize, route_scale
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        (w, ids), us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} score_err"] = checkAllclose(
+            ref_scores,
+            w.to(torch.float32),
+            tol_err_ratio=0.01,
+            msg=f"{name}: sigmoid scores",
+        )
+        ret[f"{name} idx_err"] = checkAllclose(
+            ref_idx, ids, tol_err_ratio=0.01, msg=f"{name}: sigmoid indices"
+        )
+    return ret
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("topk", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
+@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
+def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
+    row = bench_topk_sigmoid(num_experts, num_tokens, topk, dtype)
+    assert row["fused score_err"] <= 0.01, (
+        f"E={num_experts},T={num_tokens},topk={topk},{dtype}: "
+        f"score error {row['fused score_err']} exceeds tolerance"
     )
+    assert row["fused idx_err"] <= 0.01, (
+        f"E={num_experts},T={num_tokens},topk={topk},{dtype}: "
+        f"index error {row['fused idx_err']} exceeds tolerance"
+    )
+
+
+# ---------------------------------------------------------------------------
+# topk_softplus (DeepSeek V4-Pro sqrtsoftplus routing, via topk_gating)
+# ---------------------------------------------------------------------------
+
+
+@benchmark()
+def bench_topk_softplus(
+    num_experts,
+    num_tokens,
+    topk,
+    dtype,
+    bias_dtype=torch.float32,
+    renormalize=True,
+    route_scale=2.5,
+):
+    """Single fused candidate (topk_softplus and topk_gating(score_func=
+    "sqrtsoftplus") share the same underlying kernel). Default bias_dtype=fp32
+    matches the DeepSeek-V4 real model: bf16 router logits + fp32 correction
+    bias."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
+        bias_dtype
+    )
+
+    w_torch, i_torch = ref_softplus(gating_output, bias, topk, renormalize, route_scale)
+
+    def run_fused():
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device="cuda"
+        )
+        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            bias,
+            need_renorm=renormalize,
+            routed_scaling_factor=route_scale,
+            score_func="sqrtsoftplus",
+        )
+        return topk_weights, topk_ids
+
+    candidates = {"fused": run_fused}
 
     sel = _selection_scores(gating_output, bias, "softplus")
-    id_err = (
-        _count_routing_mismatches(
-            i_fused,
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        (w, ids), us = run_perftest(fn)
+        n_mism = _count_routing_mismatches(
+            ids,
             i_torch,
             sel,
             topk,
             bias=bias,
-            label=f"softplus E={num_experts} T={num_tokens} k={topk} {dtype}",
+            label=f"softplus {name} E={num_experts} T={num_tokens} k={topk} {dtype}",
         )
-        / num_tokens
-    )
-
-    result = {
-        "num_experts": num_experts,
-        "num_tokens": num_tokens,
-        "topk": topk,
-        "dtype": str(dtype).split(".")[-1],
-        "torch_us": avg_torch,
-        "fused_us": avg_fused,
-        "uplift": avg_torch / avg_fused,
-        "id_errors": id_err,
-        "max_weight_err": _max_weight_error(w_fused, i_fused, w_torch, i_torch),
-    }
-    if id_err > 0.01:
-        print(
-            f"\n[ERROR] softplus: num_experts={num_experts}, num_tokens={num_tokens}, "
-            f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
-        )
-    return result
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = n_mism / num_tokens
+        ret[f"{name} max_weight_err"] = _max_weight_error(w, ids, w_torch, i_torch)
+    return ret
 
 
-def benchmark_topk_softmax(
-    num_experts: int = 256,
-    num_tokens: int = 1024,
-    topk: int = 8,
-    dtype: torch.dtype = torch.bfloat16,
-    route_scale: float = 1.0,
-    use_bias: bool = False,
-):
-    torch.random.manual_seed(2)
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = (
-        torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
-        if use_bias
-        else torch.empty(0, device="cuda")
-    )
-
-    (w_torch, i_torch), avg_torch = run_torch_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-    (w_fused, i_fused), avg_fused = run_fused_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-    # vLLM kernel: no bias support, pass gating_output directly
-    (w_vllm, i_vllm), avg_vllm = run_vllm_softmax(
-        gating_output.clone(), topk, route_scale
-    )
-
-    sel = _selection_scores(gating_output, bias, "softmax")
-    id_err_fused = (
-        _count_routing_mismatches(
-            i_fused,
-            i_torch,
-            sel,
-            topk,
-            bias=bias,
-            label=f"softmax/fused E={num_experts} T={num_tokens} k={topk} {dtype}",
-        )
-        / num_tokens
-    )
-    # vLLM kernel compared against torch (no bias, sel_scores == softmax(x))
-    sel_nobias = _selection_scores(gating_output, torch.empty(0), "softmax")
-    id_err_vllm = (
-        _count_routing_mismatches(
-            i_vllm,
-            i_torch,
-            sel_nobias,
-            topk,
-            label=f"softmax/vllm E={num_experts} T={num_tokens} k={topk} {dtype}",
-        )
-        / num_tokens
-    )
-
-    result = {
-        "num_experts": num_experts,
-        "num_tokens": num_tokens,
-        "topk": topk,
-        "dtype": str(dtype).split(".")[-1],
-        "torch_us": avg_torch,
-        "fused_us": avg_fused,
-        "vllm_us": avg_vllm,
-        "fused_uplift": avg_torch / avg_fused,
-        "vllm_uplift": avg_torch / avg_vllm,
-        "id_err_fused": id_err_fused,
-        "id_err_vllm": id_err_vllm,
-    }
-    for label, id_err in (("fused", id_err_fused), ("vllm", id_err_vllm)):
-        if id_err > 0.01:
-            print(
-                f"\n[ERROR] softmax/{label}: num_experts={num_experts}, num_tokens={num_tokens}, "
-                f"topk={topk}, dtype={str(dtype).split('.')[-1]}, id_err={id_err:.4f}"
-            )
-    return result
-
-
-# Pytest-parametrized test functions -- topk_softplus
-# Mirrors DeepSeek-V4 model integration: gating fp32 + bias fp32 is the default.
+# Mirrors DeepSeek-V4 model integration: gating fp32 + bias fp32 is the default,
+# swept here against fp16/bf16 gating with mixed bias dtypes.
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
 @pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
 def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dtype):
-    """Pytest test for correctness of topk_softplus (sqrtsoftplus) operation.
-
-    Covers the DeepSeek-V4-Pro use case: router_logits=fp32, bias=fp32.
-    Also covers fp16/bf16 gating with mixed bias dtypes.
-    """
-    torch.random.manual_seed(0)
-    route_scale = 2.5
-
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
-        bias_dtype
+    row = bench_topk_softplus(
+        num_experts, num_tokens, topk, dtype, bias_dtype=bias_dtype
     )
-
-    (w_torch, i_torch), _ = run_torch_softplus(
-        gating_output.clone(), bias, topk, True, route_scale
-    )
-    (w_fused, i_fused), _ = run_fused_softplus(
-        gating_output.clone(), bias, topk, True, route_scale
-    )
-
-    sel = _selection_scores(gating_output, bias, "softplus")
-    n_mism = _count_routing_mismatches(
-        i_fused,
-        i_torch,
-        sel,
-        topk,
-        bias=bias,
-        label=f"softplus gating={dtype} bias={bias_dtype} E={num_experts} k={topk}",
-    )
-    assert n_mism == 0, (
+    assert row["fused err"] == 0.0, (
         f"gating={dtype},bias={bias_dtype},E={num_experts},topk={topk}: "
-        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+        f"{row['fused err'] * num_tokens:.0f}/{num_tokens} tokens have non-tie ID mismatches"
     )
-
-    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
+    assert row["fused max_weight_err"] < _WEIGHT_TOL, (
+        f"gating={dtype},bias={bias_dtype},E={num_experts},topk={topk}: "
+        f"max weight error {row['fused max_weight_err']:.2e} exceeds tolerance"
+    )
 
 
 # sqrtsoftplus token sweep (DeepSeek-V4 default): exercise every dispatch tier
@@ -566,100 +404,148 @@ def test_topk_softplus_correctness(num_experts, num_tokens, topk, dtype, bias_dt
 #   T=1/64/256  -> reg opt (TPW=1) decode
 #   T=1024/2048 -> smem_n / opt_n mid
 #   T>=4096     -> opt_n (E=64 TPW=8) and prefill_n large-prefill paths
-# DeepSeek real dtype: bf16 logits + fp32 correction_bias.
 @pytest.mark.parametrize("num_tokens", [1, 64, 256, 1024, 4096, 8192, 16384])
 @pytest.mark.parametrize("topk", [2, 8])
 @pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
 def test_topk_softplus_token_sweep(num_experts, num_tokens, topk):
-    torch.random.manual_seed(0)
-    route_scale = 2.5
-    dtype = torch.bfloat16
-
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
-
-    (w_torch, i_torch), _ = run_torch_softplus(
-        gating_output.clone(), bias, topk, True, route_scale
-    )
-    (w_fused, i_fused), _ = run_fused_softplus(
-        gating_output.clone(), bias, topk, True, route_scale
-    )
-
-    sel = _selection_scores(gating_output, bias, "softplus")
-    n_mism = _count_routing_mismatches(
-        i_fused,
-        i_torch,
-        sel,
-        topk,
-        bias=bias,
-        label=f"softplus-sweep E={num_experts} T={num_tokens} k={topk}",
-    )
-    assert n_mism == 0, (
+    row = bench_topk_softplus(num_experts, num_tokens, topk, torch.bfloat16)
+    assert row["fused err"] == 0.0, (
         f"E={num_experts},topk={topk},T={num_tokens}: "
-        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+        f"{row['fused err'] * num_tokens:.0f}/{num_tokens} tokens have non-tie ID mismatches"
+    )
+    assert row["fused max_weight_err"] < _WEIGHT_TOL, (
+        f"E={num_experts},topk={topk},T={num_tokens}: "
+        f"max weight error {row['fused max_weight_err']:.2e} exceeds tolerance"
     )
 
-    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
+
+# ---------------------------------------------------------------------------
+# topk_softmax (classic MoE softmax routing, via topk_gating + vLLM-adapted
+# topk_softmax kernel as a second candidate)
+# ---------------------------------------------------------------------------
 
 
-# Pytest-parametrized test functions -- topk_sigmoid
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [1, 2, 4, 8])
-@pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
-@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
-def test_topk_sigmoid_correctness(num_experts, num_tokens, topk, dtype):
-    """Pytest test for correctness of topk_sigmoid operation."""
+@benchmark()
+def bench_topk_softmax(
+    num_experts,
+    num_tokens,
+    topk,
+    dtype,
+    bias_dtype=torch.float32,
+    use_bias=False,
+    route_scale=1.0,
+):
+    """Two candidates: aiter's fused topk_gating (bias-capable) and the
+    vLLM-adapted topk_softmax kernel (no bias support -- always compared
+    against the no-bias reference, regardless of use_bias)."""
     torch.random.manual_seed(0)
     gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = (
+        (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
+            bias_dtype
+        )
+        if use_bias
+        else torch.empty(0, device="cuda")
+    )
 
-    # run both implementations
-    (scores_torch, indices_torch), _ = run_torch(gating_output.clone(), topk)
-    (scores_fused, indices_fused), _ = run_fused(gating_output.clone(), topk)
+    w_torch, i_torch = ref_softmax(gating_output, bias, topk, route_scale)
+    w_torch_nobias, i_torch_nobias = ref_softmax(
+        gating_output, torch.empty(0, device="cuda"), topk, route_scale
+    )
 
-    # check correctness
-    score_errors = checkAllclose(scores_torch, scores_fused, tol_err_ratio=0.01)
-    index_errors = checkAllclose(indices_torch, indices_fused, tol_err_ratio=0.01)
+    def run_fused():
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device="cuda"
+        )
+        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            bias,
+            need_renorm=False,  # softmax is already normalized
+            routed_scaling_factor=route_scale,
+            score_func="softmax",
+        )
+        return topk_weights, topk_ids
 
-    # Assert correctness
-    assert score_errors <= 0.01, f"Score errors {score_errors} exceed tolerance"
-    assert index_errors <= 0.01, f"Index errors {index_errors} exceed tolerance"
+    def run_vllm():
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device="cuda"
+        )
+        topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+        token_expert_indices = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device="cuda"
+        )
+        aiter.topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indices,
+            gating_output,
+            need_renorm=False,
+        )
+        if route_scale != 1.0:
+            topk_weights.mul_(route_scale)
+        return topk_weights, topk_ids
+
+    candidates = {"fused": run_fused, "vllm": run_vllm}
+    # vllm ignores bias entirely, so it is always graded against the no-bias
+    # reference; fused is graded against the (possibly biased) reference.
+    refs = {
+        "fused": (
+            w_torch,
+            i_torch,
+            bias,
+            _selection_scores(gating_output, bias, "softmax"),
+        ),
+        "vllm": (
+            w_torch_nobias,
+            i_torch_nobias,
+            None,
+            _selection_scores(gating_output, torch.empty(0, device="cuda"), "softmax"),
+        ),
+    }
+
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        w_ref, i_ref, ref_bias, sel = refs[name]
+        (w, ids), us = run_perftest(fn)
+        n_mism = _count_routing_mismatches(
+            ids,
+            i_ref,
+            sel,
+            topk,
+            bias=ref_bias,
+            label=f"softmax/{name} E={num_experts} T={num_tokens} k={topk} {dtype}",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = n_mism / num_tokens
+        ret[f"{name} max_weight_err"] = _max_weight_error(w, ids, w_ref, i_ref)
+    return ret
 
 
-# Pytest-parametrized test functions -- topk_softmax (via topk_gating)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("topk", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024, 2048])
 @pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
 def test_topk_softmax_correctness(num_experts, num_tokens, topk, dtype):
-    """Pytest test for correctness of topk_gating with score_func='softmax'."""
-    torch.random.manual_seed(0)
-    route_scale = 1.0
-
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
-
-    (w_torch, i_torch), _ = run_torch_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-    (w_fused, i_fused), _ = run_fused_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-
-    sel = _selection_scores(gating_output, bias, "softmax")
-    n_mism = _count_routing_mismatches(
-        i_fused,
-        i_torch,
-        sel,
-        topk,
-        bias=bias,
-        label=f"softmax E={num_experts} k={topk} dtype={dtype}",
-    )
-    assert n_mism == 0, (
-        f"E={num_experts},topk={topk},dtype={dtype}: "
-        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
-    )
-
-    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
+    """Pytest test for correctness of topk_gating with score_func='softmax'
+    (fused candidate) and the vLLM-adapted topk_softmax kernel."""
+    row = bench_topk_softmax(num_experts, num_tokens, topk, dtype, use_bias=False)
+    for name in ("fused", "vllm"):
+        assert row[f"{name} err"] == 0.0, (
+            f"{name}: E={num_experts},topk={topk},dtype={dtype}: "
+            f"{row[f'{name} err'] * num_tokens:.0f}/{num_tokens} tokens have non-tie ID mismatches"
+        )
+        assert row[f"{name} max_weight_err"] < _WEIGHT_TOL, (
+            f"{name}: E={num_experts},topk={topk},dtype={dtype}: "
+            f"max weight error {row[f'{name} max_weight_err']:.2e} exceeds tolerance"
+        )
 
 
 # Regression test for the softmax + correction_bias path.
@@ -674,47 +560,34 @@ def test_topk_softmax_correctness(num_experts, num_tokens, topk, dtype):
 # This also exercises the type-erased bias path (bias dtype is a runtime tag,
 # not a template arg) for score_func="softmax" across all supported bias dtypes.
 # num_tokens covers both the decode/TPW=1 prefill path (64) and the higher-TPW
-# multi-token prefill path (1024).
+# multi-token prefill path (1024). Only the fused candidate is checked here --
+# the vLLM kernel has no bias support.
 @pytest.mark.parametrize("bias_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("topk", [2, 8])
 @pytest.mark.parametrize("num_tokens", [64, 1024])
 @pytest.mark.parametrize("num_experts", [128, 256])
-def test_topk_softmax_bias_correctness(num_experts, num_tokens, topk, dtype, bias_dtype):
-    """topk_gating softmax with correction_bias: routing + unbiased weights must
-    match the fp32 reference across gating/bias dtype combinations."""
-    torch.random.manual_seed(0)
-    route_scale = 1.0
-
-    gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
-        bias_dtype
+def test_topk_softmax_bias_correctness(
+    num_experts, num_tokens, topk, dtype, bias_dtype
+):
+    row = bench_topk_softmax(
+        num_experts, num_tokens, topk, dtype, bias_dtype=bias_dtype, use_bias=True
     )
-
-    (w_torch, i_torch), _ = run_torch_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-    (w_fused, i_fused), _ = run_fused_softmax(
-        gating_output.clone(), bias, topk, route_scale
-    )
-
-    sel = _selection_scores(gating_output, bias, "softmax")
-    n_mism = _count_routing_mismatches(
-        i_fused,
-        i_torch,
-        sel,
-        topk,
-        bias=bias,
-        label=f"softmax+bias E={num_experts} k={topk} gating={dtype} bias={bias_dtype}",
-    )
-    assert n_mism == 0, (
+    assert row["fused err"] == 0.0, (
         f"E={num_experts},topk={topk},gating={dtype},bias={bias_dtype}: "
-        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+        f"{row['fused err'] * num_tokens:.0f}/{num_tokens} tokens have non-tie ID mismatches"
     )
-
     # The reported weights must be the *unbiased* softmax weights; the old bug
     # made these normalize over (logit+bias) and could even exceed max softmax.
-    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
+    assert row["fused max_weight_err"] < _WEIGHT_TOL, (
+        f"E={num_experts},topk={topk},gating={dtype},bias={bias_dtype}: "
+        f"max weight error {row['fused max_weight_err']:.2e} exceeds tolerance"
+    )
+
+
+# ---------------------------------------------------------------------------
+# NaN/Inf robustness (topk_gating, all score functions)
+# ---------------------------------------------------------------------------
 
 
 def _ref_selection_with_nan(gating_output, bias, score_func):
@@ -724,19 +597,30 @@ def _ref_selection_with_nan(gating_output, bias, score_func):
     Non-finite semantics (per score function), mirroring the kernel:
     - NaN: always excluded (never selected).
     - +Inf: sigmoid saturates to 1 (selectable); sqrt(softplus) clamps the logit
-      to 1e30 (selectable, top-ranked, finite); softmax excludes it (its exp is
-      mapped to -inf so it neither poisons the sum nor gets selected).
+      to 1e30 (selectable, top-ranked, finite); softmax treats a dominant +Inf
+      logit as the limit x->+inf: prob 1.0 for the +Inf expert(s) (split evenly
+      on ties), 0 for the rest.
     - -Inf: score -> 0 (low, not selected) for every function.
+
+    NOTE: torch.softmax does NOT compute the +Inf case this way -- its
+    max-subtraction still evaluates exp(+inf - +inf) = exp(nan) = nan, so
+    torch.softmax(row_with_inf) is all-NaN, not [0, ..., 1, ..., 0]. The
+    softmax branch below is hand-rolled (max-subtract, exp, but treat a NaN
+    diff -- which only occurs at the position(s) equal to +Inf -- as exp=1)
+    to mirror the kernel's actual (intentional, PyTorch-diverging) behaviour.
     """
     gf = gating_output.float()
     nan = torch.isnan(gf)
-    posinf = torch.isposinf(gf)
     b = bias.float() if (bias is not None and bias.numel() > 0) else 0.0
     if score_func == "softmax":
-        # NaN and +Inf are excluded from the normalization and from selection.
-        s = torch.softmax(gf.masked_fill(nan | posinf, float("-inf")), dim=-1)
+        gf_masked = gf.masked_fill(nan, float("-inf"))  # NaN excluded from max/sum
+        row_max = gf_masked.max(dim=-1, keepdim=True).values
+        diff = gf_masked - row_max
+        exp = torch.where(torch.isnan(diff), torch.ones_like(diff), torch.exp(diff))
+        row_sum = exp.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+        s = exp / row_sum
         sel = s + b
-        exclude = nan | posinf
+        exclude = nan
     elif score_func == "sigmoid":
         sel = torch.sigmoid(gf) + b  # sigmoid(+inf)=1, sigmoid(-inf)=0
         exclude = nan
@@ -760,21 +644,27 @@ def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
     """
     torch.random.manual_seed(0)
     gating_output = _make_gating(num_experts, num_tokens, dtype)
-    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(dtype)
+    # fp32 bias (not cast to `dtype`): when a +Inf logit collapses softmax to
+    # an exact 0.0/1.0 split, ranking among the zero-probability experts is
+    # driven entirely by bias, and bf16's ~2-3 significant digits produce
+    # frequent exact collisions among ~128 random values -- creating a mass of
+    # genuine ties beyond what the tie-tolerant comparison can disambiguate.
+    # fp32 (or fp16) bias avoids this test artifact; it also matches the real
+    # DeepSeek-V4 usage (bias kept at higher precision than gating logits).
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
 
     # Scatter NaN across token-dependent positions (so it lands anywhere in a
-    # lane's sorted partition) plus a -Inf per token.
+    # lane's sorted partition) plus a -Inf and +Inf per token.
     tok = torch.arange(num_tokens, device="cuda")
     for j in range(4):
         gating_output[tok, (tok * (7 * j + 3) + j) % num_experts] = float("nan")
     gating_output[tok, (tok * 11 + 2) % num_experts] = float("-inf")
-    # +Inf is a valid extreme logit for the per-element scores (sigmoid saturates
-    # to 1; sqrt(softplus) clamps to a finite top-ranked score). Softmax is
-    # excluded here: a +Inf makes the row-max +Inf so every exp(finite-inf)=0 and
-    # the row collapses -- excluding +Inf from the softmax max/selection is a
-    # separate hardening not covered by this test.
-    if score_func != "softmax":
-        gating_output[tok, (tok * 5 + 1) % num_experts] = float("inf")
+    # +Inf is a valid extreme logit for all scoring functions: sigmoid saturates
+    # to 1, sqrt(softplus) clamps to a finite top-ranked score, and softmax gives
+    # +Inf experts prob 1.0 (the kernel's intentional limit-case handling; see
+    # _ref_selection_with_nan -- this diverges from plain torch.softmax, which
+    # produces NaN for a row containing +Inf).
+    gating_output[tok, (tok * 5 + 1) % num_experts] = float("inf")
 
     # Preallocated output buffers, matching the real model call.
     topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
@@ -829,18 +719,78 @@ def test_topk_gating_nan(num_experts, num_tokens, topk, score_func):
     row = bench_topk_gating_nan(
         num_experts, num_tokens, topk, score_func, torch.bfloat16
     )
-    assert not row["nan_leak"], (
-        f"{score_func} E={num_experts} T={num_tokens} k={topk}: NaN leaked into weights"
-    )
+    assert not row[
+        "nan_leak"
+    ], f"{score_func} E={num_experts} T={num_tokens} k={topk}: NaN leaked into weights"
     assert row["fused err"] == 0.0, (
         f"{score_func} E={num_experts} T={num_tokens} k={topk}: routed top-k set "
         f"differs from the NaN-excluding reference (err={row['fused err']})"
     )
 
 
-if __name__ == "__main__":
+# Softmax + +Inf correctness test.
+#
+# The kernel treats a dominant +Inf logit as the limit x->+inf, NOT via plain
+# torch.softmax (which produces NaN for a row containing +Inf, since its
+# max-subtraction still evaluates exp(+inf - +inf) = exp(nan) = nan):
+#   +Inf expert: softmax prob = 1.0 (NaN logits are pre-excluded, then
+#     +Inf - +Inf = NaN in the diff is recognized as "logit == max" -> exp = 1.0)
+#   finite experts: exp(finite - +Inf) = 0 -> softmax prob = 0
+# So the +Inf expert(s) should be selected and carry weight 1.0. The reference
+# (_ref_selection_with_nan) hand-rolls this instead of calling torch.softmax.
+# This test verifies both safety (no NaN/Inf leak) and routing correctness.
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("num_tokens", [64, 2048])
+@pytest.mark.parametrize("num_experts", [64, 128, 256])
+def test_topk_softmax_posinf(num_experts, num_tokens, topk):
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, torch.bfloat16)
+    # fp32 bias: see the comment in bench_topk_gating_nan -- a +Inf-collapsed
+    # softmax ranks the zero-probability experts by bias alone, and bf16
+    # precision creates spurious exact collisions among ~128 random values.
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    tok = torch.arange(num_tokens, device="cuda")
+    gating_output[tok, (tok * 5 + 1) % num_experts] = float("inf")
+
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+
+    aiter.topk_gating(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        bias,
+        need_renorm=False,
+        routed_scaling_factor=1.0,
+        score_func="softmax",
+    )
+    assert not topk_weights.isnan().any(), "softmax + +Inf: NaN leaked into weights"
+    assert not topk_weights.isinf().any(), "softmax + +Inf: Inf leaked into weights"
+    assert (topk_ids >= 0).all() and (
+        topk_ids < num_experts
+    ).all(), "softmax + +Inf: expert ID out of range"
+
+    # Routing correctness: selection should match the NaN-excluding reference.
+    sel = _ref_selection_with_nan(gating_output, bias, "softmax")
+    i_ref = sel.topk(topk, dim=-1, sorted=False)[1].to(torch.int32)
+    n_mism = _count_routing_mismatches(
+        topk_ids,
+        i_ref,
+        sel,
+        topk,
+        bias=bias,
+        label=f"softmax+posinf E={num_experts} T={num_tokens} k={topk}",
+    )
+    assert n_mism == 0, (
+        f"softmax+posinf E={num_experts} T={num_tokens} k={topk}: "
+        f"{n_mism}/{num_tokens} tokens have non-tie routing mismatches"
+    )
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Test topk_sigmoid and topk_softplus operations"
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
     parser.add_argument(
         "--num-experts",
@@ -852,7 +802,7 @@ if __name__ == "__main__":
         "--num-tokens",
         type=str2tuple,
         default=[16384, 4096, 1024, 256, 64, 1],
-        help="Comma-separated list of number of tokens (default: 64,1024,2048)",
+        help="Comma-separated list of number of tokens (default: 16384,4096,1024,256,64,1)",
     )
     parser.add_argument(
         "--topk",
@@ -861,19 +811,13 @@ if __name__ == "__main__":
         help="Comma-separated list of topk values (default: 1,2,4,6,8)",
     )
     parser.add_argument(
+        "-d",
         "--dtype",
         type=str2Dtype,
+        nargs="*",
         default=[torch.float16, torch.bfloat16, torch.float32],
         help="Comma-separated list of dtypes: fp16, bf16, fp32 (default: fp16,bf16,fp32)",
     )
-    parser.add_argument(
-        "--test",
-        type=str,
-        default="all",
-        choices=["sigmoid", "softplus", "softmax", "nan", "all"],
-        help="Which test to run (default: all)",
-    )
-
     args = parser.parse_args()
 
     def to_list(x):
@@ -884,122 +828,93 @@ if __name__ == "__main__":
     topk_list = to_list(args.topk)
     dtype_list = to_list(args.dtype)
 
-    # Track whether any benchmark section saw a correctness regression
-    # (id_errors > 1%); exit non-zero at the end so CI catches it.
+    # Track whether any benchmark section saw a correctness regression;
+    # exit non-zero at the end so CI catches it.
     failed_sections: list[str] = []
 
-    if args.test in ("sigmoid", "all"):
-        sigmoid_experts = [e for e in num_experts_list]
-        sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
-        sigmoid_configs = list(
-            itertools.product(
-                sigmoid_experts, num_tokens_list, topk_list, sigmoid_dtypes
-            )
-        )
-        print("=" * 80)
-        print("topk_sigmoid benchmark")
-        print("=" * 80)
-        collected = []
-        for num_experts, num_tokens, topk, dtype in sigmoid_configs:
-            result = benchmark_topk_sigmoid(
-                num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
-            )
-            collected.append(result)
-        df = pd.DataFrame(collected)
-        print(df.to_string(index=False))
-        print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
-        # benchmark_topk_sigmoid uses {score,index}_errors columns
-        errors = df[(df["index_errors"] > 0.01) | (df["score_errors"] > 0.01)]
-        if len(errors) > 0:
-            print(f"\nERROR: {len(errors)} sigmoid config(s) had errors > 1%!")
-            print(errors.to_string(index=False))
-            failed_sections.append("sigmoid")
+    # -- topk_sigmoid --------------------------------------------------
+    sigmoid_dtypes = [d for d in dtype_list if d != torch.float32]
+    sigmoid_configs = list(
+        itertools.product(num_experts_list, num_tokens_list, topk_list, sigmoid_dtypes)
+    )
+    df = [bench_topk_sigmoid(*cfg) for cfg in sigmoid_configs]
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "topk_sigmoid summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    errors = df[(df["fused score_err"] > 0.01) | (df["fused idx_err"] > 0.01)]
+    if len(errors) > 0:
+        print(f"\nERROR: {len(errors)} sigmoid config(s) had errors > 1%!")
+        print(errors.to_string(index=False))
+        failed_sections.append("sigmoid")
 
-    if args.test in ("softplus", "all"):
-        softplus_configs = list(
-            itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
-        )
-        print("\n" + "=" * 80)
-        print("topk_softplus benchmark")
-        print("=" * 80)
-        collected = []
-        for num_experts, num_tokens, topk, dtype in softplus_configs:
-            result = benchmark_topk_softplus(
-                num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
-            )
-            collected.append(result)
-        df = pd.DataFrame(collected)
-        print(df.to_string(index=False))
-        print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
-        errors = df[df["id_errors"] > 0.01]
-        if len(errors) > 0:
-            print(f"\nERROR: {len(errors)} softplus config(s) had id errors > 1%!")
-            print(errors.to_string(index=False))
-            failed_sections.append("softplus")
-        else:
-            print("All softplus tests passed!")
+    # -- topk_softplus ---------------------------------------------------
+    softplus_configs = list(
+        itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
+    )
+    df = [bench_topk_softplus(*cfg) for cfg in softplus_configs]
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "topk_softplus summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    errors = df[(df["fused err"] > 0.01) | (df["fused max_weight_err"] > _WEIGHT_TOL)]
+    if len(errors) > 0:
+        print(f"\nERROR: {len(errors)} softplus config(s) had errors!")
+        print(errors.to_string(index=False))
+        failed_sections.append("softplus")
 
-    if args.test in ("softmax", "all"):
-        softmax_configs = list(
-            itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
-        )
-        print("\n" + "=" * 80)
-        print("topk_softmax benchmark: topk_gating (fused) vs topk_softmax (vLLM)")
-        print("=" * 80)
-        collected = []
-        for num_experts, num_tokens, topk, dtype in softmax_configs:
-            result = benchmark_topk_softmax(
-                num_experts=num_experts, num_tokens=num_tokens, topk=topk, dtype=dtype
-            )
-            collected.append(result)
-        df = pd.DataFrame(collected)
-        print(df.to_string(index=False))
-        print(f"\nAverage fused uplift: {df['fused_uplift'].mean():.2f}x")
-        print(f"Average vllm  uplift: {df['vllm_uplift'].mean():.2f}x")
-        errors = df[(df["id_err_fused"] > 0.01) | (df["id_err_vllm"] > 0.01)]
-        if len(errors) > 0:
-            print(f"\nERROR: {len(errors)} softmax config(s) had id errors > 1%!")
-            print(errors.to_string(index=False))
-            failed_sections.append("softmax")
-        else:
-            print("All softmax tests passed!")
+    # -- topk_softmax: topk_gating (fused) vs topk_softmax (vLLM) --------
+    softmax_configs = list(
+        itertools.product(num_experts_list, num_tokens_list, topk_list, dtype_list)
+    )
+    df = [bench_topk_softmax(*cfg) for cfg in softmax_configs]
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "topk_softmax summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+    errors = df[
+        (df["fused err"] > 0.01)
+        | (df["vllm err"] > 0.01)
+        | (df["fused max_weight_err"] > _WEIGHT_TOL)
+        | (df["vllm max_weight_err"] > _WEIGHT_TOL)
+    ]
+    if len(errors) > 0:
+        print(f"\nERROR: {len(errors)} softmax config(s) had errors!")
+        print(errors.to_string(index=False))
+        failed_sections.append("softmax")
 
-    if args.test in ("nan", "all"):
-        nan_dtypes = [d for d in dtype_list if d != torch.float32]
-        nan_configs = list(
-            itertools.product(
-                num_experts_list,
-                num_tokens_list,
-                topk_list,
-                ["sqrtsoftplus", "sigmoid", "softmax"],
-                nan_dtypes,
-            )
+    # -- topk_gating NaN/Inf robustness -----------------------------------
+    nan_dtypes = [d for d in dtype_list if d != torch.float32]
+    nan_configs = list(
+        itertools.product(
+            num_experts_list,
+            num_tokens_list,
+            topk_list,
+            ["sqrtsoftplus", "sigmoid", "softmax"],
+            nan_dtypes,
         )
-        print("\n" + "=" * 80)
-        print("topk_gating NaN/Inf robustness")
-        print("=" * 80)
-        collected = [
-            bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype)
-            for num_experts, num_tokens, topk, score_func, dtype in nan_configs
-        ]
-        df = pd.DataFrame(collected)
-        aiter.logger.info(
-            "topk_gating NaN/Inf robustness summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
-        errors = df[(df["fused err"] > 0) | (df["nan_leak"])]
-        if len(errors) > 0:
-            print(f"\nERROR: {len(errors)} nan config(s) failed (err>0 or nan_leak)!")
-            print(errors.to_string(index=False))
-            failed_sections.append("nan")
-        else:
-            print("All nan robustness tests passed!")
-    print("=" * 80)
+    )
+    df = [bench_topk_gating_nan(*cfg) for cfg in nan_configs]
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "topk_gating NaN/Inf robustness summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    errors = df[(df["fused err"] > 0) | (df["nan_leak"])]
+    if len(errors) > 0:
+        print(f"\nERROR: {len(errors)} nan config(s) failed (err>0 or nan_leak)!")
+        print(errors.to_string(index=False))
+        failed_sections.append("nan")
 
     if failed_sections:
         print(
-            f"FAIL: correctness regression in section(s): "
-            f"{', '.join(failed_sections)}",
+            f"FAIL: correctness regression in section(s): {', '.join(failed_sections)}",
             file=sys.stderr,
         )
         sys.exit(1)
+    else:
+        print("All topk_gating benchmarks passed!")
+
+
+if __name__ == "__main__":
+    main()
