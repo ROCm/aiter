@@ -100,7 +100,7 @@ _Answer:_
 
 Check which type(s) apply; these determine which Step 5 categories are mandatory.
 
-- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), HK6 (UT)
+- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), D8 (contiguous check), HK6 (UT)
 - [ ] **New constexpr / routing flag / new dtype or arch value added** → B4 (do ALL dispatch branches handle the new value, or assert on it?), C4 (new arch string literal?)
 - [ ] **Tuning config (CSV / YAML)** → D3 (hipblaslt), HK4 (kpack:1)
 - [ ] **Dispatch logic change** → B1 (silent bypass), B3 (string normalization), B4 (new value unhandled?), A3 (scope too broad)
@@ -114,6 +114,10 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?)
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
+- [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
+- [ ] **Kernel launcher / buffer-offset or index arithmetic (long-context or large-batch path)** → D9 (int32 overflow at production scale)
+- [ ] **Removes or reverses a zero-init / assert / `.contiguous()` / documented invariant** → D4 (invariant reversal cited?), B7 (assert may block valid shapes)
+- [ ] **New weight attribute / weight transform** → F1 (double HBM pin)
 
 ---
 
@@ -234,6 +238,7 @@ Real example (PR#3390): `is_causal=True` not forwarded → "fake causal" fmha pa
 **B2 — Triton tl.load / tl.store without mask** 🔴
 Unmasked load when dim is not a multiple of BLOCK_SIZE → silent garbage read, no segfault.
 Common non-aligned dims: `seqlen`, `vocab_size`, `hidden_dim`, `num_heads`, `head_dim`, `kv_lora_rank`.
+FP self-check (do this before firing): confirm the loaded dim is NOT guaranteed a multiple of BLOCK_SIZE — i.e. it is not padded/rounded up at allocation, not `tl.cdiv`-tiled with a masked tail elsewhere, and not already guarded by an enclosing mask or a caller-side pad. An unmasked load on a provably-aligned dim is safe; do not fire. Name the concrete non-aligned dim value that triggers the OOB.
 → `🔴 B2: tl.load at [line] missing mask= — silent OOB on non-aligned inputs`
 
 **B3 — String dispatch without normalization** ⚠️
@@ -292,11 +297,13 @@ Real example (PR#4073): valarLip: "check _is_fnuz by tensor's DType instead of a
 **C2 — FP8 scale bound hardcoded** ⚠️
 `fp8_max = 240.0` → correct for fnuz (e4m3fnuz max=240), wrong for OCP e4m3 (max=448).
 Use `get_dtype_max(dtype)` to derive; add a runtime guard if gfx942-only.
+FP self-check: if the constant sits on a path already runtime-guarded to a single dtype/arch (e.g. inside an `if arch == 'gfx942':` block), the hardcode is safe there — do not fire; fire only when the path handles multiple fp8 flavors.
 Real example (PR#4015): yzhou103: "would break for OCP e4m3 (max=448)."
 → `⚠️ C2: fp8_max hardcoded to [value] — use get_dtype_max(dtype)`
 
 **C3 — Dtype hardcoded without checking actual tensor** ⚠️
 Fixed `bf16`, `fp8_e8m0`, or similar in a forward path that handles multiple configs.
+FP self-check first: search the unchanged lines of this file for the same hardcoded dtype — if it already appears pre-existing on the same path, this is not a new violation (do not fire as new). Fire only when the hardcode is newly introduced, or the path newly handles more than one dtype/config.
 Real examples: ATOM#1423 "not always bf16"; ATOM#1458 "hard code to fp8_e8m0?"
 → `⚠️ C3: dtype hardcoded to [type] — should derive from actual tensor/config`
 
@@ -408,6 +415,7 @@ Real example (ATOM#1423): paged-SWA layout changed; bridge still used old layout
 
 **E4 — Downstream CI skipped on a change downstream consumes** 🔴
 aiter's downstream tests (ATOM, SGLang, vLLM) are SKIPPED BY DEFAULT and only run when a label is added — `ci:atom` (DeepSeek-R1-0528, GPT-OSS-120B), `ci:sglang` (DeepSeek-R1-MXFP4, Qwen 3.5), `ci:vllm` (GPT-OSS-120B, DeepSeek-R1-0528, Kimi-K2.5), `ci:all` (all of the above), or `ci:atom_full` (ATOM accuracy suite; only for FlyDSL/Triton upgrades). A PR that changes an op a downstream consumes can pass every *aiter* check with the downstream job skipped, merge green, and break the downstream silently — visible only after merge.
+**Staleness guard:** the label→model mapping here is a snapshot. Before quoting a specific model for a label, confirm the current `ci:*` definitions in `.github/workflows/*.yaml` — the model roster rotates, and a stale mapping produces a confidently-wrong label recommendation.
 Which label (be precise, do not reflexively pick `ci:all`):
 1. **Dispatch reachability** — is the changed/new kernel wired into a default dispatch path? A pure-additive, arch-gated kernel not in any default path is unreachable by downstream → exempt, no label needed.
 2. **Map activation → model** — if reachable, read the branch's activation condition (arch × dtype × shape × model gate) and map it to a model (e.g. 128-head fp8 MLA decode on gfx950 → DeepSeek-V4).
@@ -466,6 +474,7 @@ Exception: PRs adding benchmarks/tests for existing ops without claiming improve
 **P2 — Benchmark covers only toy shapes** ⚠️
 Numbers exist but only for M≤256, only 1 token, or one model.
 Production: DSv4 E=385/topk=7, GPT-OSS 120B, Kimi-K2.5; token range 1→16384.
+Staleness guard: the production config list is a snapshot — verify current E/topk/hidden and the model roster from the model registry or a recent benchmark before asserting what counts as "production".
 → `⚠️ P2: benchmark missing production shapes — [what's absent]`
 
 **P3 — Perf claim not reproducible** ⚠️
