@@ -193,6 +193,13 @@ def test_reference_oracle_runs():
         (64, 0, 0),  # sliding window
         (0, 64, 0),  # contextual prefix
         (64, 0, 20),  # window + targets
+        # semi_local_fig: window well below seq_len + targets. Exercises the
+        # dV/dK targets-aware n_q_tiles cap — KV tiles far from the target tail get
+        # their query sweep capped, while tiles inside the window of max_id must
+        # reopen to seq_len so the (raw-position-distant, id-clamped) target queries
+        # still contribute. A raw-position-only cap would drop them.
+        (256, 0, 20),  # semi_local_fig (window << seq + targets)
+        (128, 0, 20),
     ],
 )
 def test_flydsl_bwd_variants(max_attn_len, contextual_seq_len, target_size, dtype):

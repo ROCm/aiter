@@ -433,8 +433,30 @@ def build_hstu_attention_bwd_dvdk(
         kv_owned_ids = [to_id(kv_rows[og]) for og in range_constexpr(KV_OWNED_SUBTILES)]
 
         kv_start_row = kv_tile_idx * fx.Int32(BLOCK_M)
+        kv_end_row = kv_start_row + fx.Int32(BLOCK_M)
         active = kv_start_row < seq_len
-        q_upper = active.select(seq_len, fx.Int32(0))
+
+        # ---- Streamed-query range: causal lower bound + optional window upper cap ----
+        # Causal: queries below the KV tile never attend it (dist<=0), so start the
+        # sweep at the tile's own row (contextual row-0 opener needs the full range).
+        # Window: a KV row is seen only by queries within `max_attn_len` *ahead* of it
+        # (KV-owned mirror of the dq window *lower* bound), so the causal `seq_len`
+        # upper bound can be capped at `kv_end + max_attn_len` — the beyond-window
+        # query tiles were iterated and masked to zero before (see the opt log).
+        # Targets clamp to the shared id `max_id`, so a target query's raw position
+        # (up to seq_len) is unrelated to its effective id: if this KV tile lies
+        # within the window of `max_id` (`win_upper > max_id`), *every* target query
+        # still attends and the cap must reopen to seq_len, else their dV/dK
+        # contributions would be dropped. Contextual keeps the conservative seq_len
+        # (prefix opener adds low-id queries that the raw-position cap can't reason
+        # about); semi_local_fig has no contextual, so it takes the capped path.
+        q_upper = seq_len
+        if has_window and not has_contextual:
+            win_upper = kv_end_row + fx.Int32(max_attn_len)
+            if has_targets:
+                win_upper = (win_upper <= max_id).select(win_upper, seq_len)
+            q_upper = (win_upper < seq_len).select(win_upper, seq_len)
+        q_upper = active.select(q_upper, fx.Int32(0))
         n_q_tiles = (q_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
         q_tile_start = kv_start_row // fx.Int32(BLOCK_N)
         if has_contextual:
