@@ -108,7 +108,6 @@ jobs:
           python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
           import json
           import os
-          import subprocess
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as f:
@@ -150,43 +149,11 @@ jobs:
           )
           requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
           if requested_nodes_raw.lower() == "auto":
-              try:
-                  sinfo_output = subprocess.check_output(
-                      ["sinfo", "-N"],
-                      text=True,
-                      stderr=subprocess.STDOUT,
-                  )
-              except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-                  raise SystemExit(f"failed to query sinfo for auto nodelist: {exc}")
-              node_state = {}
-              for line in sinfo_output.splitlines():
-                  parts = line.split()
-                  if not parts or parts[0] == "NODELIST" or len(parts) < 4:
-                      continue
-                  node_state[parts[0]] = parts[3].lower()
+              requested_nodes = []
               print(
-                  "approved node states: "
-                  + ", ".join(
-                      f"{node}={node_state.get(node, 'missing')}"
-                      for node in allowed_nodes
-                  ),
+                  "slurm_nodelist=auto: leaving node selection to SPUR scheduler",
                   file=sys.stderr,
               )
-              requested_nodes = [
-                  node
-                  for node in allowed_nodes
-                  if node_state.get(node, "").startswith("idle")
-              ]
-              if len(requested_nodes) < 2:
-                  state_dump = ", ".join(
-                      f"{node}={node_state.get(node, 'missing')}"
-                      for node in allowed_nodes
-                  )
-                  raise SystemExit(
-                      "slurm_nodelist=auto requires at least two idle approved "
-                      f"nodes, found {len(requested_nodes)}. {state_dump}"
-                  )
-              requested_nodes = requested_nodes[:2]
           else:
               requested_nodes = [
                   node.strip()
@@ -202,7 +169,7 @@ jobs:
                   "slurm_nodelist contains non-approved nodes: "
                   + ", ".join(unknown_nodes)
               )
-          if len(requested_nodes) != 2:
+          if requested_nodes and len(requested_nodes) != 2:
               raise SystemExit(
                   "slurm_nodelist must resolve to exactly two approved nodes for 1P1D"
               )
