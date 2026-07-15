@@ -9,14 +9,16 @@ Key primitives:
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
+
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects._rocdl_ops_gen import cvt_scalef32_pk_bf16_fp4
 from flydsl._mlir.dialects.arith import CmpIPredicate
-from flydsl.expr.typing import T
 from flydsl.expr import arith as _arith
 from flydsl.expr import rocdl
-import flydsl.expr as fx
+from flydsl.expr.typing import T
 
 
 def crd2idx(crd, layout):
@@ -357,8 +359,8 @@ def _int4_to_bf16x4_i64_gfx950(
     omitted and must be applied later (e.g. in the epilogue).  This saves VALU
     in the hot loop and uses v_cvt_pk_bf16_f32 for proper f32→bf16 conversion.
     """
-    from flydsl.expr import rocdl
     from flydsl._mlir.dialects._arith_ops_gen import MulFOp as _MulFOp
+    from flydsl.expr import rocdl
 
     _uw = _arith._to_raw
     _av = _arith.ArithValue
@@ -1058,6 +1060,7 @@ def _unpack_b_nvfp4_gfx950(packed32, scale_f32, arith, vector):
     b1 = fp4_bytes_to_i64(2, 3, scale_f32)
     return b0, b1
 
+
 def _unpack_b_nvfp4_gfx942(packed32, scale_f32, arith, vector):
     def decode_e2m1_to_f32(nibble_i32):
         magnitude = arith.andi(nibble_i32, arith.constant(0x07, type=T.i32))
@@ -1070,13 +1073,9 @@ def _unpack_b_nvfp4_gfx942(packed32, scale_f32, arith, vector):
             arith.shli(magnitude, arith.constant(22, type=T.i32)),
         )
         val = arith.bitcast(T.f32, fp32_bits)
-        is_zero = arith.cmpi(
-            CmpIPredicate.eq, magnitude, arith.constant(0, type=T.i32)
-        )
+        is_zero = arith.cmpi(CmpIPredicate.eq, magnitude, arith.constant(0, type=T.i32))
         val = arith.select(is_zero, arith.constant(0.0, type=T.f32), val)
-        is_one = arith.cmpi(
-            CmpIPredicate.eq, magnitude, arith.constant(1, type=T.i32)
-        )
+        is_one = arith.cmpi(CmpIPredicate.eq, magnitude, arith.constant(1, type=T.i32))
         val = arith.select(is_one, arith.constant(0.5, type=T.f32), val)
         neg_val = arith.negf(val)
         is_negative = arith.cmpi(

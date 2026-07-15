@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-
+from aiter.aot.flydsl.moe import compile_one_config
 from aiter.fused_moe import (
     fused_moe,
     get_2stage_cfgs,
@@ -16,6 +16,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.enum import ActivationType, QuantType
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_stage1,
@@ -27,16 +28,12 @@ from aiter.utility.fp4_utils import (
     _quantize_nvfp4_weight_for_moe,
     shuffle_nvfp4_weight_for_flydsl,
 )
-from aiter.aot.flydsl.moe import compile_one_config
-from aiter.jit.core import AITER_CONFIGS
-
 
 DTYPE = torch.bfloat16
 NVFP4_BF16_QDTYPE = "nvfp4_bf16"
 MODEL_DIMS = [128, 192, 256, 512, 1024, 1536, 2048]
 INTER_DIMS = [128, 192, 256, 512, 1024, 1536, 2048]
 TOKENS = [1, 16, 234]
-
 
 
 @dataclass

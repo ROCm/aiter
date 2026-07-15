@@ -33,8 +33,8 @@ from aiter.jit.utils.chip_info import (
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
     from aiter.ops.flydsl.moe_common import GateMode
+    from aiter.ops.flydsl.utils import is_flydsl_available
 except ImportError:
 
     class GateMode(Enum):
@@ -45,12 +45,12 @@ except ImportError:
         return False
 
 
-from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
 )
+from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
 BLOCK_SIZE_M = 32
 
@@ -596,8 +596,8 @@ def fused_moe_(
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
 
-    # NOTE: There is no trivial way to distinguish mxfp4 input vs nvfp4 input at the moment,
-    # apart from relying on `w1_global_scale is not None`.
+    # NOTE: There is no trivial way to distinguish mxfp4 input vs nvfp4 input
+    # at the moment, apart from relying on `w1_global_scale is not None`.
     is_nvfp4_bf16 = (
         q_dtype_w == torch.uint8
         and quant_type == QuantType.No
@@ -1087,8 +1087,9 @@ def _get_default_bf16_nvfp4_fused_moe_params(
     )
     if stage1_tile_n is None:
         raise ValueError(
-            "No supported tile_n for nvfp4 stage1 default: FlyDSL nvfp4_bf16 stage1 requires inter_dim to be a positive "
-            f"multiple of tile_n, got inter_dim={inter_dim}, not divisible by 128 or 64."
+            "No supported tile_n for nvfp4 stage1 default: FlyDSL nvfp4_bf16 "
+            "stage1 requires inter_dim to be a positive multiple of tile_n, "
+            f"got inter_dim={inter_dim}, not divisible by 128 or 64."
         )
 
     kernelName1 = flydsl_kernel_name(
@@ -1100,8 +1101,9 @@ def _get_default_bf16_nvfp4_fused_moe_params(
     )
     if stage2_tile_n is None:
         raise ValueError(
-            "No supported tile_n for nvfp4 stage2 default: FlyDSL nvfp4_bf16 stage2 requires model_dim to be a positive "
-            f"multiple of tile_n, got model_dim={model_dim}, not divisible by 128 or 64."
+            "No supported tile_n for nvfp4 stage2 default: FlyDSL nvfp4_bf16 "
+            "stage2 requires model_dim to be a positive multiple of tile_n, "
+            f"got model_dim={model_dim}, not divisible by 128 or 64."
         )
 
     kernelName2 = flydsl_kernel_name(
@@ -1925,11 +1927,11 @@ def get_2stage_cfgs(
             )
 
         logger.info("\033[34m Start tuning fmoe")
-        tune_only = (
-            "TUNE_ONLY=flydsl_nvfp4 " if str(q_dtype_w) == "nvfp4_bf16" else ""
-        )
+        tune_only = "TUNE_ONLY=flydsl_nvfp4 " if str(q_dtype_w) == "nvfp4_bf16" else ""
+        tune_script = f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"
         os.system(
-            f"{tune_only}{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+            f"{tune_only}{PY} {tune_script}"
+            f" -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
         )
 
     def FinalFunc():
@@ -2074,8 +2076,18 @@ def get_2stage_cfgs(
     )
 
     tag = f"({kernelName1=}, {kernelName2=})"
+    stage_str = "1stage" if run_1stage else "2stage"
+    xbf16_str = " xbf16" if run_1stage_xbf16 else ""
+    cfg_str = "default" if cfg is None else tag
+    perf_hint = (
+        ", performance may be suboptimal. Consider using AITER_ONLINE_TUNE=1 "
+        "to tune AITER fused MOE online, or use AITER "
+        "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py offline"
+        if cfg is None
+        else ""
+    )
     logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys}{', performance may be suboptimal. Consider using AITER_ONLINE_TUNE=1 to tune AITER fused MOE online, or use AITER csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py offline' if cfg is None else ''}."
+        f"[fused_moe] using {stage_str}{xbf16_str} {cfg_str} for {keys}{perf_hint}."
     )
 
     def get_block_m() -> int:
@@ -2206,7 +2218,8 @@ def get_2stage_cfgs(
         assert q_dtype_a == torch.bfloat16
         if not is_flydsl_available():
             raise RuntimeError(
-                f"nvfp4_bf16 fused MoE requires FlyDSL, but FlyDSL is unavailable for {keys}"
+                f"nvfp4_bf16 fused MoE requires FlyDSL, "
+                f"but FlyDSL is unavailable for {keys}"
             )
         default_nvfp4_params = _get_default_bf16_nvfp4_fused_moe_params(
             token, topk, expert, model_dim, inter_dim, block_m

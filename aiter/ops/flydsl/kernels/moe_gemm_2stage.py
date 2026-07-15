@@ -12,24 +12,29 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import logging
-import os
 import functools
+import os
 from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith
-from flydsl.expr import gpu, buffer_ops, vector, rocdl
-from flydsl.expr import range_constexpr, const_expr
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
+)
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 try:
     from flydsl.runtime.device import (
-        supports_bf16_global_atomics,
         bf16_global_atomics_arch_description,
+        supports_bf16_global_atomics,
     )
 except ImportError:
     # Backward compatibility for runtime.device versions that only expose get_rocm_arch.
@@ -44,25 +49,24 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr.typing import T
 
-
+from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
+    crd2idx,
+    extract_bf16_scale,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
     lds_store_16b_xor16,
-    make_preshuffle_b_layout,
     load_b_pack_k32,
-    load_b_raw_w4a16,
-    unpack_b_w4a16,
-    load_b_raw_w4a16_groupwise,
     load_b_raw_nvfp4_groupwise,
-    unpack_b_nvfp4,
-    extract_bf16_scale,
-    tile_chunk_coord_i32,
+    load_b_raw_w4a16,
+    load_b_raw_w4a16_groupwise,
+    make_preshuffle_b_layout,
     swizzle_xor16,
-    crd2idx,
+    tile_chunk_coord_i32,
+    unpack_b_nvfp4,
+    unpack_b_w4a16,
 )
-from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .tensor_shim import _run_compiled
 
 
@@ -201,7 +205,8 @@ def compile_moe_gemm1(
     use_nvfp4_groupwise_scale = w_is_nvfp4 and group_size > 0
     if use_nvfp4_groupwise_scale and group_size != 16:
         raise ValueError(
-            f"FlyDSL nvfp4_bf16 groupwise scale requires group_size=16, got {group_size}."
+            "FlyDSL nvfp4_bf16 groupwise scale requires group_size=16, "
+            f"got {group_size}."
         )
     if is_nvfp4_bf16 and inter_dim % tile_n != 0:
         raise ValueError(
@@ -307,9 +312,11 @@ def compile_moe_gemm1(
     sw_nbytes = (
         experts * (2 * inter_dim) * num_groups
         if is_nvfp4_bf16
-        else experts * (2 * inter_dim) * num_groups * (2 if _scale_is_bf16 else 4)
-        if needs_scale_w
-        else 0
+        else (
+            experts * (2 * inter_dim) * num_groups * (2 if _scale_is_bf16 else 4)
+            if needs_scale_w
+            else 0
+        )
     )
 
     total_threads = 256
@@ -354,14 +361,17 @@ def compile_moe_gemm1(
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
-    _gs_tag = f"_g{group_size}" if (use_groupwise_scale or use_nvfp4_groupwise_scale) else ""
+    _gs_tag = (
+        f"_g{group_size}" if (use_groupwise_scale or use_nvfp4_groupwise_scale) else ""
+    )
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
     (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"{_gs_tag}{scale_tag}{_split_k_tag}"
-        f"_abi4"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        # _abi4: also masks sentinel token ids on loads to avoid illegal address faults
+        f"_abi4"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -1403,9 +1413,7 @@ def compile_moe_gemm1(
                 #    Flattened as: [even_0..N, odd_0..N]  → 2 * num_acc_n values
                 #
                 int4_bf16_single_field = is_int4_bf16 and not is_int4_bf16_groupwise
-                _fields_per_ku = (
-                    1 if int4_bf16_single_field else 2
-                )
+                _fields_per_ku = 1 if int4_bf16_single_field else 2
                 _vals_per_b_tile = k_unroll * _fields_per_ku * num_acc_n
 
                 def _flatten_b_tile(b_tile):
@@ -2262,7 +2270,8 @@ def compile_moe_gemm2(
     use_nvfp4_groupwise_scale = w_is_nvfp4 and group_size > 0
     if use_nvfp4_groupwise_scale and group_size != 16:
         raise ValueError(
-            f"FlyDSL nvfp4_bf16 groupwise scale requires group_size=16, got {group_size}."
+            "FlyDSL nvfp4_bf16 groupwise scale requires group_size=16, "
+            f"got {group_size}."
         )
     if is_nvfp4_bf16 and model_dim % tile_n != 0:
         raise ValueError(
@@ -2340,9 +2349,11 @@ def compile_moe_gemm2(
     sw_nbytes = (
         experts * model_dim * num_groups
         if is_nvfp4_bf16
-        else experts * model_dim * num_groups * (2 if _scale_is_bf16 else 4)
-        if needs_scale_w
-        else 0
+        else (
+            experts * model_dim * num_groups * (2 if _scale_is_bf16 else 4)
+            if needs_scale_w
+            else 0
+        )
     )
 
     total_threads = 256
@@ -2423,7 +2434,9 @@ def compile_moe_gemm2(
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Dynamic-shape variant: safe to reuse across (tokens/sorted_size/size_expert_ids) at runtime.
     # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
-    _gs_tag = f"_g{group_size}" if (use_groupwise_scale or use_nvfp4_groupwise_scale) else ""
+    _gs_tag = (
+        f"_g{group_size}" if (use_groupwise_scale or use_nvfp4_groupwise_scale) else ""
+    )
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
@@ -2615,9 +2628,7 @@ def compile_moe_gemm2(
                 # scale_w: [experts*model_dim] f32 (static shape in practice)
                 sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
             if const_expr(is_nvfp4_bf16):
-                gs_rsrc = _ptr_buffer_resource(
-                    arg_global_scale, fx.Index(experts * 4)
-                )
+                gs_rsrc = _ptr_buffer_resource(arg_global_scale, fx.Index(experts * 4))
             else:
                 gs_rsrc = None
 

@@ -10,8 +10,8 @@ from typing import Dict, Optional
 
 import torch
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
@@ -344,8 +344,7 @@ def get_flydsl_stage1_kernels_nvfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
             for tk in tile_ks:
                 lds_x_bytes = 2 * int(tm) * int(tk) * 2
 
-                # Not supported:
-                # error: <unknown>:0:0: local memory (131072) exceeds limit (65536) in function 'moe_gemm1_0'
+                # Not supported: local memory exceeds device limit (65536 bytes).
                 if lds_x_bytes > lds_cap_bytes:
                     continue
                 for kb in k_batches:
@@ -386,8 +385,7 @@ def get_flydsl_stage2_kernels_nvfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
             for tk in tile_ks:
                 lds_x_bytes = 2 * int(tm) * int(tk) * 2
 
-                # Not supported:
-                # error: <unknown>:0:0: local memory (131072) exceeds limit (65536) in function 'moe_gemm1_0'
+                # Not supported: local memory exceeds device limit (65536 bytes).
                 if lds_x_bytes > lds_cap_bytes:
                     continue
                 for mode in modes:
