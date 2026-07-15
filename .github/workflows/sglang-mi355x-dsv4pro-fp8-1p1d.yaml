@@ -28,11 +28,11 @@ on:
         required: false
         type: string
         default: "/data/xinhuang/sglang-aiter-ci"
-      slurm_reservation:
-        description: "Optional Slurm reservation. Empty omits --reservation."
+      slurm_nodelist:
+        description: "Optional comma-separated Slurm nodes. Use auto to choose two approved nodes."
         required: false
         type: string
-        default: "aiter_atom"
+        default: "auto"
       slurm_partition:
         description: "Optional Slurm partition. Empty omits -p."
         required: false
@@ -75,8 +75,8 @@ env:
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
-  SLURM_NODELIST_DEFAULT: ""
-  SLURM_RESERVATION_DEFAULT: aiter_atom
+  SLURM_NODELIST_DEFAULT: auto
+  SLURM_RESERVATION_DEFAULT: ""
   SLURM_NODELIST_ALLOWED: >-
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
@@ -137,26 +137,39 @@ jobs:
               "TIME_LIMIT_OVERRIDE": value("time_limit", "TIME_LIMIT_DEFAULT"),
           }
 
-          allowed_nodes = {
+          allowed_nodes = [
               node.strip()
               for node in os.environ["SLURM_NODELIST_ALLOWED"].split(",")
               if node.strip()
-          }
+          ]
           requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
           if requested_nodes_raw.lower() == "auto":
-              raise SystemExit("slurm_nodelist=auto is disabled; use approved nodes only")
-          requested_nodes = [
-              node.strip()
-              for node in requested_nodes_raw.split(",")
-              if node.strip()
-          ]
+              seed = int(os.environ.get("GITHUB_RUN_ID", "0")) + int(
+                  os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+              )
+              node_pairs = [
+                  allowed_nodes[index : index + 2]
+                  for index in range(0, len(allowed_nodes), 2)
+              ]
+              requested_nodes = node_pairs[seed % len(node_pairs)]
+          else:
+              requested_nodes = [
+                  node.strip()
+                  for node in requested_nodes_raw.split(",")
+                  if node.strip()
+              ]
+          allowed_set = set(allowed_nodes)
           unknown_nodes = [
-              node for node in requested_nodes if node not in allowed_nodes
+              node for node in requested_nodes if node not in allowed_set
           ]
           if unknown_nodes:
               raise SystemExit(
                   "slurm_nodelist contains non-approved nodes: "
                   + ", ".join(unknown_nodes)
+              )
+          if len(requested_nodes) != 2:
+              raise SystemExit(
+                  "slurm_nodelist must resolve to exactly two approved nodes for 1P1D"
               )
           pairs["SLURM_NODELIST_OVERRIDE"] = ",".join(requested_nodes)
 
