@@ -177,6 +177,13 @@ jobs:
 
           log_root="${DISAGG_SCRIPTS_STAGE%/}"
           mkdir -p "${DISAGG_SCRIPTS_STAGE}" "${log_root}"
+          # run_xPyD_disagg.slurm bind-mounts DISAGG_SCRIPTS_DIR into the container
+          # at /vllm-workspace/.buildkite/amd-disagg and runs vllm_disagg.sh from
+          # there. The runner checkout is login-node-local (invisible to compute
+          # nodes), and Spur sets SLURM_SUBMIT_DIR=/tmp, so stage the scripts into
+          # the compute-visible shared dir and point DISAGG_SCRIPTS_DIR at it.
+          echo "Staging disagg scripts from ${PWD} to ${DISAGG_SCRIPTS_STAGE}"
+          cp -rf ./. "${DISAGG_SCRIPTS_STAGE}/"
           submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
           squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
           sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
@@ -188,9 +195,10 @@ jobs:
             sbatch_args+=(--nodelist "${SPUR_NODELIST}")
           fi
 
-          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
+          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
           LOG_ROOT="${log_root}" \
             MODEL_NAME="${MODEL_NAME}" \
+            DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             IMAGE="${IMAGE}" \
             sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
