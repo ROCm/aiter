@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Tune catalog for the FlyDSL MXFP4/MXFP6/MXFP8 preshuffle GEMM (gfx950 MFMA).
+
+Mirrors the aiter a8w8-bpreshuffle tune catalog style (kernelInstance + name +
+build_kernels_list), but the mxscale_preshuffle kernel exposes only tile_m/n/k +
+waves_per_eu as perf knobs (no async/lds/cshuffle/xcd/scheduler/split-K), so the
+candidate schema and kernelName grammar are correspondingly small.
+
+kernelName grammar (distinct `mxpsh` prefix, never collides with flydsl_bpreshuflle_*):
+    flydsl_mxpsh_{tm}x{tn}x{tk}_{A}_{B}_{OUT}_w{wpe}
+e.g. flydsl_mxpsh_64x128x128_F8_F8_B16_w0   (a8w8)
+     flydsl_mxpsh_64x128x256_F4_F4_B16_w2   (a4w4)
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+_DTYPE_SHORT = {"fp8": "F8", "fp6": "F6", "fp4": "F4", "bf16": "B16", "fp16": "F16"}
+_SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
+
+# a/b operand combos the kernel supports (a4w4 / a6w4 / a8w8).
+_COMBOS = [("fp4", "fp4"), ("fp6", "fp4"), ("fp8", "fp8")]
+_TILE_M = (32, 64, 96, 128, 256)
+_TILE_N = (128, 256, 512)
+_TILE_K = (128, 256)
+_WAVES_PER_EU = (0, 1, 2, 3, 4)
+_XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
+
+
+def _a_row_bytes(a_dtype: str, tile_k: int) -> int:
+    """A bytes per row in a K-tile: fp4 packs 2 codes/byte, fp6/fp8 = 1 byte/code."""
+    return tile_k // 2 if a_dtype == "fp4" else tile_k
+
+
+@dataclass
+class kernelInstance:
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    a_dtype: str  # "fp4" | "fp6" | "fp8"
+    b_dtype: str  # "fp4" | "fp8"
+    out_dtype: str  # "bf16" | "fp16"
+    waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
+    xcd_swizzle: int = 0  # 0=off, >0=XCD L2-rasterization group size
+
+    @property
+    def name(self) -> str:
+        a = _DTYPE_SHORT[self.a_dtype]
+        b = _DTYPE_SHORT[self.b_dtype]
+        o = _DTYPE_SHORT[self.out_dtype]
+        return (
+            f"flydsl_mxpsh_{self.tile_m}x{self.tile_n}x{self.tile_k}"
+            f"_{a}_{b}_{o}_w{self.waves_per_eu}_x{self.xcd_swizzle}"
+        )
+
+
+_NAME_RE = re.compile(
+    r"^flydsl_mxpsh_(\d+)x(\d+)x(\d+)_([A-Z0-9]+)_([A-Z0-9]+)_([A-Z0-9]+)_w(\d+)(?:_x(\d+))?$"
+)
+
+
+def parse_kernel_name(name: str):
+    """kernelName string -> dict of launch params (None if it isn't an mxpsh name).
+
+    The _x{xcd} suffix is optional (older names without it default to xcd_swizzle=0).
+    """
+    m = _NAME_RE.match(name.strip())
+    if not m:
+        return None
+    tm, tn, tk, a, b, o, wpe, xcd = m.groups()
+    return dict(
+        tile_m=int(tm),
+        tile_n=int(tn),
+        tile_k=int(tk),
+        a_dtype=_SHORT_DTYPE[a],
+        b_dtype=_SHORT_DTYPE[b],
+        out_dtype=_SHORT_DTYPE[o],
+        waves_per_eu=int(wpe),
+        xcd_swizzle=int(xcd) if xcd is not None else 0,
+    )
+
+
+def estimated_lds_bytes(ki: kernelInstance) -> int:
+    """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes]."""
+    return 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
+
+
+def _max_lds_bytes() -> int:
+    try:
+        from aiter.ops.flydsl.utils import get_shared_memory_per_block
+
+        return int(get_shared_memory_per_block(fallback_gfx="gfx950"))
+    except Exception:
+        return 160 * 1024  # gfx950 LDS
+
+
+def instance_valid(ki: kernelInstance) -> bool:
+    """Shape-independent legality against the mxscale_preshuffle kernel constraints."""
+    if ki.tile_k not in (128, 256):
+        return False
+    if ki.tile_m % 32 != 0:  # microscale packs M by 2 -> m_chunks = tile_m//16 even
+        return False
+    if ki.tile_n % 128 != 0:  # packs N by 2 -> num_acc_n = tile_n//64 even
+        return False
+    arb = _a_row_bytes(ki.a_dtype, ki.tile_k)
+    if (
+        ki.tile_m * arb
+    ) % 4096 != 0:  # A coop load: n_coop = tile_m*arb//4096 must be integral
+        return False
+    if estimated_lds_bytes(ki) > _max_lds_bytes():
+        return False
+    return True
+
+
+def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    """M is ragged (grid ceil + OOB clip). K must be a multiple of 256 (the E8M0
+    scale chunk is 256-K granular) in addition to N%tile_n / K%tile_k."""
+    if K % 256 != 0:
+        return False
+    return (N % ki.tile_n == 0) and (K % ki.tile_k == 0)
+
+
+def _build_kernels_list():
+    out = {}
+    idx = 0
+    for a_dtype, b_dtype in _COMBOS:
+        for tm in _TILE_M:
+            for tn in _TILE_N:
+                for tk in _TILE_K:
+                    for wpe in _WAVES_PER_EU:
+                        for xcd in _XCD_SWIZZLE:
+                            ki = kernelInstance(
+                                tm, tn, tk, a_dtype, b_dtype, "bf16", wpe, xcd
+                            )
+                            if instance_valid(ki):
+                                out[idx] = ki
+                                idx += 1
+    return out
+
+
+kernels_list = _build_kernels_list()
+
+
+def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int):
+    """(kernel_id, kernelInstance) that match dtypes and fit the shape."""
+    return [
+        (i, ki)
+        for i, ki in kernels_list.items()
+        if ki.a_dtype == a_dtype and ki.b_dtype == b_dtype and fits_shape(ki, M, N, K)
+    ]

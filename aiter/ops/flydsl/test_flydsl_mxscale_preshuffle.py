@@ -9,8 +9,8 @@ reuse aiter's own helpers (aiter.ops.quant / aiter.ops.shuffle /
 aiter.utility.fp4_utils) — no kernel-specific reference port is needed.
 
 Usage:
-    python aiter/ops/flydsl/test_flydsl_mxfp4_preshuffle.py
-    pytest -q aiter/ops/flydsl/test_flydsl_mxfp4_preshuffle.py
+    python aiter/ops/flydsl/test_flydsl_mxscale_preshuffle.py
+    pytest -q aiter/ops/flydsl/test_flydsl_mxscale_preshuffle.py
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
 if not is_flydsl_available():
-    pytest.skip("flydsl is not installed. Skipping FlyDSL tests.", allow_module_level=True)
+    pytest.skip(
+        "flydsl is not installed. Skipping FlyDSL tests.", allow_module_level=True
+    )
 
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 
@@ -31,7 +33,9 @@ from aiter import dtypes  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight, shuffle_scale_a16w4  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
-from aiter.ops.flydsl.mxfp4_preshuffle_kernels import flydsl_mxfp4_preshuffle_gemm  # noqa: E402
+from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+    flydsl_mxscale_preshuffle_gemm,
+)  # noqa: E402
 
 torch.set_default_device("cuda")
 
@@ -42,7 +46,9 @@ _SHAPES = [
 
 
 def _cos(a, b):
-    return torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
 
 
 def _skip_if_not_gfx950():
@@ -74,14 +80,26 @@ def test_a4w4(M, N, K, tile_m, tile_n, tile_k):
     scale_a = shuffle_scale_a16w4(sa, 1, False)
     scale_b = shuffle_scale_a16w4(sb, 1, False)
 
-    a_deq = fp4_utils.mxfp4_to_f32(a_codes) * fp4_utils.e8m0_to_f32(sa[:M].repeat_interleave(32, dim=1))
-    b_deq = fp4_utils.mxfp4_to_f32(b_codes) * fp4_utils.e8m0_to_f32(sb[:N].repeat_interleave(32, dim=1))
+    a_deq = fp4_utils.mxfp4_to_f32(a_codes) * fp4_utils.e8m0_to_f32(
+        sa[:M].repeat_interleave(32, dim=1)
+    )
+    b_deq = fp4_utils.mxfp4_to_f32(b_codes) * fp4_utils.e8m0_to_f32(
+        sb[:N].repeat_interleave(32, dim=1)
+    )
     c_ref = (a_deq @ b_deq.T).float()
 
     out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
-    flydsl_mxfp4_preshuffle_gemm(
-        a_codes, b_shuf, scale_a, scale_b, out,
-        a_dtype="fp4", b_dtype="fp4", tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+    flydsl_mxscale_preshuffle_gemm(
+        a_codes,
+        b_shuf,
+        scale_a,
+        scale_b,
+        out,
+        a_dtype="fp4",
+        b_dtype="fp4",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
     )
     torch.cuda.synchronize()
     cs = _cos(out, c_ref)
@@ -95,8 +113,12 @@ def test_a8w8(M, N, K, tile_m, tile_n, tile_k):
     dev = torch.device("cuda")
     a_f, b_f = _rand_ab(M, N, K, dev)
 
-    a_q, sa = per_1x32_f8_scale_f8_quant(a_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
-    b_q, sb = per_1x32_f8_scale_f8_quant(b_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
+    a_q, sa = per_1x32_f8_scale_f8_quant(
+        a_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    b_q, sb = per_1x32_f8_scale_f8_quant(
+        b_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
     a_codes, b_codes = a_q[:M], b_q[:N]
     b_shuf = shuffle_weight(b_codes, layout=(16, 16))
     scale_a = shuffle_scale_a16w4(sa, 1, False)
@@ -107,9 +129,17 @@ def test_a8w8(M, N, K, tile_m, tile_n, tile_k):
     c_ref = (a_deq @ b_deq.T).float()
 
     out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
-    flydsl_mxfp4_preshuffle_gemm(
-        a_codes, b_shuf, scale_a, scale_b, out,
-        a_dtype="fp8", b_dtype="fp8", tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+    flydsl_mxscale_preshuffle_gemm(
+        a_codes,
+        b_shuf,
+        scale_a,
+        scale_b,
+        out,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
     )
     torch.cuda.synchronize()
     cs = _cos(out, c_ref)
