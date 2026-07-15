@@ -204,6 +204,20 @@ def get_meta_param(
 _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT = 32
 
 
+@functools.lru_cache(maxsize=1)
+def _persistent_mla_decode_max_batch():
+    """Cached read of AITER_MLA_DECODE_PERSISTENT_MAX_BATCH (read once per process)."""
+    try:
+        return int(
+            os.getenv(
+                "AITER_MLA_DECODE_PERSISTENT_MAX_BATCH",
+                _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        return _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+
+
 def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
     """Whether to keep the persistent MLA decode kernel.
 
@@ -221,15 +235,7 @@ def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
     if not is_regression_profile:
         return True
 
-    try:
-        max_batch = int(
-            os.getenv(
-                "AITER_MLA_DECODE_PERSISTENT_MAX_BATCH",
-                _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT,
-            )
-        )
-    except (TypeError, ValueError):
-        max_batch = _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+    max_batch = _persistent_mla_decode_max_batch()
 
     # max_batch <= 0 disables the gate (always keep persistent).
     if max_batch <= 0:
