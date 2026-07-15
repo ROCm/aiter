@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: "43 18 * * *"
   pull_request:
-    types: [labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -90,8 +90,10 @@ jobs:
   sglang-dsv4pro-fp8-1p1d:
     if: >-
       github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' ||
       github.event.label.name == 'ci:sglang' ||
-      github.event.label.name == 'ci:all'
+      github.event.label.name == 'ci:all'))
     runs-on: [self-hosted, aiter-di-ci-spur-login-sglang]
     timeout-minutes: 240
 
