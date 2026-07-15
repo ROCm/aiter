@@ -5,6 +5,7 @@ import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy
 
 
@@ -36,7 +37,9 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    if args["Quant_static_scale"] is not None:
+    if args.get("HAS_MX_OUT", False):
+        ret["name"] += "_mxquant"
+    elif args["Quant_static_scale"] is not None:
         ret["name"] += "_quant"
 
     fM = n_tokens
@@ -152,6 +155,11 @@ def _moe_gemm_a8w4_decode(
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
+    # MXFP8 output quant
+    YMxScale=None,
+    stride_y_mx_m: gl.constexpr = 0,
+    stride_y_mx_n: gl.constexpr = 0,
+    HAS_MX_OUT: gl.constexpr = False,
 ):
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
@@ -411,9 +419,10 @@ def _moe_gemm_a8w4_decode(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -430,9 +439,10 @@ def _moe_gemm_a8w4_decode(
                 )
             else:
                 gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
+                    gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                    ),
                     offs_x_m,
-                    write_idx * MX_SCALE_BLOCK_K,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
         write_idx += 1
@@ -453,9 +463,10 @@ def _moe_gemm_a8w4_decode(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -472,9 +483,10 @@ def _moe_gemm_a8w4_decode(
                 )
             else:
                 gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
+                    gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                    ),
                     offs_x_m,
-                    write_idx * MX_SCALE_BLOCK_K,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
         write_idx += 1
@@ -617,7 +629,33 @@ def _moe_gemm_a8w4_decode(
         out *= gammas[:, None]
 
     # quant
-    if Quant_static_scale is not None:
+    if HAS_MX_OUT:
+        tl.static_assert(
+            OUT_BLOCK_N % 32 == 0,
+            "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0",
+        )
+        NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
+        out_3d = tl.reshape(out, [BLOCK_M, NUM_QB, 32])
+        scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
+        out = tl.reshape(out_3d * quant_scale, [BLOCK_M, OUT_BLOCK_N]).to(
+            tl.float8e4nv
+        )
+        scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
+        offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_m_s = offs_m_s < M
+        offs_n_s = NUM_QB * pid_n + gl.arange(0, NUM_QB)
+        mask_n_s = offs_n_s < tl.cdiv(yN, 32)
+        YMxScalePtrs = (
+            YMxScale
+            + (start_m + offs_m_s).to(index_type)[:, None] * stride_y_mx_m
+            + offs_n_s.to(index_type)[None, :] * stride_y_mx_n
+        )
+        tl.store(
+            YMxScalePtrs,
+            scale_exp_2d,
+            mask=mask_m_s[:, None] & mask_n_s[None, :],
+        )
+    elif Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
     else:
         out = out.to(tl.bfloat16)
@@ -966,9 +1004,10 @@ def _moe_gemm_a8w4_prefill(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -991,9 +1030,10 @@ def _moe_gemm_a8w4_prefill(
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_gather(
-                        x_scales_desc,
+                        gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                            x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                        ),
                         offs_x_m,
-                        write_idx * MX_SCALE_BLOCK_K,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
@@ -1056,9 +1096,10 @@ def _moe_gemm_a8w4_prefill(
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    x_desc, add_offsets=[0, write_idx * BLOCK_K], clamp_bounds=True
+                ),
                 offs_x_m,
-                write_idx * BLOCK_K,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
@@ -1081,9 +1122,10 @@ def _moe_gemm_a8w4_prefill(
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_gather(
-                        x_scales_desc,
+                        gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                            x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                        ),
                         offs_x_m,
-                        write_idx * MX_SCALE_BLOCK_K,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
             else:
