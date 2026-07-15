@@ -352,11 +352,19 @@ fi
 cat >> "$SBATCH_SCRIPT" <<EOF
 
 set -euo pipefail
-set +e
-bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
-rc=\\$?
-echo "\\$rc" > "$BATCH_EXIT"
-exit "\\$rc"
+rank="\\${SPUR_TASK_OFFSET:-\\${SLURM_PROCID:-0}}"
+if [[ "\\$rank" == "0" ]]; then
+    set +e
+    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+    rc=\\$?
+    echo "\\$rc" > "$BATCH_EXIT"
+    exit "\\$rc"
+fi
+
+while [[ ! -f "$BATCH_EXIT" ]]; do
+    sleep 5
+done
+exit "\\$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
 EOF
 chmod +x "$SBATCH_SCRIPT"
 
