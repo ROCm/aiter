@@ -321,12 +321,7 @@ for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/nu
         """TOTAL_NODES=$((PW + DW))
 """,
         """TOTAL_NODES=$((PW + DW))
-
-if [[ -n "${SLURM_NODELIST:-}" && -z "${SLURM_RESERVATION:-}" ]]; then
-    NODE_COUNT_ARG=(--nodes "$SLURM_NODELIST")
-else
-    NODE_COUNT_ARG=(-N"$TOTAL_NODES")
-fi
+NODE_COUNT_ARG=(--nodes "$TOTAL_NODES")
 """,
     )
     text = replace_once(
