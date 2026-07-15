@@ -428,7 +428,9 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     n_groups_k = nope // GK
     entry = D
 
-    bid, pos, swa_block_tables, num_phys_blocks, bs, n_pad = _build_swa_batch(T, block_size)
+    bid, pos, swa_block_tables, num_phys_blocks, bs, n_pad = _build_swa_batch(
+        T, block_size
+    )
     cos, sin = _cos_sin(int(pos.max().item()) + 4, RD, torch.bfloat16)
     q = (torch.randn(T, H, D, device=_DEV) * 0.1).bfloat16()
     kv = (torch.randn(T, NK, D, device=_DEV) * 0.1).bfloat16()
