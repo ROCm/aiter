@@ -11,6 +11,8 @@ from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, roc
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int8, T
 
+from aiter.jit.utils.chip_info import get_cu_num
+
 from .mxmoe_gemm_v2 import (
     BK,
     BN,
@@ -26,104 +28,12 @@ from .tensor_shim import _run_compiled as run_compiled
 __all__ = [
     "compile_gemm2_a4w4_port",
     "mxfp4_moe_gemm2",
-    "select_gemm2_config",
 ]
-
-
-def _get_cu_num() -> int:
-    """CU count for the persistent-m fixed grid (env CU_NUM override, else device props)."""
-    env = os.environ.get("CU_NUM")
-    if env:
-        return int(env)
-    try:
-        import torch
-
-        return int(
-            torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-        )
-    except Exception:
-        return 304
 
 
 def _norm_sbm(SBM, BM):
     """Resolve SBM (sort_block_m): None -> SBM==BM."""
     return BM if SBM is None else SBM
-
-
-def _nearest_token_key(tok_map, tokens):
-    """Pick the table token bucket nearest (<=) the requested token count; fall back to the min key."""
-    keys = sorted(tok_map)
-    chosen = keys[0]
-    for k in keys:
-        if k <= tokens:
-            chosen = k
-        else:
-            break
-    return chosen
-
-
-# gemm2-only tuned overrides: sig (model_dim,inter_dim,experts) -> {tokens: (bm_s2, epilog,
-# persist, use_nt)}. Only gemm2-side knobs are stored here.
-_GEMM2_TUNED_TABLE = {
-    # NOTE: one inner dict per sig; do NOT repeat the sig key (dup keys overwrite).
-    (6144, 512, 257): {  # (bm_s2, epilog, persist, use_nt)
-        # 1: (32, 'reduce', False, True),  # 4.985us ok100% sbm32
-        # 2: (32, 'atomic', False, False),  # 5.946us ok100% sbm32
-        # 4: (32, 'reduce', False, True),  # 12.726us ok100% sbm32
-        # 8: (32, 'reduce', False, False),  # 20.457us ok100% sbm32
-        # 16: (32, 'atomic', False, False),  # 36.226us ok100% sbm32
-        # 32: (32, 'atomic', False, True),  # 64.799us ok100% sbm32
-        # 64: (64, 'reduce', False, True),  # 83.815us ok100% sbm64
-        # 128: (32, 'atomic', False, True),  # 70.371us ok100% sbm32
-        # 256: (64, 'atomic', False, True),  # 90.692us ok100% sbm64
-        # 512: (32, 'atomic', True, True),  # 83.007us ok100% sbm32
-        # 1024: (64, 'reduce', True, True),  # 104.510us ok100% sbm64
-        # 2048: (64, 'reduce', True, False),  # 170.830us ok100% sbm128
-        # 4096: (64, 'reduce', True, False),  # 248.961us ok100% sbm64
-        # 8192: (64, 'reduce', True, False),  # 410.807us ok100% sbm64
-        # 16384: (64, 'reduce', True, False),  # 789.103us ok100% sbm128
-        # 32768: (64, 'reduce', True, False),  # 1484.276us ok100% sbm128
-        1: (32, "atomic", False, False),  # 4.318us ok100% sbm32
-        2: (32, "atomic", False, False),  # 6.305us ok100% sbm32
-        4: (32, "atomic", False, True),  # 12.615us ok100% sbm32
-        8: (32, "atomic", False, False),  # 20.526us ok100% sbm32
-        16: (32, "atomic", False, False),  # 36.722us ok100% sbm32
-        32: (32, "atomic", False, True),  # 65.429us ok100% sbm32
-        64: (32, "atomic", False, True),  # 68.020us ok100% sbm32
-        128: (32, "atomic", False, True),  # 68.822us ok100% sbm32
-        256: (64, "reduce", False, True),  # 89.203us ok100% sbm64
-        512: (32, "atomic", False, True),  # 80.653us ok100% sbm32
-        1024: (64, "atomic", False, True),  # 117.670us ok100% sbm64
-        2048: (64, "reduce", True, False),  # 202.098us ok100% sbm128
-        4096: (64, "reduce", True, False),  # 311.413us ok100% sbm64
-        8192: (64, "reduce", True, False),  # 539.506us ok100% sbm64
-        16384: (64, "reduce", True, False),  # 1089.024us ok100% sbm128
-        32768: (64, "reduce", True, False),  # 1999.693us ok100% sbm128
-    },
-}
-
-
-def _default_gemm2_use_nt(experts, topk, tokens, bm_stage2):
-    """Reuse-aware gemm2 w2 cache policy."""
-    slots = tokens * topk
-    active = min(slots, experts)
-    if active <= 0:
-        return False
-    rows_per_expert = (slots + active - 1) // active
-    m_blocks_per_expert = (rows_per_expert + bm_stage2 - 1) // bm_stage2
-    return m_blocks_per_expert <= 1
-
-
-def select_gemm2_config(model_dim, inter_dim, experts, topk, tokens):
-    """gemm2 deploy config -> (bm_s2, epilog, persist, use_nt)."""
-    sig = (model_dim, inter_dim, experts)
-    tuned = _GEMM2_TUNED_TABLE.get(sig)
-    if tuned is not None:
-        return tuned[_nearest_token_key(tuned, tokens)]
-    bm, epilog, persist = 32, "atomic", False
-    return bm, epilog, persist, _default_gemm2_use_nt(experts, topk, tokens, bm)
 
 
 # ---- gemm2 (down-proj) compile ----
@@ -398,184 +308,96 @@ def compile_gemm2_a4w4_port(
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx)
 
-    if not has_pad:
+    @flyc.kernel(name=name, known_block_size=[256, 1, 1])
+    def gemm2_kernel(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        i32_inter: fx.Int32,
+        i32_hidden: fx.Int32,
+        i32_kpad: fx.Int32,
+        i32_npad: fx.Int32,
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,  # unused (atomic epilog); kept for signature parity
+    ):
+        tx = gpu.thread_id("x")
+        bx = gpu.block_id("x")
+        tx_i32 = fx.Int32(tx)
+        bx_i32 = fx.Int32(bx)
+        lane = tx_i32 % fx.Int32(64)
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        _gemm2_kernel_body(
+            arg_aq,
+            arg_ascale,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_cumsum,
+            arg_stids,
+            arg_sweights,
+            arg_out,
+            bx_i32,
+            lane,
+            wave,
+            i32_M,
+            i32_max_m_blocks,
+            i32_inter,
+            i32_hidden,
+            i32_kpad,
+            i32_npad,
+        )
 
-        @flyc.kernel(name=name, known_block_size=[256, 1, 1])
-        def gemm2_kernel(
-            arg_aq: fx.Int64,
-            arg_ascale: fx.Int64,
-            arg_bq: fx.Int64,
-            arg_bscale: fx.Int64,
-            arg_eids: fx.Int64,
-            arg_cumsum: fx.Int64,
-            arg_stids: fx.Int64,
-            arg_sweights: fx.Int64,
-            i32_M: fx.Int32,
-            i32_max_m_blocks: fx.Int32,
-            i32_inter: fx.Int32,
-            i32_hidden: fx.Int32,
-            arg_out: fx.Int64,
-            arg_out_scale: fx.Int64,  # unused (atomic epilog); kept for signature parity
-        ):
-            tx = gpu.thread_id("x")
-            bx = gpu.block_id("x")
-            tx_i32 = fx.Int32(tx)
-            bx_i32 = fx.Int32(bx)
-            lane = tx_i32 % fx.Int32(64)
-            wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-            _gemm2_kernel_body(
-                arg_aq,
-                arg_ascale,
-                arg_bq,
-                arg_bscale,
-                arg_eids,
-                arg_cumsum,
-                arg_stids,
-                arg_sweights,
-                arg_out,
-                bx_i32,
-                lane,
-                wave,
-                i32_M,
-                i32_max_m_blocks,
-                i32_inter,
-                i32_hidden,
-                fx.Int32(0),
-                fx.Int32(0),
-            )
-
-        @flyc.jit
-        def launch_gemm2(
-            arg_aq: fx.Int64,
-            arg_ascale: fx.Int64,
-            arg_bq: fx.Int64,
-            arg_bscale: fx.Int64,
-            arg_eids: fx.Int64,
-            arg_cumsum: fx.Int64,
-            arg_stids: fx.Int64,
-            arg_sweights: fx.Int64,
-            i32_M: fx.Int32,
-            i32_max_m_blocks: fx.Int32,
-            i32_grid_blocks: fx.Int32,
-            i32_inter: fx.Int32,
-            i32_hidden: fx.Int32,
-            arg_out: fx.Int64,
-            arg_out_scale: fx.Int64,
-            stream: fx.Stream,
-        ):
-            # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks; num_n_blocks = N_OUT//256 runtime.
-            num_n_blocks = arith.index_cast(
-                T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256))
-            )
-            grid_x = arith.index_cast(T.index, i32_grid_blocks) * num_n_blocks
-            gemm2_kernel(
-                arg_aq,
-                arg_ascale,
-                arg_bq,
-                arg_bscale,
-                arg_eids,
-                arg_cumsum,
-                arg_stids,
-                arg_sweights,
-                i32_M,
-                i32_max_m_blocks,
-                i32_inter,
-                i32_hidden,
-                arg_out,
-                arg_out_scale,
-            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
-
-    else:
-
-        @flyc.kernel(name=name, known_block_size=[256, 1, 1])
-        def gemm2_kernel(
-            arg_aq: fx.Int64,
-            arg_ascale: fx.Int64,
-            arg_bq: fx.Int64,
-            arg_bscale: fx.Int64,
-            arg_eids: fx.Int64,
-            arg_cumsum: fx.Int64,
-            arg_stids: fx.Int64,
-            arg_sweights: fx.Int64,
-            i32_M: fx.Int32,
-            i32_max_m_blocks: fx.Int32,
-            i32_inter: fx.Int32,
-            i32_hidden: fx.Int32,
-            i32_kpad: fx.Int32,
-            i32_npad: fx.Int32,
-            arg_out: fx.Int64,
-            arg_out_scale: fx.Int64,  # unused (atomic epilog); kept for signature parity
-        ):
-            tx = gpu.thread_id("x")
-            bx = gpu.block_id("x")
-            tx_i32 = fx.Int32(tx)
-            bx_i32 = fx.Int32(bx)
-            lane = tx_i32 % fx.Int32(64)
-            wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-            _gemm2_kernel_body(
-                arg_aq,
-                arg_ascale,
-                arg_bq,
-                arg_bscale,
-                arg_eids,
-                arg_cumsum,
-                arg_stids,
-                arg_sweights,
-                arg_out,
-                bx_i32,
-                lane,
-                wave,
-                i32_M,
-                i32_max_m_blocks,
-                i32_inter,
-                i32_hidden,
-                i32_kpad,
-                i32_npad,
-            )
-
-        @flyc.jit
-        def launch_gemm2(
-            arg_aq: fx.Int64,
-            arg_ascale: fx.Int64,
-            arg_bq: fx.Int64,
-            arg_bscale: fx.Int64,
-            arg_eids: fx.Int64,
-            arg_cumsum: fx.Int64,
-            arg_stids: fx.Int64,
-            arg_sweights: fx.Int64,
-            i32_M: fx.Int32,
-            i32_max_m_blocks: fx.Int32,
-            i32_grid_blocks: fx.Int32,
-            i32_inter: fx.Int32,
-            i32_hidden: fx.Int32,
-            i32_kpad: fx.Int32,
-            i32_npad: fx.Int32,
-            arg_out: fx.Int64,
-            arg_out_scale: fx.Int64,
-            stream: fx.Stream,
-        ):
-            num_n_blocks = arith.index_cast(
-                T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256))
-            )
-            grid_x = arith.index_cast(T.index, i32_grid_blocks) * num_n_blocks
-            gemm2_kernel(
-                arg_aq,
-                arg_ascale,
-                arg_bq,
-                arg_bscale,
-                arg_eids,
-                arg_cumsum,
-                arg_stids,
-                arg_sweights,
-                i32_M,
-                i32_max_m_blocks,
-                i32_inter,
-                i32_hidden,
-                i32_kpad,
-                i32_npad,
-                arg_out,
-                arg_out_scale,
-            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+    @flyc.jit
+    def launch_gemm2(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        i32_grid_blocks: fx.Int32,
+        i32_inter: fx.Int32,
+        i32_hidden: fx.Int32,
+        i32_kpad: fx.Int32,
+        i32_npad: fx.Int32,
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,
+        stream: fx.Stream,
+    ):
+        # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks; num_n_blocks = N_OUT//256 runtime.
+        num_n_blocks = arith.index_cast(
+            T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256))
+        )
+        grid_x = arith.index_cast(T.index, i32_grid_blocks) * num_n_blocks
+        gemm2_kernel(
+            arg_aq,
+            arg_ascale,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_cumsum,
+            arg_stids,
+            arg_sweights,
+            i32_M,
+            i32_max_m_blocks,
+            i32_inter,
+            i32_hidden,
+            i32_kpad,
+            i32_npad,
+            arg_out,
+            arg_out_scale,
+        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm2
 
@@ -682,7 +504,7 @@ def mxfp4_moe_gemm2(
     import torch
 
     if persist and cu_num <= 0:
-        cu_num = _get_cu_num()
+        cu_num = get_cu_num()
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
     if D_HIDDEN % 256 != 0:
@@ -720,8 +542,8 @@ def mxfp4_moe_gemm2(
             max_m_blocks if n_sorted_padded is None else (n_sorted_padded // BM)
         )
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
-    # has_pad threads the runtime i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) after i32_inter.
-    pad_args = (int(inter_dim_pad), int(model_dim_pad)) if has_pad else ()
+    # i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) are always threaded after
+    # i32_hidden; when has_pad is False they are 0 and the kernel folds pad math away.
     run_compiled(
         launch,
         inter_sorted_quant.data_ptr(),
@@ -737,7 +559,8 @@ def mxfp4_moe_gemm2(
         grid_blocks,
         D_INTER,
         D_HIDDEN,
-        *pad_args,
+        int(inter_dim_pad),
+        int(model_dim_pad),
         out.data_ptr(),
         out_scale.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,
