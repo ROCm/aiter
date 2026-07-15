@@ -478,6 +478,16 @@ jobs:
           command -v scancel
           command -v spur && spur --help | head -120 || true
 
+      - name: Clean stale ATOMesh config from prior runs
+        run: |
+          set -euo pipefail
+          # Self-hosted runner reuses the workspace; download-artifact only adds
+          # files, so stale per-cell JSONs from a previous run (e.g. a 2p1d_dpa
+          # cell) linger in atomesh-cells/ and get picked up by the benchmark
+          # loop. Clear them so only the freshly-downloaded config runs.
+          rm -rf atomesh-cells atomesh-cells.json atomesh-cell.json \
+                 atomesh-matrix.json atomesh-matrix-*.json
+
       - name: Download ATOMesh smoke config
         uses: actions/download-artifact@v4
         with:
