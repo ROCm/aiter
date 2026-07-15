@@ -251,11 +251,15 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_buffers = 3
     split_k = 1
     block_k = 512
+    use_persistent = False
+    persistent_iters = 0
 
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if k <= 1024:
+        if k <= 768:
+            use_persistent = True
+            persistent_iters = 3
             block_n = 128
             block_k = 256
             num_buffers = 2
@@ -294,6 +298,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
+        "use_persistent": use_persistent,
+        "persistent_iters": persistent_iters
     }
     return ret
 
@@ -456,19 +462,13 @@ def moe_gemm_a8w4(
     # pid grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
+    if use_gluon and config["use_persistent"]:
+        num_blocks_n = grid_n
+        grid_n = triton.cdiv(num_blocks_n, config["persistent_iters"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    use_persistent = (
-        use_gluon
-        and block_m == 16
-        and grid_n >= 2
-        and os.environ.get("AITER_MOE_A8W4_PERSISTENT", "0") == "1"
-    )
-    if use_persistent:
-        N_ITERS = 3
-        n_groups = triton.cdiv(grid_n, N_ITERS)
-        persistent_grid = grid_m * n_groups
-        _moe_gemm_a8w4_decode_persistent_gluon[(persistent_grid,)](
+    if use_gluon and config["use_persistent"]:
+        _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
             y,
             y.stride(1),
             y.stride(2),
@@ -500,7 +500,7 @@ def moe_gemm_a8w4(
             expt_hist_sum,
             expt_block_pid_map,
             grid_m,
-            grid_n,
+            num_blocks_n,
             apply_swiglu_matmul,
             alpha,
             limit,
@@ -515,7 +515,7 @@ def moe_gemm_a8w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
-            N_ITERS=N_ITERS,
+            N_ITERS=config["persistent_iters"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
