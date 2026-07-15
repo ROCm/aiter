@@ -962,6 +962,14 @@ public:
         {
             sg_.signals[i] = reinterpret_cast<Signal*>(all_meta_ptrs[i]);
         }
+        // Build the LL scratch/epoch tables now, at construction, rather than
+        // lazily on the first LL launch. The lazy path would run hipMalloc /
+        // hipMemcpy / hipMemset the first time allreduce() routes to LL, and if
+        // that first call happens inside a CUDA-graph capture (no eager warm-up
+        // before capture) those runtime calls are illegal mid-capture and abort.
+        // sg_.signals[] is populated above, so the peer scratch bases are ready.
+        if(ll_enabled())
+            ensure_ll_tables_();
     }
 
     // IPC transport overload (ROCm >= 7.15): hipIpc works on gfx1250, so peer
@@ -996,6 +1004,11 @@ public:
                 sg_.signals[i] = self_sg_;
             }
         }
+        // Eager LL-table build (see the VMM-overload constructor above): keeps
+        // hipMalloc/hipMemcpy/hipMemset out of the first LL allreduce, which may
+        // land inside a CUDA-graph capture and abort. sg_.signals[] is ready.
+        if(ll_enabled())
+            ensure_ll_tables_();
     }
 
     char* open_ipc_handle(const void* ipc_handle)
