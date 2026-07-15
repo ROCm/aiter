@@ -72,6 +72,8 @@ def get_kernel_config(m, n, k, routing_data):
     num_stages = 1
     split_k = 1
     block_k = 256
+    waves_per_eu = 0
+    kpack = 1
 
     if block_m == 16:
         block_n = 128
@@ -98,8 +100,27 @@ def get_kernel_config(m, n, k, routing_data):
             num_warps = 8
 
     else:
-        block_n = 512
+        # Large block_m (dense prefill grouped MoE, e.g. block_m == 128).
+        # Tuned on gfx1250 for the MiniMax-M3 routed GEMMs (N=6144, K in
+        # {6144, 3072}, M ~= routed prefill tokens) via rocprofv3 kernel-trace
+        # DURATION sweeps. BLOCK_N=256 with a K-dependent BLOCK_K beats the old
+        # flat BLOCK_N=512 / BLOCK_K=256 by ~1.4x end-to-end on the fused path.
         num_warps = 8
+        block_n = 256
+        if k >= 4096:
+            # deep-K projection (gate/up, K == hidden): larger K tile + more
+            # waves hides the extra K iterations.
+            block_k = 512
+            waves_per_eu = 2
+            group_m = 4
+            kpack = 1
+        else:
+            # shallow-K projection (down, K == intermediate): square K tile,
+            # kpack=2 packs two mxfp4 K-slices per MFMA for better throughput.
+            block_k = 256
+            waves_per_eu = 0
+            group_m = 1
+            kpack = 2
 
     ret = {
         "block_m": block_m,
@@ -111,9 +132,9 @@ def get_kernel_config(m, n, k, routing_data):
         "xcd_swizzle": xcd_swizzle,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 0,
+        "waves_per_eu": waves_per_eu,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
+        "kpack": kpack,
     }
     return ret
 
