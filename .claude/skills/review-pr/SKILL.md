@@ -186,6 +186,8 @@ For **Tier 2** files (fused_moe, mha, attention, gemm, mla, tuned_gemm, quant):
 
 Six failure categories — work all six in order. Severity per finding: 🔴 block / ⚠️ should fix / 📝 note.
 
+**🔴 gate — before firing any 🔴, write down the concrete input that triggers it.** Name the specific shape / scale / dtype / arch / value that makes the finding fire (e.g. "at `token_id` > 16M with H=32, D=128 the int32 product exceeds 2^31", or "when `arch=='gfx1250'` with fp4 input the branch assumes fp8"). If you cannot state a concrete triggering case, the 🔴 is unproven — **downgrade to ⚠️ ("worth checking") or drop it.** A 🔴 that reads as a definite blocker but names no demonstrable triggering input is exactly how a false positive lands on a maintainer's PR. This gate applies to every rule below — including those whose own text omits an explicit FP self-check (e.g. D9): the same index expression is safe in a capped/small-batch kernel and unsafe only at a scale you must actually exhibit.
+
 | Category | Core question | Key triggers |
 |---|---|---|
 | **A. Coverage gaps** | Same bug elsewhere? Same code other configs? | `_opt`, `_prefill_opt`, `_v2`; shared path; broad `if` condition |
