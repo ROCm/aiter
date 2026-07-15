@@ -70,7 +70,7 @@ permissions:
   contents: read
 
 env:
-  ATOM_REF_DEFAULT: 22577adb3ac909c3d0d8fe2209e64afe67b5c7bc
+  ATOM_REF_DEFAULT: main
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
@@ -315,16 +315,20 @@ jobs:
               )
               return json.loads(output.read_text(encoding="utf-8"))
 
-          requested = [
-              {
-                  "model": "DeepSeek-V4-Pro",
-                  "topology": "1p1d",
-                  "osl": os.environ["OSL"],
-                  "conc": os.environ["CONC_LIST"],
-                  "eval_conc": os.environ["EVAL_CONC_LIST"],
-                  "run_eval": True,
-              }
-          ]
+          # DeepSeek-V4-Pro temporarily disabled: running GLM-5.2-FP8 alone
+          # against ATOM main to verify the module_mla_metadata init crash is
+          # fixed on the mainline engine. Re-enable this entry to restore DeepSeek.
+          requested = []
+          # requested = [
+          #     {
+          #         "model": "DeepSeek-V4-Pro",
+          #         "topology": "1p1d",
+          #         "osl": os.environ["OSL"],
+          #         "conc": os.environ["CONC_LIST"],
+          #         "eval_conc": os.environ["EVAL_CONC_LIST"],
+          #         "run_eval": True,
+          #     }
+          # ]
           if os.environ.get("RUN_GLM_5_2_FP8", "false") == "true":
               requested.append(
                   {
