@@ -31,7 +31,7 @@ on:
         description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
         required: false
         type: string
-        default: "/data/csrikris/logs/"
+        default: "/data/xinhuang/vllm-disagg-logs/"
       spur_nodelist:
         description: "Optional comma-separated Spur nodes for the 2-node smoke job"
         required: false
@@ -68,7 +68,7 @@ jobs:
       VLLM_REPOSITORY_DEFAULT: itej89/vllm
       VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
       MODEL_NAME_DEFAULT: mini-max-fp8
-      DISAGG_SCRIPTS_STAGE_DEFAULT: /data/csrikris/logs/
+      DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
       SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
       SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
