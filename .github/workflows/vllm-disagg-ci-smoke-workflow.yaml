@@ -130,28 +130,6 @@ jobs:
           git remote add origin "https://github.com/${VLLM_REPOSITORY}.git"
           git fetch --depth=1 origin "${VLLM_REF}"
           git checkout --detach FETCH_HEAD
-          if [[ "${MODEL_NAME}" == "MiniMax-M3-MXFP8" ]]; then
-            python3 - <<'PY'
-from pathlib import Path
-
-path = Path(".buildkite/amd-disagg/models.yaml")
-text = path.read_text(encoding="utf-8")
-start = text.index("  - model: MiniMax-M3-MXFP8")
-end = text.index("\n  - model:", start + 1)
-block = text[start:end]
-if "--quantization" not in block:
-    block = block.replace(
-        'base_flags: "--trust-remote-code"',
-        'base_flags: "--trust-remote-code --quantization fp8_per_block"',
-        1,
-    )
-    text = text[:start] + block + text[end:]
-    path.write_text(text, encoding="utf-8")
-    print("Patched MiniMax-M3-MXFP8 base_flags with --quantization fp8_per_block")
-else:
-    print("MiniMax-M3-MXFP8 base_flags already contains --quantization")
-PY
-          fi
 
       - name: Show vLLM disagg inputs
         run: |
