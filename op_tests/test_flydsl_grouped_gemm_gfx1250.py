@@ -18,13 +18,16 @@ Pytest covers a small correctness case for each format. Direct execution
 (``python op_tests/test_flydsl_grouped_gemm_gfx1250.py``) runs a
 DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
 per-kernel bench that times gemm1 and gemm2 in isolation
-(``--scenario kernel``), or a tiny correctness check
-(``--scenario verify``).
+(``--scenario kernel``), a CUDA-graph replay sweep (``--scenario graph``),
+a tiny correctness check (``--scenario verify``), or a full sweep of every setting in a tuned-config
+CSV (``--scenario csv``; defaults to ``aiter/configs/tuned_grouped_fmoe.csv``,
+one benched case per row, override the file with ``--csv-path``).
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import nullcontext
 import os
 import sys
@@ -637,28 +640,44 @@ def _run_graph_scenario(
     step: int = 3,
     tol: float = LOGITS_DIFF_TOL,
     seed: int = 0,
+    const_init: Optional[float] = None,
 ) -> list[tuple[int, float, float, bool]]:
+    """Capture one max-token CUDA graph and verify smaller-token replays."""
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
     if layout not in ("gguu", "gugu"):
         raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
+    if max_tokens < 1:
+        raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+    if step < 1:
+        raise ValueError(f"graph step must be >= 1, got {step}")
 
-    k_dim = model_dim
+    _require_gfx1250()
+
+    K = model_dim
     inter = inter_dim
-    k_pack = k_dim // 2
+    K_pack = K // 2
     inter_pack = inter // 2
 
     torch.manual_seed(seed)
-    w1_logical = _pattern_packed(experts, 2 * inter, k_pack)
-    w2_logical = _pattern_packed(experts, k_dim, inter_pack)
-    w1_scale_raw = init_weight_scales(experts, 2 * inter, k_dim // SCALE_BLOCK)
-    w2_scale_raw = init_weight_scales(experts, k_dim, inter // SCALE_BLOCK)
+    w1_logical = _pattern_packed(experts, 2 * inter, K_pack, const_init=const_init)
+    w2_logical = _pattern_packed(experts, K, inter_pack, const_init=const_init)
+    w1_scale_raw = init_weight_scales(
+        experts, 2 * inter, K // SCALE_BLOCK, const_init=const_init
+    )
+    w2_scale_raw = init_weight_scales(
+        experts, K, inter // SCALE_BLOCK, const_init=const_init
+    )
     if use_bias:
-        bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
-        bias2 = (torch.randn((experts, k_dim)) * 1e-3).float()
+        if const_init is not None:
+            bias1 = torch.full((experts, 2 * inter), float(const_init))
+            bias2 = torch.full((experts, K), float(const_init))
+        else:
+            bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
+            bias2 = (torch.randn((experts, K)) * 1e-3).float()
     else:
         bias1 = torch.zeros((experts, 2 * inter))
-        bias2 = torch.zeros((experts, k_dim))
+        bias2 = torch.zeros((experts, K))
 
     if layout == "gugu":
         bias1_phys = _gguu_to_gugu_rows(bias1)
@@ -692,10 +711,7 @@ def _run_graph_scenario(
         w1_arg = w1_grouped
         w2_arg = w2_grouped
 
-    tag = f"{data_format} {layout} graph(build={max_tokens})"
-    results: list[tuple[int, float, float, bool]] = []
-
-    hidden_buf = torch.zeros((max_tokens, k_dim), dtype=torch.bfloat16)
+    hidden_buf = torch.zeros((max_tokens, K), dtype=torch.bfloat16)
     topk_id_buf = torch.zeros((max_tokens, topk), dtype=torch.int32)
     topk_w_buf = torch.zeros((max_tokens, topk), dtype=torch.bfloat16)
 
@@ -719,7 +735,10 @@ def _run_graph_scenario(
 
     def _fill(m: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         torch.manual_seed(seed + m)
-        hidden_m = (torch.randn((m, k_dim)) * 0.5).to(torch.bfloat16)
+        if const_init is not None:
+            hidden_m = torch.full((m, K), float(const_init), dtype=torch.bfloat16)
+        else:
+            hidden_m = (torch.randn((m, K)) * 0.5).to(torch.bfloat16)
         id_m, w_m = _make_topk(hidden_m, experts, topk)
         w_m = w_m.to(torch.bfloat16)
         hidden_buf[:m].copy_(hidden_m)
@@ -731,6 +750,7 @@ def _run_graph_scenario(
     for _ in range(2):
         _call()
     torch.cuda.synchronize()
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out_buf = _call()
@@ -740,9 +760,12 @@ def _run_graph_scenario(
     topk_id_buf.zero_()
     topk_w_buf.zero_()
 
+    tag = f"{data_format} {layout} graph(build={max_tokens})"
+    results: list[tuple[int, float, float, bool]] = []
     sweep = list(range(1, max_tokens, step))
     if not sweep or sweep[-1] != max_tokens:
         sweep.append(max_tokens)
+
     for m in sweep:
         hidden_m, id_m, w_m = _fill(m)
         graph.replay()
@@ -772,6 +795,7 @@ def _run_graph_scenario(
             flush=True,
         )
         results.append((m, ld, rel, passed))
+
     del graph
     return results
 
@@ -870,11 +894,199 @@ def set_data_format(data_format: str) -> None:
     """Select the grouped GEMM data format.
 
     a8w4 needs ``AITER_FORCE_A8W4=1`` so ``fused_moe`` routes the a8w4 path
-    (see fused_moe.py); a4w4 needs nothing extra.
+    (see fused_moe.py); a4w4 needs it unset so the fp4x2 activation path is
+    taken. Toggled per-row so a mixed-format CSV sweep routes each case
+    correctly.
     """
     if data_format == "a8w4":
         os.environ["AITER_FORCE_A8W4"] = "1"
+    else:
+        os.environ.pop("AITER_FORCE_A8W4", None)
     logger.info("grouped GEMM data format: %s", data_format)
+
+
+# Default tuned-config CSV: <repo>/aiter/configs/tuned_grouped_fmoe.csv. Every
+# row is one grouped-MoE setting; the --scenario csv sweep runs them all.
+DEFAULT_CSV_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "aiter",
+        "configs",
+        "tuned_grouped_fmoe.csv",
+    )
+)
+
+
+def _csv_data_format(q_dtype_a: str) -> str:
+    """Map the CSV ``q_dtype_a`` column to this test's data_format tag.
+
+    fp8 activations -> a8w4 (MXFP8 x MXFP4); fp4 activations -> a4w4
+    (MXFP4 x MXFP4). Weights are MXFP4 either way.
+    """
+    a = q_dtype_a.strip()
+    if a in ("torch.float8_e4m3fn", "torch.float8_e4m3fnuz"):
+        return "a8w4"
+    if a in ("torch.float4_e2m1fn_x2",):
+        return "a4w4"
+    raise ValueError(f"unsupported q_dtype_a in CSV: {q_dtype_a!r}")
+
+
+def _csv_activation(act_type: str) -> ActivationType:
+    a = act_type.strip()
+    if a == "ActivationType.Swiglu":
+        return ActivationType.Swiglu
+    if a == "ActivationType.Silu":
+        return ActivationType.Silu
+    raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
+
+
+def run_csv_scenario(args) -> None:
+    """Sweep every setting in a tuned_grouped_fmoe-style CSV.
+
+    Each CSV row (token, model_dim, inter_dim, expert, topk, act_type,
+    q_dtype_a, stage1_weight_layout) becomes one ``run_moe`` case. The GEMM
+    tuned config is looked up from the same CSV by the kernel via the problem
+    shape, so simply running each shape exercises its tuned setting.
+
+    Each row is benched (CUDA-graph end-to-end timing, production path) and its
+    correctness checked; one out-of-gate row is recorded rather than aborting
+    the sweep.
+    """
+    csv_path = args.csv_path or DEFAULT_CSV_PATH
+    if not os.path.isfile(csv_path):
+        raise SystemExit(f"CSV not found: {csv_path}")
+    print(f"[csv] sweeping settings from {csv_path}", flush=True)
+
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        csv_rows = list(reader)
+    if not csv_rows:
+        raise SystemExit(f"CSV has no data rows: {csv_path}")
+
+    activation_override = None
+    if args.act is not None:
+        activation_override = (
+            ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
+        )
+
+    rows = []
+    for idx, rec in enumerate(csv_rows):
+        try:
+            tokens = int(rec["token"])
+            model_dim = int(rec["model_dim"])
+            inter_dim = int(rec["inter_dim"])
+            experts = int(rec["expert"])
+            topk = int(rec["topk"])
+            layout = rec["stage1_weight_layout"].strip() or "gguu"
+            data_format = _csv_data_format(rec["q_dtype_a"])
+            activation = activation_override or _csv_activation(rec["act_type"])
+        except (KeyError, ValueError) as exc:
+            print(f"[csv] row {idx}: skipped ({exc})", flush=True)
+            continue
+
+        # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
+        if model_dim < 512 or inter_dim < 512:
+            print(
+                f"[csv] row {idx}: skipped model_dim={model_dim} "
+                f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
+                flush=True,
+            )
+            continue
+
+        act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+        print(
+            f"\n===== csv row {idx}: {data_format} {layout} {act} "
+            f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
+            f"experts={experts} topk={topk} =====",
+            flush=True,
+        )
+        # Route each row to its format (a8w4 needs AITER_FORCE_A8W4=1).
+        set_data_format(data_format)
+        tol = VERIFY_TOL_A8W4 if data_format == "a8w4" else VERIFY_TOL_A4W4
+        try:
+            metrics = run_moe(
+                data_format,
+                layout=layout,
+                experts=experts,
+                tokens=tokens,
+                topk=topk,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                tol=tol,
+                activation=activation,
+                swiglu_limit=args.swiglu_limit,
+                use_bias=not args.no_bias,
+                check_aot_cache=not args.no_check_aot_cache,
+                raise_on_fail=False,
+                bench=True,
+                kernel_bench=False,
+                warmup=args.warmup,
+                iters=args.iters,
+                const_init=args.const_init,
+            )
+        except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+            print(f"[csv] row {idx}: ERROR {exc!r}", flush=True)
+            rows.append(
+                {
+                    "row": idx,
+                    "data_format": data_format,
+                    "layout": layout,
+                    "act": act,
+                    "tokens": tokens,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "experts": experts,
+                    "topk": topk,
+                    "logits_diff": float("nan"),
+                    "rel_l2": float("nan"),
+                    "pass": False,
+                    "error": repr(exc),
+                    "us": None,
+                    "gemm1_us": None,
+                    "gemm2_us": None,
+                }
+            )
+            continue
+
+        rows.append(
+            {
+                "row": idx,
+                "data_format": data_format,
+                "layout": layout,
+                "act": act,
+                "tokens": tokens,
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "experts": experts,
+                "topk": topk,
+                "logits_diff": metrics["logits_diff"],
+                "rel_l2": metrics["rel_l2"],
+                "pass": metrics["passed"],
+                "error": None,
+                "us": metrics.get("us"),
+                "gemm1_us": metrics.get("gemm1_us"),
+                "gemm2_us": metrics.get("gemm2_us"),
+            }
+        )
+
+    summarize(rows)
+    failed = [r for r in rows if not r["pass"]]
+    if failed:
+        details = "; ".join(
+            f"row={r['row']} {r['data_format']} {r['layout']} {r['act']} "
+            f"tokens={r['tokens']} "
+            + (
+                f"error={r['error']}"
+                if r.get("error")
+                else f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
+            )
+            for r in failed
+        )
+        assert not failed, (
+            f"{len(failed)}/{len(rows)} CSV case(s) failed "
+            f"(gate {LOGITS_DIFF_TOL}): {details}"
+        )
 
 
 def main() -> None:
@@ -884,21 +1096,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("bench", "verify", "kernel", "graph"),
+        choices=("bench", "verify", "kernel", "graph", "csv"),
         default="bench",
         help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
         "correctness only. kernel: time the gemm1 and gemm2 kernels in "
         "isolation (loop each launch alone). graph: capture one CUDA graph at "
         "each --token value and verify replays for token counts "
-        "range(1, token, --graph-step).",
+        "range(1, token, --graph-step). csv: sweep every setting in --csv-path "
+        "(one run_moe case per row).",
     )
     parser.add_argument(
         "--graph-step",
         type=int,
         default=3,
-        help="stride of the verified token sweep in the graph scenario: each "
-        "captured graph (built at --token) is replayed and checked for "
-        "range(1, token, graph_step). Default 3.",
+        help="stride of the verified token sweep in the graph scenario. Default: 3.",
+    )
+    parser.add_argument(
+        "--csv-path",
+        default=None,
+        help="CSV of grouped-MoE settings to sweep with --scenario csv "
+        f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
@@ -913,10 +1130,12 @@ def main() -> None:
         "--tokens",
         type=int,
         nargs="+",
-        default=[64],
+        default=[256],
         metavar="N",
         help="one or more space-separated token counts; the scenario runs "
-        "once per value, e.g. --tokens 64 128 256",
+        "once per value, e.g. --tokens 64 128 256. For --scenario graph "
+        "this is the max token count at which the CUDA graph is captured; "
+        "replays are verified for range(1, token, --graph-step).",
     )
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--model-dim", type=int, default=7168)
@@ -926,9 +1145,11 @@ def main() -> None:
     parser.add_argument(
         "--act",
         choices=("silu", "swiglu"),
-        default="swiglu",
+        default=None,
         help="stage1 activation: silu => silu(gate)*up; "
-        "swiglu => gpt-oss swiglu with clamp/alpha/residual",
+        "swiglu => gpt-oss swiglu with clamp/alpha/residual. Default: swiglu "
+        "for bench/verify/kernel; for --scenario csv, unset means use each "
+        "row's act_type (pass --act to force one activation for all rows).",
     )
     parser.add_argument("--swiglu-limit", type=float, default=7.0)
     parser.add_argument(
@@ -980,6 +1201,13 @@ def main() -> None:
     os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
+
+    # CSV sweep: settings come from the CSV, not the shape flags. Each row sets
+    # its own data format / shape, so skip the single-shape guards below.
+    if args.scenario == "csv":
+        run_csv_scenario(args)
+        return
+
     # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
     # K tiles).
     if args.model_dim < 512 or args.inter_dim < 512:
@@ -994,7 +1222,8 @@ def main() -> None:
     # --tokens accepts one or more counts; run once per value. Each iteration
     # sets args.tokens to a single int so run_moe reads it unchanged.
     token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
-    activation = ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
+    # None (unset) defaults to swiglu for the single-shape scenarios.
+    activation = ActivationType.Silu if args.act == "silu" else ActivationType.Swiglu
     rows = []
     for _tok in token_list:
         args.tokens = _tok
@@ -1002,30 +1231,25 @@ def main() -> None:
             print(f"\n===== tokens={_tok} =====", flush=True)
 
         tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
-
-        # graph scenario: build one CUDA graph at this token count, then verify
-        # replays for range(1, token, graph_step). Each verified count becomes a
-        # row (tokens=m) so it flows through the shared summary/gate below.
         if args.scenario == "graph":
             run_only = (
-                run_only_env()
-                if not args.no_check_aot_cache
-                else nullcontext()
+                run_only_env() if not args.no_check_aot_cache else nullcontext()
             )
             with run_only:
                 graph_results = _run_graph_scenario(
                     args.data_format,
+                    layout=args.layout,
                     experts=args.experts,
                     max_tokens=_tok,
                     topk=args.topk,
                     model_dim=args.model_dim,
                     inter_dim=args.inter_dim,
-                    layout=args.layout,
                     activation=activation,
                     swiglu_limit=args.swiglu_limit,
                     use_bias=not args.no_bias,
                     step=args.graph_step,
                     tol=LOGITS_DIFF_TOL,
+                    const_init=args.const_init,
                 )
             for m, ld, rel, passed in graph_results:
                 rows.append(
@@ -1033,7 +1257,7 @@ def main() -> None:
                         "data_format": args.data_format,
                         "layout": args.layout,
                         "act": args.act,
-                        "init": "random",
+                        "init": "random" if args.const_init is None else "const",
                         "experts": args.experts,
                         "tokens": m,
                         "topk": args.topk,
