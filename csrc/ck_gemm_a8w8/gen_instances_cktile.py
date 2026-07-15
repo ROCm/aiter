@@ -152,6 +152,8 @@ torch::Tensor
 
 #include "impl/{name}.cuh"
 
+{ifdef_start}
+
 template torch::Tensor
 {name}<{dtypes}>(
     torch::Tensor &XQ,
@@ -162,13 +164,22 @@ template torch::Tensor
     std::optional<torch::Tensor> bias,
     int KBatch);
 
+{ifdef_end}
+
 """
+        eight_waves = k.M_Warp * k.N_Warp * k.K_Warp == 8
+        ifdef_start = "#ifndef __gfx942__" if eight_waves else ""
+        ifdef_end = "#endif" if eight_waves else ""
+
         if self.istune:
             # Generate both I8 and F8 instances for tuning
             # I8 instances
             for EDtype in ["TILE_BF16"]:
                 INSTANCE_abI8 = INSTANCE_template.format(
-                    name=k.name, dtypes=f"TILE_I8, TILE_BF16, {EDtype}, false"
+                    name=k.name,
+                    dtypes=f"TILE_I8, TILE_BF16, {EDtype}, false",
+                    ifdef_start=ifdef_start,
+                    ifdef_end=ifdef_end,
                 )
                 Path(
                     os.path.join(
@@ -179,7 +190,10 @@ template torch::Tensor
             # F8 instances
             for EDtype in ["TILE_BF16"]:
                 INSTANCE_abF8 = INSTANCE_template.format(
-                    name=k.name, dtypes=f"TILE_FP8, TILE_FP32, {EDtype}, false"
+                    name=k.name,
+                    dtypes=f"TILE_FP8, TILE_FP32, {EDtype}, false",
+                    ifdef_start=ifdef_start,
+                    ifdef_end=ifdef_end,
                 )
                 Path(
                     os.path.join(
@@ -191,7 +205,10 @@ template torch::Tensor
                 for ABDtype in ["TILE_FP8", "TILE_I8"]:
                     for DDtype in ["TILE_FP32", EDtype]:
                         instance = INSTANCE_template.format(
-                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}, true"
+                            name=k.name,
+                            dtypes=f"{ABDtype}, {DDtype}, {EDtype}, true",
+                            ifdef_start=ifdef_start,
+                            ifdef_end=ifdef_end,
                         )
                         Path(
                             os.path.join(
