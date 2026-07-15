@@ -2989,34 +2989,41 @@ def compile_fp8fp4_gemm(
                 active_pred_const,
                 active_stage_lds_addr[load_stage],
                 addr_box[0],
-                active_addr_hi,
+                addr_box[1],
             )
             tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, active_dgroup1))
-            addr_box[0] = addr_box[0] + active_adv_i32
+            addr_box[0], addr_box[1] = tdm_ops.add_addr_with_carry(
+                addr_box[0], addr_box[1], active_adv_i32
+            )
             if const_expr(secondary_scale_tdm):
                 dg0s = _pack_dg0(
                     sec_pred_const,
                     sec_stage_lds_addr[load_stage],
                     sec_box[0],
-                    sec_addr_hi,
+                    sec_box[1],
                 )
                 tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0s, sec_dgroup1))
-                sec_box[0] = sec_box[0] + sec_adv_i32
+                sec_box[0], sec_box[1] = tdm_ops.add_addr_with_carry(
+                    sec_box[0], sec_box[1], sec_adv_i32
+                )
             if k_prefetch is not None:
                 _l2_prefetch(k_prefetch)
 
         # Prologue
         if const_expr(secondary_scale_tdm):
             active_sec_lo = sec_addr_lo_init
+            active_sec_hi = sec_addr_hi
         for i in range_constexpr(pre_loaded):
-            addr_box = [active_addr_lo]
+            addr_box = [active_addr_lo, active_addr_hi]
             if const_expr(secondary_scale_tdm):
-                sec_box = [active_sec_lo]
+                sec_box = [active_sec_lo, active_sec_hi]
                 _issue_active_tdm(i, addr_box, sec_box=sec_box)
                 active_sec_lo = sec_box[0]
+                active_sec_hi = sec_box[1]
             else:
                 _issue_active_tdm(i, addr_box)
             active_addr_lo = addr_box[0]
+            active_addr_hi = addr_box[1]
         _bvs_tail_seed = []
         _bvs_tail_issue_start = loop_iters * num_buffers
         _bvs_ra = []
@@ -3050,19 +3057,21 @@ def compile_fp8fp4_gemm(
             _pipeline_fence_signal(outstanding=_fence_outstanding)
 
         if const_expr(loop_iters > 0):
-            init_args = list(accs) + [active_addr_lo]
+            init_args = list(accs) + [active_addr_lo, active_addr_hi]
             if const_expr(secondary_scale_tdm):
-                init_args = init_args + [active_sec_lo]
+                init_args = init_args + [active_sec_lo, active_sec_hi]
             if const_expr(use_ascale_vgpr):
                 init_args = init_args + _bvs_ra
 
             for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                 accs_in = list(state[:n_accs])
                 cur_addr_lo = state[n_accs]
-                _state_off = n_accs + 1
+                cur_addr_hi = state[n_accs + 1]
+                _state_off = n_accs + 2
                 if const_expr(secondary_scale_tdm):
                     cur_sec_lo = state[_state_off]
-                    _state_off = _state_off + 1
+                    cur_sec_hi = state[_state_off + 1]
+                    _state_off = _state_off + 2
                 if const_expr(use_ascale_vgpr):
                     _ra0 = _state_off
                     _ring_a = list(state[_ra0 : _ra0 + _bvs_D * _vs_tile_a])
@@ -3070,8 +3079,8 @@ def compile_fp8fp4_gemm(
 
                 for buf_idx in range_constexpr(num_buffers):
                     load_stage = (buf_idx + num_buffers - 1) % num_buffers
-                    addr_box = [cur_addr_lo]
-                    sec_box = [cur_sec_lo] if secondary_scale_tdm else None
+                    addr_box = [cur_addr_lo, cur_addr_hi]
+                    sec_box = [cur_sec_lo, cur_sec_hi] if secondary_scale_tdm else None
 
                     def _mid_tdm_ws(
                         _ls=load_stage,
@@ -3122,20 +3131,32 @@ def compile_fp8fp4_gemm(
                         pf_a_scales=_cur_a,
                     )
                     cur_addr_lo = addr_box[0]
+                    cur_addr_hi = addr_box[1]
                     if const_expr(secondary_scale_tdm):
                         cur_sec_lo = sec_box[0]
+                        cur_sec_hi = sec_box[1]
                     hot_loop_scheduler_scheduled()
 
-                _sec_yield = [cur_sec_lo] if secondary_scale_tdm else []
+                _sec_yield = [cur_sec_lo, cur_sec_hi] if secondary_scale_tdm else []
                 _bvs_yield = _ring_a if use_ascale_vgpr else []
-                results = yield list(accs_in) + [cur_addr_lo] + _sec_yield + _bvs_yield
+                results = (
+                    yield list(accs_in)
+                    + [
+                        cur_addr_lo,
+                        cur_addr_hi,
+                    ]
+                    + _sec_yield
+                    + _bvs_yield
+                )
 
             accs = list(results[:n_accs])
             active_addr_lo = results[n_accs]
-            _result_off = n_accs + 1
+            active_addr_hi = results[n_accs + 1]
+            _result_off = n_accs + 2
             if const_expr(secondary_scale_tdm):
-                active_sec_lo = results[n_accs + 1]
-                _result_off = _result_off + 1
+                active_sec_lo = results[_result_off]
+                active_sec_hi = results[_result_off + 1]
+                _result_off = _result_off + 2
             if const_expr(use_ascale_vgpr):
                 _bvs_tail_flat = list(
                     results[_result_off : _result_off + _bvs_D * _vs_tile_a]
@@ -3222,8 +3243,10 @@ def compile_fp8fp4_gemm(
                 _tail_mid_cb = None
                 if const_expr(_load_stage is not None):
                     _tail_had_load = True
-                    _tail_addr_box = [active_addr_lo]
-                    _tail_sec_box = [active_sec_lo] if secondary_scale_tdm else None
+                    _tail_addr_box = [active_addr_lo, active_addr_hi]
+                    _tail_sec_box = (
+                        [active_sec_lo, active_sec_hi] if secondary_scale_tdm else None
+                    )
 
                     def _tail_mid_ws(
                         _ls=_load_stage, _ab=_tail_addr_box, _sb=_tail_sec_box
@@ -3248,8 +3271,10 @@ def compile_fp8fp4_gemm(
 
                 if const_expr(_load_stage is not None):
                     active_addr_lo = _tail_addr_box[0]
+                    active_addr_hi = _tail_addr_box[1]
                     if const_expr(secondary_scale_tdm):
                         active_sec_lo = _tail_sec_box[0]
+                        active_sec_hi = _tail_sec_box[1]
 
                 hot_loop_scheduler_scheduled()
 
