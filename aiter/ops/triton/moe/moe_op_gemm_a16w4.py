@@ -1,8 +1,11 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
+import functools
 import itertools
-
+import json
+import os
+from typing import Optional
 import torch
 import triton
 
@@ -128,68 +131,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
     return ret
 
 
-def get_kernel_config_gluon(m, n, k, routing_data):
-    block_m = routing_data.block_m
-    group_m = 4
-    xcd_swizzle = 1
-    w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
-    split_k = 1
-
-    block_n = 128
-    num_warps = 4
-
-    if block_m == 16 or block_m == 32:
-        block_k = 512
-    else:
-        block_k = 256
-
-    ret = {
-        "block_m": block_m,
-        "block_n": block_n,
-        "block_k": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "group_m": group_m,
-        "xcd_swizzle": xcd_swizzle,
-        "w_cache_modifier": w_cache_modifier,
-        "split_k": split_k,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1,
-    }
-    return ret
-
-
-def swizzle_scales_gfx950(data):
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
-
-
-def swizzle_scales_gfx1250(data):
-    E, K_SCALE, N = data.shape
-    preshuffle_factor = 32
-    num_chunk_n = N // preshuffle_factor
-    SCALE_KWIDTH = 8
-    num_chunk_k = K_SCALE // SCALE_KWIDTH
-
-    data = data.transpose(-1, -2)
-    data = data.view(E, num_chunk_n, preshuffle_factor, num_chunk_k, SCALE_KWIDTH)
-    data = data.permute(0, 1, 3, 2, 4).contiguous()
-    data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
-    data = data.transpose(-1, -2)
-
-    return data
-
-
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -289,19 +230,13 @@ def moe_gemm_a16w4(
 
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
-        reduction_n_matmul = 1
         apply_swiglu_reduction = True
-        reduction_n_reduction = 2
-    elif apply_swiglu:
-        apply_swiglu_matmul = True
-        reduction_n_matmul = 2
-        apply_swiglu_reduction = False
-        reduction_n_reduction = 1
     else:
-        apply_swiglu_matmul = False
-        reduction_n_matmul = 1
+        apply_swiglu_matmul = apply_swiglu
         apply_swiglu_reduction = False
-        reduction_n_reduction = 1
+    # swiglu halves N (factor-2 reduction) in whichever stage applies it.
+    reduction_n_matmul = 2 if apply_swiglu_matmul else 1
+    reduction_n_reduction = 2 if apply_swiglu_reduction else 1
 
     # allocate output memory
     y, y_final = allocate_output(
@@ -313,21 +248,23 @@ def moe_gemm_a16w4(
         routing_data,
         gather_indx,
         scatter_indx,
-        config["block_m"],
+        block_m,
         config["split_k"],
         x.device,
     )
     stride_bias = None if bias is None else bias.stride(0)
 
-    # moe metadata
+    # moe metadata. The kernel unconditionally loads hist / token_offs_raw /
+    # block_pid_map, so expt_data is required (not optional).
     expt_data = routing_data.expt_data
-    expt_hist = None if expt_data is None else expt_data.hist
-    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
-    expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
-    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+    assert expt_data is not None, "routing_data.expt_data is required"
+    expt_hist = expt_data.hist
+    expt_hist_sum = expt_data.token_offs_pad[-1]
+    expt_token_offs_raw = expt_data.token_offs_raw
+    expt_block_pid_map = expt_data.block_pid_map
 
     # spmd grid
-    grid_m = routing_data.n_blocks(M, config["block_m"])
+    grid_m = routing_data.n_blocks(M, block_m)
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
 
