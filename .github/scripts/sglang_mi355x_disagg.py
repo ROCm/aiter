@@ -332,8 +332,8 @@ cat > "$SBATCH_SCRIPT" <<EOF
 #SBATCH --ntasks=$TOTAL_NODES
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=$TIME_LIMIT
-#SBATCH --output=$WORKDIR/slurm-%j.out
-#SBATCH --error=$WORKDIR/slurm-%j.err
+#SBATCH --output=/tmp/spur-%j.out
+#SBATCH --error=/tmp/spur-%j.err
 EOF
 if [[ -n "${SLURM_PARTITION:-}" ]]; then
     printf '#SBATCH --partition=%s\\n' "$SLURM_PARTITION" >> "$SBATCH_SCRIPT"
@@ -389,7 +389,7 @@ fi
 
 JOB_ID="\\${SLURM_JOB_ID:-\\${SPUR_JOB_ID:-batch}}"
 RANK_LOG="$WORKDIR/rank-\\${RANK}.log"
-exec > >(tee -a "\\$RANK_LOG") 2>&1
+exec > "\\$RANK_LOG" 2>&1
 
 echo "=== SGLang SPUR batch rank \\$RANK raw_rank=\\$RAW_RANK job=\\$JOB_ID host=\\$(hostname) ==="
 env | sort | grep -E '^(SLURM|SPUR)_' || true
