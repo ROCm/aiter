@@ -12,13 +12,12 @@ case-gated through tuned A8W4 stage2 configs.
 There is one active fused MoE path:
 
 - A8W4 decode stage2 kernels selected by public algorithm ids plus generated
-  inter-dim contracts. The production DSV4 contract is currently
-  `padded512_to384`: `logical_inter_dim=512`, `inter_dim_pad=128`, and runtime
-  `topk`, `hidden`, and `experts`.
+  effective inter-dim specializations. Runtime `logical_inter_dim` and
+  `inter_dim_pad` select the effective-K specialization; `topk`, `hidden`, and
+  `experts` remain runtime values.
 
-Zero-pad compile-time coverage contracts are collected from A8W4 model-config
-CSVs, so the same public A8W4 algorithm ids dispatch the matching specialization
-by effective inter dim; K is not encoded into separate public kid ranges.
+The same public A8W4 algorithm ids dispatch the matching specialization by
+effective inter dim; K is not encoded into separate public kid ranges.
 
 Private BF16 route-reduce kernel source is retained for future bring-up, but it
 is not exposed through `fused_moe` or a Python user API in this PR.
@@ -161,12 +160,12 @@ dumps should stay outside the repository.
 - gfx950 only.
 - Private BF16 source assumes no padded/OOB route rows if it is re-enabled in a
   future change.
-- A8W4 production tuning currently targets the `padded512_to384` contract:
-  `logical_inter_dim=512`, `inter_dim_pad=128`, effective inter dim `384`,
-  and runtime `topk`, `hidden`, and `experts`.
-- Public A8W4 kids can dispatch other generated inter-dim coverage contracts
-  when the runtime logical/pad contract and effective inter dim match generated
-  metadata, but those contracts are not production tuned.
+- A8W4 production tuning should use tuned CSV entries for the runtime logical
+  inter dim; runtime `inter_dim_pad` selects the compiled effective-K
+  specialization.
+- A8W4 codegen derives compiled logical/effective inter dims from tuned CSV
+  Opus rows. Because the public CSV schema does not encode `inter_dim_pad`,
+  the current DSV4 `512-128 -> 384` path is kept by a small codegen seed.
 - A8W4 direct-output kernels do not support EP `expert_mask/topk_ids` or
   `bias2`.
 - A8W4 route-out kids include a BF16 precision fallback and the MXFP8 path used

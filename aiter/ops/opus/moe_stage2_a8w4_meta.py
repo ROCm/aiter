@@ -9,10 +9,8 @@ kids without pulling in JIT registration or opus arch dispatch.
 
 from __future__ import annotations
 
-import csv
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 OPUS_A8W4_OUT_MODE_ATOMIC = 0
@@ -20,8 +18,8 @@ OPUS_A8W4_OUT_MODE_BF16 = 1
 OPUS_A8W4_OUT_MODE_FP8 = 2
 
 # Kid layout:
-# - 2000-2099: A8W4 decode algorithm candidates. K is selected by shape
-#   contract at dispatch time, not encoded into the public kid.
+# - 2000-2099: A8W4 decode algorithm candidates. K is selected by runtime
+#   effective inter dim at dispatch time, not encoded into the public kid.
 OPUS_A8W4_KID_ATOMIC_BM16_BN64_B3_WS2 = 2000
 OPUS_A8W4_KID_ROUTE_FP8_BM32_OCC4_RBN2240 = 2001
 OPUS_A8W4_KID_ROUTE_FP8_BM32_OCC5_RBN2304 = 2002
@@ -32,69 +30,6 @@ OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072_B3 = 2006
 OPUS_A8W4_KID_ROUTE_BF16_BM32_FULL_N7168_SMALL = 2007
 
 _OPUS_A8W4_REDUCE_BLOCK_N_RE = re.compile(r"_rbn(\d+)$")
-
-
-@dataclass(frozen=True)
-class OpusA8W4ShapeFamilyContract:
-    name: str
-    logical_inter_dim: int
-    inter_dim_pad: int
-
-    @property
-    def effective_inter_dim(self) -> int:
-        return self.logical_inter_dim - self.inter_dim_pad
-
-    def resolve_inter_dim_pad(
-        self,
-        *,
-        inter_dim: int,
-        inter_dim_pad: Optional[int] = None,
-    ) -> Optional[int]:
-        inter_dim = int(inter_dim)
-        if inter_dim_pad is not None:
-            inter_dim_pad = int(inter_dim_pad)
-            if inter_dim_pad < 0 or inter_dim <= inter_dim_pad:
-                return None
-            if (
-                inter_dim == self.logical_inter_dim
-                and inter_dim_pad == self.inter_dim_pad
-            ):
-                return inter_dim_pad
-            if inter_dim == self.effective_inter_dim and inter_dim_pad == 0:
-                return 0
-            return None
-        if inter_dim == self.logical_inter_dim:
-            return self.inter_dim_pad
-        if inter_dim == self.effective_inter_dim:
-            return 0
-        return None
-
-    def matches(
-        self,
-        *,
-        model_dim: int,
-        inter_dim: int,
-        expert: int,
-        topk: int,
-        block_n: Optional[int] = None,
-        inter_dim_pad: Optional[int] = None,
-    ) -> bool:
-        model_dim = int(model_dim)
-        inter_dim = int(inter_dim)
-        expert = int(expert)
-        topk = int(topk)
-        if model_dim <= 0 or expert <= 0 or topk <= 0:
-            return False
-        if (
-            self.resolve_inter_dim_pad(inter_dim=inter_dim, inter_dim_pad=inter_dim_pad)
-            is None
-        ):
-            return False
-        if block_n is not None:
-            block_n = int(block_n)
-            if block_n <= 0 or model_dim % block_n != 0:
-                return False
-        return self.effective_inter_dim > 0
 
 
 @dataclass(frozen=True)
@@ -150,7 +85,7 @@ class OpusA8W4Stage2Instance:
             return self.name
         return f"{self.name}_{route_reduce.suffix}"
 
-    def tuner_params(self, shape_family: str) -> dict[str, object]:
+    def tuner_params(self) -> dict[str, object]:
         route_reduce = opus_a8w4_route_reduce(self.route_reduce)
         params = {
             "kid": self.kid,
@@ -159,7 +94,6 @@ class OpusA8W4Stage2Instance:
             "out_mode": self.out_mode,
             "route_out": self.route_out,
             "kernel_block_n": self.block_n,
-            "shape_family": shape_family,
         }
         if route_reduce is not None:
             params["route_reduce"] = route_reduce.name
@@ -176,6 +110,7 @@ class OpusA8W4Stage2Instance:
             return False
         return True
 
+
 @dataclass(frozen=True)
 class OpusA8W4RouteReduceInstance:
     name: str
@@ -184,12 +119,6 @@ class OpusA8W4RouteReduceInstance:
     suffix: Optional[str] = None
     auto_model_dims: tuple[int, ...] = ()
 
-
-OPUS_A8W4_PADDED512_TO384_SHAPE_FAMILY_CONTRACT = OpusA8W4ShapeFamilyContract(
-    name="padded512_to384",
-    logical_inter_dim=512,
-    inter_dim_pad=128,
-)
 
 OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = OpusA8W4KernelContract(
     name="gfx950_a8w4_decode_v1",
@@ -209,64 +138,20 @@ OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = OpusA8W4KernelContract(
     c_values_per_atomic=2,
 )
 
-def _iter_model_config_a8w4_inter_dims() -> tuple[int, ...]:
-    config_dir = Path(__file__).resolve().parents[2] / "configs" / "model_configs"
-    if not config_dir.is_dir():
-        return ()
 
-    inter_dims = set()
-    for path in sorted(config_dir.glob("*_fmoe.csv")):
-        try:
-            with path.open(newline="") as f:
-                rows = csv.DictReader(f)
-                for row in rows:
-                    if (
-                        row.get("q_dtype_a") == "torch.float8_e4m3fn"
-                        and row.get("q_dtype_w") == "torch.float4_e2m1fn_x2"
-                        and row.get("q_type") == "QuantType.per_1x32"
-                    ):
-                        try:
-                            inter_dim = int(row.get("inter_dim", ""))
-                        except ValueError:
-                            continue
-                        if inter_dim > 0:
-                            inter_dims.add(inter_dim)
-        except OSError:
-            continue
-    return tuple(sorted(inter_dims))
+OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS = (384,)
 
 
-def _build_codegen_coverage_shape_family_contracts() -> (
-    tuple[OpusA8W4ShapeFamilyContract, ...]
-):
+def _opus_a8w4_k_step_packed() -> int:
     k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
     if k.bk_logical % k.fp4_values_per_byte != 0:
         raise ValueError(
             "Opus A8W4 kernel contract requires bk_logical divisible by "
             "fp4_values_per_byte"
         )
-    k_step_packed = k.bk_logical // k.fp4_values_per_byte
-    return tuple(
-        OpusA8W4ShapeFamilyContract(
-            name=f"coverage_eff{inter_dim}",
-            logical_inter_dim=inter_dim,
-            inter_dim_pad=0,
-        )
-        for inter_dim in _iter_model_config_a8w4_inter_dims()
-        if inter_dim % k_step_packed == 0
-    )
+    return k.bk_logical // k.fp4_values_per_byte
 
 
-OPUS_A8W4_SHAPE_FAMILY_CONTRACTS = (
-    OPUS_A8W4_PADDED512_TO384_SHAPE_FAMILY_CONTRACT,
-    *_build_codegen_coverage_shape_family_contracts(),
-)
-OPUS_A8W4_SHAPE_FAMILY_CONTRACTS_BY_NAME = {
-    contract.name: contract for contract in OPUS_A8W4_SHAPE_FAMILY_CONTRACTS
-}
-OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT = (
-    OPUS_A8W4_PADDED512_TO384_SHAPE_FAMILY_CONTRACT
-)
 OPUS_A8W4_ROUTE_REDUCE_INSTANCES = (
     OpusA8W4RouteReduceInstance(
         name="full_model_n7168",
@@ -513,20 +398,6 @@ def _build_mode_default_by_mode_block_m() -> dict[tuple[int, int], int]:
 OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M = _build_mode_default_by_mode_block_m()
 
 
-def opus_a8w4_normalize_shape_family(name: str) -> Optional[str]:
-    name = str(name)
-    return name if name in OPUS_A8W4_SHAPE_FAMILY_CONTRACTS_BY_NAME else None
-
-
-def opus_a8w4_shape_family(
-    name: str,
-) -> Optional[OpusA8W4ShapeFamilyContract]:
-    normalized = opus_a8w4_normalize_shape_family(name)
-    if normalized is None:
-        return None
-    return OPUS_A8W4_SHAPE_FAMILY_CONTRACTS_BY_NAME[normalized]
-
-
 def opus_a8w4_route_reduce(
     name: Optional[str],
 ) -> Optional[OpusA8W4RouteReduceInstance]:
@@ -535,28 +406,32 @@ def opus_a8w4_route_reduce(
     return OPUS_A8W4_ROUTE_REDUCE_BY_NAME.get(str(name))
 
 
-def opus_a8w4_shape_family_for_shape(
-    *,
-    model_dim: int,
-    inter_dim: int,
-    expert: int,
-    topk: int,
-    block_n: Optional[int] = None,
-    inter_dim_pad: Optional[int] = None,
-) -> Optional[OpusA8W4ShapeFamilyContract]:
-    for contract in OPUS_A8W4_SHAPE_FAMILY_CONTRACTS:
-        if inter_dim_pad is None and int(inter_dim) != contract.logical_inter_dim:
-            continue
-        if contract.matches(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            expert=expert,
-            topk=topk,
-            block_n=block_n,
-            inter_dim_pad=inter_dim_pad,
-        ):
-            return contract
-    return None
+def opus_a8w4_effective_inter_dim(
+    logical_inter_dim: int,
+    inter_dim_pad: int,
+) -> Optional[int]:
+    logical_inter_dim = int(logical_inter_dim)
+    inter_dim_pad = int(inter_dim_pad)
+    if inter_dim_pad < 0 or logical_inter_dim <= inter_dim_pad:
+        return None
+    return logical_inter_dim - inter_dim_pad
+
+
+def opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim: int) -> int:
+    effective_inter_dim = int(effective_inter_dim)
+    if effective_inter_dim <= 0:
+        raise ValueError(
+            f"effective_inter_dim must be positive, got {effective_inter_dim}"
+        )
+    k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+    k_step_packed = _opus_a8w4_k_step_packed()
+    if effective_inter_dim % k_step_packed != 0:
+        raise ValueError(
+            "effective_inter_dim must be divisible by "
+            f"K_STEP_PACKED={k_step_packed}, got {effective_inter_dim}"
+        )
+    k_tiles = effective_inter_dim // k_step_packed
+    return ((k_tiles + 1) // 2) * k.scale_groups_per_row_pack
 
 
 def _opus_a8w4_stage2_instance(kid: int) -> Optional[OpusA8W4Stage2Instance]:
@@ -598,19 +473,14 @@ def _require_a8w4_stage2_instance(kid: int) -> OpusA8W4Stage2Instance:
 def opus_a8w4_decode_kid(
     out_mode: int,
     block_m: int,
-    shape_family: str = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name,
 ) -> int:
     out_mode = int(out_mode)
     block_m = int(block_m)
-    shape_family = opus_a8w4_normalize_shape_family(shape_family)
-    if shape_family is None:
-        raise ValueError("unsupported Opus A8W4 stage2 family: unknown")
     kid = OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M.get((out_mode, block_m))
     if kid is not None:
         return kid
     raise ValueError(
-        "unsupported Opus A8W4 stage2 family/mode/block_m: "
-        f"{shape_family}/{out_mode}/{block_m}"
+        "unsupported Opus A8W4 stage2 mode/block_m: " f"{out_mode}/{block_m}"
     )
 
 
@@ -639,33 +509,22 @@ def opus_a8w4_supported_block_ms() -> tuple[int, ...]:
 
 def opus_a8w4_best_atomic_kid(
     token_num: int,
-    shape_family: str = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name,
 ) -> int:
     del token_num
-    shape_family = opus_a8w4_normalize_shape_family(shape_family)
-    if shape_family is None:
-        raise ValueError("unsupported Opus A8W4 atomic family: unknown")
     for block_m in (32, 16):
         kid = OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M.get(
             (OPUS_A8W4_OUT_MODE_ATOMIC, block_m)
         )
         if kid is not None:
             return kid
-    raise ValueError(f"unsupported Opus A8W4 atomic family: {shape_family}")
+    raise ValueError("unsupported Opus A8W4 atomic kernel")
 
 
 def get_opus_a8w4_stage2_kernels(
-    shape_family: Optional[str] = None,
     token: Optional[int] = None,
 ) -> dict[str, dict[str, object]]:
-    if shape_family is None:
-        shape_family = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name
-    else:
-        shape_family = opus_a8w4_normalize_shape_family(shape_family)
-        if shape_family is None:
-            return {}
     return {
-        inst.tuner_name: inst.tuner_params(shape_family)
+        inst.tuner_name: inst.tuner_params()
         for inst in OPUS_A8W4_STAGE2_INSTANCES
         if inst.supports_tuner_token(token)
     }

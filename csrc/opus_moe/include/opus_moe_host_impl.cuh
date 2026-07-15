@@ -119,8 +119,7 @@ int select_bf16_kernel_id(int requested_kernel_id)
 
 int select_a8w4_kernel_id(int requested_kernel_id,
                           int block_m,
-                          int logical_inter_dim,
-                          int inter_dim_pad)
+                          int effective_inter_dim)
 {
     int selected_kernel_id = requested_kernel_id;
     if(selected_kernel_id == opus_moe::kStage2KidAuto)
@@ -129,7 +128,7 @@ int select_a8w4_kernel_id(int requested_kernel_id,
         // must be requested explicitly because they require a different output
         // layout and follow-up reduce.
         selected_kernel_id = opus_moe::stage2_a8w4_auto_direct_atomic_kid(
-            logical_inter_dim, inter_dim_pad, block_m);
+            effective_inter_dim, block_m);
     }
     AITER_CHECK(opus_moe::stage2_a8w4_kid_is_valid(selected_kernel_id),
                 "opus_moe_stage2_a8w4_decode_fwd got unsupported kernel_id=",
@@ -372,14 +371,6 @@ void opus_moe_stage2_a8w4_decode_fwd(
         opus_moe::kStage2A8W4DecodeBKLogical /
         opus_moe::kStage2A8W4DecodeFp4ValuesPerByte;
 
-    const int selected_kernel_id =
-        select_a8w4_kernel_id(
-            kernel_id, block_m, logical_inter_dim, inter_dim_pad);
-    const int kernel_block_n = opus_moe::stage2_a8w4_kid_block_n(selected_kernel_id);
-    const int expected_scale_cols =
-        (((effective_inter_dim / packed_k_tile_width) + 1) / 2) *
-        opus_moe::kStage2A8W4DecodeScaleGroupsPerRowPack;
-
     AITER_CHECK(actual_topk > 0,
                 "Opus A8W4 stage2 requires positive topk, got ",
                 actual_topk);
@@ -389,6 +380,28 @@ void opus_moe_stage2_a8w4_decode_fwd(
     AITER_CHECK(num_experts > 0,
                 "Opus A8W4 stage2 requires positive experts, got ",
                 num_experts);
+    AITER_CHECK(inter_dim_pad >= 0 && logical_inter_dim > inter_dim_pad,
+                "Opus A8W4 stage2 requires 0 <= inter_dim_pad < logical_inter_dim, got "
+                "logical_inter_dim=",
+                logical_inter_dim,
+                " inter_dim_pad=",
+                inter_dim_pad);
+    AITER_CHECK(effective_inter_dim % packed_k_tile_width == 0,
+                "Opus A8W4 stage2 effective_inter_dim must be divisible by ",
+                packed_k_tile_width,
+                ", got ",
+                effective_inter_dim);
+    AITER_CHECK(opus_moe::stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim),
+                "Opus A8W4 stage2 effective_inter_dim is not compiled: ",
+                effective_inter_dim);
+
+    const int selected_kernel_id =
+        select_a8w4_kernel_id(kernel_id, block_m, effective_inter_dim);
+    const int kernel_block_n = opus_moe::stage2_a8w4_kid_block_n(selected_kernel_id);
+    const int expected_scale_cols =
+        (((effective_inter_dim / packed_k_tile_width) + 1) / 2) *
+        opus_moe::kStage2A8W4DecodeScaleGroupsPerRowPack;
+
     AITER_CHECK(kernel_block_n > 0 && model_dim % kernel_block_n == 0,
                 "Opus A8W4 stage2 kernel_id=",
                 selected_kernel_id,
