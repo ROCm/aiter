@@ -188,9 +188,13 @@ static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
 static constexpr int OPUS_GFX942_KID_OFFSET = 10000;
 static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
-// gfx1250 cluster/TDM split-K (fp32 workspace + reduce) kids: [20000, 21000).
+// gfx1250 split-K kids: [20000, 20100) plain cluster/TDM (fp32 workspace +
+// reduce), [20100, 21000) clusterlaunch multicast ws, [21000, 30000) FUSED
+// single-kernel in-cluster reduce (no reduce kernel; the fuse family sweeps
+// tile x split_k x n_cluster x ws so it spans a wide band). All use the
+// <fp32_t> lookup ABI and fold bias; the split-K band spans [20000, 30000).
 static constexpr int OPUS_GFX1250_SPLITK_KID_MIN = 20000;
-static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 21000;
+static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 30000;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;

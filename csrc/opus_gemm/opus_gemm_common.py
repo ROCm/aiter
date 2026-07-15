@@ -85,6 +85,15 @@ class OpusGemmInstance:
     cluster_wg_m: int = 4
     cluster_wg_n: int = 4
 
+    # gfx1250 FUSED single-kernel split-K (a16w16_clusterlaunch_tdm_splitk_fuse):
+    # SplitK and MClusterWg are COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)),
+    # so each kid bakes one combo. fuse_ws_dtype = DataWs partial storage
+    # ("bf16_t" default; "fp32_t" for higher reduce precision). Ignored by every
+    # other pipeline. fuse_split_k == 0 marks "not a fuse kid".
+    fuse_split_k: int = 0
+    fuse_m_cluster: int = 1
+    fuse_ws_dtype: str = "bf16_t"
+
     @property
     def name(self) -> str:
         parts = [
@@ -126,6 +135,18 @@ class OpusGemmInstance:
             # cCWMxCWN plus pPwW keep each (tile, cluster, P, wg) symbol unique.
             parts.insert(tag_at, "splitk_clusterlaunch_tdm_ws")
             parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
+            parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+            # FUSED single-kernel split-K. The visible segment is "skfuse" (NOT
+            # "splitk_...") so the reduce-TU detection (keys on "_splitk_" in the
+            # kernel name, gen_instances.py) never emits a reduce kernel for it.
+            # It IS still in SPLITK_TAGS (fp32 lookup ABI). m{m}s{split_k}ws{dt}
+            # + cluster geometry keep each (tile, split_k, m_cluster, ws_dtype)
+            # symbol unique.
+            parts.insert(tag_at, "skfuse")
+            # fuse_m_cluster now groups N-tile peers (A-multicast); tag as n{}.
+            parts.append(f"n{self.fuse_m_cluster}s{self.fuse_split_k}")
+            parts.append("wsf32" if self.fuse_ws_dtype == "fp32_t" else "wsbf16")
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
         elif self.name_tag:
             parts.insert(tag_at, self.name_tag)
@@ -996,6 +1017,108 @@ for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
 assert _cl_kid <= 21000, f"clusterlaunch gfx1250 kids overflow [20100,21000): {_cl_kid}"
 GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys())
 
+
+# -- gfx1250 FUSED single-kernel split-K (a16w16_clusterlaunch_tdm_splitk_fuse) --
+# Single kernel: last split WG folds bias + reduces the SplitK-1 partials in-kernel
+# (cluster-barrier sync), no separate reduce kernel. SplitK / MClusterWg are
+# COMPILE-TIME (cluster dims (SplitK, MClusterWg, 1)); DataWs (bf16/fp32) is a kid
+# property. B is TDM-multicast across the MClusterWg M-peers. Kids: [21000, 22000).
+def _a16w16_splitk_fuse_gfx1250(
+    bm, bn, bk, layout, split_k, m_cluster, ws_dtype="bf16_t",
+    num_slots=3, wg_per_cu=2,
+):
+    from dataclasses import replace
+
+    inst = _a16w16_cluster_tdm_splitk_ws_gfx1250(
+        bm, bn, bk, layout, num_slots=num_slots, wg_per_cu=wg_per_cu
+    )
+    return replace(
+        inst,
+        kernel_tag="a16w16_clusterlaunch_tdm_splitk_fuse",
+        # output_dtypes MUST stay ["fp32_t"] (the split-K lookup invariant): the
+        # host launcher is instantiated ONLY as <fp32_t> and opus_gemm.cu forces
+        # the fuse band to the <fp32_t> dispatch slot; the launcher then picks the
+        # real Y dtype at RUNTIME (if Y.dtype()==bf16 ... else float). Advertising
+        # bf16_t here would make gen_a16w16_tune_lookup emit &{name}<bf16_t> in the
+        # BF16 tune map -> undefined symbol (that specialization is never built).
+        # The tuner exempts fuse kids from the output-dtype narrowing separately.
+        output_dtypes=["fp32_t"],
+        fuse_split_k=split_k,
+        fuse_m_cluster=m_cluster,
+        fuse_ws_dtype=ws_dtype,
+    )
+
+
+gfx1250_splitk_fuse_kernels_list = {}
+GFX1250_SPLITK_FUSE_KID_BASE = 21000
+_sf_kid = GFX1250_SPLITK_FUSE_KID_BASE
+# (B_M, B_N, B_K, layout, split_k, m_cluster, ws_dtype) -> kid, for the tuner /
+# candidate selection to look a fuse kid up by config.
+GFX1250_SPLITK_FUSE_KID_OF = {}
+# Fuse tiles = the SAME no-spill (B_M, B_N, B_K) set as the clusterlaunch sweep
+# (_GFX1250_CLUSTERLAUNCH_TILES), so fuse covers the full tile range. Layout
+# follows the base rule (B_M==16 -> tileN, else tileM); wg_per_cu is inherited
+# per tile from the clusterlaunch table (the fuse producer shares the same TDM
+# request profile, so that wg keeps 2-WG/CU co-residency TDM-budget-safe).
+#
+# N-DIRECTION MULTICAST: the cluster is (SplitK, n_cluster, 1) where the 2nd dim
+# (stored in the fuse_m_cluster field) groups n_cluster N-tile peers that share
+# A[M-tile] via TDM multicast (mirrors the clusterlaunch cwn A-multicast that
+# wins at small M). n_cluster is swept 1..5 (TDM fan-out <= 5) subject to
+# SplitK*n_cluster <= 16 (16-WG cluster budget).
+#
+# split_k sweep per workspace dtype:
+#   * bf16 workspace: split_k 2..15
+#   * fp32 workspace: split_k 2..8 (kept conservative; the reduce now stages
+#     partials through a bounded LDS RING (kFuseReduceRing in the pipeline), so
+#     split_k is NO LONGER LDS-bounded -- this cap could be lifted to 15 too).
+# SplitK is capped at 15 (NOT 16): each __cluster_dims__ axis is a 4-bit field.
+# SplitK / n_cluster are COMPILE-TIME (cluster dims), so each (tile, split_k,
+# n_cluster, ws) is a distinct kid; neither is a runtime knob for fuse.
+_FUSE_REDUCE_RING = 3  # must match kFuseReduceRing in the fuse pipeline header
+_FUSE_NUM_SLOTS = 3
+
+
+def _fuse_ring_lds_ok(bm, bn, bk, wg, ws_bytes):
+    """Guard: the reduce LDS ring (kFuseReduceRing tiles of B_M*B_N*ws_bytes)
+    must fit kLdsTotalBytes. Mirrors the traits LDS formula so we never emit a
+    kid that would fail the pipeline's ring static_assert at compile time."""
+    pitch = bk + 8
+    seg_ab = _FUSE_NUM_SLOTS * (bm + bn) * pitch * 2  # bf16 A/B footprint
+    lds_total = (160 * 1024 + 1024) if (wg == 1 and seg_ab <= 160 * 1024) else seg_ab
+    return _FUSE_REDUCE_RING * bm * bn * ws_bytes <= lds_total
+
+
+_FUSE_WS_SWEEP = (("bf16_t", 2, 15), ("fp32_t", 4, 8))  # (ws_dtype, elem_bytes, sk_hi)
+# N-direction cluster (A-multicast) fan-out: the fuse_m_cluster field holds the
+# cluster's 2nd-dim WG count, which for this pipeline groups N-tile peers sharing
+# A. TDM multicast fans out to <= 5 WGs, and the cluster (SplitK, n_cluster, 1)
+# must satisfy SplitK*n_cluster <= 16 (16-bit workgroup_mask / 16-WG budget).
+_FUSE_MAX_NCLUSTER = 5
+_fuse_tiles_seen = set()
+for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
+    if (_bm, _bn, _bk) in _fuse_tiles_seen:
+        continue
+    _fuse_tiles_seen.add((_bm, _bn, _bk))
+    _layout = "tileN" if _bm == 16 else "tileM"
+    for _ws, _ws_bytes, _sk_hi in _FUSE_WS_SWEEP:
+        if not _fuse_ring_lds_ok(_bm, _bn, _bk, _wg, _ws_bytes):
+            continue  # ring wouldn't fit LDS for this (tile, ws) -- skip
+        for _nc in range(1, _FUSE_MAX_NCLUSTER + 1):
+            for _sk in range(2, _sk_hi + 1):
+                if _sk * _nc > 16:  # SplitK * n_cluster <= 16 (cluster budget)
+                    continue
+                gfx1250_splitk_fuse_kernels_list[_sf_kid] = _a16w16_splitk_fuse_gfx1250(
+                    _bm, _bn, _bk, _layout,
+                    split_k=_sk, m_cluster=_nc, ws_dtype=_ws, wg_per_cu=_wg,
+                )
+                GFX1250_SPLITK_FUSE_KID_OF[
+                    (_bm, _bn, _bk, _layout, _sk, _nc, _ws)
+                ] = _sf_kid
+                _sf_kid += 1
+assert _sf_kid <= 30000, f"splitk_fuse gfx1250 kids overflow [21000,30000): {_sf_kid}"
+GFX1250_SPLITK_FUSE_KIDS = frozenset(gfx1250_splitk_fuse_kernels_list.keys())
+
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
@@ -1020,6 +1143,7 @@ kernels_list = {
     **gfx942_kernels_list,
     **gfx1250_kernels_list,
     **gfx1250_clusterlaunch_kernels_list,
+    **gfx1250_splitk_fuse_kernels_list,
 }
 
 default_kernels_dict = {
