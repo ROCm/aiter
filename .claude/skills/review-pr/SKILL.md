@@ -433,9 +433,10 @@ Modifying the BEHAVIOR / SIGNATURE / DEFAULT DISPATCH / NUMERIC SEMANTICS of a l
 Trigger: diff changes the behavior/signature/default-path of a Step-4 Tier-1/Tier-2 file — NOT a pure-additive, arch-gated, behavior-preserving change (those are exempt; see E4 step 1).
 Who signs off: aiter has **no CODEOWNERS file**, so ownership is de-facto — the top committer of the path is the effective gatekeeper:
 `git log --format='%an' -- <file> | sort | uniq -c | sort -rn | head`
-For `fused_moe.py` / core MoE dispatch this is currently @valarLip (top committer, and the maintainer who reverted #3593 and gates MoE PRs). Get their sign-off BEFORE merge, not a revert after. Re-derive per file — MLA / attention / quant may have a different top committer.
+For `fused_moe.py` / core MoE dispatch this is currently @valarLip (top committer, and the maintainer who reverted #3593 and gates MoE PRs). Re-derive per file — MLA / attention / quant may have a different top committer.
+**The reviewer must proactively notify the owner — do not wait for them to notice the PR.** Post a PR comment that @-mentions them (e.g. `@valarLip`) with a one-line summary of the contract change and an explicit request to approve before merge. Passive "someone should sign off" is not enough; the finding is not resolved until the owner has been actively pinged and has responded. Do not settle for a revert after merge.
 Real example (aiter#3593): a `fused_moe.py` env knob merged on CI + one approval, then reverted by a maintainer within the hour — it should have had owner sign-off before merge.
-→ `🔴 E5: [file] is a stable downstream-facing contract — do NOT self-merge; get sign-off from its de-facto owner (git top-committer; @valarLip for fused_moe) before merge, on top of ci:all`
+→ `🔴 E5: [file] is a stable downstream-facing contract — do NOT self-merge. **Reviewer must @-mention the de-facto owner (git top-committer; @valarLip for fused_moe) in a PR comment requesting explicit sign-off** before merge, on top of ci:all`
 
 ---
 
