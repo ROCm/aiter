@@ -144,6 +144,10 @@ jobs:
               for node in os.environ["SLURM_NODELIST_ALLOWED"].split(",")
               if node.strip()
           ]
+          print(
+              "approved Slurm/SPUR node pool: " + ", ".join(allowed_nodes),
+              file=sys.stderr,
+          )
           requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
           if requested_nodes_raw.lower() == "auto":
               try:
@@ -160,6 +164,14 @@ jobs:
                   if not parts or parts[0] == "NODELIST" or len(parts) < 4:
                       continue
                   node_state[parts[0]] = parts[3].lower()
+              print(
+                  "approved node states: "
+                  + ", ".join(
+                      f"{node}={node_state.get(node, 'missing')}"
+                      for node in allowed_nodes
+                  ),
+                  file=sys.stderr,
+              )
               requested_nodes = [
                   node
                   for node in allowed_nodes
@@ -195,6 +207,10 @@ jobs:
                   "slurm_nodelist must resolve to exactly two approved nodes for 1P1D"
               )
           pairs["SLURM_NODELIST_OVERRIDE"] = ",".join(requested_nodes)
+          print(
+              "selected Slurm/SPUR nodes: " + pairs["SLURM_NODELIST_OVERRIDE"],
+              file=sys.stderr,
+          )
 
           for key, val in pairs.items():
               print(f"{key}={val}")
