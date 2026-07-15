@@ -70,6 +70,16 @@ __device__ __forceinline__ float compute_score(float x)
     else
     {
         // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
+        // Clamp +Inf (and absurd) logits to a large finite value: softplus is
+        // unbounded, so an Inf logit would make sqrt(softplus) = Inf and then
+        // overflow the renorm sum to NaN. 1e30 keeps the expert the top-ranked
+        // one while staying finite; realistic logits (<< 1e30) are unchanged.
+        // NOTE: an explicit compare, not fminf -- fminf(NaN, 1e30) returns 1e30,
+        // which would turn a NaN logit into a huge finite score and defeat the
+        // NaN guard. `NaN > 1e30` is false, so NaN falls through unchanged and is
+        // rejected downstream.
+        if(x > 1.0e30f)
+            x = 1.0e30f;
         // Highest-precision path: pure libm (expf + log1pf), ≤1 ULP.
         // Faster alternatives (commented out, ~0.5-1 ULP extra error):
         //   float sp = x > 20.0f ? x : log1pf(exp2f(x * 1.4426950408889634f));   // exp2f HW
@@ -215,6 +225,10 @@ __global__ void topk_softplus_kernel_opt(
         idxs[i]     = e;
         if(correction_bias != nullptr)
             vals[i] += static_cast<float>(correction_bias[e]);
+        // A NaN selection score never wins the argmax and would stall this
+        // lane's cursor in the k-way merge (blocking its remaining experts);
+        // push NaN to the bottom so it is simply excluded.
+        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
     }
 
     // Step 2: sort thread-local partition descending
@@ -327,6 +341,10 @@ __global__ void topk_softplus_kernel_opt_multiwave(
         idxs[i]     = e;
         if(correction_bias != nullptr)
             vals[i] += static_cast<float>(correction_bias[e]);
+        // A NaN selection score never wins the argmax and would stall this
+        // lane's cursor in the k-way merge (blocking its remaining experts);
+        // push NaN to the bottom so it is simply excluded.
+        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -484,6 +502,10 @@ __global__ void topk_softplus_kernel_opt_n(
         idxs[i]     = e;
         if(correction_bias != nullptr)
             vals[i] += static_cast<float>(correction_bias[e]);
+        // A NaN selection score never wins the argmax and would stall this
+        // lane's cursor in the k-way merge (blocking its remaining experts);
+        // push NaN to the bottom so it is simply excluded.
+        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -636,14 +658,16 @@ void topk_softplus_kernel_prefill(
 #pragma unroll
         for(int i = 0; i < VPT; i++)
         {
-            row_chunk[i] = exp2f((row_chunk[i] - local_max) * 1.4426950408889634f);
-            local_sum += row_chunk[i];
+            float ex     = exp2f((row_chunk[i] - local_max) * 1.4426950408889634f);
+            bool  bad    = ::isnan(ex);              // NaN/Inf logit
+            row_chunk[i] = bad ? -INFINITY : ex;     // exclude from selection & sum
+            local_sum += bad ? 0.0f : ex;
         }
 #pragma unroll
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, 1e-20f));
 #pragma unroll
         for(int i = 0; i < VPT; i++)
         {
@@ -777,12 +801,14 @@ __global__ void topk_softplus_kernel(
         float local_sum = 0.0f;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
-            scores[e] = exp2f((scores[e] - local_max) * 1.4426950408889634f);
-            local_sum += scores[e];
+            float ex  = exp2f((scores[e] - local_max) * 1.4426950408889634f);
+            bool  bad = ::isnan(ex);            // NaN/Inf logit
+            scores[e] = bad ? -INFINITY : ex;   // exclude from selection (stays -inf
+            local_sum += bad ? 0.0f : ex;       // through *inv_sum +bias) and from sum
         }
         local_sum = wave_reduce(local_sum, [](float a, float b) { return a + b; });
 
-        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, 1e-20f));
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
             scores[e] *= inv_sum;
@@ -936,14 +962,16 @@ __global__ void topk_softplus_kernel_smem_n(
         float local_sum = 0.0f;
         for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
         {
-            scores[e] = exp2f((scores[e] - local_max) * 1.4426950408889634f);
-            local_sum += scores[e];
+            float ex  = exp2f((scores[e] - local_max) * 1.4426950408889634f);
+            bool  bad = ::isnan(ex);            // NaN/Inf logit
+            scores[e] = bad ? -INFINITY : ex;   // exclude from selection (stays -inf
+            local_sum += bad ? 0.0f : ex;       // through *inv_sum +bias) and from sum
         }
 #pragma unroll
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, 1e-20f));
         for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
         {
             scores[e] *= inv_sum;

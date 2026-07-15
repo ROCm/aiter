@@ -23,9 +23,12 @@ import pytest
 import torch
 import aiter
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
+    run_perftest,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.dtypes import str2Dtype, str2tuple
 
 # NOTE on correctness metrics by score function:
@@ -94,63 +97,65 @@ def _count_routing_mismatches(
     and the gap to the cutoff -- evidence that disagreements are genuine ties
     created by the bias bringing two experts' biased scores nearly equal.
     """
-    debug = os.environ.get("TOPK_TIE_DEBUG", "0") != "0"
-    # Copy small tensors to CPU once to avoid per-token CUDA syncs.
-    i_fused_cpu = i_fused.cpu()
-    i_torch_cpu = i_torch.cpu()
-    sel_cpu = sel_scores.cpu()
-    sorted_sel, _ = sel_cpu.sort(dim=-1, descending=True)
-    cutoff = sorted_sel[:, topk - 1]  # k-th largest selection score per token
-    has_bias = bias is not None and bias.numel() > 0
-    bias_cpu = bias.cpu() if has_bias else None
-    mism = 0
-    for t in range(i_fused_cpu.shape[0]):
-        fused_row = i_fused_cpu[t].tolist()
-        torch_row = i_torch_cpu[t].tolist()
-        kset = set(fused_row)
-        rset = set(torch_row)
-        # Duplicate expert IDs collapse in set(); treat as real mismatch.
-        if kset == rset and len(kset) == topk:
-            continue
-        thr = cutoff[t].item()
-        extra = kset - rset  # kernel picked, ref didn't -> must be >= thr - tol
-        missing = rset - kset  # ref picked, kernel didn't -> must be <= thr + tol
-        excused = (
-            len(kset) == topk
-            and len(rset) == topk
-            and all(sel_cpu[t, e].item() >= thr - tol for e in extra)
-            and all(sel_cpu[t, e].item() <= thr + tol for e in missing)
-        )
-        if not excused:
-            mism += 1
+    # Fully vectorized on-device (no per-token Python loop): build boolean
+    # [T, E] expert masks for the fused and reference selections and evaluate
+    # the tie condition with tensor ops.
+    T, E = sel_scores.shape
+    dev = sel_scores.device
+    sel = sel_scores.to(torch.float32)
+    i_fused = i_fused.long()
+    i_torch = i_torch.long()
 
-        if debug:
+    # Cutoff = k-th largest selection score per token.
+    cutoff = sel.topk(topk, dim=-1).values.amin(dim=-1, keepdim=True)  # [T, 1]
+
+    fused_mask = torch.zeros((T, E), dtype=torch.bool, device=dev)
+    fused_mask.scatter_(1, i_fused, True)
+    ref_mask = torch.zeros((T, E), dtype=torch.bool, device=dev)
+    ref_mask.scatter_(1, i_torch, True)
+
+    # Duplicate ids collapse in the mask; a full selection covers topk experts.
+    fused_full = fused_mask.sum(dim=1) == topk
+    ref_full = ref_mask.sum(dim=1) == topk
+    match = (fused_mask == ref_mask).all(dim=1) & fused_full
+
+    extra = fused_mask & ~ref_mask   # kernel-only -> must be >= cutoff - tol
+    missing = ref_mask & ~fused_mask  # ref-only    -> must be <= cutoff + tol
+    extra_ok = ((~extra) | (sel >= (cutoff - tol))).all(dim=1)
+    missing_ok = ((~missing) | (sel <= (cutoff + tol))).all(dim=1)
+    excused = fused_full & ref_full & extra_ok & missing_ok
+
+    bad = (~match) & (~excused)
+    mism = int(bad.sum().item())
+
+    if os.environ.get("TOPK_TIE_DEBUG", "0") != "0":
+        has_bias = bias is not None and bias.numel() > 0
+        bias_cpu = bias.float().cpu() if has_bias else None
+        sel_cpu = sel.cpu()
+        cut_cpu = cutoff.squeeze(1).cpu()
+        extra_cpu, missing_cpu, bad_cpu = extra.cpu(), missing.cpu(), bad.cpu()
+        for t in (~match).cpu().nonzero(as_tuple=True)[0].tolist():
+            thr = float(cut_cpu[t])
 
             def _fmt(e):
-                sel = sel_cpu[t, e].item()
+                s = float(sel_cpu[t, e])
                 b = float(bias_cpu[e]) if has_bias else 0.0
                 return (
-                    f"      expert {e:4d}: f(x)={sel - b:+.7f}  bias={b:+.7f}  "
-                    f"f(x)+bias={sel:+.7f}  gap_to_cutoff={sel - thr:+.2e}"
+                    f"      expert {e:4d}: f(x)={s - b:+.7f}  bias={b:+.7f}  "
+                    f"f(x)+bias={s:+.7f}  gap_to_cutoff={s - thr:+.2e}"
                 )
 
-            tag = "TIE (excused)" if excused else "REAL MISMATCH"
+            tag = "REAL MISMATCH" if bool(bad_cpu[t]) else "TIE (excused)"
             print(
                 f"[TIE_DEBUG]{(' ' + label) if label else ''} token {t}: {tag}  "
                 f"cutoff(k={topk})={thr:+.7f}"
             )
             print("    kernel-only (picked by fused, not ref):")
-            for e in sorted(extra):
+            for e in extra_cpu[t].nonzero(as_tuple=True)[0].tolist():
                 print(_fmt(e))
             print("    ref-only (picked by torch, not fused):")
-            for e in sorted(missing):
+            for e in missing_cpu[t].nonzero(as_tuple=True)[0].tolist():
                 print(_fmt(e))
-            for ek in sorted(extra):
-                for er in sorted(missing):
-                    d = abs(sel_cpu[t, ek].item() - sel_cpu[t, er].item())
-                    print(
-                        f"    |f(x)+bias gap| between kernel#{ek} and ref#{er} = {d:.2e}"
-                    )
     return mism
 
 
@@ -340,32 +345,38 @@ def benchmark_topk_sigmoid(
     return result
 
 
+def _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch):
+    """Scatter the torch (ref) weights into a dense [T, E] map, then gather them
+    back in the fused id order. Returns (ref_w_aligned, matched_mask) so callers
+    can compare fused vs ref weights for the experts both selected -- fully
+    vectorized, no per-token Python loop."""
+    T = w_fused.shape[0]
+    dev = w_fused.device
+    E = int(max(int(i_fused.max()), int(i_torch.max())) + 1)
+    dense = torch.zeros((T, E), dtype=torch.float32, device=dev)
+    mask = torch.zeros((T, E), dtype=torch.bool, device=dev)
+    dense.scatter_(1, i_torch.long(), w_torch.to(torch.float32))
+    mask.scatter_(1, i_torch.long(), True)
+    ref = dense.gather(1, i_fused.long())
+    matched = mask.gather(1, i_fused.long())
+    return ref, matched
+
+
 def _max_weight_error(w_fused, i_fused, w_torch, i_torch):
     """Max absolute weight error across tokens for matched expert ids."""
-    max_err = 0.0
-    for t in range(w_fused.shape[0]):
-        for k in range(w_fused.shape[1]):
-            kid = i_fused[t, k].item()
-            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-            if len(ref_k) > 0:
-                max_err = max(
-                    max_err,
-                    abs(w_fused[t, k].item() - w_torch[t, ref_k[0]].item()),
-                )
-    return max_err
+    ref, matched = _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch)
+    if not bool(matched.any()):
+        return 0.0
+    diff = (w_fused.to(torch.float32) - ref).abs()
+    return float(diff[matched].max())
 
 
 def _assert_weights_close(w_fused, i_fused, w_torch, i_torch):
     """Assert matched expert weights are close; skip tie-swapped experts."""
-    for t in range(w_fused.shape[0]):
-        for k in range(w_fused.shape[1]):
-            kid = i_fused[t, k].item()
-            ref_k = (i_torch[t] == kid).nonzero(as_tuple=True)[0]
-            if len(ref_k) == 0:
-                continue
-            torch.testing.assert_close(
-                w_fused[t, k], w_torch[t, ref_k[0]], atol=1e-5, rtol=1e-4
-            )
+    ref, matched = _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch)
+    torch.testing.assert_close(
+        w_fused.to(torch.float32)[matched], ref[matched], atol=1e-5, rtol=1e-4
+    )
 
 
 def _make_gating(num_experts, num_tokens, dtype):
@@ -664,6 +675,127 @@ def test_topk_softmax_bias_correctness(num_experts, num_tokens, topk, dtype, bia
     _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
 
 
+def _ref_selection_with_nan(gating_output, bias, score_func):
+    """fp32 reference selection score matching the kernel's non-finite handling.
+    Reference only -- not timed, not in the table.
+
+    Non-finite semantics (per score function), mirroring the kernel:
+    - NaN: always excluded (never selected).
+    - +Inf: sigmoid saturates to 1 (selectable); sqrt(softplus) clamps the logit
+      to 1e30 (selectable, top-ranked, finite); softmax excludes it (its exp is
+      mapped to -inf so it neither poisons the sum nor gets selected).
+    - -Inf: score -> 0 (low, not selected) for every function.
+    """
+    gf = gating_output.float()
+    nan = torch.isnan(gf)
+    posinf = torch.isposinf(gf)
+    b = bias.float() if (bias is not None and bias.numel() > 0) else 0.0
+    if score_func == "softmax":
+        # NaN and +Inf are excluded from the normalization and from selection.
+        s = torch.softmax(gf.masked_fill(nan | posinf, float("-inf")), dim=-1)
+        sel = s + b
+        exclude = nan | posinf
+    elif score_func == "sigmoid":
+        sel = torch.sigmoid(gf) + b  # sigmoid(+inf)=1, sigmoid(-inf)=0
+        exclude = nan
+    else:  # sqrtsoftplus: kernel clamps the logit to 1e30 before softplus
+        sel = torch.sqrt(torch.nn.functional.softplus(torch.clamp(gf, max=1.0e30))) + b
+        exclude = nan
+    return sel.masked_fill(exclude, float("-inf"))
+
+
+@benchmark()
+def bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype):
+    """NaN/Inf robustness as an aiter-standard benchmark.
+
+    Injects NaN, +Inf and -Inf experts scattered per token, times the fused
+    topk_gating kernel with run_perftest (preallocated output buffers, as the
+    model calls it), and checks the routed top-k SET against a reference that
+    mirrors the kernel's non-finite handling (see _ref_selection_with_nan).
+    Routing is a set match (with tie tolerance), so ``err`` is the fraction of
+    tokens whose selected expert set differs; ``nan_leak`` flags any NaN in the
+    output weights. Memory-bound op -> TB/s (no meaningful FLOPs).
+    """
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(dtype)
+
+    # Scatter NaN across token-dependent positions (so it lands anywhere in a
+    # lane's sorted partition) plus a -Inf per token.
+    tok = torch.arange(num_tokens, device="cuda")
+    for j in range(4):
+        gating_output[tok, (tok * (7 * j + 3) + j) % num_experts] = float("nan")
+    gating_output[tok, (tok * 11 + 2) % num_experts] = float("-inf")
+    # +Inf is a valid extreme logit for the per-element scores (sigmoid saturates
+    # to 1; sqrt(softplus) clamps to a finite top-ranked score). Softmax is
+    # excluded here: a +Inf makes the row-max +Inf so every exp(finite-inf)=0 and
+    # the row collapses -- excluding +Inf from the softmax max/selection is a
+    # separate hardening not covered by this test.
+    if score_func != "softmax":
+        gating_output[tok, (tok * 5 + 1) % num_experts] = float("inf")
+
+    # Preallocated output buffers, matching the real model call.
+    topk_weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+    need_renorm = score_func != "softmax"
+
+    _, us = run_perftest(
+        aiter.topk_gating,
+        topk_weights,
+        topk_ids,
+        gating_output,
+        bias,
+        need_renorm=need_renorm,
+        routed_scaling_factor=2.5,
+        score_func=score_func,
+    )
+
+    # Correctness: routed set vs the NaN-excluding fp32 reference (tie-tolerant).
+    sel = _ref_selection_with_nan(gating_output, bias, score_func)
+    i_ref = sel.topk(topk, dim=-1, sorted=False)[1].to(torch.int32)
+    n_mism = _count_routing_mismatches(
+        topk_ids,
+        i_ref,
+        sel,
+        topk,
+        bias=bias,
+        label=f"nan {score_func} E={num_experts} T={num_tokens} k={topk}",
+    )
+    nan_leak = bool(topk_weights.isnan().any().item())
+
+    # Memory-bound: reads the [T, E] gating matrix, writes T*topk ids + weights.
+    nbytes = (
+        num_tokens * num_experts * gating_output.element_size()
+        + num_tokens * topk * (4 + 4)
+    )
+    ret = {"gfx": get_gfx()}
+    ret["fused us"] = us
+    ret["fused TB/s"] = nbytes / us / 1e6
+    ret["fused err"] = n_mism / num_tokens
+    ret["nan_leak"] = nan_leak
+    return ret
+
+
+# pytest wrapper: NaN experts must never be selected (top-k set matches the
+# NaN-excluding reference) and must never leak into the output weights. Covers
+# decode (T=64) and prefill (T=2048) dispatch paths.
+@pytest.mark.parametrize("score_func", ["sqrtsoftplus", "sigmoid", "softmax"])
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("num_tokens", [64, 2048])
+@pytest.mark.parametrize("num_experts", [64, 128, 256])
+def test_topk_gating_nan(num_experts, num_tokens, topk, score_func):
+    row = bench_topk_gating_nan(
+        num_experts, num_tokens, topk, score_func, torch.bfloat16
+    )
+    assert not row["nan_leak"], (
+        f"{score_func} E={num_experts} T={num_tokens} k={topk}: NaN leaked into weights"
+    )
+    assert row["fused err"] == 0.0, (
+        f"{score_func} E={num_experts} T={num_tokens} k={topk}: routed top-k set "
+        f"differs from the NaN-excluding reference (err={row['fused err']})"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Test topk_sigmoid and topk_softplus operations"
@@ -696,7 +828,7 @@ if __name__ == "__main__":
         "--test",
         type=str,
         default="all",
-        choices=["sigmoid", "softplus", "softmax", "all"],
+        choices=["sigmoid", "softplus", "softmax", "nan", "all"],
         help="Which test to run (default: all)",
     )
 
@@ -789,6 +921,37 @@ if __name__ == "__main__":
             failed_sections.append("softmax")
         else:
             print("All softmax tests passed!")
+
+    if args.test in ("nan", "all"):
+        nan_dtypes = [d for d in dtype_list if d != torch.float32]
+        nan_configs = list(
+            itertools.product(
+                num_experts_list,
+                num_tokens_list,
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                nan_dtypes,
+            )
+        )
+        print("\n" + "=" * 80)
+        print("topk_gating NaN/Inf robustness")
+        print("=" * 80)
+        collected = [
+            bench_topk_gating_nan(num_experts, num_tokens, topk, score_func, dtype)
+            for num_experts, num_tokens, topk, score_func, dtype in nan_configs
+        ]
+        df = pd.DataFrame(collected)
+        aiter.logger.info(
+            "topk_gating NaN/Inf robustness summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[(df["fused err"] > 0) | (df["nan_leak"])]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} nan config(s) failed (err>0 or nan_leak)!")
+            print(errors.to_string(index=False))
+            failed_sections.append("nan")
+        else:
+            print("All nan robustness tests passed!")
     print("=" * 80)
 
     if failed_sections:
