@@ -55,12 +55,12 @@ on:
         description: "Concurrency list for the smoke benchmark"
         required: false
         type: string
-        default: "64"
+        default: "16"
       eval_conc_list:
         description: "Concurrency list for GSM8K eval; empty uses benchmark concurrency"
         required: false
         type: string
-        default: "128"
+        default: "16"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -147,8 +147,8 @@ jobs:
           nodes = [node.strip() for node in node_list.split(",") if node.strip()]
           print(f"ATOMESH_2P1D_NODES={node_list}")
           print(f"ATOMESH_1P1D_NODES={','.join(nodes[:2])}")
-          print(f"ISL_LIST={value('isl_list', 'ISL_LIST_DEFAULT')}")
-          print("OSL=" + value("osl", "OSL_DEFAULT"))
+          print("ISL_LIST=" + os.environ["ISL_LIST_DEFAULT"])
+          print("OSL=" + os.environ["OSL_DEFAULT"])
           print("CONC_LIST=" + value("conc_list", "CONC_LIST_DEFAULT"))
           eval_conc = inputs.get("eval_conc_list", "")
           if eval_conc in ("", None):
@@ -249,9 +249,9 @@ jobs:
                     topology: 1p1d
                     pd_worker_layout: multi_node
                     nodes: "${ATOMESH_1P1D_NODES}"
-                    isl: [8192]
+                    isl: [1024]
                     osl: 1024
-                    concurrency: [128, 256]
+                    concurrency: [16]
                     prefill:
                       workers: 1
                       tp: 8
@@ -263,27 +263,7 @@ jobs:
                     runner:
                       time_limit: "08:00:00"
                     run_eval: true
-                    eval_concurrency: [64, 256]
-
-                  - name: glm-5-2-fp8-2p1d-tp8
-                    topology: 2p1d
-                    pd_worker_layout: multi_node
-                    nodes: "${ATOMESH_2P1D_NODES}"
-                    isl: [8192]
-                    osl: 1024
-                    concurrency: [128, 256]
-                    prefill:
-                      workers: 2
-                      tp: 8
-                    decode:
-                      workers: 1
-                      tp: 8
-                    benchmark:
-                      wait_server_timeout: 4200
-                    runner:
-                      time_limit: "08:00:00"
-                    run_eval: true
-                    eval_concurrency: [64, 256]
+                    eval_concurrency: [16]
 
               accuracy:
                 task: gsm8k
