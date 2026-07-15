@@ -38,6 +38,7 @@ def build_moe_route_maps_module():
         rows_to_tokens: fx.Pointer,  # (E*max_m,) int32 out: grouped row -> token
         numel: Int32,
         topk: Int32,
+        experts: Int32,
         max_m: Int32,
     ):
         i32 = T.i32
@@ -52,26 +53,35 @@ def build_moe_route_maps_module():
             a_rsrc = ptr_rsrc(rows_to_tokens)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
+            ge0 = arith.cmpi(CmpIPredicate.sge, e, arith.constant(0, type=i32))
+            ltE = arith.cmpi(CmpIPredicate.slt, e, ArithValue(experts))
+            valid_e = arith.andi(ge0, ltE)
 
-            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
-            e_idx = arith.index_cast(T.index, e)
-            addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            _if_valid = scf.IfOp(valid_e, has_else=True)
+            with ir.InsertionPoint(_if_valid.then_block):
+                base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
+                e_idx = arith.index_cast(T.index, e)
+                addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
+                ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
+                ptr = ptr._value if hasattr(ptr, "_value") else ptr
 
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                arith.constant(1, type=i32),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            ).result
+                slot = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    ptr,
+                    arith.constant(1, type=i32),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                ).result
 
-            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
-            buffer_ops.buffer_store(row, c_rsrc, route)
-            token = arith.divui(route, ArithValue(topk))
-            buffer_ops.buffer_store(token, a_rsrc, row)
+                row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+                buffer_ops.buffer_store(row, c_rsrc, route)
+                token = arith.divui(route, ArithValue(topk))
+                buffer_ops.buffer_store(token, a_rsrc, row)
+                scf.YieldOp([])
+            with ir.InsertionPoint(_if_valid.else_block):
+                buffer_ops.buffer_store(arith.constant(-1, type=i32), c_rsrc, route)
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit
@@ -82,6 +92,7 @@ def build_moe_route_maps_module():
         rows_to_tokens: fx.Pointer,
         numel: fx.Int32,
         topk: fx.Int32,
+        experts: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -92,7 +103,14 @@ def build_moe_route_maps_module():
 
         gx = arith.index_cast(T.index, grid_blocks)
         launch = route_maps_kernel(
-            topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m
+            topk_ids,
+            atomic_buffer,
+            topids_to_rows,
+            rows_to_tokens,
+            numel,
+            topk,
+            experts,
+            max_m,
         )
         launch.launch(
             grid=(gx, 1, 1),
@@ -118,6 +136,7 @@ def build_moe_topids_to_rows_module():
         atomic_buffer: fx.Pointer,
         topids_to_rows: fx.Pointer,
         numel: Int32,
+        experts: Int32,
         max_m: Int32,
     ):
         i32 = T.i32
@@ -131,21 +150,30 @@ def build_moe_topids_to_rows_module():
             out_rsrc = ptr_rsrc(topids_to_rows)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
-            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
-            e_idx = arith.index_cast(T.index, e)
-            addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                arith.constant(1, type=i32),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            ).result
-            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
-            buffer_ops.buffer_store(row, out_rsrc, route)
+            ge0 = arith.cmpi(CmpIPredicate.sge, e, arith.constant(0, type=i32))
+            ltE = arith.cmpi(CmpIPredicate.slt, e, ArithValue(experts))
+            valid_e = arith.andi(ge0, ltE)
+            _if_valid = scf.IfOp(valid_e, has_else=True)
+            with ir.InsertionPoint(_if_valid.then_block):
+                base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
+                e_idx = arith.index_cast(T.index, e)
+                addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
+                ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
+                ptr = ptr._value if hasattr(ptr, "_value") else ptr
+                slot = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    ptr,
+                    arith.constant(1, type=i32),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                ).result
+                row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+                buffer_ops.buffer_store(row, out_rsrc, route)
+                scf.YieldOp([])
+            with ir.InsertionPoint(_if_valid.else_block):
+                buffer_ops.buffer_store(arith.constant(-1, type=i32), out_rsrc, route)
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit
@@ -154,12 +182,15 @@ def build_moe_topids_to_rows_module():
         atomic_buffer: fx.Pointer,
         topids_to_rows: fx.Pointer,
         numel: fx.Int32,
+        experts: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         gx = arith.index_cast(T.index, grid_blocks)
-        launch = route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m)
+        launch = route_kernel(
+            topk_ids, atomic_buffer, topids_to_rows, numel, experts, max_m
+        )
         launch.launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),

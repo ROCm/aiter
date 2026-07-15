@@ -274,16 +274,21 @@ def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     flat_e = topk_ids.reshape(-1).to(torch.long)
+    valid = (flat_e >= 0) & (flat_e < E)
+    safe_e = torch.where(valid, flat_e, torch.zeros_like(flat_e))
     # slot = number of earlier routes to the same expert (token-major order).
-    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
-    topids_to_rows = (flat_e * max_m + slot).to(torch.int32)
+    route_hot = F.one_hot(safe_e, E) * valid[:, None]
+    slot = route_hot.cumsum(0).gather(1, safe_e[:, None]).squeeze(1) - 1
+    topids_to_rows = torch.where(
+        valid, safe_e * max_m + slot, torch.full_like(flat_e, -1)
+    ).to(torch.int32)
     # Inverse map: grouped row -> source token (-1 for unused padding rows).
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     src_tokens = torch.arange(
         token_num, device=device, dtype=torch.int32
     ).repeat_interleave(topk)
-    rows_to_tokens[topids_to_rows.to(torch.long)] = src_tokens
-    masked_m = torch.bincount(flat_e, minlength=E).to(torch.int32)
+    rows_to_tokens[topids_to_rows[valid].to(torch.long)] = src_tokens[valid]
+    masked_m = torch.bincount(safe_e[valid], minlength=E).to(torch.int32)
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
@@ -595,9 +600,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and not torch.cuda.is_current_stream_capturing()
     )
 
-    if _grouped_sync_dbg:
-        if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-            raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = None
 
     if grouped_contiguous_m:
@@ -636,8 +638,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         return payload, scale_u8
 
     if _use_naive:
-        if counts is None:
-            counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
@@ -670,13 +670,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
         flat_tokens = flat_routes // topk
         flat_rows = topids_to_rows.reshape(-1).to(torch.long)
-        grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
+        valid_routes = flat_rows >= 0
+        grouped_a1.view(E * max_m, -1)[flat_rows[valid_routes]] = a1_payload[
+            flat_tokens[valid_routes]
+        ]
         if a1_scale_token_u8 is not None:
-            a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
+            a1_scale_raw.view(E * max_m, -1)[flat_rows[valid_routes]] = (
+                a1_scale_token_u8[flat_tokens[valid_routes]]
+            )
         route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-        route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
-            route_weights.dtype
-        )
+        route_weights.view(-1)[flat_rows[valid_routes]] = topk_weight.reshape(-1)[
+            valid_routes
+        ].to(route_weights.dtype)
         grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
             a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
@@ -778,6 +783,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             rows_to_tokens = None
             _grouped_dbg("fused route+quant+scatter done")
 
+    counts = masked_m
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
@@ -1210,9 +1216,13 @@ def build_topids_to_rows(
 
     token_num, topk = topk_ids.shape
     flat_e = topk_ids.reshape(-1).to(torch.long)
+    valid = (flat_e >= 0) & (flat_e < E)
+    safe_e = torch.where(valid, flat_e, torch.zeros_like(flat_e))
     # slot[r] = (# earlier routes to the same expert) = running count - 1
-    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
-    return (flat_e * max_m + slot).view(token_num, topk).to(torch.int32)
+    route_hot = F.one_hot(safe_e, E) * valid[:, None]
+    slot = route_hot.cumsum(0).gather(1, safe_e[:, None]).squeeze(1) - 1
+    rows = torch.where(valid, safe_e * max_m + slot, torch.full_like(flat_e, -1))
+    return rows.view(token_num, topk).to(torch.int32)
 
 
 @functools.cache
@@ -1365,6 +1375,7 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
         rows_to_tokens,
         numel,
         topk,
+        E,
         max_m,
         grid_blocks,
         stream=torch.cuda.current_stream(),

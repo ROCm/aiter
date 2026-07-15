@@ -1740,6 +1740,7 @@ def flydsl_moe_topids_to_rows(
         ptr_arg(counter),
         ptr_arg(topids_to_rows),
         numel,
+        int(E),
         int(max_m),
         route_grid,
         stream=torch.cuda.current_stream(),
@@ -1837,6 +1838,7 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(counter),
             ptr_arg(topids_to_rows),
             numel,
+            int(E),
             max_m,
             route_grid,
             stream=torch.cuda.current_stream(),
@@ -1893,6 +1895,7 @@ def flydsl_moe_fused_route_quant_scatter(
         ptr_arg(grouped_a1_scale.view(-1)),
         ptr_arg(expert_row_base_arg),
         numel,
+        int(E),
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )

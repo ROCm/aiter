@@ -44,7 +44,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, ptrtoint, range_constexpr, vector
 from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
@@ -144,6 +144,8 @@ def build_moe_gather_reduce_module(
 
         f32 = T.f32
         i32 = T.i32
+        c0_i32 = arith.constant(0, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
         vec_i32_ty = T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route
         # weights straight through (no pre-cast); bf16/f16 get extended below.
@@ -202,6 +204,9 @@ def build_moe_gather_reduce_module(
                     if w_dtype == "f32"
                     else ArithValue(arith.extf(f32, w_loaded))
                 )
+                row_valid = arith.cmpi(CmpIPredicate.sge, row_i32, c0_i32)
+                row_i32 = ArithValue(arith.select(row_valid, _raw(row_i32), c0_i32))
+                w_f32 = ArithValue(arith.select(row_valid, _raw(w_f32), c0_f32))
                 return row_i32, w_f32
 
             dw_base = thread_id * vec_i32 + iter_idx_i32 * arith.constant(
