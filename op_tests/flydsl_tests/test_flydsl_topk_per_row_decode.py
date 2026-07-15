@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+import contextlib
+
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
@@ -290,6 +292,63 @@ def test_non_finite_never_selected(k, L):
         torch.full_like(logits[0], float("-inf")),
     )
     _assert_row_topk_set(sanitized.cpu(), indices[0].cpu(), k, L)
+
+
+@contextlib.contextmanager
+def _tier_override(mode):
+    """Set FLYDSL_TOPK_TIERED_OVERRIDE and clear the config/launcher caches so the
+    override actually takes effect (both are cached and otherwise ignore env)."""
+    import os
+    import aiter.ops.flydsl.topk_per_row_decode as m
+
+    prev = os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE")
+    if mode is None:
+        os.environ.pop("FLYDSL_TOPK_TIERED_OVERRIDE", None)
+    else:
+        os.environ["FLYDSL_TOPK_TIERED_OVERRIDE"] = mode
+    m._environ_kernel_config.cache_clear()
+    m._compile_launcher.cache_clear()
+    try:
+        yield m
+    finally:
+        if prev is None:
+            os.environ.pop("FLYDSL_TOPK_TIERED_OVERRIDE", None)
+        else:
+            os.environ["FLYDSL_TOPK_TIERED_OVERRIDE"] = prev
+        m._environ_kernel_config.cache_clear()
+        m._compile_launcher.cache_clear()
+
+
+@pytest.mark.parametrize("mode", ["short", "mid", "long"])
+def test_tier_mode_override(mode):
+    """FLYDSL_TOPK_TIERED_OVERRIDE forces every row to a single tier. Assert the
+    override reaches the resolved config (all modes give correct output, so output
+    alone wouldn't prove the mode was applied), then check correctness. L > k so all
+    three run real radix-select; single row so the deadlock guard is a no-op."""
+    k, L = 2048, 120003
+    with _tier_override(mode) as m:
+        assert m._kernel_config(1, L)["tier_mode"] == mode
+        _check_set_equivalence(k, 1, 1, L, "random", padded=True)
+
+
+def test_tier_mode_invalid_rejected():
+    """An unknown FLYDSL_TOPK_TIERED_OVERRIDE value is rejected."""
+    with _tier_override("bogus"):
+        logits = torch.randn((1, 8192), device="cuda", dtype=torch.float32)
+        sl = torch.tensor([8192], device="cuda", dtype=torch.int32)
+        idx = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        with pytest.raises(ValueError):
+            flydsl_top_k_per_row_decode(
+                logits,
+                1,
+                sl,
+                idx,
+                1,
+                logits.stride(0),
+                logits.stride(1),
+                k=2048,
+                ordered=False,
+            )
 
 
 @pytest.mark.parametrize("k", [512, 2048])

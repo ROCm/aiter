@@ -42,7 +42,7 @@ Constraints:
 """
 
 from functools import cache
-from typing import Any
+from typing import Any, Literal
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -107,30 +107,56 @@ def topk_workspace_slots(
     return int(num_rows) * row_slots
 
 
-def needs_workspace_zero(max_row_len: int, top_k: int, short_max: int) -> bool:
+def needs_workspace_zero(
+    max_row_len: int,
+    top_k: int,
+    short_max: int,
+    tier_mode: str = "auto",
+) -> bool:
     """Return whether any row can enter the persistent multi-block path."""
+    if tier_mode == "short":
+        return False
+    if tier_mode in ("mid", "long"):
+        return True
     return max_row_len > max(short_max, top_k)
 
 
 @cache
 def create_topk_per_row_decode_tiered_kernel(
-    blocks_per_row: int = 8,
-    *,
     top_k: int,
+    *,
+    blocks_per_row: int = 8,
     bits_per_pass: int = 11,
     scan_stages: int = SCAN_STAGES,
-    tiered: bool = True,
+    tier_mode: Literal["auto", "short", "mid", "long"] = "auto",
     tiered_short_max: int = 16384,
     tiered_mid_cap: int = 16,
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
     mask_non_finite: bool = True,
 ) -> Any:
+    """Build a launcher that selects the Top-K largest values' column indices per
+    decode row (unordered set, matching torch.topk by value). Implemented as a
+    tiered persistent multi-block radix-select; the returned launcher is cached.
+
+    top_k: number of indices selected per row (compile-time; any positive value).
+    blocks_per_row: workgroups launched per row (grid width); the mid/long tiers cap
+        how many actually cooperate, excess workgroups return immediately.
+    bits_per_pass: radix digit width, 10 or 11; 11 = 2048-bin LDS histogram, required
+        by the short tier.
+    scan_stages: histogram block-scan staging, one of 1/2/4/8.
+    tier_mode: "auto" picks a tier per row by valid length; "short"/"mid"/"long"
+        force that tier for every row.
+    tiered_short_max: row_len <= this -> short tier (single workgroup, barrier-free).
+    tiered_mid_max: short_max < row_len <= this -> mid tier; longer -> long tier.
+    tiered_mid_cap / tiered_long_cap: max cooperating workgroups per row in the mid /
+        long tier (clamped to blocks_per_row).
+    mask_non_finite: clamp inf/NaN to -inf so they never rank into the top-k.
+    """
     short_max = tiered_short_max
     mid_cap = tiered_mid_cap
     mid_max = tiered_mid_max
     long_cap = tiered_long_cap
-    """Return a cached tiered persistent decode radix-select launcher."""
 
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
@@ -142,22 +168,42 @@ def create_topk_per_row_decode_tiered_kernel(
         raise ValueError(f"mid_cap/long_cap must be >= 2, got {mid_cap}/{long_cap}")
     if mid_max < short_max:
         raise ValueError(f"mid_max must be >= short_max, got {mid_max} < {short_max}")
+    if tier_mode not in ("auto", "short", "mid", "long"):
+        raise ValueError(
+            f"tier_mode must be one of auto/short/mid/long, got {tier_mode!r}"
+        )
+    # The short tier runs the standalone one-workgroup radix-select (2048-bin LDS
+    # histogram), so it needs bits_per_pass == 11. It is compiled in for "auto"
+    # (short rows) and "short" (all rows); forcing "short" without bpp==11 is an
+    # error rather than a silent fallback.
+    if tier_mode == "short" and bits_per_pass != 11:
+        raise ValueError(
+            f"tier_mode='short' requires bits_per_pass == 11, got {bits_per_pass}"
+        )
 
-    # The short tier runs the standalone one-workgroup radix-select (11/11/10 ordered key, 2048-bin LDS
-    # histogram), so it is only available when bits_per_pass == 11.
-    short_tier = tiered and bits_per_pass == 11
+    short_tier = tier_mode in ("auto", "short") and bits_per_pass == 11
     block_threads = BLOCK_THREADS
     red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
     num_passes = _num_passes(bits_per_pass)
     num_buckets = 1 << bits_per_pass
     row_workspace_slots = COUNTER_SLOTS + num_passes * num_buckets
+
+    # Caps/thresholds only affect codegen for modes that use them; include them in
+    # the name for those modes so distinct configs cache separately.
+    _cap_tag = (
+        ""
+        if tier_mode == "short"
+        else (
+            f"_s{tiered_short_max}_mc{tiered_mid_cap}"
+            f"_mm{tiered_mid_max}_lc{tiered_long_cap}"
+        )
+    )
     kernel_name = (
         f"topk_per_row_decode_persistent_k{top_k}_"
         f"bpp{bits_per_pass}_g{blocks_per_row}_v2"
         f"_stage{scan_stages}"
-        f"{'_tiered' if tiered else ''}"
-        f"{f'_s{tiered_short_max}_mc{tiered_mid_cap}' if tiered else ''}"
-        f"{f'_mm{tiered_mid_max}_lc{tiered_long_cap}' if tiered else ''}"
+        f"_{tier_mode}"
+        f"{_cap_tag}"
         f"{'_1wg' if short_tier else ''}"
         f"{'_mf' if mask_non_finite else ''}"
     )
@@ -203,7 +249,7 @@ def create_topk_per_row_decode_tiered_kernel(
         c_parts = fx.Int32(blocks_per_row)
         c_sign_bit = fx.Int32(-2147483648)
         c_exp_mask = fx.Int32(0x7F800000)  # fp32 exponent bits (all-ones => inf/NaN)
-        c_neg_fltmax = fx.Float32(-3.4028234663852886e38)  # torch.finfo(f32).min
+        c_neg_inf = fx.Float32(float("-inf"))
         c_neg_one = fx.Int32(-1)
         c_zero_f32 = fx.Float32(0.0)
         c_row_ws = fx.Int32(row_workspace_slots)
@@ -239,24 +285,26 @@ def create_topk_per_row_decode_tiered_kernel(
         row_out = ArithValue(row) * ArithValue(c_top_k)
         row_ws_base = ArithValue(row) * ArithValue(c_row_ws)
 
-        # Per-row active-part cap over the fixed grid (excess blocks return immediately).
-        active_parts = c_parts
-        if const_expr(tiered):
-            # Per-bucket active-part caps over the fixed launch grid (excess
-            # blocks return immediately). Short rows run the single-workgroup short tier;
-            # the mid and long persistent buckets cap how many of the grid's
-            # blocks participate, trading CU coverage against barrier/atomic
-            # contention. Caps are clamped to the grid (``c_parts``).
+        # Active cooperating workgroups per row over the fixed grid (excess blocks
+        # return immediately). "auto" picks per row by length; short/mid/long force
+        # that tier for every row. Caps are clamped to the grid.
+        c_mid_cap = fx.Int32(mid_cap)
+        c_long_cap = fx.Int32(long_cap)
+        mid_parts = (ArithValue(c_parts) < ArithValue(c_mid_cap)).select(
+            c_parts, c_mid_cap
+        )
+        long_parts = (ArithValue(c_parts) < ArithValue(c_long_cap)).select(
+            c_parts, c_long_cap
+        )
+        if const_expr(tier_mode == "short"):
+            active_parts = c_one
+        elif const_expr(tier_mode == "mid"):
+            active_parts = mid_parts
+        elif const_expr(tier_mode == "long"):
+            active_parts = long_parts
+        else:  # "auto": pick per row by valid length
             c_short = fx.Int32(short_max)
             c_mid = fx.Int32(mid_max)
-            c_mid_cap = fx.Int32(mid_cap)
-            c_long_cap = fx.Int32(long_cap)
-            mid_parts = (ArithValue(c_parts) < ArithValue(c_mid_cap)).select(
-                c_parts, c_mid_cap
-            )
-            long_parts = (ArithValue(c_parts) < ArithValue(c_long_cap)).select(
-                c_parts, c_long_cap
-            )
             active_parts = (ArithValue(row_len) <= ArithValue(c_short)).select(
                 c_one,
                 (ArithValue(row_len) <= ArithValue(c_mid)).select(
@@ -393,13 +441,15 @@ def create_topk_per_row_decode_tiered_kernel(
             gpu.barrier()
 
         def mask_nonfinite(val):
+            # inf/NaN (exponent all-ones) -> -inf so they sort below every finite
+            # value and are never selected.
             if const_expr(not mask_non_finite):
                 return val
             bits = ArithValue(val).bitcast(T.i32)
             is_nonfinite = ArithValue(
                 ArithValue(bits) & ArithValue(c_exp_mask)
             ) == ArithValue(c_exp_mask)
-            return is_nonfinite.select(c_neg_fltmax, val)
+            return is_nonfinite.select(c_neg_inf, val)
 
         def radix_twiddle_key(val):
             # Map larger fp32 values to smaller unsigned keys so ascending

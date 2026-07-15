@@ -70,6 +70,8 @@ def _environ_kernel_config() -> dict:
         bits_per_pass=_env_int("FLYDSL_TOPK_TIERED_BPP"),
         # 0/1 override for the non-finite mask (default on); set 0 to disable.
         mask_non_finite=_env_int("FLYDSL_TOPK_TIERED_MASK_NONFINITE"),
+        # Force a single tier for every row (auto/short/mid/long)
+        tier_mode=os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE"),
     )
     return {k: v for k, v in cfg.items() if v is not None}
 
@@ -118,13 +120,13 @@ def _default_kernel_config(
     return dict(
         blocks_per_row=blocks_per_row,
         bits_per_pass=bits_per_pass,
-        tiered=True,
         scan_stages=_TIERED_SCAN_STAGES,
         tiered_short_max=tiered_short_max,
         tiered_mid_cap=tiered_mid_cap_default,
         tiered_mid_max=_TIERED_MID_MAX,
         tiered_long_cap=tiered_long_cap_default,
         mask_non_finite=True,
+        tier_mode="auto",
     )
 
 
@@ -140,6 +142,13 @@ def _kernel_config(num_rows: int, max_model_len: int) -> dict:
     bits_per_pass = kernel_config["bits_per_pass"]
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
+
+    tier_mode = kernel_config["tier_mode"]
+    if tier_mode not in ("auto", "short", "mid", "long"):
+        raise ValueError(
+            "FLYDSL_TOPK_TIERED_OVERRIDE must be one of auto/short/mid/long, "
+            f"got {tier_mode!r}"
+        )
 
     kernel_config = _apply_deadlock_guard(kernel_config, num_rows, max_model_len)
     return kernel_config
@@ -171,23 +180,31 @@ def _apply_deadlock_guard(
     if num_rows <= 0:
         return kernel_config
 
-    short_max = kernel_config["tiered_short_max"]
-    if max_model_len <= short_max:
-        return kernel_config  # all rows short-tier -> barrier-free
+    mode = kernel_config["tier_mode"]
+    if mode == "short":
+        return kernel_config  # single workgroup/row -> barrier-free
 
-    # Worst-case workgroups any single row can put on the barrier, given the tier
-    # its length can reach (mid vs long) and the grid width.
     mid_cap = kernel_config["tiered_mid_cap"]
     long_cap = kernel_config["tiered_long_cap"]
     blocks_per_row = kernel_config["blocks_per_row"]
-    if max_model_len <= kernel_config["tiered_mid_max"]:
-        max_active_workgroups_per_row = min(blocks_per_row, mid_cap)
-    else:
-        max_active_workgroups_per_row = min(blocks_per_row, max(mid_cap, long_cap))
 
-    is_single_workgroup = max_active_workgroups_per_row <= 1
-    if is_single_workgroup:
-        return kernel_config  # single-workgroup tier -> barrier-free
+    # Worst-case cooperating workgroups any single row can put on the barrier.
+    # Forced mid/long use that tier's cap for every row; auto only reaches a
+    # multi-block tier for rows longer than short_max.
+    if mode == "mid":
+        max_active_workgroups_per_row = min(blocks_per_row, mid_cap)
+    elif mode == "long":
+        max_active_workgroups_per_row = min(blocks_per_row, long_cap)
+    else:  # auto
+        if max_model_len <= kernel_config["tiered_short_max"]:
+            return kernel_config  # all rows short-tier -> barrier-free
+        if max_model_len <= kernel_config["tiered_mid_max"]:
+            max_active_workgroups_per_row = min(blocks_per_row, mid_cap)
+        else:
+            max_active_workgroups_per_row = min(blocks_per_row, max(mid_cap, long_cap))
+
+    if max_active_workgroups_per_row <= 1:
+        return kernel_config  # single-workgroup -> barrier-free
 
     # Co-resident envelope N = num_CU x occupancy. Occupancy is 2 on all CDNA:
     # the 1024-thread block is wave-limited (32 waves/CU / 16), with VGPR/LDS
@@ -206,11 +223,8 @@ def _apply_deadlock_guard(
         kernel_config["tiered_mid_cap"] = min(mid_cap, max_safe_active_workgroups)
         kernel_config["tiered_long_cap"] = min(long_cap, max_safe_active_workgroups)
     else:
-        kernel_config["tiered_short_max"] = max_model_len
-
-        kernel_config["tiered_mid_max"] = max(
-            kernel_config["tiered_mid_max"], max_model_len
-        )
+        # max_safe_active_workgroups < 2 -> force short tier
+        kernel_config["tier_mode"] = "short"
     return kernel_config
 
 
@@ -249,6 +263,7 @@ def _compile_launcher(
         max_model_len,
         top_k,
         kernel_config["tiered_short_max"],
+        tier_mode=kernel_config["tier_mode"],
     )
     launcher = create_topk_per_row_decode_tiered_kernel(
         top_k=top_k,
