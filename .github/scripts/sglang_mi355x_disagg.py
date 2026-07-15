@@ -139,7 +139,9 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
 [[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
 """,
         """NODELIST_ARG=()
-if [[ -n "${SLURM_RESERVATION:-}" ]]; then
+if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])--nodes([=[:space:]]|$)'; then
+    NODELIST_ARG=()
+elif [[ -n "${SLURM_RESERVATION:-}" ]]; then
     NODELIST_ARG=()
 elif [[ -n "${SLURM_NODELIST:-}" ]]; then
     NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
@@ -318,6 +320,22 @@ for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/nu
     )
     text = replace_once(
         text,
+        """TOTAL_NODES=$((PW + DW))
+""",
+        """TOTAL_NODES=$((PW + DW))
+
+NODE_COUNT_ARG=(-N"$TOTAL_NODES")
+if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])--nodes([=[:space:]]|$)'; then
+    if [[ -n "${SLURM_NODELIST:-}" && -z "${SLURM_RESERVATION:-}" ]]; then
+        NODE_COUNT_ARG=(--nodes "$SLURM_NODELIST")
+    else
+        NODE_COUNT_ARG=(--nodes "$TOTAL_NODES")
+    fi
+fi
+""",
+    )
+    text = replace_once(
+        text,
         """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
@@ -330,7 +348,8 @@ SINGLE_TASK_ARG=()
 if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])(-n,|--ntasks)'; then
     SINGLE_TASK_ARG=(--ntasks=1)
 fi
-srun "${PARTITION_ARG[@]}" -N"$TOTAL_NODES" "${SINGLE_TASK_ARG[@]}" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+
+srun "${PARTITION_ARG[@]}" "${NODE_COUNT_ARG[@]}" "${SINGLE_TASK_ARG[@]}" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
     --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
     )
