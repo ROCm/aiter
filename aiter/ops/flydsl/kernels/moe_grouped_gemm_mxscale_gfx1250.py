@@ -508,8 +508,6 @@ def _compile_stage1_finalize_act(
                         g = -((-g).maximumf(neg_lim))
                         u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
-                            g = -((-g).maximumf(neg_lim))
-                            u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                             t = g * alpha * neg_log2e
                             emu = ArithValue(
                                 llvm.call_intrinsic(
