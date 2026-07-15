@@ -325,6 +325,25 @@ for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/nu
 BATCH_EXIT="$WORKDIR/batch_exit"
 rm -f "$BATCH_EXIT"
 
+SBATCH_PARTITION_LINE=""
+if [[ -n "${SLURM_PARTITION:-}" ]]; then
+    SBATCH_PARTITION_LINE="#SBATCH --partition=$SLURM_PARTITION"
+fi
+SBATCH_NODE_LINE=""
+if [[ -n "${SLURM_RESERVATION:-}" ]]; then
+    SBATCH_NODE_LINE="#SBATCH --reservation=$SLURM_RESERVATION"
+elif [[ -n "${SLURM_NODELIST:-}" ]]; then
+    SBATCH_NODE_LINE="#SBATCH --nodelist=$SLURM_NODELIST"
+fi
+SBATCH_EXCLUSIVE_LINE=""
+if [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]]; then
+    SBATCH_EXCLUSIVE_LINE="#SBATCH --exclusive"
+fi
+SBATCH_EXCLUDE_LINE=""
+if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
+    SBATCH_EXCLUDE_LINE="#SBATCH --exclude=$SLURM_EXCLUDE"
+fi
+
 cat > "$SBATCH_SCRIPT" <<EOF
 #!/bin/bash
 #SBATCH --job-name=$JOB_NAME
@@ -334,22 +353,10 @@ cat > "$SBATCH_SCRIPT" <<EOF
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --output=/tmp/spur-%j.out
 #SBATCH --error=/tmp/spur-%j.err
-EOF
-if [[ -n "${SLURM_PARTITION:-}" ]]; then
-    printf '#SBATCH --partition=%s\\n' "$SLURM_PARTITION" >> "$SBATCH_SCRIPT"
-fi
-if [[ -n "${SLURM_RESERVATION:-}" ]]; then
-    printf '#SBATCH --reservation=%s\\n' "$SLURM_RESERVATION" >> "$SBATCH_SCRIPT"
-elif [[ -n "${SLURM_NODELIST:-}" ]]; then
-    printf '#SBATCH --nodelist=%s\\n' "$SLURM_NODELIST" >> "$SBATCH_SCRIPT"
-fi
-if [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]]; then
-    printf '#SBATCH --exclusive\\n' >> "$SBATCH_SCRIPT"
-fi
-if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
-    printf '#SBATCH --exclude=%s\\n' "$SLURM_EXCLUDE" >> "$SBATCH_SCRIPT"
-fi
-cat >> "$SBATCH_SCRIPT" <<EOF
+$SBATCH_PARTITION_LINE
+$SBATCH_NODE_LINE
+$SBATCH_EXCLUSIVE_LINE
+$SBATCH_EXCLUDE_LINE
 
 set -euo pipefail
 TOTAL_NODES="$TOTAL_NODES"
@@ -465,6 +472,11 @@ cleanup_role
 wait "\\$ROLE_PID" >/dev/null 2>&1 || true
 exit "\\$rc"
 EOF
+if ! grep -q 'set -euo pipefail' "$SBATCH_SCRIPT"; then
+    echo "ERROR: generated submit script is missing payload" >&2
+    sed -n '1,120p' "$SBATCH_SCRIPT" >&2 || true
+    exit 1
+fi
 chmod +x "$SBATCH_SCRIPT"
 
 parse_batch_job_id() {
