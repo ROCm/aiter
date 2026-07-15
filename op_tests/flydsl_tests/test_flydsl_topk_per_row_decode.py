@@ -307,7 +307,7 @@ def _tier_override(mode):
     else:
         os.environ["FLYDSL_TOPK_TIERED_OVERRIDE"] = mode
     m._environ_kernel_config.cache_clear()
-    m._compile_launcher.cache_clear()
+    m._build_launcher.cache_clear()
     try:
         yield m
     finally:
@@ -316,7 +316,7 @@ def _tier_override(mode):
         else:
             os.environ["FLYDSL_TOPK_TIERED_OVERRIDE"] = prev
         m._environ_kernel_config.cache_clear()
-        m._compile_launcher.cache_clear()
+        m._build_launcher.cache_clear()
 
 
 @pytest.mark.parametrize("mode", ["short", "mid", "long"])

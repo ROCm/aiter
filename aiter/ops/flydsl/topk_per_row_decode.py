@@ -38,6 +38,12 @@ _SHORT_MAX_PARAMS = {
 }
 
 
+def _next_pow2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 def _env_int(name: str, default: int | None = None) -> int | None:
     value = os.environ.get(name)
     if value is None:
@@ -84,9 +90,11 @@ def _default_kernel_config(
 
     # Grid width per row: enough workgroups to cover the row at LOAD_VEC elements
     # per thread, clamped to [2, 32] (32 = the wg cap the mid/long tiers can use;
-    # BLOCK_THREADS is fixed at 1024, so max_blocks is 32).
+    # BLOCK_THREADS is fixed at 1024, so max_blocks is 32). blocks_per_row is
+    # rounded to the next pow 2 to reduce the number of compilations.
     items_per_block = _TIERED_LOAD_VEC * _TIERED_BLOCK_THREADS
-    blocks_per_row = min(32, max(2, math.ceil(max_model_len / items_per_block)))
+    raw_blocks_per_row = max(2, math.ceil(max_model_len / items_per_block))
+    blocks_per_row = min(32, _next_pow2(raw_blocks_per_row))
 
     # bits_per_pass: 11 (2048-bin LDS histogram) whenever the arch can afford it;
     # the short tier requires 11. gfx942/gfx950 both qualify (CU count >= 128).
@@ -113,9 +121,11 @@ def _default_kernel_config(
 
     # Batch-aware short vs multi-block crossover (arch-specific base/slope/cap). The
     # multi-block barrier floor grows under CU contention as more rows launch, while
-    # the single-workgroup path is flat in batch.
+    # the single-workgroup path is flat in batch. Bucket num_rows to the next pow 2
+    # for the crossover, so nearby batch sizes share one compiled kernel.
     base, slope, cap = _SHORT_MAX_PARAMS.get(arch, _SHORT_MAX_PARAMS["gfx942"])
-    tiered_short_max = min(cap, base + num_rows * slope)
+    short_max_rows = _next_pow2(num_rows)
+    tiered_short_max = min(cap, base + short_max_rows * slope)
 
     return dict(
         blocks_per_row=blocks_per_row,
@@ -248,11 +258,18 @@ def flydsl_top_k_per_row_decode_workspace_size(
 
 
 @functools.lru_cache(maxsize=16384)
-def _compile_launcher(
+def _build_launcher(
     top_k: int,
     num_rows: int,
     max_model_len: int,
 ):
+    """Build (and lru-cache) the launcher + workspace metadata for this shape.
+
+    Returns the flyc.jit launcher object, does not compile. The first
+    _run_compiled() call triggers flyc.compile.
+
+    Cached per unique (top_k, num_rows, max_model_len).
+    """
     kernel_config = _kernel_config(num_rows, max_model_len)
 
     workspace_slots = topk_workspace_slots(
@@ -386,7 +403,7 @@ def flydsl_top_k_per_row_decode(
         workspace,
     )
 
-    launcher, workspace_slots, workspace_zero = _compile_launcher(
+    launcher, workspace_slots, workspace_zero = _build_launcher(
         k,
         numRows,
         logits.shape[1],
