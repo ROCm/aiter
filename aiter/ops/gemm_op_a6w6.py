@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -37,6 +38,53 @@ _POS = E2M3[0:32].copy()  # positive levels, monotonically increasing 0..7.5
 _E2M3_MAX_EXP = 2  # floor(log2(7.5))
 
 # ---------------------------------------------------------------------------
+# Hadamard rotation along K (accuracy, default ON). mxfp6's per-1x32 e8m0 block
+# scale loses precision when the 32 K-elements of a block span very different
+# magnitudes (real activations/weights have per-channel scale variation) -- the
+# small elements fall into E2M3's coarse subnormal range. A block-diagonal 32-pt
+# Walsh-Hadamard mixes the 32 elements so each block is near-uniform, recovering
+# the lost bits (~4.7x lower rel-err than fp8 on realistic data). Because H is
+# orthonormal, applying it to BOTH operands leaves the GEMM unchanged:
+# (A@H)@(B@H)^T = A@(H@H^T)@B^T = A@B^T -- so it lives entirely in the quant
+# (fused into the Triton pack kernel; asm GEMM untouched). The in-kernel 32x32
+# dot runs in bf16 (fp32-accumulated) -- ~free (+~5us/quant, +3%), and plenty of
+# precision since the result feeds a 3-mantissa E2M3 quant. Disable with
+# AITER_MXFP6_HADAMARD=0 (must be consistent for both operands of a GEMM).
+_MXFP6_HADAMARD = int(os.environ.get("AITER_MXFP6_HADAMARD", "1"))
+
+
+def _hadamard32_np() -> np.ndarray:
+    H = np.ones((1, 1), np.float32)
+    while H.shape[0] < 32:
+        H = np.block([[H, H], [H, -H]])
+    return (H / np.sqrt(32.0)).astype(np.float32)   # orthonormal: H @ H.T = I
+
+
+_HAD32_NP = _hadamard32_np()
+_HAD32_T: dict = {}
+
+
+def _had32_t(device) -> Tensor:
+    t = _HAD32_T.get(device)
+    if t is None:
+        t = torch.from_numpy(_HAD32_NP).to(device)
+        _HAD32_T[device] = t
+    return t
+
+
+def _rotate_k32_torch(x: Tensor) -> Tensor:
+    """Block-diagonal 32x32 Hadamard along the (contiguous) K axis. Rounds H to bf16
+    to mirror the fused kernel's bf16 dot (both: bf16 operands, fp32 accumulate)."""
+    R, K = x.shape
+    h = _had32_t(x.device).to(torch.bfloat16).float()
+    return (x.float().reshape(R, K // 32, 32) @ h).reshape(R, K)
+
+
+def _rotate_k32_np(x: np.ndarray) -> np.ndarray:
+    R, K = x.shape
+    return (x.reshape(R, K // 32, 32).astype(np.float32) @ _HAD32_NP).reshape(R, K)
+
+# ---------------------------------------------------------------------------
 # fused Triton quantize+pack (bf16 -> mxfp6 codes + e8m0 scales, packed into the
 # kernel's C0/C1 tile layout in ONE GPU pass). ~27x faster than the torch path,
 # making per-call activation quantization cheap enough for inference.
@@ -63,7 +111,8 @@ if _HAS_TRITON:
         return mag_code.to(tl.int32) + (scaled < 0.0).to(tl.int32) * 32
 
     @triton.jit
-    def _quant_pack_kernel(x_ptr, a_ptr, s_ptr, M, NB, NK_PAD, stride_xm, BLOCK_M: tl.constexpr):
+    def _quant_pack_kernel(x_ptr, a_ptr, s_ptr, M, NB, NK_PAD, stride_xm, h_ptr,
+                           BLOCK_M: tl.constexpr, APPLY_HAD: tl.constexpr):
         pid = tl.program_id(0)
         jb = pid % NB
         rblk = pid // NB
@@ -73,7 +122,16 @@ if _HAS_TRITON:
         g8 = tl.arange(0, 8)[None, :]
         # coalesced contiguous [BM,32] load, then quantize all 32 and split into 4 phases
         xall = tl.load(x_ptr + r * stride_xm + jb * 32 + tl.arange(0, 32)[None, :],
-                       mask=rm[:, None], other=0.0).to(tl.float32)
+                       mask=rm[:, None], other=0.0)
+        if APPLY_HAD:
+            # 32x32 Hadamard rotation FUSED in-register (no extra memory pass): mixes the
+            # 32 K-elements of this block so mxfp6's per-block scale keeps precision.
+            # bf16 MFMA (fp32 accum) -- fast, and plenty since the result feeds a 3-mantissa
+            # E2M3 quant and the activation is already bf16.
+            h = tl.load(h_ptr + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]).to(tl.bfloat16)
+            xall = tl.dot(xall.to(tl.bfloat16), h)
+        else:
+            xall = xall.to(tl.float32)
         amax = tl.max(tl.abs(xall), 1)
         safe = tl.maximum(amax, 1e-30)
         se = tl.minimum(tl.maximum(tl.floor(tl.log2(safe)) - 2.0, -127.0), 127.0)
@@ -109,6 +167,8 @@ def quant_mxfp6(x: np.ndarray):
     x = np.ascontiguousarray(x, dtype=np.float32)
     R, K = x.shape
     assert K % 32 == 0, "K must be a multiple of 32"
+    if _MXFP6_HADAMARD:
+        x = _rotate_k32_np(x)
     NB = K // 32
     blk = x.reshape(R, NB, 32)
     amax = np.abs(blk).max(axis=2)
@@ -208,6 +268,8 @@ def _tables(device):
 def quant_mxfp6_torch(x: Tensor):
     """torch/GPU version of quant_mxfp6: [R,K] float -> (codes uint8, scales uint8)."""
     x = x.float()
+    if _MXFP6_HADAMARD:
+        x = _rotate_k32_torch(x)
     R, K = x.shape
     NB = K // 32
     blk = x.reshape(R, NB, 32)
@@ -247,68 +309,6 @@ def _pack32_torch(blocks: Tensor) -> Tensor:
     b2 = ((g[..., 2] >> 4) | (g[..., 3] << 2)) & 0xFF
     out = torch.stack([b0, b1, b2], dim=-1).to(torch.uint8)
     return out.reshape(blocks.shape[0], 24)
-
-
-def pack_big_torch_128(codes: Tensor, padK: int = _PADK) -> Tensor:
-    """128-N-row fp6 B tiles (12288 B/slab: C0 8192 + C1 4096) for the 256x128 db kernel."""
-    dev = codes.device
-    R, K = codes.shape
-    nt, nk = R // 128, K // 128
-    rb = torch.arange(8, device=dev).repeat_interleave(64)
-    L = torch.arange(64, device=dev).repeat(8)
-    r16 = L % 16
-    kg = L // 16
-    local_row = rb * 16 + r16
-    t_ax = torch.arange(nt, device=dev).view(nt, 1, 1)
-    s_ax = torch.arange(nk, device=dev).view(1, nk, 1)
-    row = t_ax * 128 + local_row.view(1, 1, 512)
-    col = s_ax * 128 + (kg * 32).view(1, 1, 512)
-    row_b, col_b = torch.broadcast_tensors(row, col)
-    ar = torch.arange(32, device=dev)
-    blocks = codes[row_b.unsqueeze(-1), col_b.unsqueeze(-1) + ar]
-    packed = _pack32_torch(blocks.reshape(-1, 32)).reshape(nt, nk, 512, 24)
-    out = torch.zeros((nt, nk + padK, 12288), dtype=torch.uint8, device=dev)
-    out[:, :nk, :8192] = packed[..., :16].reshape(nt, nk, 512 * 16)
-    out[:, :nk, 8192:] = packed[..., 16:].reshape(nt, nk, 512 * 8)
-    return out.reshape(-1).contiguous()
-
-
-def pack_scale_torch_128(S: Tensor, rows: int, padK: int = _PADK) -> Tensor:
-    """128-N-row e8m0 scale tiles (512 B/slab) for the 256x128 db kernel."""
-    dev = S.device
-    R, NB = S.shape
-    nt, nk = rows // 128, NB // 4
-    off = torch.arange(512, device=dev)
-    kg = off // 128
-    r16 = (off % 128) // 8
-    sub = off % 8
-    row_local = sub * 16 + r16
-    t_ax = torch.arange(nt, device=dev).view(nt, 1, 1)
-    s_ax = torch.arange(nk, device=dev).view(1, nk, 1)
-    row = t_ax * 128 + row_local.view(1, 1, 512)
-    block = s_ax * 4 + kg.view(1, 1, 512)
-    row_b, block_b = torch.broadcast_tensors(row, block)
-    out = torch.full((nt, nk + padK, 512), 127, dtype=torch.uint8, device=dev)
-    out[:, :nk, :] = S[row_b, block_b]
-    return out.reshape(-1).contiguous()
-
-
-def quant_mxfp6_gemm_128(w: Tensor):
-    """Pack a [N,K] weight to the 128-N-row fp6 B layout (for the a6w6 256x128 db kernel).
-    Trailing pad tiles cover the db's 3-ahead B/scaleB prefetch."""
-    rows, K = w.shape
-    padR, padK = _ceil(rows, 128), _ceil(K, 128)
-    w = w.detach()
-    if padR != rows or padK != K:
-        wp = torch.zeros((padR, padK), dtype=w.dtype, device=w.device)
-        wp[:rows, :K] = w
-        w = wp
-    codes, scales = quant_mxfp6_torch(w)
-    packedB = pack_big_torch_128(codes)
-    scaleB = pack_scale_torch_128(scales, padR)
-    padB = torch.zeros(2 * 12288, dtype=torch.uint8, device=packedB.device)
-    padS = torch.full((2 * 512,), 127, dtype=torch.uint8, device=scaleB.device)
-    return torch.cat([packedB, padB]), torch.cat([scaleB, padS])
 
 
 def pack_big_torch(codes: Tensor, padK: int = _PADK) -> Tensor:
@@ -383,13 +383,14 @@ def quant_mxfp6_gemm_out(w: Tensor, packed: Tensor, packed_scale: Tensor):
         x = w
         if padK != K:
             x = torch.nn.functional.pad(x, (0, padK - K))
-        x = x.contiguous()
+        x = x.contiguous()   # rotation is fused inside the kernel (no fp32 [M,K] pre-pass)
         NB = padK // 32
         NK_PAD = padK // 128 + _PADK
         BM = 128
         grid = ((rows + BM - 1) // BM * NB,)
         _quant_pack_kernel[grid](
-            x, packed, packed_scale, rows, NB, NK_PAD, x.stride(0), BLOCK_M=BM
+            x, packed, packed_scale, rows, NB, NK_PAD, x.stride(0),
+            _had32_t(x.device), BLOCK_M=BM, APPLY_HAD=bool(_MXFP6_HADAMARD),
         )
         return packed, packed_scale
 
@@ -431,7 +432,7 @@ def quant_mxfp6_gemm(w: Tensor):
         wp = torch.zeros((padR, padK), dtype=w.dtype, device=w.device)
         wp[:rows, :K] = w
         w = wp
-    codes, scales = quant_mxfp6_torch(w)
+    codes, scales = quant_mxfp6_torch(w)   # rotation applied inside quant_mxfp6_torch
     packed = pack_big_torch(codes)
     packed_scale = pack_scale_torch(scales, padR)
     return packed, packed_scale
@@ -508,17 +509,5 @@ def gemm_a6w6(
     if padM != M or padN != N:
         return out[:M, :N]
     return out
-
-
-_A_DB_PAD_BYTES = 2 * 24576  # trailing pad tiles for the db kernel's 3-ahead A prefetch
-
-
-def quant_mxfp6_gemm_act_db(x: Tensor):
-    """Pack a fp6 activation for the 256x128 db kernel (f6gemm_db_dmabig_kernel_func):
-    identical to `quant_mxfp6_gemm` plus trailing zero tiles so the kernel's 3-ahead
-    A prefetch cannot fault past the last M-tile."""
-    packed, scale = quant_mxfp6_gemm(x)
-    pad = torch.zeros(_A_DB_PAD_BYTES, dtype=torch.uint8, device=packed.device)
-    return torch.cat([packed, pad]), scale
 
 
