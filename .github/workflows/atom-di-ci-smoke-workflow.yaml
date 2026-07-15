@@ -32,9 +32,9 @@ on:
         type: string
         default: "/data/models2/GLM-5.2-FP8"
       run_glm_5_2_fp8:
-        description: "Run GLM-5.2-FP8 1P1D TP-only case"
+        description: "Run GLM-5.2-FP8 1P1D TP-only case (needs an image with the aiter MLA-metadata JIT op; crashes otherwise)"
         required: false
-        default: true
+        default: false
         type: boolean
       log_root:
         description: "Root directory for ATOMesh logs"
@@ -70,7 +70,7 @@ permissions:
   contents: read
 
 env:
-  ATOM_REF_DEFAULT: main
+  ATOM_REF_DEFAULT: 22577adb3ac909c3d0d8fe2209e64afe67b5c7bc
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
@@ -123,7 +123,13 @@ jobs:
                   return raw
               return str(raw).lower() == "true"
 
-          run_glm = bool_input("run_glm_5_2_fp8", True)
+          # GLM-5.2-FP8 disabled by default: the aiter build baked into
+          # rocm/atom-dev:latest crashes at init with
+          # "NameError: name 'module_mla_metadata' is not defined"
+          # (aiter/jit/core.py check_args, MLA-metadata JIT op) on the
+          # glm_moe_dsa MLA path -- independent of ATOM_REF (main crashes too).
+          # Re-enable once the image ships an aiter with that JIT op registered.
+          run_glm = bool_input("run_glm_5_2_fp8", False)
 
           print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
           print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
@@ -315,20 +321,16 @@ jobs:
               )
               return json.loads(output.read_text(encoding="utf-8"))
 
-          # DeepSeek-V4-Pro temporarily disabled: running GLM-5.2-FP8 alone
-          # against ATOM main to verify the module_mla_metadata init crash is
-          # fixed on the mainline engine. Re-enable this entry to restore DeepSeek.
-          requested = []
-          # requested = [
-          #     {
-          #         "model": "DeepSeek-V4-Pro",
-          #         "topology": "1p1d",
-          #         "osl": os.environ["OSL"],
-          #         "conc": os.environ["CONC_LIST"],
-          #         "eval_conc": os.environ["EVAL_CONC_LIST"],
-          #         "run_eval": True,
-          #     }
-          # ]
+          requested = [
+              {
+                  "model": "DeepSeek-V4-Pro",
+                  "topology": "1p1d",
+                  "osl": os.environ["OSL"],
+                  "conc": os.environ["CONC_LIST"],
+                  "eval_conc": os.environ["EVAL_CONC_LIST"],
+                  "run_eval": True,
+              }
+          ]
           if os.environ.get("RUN_GLM_5_2_FP8", "false") == "true":
               requested.append(
                   {
