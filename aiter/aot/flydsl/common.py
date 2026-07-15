@@ -36,6 +36,7 @@ class OpKind(enum.Enum):
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
+    TOPK = "topk"
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         return []
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.TOPK:
+        from .topk import DEFAULT_CSVS, parse_csv
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)
@@ -250,6 +253,8 @@ def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, A
         return kind, {}
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
+    elif kind is OpKind.TOPK:
+        from .topk import compile_one_config
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return kind, compile_one_config(**job)
