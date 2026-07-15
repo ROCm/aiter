@@ -2838,7 +2838,13 @@ def compile_mxscale_gemm(
                         ],
                     )
                     tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, active_dgroup1))
-                    active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
+                    # Carry-propagating 64-bit advance: update BOTH lo and hi so a
+                    # low-dword overflow correctly carries into the high dword
+                    # (a bare addi on lo alone corrupts the address at a 2**32
+                    # boundary). Matches the non-WST _advance_addr path.
+                    active_addr_lo, active_addr_hi = tdm_ops.add_addr_with_carry(
+                        active_addr_lo, active_addr_hi, active_adv_i32
+                    )
             else:
                 for i in range_constexpr(pre_loaded):
                     dg0_a = vector.from_elements(
@@ -2935,11 +2941,12 @@ def compile_mxscale_gemm(
 
             if const_expr(loop_iters > 0):
                 if const_expr(wave_specialized_tdm):
-                    init_args = list(accs) + [active_addr_lo]
+                    init_args = list(accs) + [active_addr_lo, active_addr_hi]
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
                         cur_addr_lo = state[n_accs]
+                        cur_addr_hi = state[n_accs + 1]
 
                         for buf_idx in range_constexpr(num_buffers):
                             load_stage = (buf_idx + num_buffers - 1) % num_buffers
@@ -2949,7 +2956,7 @@ def compile_mxscale_gemm(
                             )
                             pipeline_fence_wait(use_cluster=use_cluster)
 
-                            addr_box = [cur_addr_lo]
+                            addr_box = [cur_addr_lo, cur_addr_hi]
 
                             def _issue_tdm_ws(
                                 _ls=load_stage,
@@ -2961,13 +2968,16 @@ def compile_mxscale_gemm(
                                         pred_const,
                                         active_stage_lds_addr[_ls],
                                         _ab[0],
-                                        active_addr_hi,
+                                        _ab[1],
                                     ],
                                 )
                                 tdm_ops.tensor_load_2d(
                                     tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
                                 )
-                                _ab[0] = arith.addi(_ab[0], active_adv_i32)
+                                # Carry-propagating 64-bit advance (lo + hi).
+                                _ab[0], _ab[1] = tdm_ops.add_addr_with_carry(
+                                    _ab[0], _ab[1], active_adv_i32
+                                )
 
                             # L2 prefetch stays a mid-compute callback so it issues
                             # inside the WMMA body (overlapping compute), separate
@@ -3008,12 +3018,14 @@ def compile_mxscale_gemm(
                                 mid_compute_callback=_mid_prefetch_ws,
                             )
                             cur_addr_lo = addr_box[0]
+                            cur_addr_hi = addr_box[1]
                             hot_loop_scheduler_scheduled()
 
-                        results = yield list(accs_in) + [cur_addr_lo]
+                        results = yield list(accs_in) + [cur_addr_lo, cur_addr_hi]
 
                     accs = list(results[:n_accs])
                     active_addr_lo = results[n_accs]
+                    active_addr_hi = results[n_accs + 1]
                 else:
                     if const_expr(stage1_dual_b):
                         init_args = (
@@ -3404,7 +3416,7 @@ def compile_mxscale_gemm(
                     if const_expr(_load_stage is not None):
                         _tail_had_load = True
                         if const_expr(wave_specialized_tdm):
-                            _tail_addr_box = [active_addr_lo]
+                            _tail_addr_box = [active_addr_lo, active_addr_hi]
 
                             def _tail_mid_ws(_ls=_load_stage, _ab=_tail_addr_box):
                                 dg0 = vector.from_elements(
@@ -3413,13 +3425,16 @@ def compile_mxscale_gemm(
                                         pred_const,
                                         active_stage_lds_addr[_ls],
                                         _ab[0],
-                                        active_addr_hi,
+                                        _ab[1],
                                     ],
                                 )
                                 tdm_ops.tensor_load_2d(
                                     tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
                                 )
-                                _ab[0] = arith.addi(_ab[0], active_adv_i32)
+                                # Carry-propagating 64-bit advance (lo + hi).
+                                _ab[0], _ab[1] = tdm_ops.add_addr_with_carry(
+                                    _ab[0], _ab[1], active_adv_i32
+                                )
 
                             _tail_mid_cb = _tail_mid_ws
                         else:
@@ -3498,6 +3513,7 @@ def compile_mxscale_gemm(
                     if const_expr(_load_stage is not None):
                         if const_expr(wave_specialized_tdm):
                             active_addr_lo = _tail_addr_box[0]
+                            active_addr_hi = _tail_addr_box[1]
                         else:
                             addr_lo_a = _tail_ab[0][0]
                             addr_lo_b = _tail_ab[1][0]
