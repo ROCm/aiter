@@ -267,6 +267,18 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+def validate_topk_ids(topk_ids: torch.Tensor, E: int) -> torch.Tensor:
+    """Clamp every local expert id into [0, E) before it indexes route maps.
+
+    Out-of-range ids silently corrupt the grouped-row scatter (they alias into
+    other experts' rows or write out of bounds), so clamp them into range here.
+    NaN/Inf ids are reset to 0 first so they don't slip through clamp as
+    garbage indices.
+    """
+    topk_ids = torch.nan_to_num(topk_ids, nan=0.0, posinf=0.0, neginf=0.0)
+    return topk_ids.clamp(0, E - 1)
+
+
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
@@ -314,6 +326,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     gate_mode: GateMode = GateMode.SEPARATED,
     swiglu_limit: Optional[float] = None,
 ):
+
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -463,6 +476,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
+    topk_ids = validate_topk_ids(topk_ids, E)
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
