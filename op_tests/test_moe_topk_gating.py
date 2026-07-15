@@ -609,6 +609,61 @@ def test_topk_softmax_correctness(num_experts, num_tokens, topk, dtype):
     _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
 
 
+# Regression test for the softmax + correction_bias path.
+#
+# The prefill kernel (topk_softplus_kernel_prefill) must add bias AFTER softmax
+# normalization: softmax is computed over the raw logits and bias is only added
+# to the selection score. A previous version added bias in the vectorized-load
+# phase (missing the `if constexpr(SCORE_FUNC != SCORE_SOFTMAX)` guard the smem
+# kernels have), which normalized over (logit+bias) and double-counted bias,
+# corrupting both the routing and the reported unbiased weights.
+#
+# This also exercises the type-erased bias path (bias dtype is a runtime tag,
+# not a template arg) for score_func="softmax" across all supported bias dtypes.
+# num_tokens covers both the decode/TPW=1 prefill path (64) and the higher-TPW
+# multi-token prefill path (1024).
+@pytest.mark.parametrize("bias_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("num_tokens", [64, 1024])
+@pytest.mark.parametrize("num_experts", [128, 256])
+def test_topk_softmax_bias_correctness(num_experts, num_tokens, topk, dtype, bias_dtype):
+    """topk_gating softmax with correction_bias: routing + unbiased weights must
+    match the fp32 reference across gating/bias dtype combinations."""
+    torch.random.manual_seed(0)
+    route_scale = 1.0
+
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = (torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1).to(
+        bias_dtype
+    )
+
+    (w_torch, i_torch), _ = run_torch_softmax(
+        gating_output.clone(), bias, topk, route_scale
+    )
+    (w_fused, i_fused), _ = run_fused_softmax(
+        gating_output.clone(), bias, topk, route_scale
+    )
+
+    sel = _selection_scores(gating_output, bias, "softmax")
+    n_mism = _count_routing_mismatches(
+        i_fused,
+        i_torch,
+        sel,
+        topk,
+        bias=bias,
+        label=f"softmax+bias E={num_experts} k={topk} gating={dtype} bias={bias_dtype}",
+    )
+    assert n_mism == 0, (
+        f"E={num_experts},topk={topk},gating={dtype},bias={bias_dtype}: "
+        f"{n_mism}/{num_tokens} tokens have non-tie ID mismatches"
+    )
+
+    # The reported weights must be the *unbiased* softmax weights; the old bug
+    # made these normalize over (logit+bias) and could even exceed max softmax.
+    _assert_weights_close(w_fused, i_fused, w_torch, i_torch)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Test topk_sigmoid and topk_softplus operations"

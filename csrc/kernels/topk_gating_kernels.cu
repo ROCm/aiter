@@ -607,9 +607,15 @@ void topk_softplus_kernel_prefill(
             float score         = compute_score<SCORE_FUNC>(static_cast<float>(vec[j]));
             row_orig[elt]       = score;
             row_chunk[elt]      = score;
-            if(correction_bias != nullptr) {
-                int global_e    = lane_in_group * VPT + elt;
-                row_chunk[elt] += static_cast<float>(correction_bias[global_e]);
+            // Softmax adds bias AFTER normalization (see block below), matching
+            // the smem kernels. Adding it here would make softmax normalize over
+            // (logit+bias) and double-count bias in the selection score.
+            if constexpr(SCORE_FUNC != SCORE_SOFTMAX)
+            {
+                if(correction_bias != nullptr) {
+                    int global_e    = lane_in_group * VPT + elt;
+                    row_chunk[elt] += static_cast<float>(correction_bias[global_e]);
+                }
             }
         }
     }
