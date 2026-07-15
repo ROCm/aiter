@@ -1,0 +1,5 @@
+M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,reason
+4,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,skinny_stub(device-trap on gfx1250)
+3,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,skinny_stub(device-trap on gfx1250)
+2,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,skinny_stub(device-trap on gfx1250)
+1,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,skinny_stub(device-trap on gfx1250)
