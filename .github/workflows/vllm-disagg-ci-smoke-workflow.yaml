@@ -71,6 +71,9 @@ jobs:
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
       SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
+      ROUTER_TYPE_DEFAULT: vllm-router
+      MORIIO_READ_MODE_DEFAULT: "0"
+      VLLM_ROUTER_IMAGE_DEFAULT: vllm/vllm-router:nightly
       SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
       WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
     steps:
@@ -101,6 +104,9 @@ jobs:
           )
           print(f"SPUR_NODELIST={value('spur_nodelist', 'SPUR_NODELIST_DEFAULT')}")
           print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
+          print(f"ROUTER_TYPE={os.environ['ROUTER_TYPE_DEFAULT']}")
+          print(f"MORIIO_READ_MODE={os.environ['MORIIO_READ_MODE_DEFAULT']}")
+          print(f"VLLM_ROUTER_IMAGE={os.environ['VLLM_ROUTER_IMAGE_DEFAULT']}")
           print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
           print(
               "WAIT_TIMEOUT_MINUTES="
@@ -194,9 +200,6 @@ jobs:
           """CI-only compatibility shim for vllm/vllm-openai-rocm:v0.23.0."""
           try:
               import vllm.model_executor.layers.quantization as _q
-              from vllm.model_executor.layers.quantization.modelopt import (
-                  ModelOptMxFp8Config as _ModelOptMxFp8Config,
-              )
           except Exception:
               _q = None
           if _q is not None:
@@ -204,10 +207,15 @@ jobs:
 
               def _aiter_get_quantization_config(quantization):
                   if quantization == "mxfp8":
-                      return _ModelOptMxFp8Config
+                      return _orig_get_quantization_config("modelopt_mxfp8")
                   return _orig_get_quantization_config(quantization)
 
               _q.get_quantization_config = _aiter_get_quantization_config
+              try:
+                  import vllm.model_executor.model_loader.weight_utils as _wu
+                  _wu.get_quantization_config = _aiter_get_quantization_config
+              except Exception:
+                  pass
           PY
           python3 - "${DISAGG_SCRIPTS_STAGE}/run_xPyD_disagg.slurm" <<'PY'
           from pathlib import Path
@@ -239,12 +247,15 @@ jobs:
             sbatch_args+=(--nodes "${n_nodes}" --ntasks "${n_nodes}" --ntasks-per-node 1)
           fi
 
-          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} sbatch ${sbatch_args[*]} ${script}"
+          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
           LOG_ROOT="${log_root}" \
             MODEL_NAME="${MODEL_NAME}" \
             DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}" \
             DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
             IMAGE="${IMAGE}" \
+            ROUTER_TYPE="${ROUTER_TYPE}" \
+            MORIIO_READ_MODE="${MORIIO_READ_MODE}" \
+            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
             sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
 
           job_id="$(
