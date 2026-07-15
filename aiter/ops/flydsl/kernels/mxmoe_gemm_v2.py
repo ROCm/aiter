@@ -7,96 +7,32 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import _to_raw as _raw
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN, T
 from flydsl.expr.typing import Vector as Vec
 
-# shape constants (KIMI defaults; per-shape values come from the compile args)
-NE = 385  # #experts
-TOPK_DEFAULT = 9
-INTER_DEFAULT = 512  # inter_dim: gemm2 D_INTER (contraction)
+from .mxfp4_gemm_common import (
+    kStages,
+    kBS_stride_k0_dw,
+    flat_buffer_view,
+    global_typed_ptr,
+    lds_dma_atom_128,
+    lds_dma_dst,
+    lds_typed_ptr,
+    lds_vec_load,
+    lds_swizzle_mask_f8,
+)
+from .mxfp4_gemm_common import _global_base_ptr1 as global_base_ptr1
+from .mxfp4_gemm_common import _gep1 as gep1
+from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
+from .mxfp4_gemm_common import _buffer_rsrc
+
+# shape constants (per-shape values come from the compile args)
 INTER_MAX_DEFAULT = (
     8192  # compile-time cap for runtime inter_dim (gemm2 B-view / LDS bounds)
 )
 HIDDEN_MAX_DEFAULT = 8192  # compile-time cap for runtime model_dim/hidden
-MAX_M = 655360
 BN = BK = 256
-KH_TILE = BK // 2  # 128 packed-fp4 bytes per K-tile
-kStages = 2
-kBS_stride_k0_dw = 64  # e8m0 scale-layout K-independent stride
-
-
-# -- pointer / LDS helpers ----------------------------------------------------
-def lds_dma_dst(base_i32, byte_off_i32, elem_ty=None, align=16):
-    """LDS dst view for buffer_load_lds DMA (AddressSpace.Shared = LDS enum 2, not addrspace 3)."""
-    if elem_ty is None:
-        elem_ty = T.i32
-    lds_ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)
-    lds_ptr = fx.inttoptr(lds_ptr_ty, fx.Int32(base_i32 + byte_off_i32))
-    return fx.make_view(lds_ptr, fx.make_layout(1, 1))
-
-
-def global_base_ptr1(addr_i64):
-    """One ptr<1> base from a raw i64 device address (bare data_ptr() kernarg)."""
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
-
-
-def gep1(base_ptr, byte_off_i32):
-    """getelementptr i8, base_ptr, byte_off_i32  (ptr<1>)."""
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def global_typed_ptr(arg, elem_ty, align=4):
-    """Typed global fx.Pointer over a raw i64 device address; index in ELEMENTS (ptr[i]), not bytes."""
-    ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
-    return fx.inttoptr(ptr_ty, _raw(fx.Int64(arg)))
-
-
-def lds_typed_ptr(base_i32, elem_ty, align=4):
-    """Typed LDS (Shared) fx.Pointer over an i32 LDS base; index in ELEMENTS (ptr[i]), not bytes."""
-    ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)
-    return fx.inttoptr(ptr_ty, fx.Int32(base_i32))
-
-
-def flat_buffer_view(
-    arg, base_elems, elem_ty, *, align, elem_bytes, fold=True, num_records_bytes=None
-):
-    """Flat buffer-tensor view over a RAW i64 addr; fold=True folds wave-uniform base to a VGPR voffset, fold=False keeps per-lane offset + num_records_bytes for OOB-zero."""
-    ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
-    if fold:
-        base = fx.rocdl.readfirstlane(T.i32, _raw(base_elems))
-        off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(base)).result)
-        base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg) + off_i64 * fx.Int64(elem_bytes))
-    else:
-        base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg))
-    view = fx.Tensor(fx.make_view(base_iter, fx.make_layout((1, 1), (1, 1))))
-    if num_records_bytes is not None:
-        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
-    return fx.rocdl.make_buffer_tensor(view, max_size=True)
-
-
-def lds_dma_atom_128():
-    """BufferCopyLDS128b copy-atom (16B global->LDS DMA chunk)."""
-    return fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-
-
-def lds_vec_load(base_i32, byte_off_i32, result_type, elem_ty, align=4):
-    """Typed LDS ds-read at a BYTE offset from the i32 LDS base; mirrors raw llvm.load (vector or scalar)."""
-    elem_ir_ty = elem_ty.ir_type if hasattr(elem_ty, "ir_type") else elem_ty
-    ptr = lds_typed_ptr(fx.Int32(base_i32) + byte_off_i32, elem_ir_ty, align=align)
-    return fx.ptr_load(ptr, result_type=result_type)
-
-
-def lds_swizzle_mask(row):
-    """lds_swizzle_mask<ROW_BYTES=BK/2=128>(row) = (row & 14) << 3 (fp4 A tile)."""
-    return (row & 14) << 3
-
-
-def lds_swizzle_mask_f8(row):
-    """lds_swizzle_mask<ROW_BYTES=256>(row) = (row & 15) << 4 (fp8 A tile)."""
-    return (row & 15) << 4
 
 
 # BM per-launch (default 32): bodies derive kMChunks=BM//16 (MFMA row-groups), kSubBlocks=BM//32.
@@ -471,9 +407,7 @@ def gemm2_body_v2(
     # A-scale buffer resource + uniform base (raw load); chunk = m_block_idx (BM16) else m_row//32.
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
     asc_num = fx.Index(i32_max_m_blocks) * fx.Index(asc_per_mb)
-    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=asc_num
-    )
+    ascale_rsrc = _buffer_rsrc(arg_ascale, asc_num)
     scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
     a_scale_s_base = rocdl.readfirstlane(
         T.i32, scale_chunk0 * kAS_per_chunk_dw * fx.Int32(4)
