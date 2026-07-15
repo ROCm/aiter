@@ -105,12 +105,14 @@ def parse_csv(csv_path: str):
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
             stage1_name = row.get("kernelName1", "").strip()
+            stage2_name = row.get("kernelName2", "").strip()
             stage1_params = (
                 get_flydsl_kernel_params(stage1_name)
                 if stage1_name.startswith("flydsl_")
                 else None
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
+            stage1_v2_output_layout = stage2_name.startswith("flydsl_moe2_layout_")
 
             # cktile_ stage1 runs a FlyDSL post-activation epilogue (silu ->
             # silu_and_mul_fq, swiglu -> swiglu_and_mul) that the flydsl_-only loop
@@ -138,6 +140,8 @@ def parse_csv(csv_path: str):
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
                 if not name or not name.startswith("flydsl_"):
+                    continue
+                if name.startswith("flydsl_moe2_layout_"):
                     continue
 
                 params = get_flydsl_kernel_params(name)
@@ -168,6 +172,8 @@ def parse_csv(csv_path: str):
                             if stage1_out_dtype in ("fp4", "fp8")
                             else None
                         )
+                    elif params["stage"] == 1 and stage1_v2_output_layout:
+                        job["v2_output_layout"] = True
 
                     full_job = {**job, **params}
                     key = job_identity(full_job)
@@ -216,6 +222,7 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -412,6 +419,7 @@ def _precompile_to_cache(
             _gui_sk = gate_mode == "interleave" and _is_splitk
             _gui_sk_fused = _gui_sk and _fuse_any_quant
             _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
+            _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
             _gemm_out_torch_dtype = (
                 torch.bfloat16 if _gemm_out_dtype == "bf16" else torch.float16
             )
@@ -441,23 +449,46 @@ def _precompile_to_cache(
                 )
             else:
                 tmp_out = None
-                out = (
-                    torch.empty(
-                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
+                if _v2_output_layout:
+                    _sorted_rows = max(
+                        sorted_token_ids.shape[0],
+                        sorted_expert_ids.shape[0] * tile_m,
                     )
-                    if _need_fp4
-                    else (
+                    out = (
                         torch.empty(
-                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
-                        )
-                        if _need_fp8
-                        else torch.empty(
-                            (tokens, topk, inter_dim),
+                            (_sorted_rows, inter_dim // 2),
                             device=dev,
-                            dtype=_gemm_out_torch_dtype,
+                            dtype=torch.uint8,
+                        )
+                        if _need_fp4
+                        else torch.empty(
+                            (_sorted_rows, inter_dim),
+                            device=dev,
+                            dtype=torch.uint8,
                         )
                     )
-                )
+                else:
+                    out = (
+                        torch.empty(
+                            (tokens, topk, inter_dim // 2),
+                            device=dev,
+                            dtype=torch.uint8,
+                        )
+                        if _need_fp4
+                        else (
+                            torch.empty(
+                                (tokens, topk, inter_dim),
+                                device=dev,
+                                dtype=torch.uint8,
+                            )
+                            if _need_fp8
+                            else torch.empty(
+                                (tokens, topk, inter_dim),
+                                device=dev,
+                                dtype=_gemm_out_torch_dtype,
+                            )
+                        )
+                    )
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
@@ -576,6 +607,7 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 k_wave=k_wave,
+                v2_output_layout=_v2_output_layout,
             )
             _run_compiled(exe, args)
 
