@@ -27,7 +27,7 @@ on:
         description: "Shared workspace root visible from the Spur submit and compute nodes"
         required: false
         type: string
-        default: "/it-shared/xinhuang/sglang-aiter-ci"
+        default: "/data/xinhuang/sglang-aiter-ci"
       slurm_nodelist:
         description: "Optional comma-separated Slurm nodes. Use auto to choose two approved nodes."
         required: false
@@ -74,7 +74,7 @@ env:
   IMAGE_OVERRIDE_DEFAULT: ""
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
-  SHARED_WORKSPACE_ROOT_DEFAULT: /it-shared/xinhuang/sglang-aiter-ci
+  SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
   SLURM_NODELIST_DEFAULT: auto
   SLURM_RESERVATION_DEFAULT: ""
   SLURM_NODELIST_ALLOWED: >-
@@ -93,7 +93,7 @@ jobs:
       github.event.action != 'labeled' ||
       github.event.label.name == 'ci:sglang' ||
       github.event.label.name == 'ci:all'
-    runs-on: [self-hosted, aiter-di-ci-spur-login-sglang-crusoe]
+    runs-on: [self-hosted, aiter-di-ci-spur-login-sglang]
     timeout-minutes: 240
 
     steps:
@@ -108,6 +108,7 @@ jobs:
           python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
           import json
           import os
+          import subprocess
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as f:
@@ -118,8 +119,7 @@ jobs:
           def value(name: str, default_env: str) -> str:
               raw = inputs.get(name, "")
               default = os.environ[default_env]
-              val = raw if raw not in ("", None) else default
-              return os.path.expandvars(val)
+              return raw if raw not in ("", None) else default
 
           pairs = {
               "SGLANG_REF": value("sglang_ref", "SGLANG_REF_DEFAULT"),
@@ -150,11 +150,43 @@ jobs:
           )
           requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
           if requested_nodes_raw.lower() == "auto":
-              requested_nodes = []
+              try:
+                  sinfo_output = subprocess.check_output(
+                      ["sinfo", "-N"],
+                      text=True,
+                      stderr=subprocess.STDOUT,
+                  )
+              except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+                  raise SystemExit(f"failed to query sinfo for auto nodelist: {exc}")
+              node_state = {}
+              for line in sinfo_output.splitlines():
+                  parts = line.split()
+                  if not parts or parts[0] == "NODELIST" or len(parts) < 4:
+                      continue
+                  node_state[parts[0]] = parts[3].lower()
               print(
-                  "slurm_nodelist=auto: leaving node selection to SPUR scheduler",
+                  "approved node states: "
+                  + ", ".join(
+                      f"{node}={node_state.get(node, 'missing')}"
+                      for node in allowed_nodes
+                  ),
                   file=sys.stderr,
               )
+              requested_nodes = [
+                  node
+                  for node in allowed_nodes
+                  if node_state.get(node, "").startswith("idle")
+              ]
+              if len(requested_nodes) < 2:
+                  state_dump = ", ".join(
+                      f"{node}={node_state.get(node, 'missing')}"
+                      for node in allowed_nodes
+                  )
+                  raise SystemExit(
+                      "slurm_nodelist=auto requires at least two idle approved "
+                      f"nodes, found {len(requested_nodes)}. {state_dump}"
+                  )
+              requested_nodes = requested_nodes[:2]
           else:
               requested_nodes = [
                   node.strip()
@@ -170,7 +202,7 @@ jobs:
                   "slurm_nodelist contains non-approved nodes: "
                   + ", ".join(unknown_nodes)
               )
-          if requested_nodes and len(requested_nodes) != 2:
+          if len(requested_nodes) != 2:
               raise SystemExit(
                   "slurm_nodelist must resolve to exactly two approved nodes for 1P1D"
               )
