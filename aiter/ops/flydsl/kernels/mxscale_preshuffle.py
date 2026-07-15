@@ -133,9 +133,7 @@ def launch_gemm(
     tiles_per_chunk = 256 // BK  # 1 for tile_k=256, 2 for tile_k=128
     m_chunks = BM // 16
     num_acc_n = (BN // 4) // 16  # 16-col n-subblocks per wave
-    _scale_chunk_dw = (
-        K // 32 // 4 // 2
-    ) * 64  # e8m0 stride (dwords), per shuffle_scale_w4
+    _scale_chunk_dw = ((K + 255) // 256) * 64  # e8m0 stride in dwords
     _scale_k0_dw = 64
     n_coop = A_LDS_B // 256 // 16  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)

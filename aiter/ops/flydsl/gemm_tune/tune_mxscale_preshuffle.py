@@ -179,9 +179,11 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
             info_keys = (gfx, cu_num, M, N, K, a_dtype, b_dtype)
             shape_tasks = self.get_flydsl_mxscale_tune_task(info_keys, seed, args)
             if not shape_tasks:
-                # no legal candidate for this shape (e.g. K%256!=0); skip so
+                # no legal candidate for this shape (e.g. K%128!=0); skip so
                 # mp_tuner's shape grouping stays consistent with the task list.
-                print(f"[mxscale] skip untuned shape M={M} N={N} K={K} {a_dtype}/{b_dtype}: no legal tile")
+                print(
+                    f"[mxscale] skip untuned shape M={M} N={N} K={K} {a_dtype}/{b_dtype}: no legal tile"
+                )
                 continue
             task.extend(shape_tasks)
             tasks_data.append((len(shape_tasks), ()))

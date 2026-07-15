@@ -117,9 +117,11 @@ def instance_valid(ki: kernelInstance) -> bool:
 
 
 def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
-    """M is ragged (grid ceil + OOB clip). K must be a multiple of 256 (the E8M0
-    scale chunk is 256-K granular) in addition to N%tile_n / K%tile_k."""
-    if K % 256 != 0:
+    """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
+    microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
+    word (shuffle_scale rounds K up to a whole 256-K chunk). K%tile_k excludes
+    tile_k=256 when K%256!=0, so a K=384 shape only matches tile_k=128 kernels."""
+    if K % 128 != 0:
         return False
     return (N % ki.tile_n == 0) and (K % ki.tile_k == 0)
 
