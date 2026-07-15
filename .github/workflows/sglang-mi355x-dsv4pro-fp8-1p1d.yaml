@@ -32,7 +32,7 @@ on:
         description: "Optional comma-separated Slurm nodes. Use auto to choose two approved nodes."
         required: false
         type: string
-        default: "auto"
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14"
       slurm_partition:
         description: "Optional Slurm partition. Empty omits -p."
         required: false
@@ -75,7 +75,7 @@ env:
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
-  SLURM_NODELIST_DEFAULT: auto
+  SLURM_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
   SLURM_RESERVATION_DEFAULT: ""
   SLURM_NODELIST_ALLOWED: >-
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,

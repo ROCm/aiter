@@ -318,30 +318,102 @@ for n in "${DNODES[@]}"; do run_on_node "$n" docker kill mi355x_decode  >/dev/nu
     )
     text = replace_once(
         text,
-        """TOTAL_NODES=$((PW + DW))
+        """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
+    --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
 """,
-        """TOTAL_NODES=$((PW + DW))
-NODE_COUNT_ARG=(--nodes "$TOTAL_NODES")
+        """SBATCH_SCRIPT="$WORKDIR/submit.sh"
+BATCH_EXIT="$WORKDIR/batch_exit"
+rm -f "$BATCH_EXIT"
+
+cat > "$SBATCH_SCRIPT" <<EOF
+#!/bin/bash
+#SBATCH --job-name=$JOB_NAME
+#SBATCH --nodes=$TOTAL_NODES
+#SBATCH --ntasks=$TOTAL_NODES
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=$TIME_LIMIT
+#SBATCH --output=$WORKDIR/slurm-%j.out
+#SBATCH --error=$WORKDIR/slurm-%j.err
+EOF
+if [[ -n "${SLURM_PARTITION:-}" ]]; then
+    printf '#SBATCH --partition=%s\\n' "$SLURM_PARTITION" >> "$SBATCH_SCRIPT"
+fi
+if [[ -n "${SLURM_RESERVATION:-}" ]]; then
+    printf '#SBATCH --reservation=%s\\n' "$SLURM_RESERVATION" >> "$SBATCH_SCRIPT"
+elif [[ -n "${SLURM_NODELIST:-}" ]]; then
+    printf '#SBATCH --nodelist=%s\\n' "$SLURM_NODELIST" >> "$SBATCH_SCRIPT"
+fi
+if [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]]; then
+    printf '#SBATCH --exclusive\\n' >> "$SBATCH_SCRIPT"
+fi
+if [[ -n "${SLURM_EXCLUDE:-}" ]]; then
+    printf '#SBATCH --exclude=%s\\n' "$SLURM_EXCLUDE" >> "$SBATCH_SCRIPT"
+fi
+cat >> "$SBATCH_SCRIPT" <<EOF
+
+set -euo pipefail
+set +e
+bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+rc=\\$?
+echo "\\$rc" > "$BATCH_EXIT"
+exit "\\$rc"
+EOF
+chmod +x "$SBATCH_SCRIPT"
+
+parse_batch_job_id() {
+    local output="$1"
+    output="${output//$'\\r'/}"
+    if [[ "$output" =~ Submitted[[:space:]]+batch[[:space:]]+job[[:space:]]+([0-9]+) ]]; then
+        printf '%s\\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$output" =~ ^[[:space:]]*([0-9]+)(\\;.*)?[[:space:]]*$ ]]; then
+        printf '%s\\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+echo "=== submitting batch script ==="
+sed -n '1,80p' "$SBATCH_SCRIPT"
+SBATCH_OUTPUT="$(sbatch "$SBATCH_SCRIPT")"
+SALLOC_RC=$?
+echo "$SBATCH_OUTPUT"
+if [[ "$SALLOC_RC" -eq 0 ]]; then
+    if ! BATCH_JOB_ID="$(parse_batch_job_id "$SBATCH_OUTPUT")"; then
+        echo "ERROR: unable to parse batch job id from sbatch output: $SBATCH_OUTPUT" >&2
+        SALLOC_RC=1
+    else
+        echo "batch_job_id=$BATCH_JOB_ID"
+        SLURM_OUT="$WORKDIR/slurm-${BATCH_JOB_ID}.out"
+        SLURM_ERR="$WORKDIR/slurm-${BATCH_JOB_ID}.err"
+        while [[ ! -f "$BATCH_EXIT" ]]; do
+            queue_line="$(squeue -j "$BATCH_JOB_ID" -h 2>/dev/null || true)"
+            if [[ -n "$queue_line" ]]; then
+                echo "[batch] $queue_line"
+                sleep 30
+            else
+                sleep 5
+                [[ -f "$BATCH_EXIT" ]] || { echo "ERROR: batch job $BATCH_JOB_ID ended without $BATCH_EXIT" >&2; SALLOC_RC=1; break; }
+            fi
+        done
+        if [[ -f "$BATCH_EXIT" ]]; then
+            SALLOC_RC="$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
+        fi
+        echo "--- slurm stdout ---"
+        cat "$SLURM_OUT" 2>/dev/null || true
+        echo "--- slurm stderr ---"
+        cat "$SLURM_ERR" 2>/dev/null || true
+    fi
+fi
 """,
     )
     text = replace_once(
         text,
-        """salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
-    --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
+        """    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+SALLOC_RC=$?
 """,
-        """if [[ "${SLURM_EXCLUSIVE:-1}" == "1" ]] && ! srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])--exclusive([=[:space:]]|$)'; then
-    echo "srun does not support --exclusive; skipping exclusive node request"
-    EXCLUSIVE_ARG=()
-fi
-
-SINGLE_TASK_ARG=()
-if srun --help 2>&1 | grep -Eq -- '(^|[[:space:]])(-n,|--ntasks)'; then
-    SINGLE_TASK_ARG=(--ntasks=1)
-fi
-
-srun "${PARTITION_ARG[@]}" "${NODE_COUNT_ARG[@]}" "${SINGLE_TASK_ARG[@]}" "${NODELIST_ARG[@]}" "${RESERVATION_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \\
-    --job-name "$JOB_NAME" -t "$TIME_LIMIT" \\
-""",
+        "",
     )
 
     launcher.write_text(text, encoding="utf-8")
