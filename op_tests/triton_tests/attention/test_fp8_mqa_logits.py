@@ -3,7 +3,10 @@ import torch
 import pytest
 from typing import Tuple
 from aiter.ops.triton.utils.types import get_fp8_dtypes
-from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.attention.fp8_mqa_logits import (
+    fp8_mqa_logits,
+    FOLDED_REDUCTED_SUPPORT,
+)
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 fp8_info = torch.finfo(e4m3_type)
@@ -95,9 +98,11 @@ def generate_cp_test_data(seq_len, seq_len_kv):
         (128, 1024),
         (1024, 1024),
         (1024, 1560),
+        (256, 4096),
+        (512, 8192),
     ],
 )
-@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("disable_cp", [True, False])
 @pytest.mark.parametrize("clean_logits", [True, False])
@@ -148,4 +153,38 @@ def test_fp8_mqa_logits(
     diff = calc_diff(logits, ref_logits)
     if ref_neginf_mask.all():
         return  # nothing left to compare
+    assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.skipif(
+    not FOLDED_REDUCTED_SUPPORT,
+    reason="folded-FMA reduction needs a Triton with constexpr-tuple permute (PR #9751)",
+)
+@pytest.mark.parametrize("s_q, s_k", [(256, 4096), (512, 8192)])
+@pytest.mark.parametrize("num_heads", [32, 64])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@torch.inference_mode()
+def test_fp8_mqa_logits_folded_reduction(s_q, s_k, num_heads, head_dim):
+    # On a Triton with #9751 the dispatch auto-selects the folded-FMA head
+    # reduction (num_chains=4, num_heads > 16); exercise that path explicitly.
+    # Skipped on older Triton where the reduction is the naive gl.sum.
+    torch.manual_seed(0)
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
+    q_fp8 = q.to(e4m3_type)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    ref_logits, _ = ref_fp8_mqa_logits(
+        q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
+    )
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke)
+    ref_neginf = ref_logits == float("-inf")
+    assert torch.equal(logits == float("-inf"), ref_neginf)
+    diff = calc_diff(
+        logits.masked_fill(ref_neginf, 0), ref_logits.masked_fill(ref_neginf, 0)
+    )
     assert diff < 1e-3, f"{diff=}"
