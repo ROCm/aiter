@@ -39,6 +39,7 @@ Constraints:
 
 import functools
 import math as host_math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -263,6 +264,10 @@ def build_hstu_attention_bwd_dvdk(
 
     do_tile_elems = BLOCK_N * hidden_dim
     assert do_tile_elems % elems_per_dma_pass == 0
+    # Direct dO global->LDS DMA path (single-barrier variant): row-major [q, d], no
+    # swizzle (matches the do_smem read layout). Mirrors the Q DMA sans swizzle.
+    NUM_DMA_DO = do_tile_elems // elems_per_dma_pass
+    PAIRS_PER_ROW_DO = DO_STRIDE // DMA_ELEMS
 
     VEC_DO = 8 if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0) else DMA_ELEMS
     THREADS_PER_ROW_DO = hidden_dim // VEC_DO
@@ -356,6 +361,14 @@ def build_hstu_attention_bwd_dvdk(
         q_smem = SmemPtr(lds_base, q_lds_offset, elem_type, shape=(BLOCK_N, Q_STRIDE))
         do_smem = SmemPtr(lds_base, do_lds_offset, elem_type, shape=(BLOCK_N, DO_STRIDE))
         q_lds_byte_base = buffer_ops.extract_base_index(q_smem.get(), address_space=3)
+
+        # Direct dO global->LDS DMA (single-barrier variant). dO is [L, H, hidden],
+        # so the per-token stride is num_heads*hidden_dim; base at this head's slice.
+        stride_do_n = num_heads * hidden_dim
+        do_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_do_n)
+                               + fx.Int64(head_idx) * fx.Int64(hidden_dim)) * fx.Int64(2)
+        do_rsrc = buffer_ops.create_buffer_resource(do, max_size=True, base_byte_offset=do_base_byte_offset)
+        do_lds_byte_base = buffer_ops.extract_base_index(do_smem.get(), address_space=3)
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
@@ -494,6 +507,29 @@ def build_hstu_attention_bwd_dvdk(
                 voffset = g_elem * fx.Int32(2)
                 lds_ptr = buffer_ops.create_llvm_ptr(wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES), address_space=3)
                 rocdl.raw_ptr_buffer_load_lds(q_rsrc, lds_ptr, dma_size, voffset, dma_soff, dma_off, dma_aux)
+
+        # Direct dO global->LDS DMA (single-barrier variant), row-major [q, d].
+        # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
+        # value is multiplied out — same safe-garbage contract as the Q DMA.
+        c_stride_do_n = fx.Int32(stride_do_n)
+        wave_lds_base_do = do_lds_byte_base + fx.Index(wave_id) * fx.Index(WARP_SIZE * DMA_BYTES)
+        wave_lds_lane0_do = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_lds_base_do))
+        do_dma_rows = []
+        do_dma_cols = []
+        for d in range_constexpr(NUM_DMA_DO):
+            pair = tid + fx.Int32(d * BLOCK_THREADS)
+            do_dma_rows.append(pair // fx.Int32(PAIRS_PER_ROW_DO))
+            do_dma_cols.append((pair % fx.Int32(PAIRS_PER_ROW_DO)) * c_dma_elems)
+
+        def async_load_do_lds(q_start):
+            for d in range_constexpr(NUM_DMA_DO):
+                row = do_dma_rows[d]
+                in_bounds = (q_start + row) < seq_len
+                local_tok = in_bounds.select(q_start + row, fx.Int32(0))
+                g_elem = local_tok * c_stride_do_n + do_dma_cols[d]
+                voffset = g_elem * fx.Int32(2)
+                lds_ptr = buffer_ops.create_llvm_ptr(wave_lds_lane0_do + fx.Int64(d * BLOCK_THREADS * DMA_BYTES), address_space=3)
+                rocdl.raw_ptr_buffer_load_lds(do_rsrc, lds_ptr, dma_size, voffset, dma_soff, dma_off, dma_aux)
 
         do_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_DO)
         do_load_lane_in_row = tid % fx.Int32(THREADS_PER_ROW_DO)
@@ -648,6 +684,23 @@ def build_hstu_attention_bwd_dvdk(
         do_reg_outstanding = NUM_BATCHES_DO
 
         def run_q_tile(acc, q_start):
+            if const_expr(_SINGLE_BARRIER):
+                # Single-barrier variant: DMA both Q and dO global->LDS, then one
+                # workgroup barrier publishes both. Removes the 2nd barrier and the
+                # dO register round-trip (frees the dO staging VGPRs), at the cost of
+                # the dO-load/S-compute overlap the register path provided.
+                async_load_q(q_start)
+                async_load_do_lds(q_start)
+                _waitcnt_vm_n(0)
+                gpu.barrier()
+                q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
+                p_packs, s_meta = compute_s_tile(q_start, q_packs)
+                dv_acc = [acc[i] for i in range(N_ACC_DV)]
+                dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
+                dv_acc = accum_dv_tile(dv_acc, p_packs)
+                dk_acc = accum_dk_tile(dk_acc, compute_ds_packs(s_meta))
+                return dv_acc + dk_acc
+
             async_load_q(q_start)
             do_vecs = async_load_do_regs(q_start)
             _waitcnt_vm_n(do_reg_outstanding)
