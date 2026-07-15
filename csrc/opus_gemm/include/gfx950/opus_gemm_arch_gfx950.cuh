@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// opus_gemm_arch_gfx950.cuh — gfx950-specific dispatch implementations.
+// opus_gemm_arch_gfx950.cuh -- gfx950-specific dispatch implementations.
 //
 // Provides:
-//   * opus_dispatch_a16w16_gfx950<T>      — tuned (M,N,K) lookup → heuristic
-//   * opus_a16w16_tune_dispatch_gfx950<T> — id-based tune dispatch
+//   * opus_dispatch_a16w16_gfx950<T>      -- tuned (M,N,K) lookup -> heuristic
+//   * opus_a16w16_tune_dispatch_gfx950<T> -- id-based tune dispatch
 //
 // This header is intended to be included exactly once, by opus_gemm.cu, where
 // the arch routers in that TU select the per-arch entry. Other TUs (the
@@ -103,15 +103,24 @@ constexpr int kSplitkKidMin       = 200;
 constexpr int kSplitkKidMax       = 300;
 constexpr int kNooobKidOffset     = 1000;
 
+constexpr int kUniformSplitkKidMin   = 500;
+constexpr int kUniformSplitkKidMax   = 600;
+
 constexpr bool kid_is_splitk(int kid) noexcept
 {
     return (kid >= kSplitkKidMin && kid < kSplitkKidMax) ||
            (kid >= kSplitkKidMin + kNooobKidOffset &&
-            kid < kSplitkKidMax + kNooobKidOffset);
+            kid < kSplitkKidMax + kNooobKidOffset) ||
+           (kid >= kUniformSplitkKidMin && kid < kUniformSplitkKidMax) ||
+           (kid >= kUniformSplitkKidMin + kNooobKidOffset &&
+            kid < kUniformSplitkKidMax + kNooobKidOffset) ||
+           (kid >= kBhsdSplitkKidMin && kid < kBhsdSplitkKidMax) ||
+           (kid >= kBhsdSplitkKidMin + kNooobKidOffset &&
+            kid < kBhsdSplitkKidMax + kNooobKidOffset);
 }
 }  // namespace opus_gfx950_detail
 
-// ── a16w16 tune dispatch (id-based, two specializations) ────────────────────
+// -- a16w16 tune dispatch (id-based, two specializations) --------------------
 //
 // The bf16 table omits splitk kids (their <bf16_t> instantiation doesn't
 // exist; splitk main kernel hardcodes D_C=float). The fp32 table includes
@@ -157,7 +166,7 @@ opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
     return it->func;
 }
 
-// ── a16w16 runtime dispatch (tuned lookup → heuristic fallback) ─────────────
+// -- a16w16 runtime dispatch (tuned lookup -> heuristic fallback) -------------
 //
 // On miss the heuristic returns an integer kid; we re-dispatch through
 // opus_a16w16_tune_dispatch_gfx950<>(). Splitk kids only have a <fp32_t>

@@ -47,27 +47,15 @@ from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.opus.gemm_op_a16w16 import (
     opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
+    _opus_gemm_a16w16_mmajor_raw,
 )
+from codegen.common import _A16W16_TAGS
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
-    a16w16_kernels_list,
-    a16w16_kernels_list_nooob,
-    a16w16_kernels_list_cpol,
-    a16w16_kernels_list_cpol_nooob,
-    a16w16_flatmm_kernels_list,
-    a16w16_flatmm_splitk_kernels_list,
-    a16w16_flatmm_splitk_kernels_list_nooob,
-    a16w16_persistent_kernels_list,
-    a16w16_persistent_kernels_list_cpol,
-    a16w16_persistent_kernels_list_nooob,
-    a16w16_persistent_kernels_list_cpol_nooob,
-    gfx942_nosplit_kernels_list,
-    gfx942_splitk_kernels_list,
-    gfx1250_kernels_list,
-    gfx1250_clusterlaunch_kernels_list,
     GFX1250_PLAIN_KID_OF,
     GFX1250_CLUSTERLAUNCH_KID_OF,
+    kernels_list as opus_all_kernels_list,
     SPLITK_KIDS,
     NON_SPLITK_KIDS,
     BIAS_AWARE_KIDS,
@@ -943,22 +931,11 @@ _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
 
 # Merge every a16w16-family kid into one tuner search space: * split-barrier a16w16: 4..9 legacy
 # cpol = (0, 17) (traits default) ...
+A16W16_TUNE_TAGS = set(_A16W16_TAGS)
 a16w16_all_kernels = {
-    **a16w16_kernels_list,
-    **a16w16_kernels_list_nooob,
-    **a16w16_kernels_list_cpol,
-    **a16w16_kernels_list_cpol_nooob,
-    **a16w16_flatmm_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list,
-    **a16w16_flatmm_splitk_kernels_list_nooob,
-    **a16w16_persistent_kernels_list,
-    **a16w16_persistent_kernels_list_cpol,
-    **a16w16_persistent_kernels_list_nooob,
-    **a16w16_persistent_kernels_list_cpol_nooob,
-    **gfx942_nosplit_kernels_list,
-    **gfx942_splitk_kernels_list,
-    **gfx1250_kernels_list,
-    **gfx1250_clusterlaunch_kernels_list,
+    kid: k
+    for kid, k in opus_all_kernels_list.items()
+    if k.kernel_tag in A16W16_TUNE_TAGS
 }
 
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
@@ -976,6 +953,18 @@ except Exception:
     # rocminfo unavailable -> fall back to enumerating everything so the
     # legacy multi-arch behaviour is preserved on build-only hosts.
     a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
+
+
+# Tags with generated *_mmajor launchers and tune-lookup entries.
+MMAJOR_TUNE_TAGS = frozenset(
+    {
+        "a16w16_flatmm_splitk",
+        "a16w16",
+        "a16w16_interleave",
+        "a16w16_persistent",
+        "a16w16_mono_tile",
+    }
+)
 
 
 # -- dtype handling ---------------------------------------------------------- CSV convention
@@ -1061,6 +1050,36 @@ def generate_data(
     return XQ, WQ, Y, bias_t
 
 
+def generate_data_mmajor(
+    batch,
+    m,
+    n,
+    k,
+    seed,
+    dtype=dtypes.bf16,
+    outdtype=dtypes.bf16,
+    bias=False,
+    device="cuda",
+):
+    """Generate wo_a/mmajor tensors: XQ/Y are [M, batch, *]."""
+    _install_opus_perftest_once()
+    if isinstance(dtype, str):
+        dtype = _dtype_csv_str_to_torch(dtype)
+    if isinstance(outdtype, str):
+        outdtype = _dtype_csv_str_to_torch(outdtype)
+
+    torch.manual_seed(seed)
+    XQ = torch.randn((m, batch, k), dtype=dtype, device=device)
+    WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
+    Y = torch.empty((m, batch, n), dtype=outdtype, device=device)
+    if bias:
+        # mmajor pybind currently has no bias argument; caller rejects bias.
+        bias_t = torch.randn((batch, n), dtype=outdtype, device=device)
+    else:
+        bias_t = None
+    return XQ, WQ, Y, bias_t
+
+
 MAX_DELTA_SCALE = 0.1
 
 
@@ -1087,6 +1106,16 @@ def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
     return acc.to(out_dtype)
 
 
+def opus_gemm_ref_mmajor(XQ, WQ, bias=None, out_dtype=None):
+    """Reference for XQ=[M,batch,K], WQ=[batch,N,K], output [M,batch,N]."""
+    if out_dtype is None:
+        out_dtype = XQ.dtype
+    acc = torch.einsum("mbk,bnk->mbn", XQ.float(), WQ.float())
+    if bias is not None:
+        acc = acc + bias.float().unsqueeze(0)
+    return acc.to(out_dtype)
+
+
 def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
     """Eager-path tuner func: runs the kernel AND an on-the-fly max_delta check.
 
@@ -1098,6 +1127,24 @@ def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
     _quiet_aiter_logger_once()
     _opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
     ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
+    max_delta = (Y.float() - ref.float()).abs().max().item()
+    max_ref = ref.float().abs().max().item()
+    bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
+    if max_delta > bound:
+        raise RuntimeError(
+            f"maxDelta {max_delta:.1f} exceeds bound {bound:.1f} "
+            f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE})"
+        )
+    return Y
+
+
+def run_opus_gemm_mmajor(XQ, WQ, Y, bias, kernelId, splitK):
+    """Eager-path tuner func for wo_a/mmajor layout."""
+    _quiet_aiter_logger_once()
+    if bias is not None:
+        raise RuntimeError("mmajor opus tune path does not support bias")
+    _opus_gemm_a16w16_mmajor_raw(XQ, WQ, Y, kernelId, splitK)
+    ref = opus_gemm_ref_mmajor(XQ, WQ, None, Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
     bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
@@ -1192,6 +1239,32 @@ def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
 
         # Capture-safe sync: guarantees the warmup kernel has completed before we read Y for the
         # max_delta check (above) or before the ou...
+        torch.cuda.current_stream().synchronize()
+    return Y
+
+
+def run_opus_gemm_mmajor_bench(XQ, WQ, Y, bias, kernelId, splitK):
+    """Tuner bench func for wo_a/mmajor layout."""
+    _quiet_aiter_logger_once()
+    if bias is not None:
+        raise RuntimeError("mmajor opus tune path does not support bias")
+    _opus_gemm_a16w16_mmajor_raw(XQ, WQ, Y, kernelId, splitK)
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        task_key = (id(XQ), id(WQ), id(Y), int(kernelId), int(splitK), "mmajor")
+        if task_key not in _bench_max_delta_checked:
+            _bench_max_delta_checked.add(task_key)
+            ref = opus_gemm_ref_mmajor(XQ, WQ, None, Y.dtype)
+            max_delta = (Y.float() - ref.float()).abs().max().item()
+            max_ref = ref.float().abs().max().item()
+            bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
+            if max_delta > bound:
+                raise RuntimeError(
+                    f"maxDelta {max_delta:.1f} > bound {bound:.1f} "
+                    f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE}) "
+                    f"for mmajor kid={kernelId} splitK={splitK}"
+                )
         torch.cuda.current_stream().synchronize()
     return Y
 
@@ -1301,6 +1374,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
     OUT_COLUMNS = [
         "cu_num",
+        "batch",
         "M",
         "N",
         "K",
@@ -1408,6 +1482,16 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             default=1,
             help="Batch dim for single-shape CLI tuning (default 1).",
         )
+        self.parser.add_argument(
+            "--mmajor",
+            action="store_true",
+            default=False,
+            help=(
+                "Tune the wo_a/mmajor layout: XQ/Y are [M,batch,*] and the "
+                "mmajor tune dispatch is used. Output CSV schema is unchanged "
+                "(M,N,K,batch,solidx,splitK,us...)."
+            ),
+        )
 
         # Default dtype / outdtype (CSV columns override per-row when present).
         self.parser.add_argument(
@@ -1480,6 +1564,16 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
         cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
         cli_bias = bool(args.bias)
+        self.keys = (
+            "cu_num",
+            "batch",
+            "M",
+            "N",
+            "K",
+            "bias",
+            "dtype",
+            "outdtype",
+        )
 
         if (
             args.shape_m is not None
@@ -1492,15 +1586,13 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 "M": int(args.shape_m),
                 "N": int(args.shape_n),
                 "K": int(args.shape_k),
+                "batch": int(args.shape_batch),
                 "bias": cli_bias,
                 "dtype": cli_dtype_str,
                 "outdtype": cli_outdtype_str,
             }
             self.untunedf = pd.DataFrame([row])
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
-            # Match the original code path: only assign 'batch' if the column already exists.
-            if "batch" in self.untunedf.columns:
-                self.untunedf["batch"] = int(args.shape_batch)
             logger.info(
                 f"OpusGemmA16W16Tuner: single-shape CLI tune "
                 f"(M={args.shape_m}, N={args.shape_n}, K={args.shape_k}, "
@@ -1542,6 +1634,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             else:
                 self.untunedf["outdtype"] = self.untunedf["outdtype"].fillna(
                     cli_outdtype_str
+                )
+            if "batch" not in self.untunedf.columns:
+                self.untunedf["batch"] = int(args.shape_batch)
+            else:
+                self.untunedf["batch"] = (
+                    self.untunedf["batch"].fillna(int(args.shape_batch)).astype(int)
                 )
 
             self.untunedf = self.untunedf[list(self.keys)]
@@ -1592,9 +1690,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         if bpes is None:
             info, _time, _err = results
             row_key = info[0]
-            # Backwards compat: legacy 4-key / 6-key tuples have no bias
-            # slot; route to dtype/outdtype slots that match each layout.
-            if len(row_key) >= 7:
+            # Backwards compat: current 8-key tuple is
+            # (cu,batch,M,N,K,bias,dtype,outdtype); legacy 4/6/7-key tuples
+            # have no batch slot and/or no bias slot.
+            if len(row_key) >= 8:
+                dtype_str, outdtype_str = str(row_key[6]), str(row_key[7])
+            elif len(row_key) >= 7:
                 dtype_str, outdtype_str = str(row_key[5]), str(row_key[6])
             elif len(row_key) >= 6:
                 dtype_str, outdtype_str = str(row_key[4]), str(row_key[5])
@@ -1608,12 +1709,17 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
-            # 7-key tuple now; legacy 4/6-key tuples still work.
-            if len(keys) >= 7:
+            # 8-key tuple now includes batch before M/N/K; legacy 4/6/7-key
+            # tuples still work.
+            if len(keys) >= 8:
+                cu_num, batch, M, N, K, bias_v, dtype_str, outdtype_str = keys[:8]
+            elif len(keys) >= 7:
                 cu_num, M, N, K, bias_v, dtype_str, outdtype_str = keys[:7]
+                batch = 1
             elif len(keys) >= 6:
                 cu_num, M, N, K, dtype_str, outdtype_str = keys[:6]
                 bias_v = False
+                batch = 1
             else:
                 cu_num, M, N, K = keys[:4]
                 bias_v, dtype_str, outdtype_str = (
@@ -1621,6 +1727,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "torch.bfloat16",
                     "torch.bfloat16",
                 )
+                batch = 1
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME or time == self.INF_TIME
@@ -1630,6 +1737,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             rows.append(
                 {
                     "cu_num": cu_num,
+                    "batch": int(batch),
                     "M": M,
                     "N": N,
                     "K": K,
@@ -1670,7 +1778,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 if "outdtype" in df.columns
                 else "torch.bfloat16"
             )
-            keys_tuple = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
+            batch = int(df.loc[i, "batch"]) if "batch" in df.columns else 1
+            keys_tuple = (cu_num, batch, M, N, K, bias_v, dtype_str, outdtype_str)
             info = ((keys_tuple, df.loc[i, kid_col], df.loc[i, "splitK"], ""), us, 0)
             tflops, bw = self.calculate(info)
             df.loc[i, "tflops"] = tflops
@@ -1738,7 +1847,19 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
                 resultdf = resultdf.loc[keep_mask.values].reset_index(drop=True)
 
-        return super().result_to_csv(resultdf, file, concat)
+        ret = super().result_to_csv(resultdf, file, concat)
+        # Base tuner preserves/constructs its historical column order; enforce
+        # opus' batch-first schema on disk so CSVs are readable and match the
+        # lookup key order: cu_num,batch,M,N,K,...
+        try:
+            df = pd.read_csv(file)
+            cols = [c for c in self.OUT_COLUMNS if c in df.columns] + [
+                c for c in df.columns if c not in self.OUT_COLUMNS
+            ]
+            df[cols].to_csv(file, index=False, na_rep="Null")
+        except Exception:
+            pass
+        return ret
 
     def tune(self, untunedf, tunedf, args):
         mp_num = args.mp
@@ -1791,6 +1912,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 else bool(args.bias)
             )
             shape_cands = candidate_kids_for_shape(M, N, K, bias_v, cu_num)
+            if args.mmajor:
+                shape_cands = {
+                    kid
+                    for kid in shape_cands
+                    if a16w16_all_kernels[kid].kernel_tag in MMAJOR_TUNE_TAGS
+                }
             if forced_kids is not None:
                 # Make sure the requested kids are baked in even if the
                 # shape-driven candidate set would have excluded them.
@@ -1804,8 +1931,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     f"module_deepgemm_opus will rebuild on next call."
                 )
 
-        # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
-        bench_func = run_opus_gemm_bench
+        # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the
+        # func/kwargs we provide here. --mmajor switches the data layout and
+        # dispatch path to the wo_a zero-copy convention ([M,batch,*]).
+        bench_func = run_opus_gemm_mmajor_bench if args.mmajor else run_opus_gemm_bench
+        gen_func = generate_data_mmajor if args.mmajor else generate_data
+        ref_func = opus_gemm_ref_mmajor if args.mmajor else opus_gemm_ref
         perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
 
         logger.info(
@@ -1874,9 +2005,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             )
 
             total_kernel_nums = 0
-            # 7-tuple matches self.keys; result_to_df / calculate read
-            # bias / dtype / outdtype from slots 4 / 5 / 6.
-            info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
+            # 8-tuple matches self.keys; result_to_df / calculate read
+            # batch / bias / dtype / outdtype from slots 4..7.
+            info_keys = (cu_num, batch, M, N, K, bias_v, dtype_str, outdtype_str)
 
             for kid in a16w16_kernel_ids:
                 # --kid filter (debug): skip everything outside the explicit set.
@@ -1890,6 +2021,10 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 ):
                     continue
                 k_inst = a16w16_all_kernels[kid]
+                if args.mmajor and k_inst.kernel_tag not in MMAJOR_TUNE_TAGS:
+                    continue
+                if args.mmajor and bias_v:
+                    continue
 
                 # Pre-filter kids that can't produce correct output for this shape.
                 if _kid_rejects_shape(k_inst, M, N, K):
@@ -1935,12 +2070,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     task.append(
                         (
                             info,
-                            generate_data,
+                            gen_func,
                             gen_args,
                             bench_func,
                             (opus_data_idx, kid, splitK),
                             perf_kwargs,
-                            opus_gemm_ref,
+                            ref_func,
                             ref_args,
                             {},
                             None,

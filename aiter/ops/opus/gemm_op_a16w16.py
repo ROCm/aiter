@@ -495,6 +495,7 @@ def gemm_a16w16_opus(
         outdtype=dtype,
         scaleAB=False,
         bpreshuffle=False,
+        batch=batch,
     )
     if cfg is not None:
         kid = cfg["solidx"]
@@ -527,6 +528,393 @@ def gemm_a16w16_opus(
 # stream to grow the buffer, then capture.
 @compile_ops("module_deepgemm_opus", fc_name="opus_gemm_workspace_init", develop=True)
 def opus_gemm_workspace_init() -> None: ...
+
+
+def _gen_opus_gemm_a16w16_bhsd_fake_tensors(
+    A: torch.Tensor,
+    W: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a16w16_bhsd",
+    gen_fake=_gen_opus_gemm_a16w16_bhsd_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a16w16_bhsd_raw(
+    A: torch.Tensor,
+    W: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+def _gen_opus_gemm_a16w16_mmajor_fake_tensors(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 208,
+    splitK: int = 0,
+) -> torch.Tensor:
+    return Y
+
+
+def _gen_opus_gemm_a8w8_scale_mmajor_fake_tensors(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    return Y
+
+
+# mmajor fp8 block-scale raw binding: O(A)/Y are [M, batch, *] (dim0=M,
+# dim1=batch), x_scale [M, batch, K/GROUP_K] (per-token M); wo_a + w_scale stay
+# batch-major. Zero-copy DSV4 wo_a fp8 (no caller-side transpose). Y is fp32.
+# See csrc/opus_gemm/opus_gemm.cu :: opus_gemm_a8w8_scale_mmajor.
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a8w8_scale_mmajor",
+    gen_fake=_gen_opus_gemm_a8w8_scale_mmajor_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a8w8_scale_mmajor_raw(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor: ...
+
+
+# mmajor raw binding: A(O)/Y are read with dim0=M, dim1=batch, so
+# batch-in-the-middle layouts need no caller-side transpose/permute. Shared by
+# wo_a_gemm_opus (DSV4, A=[num_tokens, n_local_groups, K]) and
+# batch_gemm_a16w16_bshd_opus. See csrc/opus_gemm/opus_gemm.cu ::
+# opus_gemm_a16w16_mmajor.
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a16w16_mmajor",
+    gen_fake=_gen_opus_gemm_a16w16_mmajor_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_a16w16_mmajor_raw(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 208,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+def batch_gemm_a16w16_bhsd_opus(
+    A: Tensor,
+    W: Tensor,
+    heads_per_group: int,
+    *,
+    kernelId: Optional[int] = None,
+    splitK: Optional[int] = None,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """BHSD-layout batch GEMM for MLA output projection.
+
+    Fuses the BHSD->BSHD transpose into the A-matrix address calculation,
+    avoiding a full HBM read-write pass for the transpose.
+
+    Parameters
+    ----------
+    A : [B, H, S, D] bf16 -- attention output in BHSD layout.
+        H = n_groups * heads_per_group, D = head_dim.
+    W : [G, R, K] bf16 -- wo_a weight reshaped to group form.
+        G = n_groups, R = o_lora_rank, K = heads_per_group * head_dim.
+    heads_per_group : int -- number of heads per group (e.g. 8 for DSv4).
+
+    Returns
+    -------
+    Tensor [B, S, G, R] -- the output projection result.
+    """
+    assert A.ndim == 4, f"A must be 4D [B, H, S, D], got {A.shape}"
+    assert W.ndim == 3, f"W must be 3D [G, R, K], got {W.shape}"
+    B, H, S, D = A.shape
+    G = W.shape[0]
+    R = W.shape[1]
+    K = W.shape[2]
+    assert H == G * heads_per_group, f"H={H} must equal G*hpg={G}*{heads_per_group}"
+    assert K == heads_per_group * D, f"K={K} must equal hpg*D={heads_per_group}*{D}"
+
+    # Reshape A: [B, H, S, D] -> [B*G, hpg, S, D]
+    A_reshaped = A.view(B, G, heads_per_group, S, D).permute(0, 1, 2, 3, 4)
+    A_reshaped = A_reshaped.reshape(B * G, heads_per_group, S, D).contiguous()
+
+    # Expand W: [G, R, K] -> [B*G, R, K]
+    W_expanded = W.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * G, R, K).contiguous()
+
+    # Allocate output
+    if out is not None:
+        assert out.shape == (B, S, G, R), f"out shape must be [{B},{S},{G},{R}]"
+        Y = out.view(B * G, S, R)
+    else:
+        Y = torch.empty(B * G, S, R, dtype=dtype, device=A.device)
+
+    # Default kid: 608 (64x64x128 WG=1 splitk) -- good for decode M<=4
+    kid = kernelId if kernelId is not None else 608
+    sk = splitK if splitK is not None else 0
+
+    _opus_gemm_a16w16_bhsd_raw(A_reshaped, W_expanded, Y, kid, sk)
+
+    return Y.view(B, G, S, R).permute(0, 2, 1, 3)  # [B, S, G, R]
+
+
+def batch_gemm_a16w16_bshd_opus(
+    A: Tensor,
+    W: Tensor,
+    heads_per_group: int,
+    *,
+    kernelId: Optional[int] = None,
+    splitK: Optional[int] = None,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    use_standard_pipeline: bool = True,
+) -> Tensor:
+    """BSHD-layout batch GEMM for MLA output projection.
+
+    A is in BSHD layout [B, S, H, D] (DSv4 default from sparse_attn).
+    Avoids the full HBM transpose by passing strided views to the kernel.
+
+    Two pipeline paths (selected by use_standard_pipeline):
+      True  -- standard a16w16 batch GEMM (kids 4-9 / 200-223): constructs
+              a strided 3D view [G, S, K] where K=hpg*D is contiguous within
+              each group. No head remapping needed.
+      False -- BHSD a_offset remapping pipeline (kids 600-655): constructs a
+              strided 4D view [G, hpg, S, D]. The kernel's a_offset does
+              div/mod to remap tile_k, but for BSHD this degenerates to an
+              identity (h*D+d == k_abs). Slightly more overhead per tile.
+
+    Parameters
+    ----------
+    A : [B, S, H, D] bf16 -- attention output in BSHD layout.
+    W : [G, R, K] bf16 -- wo_a weight.
+    heads_per_group : int -- number of heads per group (e.g. 8 for DSv4).
+    use_standard_pipeline : bool -- True uses standard kids, False uses BHSD
+        a_offset remapping kids. Default True (simpler, no div/mod).
+
+    Returns
+    -------
+    Tensor [B, S, G, R] -- the output projection result.
+    """
+    assert A.ndim == 4, f"A must be 4D [B, S, H, D], got {A.shape}"
+    assert W.ndim == 3, f"W must be 3D [G, R, K], got {W.shape}"
+    B, S, H, D = A.shape
+    G = W.shape[0]
+    R = W.shape[1]
+    K = W.shape[2]
+    assert H == G * heads_per_group, f"H={H} must equal G*hpg={G}*{heads_per_group}"
+    assert K == heads_per_group * D, f"K={K} must equal hpg*D={heads_per_group}*{D}"
+
+    if out is not None:
+        assert out.shape == (B, S, G, R), f"out shape must be [{B},{S},{G},{R}]"
+        Y_full = out
+    else:
+        Y_full = torch.empty(B, S, G, R, dtype=dtype, device=A.device)
+
+    hpg = heads_per_group
+
+    # flatmm_splitk (200-299, +1000 nooob mirror) and bhsd_splitk (600-649,
+    # +1000 nooob mirror) reduce kernels now take explicit stride_c /
+    # stride_c_batch (see gen_flatmm_splitk_instance / gen_bhsd_splitk_instance
+    # in gen_instances_gfx950.py + splitk_reduce_gfx950.cuh), so they can write
+    # straight into a *strided* Y_full view -- no temp Y_b + transpose-copy
+    # needed. Every other a16w16 kid family's launcher still hardcodes
+    # stride_c=N / stride_c_batch=M*N (ignores Y's real strides), so passing a
+    # strided view there would silently corrupt the output; keep the safe
+    # temp-buffer path for those.
+    def _kid_supports_strided_y(kid: int, splitk_min: int, splitk_max: int) -> bool:
+        base = kid % 1000
+        return splitk_min <= base < splitk_max
+
+    if use_standard_pipeline:
+        # Standard a16w16 batch GEMM via the mmajor primitive (same clean path
+        # as wo_a_gemm_opus). A[b].view(S, G, K) is already [M=S, batch=G, K]
+        # and Y_full[b] is [M=S, batch=G, N=R] -- exactly the mmajor layout
+        # (dim0=M, dim1=batch) the launcher reads via strides. So NO permute to
+        # [G, S, K], NO temp buffer, NO Python-layout-check bypass: the mmajor
+        # dispatch reads A/Y strides directly for every kid (incl. the splitk
+        # reduce, which writes the strided [S, G, R] Y in place).
+        kid = kernelId if kernelId is not None else 208
+        sk = splitK if splitK is not None else 0
+
+        for b in range(B):
+            A_b = A[b].view(S, G, K)  # [S, G, K] = [M, batch, K], zero-copy
+            Y_b = Y_full[b]  # [S, G, R] = [M, batch, N], in-place slice
+            _opus_gemm_a16w16_mmajor_raw(A_b, W, Y_b, kid, sk)
+    else:
+        # BHSD a_offset remapping path: pass 4D strided view [G, hpg, S, D].
+        kid = kernelId if kernelId is not None else 608
+        sk = splitK if splitK is not None else 0
+        direct_write = _kid_supports_strided_y(kid, 600, 650)
+
+        for b in range(B):
+            A_b = A[b].view(S, G, hpg, D).permute(1, 2, 0, 3)  # [G, hpg, S, D]
+
+            if direct_write:
+                Y_b = Y_full[b].permute(1, 0, 2)  # [G, S, R] view, no copy
+                _opus_gemm_a16w16_bhsd_raw(A_b, W, Y_b, kid, sk)
+            else:
+                Y_b = torch.empty(G, S, R, dtype=dtype, device=A.device)
+                _opus_gemm_a16w16_bhsd_raw(A_b, W, Y_b, kid, sk)
+                Y_full[b] = Y_b.permute(1, 0, 2)  # [S, G, R]
+
+    return Y_full
+
+
+def wo_a_gemm_opus(
+    o: Tensor,
+    wo_a: Tensor,
+    *,
+    kernelId: Optional[int] = None,
+    splitK: Optional[int] = None,
+    out: Optional[Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """DeepSeek-V4 grouped output-LoRA GEMM -- direct opus replacement for
+    the large-num_tokens branch of ATOM/atom/models/deepseek_v4.py:
+
+        o = o.view(num_tokens, n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(n_local_groups, o_lora_rank, -1)
+        ...
+        o = torch.einsum("sgd,grd->sgr", o, wo_a)
+
+    `o`/`wo_a`/the returned tensor are passed through in exactly this shape
+    -- no `.transpose()`/`.permute()`/`.contiguous()` at the Python level at
+    all, matching how `torch.einsum` consumes `o` natively (batch axis
+    `n_local_groups` in the middle, not outermost). The transpose is instead
+    fused into the launcher: an "_mmajor" variant reads O/Y with
+    dim0=M(num_tokens)/dim1=batch(n_local_groups) -- the opposite of the
+    regular launcher's dim0=batch/dim1=M convention -- so it addresses
+    memory correctly without the caller ever materializing a transposed
+    view. See gen_flatmm_splitk_instance / gen_noscale_instance_gfx950's
+    "_mmajor" emits (gen_instances_gfx950.py), opus_gemm.cu ::
+    opus_gemm_a16w16_mmajor, and opus_gemm_arch_gfx950.cuh ::
+    opus_a16w16_tune_dispatch_mmajor_gfx950.
+
+    Default kid picks between two "_mmajor" families by num_tokens (both
+    verified correct; ATT-profiled on MI355X to pick the empirical winner --
+    see yzhou_agent chat history for the sweep):
+      * kid 9  (a16w16 split-barrier, non-splitk, 512x256x256x64): wins
+        decisively from num_tokens ~384 up (e.g. 98us vs kid 208's 151us at
+        T=1024; 456us vs 1541us at T=8192) -- its plain double-buffered
+        pipeline pays far fewer explicit s_barrier syncs per K-iter than
+        flatmm_splitk's producer/consumer warp-specialization, and that gap
+        widens with M.
+      * kid 208 (a16w16_flatmm_splitk, warp-specialized, 64x64x128 WG=1):
+        wins for smaller num_tokens (e.g. 24us vs kid 9's 72us at T=64) --
+        kid 9's large 256x256 output tile is underfilled/wasteful below
+        ~256-384 tokens.
+    Neither fully matches hipBLASLt (`torch.einsum`'s backing GEMM): kid 9
+    lands at roughly 1.15-1.4x hipBLASLt's time in the range it wins,
+    narrowing as num_tokens grows. Pass `kernelId=` explicitly to override.
+
+    Parameters
+    ----------
+    o : [num_tokens, n_local_groups, K] bf16 -- already grouped/flattened
+        attention output (K = n_heads * head_dim // o_groups), i.e. exactly
+        `o.view(num_tokens, n_local_groups, -1)` from the model.
+    wo_a : [n_local_groups, o_lora_rank, K] bf16 -- wo_a weight, already
+        grouped, i.e. `self.wo_a.weight.view(n_local_groups, o_lora_rank, -1)`.
+    out : optional preallocated [num_tokens, n_local_groups, o_lora_rank]
+        output; reused instead of allocating a fresh tensor.
+
+    Returns
+    -------
+    Tensor [num_tokens, n_local_groups, o_lora_rank] -- same layout
+    `torch.einsum("sgd,grd->sgr", o, wo_a)` returns.
+    """
+    assert o.ndim == 3, f"o must be 3D [num_tokens, n_local_groups, K], got {o.shape}"
+    assert (
+        wo_a.ndim == 3
+    ), f"wo_a must be 3D [n_local_groups, o_lora_rank, K], got {wo_a.shape}"
+    T, G, K = o.shape
+    G_w, R, K_w = wo_a.shape
+    assert (
+        G == G_w and K == K_w
+    ), f"o/wo_a group or K mismatch: o={tuple(o.shape)} wo_a={tuple(wo_a.shape)}"
+
+    # Per-T kernel + split-K selection, tuned on MI355X for the DSV4 wo_a shape
+    # (N=o_lora_rank, K=heads_per_group*head_dim, batch=n_local_groups). Stable
+    # run_perftest numbers, see docs/dsv4_wo_a_opus_gemm_optimization.md.
+    #
+    # Latest mmajor tuner sweep (batch=8, N=1024, K=4096):
+    #   T=16:    kid200/sk4
+    #   T=32:    kid206/sk2
+    #   T=64:    kid200/sk4
+    #   T=128:   kid1404
+    #   T=256:   kid1403
+    #   T=512..2048: kid1401
+    #   T>=4096: kid9
+    # mono_tile is no-OOB in N/K (requires R%tile_N==0 and K%64==0), but M-tail
+    # is handled by bounded buffer descriptors. DSV4 wo_a satisfies N=1024,
+    # K=4096, so mono_tile can be the default for T>=128. Fall back to the
+    # previous persistent/split-barrier choices if a caller supplies an
+    # incompatible N/K.
+    auto_sk = 0
+    if kernelId is not None:
+        kid = kernelId
+    else:
+        cfg = _opus_common.lookup_tuned(
+            T,
+            R,
+            K,
+            False,
+            o.dtype,
+            dtype,
+            False,
+            False,
+            batch=G,
+        )
+        if cfg is not None and _opus_common.mono_kid_shape_ok(cfg["solidx"], R, K):
+            kid = int(cfg["solidx"])
+            auto_sk = int(cfg["splitK"])
+        else:
+            kid = None
+
+    if kid is None and T < 24:
+        kid = 200
+        auto_sk = 4
+    elif kid is None and T < 48:
+        kid = 206
+        auto_sk = 2
+    elif kid is None and T < 128:
+        kid = 200
+        auto_sk = 4
+    elif kid is None and T < 192 and _opus_common.mono_kid_shape_ok(1404, R, K):
+        kid = 1404  # mono_tile 64x128x64, best at T=128
+    elif kid is None and T < 512 and _opus_common.mono_kid_shape_ok(1403, R, K):
+        kid = 1403  # mono_tile 128x128x64, best at T=256
+    elif kid is None and T < 4096 and _opus_common.mono_kid_shape_ok(1401, R, K):
+        kid = 1401  # mono_tile 128x256x64, best at T=512..2048
+    elif kid is None and T <= 1024:
+        kid = 301  # persistent fallback for non-mono-compatible N/K
+    elif kid is None:
+        kid = 9  # large-M split-barrier fallback for non-mono-compatible N/K
+    sk = splitK if splitK is not None else auto_sk
+
+    if out is not None:
+        assert out.shape == (T, G, R), f"out shape must be [{T},{G},{R}]"
+        y = out
+    else:
+        y = torch.empty(T, G, R, dtype=dtype, device=o.device)
+
+    _opus_gemm_a16w16_mmajor_raw(o, wo_a, y, kid, sk)
+
+    return y
 
 
 __all__ = [

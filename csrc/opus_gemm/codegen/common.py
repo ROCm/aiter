@@ -34,6 +34,7 @@ _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
+    "a16w16_uniform",
     "a16w16_persistent",
     "a16w16_mono_tile",
     # gfx1250 cluster/TDM split-K (fp32 workspace + reduce kernel).

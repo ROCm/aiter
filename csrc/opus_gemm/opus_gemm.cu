@@ -45,7 +45,7 @@ template <typename CDataType>
 OpusScaleKernel opus_dispatch_scale(int M, int N, int K)
 {
 #ifdef OPUS_BUILD_HAS_GFX950
-  return opus_gemm_512x256x256x128_4x2_16x16x128_1x128x128<CDataType>;
+  return opus_gemm_512x128x256x128_4x2_16x16x128_1x128x128<CDataType>;
 #else
   (void)M;
   (void)N;
@@ -218,6 +218,15 @@ static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
 // gfx1250 cluster/TDM split-K (fp32 workspace + reduce) kids: [20000, 21000).
 static constexpr int OPUS_GFX1250_SPLITK_KID_MIN = 20000;
 static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 21000;
+// BHSD-fused split-K kids (fp32 workspace + reduce, same as the 200-family):
+// gfx950 [600, 650) + nooob mirror [1600, 1650). See opus_gemm_common.py ::
+// a16w16_bhsd_splitk_kernels_list (600-623). Like the 200-family these have
+// only <fp32_t> instantiations, so they must be classified splitk to route to
+// the fp32 tune table (the non-splitk BHSD kids 650-655 stay bf16/fp32).
+static constexpr int OPUS_BHSD_SPLITK_KID_MIN = 600;
+static constexpr int OPUS_BHSD_SPLITK_KID_MAX = 650;
+static constexpr int OPUS_UNIFORM_SPLITK_KID_MIN = 500;
+static constexpr int OPUS_UNIFORM_SPLITK_KID_MAX = 600;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
@@ -238,6 +247,9 @@ static inline bool opus_kid_is_splitk(int kid)
   return (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX) ||
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
           kid < OPUS_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET) ||
+         (kid >= OPUS_UNIFORM_SPLITK_KID_MIN && kid < OPUS_UNIFORM_SPLITK_KID_MAX) ||
+         (kid >= OPUS_UNIFORM_SPLITK_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
+          kid < OPUS_UNIFORM_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET) ||
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
           kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET) ||
          (kid >= OPUS_GFX1250_SPLITK_KID_MIN &&
@@ -347,6 +359,126 @@ void opus_gemm_a16w16_tune(
                 AiterDtype_to_str(XQ.dtype()),
                 ", expected bf16");
   }
+}
+
+// ── opus_gemm_a16w16_bhsd() — BHSD-fused batch GEMM entry ───────────────────
+
+void opus_gemm_a16w16_bhsd(
+    aiter_tensor_t &A,
+    aiter_tensor_t &W,
+    aiter_tensor_t &Y,
+    int kernelId,
+    int splitK)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(A.dim() == 4, "A must be 4D [batch, hpg, seqlen, head_dim]");
+  AITER_CHECK(W.dim() == 3, "W must be 3D [batch, N, K]");
+  AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, seqlen, N]");
+  AITER_CHECK(A.dtype() == AITER_DTYPE_bf16 && W.dtype() == AITER_DTYPE_bf16,
+              "A and W must be bf16");
+
+  if (opus_kid_is_splitk(kernelId))
+  {
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                || Y.dtype() == AITER_DTYPE_fp32,
+                "opus_gemm_a16w16_bhsd splitk kid requires bf16 or fp32 Y");
+    opus_a16w16_tune_dispatch<fp32_t>(kernelId)(A, W, Y, std::nullopt, splitK);
+  }
+  else if (Y.dtype() == AITER_DTYPE_bf16)
+  {
+    opus_a16w16_tune_dispatch<bf16_t>(kernelId)(A, W, Y, std::nullopt, splitK);
+  }
+  else if (Y.dtype() == AITER_DTYPE_fp32)
+  {
+    opus_a16w16_tune_dispatch<fp32_t>(kernelId)(A, W, Y, std::nullopt, splitK);
+  }
+  else
+  {
+    AITER_CHECK(false,
+                "opus_gemm_a16w16_bhsd: unsupported output dtype, expected bf16 or fp32");
+  }
+}
+
+// ── opus_gemm_a16w16_mmajor() — mmajor batched a16w16 GEMM entry ───────────
+//
+// A/Y are [M, batch, *] (dim0=M, dim1=batch) so batch-in-the-middle layouts
+// need no caller-side transpose/permute. Shared by wo_a_gemm_opus (DeepSeek-V4
+// output-LoRA, A=[num_tokens, n_local_groups, K], replacing
+// `torch.einsum("sgd,grd->sgr", o, wo_a)`) and batch_gemm_a16w16_bshd_opus.
+// See aiter/ops/opus/gemm_op_a16w16.py.
+void opus_gemm_a16w16_mmajor(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    int kernelId,
+    int splitK)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(O.dim() == 3, "O must be 3D [num_tokens, n_local_groups, K]");
+  AITER_CHECK(wo_a.dim() == 3, "wo_a must be 3D [n_local_groups, o_lora_rank, K]");
+  AITER_CHECK(Y.dim() == 3, "Y must be 3D [num_tokens, n_local_groups, o_lora_rank]");
+  AITER_CHECK(O.dtype() == AITER_DTYPE_bf16 && wo_a.dtype() == AITER_DTYPE_bf16,
+              "O and wo_a must be bf16");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16 || Y.dtype() == AITER_DTYPE_fp32,
+              "opus_gemm_a16w16_mmajor requires bf16 or fp32 Y");
+  // splitk-family mmajor kids (200-299 range, flatmm_splitk) only have a
+  // <fp32_t> instantiation -- main kernel writes an fp32 workspace and the
+  // reduce kernel casts to Y's real dtype. Non-splitk a16w16 mmajor kids
+  // (4-9 range) write Y directly with D_C matching Y's dtype exactly, same
+  // as their non-mmajor counterparts (see opus_gemm_a16w16_bhsd above).
+  if (opus_kid_is_splitk(kernelId))
+  {
+    opus_a16w16_tune_dispatch_mmajor<fp32_t>(kernelId)(O, wo_a, Y, std::nullopt, splitK);
+  }
+  else if (Y.dtype() == AITER_DTYPE_bf16)
+  {
+    opus_a16w16_tune_dispatch_mmajor<bf16_t>(kernelId)(O, wo_a, Y, std::nullopt, splitK);
+  }
+  else
+  {
+    opus_a16w16_tune_dispatch_mmajor<fp32_t>(kernelId)(O, wo_a, Y, std::nullopt, splitK);
+  }
+}
+
+// ── opus_gemm_a8w8_scale_mmajor() — zero-copy fp8 block-scale batched GEMM ──
+// A(O)/Y are [M, batch, *] (dim0=M, dim1=batch); x_scale is
+// [M, batch, K/GROUP_K] (per-token M). Weight WQ + w_scale stay batch-major
+// ([batch, N, K] / [batch, N/GROUP_N, K/GROUP_K]). No caller-side transpose --
+// feeds the DSV4 wo_a activation o=[num_tokens, n_groups, K] directly. The
+// launcher name is tied to the single a8w8_scale kid (see opus_dispatch_scale).
+#ifdef OPUS_BUILD_HAS_GFX950
+template <typename D_C>
+void opus_gemm_512x128x256x128_4x2_16x16x128_1x128x128_mmajor(
+    aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+#endif
+
+void opus_gemm_a8w8_scale_mmajor(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3,
+              "opus_gemm_a8w8_scale_mmajor: O/wo_a/Y must be 3D "
+              "([M,batch,K] / [batch,N,K] / [M,batch,N])");
+  AITER_CHECK(O.dtype() == AITER_DTYPE_fp8 && wo_a.dtype() == AITER_DTYPE_fp8,
+              "opus_gemm_a8w8_scale_mmajor: O and wo_a must be fp8");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
+              "opus_gemm_a8w8_scale_mmajor: Y must be fp32");
+#ifdef OPUS_BUILD_HAS_GFX950
+  const auto &arch_info = opus_get_arch_info();
+  AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
+              "opus_gemm_a8w8_scale_mmajor is gfx950-only; current device ",
+              arch_info.dev, " has gcnArchName='", arch_info.name, "'");
+  opus_gemm_512x128x256x128_4x2_16x16x128_1x128x128_mmajor<fp32_t>(
+      O, wo_a, Y, x_scale, w_scale);
+#else
+  AITER_CHECK(false,
+              "opus_gemm_a8w8_scale_mmajor requires OPUS_BUILD_HAS_GFX950");
+#endif
 }
 
 void opus_gemm_a8w8_blockscale_bpreshuffle_tune(

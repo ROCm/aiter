@@ -183,6 +183,141 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl
     return inst
 
 
+def _a16w16_interleave(
+    bs, bm, bn, bk, tn, wm, wn, wk, has_oob=True, cachectl_a=0, cachectl_b=17
+):
+    """Interleaved-schedule variant of the split-barrier a16w16 kernel.
+    Identical config space / validator / launcher as `_a16w16`; only the
+    kernel body (opus_gemm_pipeline_a16w16_interleave_gfx950.cuh) differs.
+    """
+    vec = 16 // 2
+    inst = OpusGemmInstance(
+        bs,
+        bm,
+        bn,
+        bk,
+        2,
+        tn,
+        wm,
+        wn,
+        wk,
+        vec,
+        vec,
+        4,
+        0,
+        0,
+        0,
+        "a16w16_interleave",
+        ["fp32_t", "bf16_t"],
+        has_oob=has_oob,
+    )
+    inst.cachectl_a = cachectl_a
+    inst.cachectl_b = cachectl_b
+    # Distinct symbol token so the generated instance name doesn't collide
+    # with the split-barrier `a16w16` kid of the same config (name is derived
+    # from config, not kernel_tag).
+    inst.name_tag = "interleave"
+    return inst
+
+
+# Interleaved-schedule a16w16 kids (40..49). v1 body == exact clone of the
+# split-barrier kernel (scaffold: kid 40 should match kid 9 perf/correctness);
+# the schedule rewrite lands on top in v2.
+a16w16_interleave_kernels_list = {
+    40: _a16w16_interleave(512, 256, 256, 64, 4, 16, 16, 32),  # == kid 9 config
+    # occupancy-lever tiles (smaller -> less LDS -> more WG/CU):
+    41: _a16w16_interleave(
+        256, 256, 128, 32, 2, 16, 16, 32
+    ),  # hipBLASLt-like 256x128, 4 wave
+    42: _a16w16_interleave(256, 128, 128, 32, 2, 16, 16, 32),  # 128x128, 4 wave
+}
+
+a16w16_interleave_kernels_list_nooob = {
+    kid
+    + 1000: _a16w16_interleave(
+        inst.BLOCK_SIZE,
+        inst.B_M,
+        inst.B_N,
+        inst.B_K,
+        inst.T_N,
+        inst.W_M,
+        inst.W_N,
+        inst.W_K,
+        has_oob=False,
+        cachectl_a=inst.cachectl_a,
+        cachectl_b=inst.cachectl_b,
+    )
+    for kid, inst in a16w16_interleave_kernels_list.items()
+}
+
+
+def _a16w16_uniform(bm, bn, bk, wg_per_cu=2, has_oob=True):
+    """Route B: uniform 4-wave + PGR2 + sched_group_barrier (gfx950)."""
+    vec = 16 // 2
+    inst = OpusGemmInstance(
+        256,
+        bm,
+        bn,
+        bk,
+        2,
+        2,  # T_M, T_N (uniform 4-wave)
+        16,
+        16,
+        32,  # MFMA 16x16x32
+        vec,
+        vec,
+        4,
+        0,
+        0,
+        0,
+        "a16w16_uniform",
+        ["fp32_t"],
+        wg_per_cu,
+        has_oob=has_oob,
+    )
+    inst.name_tag = "uniform"
+    return inst
+
+
+# Route B uniform family: full-tile (mono_tile-style) + PGR2 +
+# sched_group_barrier, 4-wave (T_M=T_N=2, BLOCK=256), native 16x16x32 MFMA,
+# split-K fp32 workspace store via partition_layout_c.
+#
+# K-loop is PGR1 single-step (prefetch-1), correct for ANY loops>=1 incl odd
+# (the mono_tile 2-tile-unrolled loop silently miscomputes odd loops -> was
+# the source of splitK/odd-K errors).
+#
+# B_K=64 (E_K=2, smem_sub=8): at 4-wave one smem row holds only smem_sub=8
+#   N-values but an MFMA needs W_N=16, and B also carries a wave_id_n N-slab,
+#   so the mono_tile rb (designed for 8-wave, smem_sub_e_n>=2) overflows. Fixed
+#   by a smem_sub_e_n==1 branch in make_layout_rb: reverse-solved the store's
+#   N formula from the working B_K=32 case (store_N = 32*E_N_rep + 16*wave_id_n
+#   + lane_n) and matched rb's row order to the B_K=64 physical layout
+#   (row = 4*E_N_rep + 2*wave_id_n + lane_n%T_N). err=0 all shapes incl odd
+#   loops + splitK. B_K=64 is ~17-25% faster than B_K=32 (half the K-loop
+#   barriers) -- see docs. (B_K=128 stays arch-blocked at 4-wave: smem_sub=4
+#   < W_N/T_N=8 -> smem_sub_e_m/n=0.)
+# kid 500 = 128x128x64; kid 501 = 256x128x64 (hipBLASLt-like narrow N).
+# CONSTRAINT: uniform has no K-tail masking (loops = ceil(K/B_K) reads a full
+# B_K on the last tile), so it requires K % B_K == 0. All real targets satisfy
+# this (K=4096 is a multiple of 64; splitK over K=4096 also yields all-full
+# B_K tiles). Non-multiple K (e.g. K=96 at B_K=64) gives wrong results; the
+# uniform kids are tune-path-only (not in the default heuristic), so this is
+# never hit implicitly.
+a16w16_uniform_kernels_list = {
+    500: _a16w16_uniform(128, 128, 64, 2),  # fastest uniform tile (~130us)
+    501: _a16w16_uniform(256, 128, 64, 1),  # hipBLASLt-like narrow N
+    # NOTE: 128x256 (was kid 502) measured WORST for uniform (~150us) -- tile
+    # orientation lever is reverse vs persistent (301=128x256 best). Removed.
+}
+
+a16w16_uniform_kernels_list_nooob = {
+    kid
+    + 1000: _a16w16_uniform(inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU, has_oob=False)
+    for kid, inst in a16w16_uniform_kernels_list.items()
+}
+
+
 def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
@@ -237,7 +372,11 @@ def _a16w16_flatmm(bm, bn, bk, wg_per_cu):
 # fmt: off
 # --- per-pipeline kernel instance lists ---
 a8w8_scale_kernels_list = {
-    1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
+    # EXPERIMENT: 128x256 (was 256x256) -> 2x the output tiles -> fills 256 CU
+    # (256x256 only launched 128 WG on batch=8, half the GPU idle). B_N stays
+    # 256 (GROUP_N=128 requires HALF_B_N>=128). Revert first field to 256 to
+    # restore the original 256x256 kid.
+    1: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
 }
 
 a8w8_kernels_list = {
@@ -460,6 +599,13 @@ _MONO_TILE_TILES = [
     (192, 128, 64),   # 1402
     (128, 128, 64),   # 1403
     ( 64, 128, 64),   # 1404
+    (256, 256, 64),   # 1405 -- big tile; pipeline auto-drops B to 2 slots
+                      #          (2A+2B=132 KiB) since 3x B overflows 160 KiB.
+    # NOTE: B_K=128 tiles (e.g. (128,128,128)) are NOT valid here -- the
+    # mono make_layout_ra/rb assume E_K derived from B_K=64; a B_K=128 probe
+    # (former kid 1406) produced rel-err ~0.87 (silent miscompute) AND was
+    # slower (2-slot shallow). Keep B_K=64 only until the layouts are
+    # re-derived for E_K=4.
 ]
 a16w16_mono_tile_kernels_list = {
     1400 + i: _a16w16_mono_tile(bm, bn, bk)
@@ -512,6 +658,9 @@ a16w16_persistent_kernels_list_4g_safe_nooob = {
 a16w16_mono_tile_kernels_list_4g_safe = {
     kid + _FOUR_G_SAFE_OFFSET: _make_4g_safe(inst)
     for kid, inst in a16w16_mono_tile_kernels_list.items()
+    # The 4g_safe mono pipeline is 3-slot-B only; the big 256x256 tile
+    # needs the base pipeline's 2-slot-B path, so skip its 4g_safe mirror.
+    if inst.B_M <= 192
 }
 
 
@@ -1024,6 +1173,8 @@ kernels_list = {
     **a16w16_flatmm_kernels_list,
     **a16w16_flatmm_splitk_kernels_list,
     **a16w16_flatmm_splitk_kernels_list_nooob,
+    **a16w16_uniform_kernels_list,
+    **a16w16_uniform_kernels_list_nooob,
     **a16w16_persistent_kernels_list,
     **a16w16_persistent_kernels_list_cpol,
     **a16w16_persistent_kernels_list_nooob,
@@ -1040,7 +1191,7 @@ kernels_list = {
 }
 
 default_kernels_dict = {
-    (-1): OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
+    (-1): OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
     (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
@@ -1053,6 +1204,10 @@ default_kernels_dict = {
 SPLITK_KIDS = (
     frozenset(a16w16_flatmm_splitk_kernels_list.keys())
     | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
+    | frozenset(a16w16_uniform_kernels_list.keys())
+    | frozenset(a16w16_uniform_kernels_list_nooob.keys())
+    | frozenset(a16w16_bhsd_splitk_kernels_list.keys())
+    | frozenset(a16w16_bhsd_splitk_kernels_list_nooob.keys())
     | frozenset(gfx942_splitk_kernels_list.keys())
     | frozenset(gfx1250_kernels_list.keys())
     | frozenset(gfx1250_clusterlaunch_kernels_list.keys())
@@ -1120,6 +1275,45 @@ HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
         # persistent fallback (large M, tile-aligned)
         300,
         1300,  # persistent (256, 256, 64)
+        # persistent smaller tiles: more output tiles -> fills more CUs.
+        # 128x128 (303) measured ~2x faster than kid 9 on single 1024^2x4096;
+        # 256x128 (302) matches hipBLASLt's macro-tile. Force-compiled for
+        # experiments (see docs/dsv4_wo_a_opus_gemm_optimization.md).
+        301,
+        1301,  # persistent (128, 256, 64)
+        302,
+        1302,  # persistent (256, 128, 64)
+        303,
+        1303,  # persistent (128, 128, 64)
+        # BHSD-fused batch GEMM default (batch_gemm_a16w16_bhsd/bshd_opus use
+        # kid=608). Force-compiled so the fused MLA output-projection path
+        # works out of the box without a tuned CSV; +1000 nooob mirror.
+        608,
+        1608,  # bhsd_splitk (64, 64, 128) WG=1
+        650,
+        1650,  # bhsd (non-splitk) 256x128x256x32 WG=2 -- smallest bhsd tile
+        # interleaved-schedule prototype (a16w16_interleave, ?Phase 1).
+        40,
+        1040,
+        41,
+        1041,
+        42,
+        1042,
+        # Route B uniform (gfx942 em3en4 schedule on gfx950 16x16x32).
+        500,
+        1500,  # uniform 128x128x64 (fastest uniform tile)
+        501,
+        1501,  # uniform 256x128x64 hipBLASLt-like
+        # mono_tile candidates for mmajor/wo_a tuning. These are no-OOB and
+        # only valid on tile-aligned shapes (N%tile_N==0, K%64==0; M-tail is
+        # bounded by the gmem descriptor). Forced into default builds so the
+        # tune path can compare them with 208/301/9 on real DSV4 shapes.
+        1400,
+        1401,
+        1402,
+        1403,
+        1404,
+        1405,  # big 256x256 tile (2-slot-B); hipBLASLt-like large-tile probe
     }
 )
 

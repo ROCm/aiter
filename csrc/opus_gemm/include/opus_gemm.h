@@ -35,5 +35,13 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_tune(aiter_tensor_t& XQ,
                                                 aiter_tensor_t& Y,
                                                 int kernelId);
 
+// mmajor fp8 block-scale batched GEMM (zero-copy DSV4 wo_a fp8):
+// O/Y are [M, batch, *]; wo_a + w_scale batch-major; x_scale [M, batch, K/GROUP_K].
+void opus_gemm_a8w8_scale_mmajor(aiter_tensor_t& O,
+                                 aiter_tensor_t& wo_a,
+                                 aiter_tensor_t& Y,
+                                 aiter_tensor_t& x_scale,
+                                 aiter_tensor_t& w_scale);
+
 // Per-stream splitk workspace init. See opus_gemm.cu for rationale.
 void opus_gemm_workspace_init();

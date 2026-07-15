@@ -203,7 +203,7 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
     static constexpr int T_N = 1; // compute-wave count along N
     static constexpr int T_K = 1; // compute-wave count along K
 
-    // ── Warp-spec 4-wave pipeline constraints ──
+    // -- Warp-spec 4-wave pipeline constraints --
     static_assert(T_K == 1, "flatmm requires T_K=1");
     static_assert(T_M == 2, "flatmm requires T_M=2 (ra layout depends on it)");
     static_assert(T_N == 1, "flatmm requires T_N=1 (consumer waves share N slab)");
@@ -334,6 +334,238 @@ struct opus_gemm_flatmm_kargs_gfx950 {
 #endif
 
 // ============================================================================
+// Uniform 4-wave a16w16 traits (Route B: gfx942 em3en4 schedule on gfx950)
+// ============================================================================
+//
+// Every wave loads and computes (no producer/consumer role split).  PGR2 +
+// sched_group_barrier scheduling.  HALF-quadrant smem/compute (4-wave
+// T_M=T_N=2) with split-K fp32 workspace output.
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_,
+        typename TILE_,
+        typename WAVE_,
+        int WG_PER_CU_,
+        bool HAS_BIAS_,
+        bool HAS_OOB_ = true>
+struct opus_uniform_traits_gfx950 {
+    using BLOCK = opus::remove_cvref_t<BLOCK_>;
+    using DTYPE = opus::remove_cvref_t<DTYPE_>;
+    using VEC   = opus::remove_cvref_t<VEC_>;
+    using TILE  = opus::remove_cvref_t<TILE_>;
+    using WAVE  = opus::remove_cvref_t<WAVE_>;
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+
+    static constexpr int B_M = opus::get<0>(BLOCK{});
+    static constexpr int B_N = opus::get<1>(BLOCK{});
+    static constexpr int B_K = opus::get<2>(BLOCK{});
+
+    using D_A    = opus::tuple_element_t<0, DTYPE>;
+    using D_B    = opus::tuple_element_t<1, DTYPE>;
+    using D_C    = opus::tuple_element_t<2, DTYPE>;
+    using D_ACC  = opus::tuple_element_t<3, DTYPE>;
+    using D_BIAS = opus::tuple_element_t<4, DTYPE>;
+
+    static_assert(std::is_same_v<D_C, float>,
+                  "uniform splitk main kernel requires D_C = float workspace");
+
+    static constexpr int T_M = opus::get<0>(TILE{});
+    static constexpr int T_N = opus::get<1>(TILE{});
+    static constexpr int T_K = opus::get<2>(TILE{});
+
+    static_assert(T_K == 1, "uniform requires T_K=1");
+    static_assert(BLOCK_SIZE == 256,
+                  "uniform requires BLOCK_SIZE=256 (4-wave T_M=T_N=2)");
+    static_assert(BLOCK_SIZE == 4 * opus::get_warp_size(),
+                  "uniform BLOCK_SIZE must cover exactly 4 waves");
+
+    static constexpr int W_M = opus::get<0>(WAVE{});
+    static constexpr int W_N = opus::get<1>(WAVE{});
+    static constexpr int W_K = opus::get<2>(WAVE{});
+
+    static constexpr int LDS_DEPTH = 1;
+
+    // Full-tile (mono_tile-style) geometry: each wave-row computes a
+    // B_M/T_M x B_N slab into a single v_c accumulator (no HALF quadrant
+    // split). The two physical wave-rows (wave_id_m in {0,1}) are
+    // differentiated by the ra smem-read layout + a store base offset,
+    // exactly like opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh.
+    static_assert(B_M % (W_M * T_M) == 0,
+                  "uniform B_M must divide W_M*T_M");
+    static_assert(B_N % (W_N * T_N) == 0,
+                  "uniform B_N must divide W_N*T_N");
+    static_assert(B_K % (W_K * T_K) == 0,
+                  "uniform B_K must divide W_K*T_K");
+    static constexpr int E_M = B_M / (W_M * T_M);
+    static constexpr int E_N = B_N / (W_N * T_N);
+    static constexpr int E_K = B_K / (W_K * T_K);
+
+    // rb layout grouping: E_N*T_M must be divisible by T_N. At T_N=T_M=2
+    // this is always satisfied (no B_N%128 constraint like 8-wave).
+    static_assert((E_N * T_M) % T_N == 0,
+                  "uniform E_N*T_M must divide T_N (rb layout)");
+
+    static constexpr int VEC_A = opus::get<0>(VEC{});
+    static constexpr int VEC_B = opus::get<1>(VEC{});
+    static constexpr int VEC_C = opus::get<2>(VEC{});
+
+    static_assert(VEC_A == 16 / sizeof(D_A));
+    static_assert(VEC_A == VEC_B, "uniform requires VEC_A == VEC_B");
+
+    static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
+    static_assert(smem_linear_wave % B_K == 0,
+                  "uniform requires B_K to divide smem_linear_wave");
+    static constexpr int smem_sub = smem_linear_wave / B_K;
+    static constexpr int smem_m_rep = B_M / smem_sub;
+    static constexpr int smem_n_rep = B_N / smem_sub;
+    static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
+
+    static constexpr int num_waves = BLOCK_SIZE / opus::get_warp_size();
+    static_assert(B_M % smem_sub == 0 && B_N % smem_sub == 0,
+                  "uniform: B_M/B_N must be divisible by smem_sub");
+    static_assert(smem_m_rep >= num_waves && (smem_m_rep % num_waves) == 0,
+                  "uniform: smem_m_rep must be >= num_waves and divisible");
+    static_assert(smem_n_rep >= num_waves && (smem_n_rep % num_waves) == 0,
+                  "uniform: smem_n_rep must be >= num_waves and divisible");
+
+    // ra layout: smem_sub_e_m = smem_sub / (W_M / T_N); E_M must divide.
+    static_assert((W_M % T_N) == 0,
+                  "uniform: W_M must be divisible by T_N");
+    static constexpr int smem_sub_e_m = smem_sub / (W_M / T_N);
+    static_assert(smem_sub_e_m > 0 && (E_M % smem_sub_e_m) == 0,
+                  "uniform: E_M must divide smem_sub/(W_M/T_N)");
+
+    // rb layout: smem_sub_e_n = smem_sub / (W_N / T_N). Governs whether the
+    // T_M N-slab factor lives in the smem row (=1, e.g. 4-wave B_K=64 where
+    // smem_sub=8=W_N/T_N) or the column (>=2, e.g. B_K=32). Mirrors
+    // smem_sub_e_m's role for the ra read.
+    static_assert((W_N % T_N) == 0,
+                  "uniform: W_N must be divisible by T_N");
+    static constexpr int smem_sub_e_n = smem_sub / (W_N / T_N);
+    static_assert(smem_sub_e_n > 0, "uniform: smem_sub_e_n must be > 0");
+
+    static constexpr int a_buffer_load_insts = B_M * B_K / (BLOCK_SIZE * VEC_A);
+    static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
+    static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
+    static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
+    static constexpr int mma_insts = E_M * E_N * E_K;
+
+    static constexpr bool HAS_BIAS = HAS_BIAS_;
+    static constexpr bool HAS_OOB = HAS_OOB_;
+    static constexpr int WG_PER_CU = WG_PER_CU_;
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 17;
+};
+
+// ============================================================================
+// fp8 block-scale uniform traits (Route B fp8): same 4-wave full-tile uniform
+// geometry as opus_uniform_traits_gfx950, but fp8 A/B (W_K=128 MFMA) + 128x128
+// block-scale (GROUP). DTYPE is 5-tuple <D_A, D_B, D_C(ws=fp32), D_ACC, D_SF>.
+// Per-K-block scaled accumulate: B_K == GROUP_K so each K-tile is exactly one
+// K-scale-block (scale_c_tile applies sfa[m]*sfb[nb] before accumulating).
+// ============================================================================
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_,
+        typename TILE_,
+        typename WAVE_,
+        typename GROUP_,
+        int WG_PER_CU_,
+        bool HAS_OOB_ = true>
+struct opus_uniform_scale_traits_gfx950 {
+    using BLOCK = opus::remove_cvref_t<BLOCK_>;
+    using DTYPE = opus::remove_cvref_t<DTYPE_>;
+    using VEC   = opus::remove_cvref_t<VEC_>;
+    using TILE  = opus::remove_cvref_t<TILE_>;
+    using WAVE  = opus::remove_cvref_t<WAVE_>;
+    using GROUP = opus::remove_cvref_t<GROUP_>;
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+
+    static constexpr int B_M = opus::get<0>(BLOCK{});
+    static constexpr int B_N = opus::get<1>(BLOCK{});
+    static constexpr int B_K = opus::get<2>(BLOCK{});
+
+    using D_A   = opus::tuple_element_t<0, DTYPE>;
+    using D_B   = opus::tuple_element_t<1, DTYPE>;
+    using D_C   = opus::tuple_element_t<2, DTYPE>;
+    using D_ACC = opus::tuple_element_t<3, DTYPE>;
+    using D_SF  = opus::tuple_element_t<4, DTYPE>;
+    static_assert(std::is_same<D_A, D_B>::value);
+    static_assert(std::is_same_v<D_C, float>,
+                  "uniform_scale splitk main kernel requires D_C = float workspace");
+
+    static constexpr int T_M = opus::get<0>(TILE{});
+    static constexpr int T_N = opus::get<1>(TILE{});
+    static constexpr int T_K = opus::get<2>(TILE{});
+    static_assert(T_K == 1, "uniform_scale requires T_K=1");
+    static_assert(BLOCK_SIZE == 256 && BLOCK_SIZE == 4 * opus::get_warp_size(),
+                  "uniform_scale requires BLOCK_SIZE=256 (4-wave T_M=T_N=2)");
+
+    static constexpr int W_M = opus::get<0>(WAVE{});
+    static constexpr int W_N = opus::get<1>(WAVE{});
+    static constexpr int W_K = opus::get<2>(WAVE{});
+    static_assert(W_K == 128, "uniform_scale requires fp8 MFMA 16x16x128 (W_K=128)");
+
+    static constexpr int LDS_DEPTH = 1;
+
+    static_assert(B_M % (W_M * T_M) == 0, "uniform_scale B_M must divide W_M*T_M");
+    static_assert(B_N % (W_N * T_N) == 0, "uniform_scale B_N must divide W_N*T_N");
+    static_assert(B_K % (W_K * T_K) == 0, "uniform_scale B_K must divide W_K*T_K");
+    static constexpr int E_M = B_M / (W_M * T_M);
+    static constexpr int E_N = B_N / (W_N * T_N);
+    static constexpr int E_K = B_K / (W_K * T_K);
+    static_assert((E_N * T_M) % T_N == 0, "uniform_scale E_N*T_M must divide T_N (rb layout)");
+
+    static constexpr int VEC_A = opus::get<0>(VEC{});
+    static constexpr int VEC_B = opus::get<1>(VEC{});
+    static constexpr int VEC_C = opus::get<2>(VEC{});
+    static_assert(VEC_A == 16 / sizeof(D_A));
+    static_assert(VEC_A == VEC_B, "uniform_scale requires VEC_A == VEC_B");
+
+    static constexpr int GROUP_M = opus::get<0>(GROUP{});
+    static constexpr int GROUP_N = opus::get<1>(GROUP{});
+    static constexpr int GROUP_K = opus::get<2>(GROUP{});
+    // B_K == GROUP_K keeps one K-scale-block per K-tile (simplest scaled accumulate).
+    static_assert(B_K == GROUP_K, "uniform_scale requires B_K == GROUP_K");
+
+    static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
+    static_assert(smem_linear_wave % B_K == 0, "uniform_scale requires B_K | smem_linear_wave");
+    static constexpr int smem_sub = smem_linear_wave / B_K;
+    static constexpr int smem_m_rep = B_M / smem_sub;
+    static constexpr int smem_n_rep = B_N / smem_sub;
+    static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
+
+    static constexpr int num_waves = BLOCK_SIZE / opus::get_warp_size();
+    static_assert(B_M % smem_sub == 0 && B_N % smem_sub == 0);
+    static_assert(smem_m_rep >= num_waves && (smem_m_rep % num_waves) == 0);
+    static_assert(smem_n_rep >= num_waves && (smem_n_rep % num_waves) == 0);
+
+    static_assert((W_M % T_N) == 0, "uniform_scale: W_M must be divisible by T_N");
+    static constexpr int smem_sub_e_m = smem_sub / (W_M / T_N);
+    static_assert(smem_sub_e_m > 0 && (E_M % smem_sub_e_m) == 0);
+    static_assert((W_N % T_N) == 0, "uniform_scale: W_N must be divisible by T_N");
+    static constexpr int smem_sub_e_n = smem_sub / (W_N / T_N);
+    static_assert(smem_sub_e_n > 0);
+
+    static constexpr int a_buffer_load_insts = B_M * B_K / (BLOCK_SIZE * VEC_A);
+    static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
+    static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
+    static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
+    static constexpr int mma_insts = E_M * E_N * E_K;
+    // scale loads per K-tile (one K-scale-block since B_K==GROUP_K).
+    static constexpr int sfa_buffer_load_insts = E_M * (B_K / GROUP_K);
+    static constexpr int sfb_buffer_load_insts = (B_N / GROUP_N) * (B_K / GROUP_K);
+
+    static constexpr bool HAS_BIAS = false;
+    static constexpr bool HAS_OOB = HAS_OOB_;
+    static constexpr int WG_PER_CU = WG_PER_CU_;
+    static constexpr int CACHECTL_A = 0;
+    static constexpr int CACHECTL_B = 17;
+};
+
+// ============================================================================
 // Split-K FlatMM traits (two-kernel variant: main writes fp32 workspace,
 // reduce kernel sums splits + casts to bf16 C)
 // ============================================================================
@@ -447,7 +679,7 @@ struct opus_flatmm_splitk_traits_gfx950 {
 // Pipeline: opus_gemm_pipeline_a16w16_persistent_gfx950.cuh (ported from the
 // standalone reference kernel gemm_a16w16_8wave_mouter.cc).
 //
-// Layout: each WG handles m_per_wg tile_m × 1 tile_n (M outer loop). Within
+// Layout: each WG handles m_per_wg tile_m x 1 tile_n (M outer loop). Within
 // one XCD, consecutive launch-wave WGs share the same m_grp and span all 8
 // tile_n stripes; this lets the A tile stay resident in L2 across 8 N tiles
 // for the duration of one m_grp.
@@ -690,7 +922,7 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static constexpr int VEC_B = opus::get<1>(VEC{});
     static constexpr int VEC_C = opus::get<2>(VEC{});
 
-    // ── Locked tile/wave geometry (kernel-internal constants) ──
+    // -- Locked tile/wave geometry (kernel-internal constants) --
     static constexpr int T_M = 2;
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
@@ -702,13 +934,13 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static_assert(BLOCK_SIZE == 512,
                   "mono_tile requires BLOCK_SIZE = 512 (8 waves * 64 lanes)");
 
-    // ── Locked vector widths ──
+    // -- Locked vector widths --
     static_assert(VEC_A == 8 && VEC_B == 8 && VEC_C == 8,
                   "mono_tile requires VEC_A = VEC_B = VEC_C = 8");
     static_assert(VEC_A == 16 / sizeof(D_A),
                   "mono_tile VEC_A must equal 16 / sizeof(D_A) (= 8 for bf16)");
 
-    // ── Block tile divisibility ──
+    // -- Block tile divisibility --
     static_assert(B_M % (W_M * T_M) == 0,
                   "mono_tile requires B_M divisible by W_M * T_M = 32");
     static_assert(B_N % (W_N * T_N) == 0,
@@ -716,7 +948,7 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static_assert(B_K % (W_K * T_K) == 0,
                   "mono_tile requires B_K divisible by W_K * T_K = 32");
 
-    // ── Derived MMA repeat counts ──
+    // -- Derived MMA repeat counts --
     static constexpr int E_M = B_M / (W_M * T_M);
     static constexpr int E_N = B_N / (W_N * T_N);
     static constexpr int E_K = B_K / (W_K * T_K);
@@ -726,7 +958,7 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
                   "mono_tile requires E_N divisible by (T_N / T_M) = 2 "
                   "-> B_N % 128 == 0 with the locked T_M=2,T_N=4 geometry");
 
-    // ── LDS layout ──
+    // -- LDS layout --
     static constexpr int smem_linear_wave = 64 * 16 / sizeof(D_A); // 512 for bf16
     static_assert(smem_linear_wave % B_K == 0,
                   "mono_tile requires B_K to divide smem_linear_wave (=512 for bf16)");
@@ -752,8 +984,8 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
     static_assert(smem_sub_e_m > 0 && (E_M % smem_sub_e_m) == 0,
                   "mono_tile: E_M must be divisible by smem_sub / (W_M/T_N)");
 
-    // ── Buffer / ds_read instruction counts (mirror kernel_traits<UT> in the
-    //    upstream template; recomputed here so codegen can sanity-print). ──
+    // -- Buffer / ds_read instruction counts (mirror kernel_traits<UT> in the
+    //    upstream template; recomputed here so codegen can sanity-print). --
     static constexpr int a_buffer_load_insts = B_M * B_K / (BLOCK_SIZE * VEC_A);
     static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (64 * VEC_A);

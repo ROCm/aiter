@@ -293,6 +293,43 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
+#define OPUS_GEMM_A16W16_BHSD_PYBIND              \
+    m.def("opus_gemm_a16w16_bhsd",                \
+          &opus_gemm_a16w16_bhsd,                 \
+          "BHSD-fused batch GEMM for MLA output " \
+          "projection (fuses transpose into A "   \
+          "address calculation)",                 \
+          py::arg("A"),                           \
+          py::arg("W"),                           \
+          py::arg("Y"),                           \
+          py::arg("kernelId") = 0,                \
+          py::arg("splitK")   = 0);
+
+#define OPUS_GEMM_A16W16_MMAJOR_PYBIND                  \
+    m.def("opus_gemm_a16w16_mmajor",                    \
+          &opus_gemm_a16w16_mmajor,                     \
+          "mmajor batched a16w16 GEMM: A/Y are "         \
+          "[M, batch, *] (dim0=M, dim1=batch), no "      \
+          "caller-side transpose for batch-in-middle "   \
+          "layouts (DSV4 wo_a, bshd batch GEMM)",        \
+          py::arg("O"),                                  \
+          py::arg("wo_a"),                               \
+          py::arg("Y"),                                  \
+          py::arg("kernelId") = 208,                      \
+          py::arg("splitK")   = 0);
+
+#define OPUS_GEMM_A8W8_SCALE_MMAJOR_PYBIND              \
+    m.def("opus_gemm_a8w8_scale_mmajor",                \
+          &opus_gemm_a8w8_scale_mmajor,                 \
+          "mmajor fp8 block-scale batched GEMM: O/Y "    \
+          "[M, batch, *], wo_a/w_scale batch-major, "    \
+          "x_scale [M, batch, K/GROUP_K] (zero-copy "    \
+          "DSV4 wo_a fp8)",                              \
+          py::arg("O"),                                  \
+          py::arg("wo_a"),                               \
+          py::arg("Y"),                                  \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"));
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
           &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \

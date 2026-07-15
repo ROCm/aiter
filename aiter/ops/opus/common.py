@@ -17,11 +17,12 @@ of those CSVs has an opus row matching the shape.
 
 Schema (matches gradlib/GemmTuner.py output):
 
-  gfx, cu_num, M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle,
+  gfx, cu_num, batch, M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle,
   libtype, solidx, splitK, us, kernelName, err_ratio, tflops, bw
 
 `gfx` is optional (the legacy opus-private CSV did not have it); when
-absent we tolerate it. Rows missing any of the 9 key columns
+absent we tolerate it. `batch` is optional for legacy CSVs and defaults to
+1 when absent. Rows missing any of the remaining key columns
 (cu_num/M/N/K/bias/dtype/outdtype/scaleAB/bpreshuffle) are skipped.
 
 Configuration:
@@ -67,6 +68,7 @@ OPUS_TUNED_CSV_GLOB = os.getenv("AITER_OPUS_TUNED_CSV_GLOB", _DEFAULT_TUNED_CSV_
 
 _KEY_COLUMNS = (
     "cu_num",
+    "batch",
     "M",
     "N",
     "K",
@@ -125,6 +127,13 @@ def _load_tuned_dict() -> dict:
         if df.empty:
             continue
         missing = [c for c in _KEY_COLUMNS if c not in df.columns]
+        if "batch" in missing:
+            # Legacy global GEMM CSVs were keyed without batch. Treat them as
+            # batch=1 so mmajor/batched wo_a rows can coexist without
+            # accidentally matching old single-batch winners.
+            df = df.copy()
+            df["batch"] = 1
+            missing.remove("batch")
         if missing:
             # Malformed / partial-schema CSV. Skip rather than crash.
             continue
@@ -161,6 +170,7 @@ def _key_from_runtime(
     M: int,
     N: int,
     K: int,
+    batch: int,
     bias: bool,
     dtype: torch.dtype,
     outdtype: torch.dtype,
@@ -173,6 +183,7 @@ def _key_from_runtime(
     ).multi_processor_count
     return (
         int(cu_num),
+        int(batch),
         int(M),
         int(N),
         int(K),
@@ -184,7 +195,7 @@ def _key_from_runtime(
     )
 
 
-# Mono-tile kid → (B_M, B_N, B_K). Must stay in lock-step with
+# Mono-tile kid -> (B_M, B_N, B_K). Must stay in lock-step with
 # csrc/opus_gemm/opus_gemm_common.py:_MONO_TILE_TILES; the runtime guard
 # below uses it to validate (N, K) alignment for CSV-picked mono kids,
 # since tuned_gemm.get_padded_m pads the lookup key by M only and can
@@ -195,6 +206,7 @@ _MONO_TILE_KID_TILES = {
     1402: (192, 128, 64),
     1403: (128, 128, 64),
     1404: (64, 128, 64),
+    1405: (256, 256, 64),
 }
 
 
@@ -225,12 +237,13 @@ def lookup_tuned(
     outdtype: torch.dtype,
     scaleAB: bool = False,
     bpreshuffle: bool = False,
+    batch: int = 1,
 ) -> Optional[dict]:
     """Look up a tuned winner for this shape; returns dict or None.
 
     Dict contains 'solidx' (kernelId), 'splitK', 'kernelName'.
     """
-    key = _key_from_runtime(M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle)
+    key = _key_from_runtime(M, N, K, batch, bias, dtype, outdtype, scaleAB, bpreshuffle)
     return _load_tuned_dict().get(key)
 
 

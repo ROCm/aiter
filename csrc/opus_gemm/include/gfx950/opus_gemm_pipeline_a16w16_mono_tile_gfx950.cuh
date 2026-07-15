@@ -73,6 +73,19 @@ struct kernel_traits {
     static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
+
+    // LDS budget-driven B-buffer depth. Default scheme is 2x A (double) +
+    // 3x B (r0/r1/w triple). Large tiles (e.g. 256x256x64 -> 165 KiB) blow
+    // gfx950's 160 KiB/CU LDS with 3x B; drop B to a 2-slot double buffer
+    // (2A + 2B = 132 KiB, matches hipBLASLt) so the big tile fits. Existing
+    // tiles (B_M<=192) keep B_SLOTS=3 -> their code path is unchanged.
+    static constexpr int smem_a_bytes_1 = smem_m_rep * (smem_linear_wave + smem_padding) * (int)sizeof(D_A);
+    static constexpr int smem_b_bytes_1 = smem_n_rep * (smem_linear_wave + smem_padding) * (int)sizeof(D_B);
+    static constexpr int LDS_BUDGET = 160 * 1024;
+    static constexpr int B_SLOTS =
+        (2 * smem_a_bytes_1 + 3 * smem_b_bytes_1 <= LDS_BUDGET) ? 3 : 2;
+    static_assert(2 * smem_a_bytes_1 + B_SLOTS * smem_b_bytes_1 <= LDS_BUDGET,
+                  "mono-tile LDS over 160 KiB even at B_SLOTS=2");
 };
 
 template<typename T>
@@ -279,10 +292,7 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
         make_smem(reinterpret_cast<D_A*>(smem_a + smem_a_byte))
     };
     constexpr int smem_b_byte = T::smem_n_rep * (T::smem_linear_wave + T::smem_padding) * sizeof(D_B);
-    __shared__ char smem_b[smem_b_byte * 3];
-    smem<D_B> sb_r0 = make_smem(reinterpret_cast<D_B*>(smem_b));
-    smem<D_B> sb_r1 = make_smem(reinterpret_cast<D_B*>(smem_b + smem_b_byte));
-    smem<D_B> sb_w  = make_smem(reinterpret_cast<D_B*>(smem_b + 2 * smem_b_byte));
+    __shared__ char smem_b[smem_b_byte * T::B_SLOTS];
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::E_M, T::E_N, T::E_K>{},
@@ -298,6 +308,12 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
     auto k_offset = [&](int tile_k) { return tile_k * T::B_K; };
 
     const int loops = (kargs.k + T::B_K - 1) / T::B_K;
+    if constexpr (T::B_SLOTS == 3) {
+    // ------- 3-slot B (r0/r1/w triple buffer): original scheme, verbatim.
+    smem<D_B> sb_r0 = make_smem(reinterpret_cast<D_B*>(smem_b));
+    smem<D_B> sb_r1 = make_smem(reinterpret_cast<D_B*>(smem_b + smem_b_byte));
+    smem<D_B> sb_w  = make_smem(reinterpret_cast<D_B*>(smem_b + 2 * smem_b_byte));
+
     int tic = 0, toc = 1;
 
     async_load<T::VEC_A>(g_a, s_a[tic].ptr, u_ga, u_sa, k_offset(0));
@@ -393,6 +409,48 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
     }
 
     if (wave_id_m == 0) __builtin_amdgcn_s_barrier();
+    } else {
+    // ------- 2-slot B (double buffer), for big tiles that overflow 3x B
+    // LDS (e.g. 256x256x64). A and B both prefetch-1; PGR1 K-loop identical
+    // in structure to the uniform pipeline (proven correct for any loops>=1,
+    // no wave-id-m phase shifter needed since there is no producer/consumer
+    // triple-buffer rotation).
+    smem<D_B> s_b[2] = {
+        make_smem(reinterpret_cast<D_B*>(smem_b)),
+        make_smem(reinterpret_cast<D_B*>(smem_b + smem_b_byte))
+    };
+    constexpr int ld_per_tile = T::a_buffer_load_insts + T::b_buffer_load_insts;
+
+    async_load<T::VEC_A>(g_a, s_a[0].ptr, u_ga, u_sa, k_offset(0));
+    async_load<T::VEC_B>(g_b, s_b[0].ptr, u_gb, u_sb, k_offset(0));
+
+    int cur = 0;
+    for (int tile = 0; tile < loops; ++tile) {
+        int nxt = cur ^ 1;
+        bool has_next = (tile + 1 < loops);
+        if (has_next) {
+            async_load<T::VEC_A>(g_a, s_a[nxt].ptr, u_ga, u_sa, k_offset(tile + 1));
+            async_load<T::VEC_B>(g_b, s_b[nxt].ptr, u_gb, u_sb, k_offset(tile + 1));
+            s_waitcnt_vmcnt(number<ld_per_tile>{});
+        } else {
+            s_waitcnt_vmcnt(0_I);
+        }
+        __builtin_amdgcn_s_barrier();
+
+        v_a = load<T::VEC_A>(s_a[cur], u_ra);
+        v_b = load<T::VEC_B>(s_b[cur], u_rb);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_sched_barrier(0);
+
+        __builtin_amdgcn_s_setprio(1);
+        v_c = mma(v_a, v_b, v_c);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        cur = nxt;
+    }
+    }
 
     auto u_gc = make_layout_gc<T>(lane_id, 0, wave_id_n, kargs.stride_c);
     auto v_c_f16 = cast<D_C>(v_c);

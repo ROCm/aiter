@@ -31,6 +31,7 @@ from opus_gemm_common import (
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
+    a16w16_uniform_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
     default_kernels_dict,
@@ -151,6 +152,7 @@ NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 # the actual workspace dtype and the reduce launcher writes the requested Y.
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
+    "a16w16_uniform",
     "a16w16_cluster_tdm_splitk_ws",
     "a16w16_clusterlaunch_tdm_splitk_ws",
     *_SPLITK,
@@ -297,6 +299,7 @@ class opus_gemm_codegen:
             _validate_a16w16,
             _validate_a16w16_flatmm,
             _validate_a16w16_flatmm_splitk,
+            _validate_a16w16_uniform_gfx950,
             _validate_a16w16_mono_tile,
             _validate_a16w16_persistent,
         )
@@ -359,6 +362,14 @@ class opus_gemm_codegen:
                 f"slots={info['slots']} "
                 f"comrep=({info['com_rep_m']},{info['com_rep_n']}) "
                 f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']} WG={k.WG_PER_CU}"
+            )
+        elif k.kernel_tag == "a16w16_uniform":
+            info = _validate_a16w16_uniform_gfx950(k)
+            print(
+                f"  {k.name}: E=({info['E_M']},{info['E_N']},{info['E_K']})"
+                f"  VGPR~{info['vgpr_est']}  AGPR={info['agprs']}"
+                f"  LDS={info['lds_bytes'] // 1024}KiB"
+                f"  K>={info['min_k']}"
             )
 
         pipeline_header = _pipeline_header_for(k)
@@ -598,6 +609,39 @@ class opus_gemm_codegen:
             # each opus_a16w16_tune_dispatch<CDat...
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_BF16", "bf16_t")
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_FP32", "fp32_t")
+            # "_mmajor" variants: same a16w16 / a16w16_flatmm_splitk kernels,
+            # but the launcher reads dim0 as M / dim1 as batch (no dim0<->dim1
+            # swap needed by the caller) -- see gen_flatmm_splitk_instance /
+            # gen_noscale_instance_gfx950's "_mmajor" emits and
+            # wo_a_gemm_opus in aiter/ops/opus/gemm_op_a16w16.py.
+            # a16w16_flatmm_splitk is fp32-only (matches its non-mmajor
+            # counterpart -- main kernel hardcodes D_C=float); a16w16
+            # split-barrier (non-splitk, writes Y directly) gets both.
+            _emit_map(
+                f,
+                "GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_FP32",
+                "fp32_t",
+                tags={
+                    "a16w16_flatmm_splitk",
+                    "a16w16",
+                    "a16w16_interleave",
+                    "a16w16_persistent",
+                    "a16w16_mono_tile",
+                },
+                name_suffix="_mmajor",
+            )
+            _emit_map(
+                f,
+                "GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_BF16",
+                "bf16_t",
+                tags={
+                    "a16w16",
+                    "a16w16_interleave",
+                    "a16w16_persistent",
+                    "a16w16_mono_tile",
+                },
+                name_suffix="_mmajor",
+            )
 
     def gen_a8w8_tune_lookup(self, kernels_dict):
         """Emit the int-ID-to-kernel map for A8W8 tuning."""
@@ -685,6 +729,20 @@ void
                     f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
                 else:
                     f.write(MANIFEST_SCALE.format(kernel_name=k.name))
+                # "_mmajor" sibling: same 4-arg signature, dim0=M/dim1=batch
+                # reads instead of dim0=batch/dim1=M. See
+                # gen_flatmm_splitk_instance / gen_noscale_instance_gfx950's
+                # "_mmajor" emits and GENERATE_A16W16_TUNE_LOOKUP_MMAJOR_*.
+                if k.kernel_tag in (
+                    "a16w16_flatmm_splitk",
+                    "a16w16",
+                    "a16w16_interleave",
+                    "a16w16_persistent",
+                    "a16w16_mono_tile",
+                ):
+                    f.write(
+                        MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name + "_mmajor")
+                    )
 
     # -- Per-pass TU emission -- Replaces the old "one .cpp per (kid, dtype)" scheme.
 
@@ -1039,6 +1097,7 @@ if __name__ == "__main__":
         "a16w16": a16w16_kernels_list,
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
+        "a16w16_uniform": a16w16_uniform_kernels_list,
         "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
         "gfx942_nosplit": gfx942_nosplit_kernels_list,
         "gfx942_splitk": gfx942_splitk_kernels_list,
