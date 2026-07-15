@@ -76,7 +76,7 @@ env:
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
   ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
   ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
-  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
   ISL_LIST_DEFAULT: "1024"
   OSL_DEFAULT: "1024"
   CONC_LIST_DEFAULT: "16"
