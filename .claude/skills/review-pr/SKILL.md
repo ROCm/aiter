@@ -477,11 +477,12 @@ New attention / norm kernel tested only at full head count (TP=1 equivalent). At
 Trigger: new kernel taking `num_heads_q` / `num_heads_k`; PR test shows only one head count without a TP=4 or TP=8 variant.
 → `⚠️ P4: test covers only TP=1 head count — verify at num_heads÷TP=4 (e.g., [128→32])`
 
-**P5 — Benchmark timing excludes one-time setup cost** ⚠️
-Perf numbers exist but the timing window starts AFTER a one-time setup step whose cost is borne by real users on every cold start: weight shuffle/preshuffle, first-call JIT compile, hipMemsetAsync on large buffers, or precompile of variant kernels. Omitting this makes a net-regression look like a speedup.
-Trigger: PR description shows a speedup but the benchmark script (or description) shows timing begins after `shuffle_weight()`, after `warmup_iters`, or inside an already-warm JIT cache. Check: would a user deploying this op from scratch see the same number?
-Real examples: aiter#4166 — `shuffle_weight` excluded from timing, claimed 1.14x win is actually ~0.83x regression when included; aiter#3944 — FlyDSL precompile launches 7 dummy kernels on live stream at cold-start, benchmark captures only warm-cache latency.
-→ `⚠️ P5: timing window excludes [setup step] — re-run benchmark including [shuffle_weight / first-call JIT / precompile] to confirm net improvement`
+**P5 — Benchmark hides a cost real users pay on every call or cold start** ⚠️
+The perf claim is measured with the timing window drawn so a *recurring* production cost is excluded: a first-call JIT compile on a path that is NOT cached across calls, or a setup step that runs on the live stream inside the timed region on every cold start. If that cost is real and recurring, omitting it can turn a net regression into an apparent speedup.
+Do NOT fire on a genuinely one-time, amortizable setup that production pays once at model init — excluding weight shuffle/preshuffle, model weight loading, or a first-call JIT whose result is cached forever from steady-state per-call latency is CORRECT methodology, not deception. `warmup_iters` before a steady-state loop is standard and by itself is not P5.
+FP self-check (do this before firing): is the excluded cost paid **once per deployment** (amortizable → do NOT fire) or **again on every call / every cold start / inside the timed stream** (→ fire)? If you cannot show it recurs, do not fire.
+Counter-example (does NOT trigger P5): aiter#4166 preshuffles the static weight once outside the timing loop and honestly reports a geomean 0.69x result — a correct steady-state benchmark, not a hidden cost. Charging that one-time shuffle against a single call to manufacture a "regression" is itself the false positive this rule must avoid.
+→ `⚠️ P5: timing window excludes [cost] that recurs per call / per cold start — re-run including it, or confirm it is one-time amortizable`
 
 ---
 
