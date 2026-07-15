@@ -90,6 +90,12 @@ def get_kernel_config(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
+        # Decode / tiny-M (block_m=16) on gfx1250, tuned on the MiniMax-M3 A16W4
+        # eager decode capture (M<=16, N=6144, K in {6144,3072}). A 512-deep K
+        # tile beats the flat 256 on the deep gate/up projection (K=6144)
+        # consistently across decode M (~6-15% on that GEMM); the shallow down
+        # projection (K=3072) keeps the 256 tile.
+        block_k = 512 if k >= 4096 else 256
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
