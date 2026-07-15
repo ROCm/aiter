@@ -15,6 +15,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
+from aiter.ops.asm.mla_decode_v4 import mla_decode_v4_asm_gfx1250
 
 
 @triton.jit
@@ -1480,27 +1481,55 @@ def mla_decode_fwd_v4_nm(
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    aiter.mla_decode_v4_asm(
-        q,
-        qrope,
-        kv_buffer,
-        kvrope,
-        qo_indptr,
-        kv_indptr,
-        kv_page_indices,
-        split_indptr,
-        sink,
-        max_seqlen_q,
-        sm_scale_arg,
-        int(out_16_nosplit),
-        int(num_kv_splits),
-        logits,
-        attn_lse,
-        output,
-        valid_split_count,
-        use_valid_split_count_reduce,
-        kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
-    )
+    # gfx1250 launches the v4 nm `.co` directly from Python (no C++ host
+    # bridge) via the thin wrapper in aiter.ops.mla_v4_pyco, which reproduces
+    # asm_mla_v4.cu's gfx1250 "preload" kernarg path. Every other arch (e.g.
+    # gfx950) keeps going through the canonical C-ABI dispatcher. The two share
+    # an identical call signature, so this is a pure routing decision.
+    if get_gfx() == "gfx1250":
+        mla_decode_v4_asm_gfx1250(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            split_indptr,
+            sink,
+            max_seqlen_q,
+            sm_scale_arg,
+            int(out_16_nosplit),
+            int(num_kv_splits),
+            logits,
+            attn_lse,
+            output,
+            valid_split_count,
+            use_valid_split_count_reduce,
+            kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
+        )
+    else:
+        aiter.mla_decode_v4_asm(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            split_indptr,
+            sink,
+            max_seqlen_q,
+            sm_scale_arg,
+            int(out_16_nosplit),
+            int(num_kv_splits),
+            logits,
+            attn_lse,
+            output,
+            valid_split_count,
+            use_valid_split_count_reduce,
+            kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
+        )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
     if num_kv_splits > 1:
