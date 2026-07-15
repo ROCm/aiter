@@ -129,6 +129,31 @@ def per_1x32_f4_quant(
         ``(quantized_tensor, scale_tensor)``.
     """
     assert quant_dtype == dtypes.fp4x2
+
+    # For large (>4 GiB) >=3D inputs, iterate the outermost dim so peak memory
+    # scales with a single slice instead of the whole tensor. Quantization is
+    # per-block along the last dim, so slicing leading dims is exact; ``shuffle``
+    # is applied once on the assembled scale to preserve its cross-row layout.
+    if x.dim() >= 3 and x.numel() * x.element_size() > 4 * 1024**3:
+        assert pack_dim == -1, "pack_dim=0 requires a 2D input tensor (K, N)"
+        parts = [
+            per_1x32_f4_quant(
+                x[i],
+                scale=scale,
+                quant_dtype=quant_dtype,
+                shuffle=False,
+                pack_dim=-1,
+                round_mode=round_mode,
+            )
+            for i in range(x.shape[0])
+        ]
+        y = torch.stack([p[0] for p in parts], dim=0)
+        scale = torch.cat([p[1].view(torch.uint8) for p in parts], dim=0)
+        if shuffle:
+            scale = fp4_utils.e8m0_shuffle(scale)
+        scale = scale.view(dtypes.fp8_e8m0)
+        return y, scale
+
     block_size = 32
 
     # Internally we always pack along the last dim. For RHS layout
@@ -862,6 +887,7 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     token_num: int,
     block_m: int,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> None:
     """
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
@@ -1004,6 +1030,7 @@ def fused_dynamic_mx_quant_moe_sort(
     quant_dtype: torch.dtype = dtypes.fp4x2,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
@@ -1085,6 +1112,7 @@ def fused_dynamic_mx_quant_moe_sort(
             token_num,
             block_size,
             group_size,
+            sorted_weights,
         )
     else:
         # Split path: per-token quant produces unswizzled e8m0 byte scale,
@@ -1117,6 +1145,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     block_size: int,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1134,6 +1163,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         quant_dtype=dtypes.fp4x2,
         num_rows=num_rows,
         group_size=group_size,
+        sorted_weights=sorted_weights,
     )
 
 
@@ -1146,6 +1176,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     block_size: int,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1173,6 +1204,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         quant_dtype=dtypes.fp8,
         num_rows=num_rows,
         group_size=group_size,
+        sorted_weights=sorted_weights,
     )
 
 
@@ -1226,6 +1258,16 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
+    out_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate.
+
+    When ``out_scale`` is given, the rotated activation is additionally
+    fp8-quantized in-kernel (fusing what ``get_hip_quant(per_1x128)`` would do):
+    ``out`` must be fp8 and receives ``round(rotated / scale)``, while
+    ``out_scale`` (``[m, dim // group_size]`` fp32) receives the per-(row,
+    ``1 x group_size``) block scales ``scale = absMax / fp8_max``. Without
+    ``out_scale`` it is the bf16/fp16 in-place path (``out`` shares dtype with
+    ``input``)."""
     ...

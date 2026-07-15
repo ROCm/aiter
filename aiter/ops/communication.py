@@ -29,10 +29,16 @@ def init_dist_env(
     data_parallel_size: int = 1,
     data_parallel_rank: int = 0,
     decode_context_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
 ):
     pipeline_model_parallel_size = 1
-    # world_size is TPxPP
-    world_size = pipeline_model_parallel_size * tensor_model_parallel_size
+    # world_size is TP x PP x PCP (PCP is an independent dimension that grows
+    # world_size; see initialize_model_parallel in dist/parallel_state.py).
+    world_size = (
+        pipeline_model_parallel_size
+        * tensor_model_parallel_size
+        * prefill_context_model_parallel_size
+    )
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
@@ -49,19 +55,28 @@ def init_dist_env(
         pipeline_model_parallel_size,
         decode_context_model_parallel_size=decode_context_parallel_size,
         data_parallel_size=data_parallel_size,
+        prefill_context_model_parallel_size=prefill_context_model_parallel_size,
     )
 
     if tensor_model_parallel_size > 1:
         # hack custom_allreduce
         tp_grp = get_tp_group()
         ca_comm = tp_grp.device_communicator.ca_comm
-        # signal
-        signal = torch.zeros(
-            tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
-        )
-        ca_comm.signal = signal
-        ca_comm.register_input_buffer(signal)
-        ca_comm.buffer = ca_comm._pool["input"].tensor
+        # gfx1250 (MI450) uses a VMM-based custom allreduce whose input buffer
+        # is already registered in CustomAllreduce._init_gfx1250(). The extra
+        # register_input_buffer(signal) below routes through get_external_ipc_meta,
+        # whose vmm_exchange rendezvous key is process-local (id(self)+data_ptr),
+        # so it can never align across TP ranks and deadlocks at startup. The
+        # `signal`/`buffer` attributes set here are never read anywhere, so skip
+        # the whole block on gfx1250.
+        if ca_comm is not None and not getattr(ca_comm, "_is_gfx1250", False):
+            # signal
+            signal = torch.zeros(
+                tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
+            )
+            ca_comm.signal = signal
+            ca_comm.register_input_buffer(signal)
+            ca_comm.buffer = ca_comm._pool["input"].tensor
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 
