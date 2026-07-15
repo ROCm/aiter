@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import numpy as np
 import flydsl.compiler as flyc
@@ -14,7 +16,16 @@ from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
 
-MOE_KERNARG_PRELOAD_COUNT = 16
+# Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
+# kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
+# globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
+# number of kernel arguments to preload.
+AITER_FLYDSL_KERNARG_PRELOAD = bool(
+    int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1"))
+)
+AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
+    os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
+)
 
 
 def ptr_rsrc(ptr):

@@ -23,7 +23,8 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     STensor,
     ptr_rsrc,
-    MOE_KERNARG_PRELOAD_COUNT,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
@@ -158,8 +159,8 @@ def build_moe_contiguous_psum_module():
 
     launch_psum.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -329,8 +330,8 @@ def build_moe_contiguous_psum_remap_module():
 
     launch_psum_remap.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -542,7 +543,7 @@ def build_moe_route_psum_fused_module():
     launch_route_psum_fused.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
