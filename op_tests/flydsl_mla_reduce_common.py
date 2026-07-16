@@ -4,6 +4,7 @@ import torch
 import aiter
 
 from aiter.ops.flydsl.kernels.mla_reduce import (
+    LDS_MAX_SPLITS,
     Tier,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
@@ -234,10 +235,11 @@ def torch_ref_gather(
 
 def hip_ref(po, pl, indptr, fmap, pmap, num_tiles, H, Dv, out_dtype, M=1):
     """Reference output from HIP kn_mla_reduce_v1. Outputs are zero-initialized so
-    skipped (empty) tiles match a zero-initialized final buffer under test."""
+    skipped (empty) tiles match a zero-initialized final buffer under test.
+    """
     ref_out = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=po.device)
     ref_lse = torch.zeros(num_tiles * M, H, dtype=torch.float32, device=po.device)
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, 0, ref_out, ref_lse)
+    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, LDS_MAX_SPLITS, ref_out, ref_lse)
     torch.cuda.synchronize()
     return ref_out, ref_lse
 
@@ -246,7 +248,7 @@ def hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse, M=1):
     """HIP reference sized to ``fout`` / ``flse`` (serving grids with sparse tiles)."""
     ref_out = torch.zeros_like(fout)
     ref_lse = torch.zeros_like(flse)
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, 0, ref_out, ref_lse)
+    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, LDS_MAX_SPLITS, ref_out, ref_lse)
     torch.cuda.synchronize()
     return ref_out, ref_lse
 
