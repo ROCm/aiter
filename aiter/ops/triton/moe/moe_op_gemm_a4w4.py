@@ -384,7 +384,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
-    num_buffers = 2
+    num_buffers = 3
 
     l2_prefetch_distance = 0
 
