@@ -102,7 +102,7 @@ def _load_triton_gemm_shapes() -> frozenset:
     """Load the triton-fallback shape set from the triton-GEMM CSV.
 
     Keyed by the exact ``(M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle)``
-    tuple.
+    tuple, mirroring ``_load_unsupported_gemm_shapes``.
     """
     if not os.path.exists(triton_fallback_path):
         return frozenset()
@@ -258,21 +258,6 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        # gfx1250: shapes with no safe native solution (skinny kernel device-traps,
-        # torch/hipBLASLt throws std::bad_variant_access) are routed to the triton
-        # a16w16 kernel. Checked first so it overrides the torch/skinny defaults.
-        if is_triton_fallback_gfx1250(
-            M, N, K, bias, dtype, otype, scaleAB, bpreshuffle
-        ):
-            default_config["libtype"] = "triton"
-            default_config["solidx"] = 0
-            default_config["kernelName"] = ""
-            logger.info(
-                f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, "
-                f"{scaleAB=}, {bpreshuffle=}, listed in {triton_fallback_path}, "
-                f"using triton solution:0"
-            )
-            return default_config
         if bpreshuffle:
             default_config["bpreshuffle"] = True
             if gfx == "gfx942":
