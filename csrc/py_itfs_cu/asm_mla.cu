@@ -900,7 +900,7 @@ void mla_decode_stage1_asm_fwd(
                 config_gqa_ratio = 32;
                 args.s_MQA = gqa_ratio;
             }else {
-                AITER_CHECK(false, __func__, ":only support gqa_ratio=16 fp8 mla decoding with qo_len <= 4 and qseqlen>=4 in persistent mode on gfx950");
+                AITER_CHECK(false, __func__, ":only support gqa_ratio=16 fp8 mla decoding with qo_len <= 4 and qo_len>4 in persistent mode on gfx950");
             }
         }
     } else if (gqa_ratio == 32){
@@ -924,7 +924,7 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 32;
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2,4 in persistent mode and qseqlen>=4 in persistent mode on gfx950");
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2,4 in persistent mode and decode_qlen>4 in persistent mode on gfx950");
             }
         }
     } else if (gqa_ratio == 64){
