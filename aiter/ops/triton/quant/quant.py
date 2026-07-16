@@ -216,7 +216,7 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
     even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
-    print(arch_info.get_arch())
+
     if arch_info.get_arch() in ("gfx950"):
         _dynamic_mxfp4_quant_kernel_gluon_950[grid](
             x,
@@ -233,11 +233,12 @@ def dynamic_mxfp4_quant(
             NUM_ITER=NUM_ITER,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
             num_warps=NUM_WARPS,
             waves_per_eu=0,
         )
 
-    elif arch_info.get_arch() in ("gfx1251"):
+    elif arch_info.get_arch() in ("gfx1250"):
         _dynamic_mxfp4_quant_kernel_gluon_1250[grid](
             x,
             x_fp4,
@@ -253,6 +254,7 @@ def dynamic_mxfp4_quant(
             NUM_ITER=NUM_ITER,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
             num_warps=NUM_WARPS,
             waves_per_eu=0,
         )
