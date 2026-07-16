@@ -85,10 +85,9 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \\
     text = replace_once(
         text,
         'MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1',
-        """MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || MODEL_PATH=""
-if [[ -n "${MODEL:-}" && ( -z "$MODEL_PATH" || ( "$MODEL_PATH" == /* && ! -d "$MODEL_PATH" ) ) ]]; then
-    echo "WARN: MODEL_PATH is not visible on this node, falling back to model id: ${MODEL_PATH:-<empty>} -> $MODEL" >&2
-    MODEL_PATH="$MODEL"
+        """MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || MODEL_PATH="${MODEL:-}"
+if [[ -n "${MODEL:-}" && "$MODEL_PATH" == /* && ! -e "$MODEL_PATH" ]]; then
+    echo "WARN: MODEL_PATH is not visible on the submit node; compute containers will try it before falling back to model id: $MODEL_PATH -> $MODEL" >&2
 fi""",
     )
     text = replace_once(
@@ -161,12 +160,72 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
         "export PYTHONPATH=/tmp/aiter-under-test-runtime:\\${PYTHONPATH:-}\n",
         min_count=2,
     )
+    text = replace_all(
+        text,
+        'source "\\$CIDIR/model_flags.sh"\n',
+        'source "\\$CIDIR/model_flags.sh"\n'
+        'MODEL_PATH_RUNTIME="$MODEL_PATH"\n'
+        'MODEL_FALLBACK="${MODEL:-$MODEL_PATH}"\n'
+        'if [[ "\\$MODEL_PATH_RUNTIME" == /* && ! -e "\\$MODEL_PATH_RUNTIME" ]]; then\n'
+        '  echo "WARN: MODEL_PATH is not visible inside container, falling back to model id: \\$MODEL_PATH_RUNTIME -> \\$MODEL_FALLBACK" >&2\n'
+        '  MODEL_PATH_RUNTIME="\\$MODEL_FALLBACK"\n'
+        "fi\n",
+        min_count=2,
+    )
+    text = replace_all(
+        text,
+        "--model-path $MODEL_PATH --host",
+        '--model-path "\\$MODEL_PATH_RUNTIME" --host',
+        min_count=2,
+    )
     text = replace_once(
         text,
         "    bash \\$CIDIR/install_checkout_sglang.sh\n",
         "    bash \\$CIDIR/install_checkout_sglang.sh\n"
         "    bash \\$CIDIR/install_checkout_aiter.sh\n"
         "    export PYTHONPATH=/tmp/aiter-under-test-runtime:\\${PYTHONPATH:-}\n",
+    )
+    text = replace_once(
+        text,
+        "    bash \\$CIDIR/install_checkout_router.sh\n",
+        "    bash \\$CIDIR/install_checkout_router.sh\n"
+        '    MODEL_PATH_RUNTIME="$MODEL_PATH"\n'
+        '    MODEL_FALLBACK="${MODEL:-$MODEL_PATH}"\n'
+        '    if [[ "\\$MODEL_PATH_RUNTIME" == /* && ! -e "\\$MODEL_PATH_RUNTIME" ]]; then\n'
+        '      echo "WARN: MODEL_PATH is not visible inside bench container, falling back to model id: \\$MODEL_PATH_RUNTIME -> \\$MODEL_FALLBACK" >&2\n'
+        '      MODEL_PATH_RUNTIME="\\$MODEL_FALLBACK"\n'
+        "    fi\n",
+    )
+    text = replace_once(
+        text,
+        "--host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \\",
+        '--host 127.0.0.1 --port $LBPORT --model "\\$MODEL_PATH_RUNTIME" \\',
+    )
+    text = replace_once(
+        text,
+        """    echo "[wait] prefill"; for i in \\$(seq 1 600); do curl -sf http://\\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
+    echo "[wait] decode";  for i in \\$(seq 1 600); do curl -sf http://\\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
+""",
+        """    wait_health() {
+      NAME=\\$1
+      URL=\\$2
+      echo "[wait] \\$NAME \\$URL"
+      for i in \\$(seq 1 600); do
+        if curl -sf "\\$URL" >/dev/null; then
+          echo "[wait] \\$NAME ready after \\$i attempt(s)"
+          return 0
+        fi
+        if [ \\$((i % 12)) -eq 0 ]; then
+          echo "[wait] \\$NAME still not ready after \\$((i * 5))s"
+        fi
+        sleep 5
+      done
+      echo "[wait] ERROR: \\$NAME not ready after 3000s: \\$URL"
+      exit 1
+    }
+    wait_health prefill http://\\$PIP:$PPORT/health
+    wait_health decode http://\\$DIP:$DPORT/health
+""",
     )
     text = replace_all(
         text,
@@ -456,15 +515,15 @@ echo "shared_log=\\$RANK_LOG"
 env | sort | grep -E '^(SLURM|SPUR)_' || true
 
 IPS=()
-if (( \\${#REQUESTED_NODES[@]} >= TOTAL_NODES )); then
-    for node in "\\${REQUESTED_NODES[@]:0:$TOTAL_NODES}"; do
-        ip="\\$(getent ahostsv4 "\\$node" | head -1 | awk '{print \\$1}')"
-        IPS+=("\\${ip:-\\$node}")
-    done
-elif [[ -n "\\${SPUR_PEER_NODES:-}" ]]; then
+if [[ -n "\\${SPUR_PEER_NODES:-}" ]]; then
     IFS=',' read -r -a PEERS <<< "\\$SPUR_PEER_NODES"
     for peer in "\\${PEERS[@]}"; do
         IPS+=("\\${peer%%:*}")
+    done
+elif (( \\${#REQUESTED_NODES[@]} >= TOTAL_NODES )); then
+    for node in "\\${REQUESTED_NODES[@]:0:$TOTAL_NODES}"; do
+        ip="\\$(getent ahostsv4 "\\$node" | awk '\\$1 !~ /^127[.]/ {print \\$1; exit}')"
+        IPS+=("\\${ip:-\\$node}")
     done
 fi
 
@@ -560,16 +619,50 @@ if [[ "$SALLOC_RC" -eq 0 ]]; then
         echo "batch_job_id=$BATCH_JOB_ID"
         SLURM_OUT="$WORKDIR/slurm-${BATCH_JOB_ID}.out"
         SLURM_ERR="$WORKDIR/slurm-${BATCH_JOB_ID}.err"
+        declare -A LIVE_LOG_LINES=()
+        print_live_logs() {
+            shopt -s nullglob
+            local file current previous start skipped
+            local limit=80
+            local files=(
+                "$WORKDIR"/startup.log
+                "$WORKDIR"/rank-*.log
+                "$WORKDIR"/bench.log
+                "$WORKDIR"/prefill_rank*.log
+                "$WORKDIR"/decode_rank*.log
+            )
+            shopt -u nullglob
+            for file in "${files[@]}"; do
+                [[ -f "$file" ]] || continue
+                current="$(wc -l < "$file" 2>/dev/null || echo 0)"
+                [[ "$current" =~ ^[0-9]+$ ]] || current=0
+                previous="${LIVE_LOG_LINES[$file]:-0}"
+                if (( current <= previous )); then
+                    continue
+                fi
+                start=$((previous + 1))
+                if (( current - previous > limit )); then
+                    skipped=$((current - previous - limit))
+                    start=$((current - limit + 1))
+                    echo "--- live $(basename "$file") skipped ${skipped} older new line(s) ---"
+                fi
+                echo "--- live $(basename "$file") lines ${start}-${current} ---"
+                sed -n "${start},${current}p" "$file" | sed "s/^/[$(basename "$file")] /" || true
+                LIVE_LOG_LINES["$file"]="$current"
+            done
+        }
         while [[ ! -f "$BATCH_EXIT" ]]; do
             queue_line="$(squeue -j "$BATCH_JOB_ID" -h 2>/dev/null || true)"
             if [[ -n "$queue_line" ]]; then
                 echo "[batch] $queue_line"
+                print_live_logs
                 sleep 30
             else
                 sleep 5
                 [[ -f "$BATCH_EXIT" ]] || { echo "ERROR: batch job $BATCH_JOB_ID ended without $BATCH_EXIT" >&2; SALLOC_RC=1; break; }
             fi
         done
+        print_live_logs
         if [[ -f "$BATCH_EXIT" ]]; then
             SALLOC_RC="$(cat "$BATCH_EXIT" 2>/dev/null || echo 1)"
         fi
