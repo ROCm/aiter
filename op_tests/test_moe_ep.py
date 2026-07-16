@@ -421,57 +421,90 @@ def test_fmoe_ep_mxfp4(
         print(f"skip {quant_label} on gfx1250: only a8w4_mxfp4 supported")
         return
 
-    # Match ATOM MoriV2ModularKernel._maybe_trim_dispatch_output shapes:
-    #   total_valid_tokens = context.graph_bs * topk * dp_size
+    # ---------- ATOM shape model (MoriV2ModularKernel) ----------
+    # Before MORI dispatch: each of `ep` ranks holds `graph_bs` tokens, each
+    #   with `topk` *global* expert ids (spanning all E experts).
+    # MORI dispatch: sends each token to every rank that owns at least one of
+    #   its topk experts. The token (hidden_states row) is sent once per unique
+    #   dest_pe (deduplicated); all topk idx/weight travel with it.
+    # After dispatch: recv buffer shape (mr, hidden_dim) with (mr, topk) ids.
+    #   total_recv = number of unique tokens that landed on this rank.
+    # After trim: buffer is sliced to graph_bs * topk * dp_size (CUDAGraph bound).
+    #
+    # Balanced simulation:
+    #   experts_per_rank = E // ep.  Each token's topk experts are spread
+    #   across ranks; under balanced routing every token has at least 1 expert
+    #   on this rank, so recv_tokens ≈ graph_bs * ep = token.
     graph_bs = token // ep
-    recv_tokens = graph_bs * ep  # balanced: all tokens land on this rank
-    trim_M = graph_bs * topk * ep  # ATOM's trim bound (= token * topk)
+    experts_per_rank = E // ep
+    recv_tokens = graph_bs * ep  # balanced: every token arrives
+    trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound
     print(
         f"  [EP sim] global_token={token} topk={topk} ep={ep} "
         f"graph_bs={graph_bs} recv_tokens={recv_tokens} trim_M={trim_M}"
     )
 
     ep_id = ep - 1
+    local_expert_start = ep_id * experts_per_rank
+    local_expert_end = (ep_id + 1) * experts_per_rank
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
-    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    expert_mask[local_expert_start:local_expert_end] = 1
     local_E = int(torch.sum(expert_mask).item())
     fake_expertid = expert_mask.numel() - 1
     expert_mask[-1] = 0
     expert_mask[E:-1] = 1
 
     dtype = dtypes.bf16
-    input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
-    score = torch.randn((trim_M, E), dtype=dtype, device="cuda")
 
-    # Build topk_ids with the full topk dimension (MORI preserves topk after dispatch).
-    # fused_topk routes across ALL experts (not just local); expert_mask handles filtering.
-    total_topk_ids = torch.empty(
+    # ---------- Simulate MORI dispatch output ----------
+    # Step 1: generate `recv_tokens` *source* tokens with global topk routing.
+    #   Each source token picks topk experts from ALL E experts via fused_topk
+    #   (the router runs *before* dispatch on the source rank).
+    src_input = torch.randn((recv_tokens, model_dim), dtype=dtype, device="cuda")
+    src_score = torch.randn((recv_tokens, E), dtype=dtype, device="cuda")
+    src_topk_ids = torch.empty(
+        (recv_tokens, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+    )
+    ns_ids, s_ids = src_topk_ids.split([topk, shared_E + 1], dim=1)
+    shared_expert_ids = [E + i for i in range(shared_E + 1)]
+    s_ids_list = [[fake_expertid] * (shared_E + 1)] * recv_tokens
+    for i in range(ep_id, recv_tokens, ep):
+        s_ids_list[i] = shared_expert_ids
+    s_ids[:] = torch.tensor(s_ids_list, dtype=dtypes.i32, device="cuda")
+    src_topk_weights = torch.empty(
+        (recv_tokens, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+    )
+    ns_wts, s_wts = src_topk_weights.split([topk, shared_E + 1], dim=1)
+    s_wts[:] = 0.1
+    fused_topk(src_input, src_score, topk, True, ns_ids, ns_wts)
+
+    # Step 2: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
+    #   First recv_tokens rows = valid received tokens (from step 1).
+    #   Rows [recv_tokens, trim_M) = dead padding (MORI arena tail).
+    input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
+    input_[:recv_tokens] = src_input
+
+    total_topk_ids = torch.zeros(
         (trim_M, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
     )
-    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
-    shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * trim_M
-    for i in range(ep_id, trim_M, ep):
-        s_topk_ids_list[i] = shared_expert_ids
-    s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device="cuda")
+    total_topk_ids[:recv_tokens] = src_topk_ids
 
-    total_topk_weights = torch.empty(
+    total_topk_weights = torch.zeros(
         (trim_M, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
     )
-    ns_topk_weights, s_topk_weights = total_topk_weights.split(
-        [topk, shared_E + 1], dim=1
-    )
-    s_topk_weights[:] = 0.1
-    fused_topk(input_, score, topk, True, ns_topk_ids, ns_topk_weights)
+    total_topk_weights[:recv_tokens] = src_topk_weights
+
     topk_ids = total_topk_ids
     topk_weights = total_topk_weights
 
-    # num_local_tokens: device tensor matching ATOM's total_recv_t semantic.
-    # Only the first recv_tokens rows are valid; the [recv_tokens, trim_M) tail is padding.
+    # num_local_tokens: device tensor matching ATOM's total_recv_t from MORI.
+    # fused_moe only processes the first recv_tokens rows; the tail is skipped.
     num_local_tokens = torch.tensor([recv_tokens], dtype=dtypes.i32, device="cuda")
-    ref_input = input_[:recv_tokens]
-    ref_topk_ids = total_topk_ids[:recv_tokens]
-    ref_topk_weights = total_topk_weights[:recv_tokens]
+
+    # Reference: same valid tokens, same routing, same expert_mask.
+    ref_input = src_input
+    ref_topk_ids = src_topk_ids
+    ref_topk_weights = src_topk_weights
 
     total_local = local_E + shared_E
     w1 = (
