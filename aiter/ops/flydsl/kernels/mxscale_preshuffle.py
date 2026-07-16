@@ -16,7 +16,6 @@ from flydsl.expr.typing import (
     BFloat16,
     Constexpr,
     Float4E2M1FN,
-    Float6E2M3FN,
     Float8E4M3FN,
     Float16,
     Float32,
