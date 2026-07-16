@@ -25,14 +25,15 @@ Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
     ENABLE_CK=0 AITER_FORCE_A8W4=1 AITER_USE_GROUPED_GEMM=1 AITER_BF16_FP8_MOE_BOUND=0 \
-    MORI_ROOT=/app/mori MORI_CCO_BC=<...>/libmori_cco_device.bc FLYDSL_GPU_ARCH=gfx1250 \
+    FLYDSL_GPU_ARCH=gfx1250 \
     torchrun --standalone --nproc_per_node=4 test_mega_moe.py \
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
+    # cco v2 op-layer is vendored in aiter; only an installed mori (mori.cco) is
+    # required. Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip JIT.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -m -hd -id -e -k --shared_E -q
 """
 import os
-import sys
 import argparse
 
 import torch
@@ -59,12 +60,11 @@ os.environ.setdefault("AITER_FORCE_A8W4", "1")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 
-# mori v2 (dispatch_combine_v2) lives outside the aiter tree; import by top-level
-# module name after inserting its dir on sys.path. MORI_ROOT is the mori checkout.
-MORI_ROOT = os.environ.get("MORI_ROOT", "/home/yashao/mori")
-os.environ.setdefault(
-    "MORI_CCO_BC", os.path.join(MORI_ROOT, "lib", "libmori_cco_device.bc")
-)
+# The cco v2 dispatch/combine op-layer is vendored into aiter
+# (aiter.ops.flydsl.dispatch_combine_v2). Only the cco comm substrate stays an
+# installed-mori dependency (mori.cco.Communicator + libmori_cco*.{so,bc}).
+# MORI_CCO_BC optionally points at a prebuilt libmori_cco_device.bc; when unset,
+# cco JIT-compiles the device bitcode on first use.
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
 _FP8_DTYPE = dtypes.fp8
@@ -74,14 +74,25 @@ _FP8_KEYS = ("per_Token", "per_128x128")
 
 
 def _import_mori_v2():
-    """Import the mori v2 op-layer + cco helpers (compiles FlyDSL on first use)."""
-    sys.path.insert(
-        0, os.path.join(MORI_ROOT, "python", "mori", "ops", "dispatch_combine_v2")
-    )
-    sys.path.insert(0, os.path.join(MORI_ROOT, "examples", "cco", "python"))
+    """Import the vendored cco v2 op-layer (compiles FlyDSL on first use).
+
+    The dispatch/combine op + kernels are vendored into aiter
+    (aiter.ops.flydsl.dispatch_combine_v2). Only the cco communication substrate
+    (mori.cco.Communicator + libmori_cco*.{so,bc}) stays an installed-mori dep.
+    set_device / sync are inlined here on torch (they were trivial hip wrappers).
+    """
     from mori.cco import Communicator
-    from cco_example_common import set_device, sync
-    from dispatch_combine_op import EpDispatchCombineConfig, EpDispatchCombineOp
+    from aiter.ops.flydsl.dispatch_combine_v2 import (
+        EpDispatchCombineConfig,
+        EpDispatchCombineOp,
+    )
+
+    def set_device(rank: int) -> None:
+        gpu = int(os.environ.get("CCO_GPU", rank % torch.cuda.device_count()))
+        torch.cuda.set_device(gpu)
+
+    def sync() -> None:
+        torch.cuda.synchronize()
 
     return Communicator, set_device, sync, EpDispatchCombineConfig, EpDispatchCombineOp
 
