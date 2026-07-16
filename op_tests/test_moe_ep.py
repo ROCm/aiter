@@ -404,13 +404,23 @@ def test_fmoe_ep_mxfp4(
     `token` is the **global** token count (total across all EP ranks).
     The test mirrors ATOM's real MoriV2ModularKernel shapes after dispatch+trim:
 
-      graph_bs     = token // ep          (per-rank tokens before dispatch)
-      recv_tokens  = token                (balanced: every token arrives)
-      trim_M       = graph_bs * topk * ep (= token * topk, ATOM's CUDAGraph trim bound)
+      graph_bs    = token // ep          (per-rank tokens before dispatch)
+      n_src       = token                (global source tokens across all ranks)
+      total_recv  = #tokens routed to THIS rank (MORI's total_recv_t, <= n_src)
+      trim_M      = graph_bs * topk * ep (= token * topk, ATOM's CUDAGraph trim bound)
+
+    Unlike a balanced "every token arrives" assumption, `total_recv` is derived
+    from the actual routing exactly like MORI dispatch (and run_ref() in
+    test_mori_all2all.py): a source token is received iff it owns >=1 *local*
+    expert (routed or active shared), deduplicated to one buffer row per token.
+    MORI returns that count as the device scalar `total_recv_t`, which ATOM
+    forwards to fused_moe as `num_local_tokens` (mirrors test_mega_moe.py's
+    DeviceMoEPipeline._layer_step, where total_recv_t comes straight from
+    op.dispatch and feeds moe_forward's num_local_tokens).
 
     The dispatch buffer has `trim_M` rows with the full `topk` routing dimension.
-    Only the first `recv_tokens` rows carry valid data; the `[recv_tokens, trim_M)`
-    tail is dead padding (ATOM uses the device-tensor `num_local_tokens` to skip it).
+    Only the first `total_recv` rows carry valid data; the `[total_recv, trim_M)`
+    tail is dead padding (fused_moe uses `num_local_tokens` to skip it).
     expert_mask filters non-local experts so fused_moe only computes on this rank's
     experts."""
     _gfx = get_gfx()
@@ -431,18 +441,14 @@ def test_fmoe_ep_mxfp4(
     #   total_recv = number of unique tokens that landed on this rank.
     # After trim: buffer is sliced to graph_bs * topk * dp_size (CUDAGraph bound).
     #
-    # Balanced simulation:
-    #   experts_per_rank = E // ep.  Each token's topk experts are spread
-    #   across ranks; under balanced routing every token has at least 1 expert
-    #   on this rank, so recv_tokens ≈ graph_bs * ep = token.
+    # Realistic simulation:
+    #   experts_per_rank = E // ep. total_recv is computed from the actual routing
+    #   (tokens owning >=1 local expert, deduplicated) -- MORI's total_recv_t --
+    #   rather than assuming every token arrives. total_recv <= n_src = token.
     graph_bs = token // ep
     experts_per_rank = E // ep
-    recv_tokens = graph_bs * ep  # balanced: every token arrives
-    trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound
-    print(
-        f"  [EP sim] global_token={token} topk={topk} ep={ep} "
-        f"graph_bs={graph_bs} recv_tokens={recv_tokens} trim_M={trim_M}"
-    )
+    n_src = graph_bs * ep  # global source tokens (all EP ranks' pre-dispatch tokens)
+    trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound (buffer rows)
 
     ep_id = ep - 1
     local_expert_start = ep_id * experts_per_rank
@@ -457,54 +463,72 @@ def test_fmoe_ep_mxfp4(
     dtype = dtypes.bf16
 
     # ---------- Simulate MORI dispatch output ----------
-    # Step 1: generate `recv_tokens` *source* tokens with global topk routing.
-    #   Each source token picks topk experts from ALL E experts via fused_topk
+    # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold before
+    #   dispatch). Each token picks topk experts from ALL E experts via fused_topk
     #   (the router runs *before* dispatch on the source rank).
-    src_input = torch.randn((recv_tokens, model_dim), dtype=dtype, device="cuda")
-    src_score = torch.randn((recv_tokens, E), dtype=dtype, device="cuda")
+    src_input = torch.randn((n_src, model_dim), dtype=dtype, device="cuda")
+    src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
     src_topk_ids = torch.empty(
-        (recv_tokens, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+        (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
     )
     ns_ids, s_ids = src_topk_ids.split([topk, shared_E + 1], dim=1)
     shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_ids_list = [[fake_expertid] * (shared_E + 1)] * recv_tokens
-    for i in range(ep_id, recv_tokens, ep):
+    s_ids_list = [[fake_expertid] * (shared_E + 1)] * n_src
+    for i in range(ep_id, n_src, ep):
         s_ids_list[i] = shared_expert_ids
     s_ids[:] = torch.tensor(s_ids_list, dtype=dtypes.i32, device="cuda")
     src_topk_weights = torch.empty(
-        (recv_tokens, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+        (n_src, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
     )
     ns_wts, s_wts = src_topk_weights.split([topk, shared_E + 1], dim=1)
     s_wts[:] = 0.1
     fused_topk(src_input, src_score, topk, True, ns_ids, ns_wts)
 
-    # Step 2: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
-    #   First recv_tokens rows = valid received tokens (from step 1).
-    #   Rows [recv_tokens, trim_M) = dead padding (MORI arena tail).
+    # Step 2: MORI dispatch keeps only the tokens that own >=1 *local* expert on
+    #   this rank (routed OR active shared), deduplicated to one row per token --
+    #   exactly run_ref()'s `mask.any(1)` selection in test_mori_all2all.py. The
+    #   received count is the device scalar MORI returns as total_recv_t.
+    recv_mask = expert_mask[src_topk_ids.long()].bool().any(dim=1)
+    recv_input = src_input[recv_mask].contiguous()
+    recv_topk_ids = src_topk_ids[recv_mask].contiguous()
+    recv_topk_weights = src_topk_weights[recv_mask].contiguous()
+    total_recv = int(recv_input.shape[0])
+    assert total_recv <= trim_M, f"total_recv={total_recv} exceeds trim_M={trim_M}"
+    print(
+        f"  [EP sim] global_token={token} topk={topk} ep={ep} graph_bs={graph_bs} "
+        f"n_src={n_src} total_recv={total_recv} trim_M={trim_M}"
+    )
+
+    # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
+    #   First total_recv rows = valid received tokens (from step 2).
+    #   Rows [total_recv, trim_M) = dead padding (MORI arena tail).
     input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
-    input_[:recv_tokens] = src_input
+    input_[:total_recv] = recv_input
 
     total_topk_ids = torch.zeros(
         (trim_M, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
     )
-    total_topk_ids[:recv_tokens] = src_topk_ids
+    total_topk_ids[:total_recv] = recv_topk_ids
 
     total_topk_weights = torch.zeros(
         (trim_M, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
     )
-    total_topk_weights[:recv_tokens] = src_topk_weights
+    total_topk_weights[:total_recv] = recv_topk_weights
 
     topk_ids = total_topk_ids
     topk_weights = total_topk_weights
 
-    # num_local_tokens: device tensor matching ATOM's total_recv_t from MORI.
-    # fused_moe only processes the first recv_tokens rows; the tail is skipped.
-    num_local_tokens = torch.tensor([recv_tokens], dtype=dtypes.i32, device="cuda")
+    # total_recv_t: device scalar matching MORI's dispatch return; fused_moe gets
+    # it as num_local_tokens and processes only the first total_recv rows, skipping
+    # the padded tail (mirrors DeviceMoEPipeline._layer_step in test_mega_moe.py,
+    # where total_recv_t from op.dispatch feeds moe_forward's num_local_tokens).
+    total_recv_t = torch.tensor([total_recv], dtype=dtypes.i32, device="cuda")
+    num_local_tokens = total_recv_t
 
-    # Reference: same valid tokens, same routing, same expert_mask.
-    ref_input = src_input
-    ref_topk_ids = src_topk_ids
-    ref_topk_weights = src_topk_weights
+    # Reference: same received tokens, same routing, same expert_mask.
+    ref_input = recv_input
+    ref_topk_ids = recv_topk_ids
+    ref_topk_weights = recv_topk_weights
 
     total_local = local_E + shared_E
     w1 = (
@@ -600,8 +624,8 @@ def test_fmoe_ep_mxfp4(
         num_iters=16,
     )
 
-    # Trim to valid prefix (recv_tokens rows); the [recv_tokens, trim_M) tail is padding.
-    out = out[:recv_tokens]
+    # Trim to valid prefix (total_recv rows); the [total_recv, trim_M) tail is padding.
+    out = out[:total_recv]
     diff = (ref - out).float()
     abs_err = diff.abs()
     abs_mean = abs_err.mean().item()
@@ -610,7 +634,7 @@ def test_fmoe_ep_mxfp4(
     logits_diff = _calc_diff(ref, out)
 
     _msg = (
-        f"{quant_label} ep={ep} token={token}(recv={recv_tokens}, trim_M={trim_M}) "
+        f"{quant_label} ep={ep} token={token}(recv={total_recv}, trim_M={trim_M}) "
         f"model_dim={model_dim} inter_dim={inter_dim} E={E} topk={topk}"
     )
     if _gfx == "gfx1250":
@@ -632,7 +656,7 @@ def test_fmoe_ep_mxfp4(
         {
             "quant": quant_label,
             "global_token": token,
-            "recv_tokens": recv_tokens,
+            "total_recv": total_recv,
             "trim_M": trim_M,
             "model_dim": model_dim,
             "inter_dim": inter_dim,
