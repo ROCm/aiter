@@ -24,6 +24,7 @@ from aiter.fused_moe import (
     fused_moe,
     get_2stage_cfgs,
     get_padded_M,
+    moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -583,6 +584,11 @@ parser.add_argument(
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
 parser.add_argument(
+    "--bm16-scale-boundary",
+    action="store_true",
+    help="Run only the deterministic BM16 tiled-scale boundary regression.",
+)
+parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
@@ -872,14 +878,249 @@ def _iter_legacy_cases():
                     ), extras
 
 
+def test_bm16_tiled_scale_boundary():
+    """Compare BM16 and BM32 across a non-32-aligned scale row boundary."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip BM16 tiled-scale boundary test on %s", get_gfx())
+        return
+
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    expected_kernels = {
+        4: (
+            "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t16x128x256_atomic_xcd4",
+        ),
+        16: (
+            "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w2_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t16x128x256_atomic_xcd4",
+        ),
+        64: (
+            "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
+        ),
+    }
+    for token in (4, 16, 64):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            7168,
+            512,
+            385,
+            7,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE.value,
+        )
+        assert metadata.block_m == 16
+        stages = (metadata.stage1, metadata.stage2)
+        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
+        assert kernel_names == expected_kernels[token]
+        for stage in stages:
+            kernel_name = stage.keywords["kernelName"]
+            params = _aiter_mk.get_flydsl_kernel_params(kernel_name)
+            assert params is not None and params["tile_m"] == 16
+
+    token, model_dim, inter_dim = 3, 1024, 512
+    experts, topk = 3, 2
+
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 0]], dtype=torch.int32)
+    topk_weights = torch.tensor(
+        [[0.75, 0.25], [0.625, 0.375], [0.5, 0.5]], dtype=torch.float32
+    )
+
+    activation = (
+        torch.linspace(0.25, 1.0, 32, dtype=torch.float32)
+        * torch.exp2(
+            (torch.arange(token * model_dim // 32) % 8 - 8).view(token, -1, 1)
+        )
+    ).reshape(token, model_dim).to(torch.bfloat16)
+
+    def filled(shape, value, dtype):
+        return torch.full(shape, value, dtype=torch.uint8).view(dtype)
+
+    w1 = filled((experts, inter_dim * 2, model_dim // 2), 0x11, dtypes.fp4x2)
+    w2 = filled((experts, model_dim, inter_dim // 2), 0x11, dtypes.fp4x2)
+    w1_scale = filled(
+        (experts, inter_dim * 2, model_dim // 32), 127, dtypes.fp8_e8m0
+    )
+    w2_scale = filled((experts, model_dim, inter_dim // 32), 127, dtypes.fp8_e8m0)
+
+    def run(block_m, check_num_valid=True):
+        routing = moe_sorting(
+            topk_ids, topk_weights, experts, model_dim, torch.bfloat16, block_m,
+            accumulate=True,
+        )
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = routing
+        if check_num_valid:
+            assert num_valid_ids[0].item() == experts * block_m
+
+        a1, a1_scale = aiter.fused_dynamic_mxfp8_quant_moe_sort(
+            activation,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            topk=topk,
+            block_size=block_m,
+            sorted_weights=sorted_weights,
+        )
+        gemm_args = dict(
+            sorted_token_ids=sorted_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            topk=topk,
+            tile_m=block_m,
+            tile_n=128,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+        )
+        a2, a2_scale = flydsl_moe_stage1(
+            a=a1,
+            w1=w1,
+            out_dtype="fp8",
+            w1_scale=w1_scale,
+            a1_scale=a1_scale,
+            use_async_copy=True,
+            waves_per_eu=1,
+            b_nt=2,
+            gate_mode=GateMode.INTERLEAVE.value,
+            **gemm_args,
+        )
+
+        stage2 = flydsl_moe_stage2(
+            inter_states=a2,
+            w2=w2,
+            out=moe_buf,
+            out_dtype="bf16",
+            mode="atomic",
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            sorted_weights=sorted_weights,
+            xcd_swizzle=4,
+            **gemm_args,
+        )
+        return a2, stage2
+
+    def assert_match(actual, expected):
+        for actual_stage, expected_stage, tolerance in zip(
+            actual, expected, (0, 0.02)
+        ):
+            actual_stage = actual_stage.float()
+            expected_stage = expected_stage.float()
+            assert torch.isfinite(actual_stage).all()
+            torch.testing.assert_close(
+                actual_stage, expected_stage, rtol=tolerance, atol=tolerance
+            )
+
+    def run_stage1_scale_boundary(block_m):
+        boundary_token = 33
+        boundary_topk_ids = torch.zeros(
+            (boundary_token, 1), dtype=torch.int32
+        )
+        boundary_topk_weights = torch.ones(
+            (boundary_token, 1), dtype=torch.float32
+        )
+        boundary_activation = (
+            torch.linspace(0.25, 1.0, 32, dtype=torch.float32)
+            * torch.exp2(
+                (
+                    torch.arange(boundary_token * model_dim // 32) % 8 - 8
+                ).view(boundary_token, -1, 1)
+            )
+        ).reshape(boundary_token, model_dim).to(torch.bfloat16)
+        boundary_w1 = filled(
+            (1, inter_dim * 2, model_dim // 2), 0x11, dtypes.fp4x2
+        )
+        boundary_w1_scale = filled(
+            (inter_dim * 2, model_dim // 32), 127, dtypes.fp8_e8m0
+        )
+        routing = moe_sorting(
+            boundary_topk_ids,
+            boundary_topk_weights,
+            1,
+            model_dim,
+            torch.bfloat16,
+            block_m,
+            accumulate=True,
+        )
+        sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = routing
+        expected_rows = 48 if block_m == 16 else 64
+        assert sorted_ids.numel() == expected_rows
+        assert num_valid_ids[0].item() == expected_rows
+        a1, a1_scale = aiter.fused_dynamic_mxfp8_quant_moe_sort(
+            boundary_activation,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=boundary_token,
+            topk=1,
+            block_size=block_m,
+        )
+        assert a1_scale.shape[0] == 64
+        return flydsl_moe_stage1(
+            a=a1,
+            w1=boundary_w1,
+            sorted_token_ids=sorted_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            topk=1,
+            tile_m=block_m,
+            tile_n=128,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="fp8",
+            w1_scale=boundary_w1_scale,
+            a1_scale=a1_scale,
+            use_async_copy=True,
+            waves_per_eu=1,
+            b_nt=2,
+            gate_mode=GateMode.INTERLEAVE.value,
+        )
+
+    bm16 = run(16)
+    bm32 = run(32)
+    bm16_stage1_boundary = run_stage1_scale_boundary(16)
+    bm32_stage1_boundary = run_stage1_scale_boundary(32)
+    torch.cuda.synchronize()
+    assert_match(bm16, bm32)
+    torch.testing.assert_close(
+        bm16_stage1_boundary[0],
+        bm32_stage1_boundary[0],
+        rtol=0,
+        atol=0,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(16, check_num_valid=False)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert_match(captured, bm16)
+    aiter.logger.info(
+        "BM16 dispatch, fused kernels, and graph replay match the BM32 control"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 _case_iters = []
-if not args.no_flydsl_csv:
-    _case_iters.append(_iter_csv_cases())
-if not args.no_legacy:
-    _case_iters.append(_iter_legacy_cases())
+if args.bm16_scale_boundary:
+    test_bm16_tiled_scale_boundary()
+else:
+    if not args.no_flydsl_csv:
+        _case_iters.append(_iter_csv_cases())
+    if not args.no_legacy:
+        _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
