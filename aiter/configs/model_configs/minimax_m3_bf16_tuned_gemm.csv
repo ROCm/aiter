@@ -6,6 +6,7 @@ gfx1250,256,1,9216,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0
 gfx1250,256,1,9856,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0131,auto,0.0,9.22,9227.09
 gfx1250,256,1,24576,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0455,auto,0.0,6.64,6637.91
 gfx1250,256,1,200064,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.3169,auto,0.0,7.76,7759.50
+gfx1250,256,2,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,4.857,auto,0.0,0.65,329.0
 gfx1250,256,2,200064,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.3191,auto,0.0,15.41,7705.89
 gfx1250,256,3,128,6144,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0093,auto,0.0,0.51,173.69
 gfx1250,256,3,6144,8192,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0115,auto,0.0,26.18,8734.23
