@@ -473,6 +473,7 @@ class DeviceMoEPipeline:
             num_experts_per_rank=self.EPR,
             num_experts_per_token=self.topk,
             data_type=self.transport_dtype,
+            combine_mode=os.environ.get("COMBINE", "gather"),  # gather | scatter
         )
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
@@ -620,6 +621,7 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
+            f"combine={os.environ.get('COMBINE', 'gather')} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
         )
