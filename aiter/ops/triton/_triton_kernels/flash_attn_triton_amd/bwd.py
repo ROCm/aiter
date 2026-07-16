@@ -489,6 +489,19 @@ def get_bwd_configs(mode: AutotuneMode):
                     num_stages=2,
                     num_warps=8,
                 ),
+                # mid-tile, 2-stage variant
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                    },
+                    num_stages=2,
+                    num_warps=4,
+                ),
             ]
             causal_configs = [
                 triton.Config(
@@ -537,6 +550,32 @@ def get_bwd_configs(mode: AutotuneMode):
                         "waves_per_eu": 2,
                     },
                     num_stages=2,
+                    num_warps=4,
+                ),
+                # larger-tile variant (helps long-seq throughput; noncausal-proven)
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 256,
+                        "BLOCK_M2": 256,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                    },
+                    num_stages=2,
+                    num_warps=8,
+                ),
+                # small-tile variant (helps short seqlen / wide-window cases)
+                triton.Config(
+                    {
+                        "BLOCK_M1": 16,
+                        "BLOCK_N1": 64,
+                        "BLOCK_M2": 64,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                    },
+                    num_stages=1,
                     num_warps=4,
                 ),
             ]
@@ -827,7 +866,8 @@ def _bwd_dq_inner_split(
             dp = tl.dot(do, vT)
 
         if ENABLE_DROPOUT:
-            dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dp.dtype) * dropout_scale
+            dp = dp * scaled_mask
 
         # ds
         delta_i = Di[:, None]
@@ -842,7 +882,7 @@ def _bwd_dq_inner_split(
             ds_transposed = tl.trans(ds).to(kT.type.element_ty)
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
 
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
@@ -967,10 +1007,11 @@ def _bwd_dkdv_inner_split(
 
         # dV
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            scaled_mask = dropout_mask.to(pT.dtype) * dropout_scale
+            pT_dropout = pT * scaled_mask
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -982,7 +1023,8 @@ def _bwd_dkdv_inner_split(
             dpT = tl.dot(v, tl.trans(do))
 
         if ENABLE_DROPOUT:
-            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dpT.dtype) * dropout_scale
+            dpT = dpT * scaled_mask
 
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
@@ -995,7 +1037,7 @@ def _bwd_dkdv_inner_split(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
         # increment pointers
         curr_m += step_m
@@ -1149,10 +1191,11 @@ def _bwd_dkdvdq_inner_atomic(
 
         # dV
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            scaled_mask = dropout_mask.to(pT.dtype) * dropout_scale
+            pT_dropout = pT * scaled_mask
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
@@ -1164,7 +1207,8 @@ def _bwd_dkdvdq_inner_atomic(
             dpT = tl.dot(v, tl.trans(do))
 
         if ENABLE_DROPOUT:
-            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dpT.dtype) * dropout_scale
+            dpT = dpT * scaled_mask
 
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
@@ -1177,7 +1221,7 @@ def _bwd_dkdvdq_inner_atomic(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
@@ -2816,7 +2860,10 @@ def _bwd_dkdv_inner(
     descale_q,
     descale_k,
     descale_v,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
     MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
+    USE_SLIDING_WINDOW: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,  # activate dropout
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,  # activate exp2
@@ -2847,7 +2894,7 @@ def _bwd_dkdv_inner(
     curr_philox_offset = batch_philox_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
 
-    for blk_idx in range(num_steps):
+    for blk_idx in tl.range(num_steps, num_stages=1):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_m = {curr_m}")  # noqa: E701
         offs_m = curr_m + tl.arange(0, BLOCK_M)
@@ -2903,27 +2950,47 @@ def _bwd_dkdv_inner(
         else:
             pT = tl.math.exp(qkT_shifted)
 
-        # Autoregressive masking.
-        if MASK:
-            # offset offs_m with delta_qk since the causal mask starts at
-            # bottom right of the (seqlen_q, seqlen_k) matrix
-            causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
-            mask = causal_mask & mask_nm
+        # Causal and sliding-window masking.
+        if MASK or USE_SLIDING_WINDOW:
+            mask = mask_nm
+            if MASK:
+                # offset offs_m with delta_qk since the causal mask starts at
+                # bottom right of the (seqlen_q, seqlen_k) matrix
+                causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
+                mask = causal_mask & mask
+            if USE_SLIDING_WINDOW:
+                # Per-element form of the band a query m attends:
+                #   m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R.
+                # _sliding_window_q_bounds() is the block-range inversion of this same
+                # inequality (it bounds m for a fixed K block); keep the two in sync.
+                causal_offset = seqlen_k - seqlen_q
+                if WINDOW_SIZE_LEFT < 0:
+                    window_mask = offs_n[:, None] <= (
+                        offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
+                    )
+                else:
+                    left_bound = offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
+                    right_bound = offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
+                    window_mask = (offs_n[:, None] >= left_bound) & (
+                        offs_n[:, None] <= right_bound
+                    )
+                mask = window_mask & mask
             if DEBUG_TRITON_DETAIL:
                 if start_n == 256:
-                    print(f"causal_mask: {causal_mask.shape}\n", causal_mask)
+                    print(f"mask: {mask.shape}\n", mask)
                     print(
-                        f"qkT after causal: {qkT.shape}\n",
-                        tl.where(causal_mask, qkT * sm_scale, 0.0),
+                        f"pT after mask: {pT.shape}\n",
+                        tl.where(mask, pT, 0.0),
                     )
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
-            dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
+            scaled_mask = dropout_mask.to(pT.dtype) * dropout_scale
+            pT_dropout = pT * scaled_mask
+            dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
         else:
-            dv += tl.dot(pT.to(do.type.element_ty), do)
+            dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
         if DEBUG_TRITON_DETAIL:
             if start_n == 256:
@@ -2936,7 +3003,8 @@ def _bwd_dkdv_inner(
         else:
             dpT = tl.dot(v, tl.trans(do))
         if ENABLE_DROPOUT:
-            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dpT.dtype) * dropout_scale
+            dpT = dpT * scaled_mask
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
         if IS_FP8:
@@ -2946,7 +3014,7 @@ def _bwd_dkdv_inner(
             dsT_transposed = tl.trans(dsT).to(qT.type.element_ty)
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
-            dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
@@ -2997,7 +3065,10 @@ def _bwd_dq_inner(
     descale_q,
     descale_k,
     descale_v,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
     MASK: tl.constexpr,
+    USE_SLIDING_WINDOW: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -3028,7 +3099,7 @@ def _bwd_dq_inner(
     step_n = BLOCK_N2
     curr_philox_offset = batch_philox_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
-    for blk_idx in range(num_steps):
+    for blk_idx in tl.range(num_steps, num_stages=1):
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
@@ -3087,10 +3158,29 @@ def _bwd_dq_inner(
         else:
             p = tl.math.exp(qk_shifted)
 
-        # Autoregressive masking.
-        if MASK:
-            causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
-            mask = causal_mask & mask_mn
+        # Causal and sliding-window masking.
+        if MASK or USE_SLIDING_WINDOW:
+            mask = mask_mn
+            if MASK:
+                causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
+                mask = causal_mask & mask
+            if USE_SLIDING_WINDOW:
+                # Per-element form of the band a query m attends:
+                #   m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R.
+                # _sliding_window_k_bounds() is the block-range inversion of this same
+                # inequality (it bounds n for a fixed Q block); keep the two in sync.
+                causal_offset = seqlen_k - seqlen_q
+                if WINDOW_SIZE_LEFT < 0:
+                    window_mask = offs_n[None, :] <= (
+                        offs_m[:, None] + causal_offset + WINDOW_SIZE_RIGHT
+                    )
+                else:
+                    left_bound = offs_m[:, None] + causal_offset - WINDOW_SIZE_LEFT
+                    right_bound = offs_m[:, None] + causal_offset + WINDOW_SIZE_RIGHT
+                    window_mask = (offs_n[None, :] >= left_bound) & (
+                        offs_n[None, :] <= right_bound
+                    )
+                mask = window_mask & mask
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
@@ -3098,7 +3188,8 @@ def _bwd_dq_inner(
         else:
             dp = tl.dot(do, vT)
         if ENABLE_DROPOUT:
-            dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+            scaled_mask = dropout_mask.to(dp.dtype) * dropout_scale
+            dp = dp * scaled_mask
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
         # Compute dQ.
@@ -3110,12 +3201,81 @@ def _bwd_dq_inner(
             ds_transposed = tl.trans(ds).to(kT.type.element_ty)
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
-            dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
     return dq
+
+
+@triton.jit
+def _sliding_window_q_bounds(
+    start_n,
+    seqlen_q,
+    seqlen_k,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Query-block range that overlaps the sliding window for a fixed K block.
+
+    dKdV sweeps query blocks for the fixed key block [start_n, start_n+BLOCK_N).
+    A query m attends key n iff
+        m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R,
+    so the queries that touch any key in this block span
+        [start_n - R - off, (start_n + BLOCK_N - 1) + L - off]   (off = seqlen_k - seqlen_q).
+    Returns (start_m, num_steps) aligned to BLOCK_M; num_steps == 0 means the
+    block is entirely outside the window and can be skipped.
+    """
+    causal_offset = seqlen_k - seqlen_q
+    m_lo = start_n - WINDOW_SIZE_RIGHT - causal_offset
+    if WINDOW_SIZE_LEFT < 0:  # unbounded left -> no upper limit on contributing queries
+        m_hi = seqlen_q - 1
+    else:
+        m_hi = (start_n + BLOCK_N - 1) + WINDOW_SIZE_LEFT - causal_offset
+    m_lo = tl.maximum(m_lo, 0)
+    m_hi = tl.minimum(m_hi, seqlen_q - 1)
+    start_m = (m_lo // BLOCK_M) * BLOCK_M
+    if m_hi < m_lo:
+        num_steps = 0
+    else:
+        num_steps = tl.cdiv(m_hi + 1 - start_m, BLOCK_M)
+    return start_m, num_steps
+
+
+@triton.jit
+def _sliding_window_k_bounds(
+    start_m,
+    seqlen_q,
+    seqlen_k,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Key-block range that overlaps the sliding window for a fixed Q block.
+
+    dQ sweeps key blocks for the fixed query block [start_m, start_m+BLOCK_M).
+    The keys query m attends are [m + off - L, m + off + R] (off = seqlen_k - seqlen_q),
+    so across the block they span [start_m + off - L, (start_m + BLOCK_M - 1) + off + R].
+    Returns (start_n, num_steps) aligned to BLOCK_N; num_steps == 0 means skip.
+    """
+    causal_offset = seqlen_k - seqlen_q
+    if WINDOW_SIZE_LEFT < 0:  # unbounded left -> keys reach back to 0
+        n_lo = 0
+    else:
+        n_lo = start_m + causal_offset - WINDOW_SIZE_LEFT
+    n_hi = (start_m + BLOCK_M - 1) + causal_offset + WINDOW_SIZE_RIGHT
+    n_lo = tl.maximum(n_lo, 0)
+    n_hi = tl.minimum(n_hi, seqlen_k - 1)
+    start_n = (n_lo // BLOCK_N) * BLOCK_N
+    if n_hi < n_lo:
+        num_steps = 0
+    else:
+        num_steps = tl.cdiv(n_hi + 1 - start_n, BLOCK_N)
+    return start_n, num_steps
 
 
 @triton.autotune(
@@ -3210,6 +3370,9 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
@@ -3423,7 +3586,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 descale_q,
                 descale_k,
                 descale_v,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
                 MASK=True,  # causal masking
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -3433,7 +3599,19 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             start_m += num_steps * MASK_BLOCK_M1
-            num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M1)
+            # The unmasked region runs from the diagonal to seqlen_q. With a
+            # finite left window, queries more than WINDOW_SIZE_LEFT past this
+            # K block attend nothing in it, so cap the sweep at that upper bound.
+            if USE_SLIDING_WINDOW and WINDOW_SIZE_LEFT >= 0:
+                # m_hi = (n_hi + WINDOW_SIZE_LEFT) - (seqlen_k - seqlen_q)
+                m_hi = (start_n + BLOCK_N1 - 1) + WINDOW_SIZE_LEFT + delta_qk
+                m_hi = tl.minimum(m_hi, seqlen_q - 1)
+                if m_hi < start_m:
+                    num_steps = 0
+                else:
+                    num_steps = tl.cdiv(m_hi + 1 - start_m, BLOCK_M1)
+            else:
+                num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M1)
             end_m = start_m + num_steps * BLOCK_M1
 
             if DEBUG_TRITON:
@@ -3483,7 +3661,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 descale_q,
                 descale_k,
                 descale_v,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
                 MASK=False,  # causal masking
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -3629,7 +3810,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 descale_q,
                 descale_k,
                 descale_v,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
                 MASK=True,  #
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -3639,8 +3823,22 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             end_n -= num_steps * MASK_BLOCK_N2
-            num_steps = tl.cdiv(end_n, BLOCK_N2)
-            start_n = max(end_n - num_steps * BLOCK_N2, 0)
+            # The unmasked region runs from 0 up to the diagonal (end_n). With a
+            # finite left window, keys more than WINDOW_SIZE_LEFT before this Q
+            # block fall outside the band, so raise the lower bound.
+            if USE_SLIDING_WINDOW and WINDOW_SIZE_LEFT >= 0:
+                # n_lo = start_m - (seqlen_q - seqlen_k) - WINDOW_SIZE_LEFT
+                n_lo = start_m - delta_qk - WINDOW_SIZE_LEFT
+                n_lo = tl.maximum(n_lo, 0)
+                n_lo = (n_lo // BLOCK_N2) * BLOCK_N2
+                if n_lo >= end_n:
+                    num_steps = 0
+                else:
+                    num_steps = tl.cdiv(end_n - n_lo, BLOCK_N2)
+                start_n = n_lo
+            else:
+                num_steps = tl.cdiv(end_n, BLOCK_N2)
+                start_n = max(end_n - num_steps * BLOCK_N2, 0)
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
@@ -3684,7 +3882,10 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 descale_q,
                 descale_k,
                 descale_v,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
                 MASK=False,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -3793,6 +3994,9 @@ def bwd_kernel_fused_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     USE_SEQUSED: tl.constexpr,  # Add flag for seqused
+    USE_SLIDING_WINDOW: tl.constexpr,
+    WINDOW_SIZE_LEFT: tl.constexpr,
+    WINDOW_SIZE_RIGHT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
@@ -3914,9 +4118,21 @@ def bwd_kernel_fused_noncausal(
             else:
                 descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
-            # because there is no causal, we always start from the beginning
-            start_m = 0
-            num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
+            # because there is no causal, we sweep all query blocks -- unless a
+            # sliding window lets us skip query blocks entirely outside the band.
+            if USE_SLIDING_WINDOW:
+                start_m, num_steps = _sliding_window_q_bounds(
+                    start_n,
+                    seqlen_q,
+                    seqlen_k,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    BLOCK_N1,
+                    BLOCK_M1,
+                )
+            else:
+                start_m = 0
+                num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
             dk, dv = _bwd_dkdv_inner(
                 dk,
                 dv,  # output tensors
@@ -3954,7 +4170,10 @@ def bwd_kernel_fused_noncausal(
                 descale_q,
                 descale_k,
                 descale_v,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
                 MASK=False,  # causal masking
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -4036,9 +4255,20 @@ def bwd_kernel_fused_noncausal(
                 descale_q, descale_k, descale_v = 1.0, 1.0, 1.0
 
             # start can only be 0 at minimum
-            start_n = 0
             end_n = seqlen_k
-            num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
+            if USE_SLIDING_WINDOW:
+                start_n, num_steps = _sliding_window_k_bounds(
+                    start_m,
+                    seqlen_q,
+                    seqlen_k,
+                    WINDOW_SIZE_LEFT,
+                    WINDOW_SIZE_RIGHT,
+                    BLOCK_M2,
+                    BLOCK_N2,
+                )
+            else:
+                start_n = 0
+                num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
             dq = _bwd_dq_inner(
@@ -4080,7 +4310,10 @@ def bwd_kernel_fused_noncausal(
                 descale_q,
                 descale_k,
                 descale_v,
+                WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT,
                 MASK=False,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
                 USE_EXP2=USE_EXP2,
@@ -4142,6 +4375,8 @@ def attention_backward_triton_impl(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -4398,6 +4633,28 @@ def attention_backward_triton_impl(
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
 
+    # "Active" iff either edge differs from the -1 "off" sentinel. This mirrors
+    # the forward kernels (fwd_prefill.py / fwd_decode.py both test `!= -1`); the
+    # interface guards removed in this change used `>= 0`, which is equivalent for
+    # every valid input (-1 is the only negative either edge ever takes).
+    use_sliding_window = window_size_left != -1 or window_size_right != -1
+    if use_sliding_window and mode != "fused":
+        raise NotImplementedError(
+            "Sliding-window backward is currently implemented for fused mode only."
+        )
+    # The kernels only special-case an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
+    # There is no infinite-right code path, so a negative right bound would collapse
+    # right_bound to (anchor - 1) and silently mask out almost everything. When the
+    # window is active, window_size_right must therefore be >= 0. (window_size_right
+    # == -1 is only valid as the "off" sentinel, i.e. together with
+    # window_size_left == -1, which leaves use_sliding_window False.)
+    if use_sliding_window and window_size_right < 0:
+        raise NotImplementedError(
+            "Sliding-window backward requires window_size_right >= 0 "
+            f"(got window_size_right={window_size_right}). An infinite right edge "
+            "is not supported; use window_size_right=0 for a causal window."
+        )
+
     # get closest power of 2 over or equal to 32.
     padded_d_model_qk = 1 << (head_size_qk - 1).bit_length()
     padded_d_model_qk = max(padded_d_model_qk, 32)
@@ -4590,6 +4847,9 @@ def attention_backward_triton_impl(
                 USE_SEQUSED=(
                     seqused_q is not None or seqused_k is not None
                 ),  # Add flag for seqused
+                USE_SLIDING_WINDOW=use_sliding_window,
+                WINDOW_SIZE_LEFT=window_size_left,
+                WINDOW_SIZE_RIGHT=window_size_right,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
@@ -4678,6 +4938,9 @@ def attention_backward_triton_impl(
                 USE_SEQUSED=(
                     seqused_q is not None or seqused_k is not None
                 ),  # Add flag for seqused
+                USE_SLIDING_WINDOW=use_sliding_window,
+                WINDOW_SIZE_LEFT=window_size_left,
+                WINDOW_SIZE_RIGHT=window_size_right,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,

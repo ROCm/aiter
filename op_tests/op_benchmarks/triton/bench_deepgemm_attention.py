@@ -14,6 +14,8 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.shuffle import shuffle_weight
 
 
@@ -21,12 +23,16 @@ def cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def kv_cache_cast_to_fp8(x: torch.Tensor, padding=False) -> torch.Tensor:
+def kv_cache_cast_to_fp8(
+    x: torch.Tensor, padding=False, fp8_dtype=None
+) -> torch.Tensor:
+    if fp8_dtype is None:
+        fp8_dtype = get_fp8_e4m3_dtype()
     num_blocks, block_size, num_heads, head_dim = x.shape
     assert num_heads == 1
     x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
     sf = x_amax / 240.0
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fnuz)
+    x_scaled = (x * (1.0 / sf)).to(fp8_dtype)
 
     padding_size = 0 if not padding else (16 - (block_size * 4) % 16) % 16
     x_fp8 = torch.empty(
@@ -202,7 +208,9 @@ def run_benchmark(args: argparse.Namespace):
         assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
 
         var_ratio = 0.5
-        EnableVarCtxOpt = var_ratio > 0.0
+        # varctx gluon kernel only exists on the preshuffle path; passing a
+        # varctx schedule to the base kernel breaks compile (signature mismatch).
+        EnableVarCtxOpt = var_ratio > 0.0 and args.kv_preshuffle and not args.no_varctx
 
         context_lens = (
             torch.randint(
@@ -234,7 +242,11 @@ def run_benchmark(args: argparse.Namespace):
             dtype=torch.float32,
         )
 
-        qk_datatype = torch.float8_e4m3fnuz
+        qk_datatype = get_fp8_e4m3_dtype()
+        print(
+            f">>> arch={arch_info.get_arch()} fp8_dtype={qk_datatype} "
+            f"({'OCP e4m3fn' if qk_datatype is torch.float8_e4m3fn else 'e4m3fnuz'})"
+        )
         max_block_len = (
             (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
         )
@@ -252,7 +264,9 @@ def run_benchmark(args: argparse.Namespace):
                 counter += 1
 
         q_fp8 = q.to(qk_datatype)
-        kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache, padding=args.padding)
+        kv_cache_fp8 = kv_cache_cast_to_fp8(
+            kv_cache, padding=args.padding, fp8_dtype=qk_datatype
+        )
 
         kv_indices = torch.zeros(
             prefix_sum_context_lens[-1], device="cuda", dtype=torch.int32
@@ -453,6 +467,11 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="KVCache block size, only used when kv_preshuffle is enabled, must be multiple of 16",
+    )
+    parser.add_argument(
+        "--no-varctx",
+        action="store_true",
+        help="Disable varctx schedule (only applies with --kv_preshuffle)",
     )
 
     args = parser.parse_args()

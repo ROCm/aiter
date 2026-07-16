@@ -100,3 +100,8 @@ default_kernels_dict = {
     -1:  kernelInstance(256,     64,   128,    128,  16,  16,  16,   16,   4,    2,     [8, 32, 1],      [8, 32, 1],         2,           2,               [1, 32, 1, 8],                  8,          "Intrawave",             3,     ),
 }
 # fmt: on
+
+
+# Name-keyed reverse lookup so codegen can filter the tuned CSV by kernelName,
+# matching what the C++ runtime dispatcher uses.
+kernels_by_name = {v.name: v for v in kernels_list.values()}

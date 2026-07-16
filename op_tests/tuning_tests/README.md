@@ -6,10 +6,13 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 | File | Level | GPU | What it tests |
 |------|-------|-----|---------------|
-| `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates, invalid times, errRatio, git conflicts |
-| `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk |
+| `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
+| `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
+| `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
-| `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes, verify output CSV |
+| `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
+| `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
+| `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
 
 ## Tuner family coverage
@@ -42,7 +45,8 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 # Level 0+1 only (no GPU, <10s)
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
-  op_tests.tuning_tests.test_mp_tuner_logic -v
+  op_tests.tuning_tests.test_mp_tuner_logic \
+  op_tests.tuning_tests.test_online_tune -v
 
 # Level 2: pipeline smoke (~10min)
 python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v
@@ -52,6 +56,24 @@ python3 -m unittest op_tests.tuning_tests.test_run_config -v
 
 # Everything
 python3 -m unittest discover -s op_tests/tuning_tests -v
+```
+
+### Running individual tuner tests
+
+Each tuner in `test_tune_pipeline.py` has two variants: `_mp1` (single GPU) and `_mp_default` (all GPUs).
+
+```bash
+# Run a specific tuner (both mp1 and mp_default)
+python3 -m pytest op_tests/tuning_tests/test_tune_pipeline.py -k "gradlib_bf16" -v
+
+# Run only the single-GPU variant
+python3 -m pytest op_tests/tuning_tests/test_tune_pipeline.py -k "gradlib_bf16_mp1" -v
+
+# Run only the multi-GPU variant
+python3 -m pytest op_tests/tuning_tests/test_tune_pipeline.py -k "gradlib_bf16_mp_default" -v
+
+# Run a specific tuner with unittest
+python3 -m unittest op_tests.tuning_tests.test_tune_pipeline.TestTunePipeline.test_a8w8_blockscale_mp1 -v
 ```
 
 ## Reproducing with custom config

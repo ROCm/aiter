@@ -320,7 +320,9 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                         a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, SCALE_GROUP_SIZE
                     )
 
-                accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+                accumulator = tl.dot_scaled(
+                    a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
+                )
 
                 a_ptrs += BLOCK_SIZE_K * stride_ak
                 b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
@@ -816,7 +818,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
                 b_ptr.dtype.element_ty
             )
 
-            accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
+            accumulator += tl.dot(a, b) * a_scale
 
             a_ptrs += BLOCK_SIZE_K * stride_ak_i64
             b_ptrs += BLOCK_SIZE_K * stride_bk_i64

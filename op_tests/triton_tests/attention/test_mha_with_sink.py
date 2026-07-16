@@ -332,12 +332,12 @@ def test_mha_varlen_with_sink(
 
 @pytest.mark.parametrize("BATCH", [1, 2])
 @pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K", [(64, 64), (256, 256), (128, 64), (32, 128)]
+    "SEQLEN_Q, SEQLEN_K", [(64, 64), (256, 256), (128, 64), (32, 128), (1024, 1024)]
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1), (16, 4)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1), (16, 4), (28, 4)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [True])
-@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 64])
+@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32, 64])
 def test_mha_with_sink_sliding_window(
     BATCH: int,
     SEQLEN_Q: int,

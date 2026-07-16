@@ -80,25 +80,61 @@ def prepare_token_indices(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     )
 
 
+def _prefill_lens(
+    cu_seqlens: torch.LongTensor,
+    num_decodes: int,
+) -> torch.LongTensor:
+    """Per-sequence token counts for the prefill slice, computed directly
+    from the original (cache-stable) ``cu_seqlens`` without materialising an
+    intermediate sliced view. Equivalent to
+    ``prepare_lens(cu_seqlens[num_decodes:])`` but skips the call to
+    ``prepare_lens`` on a sliced tensor (which would miss its own cache).
+    """
+    if num_decodes == 0:
+        return prepare_lens(cu_seqlens)
+    return cu_seqlens[num_decodes + 1 :] - cu_seqlens[num_decodes:-1]
+
+
 @tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> torch.LongTensor:
     """
     Prepare chunk indices for variable-length sequences.
 
+    When the caller is the GDN mixed-batch dispatcher,
+    ``num_decodes`` / ``num_decode_tokens`` indicate that the prefill slice
+    starts at ``cu_seqlens[num_decodes]`` rather than ``cu_seqlens[0]``; we
+    account for that internally so the cache key stays
+    ``(metadata_cu_seqlens_id, chunk_size, num_decodes, num_decode_tokens)``
+    -- stable across forward calls when the scheduler reuses the metadata
+    ``cu_seqlens`` tensor. This is what eliminates the per-forward
+    ``.tolist()`` D2H: passing the ORIGINAL stable tensor (never a freshly
+    sliced one) keeps every subsequent call a cache hit.
+
+    ``num_decode_tokens`` does not affect the output (the chunk indices are
+    rebase-invariant) but is part of the cache key for symmetry with
+    ``prepare_chunk_offsets``.
+
     Args:
-        cu_seqlens: Cumulative sequence lengths [N+1]
+        cu_seqlens: Cumulative sequence lengths [N+1] (original, unsliced)
         chunk_size: Size of each chunk
+        num_decodes: number of leading decode-only sequences to skip
+        num_decode_tokens: number of leading decode tokens (cache key only)
 
     Returns:
         Tensor of shape [num_chunks, 2] where each row is [sequence_id, chunk_idx_in_seq]
     """
+    _ = num_decode_tokens  # in cache key only
     indices = torch.cat(
         [
             torch.arange(n)
-            for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
+            for n in triton.cdiv(
+                _prefill_lens(cu_seqlens, num_decodes), chunk_size
+            ).tolist()
         ]
     )
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
@@ -108,20 +144,75 @@ def prepare_chunk_indices(
 def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> torch.LongTensor:
     """
     Prepare cumulative chunk offsets for variable-length sequences.
 
+    See ``prepare_chunk_indices`` for the decode-prefix slicing semantics.
+
     Args:
-        cu_seqlens: Cumulative sequence lengths [N+1]
+        cu_seqlens: Cumulative sequence lengths [N+1] (original, unsliced)
         chunk_size: Size of each chunk
+        num_decodes: number of leading decode-only sequences to skip
+        num_decode_tokens: number of leading decode tokens (cache key only)
 
     Returns:
-        Cumulative chunk offsets [N+1]
+        Cumulative chunk offsets [N_prefill+1]
     """
+    _ = num_decode_tokens  # in cache key only
     return torch.cat(
-        [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
+        [
+            cu_seqlens.new_tensor([0]),
+            triton.cdiv(_prefill_lens(cu_seqlens, num_decodes), chunk_size),
+        ]
     ).cumsum(-1)
+
+
+@tensor_cache
+def prepare_rebased_cu_seqlens(
+    cu_seqlens: torch.LongTensor,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> torch.LongTensor:
+    """Rebase cumulative sequence lengths to the prefill slice.
+
+    Produces the kernel-facing offsets
+    ``cu_seqlens[num_decodes:] - num_decode_tokens`` for callers that need an
+    actual rebased ``cu_seqlens`` tensor (e.g. as a kernel arg, or to derive
+    the prefill sequence count). ``@tensor_cache`` keys on the ORIGINAL
+    ``cu_seqlens`` identity + the two ints, so the slice/subtract runs once
+    per (cu_seqlens_id, num_decodes, num_decode_tokens) tuple.
+
+    When ``num_decodes == 0`` and ``num_decode_tokens == 0`` (pure-prefill
+    batch) the input tensor is returned unchanged (same object).
+    """
+    if num_decodes == 0 and num_decode_tokens == 0:
+        return cu_seqlens
+    return cu_seqlens[num_decodes:] - num_decode_tokens
+
+
+@tensor_cache
+def prepare_num_chunks(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> int:
+    """Total number of chunks across the prefill sequences (host int).
+
+    Equals the last element of the (decode-aware) cumulative chunk offsets,
+    i.e. ``sum_i cdiv(prefill_seqlen_i, chunk_size)``. Reuses the cached
+    ``prepare_chunk_offsets``; the single ``int()`` D2H is memoized per
+    ``(cu_seqlens identity, chunk_size, num_decodes, num_decode_tokens)``, so
+    it runs once per shape rather than once per forward call.
+    """
+    return int(
+        prepare_chunk_offsets(cu_seqlens, chunk_size, num_decodes, num_decode_tokens)[
+            -1
+        ]
+    )
 
 
 @tensor_cache

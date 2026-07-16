@@ -7,6 +7,7 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -28,8 +29,8 @@ def matmul_launch_metadata(grid, kernel, args):
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     if gindx is not None:
+        gindx = gindx.to(torch.int32)
         ret["name"] += "_layer1"
     else:
         ret["name"] += "_layer2"
@@ -44,8 +45,6 @@ def matmul_launch_metadata(grid, kernel, args):
     fK = K if K is not None else n_tokens
     ret[f"flops{nbits}"] = 2.0 * fM * N * fK
 
-    gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     n_x_bytes = X.numel() * X.element_size()
     n_y_bytes = Y.numel() * Y.element_size()
     if hist is not None:
@@ -146,7 +145,7 @@ def _moe_gemm_a8w4(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: tl.constexpr,
-    ADD_RESIDUAL: tl.constexpr,
+    SWIGLU_ADD_RESIDUAL: tl.constexpr,
     # MoE config
     N_EXPTS_ACT: tl.constexpr,
     # optimization config
@@ -162,6 +161,14 @@ def _moe_gemm_a8w4(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    # Idea 1: fold per-1×32 MXFP8 (ue8m0 scale) group quant into write-back.
+    # When HAS_MX_OUT=True, Y is fp8 e4m3 and YMxScale receives uint8 ue8m0
+    # exponents at [m, n // 32]. Eliminates the standalone `downcast_to_mxfp`
+    # launch between GEMM1 and GEMM2. Requires SPLIT_K==1 and OUT_BLOCK_N % 32 == 0.
+    YMxScale=None,
+    stride_y_mx_m=0,
+    stride_y_mx_n=0,
+    HAS_MX_OUT: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -393,7 +400,7 @@ def _moe_gemm_a8w4(
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
@@ -421,4 +428,36 @@ def _moe_gemm_a8w4(
         + offs_y_n.to(index_type)[None, :] * stride_y_n
     )
     mask = mask_m[:, None] & mask_n[None, :]
-    tl.store(YPtrs, out, mask=mask)
+    if HAS_MX_OUT and SPLIT_K == 1:
+        # Per-1×32 MXFP8 group quant emit. Mirrors the ue8m0 path in
+        # `_fused_clamp_silu_mul_kernel`. OUT_BLOCK_N is the post-swiglu output
+        # block size (BLOCK_N if no swiglu, BLOCK_N//2 with apply_swiglu).
+        tl.static_assert(
+            OUT_BLOCK_N % 32 == 0,
+            "HAS_MX_OUT requires OUT_BLOCK_N % 32 == 0",
+        )
+        NUM_QB: tl.constexpr = OUT_BLOCK_N // 32
+        out_safe = tl.where(mask, out, 0.0)
+        out_3d = tl.reshape(out_safe, [BLOCK_M, NUM_QB, 32])
+        # Reuse the shared MXFP8 (1x32 e8m0) scale derivation. It returns the
+        # per-group uint8 e8m0 scale and the matching fp32 multiplicative scale,
+        # both keeping the quant axis with size 1 so they broadcast over out_3d.
+        scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
+        quant_tensor = out_3d * quant_scale
+        quant_2d = tl.reshape(quant_tensor, [BLOCK_M, OUT_BLOCK_N])
+        tl.store(YPtrs, quant_2d.to(Y.dtype.element_ty), mask=mask)
+        scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
+        offs_s_n = NUM_QB * pid_n + tl.arange(0, NUM_QB)
+        mask_s_n = offs_s_n < tl.cdiv(yN, 32)
+        YMxScalePtrs = (
+            YMxScale
+            + (start_m + offs_y_m).to(index_type)[:, None] * stride_y_mx_m
+            + offs_s_n.to(index_type)[None, :] * stride_y_mx_n
+        )
+        tl.store(
+            YMxScalePtrs,
+            scale_exp_2d,
+            mask=mask_m[:, None] & mask_s_n[None, :],
+        )
+    else:
+        tl.store(YPtrs, out, mask=mask)

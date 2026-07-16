@@ -337,8 +337,8 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     args.M        = m;
     args.N        = n;
     args.K        = k;
-    args.stride_A = k;
-    args.stride_B = k;
+    args.stride_A = XQ.stride(-2);
+    args.stride_B = WQ.stride(-2);
     args.stride_C = n;
     args.stride_E = n;
 

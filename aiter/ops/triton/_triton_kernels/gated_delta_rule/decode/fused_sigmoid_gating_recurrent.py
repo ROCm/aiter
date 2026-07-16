@@ -4,7 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import input_guard
+from ..gated_delta_rule_utils import (
+    autotune_cache_kwargs,
+    gated_delta_rule_autotune_configs,
+    input_guard,
+)
 
 
 def is_cuda():
@@ -37,8 +41,9 @@ def get_autotune_config():
     }
 )
 @triton.autotune(
-    configs=get_autotune_config(),
+    configs=gated_delta_rule_autotune_configs(get_autotune_config()),
     key=["K", "V"],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(

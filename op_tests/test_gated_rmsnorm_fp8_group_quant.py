@@ -14,6 +14,7 @@ Constraint: ONLY supports head_dim=128 and group_size=128
 import pandas as pd
 import torch
 import aiter
+from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 import argparse
 
@@ -156,12 +157,14 @@ def test_gated_rmsnorm_fp8_group_quant(
     dtype: torch.dtype,
     eps: float = 1e-6,
     group_size: int = 128,
-    quant_dtype=torch.float8_e4m3fnuz,
+    quant_dtype=None,
     transpose_scale: bool = False,
 ):
     """
     Test gated RMSNorm with FP8 group quantization.
     """
+    if quant_dtype is None:
+        quant_dtype = dtypes.fp8
     torch.manual_seed(42)
     device = "cuda"
 

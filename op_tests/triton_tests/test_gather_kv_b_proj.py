@@ -8,8 +8,16 @@ import torch
 
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter import dtypes
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA device is required"
+)
 
 
 def ref_gather_kv_b_proj(
@@ -137,6 +145,12 @@ def ref_gather_kv_b_proj(
         v_prefix_tp[context_start:context_end, :] = v_proj_tp
 
     return (k_prefix, v_prefix)
+
+
+def _dequant_mxfp4_weight(weight_fp4: torch.Tensor, scale_e8m0: torch.Tensor):
+    weight_f32 = mxfp4_to_f32(weight_fp4.view(torch.uint8))
+    scale_f32 = e8m0_to_f32(scale_e8m0.view(torch.uint8)).repeat_interleave(32, dim=1)
+    return weight_f32 * scale_f32
 
 
 def _make_kv_test_data(
@@ -766,6 +780,404 @@ def test_gather_kv_b_proj_asymmetric_dims(
     checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(
+    not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
+)
+@pytest.mark.parametrize("weight_preshuffle", [False, True])
+@pytest.mark.parametrize("k_buffer_type", [torch.bfloat16, dtypes.fp8])
+def test_gather_kv_b_proj_mxfp4_weight(k_buffer_type, weight_preshuffle):
+    """Validate the FP4 MXFP4 kv_b_proj path against a dequantized torch reference."""
+    fp4_weight_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_weight_dtype is None:
+        pytest.skip("torch.float4_e2m1fn_x2 is unavailable")
+
+    torch.manual_seed(0)
+    random.seed(0)
+    batch_size = 2
+    block_size = 1
+    avg_kv_length = 32
+    kv_c_dim = 512
+    kv_pe_dim = 64
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    tp_k_head_num = 1
+    device = "cuda"
+    weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
+
+    (
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        _context_lens,
+        _num_block,
+    ) = _make_kv_test_data(
+        batch_size,
+        block_size,
+        avg_kv_length,
+        kv_c_dim,
+        kv_pe_dim,
+        k_buffer_type,
+        device,
+    )
+
+    weight_src = torch.randn((weight_n, kv_c_dim), device=device, dtype=torch.bfloat16)
+    kv_proj_weight_u8, kv_proj_scale = torch_dynamic_mxfp4_quant(weight_src)
+    kv_proj_weight_ref = _dequant_mxfp4_weight(kv_proj_weight_u8, kv_proj_scale)
+
+    k_ref, v_ref = ref_gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight_ref,
+        torch.ones(weight_n, device=device, dtype=torch.float32),
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+    )
+
+    total_kv = kv_prefix_sum_context_lens[-1].item()
+    k_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * (qk_nope_head_dim + kv_pe_dim)),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * v_head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    kv_proj_weight = kv_proj_weight_u8.view(fp4_weight_dtype)
+    if weight_preshuffle:
+        kv_proj_weight = shuffle_weight(kv_proj_weight)
+        kv_proj_scale = shuffle_scale(kv_proj_scale)
+
+    gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+        v_prefix.view(-1, tp_k_head_num, v_head_dim),
+        weight_preshuffle=weight_preshuffle,
+    )
+
+    checkAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1)
+    checkAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.skipif(
+    not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
+)
+@pytest.mark.parametrize("weight_preshuffle", [False, True])
+def test_gather_kv_b_proj_mxfp4_oversized_kv_indices(weight_preshuffle):
+    # FP4 gather should size its launch from valid output tokens, not kv_indices capacity.
+    fp4_weight_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_weight_dtype is None:
+        pytest.skip("torch.float4_e2m1fn_x2 is unavailable")
+
+    torch.manual_seed(0)
+    random.seed(0)
+    batch_size = 2
+    block_size = 1
+    avg_kv_length = 32
+    kv_c_dim = 512
+    kv_pe_dim = 64
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    tp_k_head_num = 1
+    device = "cuda"
+    weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
+
+    (
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices_valid,
+        kv_prefix_sum_context_lens,
+        _context_lens,
+        _num_block,
+    ) = _make_kv_test_data(
+        batch_size,
+        block_size,
+        avg_kv_length,
+        kv_c_dim,
+        kv_pe_dim,
+        dtypes.fp8,
+        device,
+    )
+
+    oversized_numel = 70000 * 32
+    kv_indices = torch.zeros(oversized_numel, device=device, dtype=torch.int32)
+    kv_indices[: kv_indices_valid.numel()] = kv_indices_valid
+
+    weight_src = torch.randn((weight_n, kv_c_dim), device=device, dtype=torch.bfloat16)
+    kv_proj_weight_u8, kv_proj_scale = torch_dynamic_mxfp4_quant(weight_src)
+    kv_proj_weight_ref = _dequant_mxfp4_weight(kv_proj_weight_u8, kv_proj_scale)
+
+    k_ref, v_ref = ref_gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight_ref,
+        torch.ones(weight_n, device=device, dtype=torch.float32),
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+    )
+
+    total_kv = kv_prefix_sum_context_lens[-1].item()
+    k_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * (qk_nope_head_dim + kv_pe_dim)),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * v_head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    kv_proj_weight = kv_proj_weight_u8.view(fp4_weight_dtype)
+    if weight_preshuffle:
+        kv_proj_weight = shuffle_weight(kv_proj_weight)
+        kv_proj_scale = shuffle_scale(kv_proj_scale)
+
+    gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+        v_prefix.view(-1, tp_k_head_num, v_head_dim),
+        weight_preshuffle=weight_preshuffle,
+    )
+
+    checkAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1)
+    checkAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize(
+    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode",
+    [
+        (4, 64, 4, torch.bfloat16, 512, "block"),
+        (8, 64, 4, torch.bfloat16, 1024, "block"),
+        (4, 64, 4, dtypes.fp8, 512, "block"),
+        (8, 64, 4, dtypes.fp8, 1024, "block"),
+        (4, 64, 4, torch.bfloat16, 512, "per_row"),
+        (4, 64, 4, dtypes.fp8, 512, "per_row"),
+        # NOTE: scale_mode="bf16_weight" is intentionally omitted — the bf16
+        # weight + weight_preshuffle gather path is broken independent of the KV
+        # shuffle (test_gather_kv_b_proj_bf16_weight also mismatches), so it
+        # would fail this test's hard assert for an unrelated reason.
+        # block_size larger than the 16-token shuffle group, non-power-of-2 batch
+        (3, 128, 4, dtypes.fp8, 768, "block"),
+        # MXFP4 weight against a bf16/fp8 (non-FP4) shuffled kv buffer. The dot
+        # runs bf16 x e2m1: bf16 kv ~= "fp8xfp8" intent, fp8 kv ~= "fp8xfp4".
+        (4, 64, 4, torch.bfloat16, 512, "mxfp4_weight"),
+        (8, 64, 4, dtypes.fp8, 1024, "mxfp4_weight"),
+    ],
+)
+def test_gather_kv_b_proj_shuffled_kv(
+    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode, perf=False
+):
+    """Shuffled (block_size) bf16/fp8 KV-cache gather.
+
+    The reference runs on the plain token-contiguous buffer; the kernel reads a
+    shuffle_kv_buffer()-permuted copy with shuffled_kv_cache=True. kv_indices are
+    block-granular (one entry per block of `block_size` tokens).
+    """
+    torch.manual_seed(0)
+    random.seed(0)
+    kv_c_dim = 512
+    kv_pe_dim = 64
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+    tp_k_head_num = 128 // num_tp
+    num_block = 2 * avg_kv_length // block_size
+    weight_preshuffle = True
+    device = "cuda"
+    weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
+    is_mxfp4_weight = scale_mode == "mxfp4_weight"
+    fp4_weight_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if is_mxfp4_weight and (not arch_info.is_fp4_avail() or fp4_weight_dtype is None):
+        pytest.skip("MXFP4 weight not supported on this architecture")
+
+    assert block_size % 16 == 0
+
+    # Plain token-contiguous buffer (what the reference consumes).
+    k_buffer = torch.randn(
+        (num_block, block_size, kv_c_dim + kv_pe_dim),
+        device=device,
+        dtype=torch.float32,
+    ).to(k_buffer_type)
+    k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
+
+    var_ratio = 0.2
+    context_lens = (
+        torch.randint(
+            int((1 - var_ratio) * avg_kv_length),
+            int(((1 + var_ratio)) * avg_kv_length) + 1,
+            (batch_size,),
+        )
+        .cuda()
+        .to(torch.int32)
+    )
+    context_blocks = torch.div(
+        context_lens + block_size - 1, block_size, rounding_mode="trunc"
+    )
+
+    kv_indptr = torch.zeros((batch_size + 1,), device="cuda", dtype=torch.int32)
+    kv_indptr[1:] = torch.cumsum(context_blocks, dim=0)
+
+    kv_prefix_sum_context_lens = torch.zeros(
+        (batch_size + 1,), device="cuda", dtype=torch.int32
+    )
+    kv_prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
+
+    kv_indices = torch.zeros(kv_indptr[-1], device="cuda", dtype=torch.int32)
+    for b in range(batch_size):
+        ctx_blk = int(context_blocks[b].item())
+        kv_indices[kv_indptr[b] : kv_indptr[b + 1]] = torch.randperm(
+            num_block, device="cuda"
+        )[:ctx_blk]
+
+    # Weight + scale per scale_mode. For mxfp4_weight the reference uses the
+    # dequantized weight; the kernel gets packed FP4 + e8m0 scale.
+    kv_proj_weight_u8 = None
+    if is_mxfp4_weight:
+        weight_src = torch.randn(
+            (weight_n, kv_c_dim), device=device, dtype=torch.bfloat16
+        )
+        kv_proj_weight_u8, kv_proj_scale_e8m0 = torch_dynamic_mxfp4_quant(weight_src)
+        ref_weight = _dequant_mxfp4_weight(kv_proj_weight_u8, kv_proj_scale_e8m0)
+        ref_scale = torch.ones(weight_n, device=device, dtype=torch.float32)
+    elif scale_mode == "bf16_weight":
+        weight_dtype = torch.bfloat16
+        kv_proj_scale = torch.ones((weight_n, 1), device=device, dtype=torch.float32)
+        kv_proj_weight = torch.randn(
+            (weight_n, kv_c_dim), device=device, dtype=torch.float32
+        ).to(weight_dtype)
+        ref_weight, ref_scale = kv_proj_weight, kv_proj_scale
+    elif scale_mode == "per_row":
+        weight_dtype = dtypes.fp8
+        kv_proj_scale = torch.randn(
+            (weight_n, 1), device=device, dtype=torch.float32
+        ).abs()
+        kv_proj_weight = torch.randn(
+            (weight_n, kv_c_dim), device=device, dtype=torch.float32
+        ).to(weight_dtype)
+        ref_weight, ref_scale = kv_proj_weight, kv_proj_scale
+    else:  # block scale
+        weight_dtype = dtypes.fp8
+        kv_proj_scale = torch.randn(
+            (weight_n // 128, kv_c_dim // 128), device=device, dtype=torch.float32
+        ).abs()
+        kv_proj_weight = torch.randn(
+            (weight_n, kv_c_dim), device=device, dtype=torch.float32
+        ).to(weight_dtype)
+        ref_weight, ref_scale = kv_proj_weight, kv_proj_scale
+
+    # Reference from the plain (unshuffled) buffer.
+    k_ref, v_ref = ref_gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        ref_weight,
+        ref_scale,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+    )
+
+    # Shuffle a copy for the kernel: [nb, block_size, 1, d] -> [nb, 1, block_size, d]
+    # whose per-block memory is [shuffled lora | shuffled rope].
+    k_buffer_shuffled = shuffle_kv_buffer(
+        k_buffer.view(num_block, block_size, 1, kv_c_dim + kv_pe_dim),
+        kv_lora_rank=kv_c_dim,
+    ).reshape(num_block, block_size, kv_c_dim + kv_pe_dim)
+
+    total_kv = kv_prefix_sum_context_lens[-1].item()
+    k_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * (qk_nope_head_dim + kv_pe_dim)),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_prefix = torch.zeros(
+        (total_kv, tp_k_head_num * v_head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    if is_mxfp4_weight:
+        kv_proj_weight = kv_proj_weight_u8.view(fp4_weight_dtype)
+        kv_proj_scale = kv_proj_scale_e8m0
+        if weight_preshuffle:
+            kv_proj_weight = shuffle_weight(kv_proj_weight)
+            kv_proj_scale = shuffle_scale(kv_proj_scale)
+    elif weight_preshuffle:
+        kv_proj_weight = shuffle_weight(kv_proj_weight)
+
+    gather_kv_b_proj(
+        k_buffer_shuffled,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+        v_prefix.view(-1, tp_k_head_num, v_head_dim),
+        weight_preshuffle=weight_preshuffle,
+        shuffled_kv_cache=True,
+    )
+
+    # FP4 weight reconstruction carries more error than fp8/bf16 weight.
+    atol = 1e-1 if is_mxfp4_weight else 1e-2
+    rtol = 1e-1 if is_mxfp4_weight else 1e-2
+    # checkAllclose only logs; assert here so the test actually fails on a
+    # mismatch instead of silently passing.
+    for name, got, ref in (("k", k_prefix, k_ref), ("v", v_prefix, v_ref)):
+        checkAllclose(ref, got, atol=atol, rtol=rtol)
+        bad = (~torch.isclose(ref, got, atol=atol, rtol=rtol)).float().mean().item()
+        assert (
+            bad <= 1e-3
+        ), f"{name}: {bad:.3%} of elements exceed atol={atol} rtol={rtol}"
+
+    if perf:
+        _, elapsed_us = run_perftest(
+            gather_kv_b_proj,
+            k_buffer_shuffled,
+            k_scale,
+            kv_indptr,
+            kv_indices,
+            kv_prefix_sum_context_lens,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+            v_prefix.view(-1, tp_k_head_num, v_head_dim),
+            weight_preshuffle=weight_preshuffle,
+            shuffled_kv_cache=True,
+        )
+        print(
+            f">>> Performance gather_kv_b_proj_shuffled_kv ({scale_mode}):\n"
+            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
+            f"kv_length {avg_kv_length}, ktype {k_buffer_type}\n"
+            f">>>       elapsed={elapsed_us:.2f}us"
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-B", "--batch", type=int, default=16, help="Batch size.")
@@ -806,19 +1218,31 @@ if __name__ == "__main__":
     ), "Only fp8 and bfloat16 are supported"
     k_buffer_type = dtypes.fp8 if args.ktype == "fp8" else torch.bfloat16
 
-    test_gather_kv_b_proj_per_row_scale(
-        args.batch,
-        args.blocksize,
-        args.num_tp,
-        k_buffer_type,
-        args.kv_length,
-        perf=True,
-    )
-    test_gather_kv_b_proj(
-        args.batch,
-        args.blocksize,
-        args.num_tp,
-        k_buffer_type,
-        args.kv_length,
-        perf=True,
-    )
+    if args.kv_preshuffle:
+        block_size = args.blocksize if args.blocksize % 16 == 0 else 64
+        test_gather_kv_b_proj_shuffled_kv(
+            args.batch,
+            block_size,
+            args.num_tp,
+            k_buffer_type,
+            args.kv_length,
+            scale_mode="block",
+            perf=True,
+        )
+    else:
+        test_gather_kv_b_proj_per_row_scale(
+            args.batch,
+            args.blocksize,
+            args.num_tp,
+            k_buffer_type,
+            args.kv_length,
+            perf=True,
+        )
+        test_gather_kv_b_proj(
+            args.batch,
+            args.blocksize,
+            args.num_tp,
+            k_buffer_type,
+            args.kv_length,
+            perf=True,
+        )

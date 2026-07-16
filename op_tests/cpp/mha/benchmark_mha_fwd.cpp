@@ -493,6 +493,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                  sizeof(VDataType) * hdim_v * real_seqlen_k +
                                  sizeof(ODataType) * real_seqlen_q * hdim_v);
         }
+        if(mask.type != mask_enum::no_mask)
+        {
+            flop /= 2;
+        }
     }
 
     const ck_tile::index_t max_num_page_blocks =

@@ -72,6 +72,7 @@ def generate_gemm_a16w8_blockscale_inputs(
     - x: (M, K) -> row-major format
     - w: (N, K) -> column-major format
     """
+    torch.manual_seed(0)
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
