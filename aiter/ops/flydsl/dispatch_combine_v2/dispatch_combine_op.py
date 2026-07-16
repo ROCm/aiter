@@ -22,6 +22,7 @@
 """Host op-layer for the cco-LSA intranode dispatch/combine kernels. One SymmArena
 window holds the symmetric staging; per-rank metadata are plain device tensors."""
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -518,7 +519,18 @@ class EpDispatchCombineOp:
             dispatch_specs = [(cfg.dispatch_block_num, cfg.dispatch_warp_num_per_block)]
             combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
         if cfg.is_scatter:
-            combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
+            # Scatter combine hits an all-block grid barrier mid-kernel (Stage 1
+            # write -> barrier -> Stage 3 read). With the gather-tuned (block=80,
+            # warp=4) that barrier serializes badly (occupancy-bound: too many
+            # blocks to co-reside, so the grid barrier spins). Far fewer blocks with
+            # more warps per block (8x16) keeps all blocks resident and roughly
+            # halves the scatter combine kernel time. Override via SCATTER_COMB_BW
+            # (e.g. "16,16") to retune for a different token count / hidden dim.
+            _b, _w = 8, 16
+            _bw = os.environ.get("SCATTER_COMB_BW")
+            if _bw:
+                _b, _w = (int(x) for x in _bw.split(","))
+            combine_specs = [(_b, _w)]
         self._dispatch_specs = dispatch_specs
         self._combine_specs = combine_specs
 
