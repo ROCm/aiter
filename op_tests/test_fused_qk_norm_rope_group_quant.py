@@ -38,10 +38,17 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+
+try:
+    from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
+
+    _FLYDSL_IMPORT_ERROR = None
+except Exception as e:
+    flydsl_qk_norm_rope_quant = None
+    _FLYDSL_IMPORT_ERROR = e
 
 torch.set_default_device("cuda")
 
@@ -306,7 +313,7 @@ def test_fused_qk_norm_rope_group_quant(
     #   q_fp8=False -> flydsl bf16 (quant off)  [both write bf16 Q]
     # (comparing bf16-Q against fp8-flydsl would just measure the 2x Q write.)
     fly_us = float("nan")
-    if compare_flydsl:
+    if compare_flydsl and flydsl_qk_norm_rope_quant is not None:
         try:
             _, fly_us = run_perftest(
                 flydsl_qk_norm_rope_quant,
@@ -355,36 +362,39 @@ def test_fused_qk_norm_rope_group_quant(
 
 
 # ============================================================================
-# SWA fused ring-cache write test
+# SWA fused paged-cache write test
 # ============================================================================
 #
-# Decode-only fusion: the post-norm/rope K row is ALSO scattered into a per-request
-# sliding-window ring that mirrors the main K output's two-buffer split:
-#   swa_nope[slot, pos % cache_size, :] = k_nope_scale_buff[t]   (nope fp8 + dup e8m0 + pad)
-#   swa_rope[slot, pos % cache_size, :] = k_rope_buff[t]         (rope bf16)
-# where slot = state_slot_mapping[batch_id_per_token[t]]; batch_id == -1 (CG-pad) skips.
+# Decode-only fusion: the post-norm/rope K row is ALSO scattered into the paged
+# SWA pool that mirrors the main K output's two-buffer split:
+#   blk  = pos // block_size
+#   phys = swa_block_tables[batch_id_per_token[t], blk]
+#   row  = phys * block_size + pos % block_size
+#   swa_nope[row, :] = k_nope_scale_buff[t]   (nope fp8 + dup e8m0 + pad)
+#   swa_rope[row, :] = k_rope_buff[t]         (rope bf16)
+# batch_id == -1 (CG-pad) or phys == -1 (outside SWA window) skips.
 #
 # Verification strategy: run the kernel, then REPLAY the scatter in python from the
-# kernel's own main K outputs and compare byte-exact to the SWA ring. This validates
-# the ring addressing + the verbatim entry copy (incl. the duplicated scale + pad)
+# kernel's own main K outputs and compare byte-exact to the SWA pool. This validates
+# the paged addressing + the verbatim entry copy (incl. the duplicated scale + pad)
 # independently of the quant math (which the main test above already checks vs ref).
 
 
-def _build_swa_batch(T, cache_size):
+def _build_swa_batch(T, block_size):
     """Collision-free decode-ish batch layout: split the first ``real`` tokens into
-    ``bs`` contiguous sequences (distinct ring slot per seq, consecutive positions ->
-    distinct pos%cache_size within a seq), plus a couple of trailing CG-pad (bid=-1)
-    tokens that must be skipped by the kernel. Returns int32 batch_id [T], int64
-    positions [T], int32 state_slot_mapping [bs], num_slots, bs, n_pad."""
+    ``bs`` contiguous sequences, assign each touched logical SWA block to a physical
+    block via ``swa_block_tables``, plus trailing CG-pad (bid=-1) tokens that must be
+    skipped by the kernel. Returns int32 batch_id [T], int64 positions [T], int32
+    swa_block_tables [bs, max_blocks], num_phys_blocks, bs, n_pad."""
     n_pad = min(2, T - 1) if T > 1 else 0
     real = T - n_pad
-    # Pick bs so each seq has <= cache_size tokens (consecutive positions -> distinct
-    # pos%cache_size within a seq => collision-free ring writes). At least 4 seqs when
+    # Pick bs so each seq has <= block_size tokens (consecutive positions -> distinct
+    # pos%block_size within a seq => collision-free paged writes). At least 4 seqs when
     # there are enough tokens, to exercise multi-seq slot indirection.
-    min_bs = (real + cache_size - 1) // cache_size  # ceil(real / cache_size)
+    min_bs = (real + block_size - 1) // block_size  # ceil(real / block_size)
     bs = max(min(4, real), min_bs)
     counts = [real // bs + (1 if i < real % bs else 0) for i in range(bs)]
-    assert max(counts) <= cache_size, "per-seq token count must be <= cache_size"
+    assert max(counts) <= block_size, "per-seq token count must be <= block_size"
     bid_list, pos_list = [], []
     for i, cnt in enumerate(counts):
         base = int(torch.randint(0, 64, (1,)).item())
@@ -396,9 +406,15 @@ def _build_swa_batch(T, cache_size):
         pos_list.append(0)
     bid = torch.tensor(bid_list, dtype=torch.int32, device=_DEV)
     pos = torch.tensor(pos_list, dtype=torch.int64, device=_DEV)
-    num_slots = bs + 2  # extra slots to exercise the slot indirection
-    slot_map = torch.randperm(num_slots, device=_DEV)[:bs].to(torch.int32)
-    return bid, pos, slot_map, num_slots, bs, n_pad
+    max_blocks = int(pos[:real].max().item()) // block_size + 2
+    block_tables_cpu = torch.full((bs, max_blocks), -1, dtype=torch.int32)
+    next_phys = 0
+    for b, p in zip(bid_list[:real], pos_list[:real]):
+        blk = p // block_size
+        if int(block_tables_cpu[b, blk]) < 0:
+            block_tables_cpu[b, blk] = next_phys
+            next_phys += 1
+    return bid, pos, block_tables_cpu.to(_DEV), next_phys, bs, n_pad
 
 
 @benchmark()
@@ -408,11 +424,13 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     random.seed(0)
     nope = D - RD
     eps = 1e-6
-    cache_size = 128  # DeepSeek-V4 sliding window
+    block_size = 128  # DeepSeek-V4 paged-SWA block size
     n_groups_k = nope // GK
     entry = D
 
-    bid, pos, slot_map, num_slots, bs, n_pad = _build_swa_batch(T, cache_size)
+    bid, pos, swa_block_tables, num_phys_blocks, bs, n_pad = _build_swa_batch(
+        T, block_size
+    )
     cos, sin = _cos_sin(int(pos.max().item()) + 4, RD, torch.bfloat16)
     q = (torch.randn(T, H, D, device=_DEV) * 0.1).bfloat16()
     kv = (torch.randn(T, NK, D, device=_DEV) * 0.1).bfloat16()
@@ -435,9 +453,10 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     k_nope_scale_buff = torch.zeros(T, NK, entry, dtype=_FP8, device=_DEV)
     k_rope_buff = torch.empty(T, NK, RD, dtype=torch.bfloat16, device=_DEV)
 
-    # SWA ring buffers (zero-init: unwritten cells must stay zero for the byte-compare)
-    swa_nope = torch.zeros(num_slots, cache_size, entry, dtype=_FP8, device=_DEV)
-    swa_rope = torch.zeros(num_slots, cache_size, RD, dtype=torch.bfloat16, device=_DEV)
+    # Paged SWA buffers (zero-init: unwritten rows must stay zero for the byte-compare)
+    num_rows = num_phys_blocks * block_size
+    swa_nope = torch.zeros(num_rows, entry, dtype=_FP8, device=_DEV)
+    swa_rope = torch.zeros(num_rows, RD, dtype=torch.bfloat16, device=_DEV)
 
     (q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff), us = run_perftest(
         aiter.fused_qk_norm_rope_group_quant,
@@ -458,7 +477,8 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
         scale_dtype="e8m0",
         swa_nope_scale_buff=swa_nope,
         swa_rope_buff=swa_rope,
-        state_slot_mapping=slot_map,
+        swa_block_tables=swa_block_tables,
+        swa_block_size=block_size,
         batch_id_per_token=bid,
     )
 
@@ -482,23 +502,26 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
         k_rope_buff.float(), ref_k_pe.float(), atol=0.01, rtol=0.01, msg="K-pe bf16"
     )
 
-    # --- SWA ring == replay(main K outputs) ---
-    # Build the expected ring by replaying the scatter from the kernel's own main K
+    # --- SWA pool == replay(main K outputs) ---
+    # Build the expected paged pool by replaying the scatter from the kernel's own main K
     # outputs (last-write-wins; the collision-free layout makes order irrelevant).
     exp_nope = torch.zeros_like(swa_nope)
     exp_rope = torch.zeros_like(swa_rope)
     bid_cpu = bid.tolist()
     pos_cpu = pos.tolist()
-    slot_cpu = slot_map.tolist()
+    block_tables_cpu = swa_block_tables.cpu()
     n_written = 0
     for t in range(T):
         b = bid_cpu[t]
         if b < 0:
             continue
-        slot = slot_cpu[b]
-        ring = pos_cpu[t] % cache_size
-        exp_nope[slot, ring] = k_nope_scale_buff[t, 0]
-        exp_rope[slot, ring] = k_rope_buff[t, 0]
+        blk = pos_cpu[t] // block_size
+        phys = int(block_tables_cpu[b, blk])
+        if phys < 0:
+            continue
+        row = phys * block_size + pos_cpu[t] % block_size
+        exp_nope[row] = k_nope_scale_buff[t, 0]
+        exp_rope[row] = k_rope_buff[t, 0]
         n_written += 1
 
     # Byte-exact compare (pure copy): fp8 entry incl. nope + dup scale + pad, and rope bf16.
@@ -520,7 +543,7 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     return {
         "hip_us": round(us, 3),
         "bs": bs,
-        "num_slots": num_slots,
+        "num_phys_blocks": num_phys_blocks,
         "n_pad": n_pad,
         "n_written": n_written,
         "err_k": err_k,
@@ -575,14 +598,20 @@ parser.add_argument(
 parser.add_argument(
     "--swa",
     action="store_true",
-    help="run ONLY the fused SWA ring-cache write test (decode-only).",
+    help="run ONLY the fused paged-SWA write test (decode-only).",
 )
 parser.add_argument(
     "--no-swa",
     action="store_true",
-    help="skip the fused SWA ring-cache write test.",
+    help="skip the fused paged-SWA write test.",
 )
 args = parser.parse_args()
+
+if not args.no_flydsl and _FLYDSL_IMPORT_ERROR is not None:
+    aiter.logger.warning(
+        "flydsl comparison disabled: %s. Use --no-flydsl to silence this warning.",
+        _FLYDSL_IMPORT_ERROR,
+    )
 
 neox_modes = [False, True] if args.neox else [False]
 
@@ -611,7 +640,7 @@ if not args.swa:
         df.to_markdown(index=False),
     )
 
-# --- SWA fused ring-cache write sweep (decode-only; small T to stay off the
+# --- SWA fused paged-cache write sweep (decode-only; small T to stay off the
 # fine-grained xlarge path which does not carry the SWA scatter) ---
 if args.swa or not args.no_swa:
     # cap T to the decode/med range (<= 1024) so the coarse kernel (shared K-wave
@@ -634,6 +663,6 @@ if args.swa or not args.no_swa:
             )
     swa_df = pd.DataFrame(swa_rows)
     aiter.logger.info(
-        "fused_qk_norm_rope_group_quant SWA ring-write summary (markdown):\n%s",
+        "fused_qk_norm_rope_group_quant paged-SWA write summary (markdown):\n%s",
         swa_df.to_markdown(index=False),
     )
