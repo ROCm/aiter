@@ -147,7 +147,7 @@ def _dynamic_mxfp4_quant_kernel_gluon_950(
         order=[0, 1],
     )
 
-    for pid_n in range(start_n, min(start_n + NUM_ITER, N), num_stages=NUM_STAGES):
+    for pid_n in range(start_n, min(start_n + NUM_ITER, N)):
         x_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
             0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout)
         )
@@ -195,6 +195,7 @@ def _dynamic_mxfp4_quant_kernel_gluon_950(
                 mask=bs_mask,
             )
 
+
 @gluon.jit
 def _dynamic_mxfp4_quant_kernel_gluon_1250(
     x_ptr,
@@ -220,15 +221,15 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
 ):
     gl.static_assert(NUM_BUFFERS >= 2, "LDS kernel requires NUM_BUFFERS >= 2")
 
-    pid_m  = gl.program_id(0)
+    pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
 
-    stride_x_m    = gl.cast(stride_x_m_in,    gl.int64)
-    stride_x_n    = gl.cast(stride_x_n_in,    gl.int64)
+    stride_x_m = gl.cast(stride_x_m_in, gl.int64)
+    stride_x_n = gl.cast(stride_x_n_in, gl.int64)
     stride_x_fp4_m = gl.cast(stride_x_fp4_m_in, gl.int64)
     stride_x_fp4_n = gl.cast(stride_x_fp4_n_in, gl.int64)
-    stride_bs_m   = gl.cast(stride_bs_m_in,   gl.int64)
-    stride_bs_n   = gl.cast(stride_bs_n_in,   gl.int64)
+    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
+    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
 
@@ -251,12 +252,18 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
+    SHARED_LAYOUT_O: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_SIZE_N // 2, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N // 2], [1, 0]
+    )
+    out_smem = gl.allocate_shared_memory(
+        x_fp4_ptr.type.element_ty,
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N // 2],
+        layout=SHARED_LAYOUT_O,
+    )
 
     # TDM descriptor: base at this CTA's (M, N) origin
     x_base = (
-        x_ptr
-        + pid_m * BLOCK_SIZE_M * stride_x_m
-        + start_n * BLOCK_SIZE_N * stride_x_n
+        x_ptr + pid_m * BLOCK_SIZE_M * stride_x_m + start_n * BLOCK_SIZE_N * stride_x_n
     )
     x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=x_base,
@@ -265,10 +272,17 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         layout=SHARED_LAYOUT_X,
     )
+    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=x_fp4_ptr,
+        shape=(M, N // 2),
+        strides=(stride_x_fp4_m, stride_x_fp4_n),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N // 2),
+        layout=SHARED_LAYOUT_O,
+    )
 
-    load_idx    = 0
+    load_idx = 0
     compute_idx = 0
-    num_tiles   = min(NUM_ITER, gl.cdiv(N, BLOCK_SIZE_N) - start_n)
+    num_tiles = min(NUM_ITER, gl.cdiv(N, BLOCK_SIZE_N) - start_n)
     # ---- Prologue: fill NUM_BUFFERS-1 slots ----
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
@@ -290,66 +304,80 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
         )
         load_idx += 1
 
-        x_reg = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            x_buffer.index(compute_idx % NUM_BUFFERS), blocked_layout
-        ).to(gl.float32)
+        x_reg = (
+            x_buffer.index(compute_idx % NUM_BUFFERS)
+            .load(layout=blocked_layout)
+            .to(gl.float32)
+        )
 
         out_fp4, bs_e8m0 = _mxfp4_quant_op_gluon(
             x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
 
-        pid_n      = start_n + compute_idx
-        out_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        out_offs_n = pid_n * BLOCK_SIZE_N // 2 + gl.arange(0, BLOCK_SIZE_N // 2)
-        out_offs   = out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
-        if EVEN_M_N:
-            gl.store(x_fp4_ptr + out_offs, out_fp4)
-        else:
-            gl.store(x_fp4_ptr + out_offs, out_fp4,
-                     mask=(out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :])
+        pid_n = start_n + compute_idx
+        out_smem.store(out_fp4)
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(
+            out_desc,
+            [pid_m * BLOCK_SIZE_M, pid_n * (BLOCK_SIZE_N // 2)],
+            out_smem,
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs   = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
             gl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
-            gl.store(bs_ptr + bs_offs, bs_e8m0,
-                     mask=(bs_offs_m < M)[:, None] & (
-                         bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-                     )[None, :])
+            gl.store(
+                bs_ptr + bs_offs,
+                bs_e8m0,
+                mask=(bs_offs_m < M)[:, None]
+                & (
+                    bs_offs_n
+                    < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+                )[None, :],
+            )
         compute_idx += 1
 
     # ---- Epilogue: drain remaining NUM_BUFFERS-1 tiles ----
     for i in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2 - i)
 
-        x_reg = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            x_buffer.index(compute_idx % NUM_BUFFERS), blocked_layout
-        ).to(gl.float32)
+        x_reg = (
+            x_buffer.index(compute_idx % NUM_BUFFERS)
+            .load(layout=blocked_layout)
+            .to(gl.float32)
+        )
 
         out_fp4, bs_e8m0 = _mxfp4_quant_op_gluon(
             x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
 
-        pid_n      = start_n + compute_idx
-        out_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        out_offs_n = pid_n * BLOCK_SIZE_N // 2 + gl.arange(0, BLOCK_SIZE_N // 2)
-        out_offs   = out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
-        if EVEN_M_N:
-            gl.store(x_fp4_ptr + out_offs, out_fp4)
-        else:
-            gl.store(x_fp4_ptr + out_offs, out_fp4,
-                     mask=(out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :])
+        pid_n = start_n + compute_idx
+        out_smem.store(out_fp4)
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(
+            out_desc,
+            [pid_m * BLOCK_SIZE_M, pid_n * (BLOCK_SIZE_N // 2)],
+            out_smem,
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs   = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
             gl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
-            gl.store(bs_ptr + bs_offs, bs_e8m0,
-                     mask=(bs_offs_m < M)[:, None] & (
-                         bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-                     )[None, :])
+            gl.store(
+                bs_ptr + bs_offs,
+                bs_e8m0,
+                mask=(bs_offs_m < M)[:, None]
+                & (
+                    bs_offs_n
+                    < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+                )[None, :],
+            )
         compute_idx += 1
