@@ -101,6 +101,31 @@ def lds_cap_bytes(arch: str | None = None) -> int:
 
 _LOG2E = host_math.log2(host_math.e)
 
+# Two ways to publish Q and dO to LDS each q-tile:
+#   - SINGLE barrier: DMA dO directly global->LDS (like Q) so one barrier publishes
+#     both. Removes the dO register round-trip + `store_do_regs_to_lds` ds_write.
+#   - TWO barriers: stage dO global->registers, take barrier #1 (Q), compute S while
+#     the dO loads land, then store dO->LDS and take barrier #2. The extra barrier
+#     buys a dO-load / S-GEMM *overlap* whose value scales with the dO tile size
+#     (BLOCK_N * hidden_dim).
+# Measured (2026-07-15, MI300X, uniform, perm ON): single-barrier is +0..+3.5% at
+# hidden_dim=64 (the deployment target) but -6.1% on hidden_dim=128 / N=16384
+# (the overlap it drops is worth more than the barrier it saves). So it is a
+# **tunable per-shape param** (`single_barrier`, carried in the tuned CSV like
+# block_m); when unspecified it falls back to a shape heuristic (single barrier for
+# small dO tiles, hidden_dim <= 64). Numerically identical either way (bf16 reorder
+# noise ~3e-6). Precedence: env override > explicit param (from CSV/caller) >
+# heuristic. `HSTU_BWD_SINGLE_BARRIER=0/1` forces one path (A/B / debug).
+_SB_ENV = os.environ.get("HSTU_BWD_SINGLE_BARRIER")  # None unless explicitly set
+
+
+def _resolve_single_barrier(hidden_dim: int, param) -> bool:
+    if _SB_ENV is not None:
+        return _SB_ENV == "1"
+    if param is not None:
+        return bool(param)
+    return hidden_dim <= 64
+
 
 def _waitcnt_vm_n(n: int):
     """Emit s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7)."""
@@ -217,6 +242,7 @@ def build_hstu_attention_bwd_dvdk(
     num_waves: int = 4,
     waves_per_eu: int = 0,
     has_perm: bool = False,
+    single_barrier=None,
 ):
     validate_hstu_attention_bwd(
         num_heads, head_dim, hidden_dim, batch, causal, max_attn_len,
@@ -268,6 +294,7 @@ def build_hstu_attention_bwd_dvdk(
     # swizzle (matches the do_smem read layout). Mirrors the Q DMA sans swizzle.
     NUM_DMA_DO = do_tile_elems // elems_per_dma_pass
     PAIRS_PER_ROW_DO = DO_STRIDE // DMA_ELEMS
+    SINGLE_BARRIER = _resolve_single_barrier(hidden_dim, single_barrier)
 
     VEC_DO = 8 if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0) else DMA_ELEMS
     THREADS_PER_ROW_DO = hidden_dim // VEC_DO
@@ -684,7 +711,7 @@ def build_hstu_attention_bwd_dvdk(
         do_reg_outstanding = NUM_BATCHES_DO
 
         def run_q_tile(acc, q_start):
-            if const_expr(_SINGLE_BARRIER):
+            if const_expr(SINGLE_BARRIER):
                 # Single-barrier variant: DMA both Q and dO global->LDS, then one
                 # workgroup barrier publishes both. Removes the 2nd barrier and the
                 # dO register round-trip (frees the dO staging VGPRs), at the cost of

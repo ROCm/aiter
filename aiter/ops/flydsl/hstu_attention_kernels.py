@@ -524,16 +524,25 @@ _BWD_CSV_COLUMNS: list[str] = [
     "block_n",
     "num_waves",
     "waves_per_eu",
+    "single_barrier",
     "duration",
 ]
+
+# Columns that identify the *problem* (everything except the tuned tile params +
+# duration). single_barrier is a tuned param, not problem identity.
+_BWD_TILE_COLUMNS = ("block_m", "block_n", "num_waves", "waves_per_eu", "single_barrier")
 
 
 @functools.lru_cache()
 def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
     def _parse_row(row: dict) -> Optional[tuple[tuple, float, dict]]:
-        if set(row.keys()) != set(_BWD_CSV_COLUMNS):
+        # single_barrier is optional (added 2026-07-15) so pre-existing CSVs without
+        # that column still parse; a missing/blank value falls back to the builder's
+        # shape heuristic.
+        required = set(_BWD_CSV_COLUMNS) - {"single_barrier"}
+        if not required.issubset(row.keys()):
             raise KeyError(
-                f"unexpected columns: {set(row.keys()) ^ set(_BWD_CSV_COLUMNS)}"
+                f"missing columns: {required - set(row.keys())}"
             )
 
         duration = float(row["duration"])
@@ -563,7 +572,12 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             num_waves=int(row["num_waves"]),
             waves_per_eu=int(row["waves_per_eu"]),
         )
-        # Key on (problem, kernel) so dV/dK and dQ tune independently.
+        # single_barrier applies only to the fused dvdk kernel; carried as an
+        # optional bool (None => builder heuristic). Blank / absent => None.
+        sb_raw = (row.get("single_barrier") or "").strip().lower()
+        if sb_raw not in ("", "none"):
+            kernel_config["single_barrier"] = sb_raw in ("1", "true")
+        # Key on (problem, kernel) so dVdK and dQ tune independently.
         return (problem_key, kernel), duration, kernel_config
 
     default_tuned_file = (
@@ -699,6 +713,7 @@ def _compile_bwd_launcher(
     num_waves: Optional[int],
     waves_per_eu: Optional[int],
     has_perm: bool = False,
+    single_barrier: Optional[bool] = None,
 ) -> tuple[Callable, Callable]:
     """Builds the (dV+dK, dQ) launcher pair, resolving tuned -> default -> custom
     per kernel.
@@ -751,11 +766,19 @@ def _compile_bwd_launcher(
         max_seq_len=max_seq_len,
         has_perm=has_perm,
     )
+    # single_barrier is a dvdk-only tuned param (dQ has no such knob). Precedence:
+    # explicit caller override > tuned CSV entry > builder heuristic (None).
+    dvdk_config = _resolve(_BWD_KERNEL_DVDK)
+    if single_barrier is not None:
+        dvdk_config["single_barrier"] = single_barrier
+    dq_config = _resolve(_BWD_KERNEL_DQ)
+    dq_config.pop("single_barrier", None)
+
     dvdk_launcher = build_hstu_attention_bwd_dvdk(
-        **common_kwargs, **_resolve(_BWD_KERNEL_DVDK)
+        **common_kwargs, **dvdk_config
     )
     dq_launcher = build_hstu_attention_bwd_dq(
-        **common_kwargs, **_resolve(_BWD_KERNEL_DQ)
+        **common_kwargs, **dq_config
     )
     return dvdk_launcher, dq_launcher
 
@@ -777,6 +800,7 @@ def flydsl_hstu_attention_bwd(
     block_n: Optional[int] = None,
     num_waves: Optional[int] = None,
     waves_per_eu: Optional[int] = None,
+    single_barrier: Optional[bool] = None,
     sort_by_length: bool = False,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -817,6 +841,7 @@ def flydsl_hstu_attention_bwd(
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
         has_perm=sort_by_length,
+        single_barrier=single_barrier,
     )
 
     dq = torch.empty_like(q)
@@ -888,16 +913,17 @@ def _make_bwd_kernel_runners(
     block_n: Optional[int] = None,
     num_waves: Optional[int] = None,
     waves_per_eu: Optional[int] = None,
+    single_barrier: Optional[bool] = None,
     sort_by_length: bool = False,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> dict:
-    """Tuning/profiling helper: build the (dV, dK, dQ) launcher triple with an
-    explicit tile config forced on all three, and return zero-arg callables that
-    launch ONLY one kernel each: {"dv": fn, "dk": fn, "dq": fn}.
+    """Tuning/profiling helper: build the (dV+dK, dQ) launcher pair with an
+    explicit tile config forced on both, and return zero-arg callables that
+    launch ONLY one kernel each: {"dvdk": fn, "dq": fn}.
 
-    This lets the tuner time the three backward kernels independently (they have
+    This lets the tuner time the two backward kernels independently (they have
     different optimal configs) without going through the public entry point,
-    which always launches all three. Not part of the public API.
+    which always launches both. Not part of the public API.
     """
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_bwd_inputs(
         q=q, k=k, v=v, dout=dout, seq_offsets=seq_offsets, num_targets=num_targets,
@@ -919,6 +945,7 @@ def _make_bwd_kernel_runners(
         num_waves=num_waves,
         waves_per_eu=waves_per_eu,
         has_perm=sort_by_length,
+        single_barrier=single_barrier,
     )
 
     dq = torch.empty_like(q)
