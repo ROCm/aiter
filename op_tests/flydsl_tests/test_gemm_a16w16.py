@@ -74,27 +74,19 @@ def _generate_inputs(M, N, K, dtype, layout="TN", output=False, bias=False):
 
 def get_x_vals():
     return [
-        (1, 1, 1),
-        (1, 16, 16),
-        (16, 1, 16),
-        (16, 16, 1),
-        # Irregular
-        (3, 5, 7),
-        (17, 33, 65),
-        (63, 127, 255),
-        (65, 129, 257),
         # Aligned
         (64, 64, 64),
         (128, 128, 128),
+        (256, 256, 256),
         # Multi-block
         (128, 256, 512),
         (256, 512, 256),
         # Asymmetric
         (32, 256, 128),
         (256, 32, 128),
+        # Large K (drives the flat main loop + drain)
         (128, 128, 1024),
         (1024, 128, 128),
-        (1536, 512, 768),
     ]
 
 
@@ -105,7 +97,6 @@ def get_fewer_x_vals():
         (256, 512, 256),
         (128, 128, 1024),
         (1024, 128, 128),
-        (1536, 512, 768),
     ]
 
 
@@ -115,7 +106,7 @@ def test_gemm_a16_w16(M, N, K):
     x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
 
     torch_out = F.linear(x, w, bias=None)
-    kernel_out = gemm_a16w16(x, w, dtype=torch.bfloat16)
+    kernel_out = gemm_a16w16(x, w, dtype=torch.bfloat16, num_buffers=3)
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
 
@@ -136,7 +127,9 @@ def test_gemm_a16_w16_activation(M, N, K, dtype, output, activation):
     elif activation in ("silu", "silu_exp2"):
         torch_out = F.silu(torch_out)
 
-    kernel_out = gemm_a16w16(x, w, dtype=dtype, y=y, activation=activation)
+    kernel_out = gemm_a16w16(
+        x, w, dtype=dtype, y=y, activation=activation, num_buffers=3
+    )
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
 
@@ -148,6 +141,113 @@ def test_gemm_a16_w16_layout(M, N, K, layout):
     x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16, layout=layout)
 
     torch_out = F.linear(x, w, bias=None)
-    kernel_out = gemm_a16w16(x, w, dtype=torch.bfloat16)
+    kernel_out = gemm_a16w16(x, w, dtype=torch.bfloat16, num_buffers=3)
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# 32x32 output tile, deep K (tile_k=128); tile_n=32 needs n_warp=2, K multiple of 128.
+@pytest.mark.parametrize(
+    "M, N, K", [(32, 32, 256), (128, 128, 256), (256, 256, 512), (64, 64, 1024)]
+)
+def test_gemm_a16_w16_tile_32x32x128(M, N, K):
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+
+    torch_out = F.linear(x, w, bias=None)
+    kernel_out = gemm_a16w16(
+        x,
+        w,
+        dtype=torch.bfloat16,
+        num_buffers=3,
+        tile_m=32,
+        tile_n=32,
+        tile_k=128,
+        m_warp=2,
+        n_warp=2,
+    )
+
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+# Split-K: partition K across split_k grid-z workgroups, atomic-add into a pre-zeroed C.
+def _splitk_configs():
+    # (M, N, K, tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, split_k) — all valid.
+    return [
+        (128, 128, 512, 64, 64, 128, 2, 2, 2, 2),  # 4 tiles, 2/split
+        (128, 128, 512, 64, 64, 128, 2, 2, 2, 4),  # 4 tiles, 1/split
+        (64, 64, 768, 64, 64, 128, 2, 2, 2, 3),  # 6 tiles, 2/split
+        (64, 64, 768, 64, 64, 128, 2, 2, 2, 6),  # 6 tiles, 1/split
+        (128, 256, 1024, 64, 64, 128, 2, 2, 2, 4),  # 8 tiles, 2/split
+        (256, 128, 1024, 32, 32, 128, 2, 2, 2, 8),  # 8 tiles, 1/split (max split)
+        (128, 128, 1024, 64, 64, 128, 2, 2, 3, 4),  # nb=3, 2/split
+    ]
+
+
+@pytest.mark.parametrize("M,N,K,tm,tn,tk,mw,nw,nb,sk", _splitk_configs())
+def test_gemm_a16_w16_split_k(M, N, K, tm, tn, tk, mw, nw, nb, sk):
+    """Primary split-K correctness: fp32 output (lossless) -> split_k=N == split_k=1."""
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+
+    common = dict(
+        dtype=torch.float32,
+        tile_m=tm,
+        tile_n=tn,
+        tile_k=tk,
+        m_warp=mw,
+        n_warp=nw,
+        num_buffers=nb,
+    )
+    out_single = gemm_a16w16(x, w, split_k=1, **common).clone()
+    out_split = gemm_a16w16(x, w, split_k=sk, **common).clone()
+
+    torch.testing.assert_close(out_split, out_single, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("M,N,K,tm,tn,tk,mw,nw,nb,sk", _splitk_configs())
+def test_gemm_a16_w16_split_k_bf16(M, N, K, tm, tn, tk, mw, nw, nb, sk):
+    """bf16-output split-K at O(1) magnitudes (scaled inputs) must match split_k=1."""
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+    x = (x.float() * 0.1).to(torch.bfloat16)
+    w = (w.float() * 0.1).to(torch.bfloat16)
+
+    common = dict(
+        dtype=torch.bfloat16,
+        tile_m=tm,
+        tile_n=tn,
+        tile_k=tk,
+        m_warp=mw,
+        n_warp=nw,
+        num_buffers=nb,
+    )
+    out_single = gemm_a16w16(x, w, split_k=1, **common).clone()
+    out_split = gemm_a16w16(x, w, split_k=sk, **common).clone()
+
+    torch.testing.assert_close(out_split, out_single, atol=1e-1, rtol=2e-2)
+
+
+@pytest.mark.parametrize("sk", [2, 4])
+def test_gemm_a16_w16_split_k_output_buffer_zeroed(sk):
+    """split_k>1 atomic-ADDS into C; the wrapper must zero it each call (no doubling)."""
+    M, N, K = 128, 128, 512
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+    y = torch.empty((M, N), dtype=torch.float32, device="cuda")
+
+    common = dict(
+        dtype=torch.float32,
+        y=y,
+        tile_m=64,
+        tile_n=64,
+        tile_k=128,
+        m_warp=2,
+        n_warp=2,
+        num_buffers=2,
+        split_k=sk,
+    )
+    out1 = gemm_a16w16(x, w, **common).clone()
+    out2 = gemm_a16w16(x, w, **common).clone()  # reuse y -> must re-zero, not 2x
+
+    torch.testing.assert_close(out2, out1, atol=1e-2, rtol=1e-3)

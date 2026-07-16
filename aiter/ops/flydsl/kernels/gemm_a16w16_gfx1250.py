@@ -112,6 +112,10 @@ def compile_gemm_a16w16(
     loop_carried_load_percent: Optional[int] = None,
     kernarg_preload: bool = False,
     use_manual_barrier: bool = False,
+    split_k: int = 1,
+    sched_strategy: Optional[str] = None,
+    barrier_signal_wait_latency: Optional[int] = None,
+    main_loop_unroll: bool = False,
 ):
     """Compile the A16W16 GEMM kernel; returns launch_fn(y, x, w, bias, M, N, stream=stream)."""
     _ = (M, N)
@@ -120,6 +124,15 @@ def compile_gemm_a16w16(
         raise ValueError(f"num_buffers must be between 2 and 8, got {num_buffers}")
     if in_dtype not in ("fp16", "bf16"):
         raise ValueError(f"in_dtype must be 'fp16' or 'bf16', got {in_dtype!r}")
+    # Experimental LLVM scheduling levers (injected via llvm_options below).
+    if sched_strategy is not None and sched_strategy not in (
+        "max-ilp",
+        "max-memory-clause",
+    ):
+        raise ValueError(
+            "sched_strategy must be None, 'max-ilp', or 'max-memory-clause', "
+            f"got {sched_strategy!r}"
+        )
 
     effective_waves_per_eu = waves_per_eu
     is_f16 = in_dtype == "fp16"
@@ -138,6 +151,10 @@ def compile_gemm_a16w16(
 
     if K % tile_k != 0:
         raise ValueError(f"K must be divisible by tile_k={tile_k}, got K={K}")
+    if split_k < 1:
+        raise ValueError(f"split_k must be >= 1, got {split_k}")
+    if K % split_k != 0:
+        raise ValueError(f"K must be divisible by split_k={split_k}, got K={K}")
     if tile_k % WMMA_K != 0:
         raise ValueError(f"tile_k must be a multiple of {WMMA_K}, got {tile_k}")
     if tile_m % WMMA_M != 0:
@@ -177,7 +194,13 @@ def compile_gemm_a16w16(
     if warp_tile_n % WMMA_N != 0:
         raise ValueError(f"warp_tile_n={warp_tile_n} must be a multiple of {WMMA_N}")
 
-    num_k_tiles = K // tile_k
+    # split_k>1 splits K into split_k grid-z chunks; num_k_tiles is per-split.
+    split_k_chunk = K // split_k
+    if split_k_chunk % tile_k != 0:
+        raise ValueError(
+            f"K/split_k must be divisible by tile_k={tile_k}, got {split_k_chunk}"
+        )
+    num_k_tiles = split_k_chunk // tile_k
     if num_k_tiles < num_buffers - 1:
         raise ValueError(
             f"{num_buffers}-stage buffering requires num_k_tiles >= {num_buffers - 1}, "
@@ -219,9 +242,7 @@ def compile_gemm_a16w16(
     lds_b_data_bytes = lds_b_elems * elem_bytes
 
     # Unified LDS allocator: contiguous [A0..A_nb-1 | B0..B_nb-1] ring slots
-    unified_alloc = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="a16w16_unified"
-    )
+    unified_alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="a16w16_unified")
     unified_a_off = unified_alloc._align(unified_alloc.ptr, 16)
     unified_alloc.ptr = unified_a_off + num_buffers * lds_a_data_bytes
     unified_b_off = unified_alloc._align(unified_alloc.ptr, 16)
@@ -254,6 +275,10 @@ def compile_gemm_a16w16(
         by = gpu.block_id("y")
         blk_m = bx * arith.index(tile_m)
         blk_n = by * arith.index(tile_n)
+        # split_k>1: grid-z block picks the K-chunk origin (compile-time gated).
+        if const_expr(split_k > 1):
+            bz = gpu.block_id("z")
+            split_k_base = bz * arith.index(split_k_chunk)
 
         # Thread -> warp decomposition
         layout_thr = fx.make_layout(
@@ -374,8 +399,12 @@ def compile_gemm_a16w16(
         stages_b_mem = [p.get() for p in stages_b]
 
         # TDM descriptors built once at entry; lo32 advances per K-tile, LDS base per ring slot.
-        _desc_a_init = make_a_desc(arith.index(0), stages_a_mem[0])
-        _desc_b_init = make_b_desc(arith.index(0), stages_b_mem[0])
+        if const_expr(split_k > 1):
+            _desc_a_init = make_a_desc(split_k_base, stages_a_mem[0])
+            _desc_b_init = make_b_desc(split_k_base, stages_b_mem[0])
+        else:
+            _desc_a_init = make_a_desc(arith.index(0), stages_a_mem[0])
+            _desc_b_init = make_b_desc(arith.index(0), stages_b_mem[0])
         dgroup1_a = _desc_a_init.dgroup1
         dgroup1_w = _desc_b_init.dgroup1
         addr_hi_a = vector.extract(
@@ -639,7 +668,9 @@ def compile_gemm_a16w16(
             return accs
 
         def epilogue_stores(final_accs):
-            """Write accumulators to global output Y."""
+            """Write accumulators to Y (buffer_store, or atomic-fadd if split_k>1)."""
+            if const_expr(split_k > 1):
+                zero_i32 = fx.Int32(0)
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -652,28 +683,70 @@ def compile_gemm_a16w16(
                     )
 
                     if const_expr(_half_out):
-                        h_vec = arith.trunc_f(T.vec(8, _out_elem), final_accs[idx])
-                        i32_vec = vector.bitcast(T.vec(4, T.i32), h_vec)
-                        c_off_bytes = (row * n_stride + col_base) * arith.index(
-                            elem_bytes_d
-                        )
-                        buffer_ops.buffer_store(
-                            i32_vec, y_rsrc, c_off_bytes, offset_is_bytes=True
-                        )
-                    else:
-                        for half in range_constexpr(2):
-                            vals = [
-                                vector.extract(
-                                    final_accs[idx],
-                                    static_position=[half * 4 + vi],
+                        if const_expr(split_k > 1):
+                            h_vec = arith.trunc_f(T.vec(8, _out_elem), final_accs[idx])
+                            c_off_bytes = (row * n_stride + col_base) * arith.index(
+                                elem_bytes_d
+                            )
+                            pair_ty = T.vec(2, _out_elem)
+                            for pair in range_constexpr(4):
+                                e0 = vector.extract(
+                                    h_vec,
+                                    static_position=[pair * 2],
                                     dynamic_position=[],
                                 )
-                                for vi in range_constexpr(4)
-                            ]
-                            vec4 = vector.from_elements(T.vec(4, T.f32), vals)
-                            col = col_base + arith.index(half * 4)
-                            c_off = row * n_stride + col
-                            buffer_ops.buffer_store(vec4, y_rsrc, c_off)
+                                e1 = vector.extract(
+                                    h_vec,
+                                    static_position=[pair * 2 + 1],
+                                    dynamic_position=[],
+                                )
+                                pair_vec = vector.from_elements(pair_ty, [e0, e1])
+                                byte_off = arith.index_cast(
+                                    T.i32, c_off_bytes + arith.index(pair * 4)
+                                )
+                                rocdl.raw_ptr_buffer_atomic_fadd(
+                                    pair_vec, y_rsrc, byte_off, zero_i32, zero_i32
+                                )
+                        else:
+                            h_vec = arith.trunc_f(T.vec(8, _out_elem), final_accs[idx])
+                            i32_vec = vector.bitcast(T.vec(4, T.i32), h_vec)
+                            c_off_bytes = (row * n_stride + col_base) * arith.index(
+                                elem_bytes_d
+                            )
+                            buffer_ops.buffer_store(
+                                i32_vec, y_rsrc, c_off_bytes, offset_is_bytes=True
+                            )
+                    else:
+                        if const_expr(split_k > 1):
+                            for half in range_constexpr(2):
+                                base = row * n_stride + col_base + arith.index(half * 4)
+                                for vi in range_constexpr(4):
+                                    val = vector.extract(
+                                        final_accs[idx],
+                                        static_position=[half * 4 + vi],
+                                        dynamic_position=[],
+                                    )
+                                    byte_off = arith.index_cast(
+                                        T.i32,
+                                        (base + arith.index(vi)) * arith.index(4),
+                                    )
+                                    rocdl.raw_ptr_buffer_atomic_fadd(
+                                        val, y_rsrc, byte_off, zero_i32, zero_i32
+                                    )
+                        else:
+                            for half in range_constexpr(2):
+                                vals = [
+                                    vector.extract(
+                                        final_accs[idx],
+                                        static_position=[half * 4 + vi],
+                                        dynamic_position=[],
+                                    )
+                                    for vi in range_constexpr(4)
+                                ]
+                                vec4 = vector.from_elements(T.vec(4, T.f32), vals)
+                                col = col_base + arith.index(half * 4)
+                                c_off = row * n_stride + col
+                                buffer_ops.buffer_store(vec4, y_rsrc, c_off)
 
         # Accumulators
         acc_zero = arith.constant_vector(0.0, T.vec(8, T.f32))
@@ -727,13 +800,14 @@ def compile_gemm_a16w16(
             """Compute K-tile cidx from carried frags; if do_prefetch, load cidx+1 into a fresh bank."""
             load_buf_i32 = arith.remui(lidx, nb_const_i32)
 
-            # Wait at the TOP (above the TDM -> does not count this iter's refill).
-            tdm_ops.tensor_wait(max(0, num_buffers - 3) * _TDMS_PER_TILE)
-            # Refill LDS slot load_buf with the next-to-issue K-tile.
+            # Refill first, then wait: keeps NB-2 tiles' TDM in flight (depth-2).
             lo_a_, lo_w_ = issue_tdm_loads(load_buf_i32, lo_a_, lo_w_)
             if const_expr(num_buffers == 2):
-                # NB=2: drain the just-issued TDM to close the RAW hazard on the slot we refilled.
+                # NB=2: only 2 slots -> drain the just-issued TDM (RAW hazard).
                 tdm_ops.tensor_wait(0)
+            else:
+                tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
+
             # Single barrier: RAW wall for this tile's T+1 ds_reads and (across the backedge) WAR wall for the next refill.
             _wg_barrier()
 
@@ -750,80 +824,113 @@ def compile_gemm_a16w16(
             return accs_, nbank, lo_a_, lo_w_
 
         if const_expr(main_loop_iters > 0):
-            lo_a_s = lo_a
-            lo_w_s = lo_w
-            load_idx_s = load_idx_init
-            compute_idx_s = compute_idx_init
-            num_pairs = main_loop_iters // 2
+            if const_expr(main_loop_unroll):
+                # Unroll-by-2: 2 tiles/trip, ping-pong 2 register banks + odd leftover.
+                lo_a_s = lo_a
+                lo_w_s = lo_w
+                load_idx_s = load_idx_init
+                compute_idx_s = compute_idx_init
+                num_pairs = main_loop_iters // 2
 
-            if const_expr(num_pairs > 0):
+                if const_expr(num_pairs > 0):
+                    init_state = _pack_state(accs, cur_a, cur_b) + [
+                        lo_a_s,
+                        lo_w_s,
+                        load_idx_s,
+                        compute_idx_s,
+                    ]
+                    results = init_state
+                    for pair_step, state in range(0, num_pairs, 1, init=init_state):
+                        _disable_unroll_on_enclosing_loop()
+                        cidx = state[-1]
+                        lidx = state[-2]
+                        lw = state[-3]
+                        lx = state[-4]
+                        p_accs, b0a, b0b = _unpack_state(state[:-4])
+
+                        # sub-0: tile T from bank0, prefetch T+1 -> bank1.
+                        p_accs, bank1, lx, lw = _run_tile(
+                            p_accs, b0a, b0b, lx, lw, cidx, lidx, do_prefetch=True
+                        )
+                        b1a, b1b = bank1
+                        cidx1 = arith.addi(cidx, one_i32)
+                        lidx1 = arith.addi(lidx, one_i32)
+
+                        # sub-1: tile T+1 from bank1, prefetch T+2 -> bank0 (yielded).
+                        p_accs, bank0, lx, lw = _run_tile(
+                            p_accs, b1a, b1b, lx, lw, cidx1, lidx1, do_prefetch=True
+                        )
+                        nb0a, nb0b = bank0
+                        cidx2 = arith.addi(cidx1, one_i32)
+                        lidx2 = arith.addi(lidx1, one_i32)
+
+                        new_state = _pack_state(p_accs, nb0a, nb0b) + [
+                            lx,
+                            lw,
+                            lidx2,
+                            cidx2,
+                        ]
+                        results = yield new_state
+
+                    accs, cur_a, cur_b = _unpack_state(results[:-4])
+                    lo_a_s = results[-4]
+                    lo_w_s = results[-3]
+                    load_idx_s = results[-2]
+                    compute_idx_s = results[-1]
+                else:
+                    accs = list(accs)
+
+                # Leftover odd tile: compute the carried bank, prefetch first drain tile.
+                if const_expr(main_loop_iters % 2 == 1):
+                    accs, leftover_bank, lo_a_s, lo_w_s = _run_tile(
+                        accs,
+                        cur_a,
+                        cur_b,
+                        lo_a_s,
+                        lo_w_s,
+                        compute_idx_s,
+                        load_idx_s,
+                        do_prefetch=True,
+                    )
+                    cur_a, cur_b = leftover_bank
+                    compute_idx_s = arith.addi(compute_idx_s, one_i32)
+            else:
+                # Single tile/trip: compute T from carried bank, prefetch T+1.
                 init_state = _pack_state(accs, cur_a, cur_b) + [
-                    lo_a_s,
-                    lo_w_s,
-                    load_idx_s,
-                    compute_idx_s,
+                    lo_a,
+                    lo_w,
+                    load_idx_init,
+                    compute_idx_init,
                 ]
                 results = init_state
-                for pair_step, state in range(0, num_pairs, 1, init=init_state):
+                for step, state in range(0, main_loop_iters, 1, init=init_state):
                     _disable_unroll_on_enclosing_loop()
                     cidx = state[-1]
                     lidx = state[-2]
                     lw = state[-3]
                     lx = state[-4]
-                    p_accs, b0a, b0b = _unpack_state(state[:-4])
+                    p_accs, ca, cb = _unpack_state(state[:-4])
 
-                    # sub-0: tile T from bank0, prefetch T+1 -> bank1.
-                    p_accs, bank1, lx, lw = _run_tile(
-                        p_accs, b0a, b0b, lx, lw, cidx, lidx, do_prefetch=True
+                    # tile T from the carried bank, prefetch T+1 -> next bank (yielded).
+                    p_accs, bank, lx, lw = _run_tile(
+                        p_accs, ca, cb, lx, lw, cidx, lidx, do_prefetch=True
                     )
-                    b1a, b1b = bank1
+                    next_a, next_b = bank
                     cidx1 = arith.addi(cidx, one_i32)
                     lidx1 = arith.addi(lidx, one_i32)
 
-                    # sub-1: tile T+1 from bank1, prefetch T+2 -> bank0 (yielded).
-                    p_accs, bank0, lx, lw = _run_tile(
-                        p_accs, b1a, b1b, lx, lw, cidx1, lidx1, do_prefetch=True
-                    )
-                    nb0a, nb0b = bank0
-                    cidx2 = arith.addi(cidx1, one_i32)
-                    lidx2 = arith.addi(lidx1, one_i32)
-
-                    new_state = _pack_state(p_accs, nb0a, nb0b) + [
+                    new_state = _pack_state(p_accs, next_a, next_b) + [
                         lx,
                         lw,
-                        lidx2,
-                        cidx2,
+                        lidx1,
+                        cidx1,
                     ]
                     results = yield new_state
 
                 accs, cur_a, cur_b = _unpack_state(results[:-4])
-                lo_a_s = results[-4]
-                lo_w_s = results[-3]
-                load_idx_s = results[-2]
-                compute_idx_s = results[-1]
-            else:
-                accs = list(accs)
-
-            # Leftover odd tile: compute the carried bank and prefetch the first drain tile into the carry.
-            if const_expr(main_loop_iters % 2 == 1):
-                accs, leftover_bank, lo_a_s, lo_w_s = _run_tile(
-                    accs,
-                    cur_a,
-                    cur_b,
-                    lo_a_s,
-                    lo_w_s,
-                    compute_idx_s,
-                    load_idx_s,
-                    do_prefetch=True,
-                )
-                cur_a, cur_b = leftover_bank
-                compute_idx_s = arith.addi(compute_idx_s, one_i32)
-
-            final_compute_idx = compute_idx_s
         else:
             accs = list(accs)
             # No main loop ran — drain starts at compute_idx = 0.
-            final_compute_idx = arith.constant(0, type=T.i32)
 
         # ── Drain (fully unrolled): consume carried frags, prefetch next bank per tile; final tile does no wait/barrier/ds_load ──
         drain_count_d = (
@@ -881,6 +988,10 @@ def compile_gemm_a16w16(
         loop_carried_load_percent,
         kernarg_preload,
         use_manual_barrier,
+        split_k,
+        sched_strategy,
+        barrier_signal_wait_latency,
+        main_loop_unroll,
     )
 
     @flyc.jit
@@ -908,6 +1019,7 @@ def compile_gemm_a16w16(
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
         gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gz = split_k  # 1 at default -> grid tuple identical to original
 
         # Emit kernel
         launcher = kernel_gemm_a16w16(arg_y, arg_x, arg_w, arg_bias, i32_m, i32_n)
@@ -957,19 +1069,23 @@ def compile_gemm_a16w16(
                     op.attributes["arg_attrs"] = ir.ArrayAttr.get(per_arg)
 
         launcher.launch(
-            grid=(gx, gy, 1),
+            grid=(gx, gy, gz),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    # Backend scheduling hints: only cl::opts present in THIS LLVM are enabled; others raise "Unknown LLVM option" and stay commented.
-    launch_gemm_a16w16.compile_hints["llvm_options"] = {
+    # Backend cl::opt hints; only options present in THIS build are set.
+    _llvm_opts = {
         "amdgpu-expert-scheduling-mode": True,  # valid bool cl::opt (GFX12+ only)
-        # Not present in this LLVM; re-enable when built against a downstream LLVM that defines them:
-        # "amdgpu-anti-hints-for-va-vdst", "amdgpu-enable-static-simulator",
-        # "amdgpu-static-sim-inline", "amdgpu-block-carried-latency",
-        # "amdgpu-sched-strategy" ("coexec" is also unrecognized upstream)
     }
+    # Experimental scheduling levers (in-process LLVM); None => cl::init default.
+    if sched_strategy is not None:
+        # cl::opt<str>: max-ilp (GCNMaxILP) or max-memory-clause.
+        _llvm_opts["amdgpu-sched-strategy"] = sched_strategy
+    if barrier_signal_wait_latency is not None:
+        # cl::opt<unsigned> init(35): synthetic barrier signal->wait latency.
+        _llvm_opts["amdgpu-barrier-signal-wait-latency"] = barrier_signal_wait_latency
+    launch_gemm_a16w16.compile_hints["llvm_options"] = _llvm_opts
 
     return launch_gemm_a16w16
 
@@ -992,6 +1108,10 @@ def gemm_a16w16(
     kernarg_preload: bool = False,
     loop_carried_load_percent: Optional[int] = None,
     use_manual_barrier: bool = False,
+    split_k: int = 1,
+    sched_strategy: Optional[str] = None,
+    barrier_signal_wait_latency: Optional[int] = None,
+    main_loop_unroll: bool = False,
 ):
     """Compute Y = X @ W^T + bias. Auto-detects physical layout from strides."""
     assert x.dtype in (
@@ -1039,22 +1159,9 @@ def gemm_a16w16(
     # N-pad up to a tile_n multiple
     N_stride = ((N + tile_n - 1) // tile_n) * tile_n
 
-    # Output allocation
-    if y is not None:
-        y_buf = (
-            y
-            if N_stride == N
-            else torch.empty((M, N_stride), device=x.device, dtype=dtype)
-        )
-    else:
-        y_buf = (
-            torch.empty((M, N_stride), device=x.device, dtype=dtype)
-            if N_stride != N
-            else torch.empty((M, N), device=x.device, dtype=dtype)
-        )
-
-    if bias is None:
-        bias = torch.empty(0, device=x.device, dtype=dtype)
+    # split_k>1 half-out: accumulate in fp32 workspace, cast at end (bf16 atomic lossy).
+    _half_dtype = dtype in (torch.float16, torch.bfloat16)
+    _splitk_f32_accum = split_k > 1 and _half_dtype
 
     in_dtype_str = "fp16" if x.dtype == torch.float16 else "bf16"
     if dtype == torch.float16:
@@ -1063,6 +1170,30 @@ def gemm_a16w16(
         out_dtype_str = "bf16"
     else:
         out_dtype_str = "f32"
+    buf_dtype = dtype
+    if _splitk_f32_accum:
+        out_dtype_str = "f32"  # kernel accumulates fp32 partials
+        buf_dtype = torch.float32  # fp32 workspace, cast to `dtype` after launch
+
+    # split_k>1 atomic-fadd needs a zeroed buffer; fp32-accum uses a fresh workspace.
+    _alloc = torch.zeros if split_k > 1 else torch.empty
+    if y is not None and not _splitk_f32_accum:
+        y_buf = (
+            y
+            if N_stride == N
+            else _alloc((M, N_stride), device=x.device, dtype=buf_dtype)
+        )
+        if split_k > 1 and y_buf is y:
+            y_buf.zero_()
+    else:
+        y_buf = (
+            _alloc((M, N_stride), device=x.device, dtype=buf_dtype)
+            if N_stride != N
+            else _alloc((M, N), device=x.device, dtype=buf_dtype)
+        )
+
+    if bias is None:
+        bias = torch.empty(0, device=x.device, dtype=dtype)
 
     launch_fn = compile_gemm_a16w16(
         M=M if not physical_mk else 0,
@@ -1085,9 +1216,21 @@ def gemm_a16w16(
         kernarg_preload=kernarg_preload,
         loop_carried_load_percent=loop_carried_load_percent,
         use_manual_barrier=use_manual_barrier,
+        split_k=split_k,
+        sched_strategy=sched_strategy,
+        barrier_signal_wait_latency=barrier_signal_wait_latency,
+        main_loop_unroll=main_loop_unroll,
     )
 
     launch_fn(y_buf, x, w, bias, M, N_stride, stream=torch.cuda.current_stream())
+
+    if _splitk_f32_accum:
+        # Cast the fp32 accumulation workspace back to the requested half dtype.
+        result = (y_buf[:, :N] if N_stride != N else y_buf).to(dtype)
+        if y is not None:
+            y.copy_(result)
+            return y
+        return result
 
     if N_stride != N:
         result = y_buf[:, :N]
