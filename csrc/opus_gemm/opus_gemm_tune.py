@@ -2022,11 +2022,26 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                                 f"for fp8 row (a8w8_noscale does not support bias)"
                             )
                         continue
-                    if out_dtype is not dtypes.fp32:
+                    _OUT_TORCH_TO_CTYPE = {
+                        dtypes.bf16: "bf16_t",
+                        dtypes.fp32: "fp32_t",
+                    }
+                    _need = _OUT_TORCH_TO_CTYPE.get(out_dtype)
+                    if _need is None:
                         if forced_kids is not None and kid in forced_kids:
                             logger.warning(
                                 f"OpusGemmA16W16Tuner: --kid {kid} rejected "
-                                f"for fp8 row (a8w8_noscale requires outdtype=fp32)"
+                                f"for fp8 row (a8w8_noscale supports outdtype "
+                                f"in {{bf16, fp32}}, got {outdtype_str})"
+                            )
+                        continue
+                    if _need not in getattr(k_inst, "output_dtypes", []):
+                        if forced_kids is not None and kid in forced_kids:
+                            logger.warning(
+                                f"OpusGemmA16W16Tuner: --kid {kid} rejected "
+                                f"for fp8 row (kernel output_dtypes="
+                                f"{getattr(k_inst, 'output_dtypes', [])} does not "
+                                f"include required {_need})"
                             )
                         continue
                     splitK_range = [0]

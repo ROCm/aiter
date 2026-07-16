@@ -152,9 +152,19 @@ void opus_gemm(
     }
     else
     {
-      AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
-                  "opus_gemm a8w8 no-scale only supports fp32 output");
-      opus_dispatch_a8w8<fp32_t>(M, N, K)(XQ, WQ, Y);
+      if (Y.dtype() == AITER_DTYPE_bf16)
+      {
+        opus_dispatch_a8w8<bf16_t>(M, N, K)(XQ, WQ, Y);
+      }
+      else if (Y.dtype() == AITER_DTYPE_fp32)
+      {
+        opus_dispatch_a8w8<fp32_t>(M, N, K)(XQ, WQ, Y);
+      }
+      else
+      {
+        AITER_CHECK(false,
+                    "opus_gemm a8w8 no-scale: unsupported output dtype, expected bf16 or fp32");
+      }
     }
   }
   else if (XQ.dtype() == AITER_DTYPE_bf16)

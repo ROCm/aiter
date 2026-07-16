@@ -243,6 +243,7 @@ a8w8_scale_kernels_list = {
 
 a8w8_noscale_kernels_list = {
     2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8_noscale", ["fp32_t"]),
+    10: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8_noscale", ["bf16_t"]),
 }
 
 # Backward-compatible alias: legacy codegen paths and filters historically
