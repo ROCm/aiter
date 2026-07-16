@@ -25,14 +25,14 @@ Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
     ENABLE_CK=0 AITER_FORCE_A8W4=1 AITER_USE_GROUPED_GEMM=1 AITER_BF16_FP8_MOE_BOUND=0 \
-    MORI_ROOT=/app/mori \
     torchrun --standalone --nproc_per_node=4 test_mega_moe.py \
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
+    # cco v2 op-layer is vendored in aiter; only an installed mori (mori.cco) is
+    # required. Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip JIT.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -m -hd -id -e -k --shared_E -q
 """
 import os
-import sys
 import argparse
 
 import torch
@@ -62,10 +62,6 @@ os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
-# mori v2 (dispatch_combine_v2) lives outside the aiter tree; import by top-level
-# module name after inserting its dir on sys.path. MORI_ROOT is the mori checkout.
-MORI_ROOT = os.environ.get("MORI_ROOT", "/home/yashao/mori")
-
 _FP8_DTYPE = dtypes.fp8
 QUANT_KEYS = ["No", "per_Token", "per_128x128", "a8w4_mxfp4", "a4w4_mxfp4"]
 _MXFP4_KEYS = ("a8w4_mxfp4", "a4w4_mxfp4")
@@ -73,14 +69,25 @@ _FP8_KEYS = ("per_Token", "per_128x128")
 
 
 def _import_mori_v2():
-    """Import the mori v2 op-layer. The dispatch_combine_v2 op module is not yet
-    exported as a package API, so its dir is put on sys.path and imported by
-    top-level name. cco itself comes from the installed ``mori`` package."""
-    sys.path.insert(
-        0, os.path.join(MORI_ROOT, "python", "mori", "ops", "dispatch_combine_v2")
-    )
+    """Import the vendored cco v2 op-layer (compiles FlyDSL on first use).
+
+    The dispatch/combine op + kernels are vendored into aiter
+    (aiter.ops.flydsl.dispatch_combine_v2). Only the cco communication substrate
+    (mori.cco.Communicator + libmori_cco*.{so,bc}) stays an installed-mori dep.
+    set_device / sync are inlined here on torch (they were trivial hip wrappers).
+    """
     from mori.cco import Communicator
-    from dispatch_combine_op import EpDispatchCombineConfig, EpDispatchCombineOp
+    from aiter.ops.flydsl.dispatch_combine_v2 import (
+        EpDispatchCombineConfig,
+        EpDispatchCombineOp,
+    )
+
+    def set_device(rank: int) -> None:
+        gpu = int(os.environ.get("CCO_GPU", rank % torch.cuda.device_count()))
+        torch.cuda.set_device(gpu)
+
+    def sync() -> None:
+        torch.cuda.synchronize()
 
     return Communicator, EpDispatchCombineConfig, EpDispatchCombineOp
 
