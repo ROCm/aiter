@@ -1206,8 +1206,6 @@ SPLITK_KIDS = (
     | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
     | frozenset(a16w16_uniform_kernels_list.keys())
     | frozenset(a16w16_uniform_kernels_list_nooob.keys())
-    | frozenset(a16w16_bhsd_splitk_kernels_list.keys())
-    | frozenset(a16w16_bhsd_splitk_kernels_list_nooob.keys())
     | frozenset(gfx942_splitk_kernels_list.keys())
     | frozenset(gfx1250_kernels_list.keys())
     | frozenset(gfx1250_clusterlaunch_kernels_list.keys())
@@ -1285,13 +1283,6 @@ HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
         1302,  # persistent (256, 128, 64)
         303,
         1303,  # persistent (128, 128, 64)
-        # BHSD-fused batch GEMM default (batch_gemm_a16w16_bhsd/bshd_opus use
-        # kid=608). Force-compiled so the fused MLA output-projection path
-        # works out of the box without a tuned CSV; +1000 nooob mirror.
-        608,
-        1608,  # bhsd_splitk (64, 64, 128) WG=1
-        650,
-        1650,  # bhsd (non-splitk) 256x128x256x32 WG=2 -- smallest bhsd tile
         # interleaved-schedule prototype (a16w16_interleave, ?Phase 1).
         40,
         1040,
