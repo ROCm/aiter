@@ -50,9 +50,11 @@ from aiter.ops.flydsl.kernels.pipeline_utils import (
     tdm_epilogue_fence_threshold_bytes,
 )
 from aiter.ops.flydsl.kernels.quant_utils import (
+    emit_cvt_pk8_fp8_f32,
     emit_f32_to_e2m1,
     emit_mx_e8m0_scale,
 )
+from aiter.utility.mx_types import MxDtypeInt as _MxDtype
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -249,9 +251,9 @@ def compile_mxscale_gemm(
         None if stage1_quant_out in (None, "", "none") else str(stage1_quant_out)
     )
     if stage1_quant_out_mode is not None:
-        if stage1_quant_out_mode != "fp4":
+        if stage1_quant_out_mode not in ("fp4", "fp8"):
             raise ValueError(
-                f"stage1_quant_out currently supports only 'fp4', got "
+                f"stage1_quant_out supports 'fp4' or 'fp8', got "
                 f"{stage1_quant_out!r}"
             )
         if stage1_act_mode is None or stage1_weight_layout_mode not in (
@@ -348,13 +350,14 @@ def compile_mxscale_gemm(
     B_TOTAL_N = N if stage1_act_interleave else (N * 2 if stage1_dual_b else N)
     C_N = N // 2 if stage1_act_interleave else N
 
-    # Fused stage1 quant epilogue geometry (MXFP4 payload + preshuffled e8m0).
-    # feat_dim = C_N (== inter_dim), quantized in 32-elem MX blocks along the
-    # output feature dim (gemm2's K). The scale-preshuffle tile geometry keys on
-    # gemm2's warp_tile_m (stage1_quant_wmma_rep = gemm2.warp_tile_m // 16), NOT
-    # on this GEMM's own tiling.
+    # Fused stage1 quant epilogue geometry (MXFP4/MXFP8 payload + preshuffled
+    # e8m0). feat_dim = C_N (== inter_dim), quantized in 32-elem MX blocks along
+    # the output feature dim (gemm2's K). The scale-preshuffle tile geometry keys
+    # on gemm2's warp_tile_m (stage1_quant_wmma_rep = gemm2.warp_tile_m // 16),
+    # NOT on this GEMM's own tiling.
+    _q_is_fp8 = stage1_quant_out_mode == "fp8"
     if stage1_quant_out_mode is not None:
-        # The GEMM's stage1 output (bf16 tensor_store) is replaced by MXFP4
+        # The GEMM's stage1 output (bf16 tensor_store) is replaced by quantised
         # payload + scale buffer_stores, so the LDS D-tile TDM store path is off.
         use_tdm_store = False
         if C_N % 32 != 0:
@@ -372,7 +375,8 @@ def compile_mxscale_gemm(
         _q_wmma_rep = int(stage1_quant_wmma_rep)
         _q_rows_per_tile = _q_wmma_rep * 16
         _q_dst_scale_dwords_per_row = _q_scale_dwords_per_row * _q_wmma_rep
-        _q_payload_bytes_per_row = _q_feat_dim // 2
+        # fp4: 2 elems per byte; fp8: 1 elem per byte
+        _q_payload_bytes_per_row = _q_feat_dim if _q_is_fp8 else _q_feat_dim // 2
 
     if K % tile_k != 0:
         raise ValueError(f"K must be divisible by tile_k={tile_k}, got K={K}")
@@ -409,8 +413,8 @@ def compile_mxscale_gemm(
         # number of 32-col output MX blocks. gugu de-interleaves (output cols =
         # raw//2) so needs warp_tile_n%64==0; gguu keeps output cols == raw so
         # needs warp_tile_n%32==0.
-        if not is_fp4:
-            raise ValueError("stage1_quant_out requires data_format='fp4'")
+        if not (is_fp4 or is_a8w4):
+            raise ValueError("stage1_quant_out requires data_format='fp4' or 'a8w4'")
         _q_warp_align = 32 if stage1_dual_b else 64
         if warp_tile_n % _q_warp_align != 0:
             raise ValueError(
@@ -2055,10 +2059,10 @@ def compile_mxscale_gemm(
                         scf.YieldOp([])
 
             def _emit_stage1_quant_blocks(entries):
-                # Shared MXFP4 quant + scale-preshuffle store for the fused stage1
-                # output, folding moe_fused_quant_preshuffle into the epilogue.
-                # `entries` is a list of (m_off, mx_block_i32, chunks) where each
-                # chunk is (out_col_base_i32, [f32 vals]) of consecutive de-quant
+                # Shared MXFP4/MXFP8 quant + scale-preshuffle store for the fused
+                # stage1 output, folding moe_fused_quant_preshuffle into the
+                # epilogue. `entries` is a list of (m_off, mx_block_i32, chunks)
+                # where each chunk is (out_col_base_i32, [f32 vals]) of consecutive
                 # output columns (even length). Both the gugu (interleaved) and
                 # gguu (dual-B) front-ends feed this: a warp owns whole 32-col MX
                 # block(s), each block split as 16 cols/lane over the lane_kgrp
@@ -2083,7 +2087,7 @@ def compile_mxscale_gemm(
 
                     # Match the non-fused path (activated output is written to the
                     # bf16/f16 intermediate, then quantized): round each activated
-                    # value to the output element type before amax + fp4 cast so
+                    # value to the output element type before amax + quant cast so
                     # the fused epilogue is bit-consistent with gemm1(bf16) +
                     # standalone quant. Skips only when out_dtype is f32.
                     if const_expr(_bf16_out):
@@ -2112,39 +2116,65 @@ def compile_mxscale_gemm(
                         c16_i32, arith.constant(WAVE_SIZE, type=T.i32)
                     )
                     block_amax = arith.maxnumf(block_amax, peer)
-                    e8m0 = emit_mx_e8m0_scale(block_amax)
+                    _e8m0_dtype = _MxDtype.FP8_E4M3 if _q_is_fp8 else _MxDtype.FP4_E2M1
+                    e8m0 = emit_mx_e8m0_scale(block_amax, dtype=_e8m0_dtype)
                     recip = ((c254_i32 - e8m0) << c23_i32).bitcast(T.f32)
                     e8m0_byte = arith.trunci(T.i8, e8m0)
 
-                    # Pack each chunk's consecutive cols into fp4x2 bytes.
                     payload_writes = []
-                    for out_col_base, vals in chunks:
-                        nibs = [emit_f32_to_e2m1(v * recip) for v in vals]
-                        nbytes = len(vals) // 2
-                        byte_vals = [
-                            nibs[2 * k] | (nibs[2 * k + 1] << c4_i32)
-                            for k in range(nbytes)
-                        ]
-                        packed = functools.reduce(
-                            lambda acc, k: acc
-                            | (byte_vals[k] << arith.constant(8 * k, type=T.i32)),
-                            range(1, nbytes),
-                            byte_vals[0],
-                        )
-                        if const_expr(nbytes == 1):
-                            store_val = arith.trunci(T.i8, packed)
-                        elif const_expr(nbytes == 2):
-                            store_val = arith.trunci(T.i16, packed)
-                        else:
-                            store_val = packed  # i32 (nbytes == 4)
-                        # payload byte offset within row = out_col_base // 2.
-                        chunk_byte = out_col_base >> arith.constant(1, type=T.i32)
-                        payload_byte_off = (
-                            row_i32
-                            * arith.constant(_q_payload_bytes_per_row, type=T.i32)
-                            + chunk_byte
-                        )
-                        payload_writes.append((payload_byte_off, store_val))
+                    if const_expr(_q_is_fp8):
+                        # Pack each chunk's 8 f32 cols into 8 fp8 e4m3
+                        # bytes. Same f32*recip approach as the fp4 path
+                        # so the conversion stays in f32 without a bf16
+                        # round-trip.
+                        for out_col_base, vals in chunks:
+                            nvals = len(vals)
+                            assert (
+                                nvals == 8
+                            ), f"fp8 pk8 quant expects 8-elem chunks, got {nvals}"
+                            store_val = emit_cvt_pk8_fp8_f32(
+                                vals,
+                                recip,
+                                rocdl=rocdl,
+                                vector=vector,
+                                T=T,
+                            )
+                            payload_byte_off = (
+                                row_i32
+                                * arith.constant(_q_payload_bytes_per_row, type=T.i32)
+                                + out_col_base
+                            )
+                            payload_writes.append((payload_byte_off, store_val))
+                    else:
+                        # Pack each chunk's consecutive cols into fp4x2 bytes.
+                        for out_col_base, vals in chunks:
+                            nibs = [emit_f32_to_e2m1(v * recip) for v in vals]
+                            nbytes = len(vals) // 2
+                            byte_vals = [
+                                nibs[2 * k] | (nibs[2 * k + 1] << c4_i32)
+                                for k in range(nbytes)
+                            ]
+                            packed = functools.reduce(
+                                lambda acc, k: acc
+                                | (byte_vals[k] << arith.constant(8 * k, type=T.i32)),
+                                range(1, nbytes),
+                                byte_vals[0],
+                            )
+                            store_val = None
+                            if const_expr(nbytes == 1):
+                                store_val = arith.trunci(T.i8, packed)
+                            elif const_expr(nbytes == 2):
+                                store_val = arith.trunci(T.i16, packed)
+                            else:
+                                store_val = packed  # i32 (nbytes == 4)
+                            # payload byte offset within row = out_col_base // 2.
+                            chunk_byte = out_col_base >> arith.constant(1, type=T.i32)
+                            payload_byte_off = (
+                                row_i32
+                                * arith.constant(_q_payload_bytes_per_row, type=T.i32)
+                                + chunk_byte
+                            )
+                            payload_writes.append((payload_byte_off, store_val))
 
                     # Preshuffled e8m0 scale destination (mirrors the standalone
                     # moe_fused_quant_preshuffle geometry).

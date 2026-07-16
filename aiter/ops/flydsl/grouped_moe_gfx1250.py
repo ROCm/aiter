@@ -792,19 +792,19 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if _bias1_arg is not None and _bias1_arg.dtype != dtype:
         _bias1_arg = _bias1_arg.to(dtype)
 
-    # Fuse gemm1's output MXFP4 quant + scale-preshuffle into the GEMM epilogue
+    # Fuse gemm1's output quant + scale-preshuffle into the GEMM epilogue
     # (folds the standalone moe_fused_quant_preshuffle kernel). Enabled by default
-    # for the eligible fp4 gugu (interleaved) / gguu (dual-B) paths; opt out with
-    # AITER_FLYDSL_FUSE_GEMM1_QUANT=0. The scale is laid out for gemm2's A-scale
-    # (wmma_rep = warp_tile_m2 // 16). gugu de-interleaves output cols (needs
-    # warp_tile_n%64==0); gguu keeps them (needs warp_tile_n%32==0).
+    # for the eligible fp4/a8w4 gugu (interleaved) / gguu (dual-B) paths; opt out
+    # with AITER_FLYDSL_FUSE_GEMM1_QUANT=0. The scale is laid out for gemm2's
+    # A-scale (wmma_rep = warp_tile_m2 // 16). gugu de-interleaves output cols
+    # (needs warp_tile_n%64==0); gguu keeps them (needs warp_tile_n%32==0).
     _wr2 = warp_tile_m2 // 16
     _q_warp_align = 32 if stage1_weight_layout == "gguu" else 64
     _fuse_gemm1_quant = (
         os.environ.get("AITER_FLYDSL_FUSE_GEMM1_QUANT", "1")
         not in ("", "0", "false", "False")
         and (not _use_naive)
-        and data_format == "fp4"
+        and data_format in ("fp4", "a8w4")
         and stage1_weight_layout in ("gugu", "gguu")
         and int(split_k1) == 1
         and (tile_n // n_warp) % _q_warp_align == 0
@@ -813,8 +813,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     if _fuse_gemm1_quant:
         grouped_a2 = None
+        # fp4: 2 elems per byte (inter_dim // 2); fp8/a8w4: 1 byte per elem
+        _a2_payload_last = inter_dim // 2 if data_format == "fp4" else inter_dim
         grouped_a2_payload = torch.empty(
-            (route_E, route_max_m, inter_dim // 2), dtype=torch.uint8, device=device
+            (route_E, route_max_m, _a2_payload_last), dtype=torch.uint8, device=device
         )
         grouped_a2_scale = torch.empty(
             (route_E, route_max_m // _wr2, (inter_dim // 32) * _wr2),
@@ -857,7 +859,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         ),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
         **(
-            {"stage1_quant_out": "fp4", "stage1_quant_wmma_rep": _wr2}
+            {
+                "stage1_quant_out": "fp8" if data_format == "a8w4" else "fp4",
+                "stage1_quant_wmma_rep": _wr2,
+            }
             if _fuse_gemm1_quant
             else {}
         ),
