@@ -22,7 +22,7 @@ on:
         description: "DeepSeek-V4-Pro-FP8 path visible on the Spur compute nodes"
         required: false
         type: string
-        default: "/data/models2/DeepSeek-V4-Pro-FP8"
+        default: "/it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8"
       shared_workspace_root:
         description: "Shared workspace root visible from the Spur submit and compute nodes"
         required: false
@@ -72,7 +72,7 @@ env:
   SGLANG_REPOSITORY: sgl-project/sglang
   SGLANG_REF_DEFAULT: main
   IMAGE_OVERRIDE_DEFAULT: "lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715"
-  MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
+  MODEL_PATH_DEFAULT: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
   SGLANG_SPUR_IB_DEVICES: ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
