@@ -158,7 +158,7 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
         'bash "\\$CIDIR/install_checkout_sglang.sh"\n',
         'bash "\\$CIDIR/install_checkout_sglang.sh"\n'
         'bash "\\$CIDIR/install_checkout_aiter.sh"\n'
-        'export PYTHONPATH=/tmp/aiter-under-test-runtime:${PYTHONPATH:-}\n',
+        "export PYTHONPATH=/tmp/aiter-under-test-runtime:\\${PYTHONPATH:-}\n",
         min_count=2,
     )
     text = replace_once(
@@ -166,7 +166,7 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
         "    bash \\$CIDIR/install_checkout_sglang.sh\n",
         "    bash \\$CIDIR/install_checkout_sglang.sh\n"
         "    bash \\$CIDIR/install_checkout_aiter.sh\n"
-        "    export PYTHONPATH=/tmp/aiter-under-test-runtime:${PYTHONPATH:-}\n",
+        "    export PYTHONPATH=/tmp/aiter-under-test-runtime:\\${PYTHONPATH:-}\n",
     )
     text = replace_all(
         text,
@@ -393,6 +393,7 @@ cat > "$SBATCH_SCRIPT" <<EOF
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --output=/tmp/spur-%j.out
 #SBATCH --error=/tmp/spur-%j.err
+#SBATCH --chdir=/tmp
 $SBATCH_PARTITION_LINE
 $SBATCH_NODE_LINE
 $SBATCH_EXCLUSIVE_LINE
