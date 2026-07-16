@@ -48,6 +48,7 @@ import functools
 
 from aiter.ops.flydsl.moe_common import (
     GateMode,
+    xcd_swizzle_workgroup_id,
 )  # noqa: F401  re-exported for back-compat
 
 
@@ -551,8 +552,15 @@ def compile_mixed_moe_gemm1(
                 _num_wgs = _gx * _gy
 
                 _c_xcds = arith.constant(_NUM_XCDS_S1, index=True)
-                _wgs_per_xcd = _num_wgs / _c_xcds
-                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+                _wgid = xcd_swizzle_workgroup_id(
+                    _linear_id,
+                    _num_wgs,
+                    _c_xcds,
+                    divide=lambda lhs, rhs: lhs / rhs,
+                    minimum=lambda lhs, rhs: arith.select(
+                        arith.cmpi(CmpIPredicate.ult, lhs, rhs), lhs, rhs
+                    ),
+                )
 
                 _WGM_S1 = xcd_swizzle
                 _c_wgm = arith.constant(_WGM_S1, index=True)
@@ -3250,8 +3258,15 @@ def compile_mixed_moe_gemm2(
                 _num_wgs = _gx * _gy
 
                 _c_xcds = arith.constant(_NUM_XCDS_S, index=True)
-                _wgs_per_xcd = _num_wgs / _c_xcds
-                _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+                _wgid = xcd_swizzle_workgroup_id(
+                    _linear_id,
+                    _num_wgs,
+                    _c_xcds,
+                    divide=lambda lhs, rhs: lhs / rhs,
+                    minimum=lambda lhs, rhs: arith.select(
+                        arith.cmpi(CmpIPredicate.ult, lhs, rhs), lhs, rhs
+                    ),
+                )
 
                 _WGM_S = xcd_swizzle
                 _c_wgm = arith.constant(_WGM_S, index=True)
