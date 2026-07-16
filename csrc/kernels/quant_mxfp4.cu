@@ -38,13 +38,17 @@ __device__ __forceinline__ uint32_t cvt_fp4_pk(uint32_t src, uint32_t pair, floa
 __device__ __forceinline__ uint8_t even_round_e2m1(float val) {
     float a = fabsf(val);
     uint8_t mag;
-    if      (a >= 5.0f)  mag = 7;
+    // Round-to-nearest-even: at an exact midpoint, round to the value whose
+    // E2M1 mantissa bit is 0. Midpoints where the larger neighbor is odd
+    // (5.0, 2.5, 1.25, 0.25) use strict '>' so the tie rounds down to even;
+    // midpoints where the larger neighbor is even (3.5, 1.75, 0.75) use '>='.
+    if      (a >  5.0f)  mag = 7;
     else if (a >= 3.5f)  mag = 6;
-    else if (a >= 2.5f)  mag = 5;
+    else if (a >  2.5f)  mag = 5;
     else if (a >= 1.75f) mag = 4;
-    else if (a >= 1.25f) mag = 3;
+    else if (a >  1.25f) mag = 3;
     else if (a >= 0.75f) mag = 2;
-    else if (a >= 0.25f) mag = 1;
+    else if (a >  0.25f) mag = 1;
     else                 mag = 0;
     uint8_t sign_bit = (val < 0.0f) ? 8u : 0u;
     return sign_bit | mag;
