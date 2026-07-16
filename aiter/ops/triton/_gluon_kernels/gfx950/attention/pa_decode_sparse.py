@@ -785,10 +785,15 @@ def _pa_decode_sparse(
             mask=head_mask_pv[:, None],
         )
     else:
-        # store un-normalized partials for the reduce kernel
+        # store un-normalized partials for the reduce kernel. m is stored in the
+        # base-2 exponent domain (row-max * softmax_scale * log2e) so the reduce/
+        # skip_reduce partials match the triton convention.
         pm_base = query_idx * pm_stride0 + split_id * pm_stride_s
         gl.amd.cdna4.buffer_store(
-            m_pv, ptr=part_m_ptr + pm_base, offsets=h_pv.to(gl.int32), mask=head_mask_pv
+            m_pv * (scale * RCP_LN2),
+            ptr=part_m_ptr + pm_base,
+            offsets=h_pv.to(gl.int32),
+            mask=head_mask_pv,
         )
         gl.amd.cdna4.buffer_store(
             l_pv, ptr=part_l_ptr + pm_base, offsets=h_pv.to(gl.int32), mask=head_mask_pv
@@ -822,15 +827,16 @@ def _pa_decode_sparse_reduce(
     pa_stride_s: gl.constexpr,
     pa_stride_h: gl.constexpr,
     num_heads: gl.constexpr,
-    scale,
     HAS_SINK: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
 ):
-    """Split-KV combine: merge the per-split partials, fold the attn sink, and
-    write the final output. Grid: (num_queries, heads_blocks)."""
+    """Split-KV combine: merge the per-split partials, fold the attn sink, and write
+    the final output. Partials store m in the base-2 exponent domain (row-max *
+    softmax_scale * log2e), matching the triton reduce. Grid: (num_queries, heads_blocks).
+    """
     NUM_WARPS: gl.constexpr = gl.num_warps()
     RCP_LN2: gl.constexpr = 1.4426950408889634
     query_idx = gl.program_id(0)
@@ -858,12 +864,12 @@ def _pa_decode_sparse_reduce(
         m_s = gl.amd.cdna4.buffer_load(
             ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf
         )
-        m_final = gl.maximum(m_final, m_s * scale)
+        m_final = gl.maximum(m_final, m_s)  # m_s already in base-2 exponent domain
     if HAS_SINK:
         sink = gl.amd.cdna4.buffer_load(
             ptr=attn_sink_ptr, offsets=h, mask=head_mask, other=neg_inf
         ).to(gl.float32)
-        m_final = gl.maximum(m_final, sink)
+        m_final = gl.maximum(m_final, sink * RCP_LN2)  # lift sink to base-2
 
     # pass 2: weighted sums
     l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)
@@ -876,7 +882,7 @@ def _pa_decode_sparse_reduce(
         l_s = gl.amd.cdna4.buffer_load(
             ptr=part_l_ptr + base, offsets=h, mask=head_mask, other=0.0
         )
-        w = gl.exp2((m_s * scale - m_final) * RCP_LN2)
+        w = gl.exp2(m_s - m_final)
         l_final = l_final + w * l_s
         a_base = query_idx * pa_stride0 + s * pa_stride_s
         a_off = (a_base + h[:, None] * pa_stride_h + offs_d[None, :]).to(gl.int32)
@@ -889,7 +895,7 @@ def _pa_decode_sparse_reduce(
         sink = gl.amd.cdna4.buffer_load(
             ptr=attn_sink_ptr, offsets=h, mask=head_mask, other=neg_inf
         ).to(gl.float32)
-        l_final = l_final + gl.exp2((sink - m_final) * RCP_LN2)
+        l_final = l_final + gl.exp2(sink * RCP_LN2 - m_final)
 
     out = acc / l_final[:, None]
     o_off = (query_idx * out_stride0 + h[:, None] * out_stride1 + offs_d[None, :]).to(
