@@ -174,6 +174,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     WU_CONTIGUOUS: bool = True,
     STATE_DTYPE_BF16: bool = False,
     G_IS_LOG2_SCALED: bool = False,
+    USE_STATE_INDICES: bool = False,
 ):
     """Compile the GDN K5 kernel.
 
@@ -266,7 +267,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
     _K5_KERNEL_REVISION = (
-        118  # u/g prefetch before GEMM1 (full MFMA chain hides HBM latency)
+        119  # +state_indices slot (indexed state-pool gather / in-place write-back)
     )
 
     GPU_ARCH = get_rocm_arch()
@@ -364,6 +365,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         ht_tensor: fx.Pointer,
         cu_seqlens_tensor: fx.Pointer,
         chunk_offsets_tensor: fx.Pointer,
+        state_indices_tensor: fx.Pointer,
         T_val: fx.Int32,
         T_flat: fx.Int32,
         N_val: fx.Int32,
@@ -372,6 +374,18 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         i_nh = fx.block_idx.y
         i_n = i_nh // fx.Int32(H)
         i_h = i_nh % fx.Int32(H)
+
+        # Indexed state-pool gather: when USE_STATE_INDICES, the SSM state slot
+        # for sequence ``i_n`` is ``state_indices[i_n]`` (addressing a pool
+        # ``[pool_size, H, V, K]``) rather than ``i_n`` itself (dense
+        # ``[N, H, V, K]``). Only h0 (read) and ht (in-place write-back) use this
+        # slot; the per-chunk h snapshot stays dense (i_n-indexed).
+        if const_expr(USE_STATE_INDICES):
+            si_ = GTensor(state_indices_tensor, dtype=T.i32, shape=(-1,))
+            state_n = si_[fx.Index(i_n)]
+        else:
+            state_n = i_n
+        state_nh = state_n * fx.Int32(H) + i_h
 
         tid = fx.thread_idx.x
         wid = tid // fx.Int32(WARP_SIZE)
@@ -555,9 +569,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             vn_base = ((i_n * fx.Int32(H) + i_h) * T_flat) * fx.Int32(V)
 
         if const_expr(USE_INITIAL_STATE):
-            h0_base = i_nh * fx.Int32(V * K)
+            h0_base = state_nh * fx.Int32(V * K)
         if const_expr(STORE_FINAL_STATE):
-            ht_base = i_nh * fx.Int32(V * K)
+            ht_base = state_nh * fx.Int32(V * K)
 
         # -- MFMA lane mapping for 16x16 tiles --
         lane_n = lane % fx.Int32(16)
@@ -1104,6 +1118,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         ht_tensor: fx.Pointer,
         cu_seqlens_tensor: fx.Pointer,
         chunk_offsets_tensor: fx.Pointer,
+        state_indices_tensor: fx.Pointer,
         T_val: fx.Int32,
         T_flat: fx.Int32,
         N_val: fx.Int32,
@@ -1128,6 +1143,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             ht_tensor,
             cu_seqlens_tensor,
             chunk_offsets_tensor,
+            state_indices_tensor,
             T_val,
             T_flat,
             N_val,

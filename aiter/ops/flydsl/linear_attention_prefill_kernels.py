@@ -749,11 +749,17 @@ def _get_or_compile_mfma16_hip(
     wu_contig,
     state_bf16=False,
     g_log2_scaled=False,
+    use_state_indices=False,
 ):
     """Compile (and cache) the mfma16 / HIP-aligned K5 kernel (formerly the "vk"
     fork): 16x16x16 bf16 MFMA + HIP-matching warp partition, writing the public
     VK layout [..., V, K]. Same compile-time config surface as the baseline / KV
-    paths; distinct cache namespace."""
+    paths; distinct cache namespace.
+
+    ``use_state_indices`` compiles the indexed state-pool variant: the SSM
+    ``initial_state`` is a pool ``[pool_size, H, V, K]`` and each sequence's slot
+    is gathered from an ``initial_state_indices[N]`` int32 array (with in-place
+    final-state write-back into the same pool slot), mirroring the HIP kernel."""
     return compile_chunk_gated_delta_h_mfma16_hip(
         K=K,
         V=V,
@@ -770,6 +776,7 @@ def _get_or_compile_mfma16_hip(
         WU_CONTIGUOUS=wu_contig,
         STATE_DTYPE_BF16=state_bf16,
         G_IS_LOG2_SCALED=g_log2_scaled,
+        USE_STATE_INDICES=use_state_indices,
     )
 
 
@@ -1070,6 +1077,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
     _fork: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
@@ -1153,6 +1162,38 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_gk = gk is not None
     use_h0 = initial_state is not None
     g_log2_scaled = bool(use_exp2)
+
+    # Indexed state-pool support (mfma16_hip fork only). When
+    # ``initial_state_indices`` is given, ``initial_state`` is a pool
+    # ``[pool_size, H, V, K]`` and each sequence gathers its slot from the index
+    # array; the final state is written back in place into that same pool
+    # (mirrors ``chunk_gated_delta_rule_fwd_h_hip_fn``). ``inplace_final_state``
+    # defaults to True whenever indices are given.
+    use_state_indices = initial_state_indices is not None
+    inplace = use_state_indices if inplace_final_state is None else inplace_final_state
+    if use_state_indices:
+        if _fork != "mfma16_hip":
+            raise NotImplementedError(
+                "FlyDSL K5: initial_state_indices is only implemented for the "
+                f"mfma16_hip fork; got _fork={_fork!r}."
+            )
+        if initial_state is None:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires initial_state (the "
+                "state pool)."
+            )
+        if not inplace:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires in-place final-state "
+                "write-back; leave inplace_final_state unset or set it to True."
+            )
+        if not output_final_state:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires output_final_state=True "
+                "(the indexed path writes the final state back into the pool)."
+            )
+    elif inplace and initial_state is None:
+        raise ValueError("FlyDSL K5: inplace_final_state requires initial_state.")
 
     # State-dtype validation: cheap, and raises on bad / conflicting dtypes.
     # ``state_bf16`` is the only derived bit the compile key needs.
@@ -1312,6 +1353,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         _compile_fn = _get_or_compile_naive_opt
     else:
         _compile_fn = _get_or_compile
+    # ``use_state_indices`` is an mfma16_hip-only compile knob; every other
+    # fork's ``_get_or_compile*`` shares the common signature without it.
+    _extra_compile_kwargs = (
+        {"use_state_indices": use_state_indices} if _mfma16_hip_active else {}
+    )
     launch_fn = _compile_fn(
         K,
         V,
@@ -1328,6 +1374,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         True,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
+        **_extra_compile_kwargs,
     )
 
     # Null-arg placeholder for the @flyc.jit slots the kernel ignores on this
@@ -1384,9 +1431,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # original token-major layout.
     h = k.new_empty(h_shape)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
-    final_state = (
-        k.new_empty(fs_shape, dtype=fs_dtype) if fs_shape is not None else None
-    )
+    if fs_shape is None:
+        final_state = None
+    elif inplace:
+        # In-place write-back: the final state aliases the ``initial_state``
+        # buffer (the pool when indexed, or the dense [N,H,V,K] state otherwise),
+        # so no separate output tensor is allocated. The kernel writes each
+        # sequence's slot back into this same buffer.
+        final_state = initial_state
+    else:
+        final_state = k.new_empty(fs_shape, dtype=fs_dtype)
 
     # The 11 tensor slots, wrapped as raw fx.Pointer args. Keep the torch
     # tensors referenced as locals (``k``/``u``/``h``/... above) so the storage
@@ -1408,6 +1462,23 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             co_arg,
         )
     )
+
+    # The mfma16_hip kernel carries an extra ``state_indices`` slot (12th tensor
+    # arg). Always supply it for that fork -- a real int32 [N] index array when
+    # indexed, else a 1-elem int32 dummy for the dense path. ``si_i32`` is kept
+    # as a local so its storage stays alive across the synchronous launch.
+    if _mfma16_hip_active:
+        if use_state_indices:
+            si_i32 = initial_state_indices.to(torch.int32).contiguous()
+            if si_i32.numel() != N:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices length "
+                    f"({si_i32.numel()}) must equal the number of sequences "
+                    f"N={N}."
+                )
+        else:
+            si_i32 = dummy.to(torch.int32)
+        tensor_args = tensor_args + (_as_ptr(si_i32),)
 
     launch_fn(
         *tensor_args,
@@ -1489,14 +1560,19 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """mfma16 / HIP-aligned K5 implementation (formerly the "vk" fork): NON-VWARP
     only -- uses the 16x16x16 bf16 MFMA and the SAME split-M warp partition (BT
     split-M, K split across waves, V not split across warps) as the hand-tuned
     HIP/C++ K5 kernel, writing the public VK layout [..., V, K]. API-identical to
-    ``chunk_gated_delta_rule_fwd_h_flydsl``; the kernel is used only when the
-    chosen BV is 64, else it falls back to the baseline. The returned h is the
-    usual VK layout (transposed view)."""
+    ``chunk_gated_delta_rule_fwd_h_flydsl``.
+
+    Supports the indexed state-pool contract via ``initial_state_indices`` /
+    ``inplace_final_state`` (see ``chunk_gated_delta_rule_fwd_h_flydsl``),
+    matching ``chunk_gated_delta_rule_fwd_h_hip_fn``. The returned h is the usual
+    VK layout."""
     return chunk_gated_delta_rule_fwd_h_flydsl(
         k,
         w,
@@ -1512,6 +1588,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=inplace_final_state,
         _fork="mfma16_hip",
     )
 
