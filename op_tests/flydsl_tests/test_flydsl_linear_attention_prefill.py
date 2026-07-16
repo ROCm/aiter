@@ -353,7 +353,7 @@ _PREFILL_GROUPS = [
         model_name="Qwen3.5-397B-ptpc-ali",
         Hv=64,
         tps=[8],
-        full_prompt_lens=[8192],
+        full_prompt_lens=[1024, 2048, 4096, 8192],
         is_varlen=False,
         max_num_batched_tokens="full_prompt_len",
     ),
@@ -374,7 +374,7 @@ _PREFILL_GROUPS = [
         model_name="varlen-32k-qwen-ptpc-ali",
         Hv=64,
         tps=[8],
-        full_prompt_lens=[8192],
+        full_prompt_lens=[1024, 2048, 4096, 8192],
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
