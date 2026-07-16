@@ -18,7 +18,7 @@ import os
 import pytest
 
 from aiter import dtypes
-from aiter.mla import _use_persistent_mla_decode
+from aiter.mla import _persistent_mla_decode_max_batch, _use_persistent_mla_decode
 from aiter.jit.utils.chip_info import get_gfx
 
 try:
@@ -40,6 +40,16 @@ def _is_gfx950():
 pytestmark = pytest.mark.skipif(
     not _is_gfx950(), reason="gate only differentiates on gfx950"
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_max_batch_cache():
+    # The env read is memoized (lru_cache) so it costs nothing on the hot path;
+    # clear it around each test so per-test AITER_MLA_DECODE_PERSISTENT_MAX_BATCH
+    # overrides are actually observed instead of a stale first read.
+    _persistent_mla_decode_max_batch.cache_clear()
+    yield
+    _persistent_mla_decode_max_batch.cache_clear()
 
 
 def test_defaults():

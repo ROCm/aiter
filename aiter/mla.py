@@ -298,7 +298,13 @@ def mla_decode_fwd(
     # Above the concurrency threshold the persistent kernel is slower, so
     # fall back to the non-persistent split-KV path (which rebuilds its own
     # num_kv_splits and ignores work_meta_data). See _use_persistent_mla_decode.
-    if persistent_mode:
+    #
+    # Scope: only the dense vLLM-style decode (num_kv_splits left to aiter) is
+    # gated. Callers that pass an explicit num_kv_splits -- the sparse/expert
+    # op paths -- depend on the persistent kernel's work_meta_data layout; the
+    # non-persistent fallback can't honor their top-k/split scheme and would
+    # return wrong results, so never downgrade them.
+    if persistent_mode and num_kv_splits is None:
         persistent_mode = _use_persistent_mla_decode(
             bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
         )
