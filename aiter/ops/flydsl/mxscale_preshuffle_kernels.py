@@ -56,7 +56,9 @@ def flydsl_mxscale_preshuffle_gemm(
 
     # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.
     if a_dtype not in ("fp4", "fp6", "fp8"):
-        raise ValueError(f"unsupported a_dtype {a_dtype!r}; expected 'fp4', 'fp6', or 'fp8'")
+        raise ValueError(
+            f"unsupported a_dtype {a_dtype!r}; expected 'fp4', 'fp6', or 'fp8'"
+        )
     if b_dtype not in ("fp4", "fp8"):
         raise ValueError(f"unsupported b_dtype {b_dtype!r}; expected 'fp4' or 'fp8'")
 
@@ -68,7 +70,9 @@ def flydsl_mxscale_preshuffle_gemm(
     if K % int(tile_k) != 0:
         raise ValueError(f"K ({K}) is not a multiple of tile_k ({tile_k})")
     if K % 128 != 0:
-        raise ValueError(f"K ({K}) must be a multiple of 128 for MXFP microscale; got {K}")
+        raise ValueError(
+            f"K ({K}) must be a multiple of 128 for MXFP microscale; got {K}"
+        )
     out_dtype = _OUT_DTYPE_STR.get(Out.dtype)
     if out_dtype is None:
         raise ValueError(
