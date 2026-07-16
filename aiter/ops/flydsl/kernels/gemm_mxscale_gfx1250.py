@@ -2439,6 +2439,7 @@ def compile_mxscale_gemm(
                 _effective_l2_pf = max(1, _effective_l2_pf - 1)
 
             def _l2_prefetch(k_base):
+                return
                 if const_expr(_effective_l2_pf <= 0):
                     return
                 pf_k = k_base + arith.index(_effective_l2_pf * tile_k)
