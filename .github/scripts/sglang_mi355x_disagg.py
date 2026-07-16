@@ -84,6 +84,15 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \\
     )
     text = replace_once(
         text,
+        'MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1',
+        """MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || MODEL_PATH=""
+if [[ -n "${MODEL:-}" && ( -z "$MODEL_PATH" || ( "$MODEL_PATH" == /* && ! -d "$MODEL_PATH" ) ) ]]; then
+    echo "WARN: MODEL_PATH is not visible on this node, falling back to model id: ${MODEL_PATH:-<empty>} -> $MODEL" >&2
+    MODEL_PATH="$MODEL"
+fi""",
+    )
+    text = replace_once(
+        text,
         '-C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
         '-C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
     )
