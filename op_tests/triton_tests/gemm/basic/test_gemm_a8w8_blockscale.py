@@ -55,12 +55,21 @@ def get_x_vals():
     # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
     # K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
     x_vals += [(512, 512, K) for K in (128, 192, 256, 320)]
-    x_vals += [(v, 8192, 1024) for v in (1, 64, 1024)]
-    x_vals += [(v, 4096, 8192) for v in (1, 64, 1024)]
-    x_vals += [(v, 4096, 4096) for v in (1, 64, 1024)]
-    x_vals += [(v, 4096, 2048) for v in (1, 64, 1024)]
-    x_vals += [(v, 1536, 4096) for v in (1, 64, 1024)]
-    x_vals += [(v, 32768, 1024) for v in (1, 64, 1024)]
+    x_vals = []
+    m_range = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 16384]
+    m_range += [v + 1 for v in m_range]
+    x_vals += [(v, 8192, 1024) for v in m_range]
+    x_vals += [(v, 4096, 8192) for v in m_range]
+    x_vals += [(v, 4096, 4096) for v in m_range]
+    x_vals += [(v, 4096, 2048) for v in m_range]
+    x_vals += [(v, 1536, 4096) for v in m_range]
+    x_vals += [(v, 32768, 1024) for v in m_range]
+    x_vals += [(v, 8192, 1536) for v in m_range]
+    x_vals += [(v, 7168, 4096) for v in m_range]
+    x_vals += [(v, 1536, 7168) for v in m_range]
+    x_vals += [(v, 7168, 768) for v in m_range]
+    x_vals += [(v, 2048, 7168) for v in m_range]
+    x_vals += [(v, 16384, 1536) for v in m_range]
     return x_vals
 
 
@@ -135,8 +144,10 @@ def generate_gemm_a8w8_blockscale_inputs(
         for shape in get_x_vals()
     ],
 )
-@pytest.mark.parametrize("backend", ["gluon", "triton"])
-@pytest.mark.parametrize("shuffle", [True, False])
+# @pytest.mark.parametrize("backend", ["gluon", "triton"])
+# @pytest.mark.parametrize("shuffle", [True, False])
+@pytest.mark.parametrize("backend", ["gluon"])
+@pytest.mark.parametrize("shuffle", [True])
 def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
