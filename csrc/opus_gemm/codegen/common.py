@@ -32,6 +32,7 @@ _GFX942_A16W16_TAGS = (
 )
 _A16W16_TAGS = (
     "a16w16",
+    "a16w16_interleave",
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_uniform",

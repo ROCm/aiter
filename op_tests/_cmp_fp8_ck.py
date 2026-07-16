@@ -13,9 +13,9 @@ import torch
 from aiter import dtypes
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
 from aiter.test_common import checkAllclose, run_perftest
-from aiter.ops.opus.gemm_op_a16w16 import (
-    _opus_gemm_a8w8_scale_mmajor_raw,
-    _opus_gemm_uniform_scale_mmajor_raw,
+from aiter.ops.opus.bmm_op import (
+    _opus_bmm_a8w8_scale_mmajor_raw,
+    _opus_bmm_a8w8_uniform_scale_mmajor_raw,
 )
 
 torch.set_default_device("cuda")
@@ -65,12 +65,12 @@ def run(m, n, k, g):
 
     def opus_a8w8():
         Y = torch.empty((m, g, n), dtype=dtypes.fp32)
-        _opus_gemm_a8w8_scale_mmajor_raw(Omm, Wfp8, Y, xsmm, ws)
+        _opus_bmm_a8w8_scale_mmajor_raw(Omm, Wfp8, Y, xsmm, ws)
         return Y
 
     def opus_uniform():
         Y = torch.empty((m, g, n), dtype=dtypes.fp32)
-        _opus_gemm_uniform_scale_mmajor_raw(Omm, Wfp8, Y, xsmm, ws, 700)
+        _opus_bmm_a8w8_uniform_scale_mmajor_raw(Omm, Wfp8, Y, xsmm, ws, 700)
         return Y
 
     # CK: 2D per-batch, loop over G (one launch each), stack.

@@ -12,7 +12,7 @@ import torch
 from aiter import dtypes
 from aiter.test_common import run_perftest
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8
-from aiter.ops.opus.gemm_op_a16w16 import _opus_gemm_a8w8_scale_mmajor_raw
+from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_scale_mmajor_raw
 
 torch.set_default_device("cuda")
 GROUP = 128
@@ -47,7 +47,7 @@ def run(m, n, k, g):
 
     def opus_a8w8_blockscale():
         Y = torch.empty((m, g, n), dtype=dtypes.fp32)
-        _opus_gemm_a8w8_scale_mmajor_raw(Omm, Wfp8, Y, xsmm, ws)
+        _opus_bmm_a8w8_scale_mmajor_raw(Omm, Wfp8, Y, xsmm, ws)
         return Y
 
     # CK batched: rowwise (per-token x_scale[b,m,1], per-channel w_scale[b,1,n])

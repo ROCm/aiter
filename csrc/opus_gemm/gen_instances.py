@@ -32,7 +32,7 @@ from opus_gemm_common import (
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_uniform_kernels_list,
-    a16w16_uniform_scale_kernels_list,
+    a8w8_uniform_scale_kernels_list,
     a16w16_kernels_list,
     a16w16_mono_tile_kernels_list,
     default_kernels_dict,
@@ -138,7 +138,7 @@ def _kernel_func_for(k):
 
 INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
-    "a16w16_uniform_scale": ("fp8_t", "fp8_t"),
+    "a8w8_uniform_scale": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
@@ -585,15 +585,17 @@ class opus_gemm_codegen:
     {{ {kid}, &{kernel_name}<CTYPE> }},  \\
 """
 
-        def _emit_map(f, macro_name, ctype):
+        def _emit_map(f, macro_name, ctype, tags=None, name_suffix=""):
             f.write(f"#define {macro_name}(CTYPE) \\\n")
             rows = []
             for kid, k in kernels_dict.items():
                 if not (isinstance(kid, int) and k.kernel_tag in A16W16_TUNE_TAGS):
                     continue
+                if tags is not None and k.kernel_tag not in tags:
+                    continue
                 if ctype not in k.output_dtypes:
                     continue
-                rows.append((kid, k.name))
+                rows.append((kid, k.name + name_suffix))
             rows.sort(key=lambda r: r[0])
             n = len(rows)
             for i, (kid, name) in enumerate(rows):
@@ -1100,7 +1102,7 @@ if __name__ == "__main__":
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
         "a16w16_flatmm_splitk": a16w16_flatmm_splitk_kernels_list,
         "a16w16_uniform": a16w16_uniform_kernels_list,
-        "a16w16_uniform_scale": a16w16_uniform_scale_kernels_list,
+        "a8w8_uniform_scale": a8w8_uniform_scale_kernels_list,
         "a16w16_mono_tile": a16w16_mono_tile_kernels_list,
         "gfx942_nosplit": gfx942_nosplit_kernels_list,
         "gfx942_splitk": gfx942_splitk_kernels_list,
@@ -1213,7 +1215,7 @@ if __name__ == "__main__":
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.
     if target_arches is None or "gfx950" in target_arches:
         S |= set(a8w8_scale_kernels_list.keys())
-        S |= set(a16w16_uniform_scale_kernels_list.keys())
+        S |= set(a8w8_uniform_scale_kernels_list.keys())
         S |= set(a8w8_kernels_list.keys())
 
     # Honor --kernel_tag as a developer override that *further restricts* the set (within the a16w16
@@ -1225,7 +1227,7 @@ if __name__ == "__main__":
             S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
             if target_arches is None or "gfx950" in target_arches:
                 S |= set(a8w8_scale_kernels_list.keys())
-                S |= set(a16w16_uniform_scale_kernels_list.keys())
+                S |= set(a8w8_uniform_scale_kernels_list.keys())
                 S |= set(a8w8_kernels_list.keys())
 
     # Heuristic-fallback invariant (single source of truth: opus_gemm_common.py).

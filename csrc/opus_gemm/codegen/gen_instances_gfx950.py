@@ -23,10 +23,11 @@ PIPELINE_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
+    "a16w16_interleave": "gfx950/opus_gemm_pipeline_a16w16_interleave_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_uniform": "gfx950/opus_gemm_pipeline_a16w16_uniform_gfx950.cuh",
-    "a16w16_uniform_scale": "gfx950/opus_gemm_pipeline_a16w16_uniform_scale_gfx950.cuh",
+    "a8w8_uniform_scale": "gfx950/opus_gemm_pipeline_a8w8_uniform_scale_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
 }
@@ -44,10 +45,11 @@ TRAITS_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_interleave": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_uniform": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
-    "a16w16_uniform_scale": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a8w8_uniform_scale": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
 }
@@ -56,10 +58,11 @@ KERNEL_FUNC_MAP = {
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
     "a16w16": "gemm_a16w16_kernel",
+    "a16w16_interleave": "gemm_a16w16_interleave_kernel",
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_uniform": "gemm_a16w16_uniform_kernel",
-    "a16w16_uniform_scale": "gemm_a16w16_uniform_scale_kernel",
+    "a8w8_uniform_scale": "gemm_a8w8_uniform_scale_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
 }
@@ -74,10 +77,11 @@ TRAITS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
     "a16w16": "opus_gemm_a16w16_traits_gfx950",
+    "a16w16_interleave": "opus_gemm_a16w16_traits_gfx950",
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_uniform": "opus_uniform_traits_gfx950",
-    "a16w16_uniform_scale": "opus_uniform_scale_traits_gfx950",
+    "a8w8_uniform_scale": "opus_a8w8_uniform_scale_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
     "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
 }
@@ -86,10 +90,11 @@ KARGS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
     "a16w16": "opus_gemm_noscale_kargs_gfx950",
+    "a16w16_interleave": "opus_gemm_noscale_kargs_gfx950",
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_uniform": "opus_gemm_flatmm_splitk_kargs_gfx950",
-    "a16w16_uniform_scale": "opus_gemm_uniform_scale_kargs_gfx950",
+    "a8w8_uniform_scale": "opus_gemm_a8w8_uniform_scale_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
     "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
 }
@@ -2059,8 +2064,9 @@ void
 # ---------- Self-register at import time ----------
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
-register_emit("gfx950", "a16w16_uniform_scale", gen_uniform_scale_instance)
+register_emit("gfx950", "a8w8_uniform_scale", gen_uniform_scale_instance)
 register_emit("gfx950", "a16w16", gen_noscale_instance_gfx950)
+register_emit("gfx950", "a16w16_interleave", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)

@@ -318,10 +318,10 @@ namespace py = pybind11;
           py::arg("kernelId") = 208,                      \
           py::arg("splitK")   = 0);
 
-#define OPUS_GEMM_A8W8_SCALE_MMAJOR_PYBIND              \
-    m.def("opus_gemm_a8w8_scale_mmajor",                \
-          &opus_gemm_a8w8_scale_mmajor,                 \
-          "mmajor fp8 block-scale batched GEMM: O/Y "    \
+#define OPUS_BMM_A8W8_SCALE_MMAJOR_PYBIND               \
+    m.def("opus_bmm_a8w8_scale_mmajor",                 \
+          &opus_bmm_a8w8_scale_mmajor,                  \
+          "mmajor fp8 block-scale BMM: O/Y "             \
           "[M, batch, *], wo_a/w_scale batch-major, "    \
           "x_scale [M, batch, K/GROUP_K] (zero-copy "    \
           "DSV4 wo_a fp8)",                              \
@@ -330,11 +330,11 @@ namespace py = pybind11;
           py::arg("Y"),                                  \
           py::arg("x_scale"),                            \
           py::arg("w_scale"));
-#define OPUS_GEMM_UNIFORM_SCALE_PYBIND                  \
-    m.def("opus_gemm_uniform_scale",                    \
-          &opus_gemm_uniform_scale,                     \
-          "batch-major fp8 block-scale UNIFORM batched " \
-          "GEMM (Route B fp8, 4-wave full-tile, direct " \
+#define OPUS_BMM_A8W8_UNIFORM_SCALE_PYBIND                   \
+    m.def("opus_bmm_a8w8_uniform_scale",                     \
+          &opus_bmm_a8w8_uniform_scale,                      \
+          "batch-major fp8 block-scale UNIFORM BMM "     \
+          "(Route B fp8, 4-wave full-tile, direct "      \
           "store): O/wo_a/Y = [batch,M,K]/[batch,N,K]/" \
           "[batch,M,N]; Y fp32 or bf16; kernelId "      \
           "700=128x128, 701=256x128",                   \
@@ -344,10 +344,10 @@ namespace py = pybind11;
           py::arg("x_scale"),                            \
           py::arg("w_scale"),                            \
           py::arg("kernelId") = 700);
-#define OPUS_GEMM_UNIFORM_SCALE_MMAJOR_PYBIND           \
-    m.def("opus_gemm_uniform_scale_mmajor",             \
-          &opus_gemm_uniform_scale_mmajor,              \
-          "mmajor fp8 block-scale UNIFORM batched GEMM " \
+#define OPUS_BMM_A8W8_UNIFORM_SCALE_MMAJOR_PYBIND            \
+    m.def("opus_bmm_a8w8_uniform_scale_mmajor",              \
+          &opus_bmm_a8w8_uniform_scale_mmajor,               \
+          "mmajor fp8 block-scale UNIFORM BMM "          \
           "(Route B fp8, 4-wave full-tile, direct "     \
           "store): O/Y [M, batch, *], wo_a/w_scale "    \
           "batch-major, x_scale [M, batch, K/GROUP_K]; " \

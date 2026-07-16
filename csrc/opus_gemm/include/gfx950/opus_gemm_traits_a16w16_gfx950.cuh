@@ -479,7 +479,7 @@ template<int BLOCK_SIZE_,
         typename GROUP_,
         int WG_PER_CU_,
         bool HAS_OOB_ = true>
-struct opus_uniform_scale_traits_gfx950 {
+struct opus_a8w8_uniform_scale_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -579,7 +579,7 @@ struct opus_uniform_scale_traits_gfx950 {
 // opus_gemm_scale_kargs_gfx950 (a8w8_scale): direct store to ptr_c, per-token
 // A scale (sfa) + block B scale (sfb). Guarded so a fused host TU that pulls
 // in both this header and the a8w8_scale header does not double-define.
-struct opus_gemm_uniform_scale_kargs_gfx950 {
+struct opus_gemm_a8w8_uniform_scale_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;

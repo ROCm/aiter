@@ -245,7 +245,7 @@ inline __device__ auto make_layout_sfa(int lane_id, int wave_id_m, int stride_sf
 #endif // __HIP_DEVICE_COMPILE__
 
 template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU) void gemm_a16w16_uniform_scale_kernel(opus_gemm_uniform_scale_kargs_gfx950 kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU) void gemm_a8w8_uniform_scale_kernel(opus_gemm_a8w8_uniform_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
     using namespace opus;

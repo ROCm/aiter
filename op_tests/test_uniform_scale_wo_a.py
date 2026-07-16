@@ -22,15 +22,15 @@ import torch
 from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus.gemm_op_a16w16 import (
-    _opus_gemm_uniform_scale_raw,
-    _opus_gemm_uniform_scale_mmajor_raw,
+from aiter.ops.opus.bmm_op import (
+    _opus_bmm_a8w8_uniform_scale_raw,
+    _opus_bmm_a8w8_uniform_scale_mmajor_raw,
 )
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import _opus_gemm_a8w8_scale_mmajor_raw
+    from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_scale_mmajor_raw
 except ImportError:  # pragma: no cover
-    _opus_gemm_a8w8_scale_mmajor_raw = None
+    _opus_bmm_a8w8_scale_mmajor_raw = None
 
 torch.set_default_device("cuda")
 
@@ -83,13 +83,13 @@ def test_uniform_scale(m, n, k, g, layout, out_dtype):
         O_in, xs_in = O_fp8, x_scale  # [g,m,k], [g,m,k/128] contiguous
         ref = ref_bm
         y_shape = (g, m, n)
-        run = _opus_gemm_uniform_scale_raw
+        run = _opus_bmm_a8w8_uniform_scale_raw
     else:  # mmajor: transposed views (dim0=M, dim1=batch=G)
         O_in = O_fp8.transpose(0, 1)  # [m,g,k] view
         xs_in = x_scale.transpose(0, 1)  # [m,g,k/128] view
         ref = ref_bm.transpose(0, 1)  # [m,g,n]
         y_shape = (m, g, n)
-        run = _opus_gemm_uniform_scale_mmajor_raw
+        run = _opus_bmm_a8w8_uniform_scale_mmajor_raw
 
     def _call(kid):
         Y = torch.empty(y_shape, dtype=ydt)
@@ -100,17 +100,12 @@ def test_uniform_scale(m, n, k, g, layout, out_dtype):
         "uniform700_128x128": lambda: _call(700),
         "uniform701_256x128": lambda: _call(701),
     }
-    # a8w8_scale (8-wave quad) baseline: mmajor + fp32 only (its C++ entry
-    # hardcodes fp32 Y and the mmajor layout).
-    if (
-        layout == "mmajor"
-        and out_dtype == "fp32"
-        and _opus_gemm_a8w8_scale_mmajor_raw is not None
-    ):
+    # a8w8_scale (8-wave quad) baseline: mmajor only, supports fp32/bf16 Y.
+    if layout == "mmajor" and _opus_bmm_a8w8_scale_mmajor_raw is not None:
 
         def _a8w8():
-            Y = torch.empty(y_shape, dtype=dtypes.fp32)
-            _opus_gemm_a8w8_scale_mmajor_raw(O_in, W_fp8, Y, xs_in, w_scale)
+            Y = torch.empty(y_shape, dtype=ydt)
+            _opus_bmm_a8w8_scale_mmajor_raw(O_in, W_fp8, Y, xs_in, w_scale)
             return Y
 
         candidates["a8w8_scale"] = _a8w8

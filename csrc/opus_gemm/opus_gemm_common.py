@@ -318,7 +318,7 @@ a16w16_uniform_kernels_list_nooob = {
 }
 
 
-def _a16w16_uniform_scale(bm, bn, bk, wg_per_cu=2, has_oob=True):
+def _a8w8_uniform_scale(bm, bn, bk, wg_per_cu=2, has_oob=True):
     """fp8 block-scale uniform (Route B fp8): 4-wave full-tile, MFMA 16x16x128,
     128x128 blockscale, PGR1 + sched_group_barrier, DIRECT store to Y."""
     vec = 16  # VEC_A = VEC_B = 16 for fp8 (16 bytes / 1 byte)
@@ -338,21 +338,21 @@ def _a16w16_uniform_scale(bm, bn, bk, wg_per_cu=2, has_oob=True):
         1,
         128,
         128,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
-        "a16w16_uniform_scale",
+        "a8w8_uniform_scale",
         ["bf16_t", "fp32_t"],  # direct store: Y bf16 or fp32 (v_c fp32 -> D_C)
         wg_per_cu,
         has_oob=has_oob,
     )
-    inst.name_tag = "uniform_scale"
+    inst.name_tag = "a8w8_uniform_scale"
     return inst
 
 
 # fp8 block-scale uniform family. B_N must equal GROUP_N (=128) so one sfb value
 # covers the whole tile-N; B_K must equal GROUP_K (=128). Direct store to Y (no
 # split-K workspace/reduce). kid 700 = 128x128x128, kid 701 = 256x128x128.
-a16w16_uniform_scale_kernels_list = {
-    700: _a16w16_uniform_scale(128, 128, 128, 2),
-    701: _a16w16_uniform_scale(256, 128, 128, 1),
+a8w8_uniform_scale_kernels_list = {
+    700: _a8w8_uniform_scale(128, 128, 128, 2),
+    701: _a8w8_uniform_scale(256, 128, 128, 1),
 }
 
 
@@ -414,7 +414,7 @@ a8w8_scale_kernels_list = {
     # (256x256 only launched 128 WG on batch=8, half the GPU idle). B_N stays
     # 256 (GROUP_N=128 requires HALF_B_N>=128). Revert first field to 256 to
     # restore the original 256x256 kid.
-    1: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
+    1: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["bf16_t", "fp32_t"]),
 }
 
 a8w8_kernels_list = {
@@ -1211,9 +1211,7 @@ kernels_list = {
     **a16w16_flatmm_kernels_list,
     **a16w16_flatmm_splitk_kernels_list,
     **a16w16_flatmm_splitk_kernels_list_nooob,
-    **a16w16_uniform_kernels_list,
-    **a16w16_uniform_kernels_list_nooob,
-    **a16w16_uniform_scale_kernels_list,
+    **a8w8_uniform_scale_kernels_list,
     **a16w16_persistent_kernels_list,
     **a16w16_persistent_kernels_list_cpol,
     **a16w16_persistent_kernels_list_nooob,
@@ -1230,7 +1228,7 @@ kernels_list = {
 }
 
 default_kernels_dict = {
-    (-1): OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
+    (-1): OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["bf16_t", "fp32_t"]),
     (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
     (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
@@ -1243,8 +1241,6 @@ default_kernels_dict = {
 SPLITK_KIDS = (
     frozenset(a16w16_flatmm_splitk_kernels_list.keys())
     | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
-    | frozenset(a16w16_uniform_kernels_list.keys())
-    | frozenset(a16w16_uniform_kernels_list_nooob.keys())
     | frozenset(gfx942_splitk_kernels_list.keys())
     | frozenset(gfx1250_kernels_list.keys())
     | frozenset(gfx1250_clusterlaunch_kernels_list.keys())
@@ -1322,18 +1318,6 @@ HEURISTIC_DEFAULT_KIDS_GFX950 = frozenset(
         1302,  # persistent (256, 128, 64)
         303,
         1303,  # persistent (128, 128, 64)
-        # interleaved-schedule prototype (a16w16_interleave, ?Phase 1).
-        40,
-        1040,
-        41,
-        1041,
-        42,
-        1042,
-        # Route B uniform (gfx942 em3en4 schedule on gfx950 16x16x32).
-        500,
-        1500,  # uniform 128x128x64 (fastest uniform tile)
-        501,
-        1501,  # uniform 256x128x64 hipBLASLt-like
         # mono_tile candidates for mmajor/wo_a tuning. These are no-OOB and
         # only valid on tile-aligned shapes (N%tile_N==0, K%64==0; M-tail is
         # bounded by the gmem descriptor). Forced into default builds so the

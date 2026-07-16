@@ -113,10 +113,7 @@ constexpr bool kid_is_splitk(int kid) noexcept
             kid < kSplitkKidMax + kNooobKidOffset) ||
            (kid >= kUniformSplitkKidMin && kid < kUniformSplitkKidMax) ||
            (kid >= kUniformSplitkKidMin + kNooobKidOffset &&
-            kid < kUniformSplitkKidMax + kNooobKidOffset) ||
-           (kid >= kBhsdSplitkKidMin && kid < kBhsdSplitkKidMax) ||
-           (kid >= kBhsdSplitkKidMin + kNooobKidOffset &&
-            kid < kBhsdSplitkKidMax + kNooobKidOffset);
+            kid < kUniformSplitkKidMax + kNooobKidOffset);
 }
 }  // namespace opus_gfx950_detail
 
