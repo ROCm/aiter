@@ -65,10 +65,24 @@ if [[ -n "${AITER_SOURCE_DIR:-}" ]]; then
     AITER_MOUNT_ARGS=" -v $AITER_SOURCE_DIR:/aiter-under-test:ro"
 fi
 
-DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \\
+HOST_IBVERBS_ARGS=""
+host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+if [[ -n "$host_ionic" && -e "$host_ionic" ]]; then
+    HOST_IBVERBS_ARGS+=" -v $host_ionic:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro"
+fi
+if [[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]]; then
+    HOST_IBVERBS_ARGS+=" -v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro"
+fi
+if [[ -e /etc/libibverbs.d/ionic.driver ]]; then
+    HOST_IBVERBS_ARGS+=" -v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro"
+fi
+
+DOCKER_COMMON="--rm --network host --ipc host --shm-size 128g --privileged \\
+--cap-add IPC_LOCK --cap-add NET_ADMIN \\
+--ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \\
 --security-opt seccomp=unconfined \\
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \\
--v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $AITER_MOUNT_ARGS $CHECKOUT_DOCKER_ARGS"
+-v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $AITER_MOUNT_ARGS $HOST_IBVERBS_ARGS $CHECKOUT_DOCKER_ARGS"
 """,
     )
     text = replace_once(
@@ -94,6 +108,20 @@ fi""",
         text,
         '-C "$GITHUB_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
         '-C "$SGLANG_RUNTIME_WORKSPACE" -cf - . | tar -C "$CHECKOUT_STAGE" -xf -',
+    )
+    text = replace_once(
+        text,
+        'echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"',
+        '''if [[ -n "${SGLANG_SPUR_IB_DEVICES:-}" ]]; then
+    echo "overriding disaggregation IB devices for SPUR: $IB -> $SGLANG_SPUR_IB_DEVICES"
+    IB="$SGLANG_SPUR_IB_DEVICES"
+fi
+echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=$ISL osl=$OSL"''',
+    )
+    text = replace_once(
+        text,
+        'MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"',
+        'MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=0 -e NCCL_NET_PLUGIN=none -e NCCL_SOCKET_IFNAME=eth1 -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7 -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=0 -e NCCL_PXN_DISABLE=0 -e NCCL_NET_DISABLE_INTRA=1 -e NCCL_IB_TC=104 -e NCCL_IB_FIFO_TC=192 -e NCCL_IB_QPS_PER_CONNECTION=1 -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=12 -e NCCL_DEBUG=WARN"',
     )
     text = replace_once(
         text,

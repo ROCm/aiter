@@ -74,6 +74,7 @@ env:
   IMAGE_OVERRIDE_DEFAULT: ""
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
+  SGLANG_SPUR_IB_DEVICES: ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
   SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/sglang-aiter-ci
   SLURM_NODELIST_DEFAULT: auto
   SLURM_RESERVATION_DEFAULT: ""
@@ -360,6 +361,7 @@ jobs:
           export MATRIX_CONFIG_NAME=dsv4pro-fp8-mi355x-sglang
           export MODEL_PATH="${MODEL_PATH_OVERRIDE}"
           export MODEL_MOUNT_ROOTS="${MODEL_MOUNT_ROOTS}"
+          export SGLANG_SPUR_IB_DEVICES="${SGLANG_SPUR_IB_DEVICES}"
           export IMAGE_OVERRIDE="${IMAGE_OVERRIDE}"
           export SLURM_NODELIST="${SLURM_NODELIST_OVERRIDE}"
           export SLURM_RESERVATION="${SLURM_RESERVATION_OVERRIDE}"
