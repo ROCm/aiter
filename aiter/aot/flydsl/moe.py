@@ -181,7 +181,7 @@ def parse_csv(csv_path: str):
                     full_job = {**job, **params}
                     if params["stage"] == 1 and stage1_v2_output_layout:
                         full_job["v2_output_layout"] = True
-                        if stage2_v2_params is not None:                            
+                        if stage2_v2_params is not None:
                             full_job["out_dtype"] = stage2_v2_params["a_dtype"]
                     key = job_identity(full_job)
                     if key in seen:
