@@ -17,7 +17,8 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
 
 SERVING_NUM_REDUCE_TILE = 16384
 SERVING_PARTIAL_POOL = 606
-MLA_REDUCE_SUPPORTED_GFX = ["gfx942", "gfx950"]
+# gfx950 not yet a target for this kernel; keep tests scoped to gfx942 until it is.
+MLA_REDUCE_SUPPORTED_GFX = ["gfx942"]
 
 
 def mla_reduce_out_dtype(dt: str) -> torch.dtype:

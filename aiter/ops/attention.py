@@ -1389,6 +1389,7 @@ def get_mla_metadata_v1(
     dtype_kv_rope: Optional[torch.dtype] = None,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
+    reduce_max_split: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward-compatible wrapper around the compiled ``get_mla_metadata_v1``.
 
@@ -1436,6 +1437,7 @@ def get_mla_metadata_v1(
         dtype_q_rope=dtype_q_rope,
         dtype_kv_nope=dtype_kv_nope,
         dtype_kv_rope=dtype_kv_rope,
+        reduce_max_split=reduce_max_split,
     )
 
 
