@@ -192,12 +192,31 @@ def _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch):
 
 
 def _max_weight_error(w_fused, i_fused, w_torch, i_torch):
-    """Max absolute weight error across tokens for matched expert ids."""
+    """Max absolute weight error, restricted to tokens whose fused and torch
+    selected SETS are identical.
+
+    With renormalization the weight of even a commonly-selected expert depends on
+    the whole selected set (shared denominator = sum over the top-k). A benign
+    boundary tie-swap in one slot -- the exp/log HW approximation ranking two
+    near-equal experts differently from exact libm, already accepted by
+    _count_routing_mismatches -- therefore shifts the *other* experts' weights by
+    a non-trivial amount. Comparing weights across a swapped set is a false
+    mismatch, so only same-set tokens are measured here."""
+    T = w_fused.shape[0]
+    dev = w_fused.device
+    E = int(max(int(i_fused.max()), int(i_torch.max())) + 1)
+    fused_mask = torch.zeros((T, E), dtype=torch.bool, device=dev)
+    fused_mask.scatter_(1, i_fused.long(), True)
+    torch_mask = torch.zeros((T, E), dtype=torch.bool, device=dev)
+    torch_mask.scatter_(1, i_torch.long(), True)
+    same_set = (fused_mask == torch_mask).all(dim=1)  # [T]
+
     ref, matched = _torch_weight_aligned_to_fused(w_fused, i_fused, w_torch, i_torch)
-    if not bool(matched.any()):
+    use = matched & same_set.unsqueeze(1)
+    if not bool(use.any()):
         return 0.0
     diff = (w_fused.to(torch.float32) - ref).abs()
-    return float(diff[matched].max())
+    return float(diff[use].max())
 
 
 # ---------------------------------------------------------------------------
