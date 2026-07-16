@@ -469,6 +469,38 @@ def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
     assert by_kernel["dq"] == dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=2)
 
 
+def test_bwd_tuned_csv_single_barrier_column(tmp_path):
+    """single_barrier is an optional dvdk-only tuned param: '1'/'0' parse to bool,
+    blank/absent falls back to None (builder heuristic)."""
+    path = _write_bwd_csv(
+        tmp_path / "tuned_bwd.csv",
+        [
+            _bwd_row(kernel="dvdk", block_m=96, single_barrier="1"),
+            _bwd_row(kernel="dq", block_m=128, single_barrier=""),
+        ],
+    )
+    by_kernel = {kern: cfg for (_, kern), cfg in
+                 hstu_kernels._bwd_tuned_config_map(path).items()}
+    # dvdk carries the parsed bool; dQ (blank) does not carry the key at all.
+    assert by_kernel["dvdk"]["single_barrier"] is True
+    assert "single_barrier" not in by_kernel["dq"]
+
+
+def test_bwd_tuned_csv_without_single_barrier_column(tmp_path):
+    """A pre-existing CSV lacking the single_barrier column still parses (the column
+    was added 2026-07-15); the param simply defaults to the builder heuristic."""
+    cols = [c for c in hstu_kernels._BWD_CSV_COLUMNS if c != "single_barrier"]
+    with open(tmp_path / "old.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        row = _bwd_row(kernel="dvdk")
+        row.pop("single_barrier", None)
+        w.writerow({c: row[c] for c in cols})
+    by_kernel = {kern: cfg for (_, kern), cfg in
+                 hstu_kernels._bwd_tuned_config_map(str(tmp_path / "old.csv")).items()}
+    assert by_kernel["dvdk"] == dict(block_m=128, block_n=64, num_waves=4, waves_per_eu=2)
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end autograd integration
 # --------------------------------------------------------------------------- #
