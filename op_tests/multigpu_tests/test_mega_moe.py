@@ -25,7 +25,6 @@ Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
     ENABLE_CK=0 AITER_FORCE_A8W4=1 AITER_USE_GROUPED_GEMM=1 AITER_BF16_FP8_MOE_BOUND=0 \
-    FLYDSL_GPU_ARCH=gfx1250 \
     torchrun --standalone --nproc_per_node=4 test_mega_moe.py \
       -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
     # cco v2 op-layer is vendored in aiter; only an installed mori (mori.cco) is
@@ -56,15 +55,11 @@ except Exception:  # pragma: no cover
 
 # a8w4 (fp8 activation + mxfp4 weight) grouped kernel knobs. Force the real
 # fp8/mxfp4 grouped path regardless of token count (mirrors test_moe_ep.py).
+os.environ.setdefault("ENABLE_CK", "0")
 os.environ.setdefault("AITER_FORCE_A8W4", "1")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 
-# The cco v2 dispatch/combine op-layer is vendored into aiter
-# (aiter.ops.flydsl.dispatch_combine_v2). Only the cco comm substrate stays an
-# installed-mori dependency (mori.cco.Communicator + libmori_cco*.{so,bc}).
-# MORI_CCO_BC optionally points at a prebuilt libmori_cco_device.bc; when unset,
-# cco JIT-compiles the device bitcode on first use.
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
 _FP8_DTYPE = dtypes.fp8
@@ -94,7 +89,7 @@ def _import_mori_v2():
     def sync() -> None:
         torch.cuda.synchronize()
 
-    return Communicator, set_device, sync, EpDispatchCombineConfig, EpDispatchCombineOp
+    return Communicator, EpDispatchCombineConfig, EpDispatchCombineOp
 
 
 # --------------------------------------------------------------------------- #
@@ -269,10 +264,10 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
 _WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
 
 
-def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0):
+def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED):
     """One weight set reused by every layer. Same seed on all ranks so the global
     expert partition is consistent. Returns bf16 (w1[E,2I,H], w2[E,H,I], sw1, sw2)."""
-    gen = torch.Generator(device=dev).manual_seed(_WEIGHT_SEED)
+    gen = torch.Generator(device=dev).manual_seed(seed)
     w1 = (torch.randn((E, 2 * idim, hdim), generator=gen, device=dev, dtype=torch.float32) / 10).to(dtype)
     w2 = (torch.randn((E, hdim, idim), generator=gen, device=dev, dtype=torch.float32) / 10).to(dtype)
     sw1 = sw2 = None
@@ -415,13 +410,14 @@ class RefModel:
 # Device pipeline: N-layer dispatch->gemm->combine, one CUDA graph (ISOLATED)
 # --------------------------------------------------------------------------- #
 class DeviceMoEPipeline:
-    """Owns the cco Communicator + EpDispatchCombineOp + a8w4 shuffled weights +
-    per-layer routing handles. Captures the whole N-layer chain into ONE CUDA
-    graph and times replays with torch.profiler. No fp32-reference logic here."""
+    """Owns the cco Communicator + EpDispatchCombineOp + a8w4 shuffled weights.
+    Each layer recomputes its own routing inside dispatch (e2e-faithful), and the
+    whole N-layer chain is captured into ONE CUDA graph and timed with
+    torch.profiler. No fp32-reference logic here."""
 
-    def __init__(self, d, E, hdim, idim, topk, spec, n_layers,
+    def __init__(self, dist_ctx, E, hdim, idim, topk, spec, n_layers,
                  w1_bf, w2_bf, sw1, sw2, routings, ct):
-        self.d = d
+        self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
         self.spec = spec
         self.n_layers = n_layers
@@ -429,8 +425,8 @@ class DeviceMoEPipeline:
         self.sw1, self.sw2 = sw1, sw2
         self.routings = routings
         self.ct = ct
-        self.EPR = E // d.world
-        self.dev = torch.device("cuda", d.local_rank)
+        self.EPR = E // dist_ctx.world
+        self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
         self.op = None
         self.graph = None
@@ -439,11 +435,12 @@ class DeviceMoEPipeline:
 
     # ---- initialization (grouped together) ---- #
     def setup(self, x0):
-        (Communicator, set_device, sync,
+        (Communicator,
          EpDispatchCombineConfig, EpDispatchCombineOp) = _import_mori_v2()
-        self._sync = sync
-        set_device(self.d.local_rank)
-        dev, r = self.dev, self.d.rank
+        # torch.cuda.set_device sets the process HIP current device (== driver
+        # hipSetDevice) that cco keys off; Dist already set it, repeat for safety.
+        torch.cuda.set_device(self.dist_ctx.local_rank)
+        dev, r = self.dev, self.dist_ctx.rank
 
         # this rank's LOCAL expert weights (quant + layout shuffle), a8w4.
         w1_g = self.w1_bf[r * self.EPR : (r + 1) * self.EPR].contiguous()
@@ -460,17 +457,17 @@ class DeviceMoEPipeline:
         # cco rendezvous + op (ONE op, reused by every layer; config is per-layer
         # identical). max_num_inp_token_per_rank = ct.
         uid = Communicator.get_unique_id() if r == 0 else None
-        uid = self.d.bcast_uid(uid)
+        uid = self.dist_ctx.bcast_uid(uid)
         win_bytes = (
-            self.d.world * self.ct * self.hdim * self.transport_dtype.itemsize * 2
+            self.dist_ctx.world * self.ct * self.hdim * self.transport_dtype.itemsize * 2
             + (1 << 24)
         )
         self.comm = Communicator.init(
-            self.d.world, r, uid, per_rank_vmm=2 * win_bytes + (1 << 28)
+            self.dist_ctx.world, r, uid
         )
         cfg = EpDispatchCombineConfig(
             rank=r,
-            world_size=self.d.world,
+            world_size=self.dist_ctx.world,
             hidden_dim=self.hdim,
             max_num_inp_token_per_rank=self.ct,
             num_experts_per_rank=self.EPR,
@@ -480,25 +477,15 @@ class DeviceMoEPipeline:
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
 
-        # Fix each layer's routing handle ONCE (eager, pre-capture). The handle
-        # clones its own dest-slot map, so N handles are independent; the layout
-        # only depends on topk_ids, not token values, so x0 is fine here.
-        self.handles = []
-        for ids, wts in self.routings:
-            *_ , handle = self.op.dispatch(
-                x0, wts, None, ids, return_routing=True
-            )
-            self.handles.append(handle)
-        self._sync()
-        self.comm.barrier()
-
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
     def _layer_step(self, x, l):
         ids, wts = self.routings[l]
-        handle = self.handles[l]
         xn = _rmsnorm(x)  # keep a8w4 fp8 activations in range across 61 layers
-        recv_x, recv_w, _rs, recv_idx, total_recv_t = self.op.dispatch(
-            xn, wts, None, ids, routing=handle
+        # Recompute routing every layer (mode A: atomic routing inside dispatch)
+        # instead of replaying a precomputed handle. return_routing=True hands
+        # back this layer's forward dest-slot map, which combine then consumes.
+        recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
+            xn, wts, None, ids, return_routing=True
         )
         out = moe_forward(
             recv_x, self.w1_a, self.w2_a, self.w1_s, self.w2_s,
@@ -615,47 +602,52 @@ def _device_shared_ffn(tokens, sw1, sw2):
 # --------------------------------------------------------------------------- #
 def main():
     args = _parse_args()
-    d = Dist()
-    dev = torch.device("cuda", d.local_rank)
+    dist_ctx = Dist()
+    dev = torch.device("cuda", dist_ctx.local_rank)
     spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
-        if d.rank == 0:
+        if dist_ctx.rank == 0:
             print(f"skip {args.quant_type}: mxfp4 requires gfx950/gfx1250, got {get_gfx()}")
-        d.shutdown()
+        dist_ctx.shutdown()
         return
 
     E, hdim, idim, topk = args.expert, args.hidden, args.inter, args.topk
     ct, n_layers = args.tokens, args.layers
-    assert E % d.world == 0, f"E={E} must be divisible by world_size={d.world}"
+    assert E % dist_ctx.world == 0, f"E={E} must be divisible by world_size={dist_ctx.world}"
 
-    if d.rank == 0:
+    if dist_ctx.rank == 0:
         print(
-            f"[cfg] world={d.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
-            f"inter={idim} E={E} topk={topk} EPR={E // d.world} quant={args.quant_type} "
-            f"gate={spec['gate_mode'].name} shared_E={args.shared_E} gfx={get_gfx()}",
+            f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
+            f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
+            f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
         )
 
     # ---- shared inputs: weights (same on all ranks) + this rank's tokens/routing.
+    # args.seed shifts all RNG; weights stay rank-independent (identical global
+    # experts), tokens/routing vary per rank. Default keeps runs reproducible.
     w1_bf, w2_bf, sw1, sw2 = make_shared_weights(
-        E, hdim, idim, dtypes.bf16, dev, shared_E=args.shared_E
+        E, hdim, idim, dtypes.bf16, dev, shared_E=args.shared_experts,
+        seed=_WEIGHT_SEED + args.seed,
     )
     x0 = torch.randn(
         ct, hdim,
-        generator=torch.Generator(device=dev).manual_seed(1000 + d.rank),
+        generator=torch.Generator(device=dev).manual_seed(1000 + dist_ctx.rank + args.seed),
         device=dev, dtype=torch.float32,
     ).to(dtypes.bf16)
-    routings = make_routings(n_layers, ct, E, topk, dev, seed=4242 + 100 * d.rank)
+    routings = make_routings(
+        n_layers, ct, E, topk, dev, seed=4242 + 100 * dist_ctx.rank + args.seed
+    )
 
     # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench.
     pipe = DeviceMoEPipeline(
-        d, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct
+        dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct
     )
     pipe.setup(x0)
     pipe.capture(x0)
     total_us, per_layer_us, prof_us = pipe.bench()
-    if d.rank == 0:
+    if dist_ctx.rank == 0:
         prof_note = (
             f"prof_device={prof_us:.1f}us"
             if prof_us > 0
@@ -682,8 +674,8 @@ def main():
         ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
         ref_out = ref.run(x0, routings).float()
         logits_diff = _calc_diff(ref_out, out_dev)
-        errs = d.allreduce_sum(0 if logits_diff < args.logits_tol else 1)
-        if d.rank == 0:
+        errs = dist_ctx.allreduce_sum(0 if logits_diff < args.logits_tol else 1)
+        if dist_ctx.rank == 0:
             print(
                 f"# MEGA-CHECK layers={n_layers}: {'PASS' if errs == 0 else 'FAIL'} "
                 f"(rank0 logits_diff={logits_diff:.6f} tol={args.logits_tol})",
@@ -691,20 +683,22 @@ def main():
             )
 
     pipe.teardown()
-    d.shutdown()
+    dist_ctx.shutdown()
 
 
 def _parse_args():
     p = argparse.ArgumentParser(description="multi-layer EP MoE perf + accuracy")
     p.add_argument("-q", "--quant_type", type=str, choices=QUANT_KEYS,
                    default="a8w4_mxfp4", help="quantization type")
-    p.add_argument("-m", "--tokens", type=int, default=128, help="tokens per rank")
+    p.add_argument("-bs", "--tokens", type=int, default=128, help="tokens per rank")
     p.add_argument("-hd", "--hidden", type=int, default=7168, help="model/hidden dim")
     p.add_argument("-id", "--inter", type=int, default=3072, help="intermediate dim")
     p.add_argument("-e", "--expert", type=int, default=384, help="routed experts (global)")
     p.add_argument("-k", "--topk", type=int, default=6, help="top-k")
-    p.add_argument("--shared_E", type=int, default=0, help="dense shared experts")
+    p.add_argument("--shared_experts", type=int, default=0, help="dense shared experts")
     p.add_argument("--layers", type=int, default=61, help="number of MoE layers")
+    p.add_argument("--seed", type=int, default=0,
+                   help="base RNG seed for weights/tokens/routing (optional; default 0)")
     p.add_argument("--logits_tol", type=float, default=0.1, help="end-to-end 1-cosine tol")
     p.add_argument("--acc_verify", type=int, default=1, help="run fp32 reference accuracy check")
     p.add_argument("--profile_table", type=int, default=0, help="print per-kernel table")
