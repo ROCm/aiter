@@ -81,6 +81,8 @@ env:
   SLURM_NODELIST_ALLOWED: >-
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  SLURM_NODELIST_BLOCKED: >-
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6
   SLURM_PARTITION_DEFAULT: ""
   SLURM_EXCLUSIVE_DEFAULT: "1"
   CONC_LIST_DEFAULT: "1,8,16,32,64,128,256"
@@ -146,10 +148,22 @@ jobs:
               for node in os.environ["SLURM_NODELIST_ALLOWED"].split(",")
               if node.strip()
           ]
+          blocked_nodes = [
+              node.strip()
+              for node in os.environ.get("SLURM_NODELIST_BLOCKED", "").split(",")
+              if node.strip()
+          ]
+          blocked_set = set(blocked_nodes)
           print(
               "approved Slurm/SPUR node pool: " + ", ".join(allowed_nodes),
               file=sys.stderr,
           )
+          if blocked_nodes:
+              print(
+                  "blocked Slurm/SPUR nodes for auto selection: "
+                  + ", ".join(blocked_nodes),
+                  file=sys.stderr,
+              )
           requested_nodes_raw = pairs["SLURM_NODELIST_OVERRIDE"].strip()
           if requested_nodes_raw.lower() == "auto":
               wait_seconds = int(os.environ.get("SLURM_NODELIST_WAIT_SECONDS", "7200"))
@@ -174,7 +188,8 @@ jobs:
                   idle_nodes = [
                       node
                       for node in allowed_nodes
-                      if node_state.get(node, "").startswith("idle")
+                      if node not in blocked_set
+                      and node_state.get(node, "").startswith("idle")
                   ]
                   print(
                       "approved node states: "
@@ -190,11 +205,11 @@ jobs:
                   if time.monotonic() >= deadline:
                       raise SystemExit(
                           "timed out waiting for two idle approved nodes. "
-                          f"last idle count={len(idle_nodes)}"
+                          f"last unblocked idle count={len(idle_nodes)}"
                       )
                   print(
                       "waiting for two idle approved nodes; "
-                      f"found {len(idle_nodes)}, retrying in {poll_seconds}s",
+                      f"found {len(idle_nodes)} unblocked, retrying in {poll_seconds}s",
                       file=sys.stderr,
                   )
                   time.sleep(poll_seconds)
