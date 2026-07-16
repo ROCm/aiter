@@ -299,7 +299,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
         "use_persistent": use_persistent,
-        "persistent_iters": persistent_iters
+        "persistent_iters": persistent_iters,
     }
     return ret
 
@@ -573,7 +573,7 @@ def moe_gemm_a8w4(
             waves_per_eu=config["waves_per_eu"],
         )
     elif use_gluon:
-        _moe_gemm_a8w4_decode_gluon[(grid,)](
+        _moe_gemm_a8w4_prefill_gluon[(grid,)](
             y,
             y.stride(1),
             y.stride(2),
@@ -619,7 +619,7 @@ def moe_gemm_a8w4(
             NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLED=preshuffled,
-            #X_SCALE_TDM=X_SCALE_TDM,
+            X_SCALE_TDM=X_SCALE_TDM,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
