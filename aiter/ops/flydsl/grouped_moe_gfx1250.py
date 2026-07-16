@@ -1402,6 +1402,10 @@ def flydsl_moe_gather_reduce(
         E, max_m, model_dim = grouped_out.shape
     token_num, topk = topids_to_rows.shape
     device = grouped_out.device
+    if gather_w.shape != (token_num, topk):
+        raise ValueError(
+            f"gather_w shape must be {(token_num, topk)}, got {tuple(gather_w.shape)}"
+        )
     if grouped_out.dtype == torch.bfloat16:
         out_dtype = "bf16"
     elif grouped_out.dtype == torch.float16:
@@ -1419,11 +1423,25 @@ def flydsl_moe_gather_reduce(
             f"unsupported gather_w dtype {gather_w.dtype}; need f32/bf16/f16"
         )
 
+    # The FlyDSL kernel uses flat pointer offsets, so pass compact buffers only.
+    topids_to_rows = topids_to_rows.to(device=device, dtype=torch.int32).contiguous()
+    gather_w = gather_w.to(device=device).contiguous()
+
     grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
     if out is None:
         out = torch.empty(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
+    elif out.shape != (token_num, model_dim):
+        raise ValueError(
+            f"out shape must be {(token_num, model_dim)}, got {tuple(out.shape)}"
+        )
+    elif out.dtype != grouped_out.dtype:
+        raise ValueError(f"out dtype must be {grouped_out.dtype}, got {out.dtype}")
+    elif out.device != device:
+        raise ValueError(f"out device must be {device}, got {out.device}")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous for flydsl_moe_gather_reduce")
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
     launch = _get_compiled_gather_reduce(
@@ -1437,6 +1455,7 @@ def flydsl_moe_gather_reduce(
         ptr_arg(out),
         token_num,
         slice_stride_dw,
+        E * max_m,
         stream=torch.cuda.current_stream(),
     )
     return out

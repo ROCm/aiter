@@ -138,6 +138,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: Int32,
         slice_stride_dw: Int32,
+        num_grouped_rows: Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -159,6 +160,7 @@ def build_moe_gather_reduce_module(
         num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
         slice_stride_dw_i32 = ArithValue(slice_stride_dw)
+        num_grouped_rows_i32 = ArithValue(num_grouped_rows)
 
         tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
         _if_tok = scf.IfOp(tok_valid)
@@ -191,7 +193,7 @@ def build_moe_gather_reduce_module(
             def _load_row_weight(k):
                 """Load (source grouped row, route weight as f32) for slot k."""
                 map_off = map_base + arith.constant(k, type=i32)
-                row_i32 = ArithValue(
+                row_raw = ArithValue(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
                 # weight loaded in its native dtype; extend to f32 unless it is
@@ -204,8 +206,11 @@ def build_moe_gather_reduce_module(
                     if w_dtype == "f32"
                     else ArithValue(arith.extf(f32, w_loaded))
                 )
-                row_valid = arith.cmpi(CmpIPredicate.sge, row_i32, c0_i32)
-                row_i32 = ArithValue(arith.select(row_valid, _raw(row_i32), c0_i32))
+                # Unsigned compare treats negative route rows as invalid too.
+                row_valid = arith.cmpi(
+                    CmpIPredicate.ult, row_raw, num_grouped_rows_i32
+                )
+                row_i32 = ArithValue(arith.select(row_valid, _raw(row_raw), c0_i32))
                 w_f32 = ArithValue(arith.select(row_valid, _raw(w_f32), c0_f32))
                 return row_i32, w_f32
 
@@ -318,6 +323,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
+        num_grouped_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -332,6 +338,7 @@ def build_moe_gather_reduce_module(
             out,
             num_tokens,
             slice_stride_dw,
+            num_grouped_rows,
         )
         launcher.launch(
             grid=(idx_tokens, n_iters, 1),

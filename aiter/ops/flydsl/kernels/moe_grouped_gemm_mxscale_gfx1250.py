@@ -35,7 +35,7 @@ from aiter.ops.flydsl.kernels.gemm_mxscale_gfx1250 import (
     compile_a8w4_gemm,
     compile_mxfp4_gemm,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
 
 @dataclass(frozen=True)
@@ -407,7 +407,7 @@ def _compile_stage1_finalize_act(
 
     module_name = (
         f"moe_stage1_finalize_act_{act}_{out_dtype}"
-        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}_v4_sk{split_k}"
+        f"_e{experts}_m{max_m}_i{inter_dim}_{stage1_weight_layout}_sk{split_k}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
@@ -505,6 +505,8 @@ def _compile_stage1_finalize_act(
                     for pair_idx in range_constexpr(VEC_DW * 2):
                         g = g_acc[pair_idx]
                         u = u_acc[pair_idx]
+                        g = -((-g).maximumf(neg_lim))
+                        u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
                             g = -((-g).maximumf(neg_lim))
                             u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
@@ -612,11 +614,11 @@ def _compile_stage1_finalize_act(
                         g_hi = g_hi_acc[lane]
                         u_lo = u_lo_acc[lane]
                         u_hi = u_hi_acc[lane]
+                        g_lo = -((-g_lo).maximumf(neg_lim))
+                        g_hi = -((-g_hi).maximumf(neg_lim))
+                        u_lo = (-((-u_lo).maximumf(neg_lim))).maximumf(neg_lim)
+                        u_hi = (-((-u_hi).maximumf(neg_lim))).maximumf(neg_lim)
                         if const_expr(act == "swiglu"):
-                            g_lo = -((-g_lo).maximumf(neg_lim))
-                            g_hi = -((-g_hi).maximumf(neg_lim))
-                            u_lo = (-((-u_lo).maximumf(neg_lim))).maximumf(neg_lim)
-                            u_hi = (-((-u_hi).maximumf(neg_lim))).maximumf(neg_lim)
                             t_lo = g_lo * alpha * neg_log2e
                             t_hi = g_hi * alpha * neg_log2e
                             emu_lo = ArithValue(
@@ -1325,15 +1327,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        m_tile_prefix,
-                        m_tile_map,
+                        ptr_arg(y),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(bias),
+                        ptr_arg(masked_m),
+                        ptr_arg(m_tile_prefix),
+                        ptr_arg(m_tile_map),
                         cfg.max_m,
                         fused_n,
                         _swiglu_lim_rt,
@@ -1342,14 +1344,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 else:
                     _run_compiled(
                         fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        m_tile_prefix,
-                        m_tile_map,
+                        ptr_arg(y),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(masked_m),
+                        ptr_arg(m_tile_prefix),
+                        ptr_arg(m_tile_map),
                         cfg.max_m,
                         fused_n,
                         _swiglu_lim_rt,
@@ -1359,15 +1361,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         _get_raw_base_bias(),
-                        gemm_tmp,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        m_tile_prefix,
-                        m_tile_map,
+                        ptr_arg(gemm_tmp),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(bias),
+                        ptr_arg(masked_m),
+                        ptr_arg(m_tile_prefix),
+                        ptr_arg(m_tile_map),
                         cfg.max_m,
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
@@ -1376,14 +1378,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 else:
                     _run_compiled(
                         _get_raw_base(),
-                        gemm_tmp,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        m_tile_prefix,
-                        m_tile_map,
+                        ptr_arg(gemm_tmp),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(masked_m),
+                        ptr_arg(m_tile_prefix),
+                        ptr_arg(m_tile_map),
                         cfg.max_m,
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
@@ -1405,15 +1407,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        grouped_layout,
+                        ptr_arg(y),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(bias),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(grouped_layout),
                         m_tile_total,
                         contiguous_m,
                         fused_n,
@@ -1423,14 +1425,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 else:
                     _run_compiled(
                         fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        grouped_layout,
+                        ptr_arg(y),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(grouped_layout),
                         m_tile_total,
                         contiguous_m,
                         fused_n,
@@ -1441,15 +1443,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         _get_raw_base_bias(),
-                        gemm_tmp,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        grouped_layout,
+                        ptr_arg(gemm_tmp),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(bias),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(grouped_layout),
                         m_tile_total,
                         contiguous_m,
                         2 * cfg.inter_dim,
@@ -1459,14 +1461,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 else:
                     _run_compiled(
                         _get_raw_base(),
-                        gemm_tmp,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        grouped_layout,
+                        ptr_arg(gemm_tmp),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(grouped_layout),
                         m_tile_total,
                         contiguous_m,
                         2 * cfg.inter_dim,
@@ -1485,15 +1487,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        _unused_m_tile_map,
+                        ptr_arg(y),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(bias),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(_unused_m_tile_map),
                         cfg.max_m,
                         cfg.max_m,
                         fused_n,
@@ -1503,14 +1505,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 else:
                     _run_compiled(
                         fused_gemm,
-                        y,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        _unused_m_tile_map,
+                        ptr_arg(y),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(_unused_m_tile_map),
                         cfg.max_m,
                         cfg.max_m,
                         fused_n,
@@ -1521,15 +1523,15 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 if bias is not None:
                     _run_compiled(
                         _get_raw_base_bias(),
-                        gemm_tmp,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        bias,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        _unused_m_tile_map,
+                        ptr_arg(gemm_tmp),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(bias),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(_unused_m_tile_map),
                         cfg.max_m,
                         cfg.max_m,
                         2 * cfg.inter_dim,
@@ -1539,14 +1541,14 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 else:
                     _run_compiled(
                         _get_raw_base(),
-                        gemm_tmp,
-                        x,
-                        w,
-                        scale_x,
-                        scale_w,
-                        masked_m,
-                        _unused_m_tile_prefix,
-                        _unused_m_tile_map,
+                        ptr_arg(gemm_tmp),
+                        ptr_arg(x),
+                        ptr_arg(w),
+                        ptr_arg(scale_x),
+                        ptr_arg(scale_w),
+                        ptr_arg(masked_m),
+                        ptr_arg(_unused_m_tile_prefix),
+                        ptr_arg(_unused_m_tile_map),
                         cfg.max_m,
                         cfg.max_m,
                         2 * cfg.inter_dim,
@@ -1718,15 +1720,15 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if bias is not None:
                 _run_compiled(
                     gemm,
-                    gemm_arg,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    bias,
-                    masked_m,
-                    m_tile_prefix,
-                    m_tile_map,
+                    ptr_arg(gemm_arg),
+                    ptr_arg(x),
+                    ptr_arg(w),
+                    ptr_arg(scale_x),
+                    ptr_arg(scale_w),
+                    ptr_arg(bias),
+                    ptr_arg(masked_m),
+                    ptr_arg(m_tile_prefix),
+                    ptr_arg(m_tile_map),
                     cfg.max_m,
                     cfg.model_dim,
                     _no_act_swiglu_lim,
@@ -1735,14 +1737,14 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             else:
                 _run_compiled(
                     gemm,
-                    gemm_arg,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    m_tile_prefix,
-                    m_tile_map,
+                    ptr_arg(gemm_arg),
+                    ptr_arg(x),
+                    ptr_arg(w),
+                    ptr_arg(scale_x),
+                    ptr_arg(scale_w),
+                    ptr_arg(masked_m),
+                    ptr_arg(m_tile_prefix),
+                    ptr_arg(m_tile_map),
                     cfg.max_m,
                     cfg.model_dim,
                     _no_act_swiglu_lim,
@@ -1762,15 +1764,15 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if bias is not None:
                 _run_compiled(
                     gemm,
-                    gemm_arg,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    bias,
-                    masked_m,
-                    _unused_m_tile_prefix,
-                    grouped_layout,
+                    ptr_arg(gemm_arg),
+                    ptr_arg(x),
+                    ptr_arg(w),
+                    ptr_arg(scale_x),
+                    ptr_arg(scale_w),
+                    ptr_arg(bias),
+                    ptr_arg(masked_m),
+                    ptr_arg(_unused_m_tile_prefix),
+                    ptr_arg(grouped_layout),
                     m_tile_total,
                     contiguous_m,
                     cfg.model_dim,
@@ -1780,14 +1782,14 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             else:
                 _run_compiled(
                     gemm,
-                    gemm_arg,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    _unused_m_tile_prefix,
-                    grouped_layout,
+                    ptr_arg(gemm_arg),
+                    ptr_arg(x),
+                    ptr_arg(w),
+                    ptr_arg(scale_x),
+                    ptr_arg(scale_w),
+                    ptr_arg(masked_m),
+                    ptr_arg(_unused_m_tile_prefix),
+                    ptr_arg(grouped_layout),
                     m_tile_total,
                     contiguous_m,
                     cfg.model_dim,
@@ -1805,15 +1807,15 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             if bias is not None:
                 _run_compiled(
                     gemm,
-                    gemm_arg,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    bias,
-                    masked_m,
-                    _unused_m_tile_prefix,
-                    _unused_m_tile_map,
+                    ptr_arg(gemm_arg),
+                    ptr_arg(x),
+                    ptr_arg(w),
+                    ptr_arg(scale_x),
+                    ptr_arg(scale_w),
+                    ptr_arg(bias),
+                    ptr_arg(masked_m),
+                    ptr_arg(_unused_m_tile_prefix),
+                    ptr_arg(_unused_m_tile_map),
                     cfg.max_m,
                     cfg.max_m,
                     cfg.model_dim,
@@ -1823,14 +1825,14 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             else:
                 _run_compiled(
                     gemm,
-                    gemm_arg,
-                    x,
-                    w,
-                    scale_x,
-                    scale_w,
-                    masked_m,
-                    _unused_m_tile_prefix,
-                    _unused_m_tile_map,
+                    ptr_arg(gemm_arg),
+                    ptr_arg(x),
+                    ptr_arg(w),
+                    ptr_arg(scale_x),
+                    ptr_arg(scale_w),
+                    ptr_arg(masked_m),
+                    ptr_arg(_unused_m_tile_prefix),
+                    ptr_arg(_unused_m_tile_map),
                     cfg.max_m,
                     cfg.max_m,
                     cfg.model_dim,
