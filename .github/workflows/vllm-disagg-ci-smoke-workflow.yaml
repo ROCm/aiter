@@ -4,12 +4,6 @@ on:
   schedule:
     # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
     - cron: '30 18 * * *'
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths:
-      - ".github/workflows/vllm-disagg-ci-smoke-workflow.yaml"
-      - ".github/actionlint.yaml"
   workflow_dispatch:
     inputs:
       vllm_repository:
