@@ -8,10 +8,10 @@ build_kernels_list), but the mxscale_preshuffle kernel exposes only tile_m/n/k +
 waves_per_eu as perf knobs (no async/lds/cshuffle/xcd/scheduler/split-K), so the
 candidate schema and kernelName grammar are correspondingly small.
 
-kernelName grammar (distinct `mxpsh` prefix, never collides with flydsl_bpreshuflle_*):
-    flydsl_mxpsh_{tm}x{tn}x{tk}_{A}_{B}_{OUT}_w{wpe}
-e.g. flydsl_mxpsh_64x128x128_F8_F8_B16_w0   (a8w8)
-     flydsl_mxpsh_64x128x256_F4_F4_B16_w2   (a4w4)
+kernelName grammar (distinct `mxpsh` prefix, never collides with flydsl_bpreshuffle_*):
+    flydsl_mxpsh_{tm}x{tn}x{tk}_{A}_{B}_{OUT}_w{wpe}_x{xcd}
+e.g. flydsl_mxpsh_64x128x128_F8_F8_B16_w0_x0   (a8w8)
+     flydsl_mxpsh_64x128x256_F4_F4_B16_w2_x4   (a4w4)
 """
 
 from __future__ import annotations
