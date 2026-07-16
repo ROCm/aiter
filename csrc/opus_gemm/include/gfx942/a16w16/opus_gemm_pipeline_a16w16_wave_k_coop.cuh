@@ -221,42 +221,6 @@ struct wkc_unsupported_shape {
     static constexpr bool value = false;
 };
 
-struct wkc_mfma_16x16x16_bf16
-    : opus::impl::mfma_adaptor<
-          opus::mfma<opus::bf16_t, opus::bf16_t, opus::fp32_t, 16, 16, 16>> {
-    template<typename VA, typename VB, typename VC>
-    __device__ __forceinline__
-    auto operator()(const VA& a, const VB& b, const VC& c) const
-    {
-        float4_acc acc = c;
-        // Standard mfma: dst = A @ B + dst. Asm operand order: dst, srcA, srcB, srcC.
-        asm volatile(
-            "v_mfma_f32_16x16x16_bf16 %[c], %[a], %[b], %[c]\n"
-            : [c] "+v" (acc)
-            : [a] "v" (a), [b] "v" (b));
-        return acc;
-    }
-};
-
-__device__ __forceinline__
-void wkc_mfma_direct(short4_ab a, short4_ab b, float4_acc& acc)
-{
-    asm volatile(
-        "v_mfma_f32_16x16x16_bf16 %[c], %[a], %[b], %[c]\n"
-        : [c] "+v" (acc)
-        : [a] "v" (a), [b] "v" (b));
-}
-
-template<int E_M, int E_N, int E_K>
-__device__ __forceinline__
-auto make_wkc_tiled_mma()
-{
-    return opus::make_tiled_mma(
-        wkc_mfma_16x16x16_bf16{},
-        opus::seq<E_M, E_N, E_K>{},
-        opus::seq<1, 1, 1>{});
-}
-
 template<typename T, int E_K, typename U_A, typename U_B>
 __device__ __forceinline__
 void load_wkc_e2n1_k(opus::array<short4_ab, 8>& v_a,
@@ -490,19 +454,17 @@ void wkc_phase_compute_e2n2_step(opus::array<short4_ab, 2>& v_a,
                                  const U_A& u_ua,
                                  const U_B& u_ub)
 {
-    auto mfma = wkc_mfma_16x16x16_bf16{};
-
     s_waitcnt_lgkmcnt(2_I);
-    v_c[0] = mfma(v_a[0], v_b[0], v_c[0]);
+    v_c[0] = opus::mfma_f32_16x16x16_bf16{}(v_a[0], v_b[0], v_c[0]);
     s_waitcnt_lgkmcnt(1_I);
-    v_c[2] = mfma(v_a[1], v_b[0], v_c[2]);
+    v_c[2] = opus::mfma_f32_16x16x16_bf16{}(v_a[1], v_b[0], v_c[2]);
     s_waitcnt_lgkmcnt(0_I);
     {
         opus::array<short4_ab, 2> next_a, next_b;
         load_wkc_e2n2_a_tile<T>(next_a, smem_a_base, wave_slab_id, K_NEXT, u_ua);
         load_wkc_e2n2_b_tile<T>(next_b, smem_b_base, wave_slab_id, K_NEXT, u_ub);
-        v_c[1] = mfma(v_a[0], v_b[1], v_c[1]);
-        v_c[3] = mfma(v_a[1], v_b[1], v_c[3]);
+        v_c[1] = opus::mfma_f32_16x16x16_bf16{}(v_a[0], v_b[1], v_c[1]);
+        v_c[3] = opus::mfma_f32_16x16x16_bf16{}(v_a[1], v_b[1], v_c[3]);
         v_a[0] = next_a[0];
         v_b[0] = next_b[0];
         v_a[1] = next_a[1];
@@ -515,15 +477,13 @@ void wkc_phase_compute_e2n2_final(opus::array<short4_ab, 2>& v_a,
                                   opus::array<short4_ab, 2>& v_b,
                                   opus::array<float4_acc, 4>& v_c)
 {
-    auto mfma = wkc_mfma_16x16x16_bf16{};
-
     s_waitcnt_lgkmcnt(2_I);
-    v_c[0] = mfma(v_a[0], v_b[0], v_c[0]);
+    v_c[0] = opus::mfma_f32_16x16x16_bf16{}(v_a[0], v_b[0], v_c[0]);
     s_waitcnt_lgkmcnt(1_I);
-    v_c[2] = mfma(v_a[1], v_b[0], v_c[2]);
+    v_c[2] = opus::mfma_f32_16x16x16_bf16{}(v_a[1], v_b[0], v_c[2]);
     s_waitcnt_lgkmcnt(0_I);
-    v_c[1] = mfma(v_a[0], v_b[1], v_c[1]);
-    v_c[3] = mfma(v_a[1], v_b[1], v_c[3]);
+    v_c[1] = opus::mfma_f32_16x16x16_bf16{}(v_a[0], v_b[1], v_c[1]);
+    v_c[3] = opus::mfma_f32_16x16x16_bf16{}(v_a[1], v_b[1], v_c[3]);
 }
 
 template<int E_M, int E_N, int E_K>
@@ -571,13 +531,13 @@ void wkc_compute_tile(const char* smem_a_base,
         smem_b_base, wave_slab_id, 0, 3, u_ub);
 
     s_waitcnt_lgkmcnt(6_I);
-    wkc_mfma_direct(a0, b0, acc[0]);
+    acc[0] = opus::mfma_f32_16x16x16_bf16{}(a0, b0, acc[0]);
     s_waitcnt_lgkmcnt(4_I);
-    wkc_mfma_direct(a1, b1, acc[0]);
+    acc[0] = opus::mfma_f32_16x16x16_bf16{}(a1, b1, acc[0]);
     s_waitcnt_lgkmcnt(2_I);
-    wkc_mfma_direct(a2, b2, acc[0]);
+    acc[0] = opus::mfma_f32_16x16x16_bf16{}(a2, b2, acc[0]);
     s_waitcnt_lgkmcnt(0_I);
-    wkc_mfma_direct(a3, b3, acc[0]);
+    acc[0] = opus::mfma_f32_16x16x16_bf16{}(a3, b3, acc[0]);
 }
 
 template<typename T, typename U_A, typename U_B>
@@ -590,7 +550,10 @@ void wkc_compute_tile(const char* smem_a_base,
                       float4_acc* acc,
                       wkc_tile_tag<2, 1, 4>)
 {
-    auto mma = make_wkc_tiled_mma<2, 1, 4>();
+    auto mma = opus::make_tiled_mma(
+        opus::impl::mfma_adaptor<opus::mfma_f32_16x16x16_bf16>{},
+        opus::seq<2, 1, 4>{},
+        opus::seq<1, 1, 1>{});
     opus::array<short4_ab, 8> v_a;
     opus::array<short4_ab, 4> v_b;
     opus::array<float4_acc, 2> v_c;
@@ -614,7 +577,10 @@ void wkc_compute_tile(const char* smem_a_base,
                       float4_acc* acc,
                       wkc_tile_tag<1, 2, 4>)
 {
-    auto mma = make_wkc_tiled_mma<1, 2, 4>();
+    auto mma = opus::make_tiled_mma(
+        opus::impl::mfma_adaptor<opus::mfma_f32_16x16x16_bf16>{},
+        opus::seq<1, 2, 4>{},
+        opus::seq<1, 1, 1>{});
     opus::array<short4_ab, 4> v_a;
     opus::array<short4_ab, 8> v_b;
     opus::array<float4_acc, 2> v_c;
@@ -638,7 +604,10 @@ void wkc_compute_tile(const char* smem_a_base,
                       float4_acc* acc,
                       wkc_tile_tag<4, 1, 4>)
 {
-    auto mma = make_wkc_tiled_mma<4, 1, 4>();
+    auto mma = opus::make_tiled_mma(
+        opus::impl::mfma_adaptor<opus::mfma_f32_16x16x16_bf16>{},
+        opus::seq<4, 1, 4>{},
+        opus::seq<1, 1, 1>{});
     opus::array<short4_ab, 16> v_a;
     opus::array<short4_ab, 4> v_b;
     opus::array<float4_acc, 4> v_c;
@@ -666,7 +635,10 @@ void wkc_compute_tile(const char* smem_a_base,
                       float4_acc* acc,
                       wkc_tile_tag<1, 2, 2>)
 {
-    auto mma = make_wkc_tiled_mma<1, 2, 2>();
+    auto mma = opus::make_tiled_mma(
+        opus::impl::mfma_adaptor<opus::mfma_f32_16x16x16_bf16>{},
+        opus::seq<1, 2, 2>{},
+        opus::seq<1, 1, 1>{});
     opus::array<short4_ab, 2> v_a;
     opus::array<short4_ab, 4> v_b;
     opus::array<float4_acc, 2> v_c;
