@@ -110,6 +110,35 @@ python3 -m pip uninstall -y amd-aiter aiter || true
 MAX_JOBS="${AITER_MAX_JOBS:-64}" PREBUILD_KERNELS="${AITER_PREBUILD_KERNELS:-0}" GPU_ARCHS="${GPU_ARCHS:-gfx950}" \
   python3 -m pip install --no-build-isolation -e "$RUNTIME_AITER"
 python3 -m pip show amd-aiter || python3 -m pip show aiter || true
+export PYTHONPATH="$RUNTIME_AITER:${PYTHONPATH:-}"
+python3 - <<'PY'
+import importlib.metadata
+import sys
+import traceback
+
+required = (
+    "dynamic_per_tensor_quant",
+    "dynamic_per_token_scaled_quant",
+    "static_per_tensor_quant",
+)
+
+try:
+    import aiter
+    print(f"[checkout-aiter] sys_path_head={sys.path[:5]}")
+    print(f"[checkout-aiter] aiter_file={aiter.__file__}")
+    try:
+        print(f"[checkout-aiter] amd-aiter_version={importlib.metadata.version('amd-aiter')}")
+    except Exception as exc:
+        print(f"[checkout-aiter] amd-aiter_version_error={exc}")
+    missing = [name for name in required if not hasattr(aiter, name)]
+    for name in required:
+        print(f"[checkout-aiter] has_{name}={hasattr(aiter, name)}")
+    if missing:
+        raise RuntimeError(f"aiter import succeeded but missing required symbols: {missing}")
+except Exception:
+    traceback.print_exc()
+    raise
+PY
 EOF
 
 cat > "$WORKDIR/prefill_entry.sh" <<EOF
@@ -119,14 +148,16 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
         text,
         'bash "\\$CIDIR/install_checkout_sglang.sh"\n',
         'bash "\\$CIDIR/install_checkout_sglang.sh"\n'
-        'bash "\\$CIDIR/install_checkout_aiter.sh"\n',
+        'bash "\\$CIDIR/install_checkout_aiter.sh"\n'
+        'export PYTHONPATH=/tmp/aiter-under-test-runtime:${PYTHONPATH:-}\n',
         min_count=2,
     )
     text = replace_once(
         text,
         "    bash \\$CIDIR/install_checkout_sglang.sh\n",
         "    bash \\$CIDIR/install_checkout_sglang.sh\n"
-        "    bash \\$CIDIR/install_checkout_aiter.sh\n",
+        "    bash \\$CIDIR/install_checkout_aiter.sh\n"
+        "    export PYTHONPATH=/tmp/aiter-under-test-runtime:${PYTHONPATH:-}\n",
     )
     text = replace_all(
         text,
