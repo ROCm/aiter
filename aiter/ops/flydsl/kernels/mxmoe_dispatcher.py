@@ -297,6 +297,7 @@ def compile_gemm2_a4w4_port(
             ):
                 m_block = m_tile0 + fx.Int32(_it) * c_stride
                 unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
+                gpu.barrier()  # persist: separate prev-iter epilog C-slab LDS reads from this iter's A-load into the shared LDS union
                 issue_all_a_loads(m_block * fx.Int32(BM))
                 rocdl.sched_barrier(0)
                 if fx.Int32(m_block) < total_m_blocks:
