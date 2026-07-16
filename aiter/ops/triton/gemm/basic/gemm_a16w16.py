@@ -185,6 +185,15 @@ def gemm_a16w16_(
                 depth_cap = num_k_tiles
         else:
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
+            if depth_cap < _MIN_BUFFERS.get(kernel_type, 1):
+                needed = _MIN_BUFFERS.get(kernel_type, 1) + _DEPTH_SLACK.get(kernel_type, 0)
+                _LOGGER.warning(
+                    f"GEMM_A16W16 [gluon/gfx1250]: config kernel_type='{kernel_type}' needs "
+                    f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
+                    f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
+                )
+                kernel_type = "bandwidth_bound"
+                depth_cap = num_k_tiles
 
         NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
 
