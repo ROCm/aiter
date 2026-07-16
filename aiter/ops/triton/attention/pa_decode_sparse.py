@@ -133,7 +133,7 @@ def pa_decode_sparse(
         # If H is too large to fit a single tile, halve until it does.
         if use_gluon:
             if H >= 128:
-                block_h = 64
+                block_h = 128
             elif H >= 64:
                 if T >= 2048:
                     block_h = 64
@@ -164,7 +164,13 @@ def pa_decode_sparse(
     # arches use the synchronous slot path, where 32 exposes memory latency.
     if use_gluon:
         block_k = 16
-        if block_h == 64:
+        waves_per_eu = 1
+        if block_h == 128:
+            block_k = 32
+            attn_num_warps = 8
+            max_num_wg = 256
+            waves_per_eu = 2
+        elif block_h == 64:
             attn_num_warps = 4
             max_num_wg = 256
         elif block_h == 32:
@@ -177,8 +183,8 @@ def pa_decode_sparse(
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
         max_num_wg = 256
+        waves_per_eu = 1
     num_stages = 2
-    waves_per_eu = 1
     # gluon reduce with BLOCK_H=1 keeps KV_SPLITS and BLOCK_H entirely
     # in-thread; a single warp suffices and avoids shared-memory layout
     # mismatches between 2D (m/l) and 3D (acc) loads.

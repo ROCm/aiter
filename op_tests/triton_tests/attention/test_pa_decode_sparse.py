@@ -147,14 +147,38 @@ def _make_inputs(
 # ---------------------------------------------------------------------------
 
 
-def _wrapper_main_kernel_params(D: int):
+def _wrapper_main_kernel_params(T: int, H: int, D: int):
     """Reproduce the (use_exp2, block_k) the wrapper picks for the main kernel.
 
     Must stay in sync with ``pa_decode_sparse``'s USE_EXP2 and block_k logic.
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True
-    block_k = 16 if use_gluon else (16 if D >= 256 else 32)
+    if use_gluon:
+        if H >= 128:
+            block_h = 128
+        elif H >= 64:
+            if T >= 2048:
+                block_h = 64
+            elif T >= 32:
+                block_h = 32
+            else:
+                block_h = 16
+        elif H >= 32:
+            if T >= 256:
+                block_h = 32
+            else:
+                block_h = 16
+        else:
+            block_h = triton.next_power_of_2(H)
+    else:
+        block_h = triton.next_power_of_2(min(H, 16))
+    if use_gluon:
+        block_k = 16
+        if block_h == 128:
+            block_k = 32
+    else:
+        block_k = 16 if D >= 256 else 32
     return use_exp2, block_k
 
 
@@ -224,13 +248,13 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 32, 64, 128, 256, 2048])
-@pytest.mark.parametrize("H", [16, 64, 128])
+@pytest.mark.parametrize("T", [1, 64, 256, 2048])
+@pytest.mark.parametrize("H", [16, 32, 64, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [136, 388, 1024])
 @pytest.mark.parametrize("var_len", [True, False])
-@pytest.mark.parametrize("sentinels", [False])
-@pytest.mark.parametrize("skip_reduce", [False])  # skip_reduce = True for debug only
+@pytest.mark.parametrize("sentinels", [True, False])
+@pytest.mark.parametrize("skip_reduce", [True, False])
 def test_pa_decode_sparse_vs_reference(
     T, H, D, kv_len, var_len, sentinels, skip_reduce
 ):
@@ -264,7 +288,7 @@ def test_pa_decode_sparse_vs_reference(
         # skip_reduce with the split-K path active (kv_splits > 1): the wrapper
         # returns raw partials, so do the log-sum-exp combine + sink fold here.
         acc_partial, m_partial, l_partial = result
-        use_exp2, block_k = _wrapper_main_kernel_params(D)
+        use_exp2, block_k = _wrapper_main_kernel_params(T, H, D)
         out = _reduce_partials_torch(
             acc_partial, m_partial, l_partial, sink, indptr, block_k, use_exp2
         ).to(q.dtype)
