@@ -72,7 +72,6 @@ except ImportError:
 if is_flydsl_available():
     try:
         from aiter.ops.flydsl.moe_kernels import (
-            flydsl_kernel_name,
             flydsl_moe_stage1,
             flydsl_moe_stage2,
             get_flydsl_stage1_kernels,
