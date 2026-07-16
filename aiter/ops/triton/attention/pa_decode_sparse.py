@@ -125,8 +125,8 @@ def pa_decode_sparse(
     out = torch.empty_like(q)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
-    # kv_indices = kv_indices.to(torch.int32).contiguous()
-    # kv_indptr = kv_indptr.to(torch.int32).contiguous()
+
+    use_gluon = DEVICE_ARCH == "gfx1250"
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
@@ -158,8 +158,6 @@ def pa_decode_sparse(
     h_padded = n_head_blocks * block_h
     block_d = triton.next_power_of_2(D)
     assert block_d == D
-
-    use_gluon = DEVICE_ARCH == "gfx1250"
 
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
