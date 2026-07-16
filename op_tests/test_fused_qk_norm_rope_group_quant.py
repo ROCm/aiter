@@ -540,8 +540,43 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
         msg="SWA rope bf16 (exact)",
     )
 
+    # --- flydsl bf16 paged-SWA write comparison ---
+    # flydsl's fused SWA scatter is BF16-only (fp8+SWA is rejected), so this is the
+    # only apples-ish "both fuse the SWA write" comparison: flydsl writes the full KV
+    # row as bf16 into the same paged pool (block_tables[bid, pos//bs]*bs + pos%bs),
+    # while ours writes the v4 layout (fp8 nope + dup e8m0 scale + bf16 rope). flydsl
+    # moves less K-write traffic (bf16 512B vs our 448+14 fp8 + 128 bf16), so treat the
+    # ratio as indicative of kernel efficiency, not a same-output benchmark.
+    fly_us = float("nan")
+    if flydsl_qk_norm_rope_quant is not None:
+        try:
+            swa_kv_fly = torch.zeros(num_rows, D, dtype=torch.bfloat16, device=_DEV)
+            _, fly_us = run_perftest(
+                flydsl_qk_norm_rope_quant,
+                q.view(T, H * D),
+                kv.view(T, D),
+                kw,
+                cos,
+                sin,
+                pos,
+                num_q_heads=H,
+                head_dim=D,
+                rope_head_dim=RD,
+                quant=False,
+                scale_dtype="fp32",
+                swa_kv=swa_kv_fly,
+                batch_id_per_token=bid,
+                swa_block_tables=swa_block_tables,
+                swa_block_size=block_size,
+            )
+        except Exception:
+            fly_us = float("nan")
+    ratio = (us / fly_us) if fly_us == fly_us and fly_us > 0 else float("nan")
+
     return {
         "hip_us": round(us, 3),
+        "flydsl_bf16_us": (round(fly_us, 3) if fly_us == fly_us else None),
+        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),
         "bs": bs,
         "num_phys_blocks": num_phys_blocks,
         "n_pad": n_pad,
