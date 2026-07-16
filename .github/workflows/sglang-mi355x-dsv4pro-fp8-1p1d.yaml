@@ -14,10 +14,10 @@ on:
         type: string
         default: "main"
       image:
-        description: "Optional SGLang ROCm image override. Empty uses the recipe default."
+        description: "SGLang ROCm image override."
         required: false
         type: string
-        default: ""
+        default: "lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715"
       model_path:
         description: "DeepSeek-V4-Pro-FP8 path visible on the Spur compute nodes"
         required: false
@@ -71,7 +71,7 @@ permissions:
 env:
   SGLANG_REPOSITORY: sgl-project/sglang
   SGLANG_REF_DEFAULT: main
-  IMAGE_OVERRIDE_DEFAULT: ""
+  IMAGE_OVERRIDE_DEFAULT: "lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715"
   MODEL_PATH_DEFAULT: /data/models2/DeepSeek-V4-Pro-FP8
   MODEL_MOUNT_ROOTS: /it-share /data /models
   SGLANG_SPUR_IB_DEVICES: ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
