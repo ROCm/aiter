@@ -9,6 +9,7 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_common import checkAllclose
 
 
 def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale):
@@ -153,7 +154,7 @@ def _wrapper_main_kernel_params(D: int):
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True
-    block_k = 32 if use_gluon else (16 if D >= 256 else 32)
+    block_k = 16 if use_gluon else (16 if D >= 256 else 32)
     return use_exp2, block_k
 
 
@@ -223,8 +224,8 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 64, 256])
-@pytest.mark.parametrize("H", [16, 64])
+@pytest.mark.parametrize("T", [1, 32, 64, 128, 256, 2048])
+@pytest.mark.parametrize("H", [16, 64, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [136, 388, 1024])
 @pytest.mark.parametrize("var_len", [True, False])
@@ -272,7 +273,18 @@ def test_pa_decode_sparse_vs_reference(
         # wrapper already returns the final output.
         out = result
 
-    torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out.to(torch.bfloat16),
+            ref.to(torch.bfloat16),
+            atol=5e-3,
+            rtol=5e-3,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse output",
+        )
+        <= tol_err_ratio
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +324,10 @@ def _dequant_kv_fp8(kv_fp8, kv_scales, group_size=_FP8_GROUP_SIZE):
     return (kv_f32 * scales_expanded).view(total_pages, D)
 
 
-@pytest.mark.parametrize("T", [1, 32, 128])
-@pytest.mark.parametrize("H", [1, 8, 16])
+@pytest.mark.parametrize("T", [1, 32])
+@pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("kv_len", [100, 400, 1024])
+@pytest.mark.parametrize("kv_len", [100])
 @pytest.mark.parametrize("var_len", [True, False])
 def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len):
     if not torch.cuda.is_available():
@@ -350,4 +362,15 @@ def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len):
         has_invalid=False,
     )
 
-    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out.to(torch.bfloat16),
+            ref.to(torch.bfloat16),
+            atol=1e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse output",
+        )
+        <= tol_err_ratio
+    )

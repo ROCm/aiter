@@ -131,7 +131,22 @@ def pa_decode_sparse(
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
         # If H is too large to fit a single tile, halve until it does.
-        block_h = triton.next_power_of_2(min(H, 16))
+        if H >= 128:
+            block_h = 64
+        elif H >= 64:
+            if T >= 2048:
+                block_h = 64
+            elif T >= 32:
+                block_h = 32
+            else:
+                block_h = 16
+        elif H >= 32:
+            if T >= 256:
+                block_h = 32
+            else:
+                block_h = 16
+        else:
+            block_h = triton.next_power_of_2(H)
     else:
         block_h = triton.next_power_of_2(block_h)
     block_h = max(block_h, 16)  # AMD MFMA min tile
@@ -148,8 +163,15 @@ def pa_decode_sparse(
     # arches use the synchronous slot path, where 32 exposes memory latency.
     if use_gluon:
         block_k = 16
-        attn_num_warps = 1
-        max_num_wg = 1024
+        if block_h == 64:
+            attn_num_warps = 4
+            max_num_wg = 256
+        elif block_h == 32:
+            attn_num_warps = 2
+            max_num_wg = 512
+        else:
+            attn_num_warps = 1
+            max_num_wg = 1024
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
