@@ -118,7 +118,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_pa_v1.py]=20
     FILE_TIMES[op_tests/test_sample.py]=20
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_group_quant.py]=16
-    FILE_TIMES[op_tests/test_gated_rmsnorm_fp8_group_quant.py]=16
+    FILE_TIMES[op_tests/test_gated_rmsnorm_fp8_quant.py]=16
     FILE_TIMES[op_tests/test_moe_tkw1.py]=16
     FILE_TIMES[op_tests/test_fused_qk_norm.py]=15
     FILE_TIMES[op_tests/test_gemm_a16w16.py]=14
