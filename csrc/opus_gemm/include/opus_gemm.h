@@ -37,3 +37,9 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_tune(aiter_tensor_t& XQ,
 
 // Per-stream splitk workspace init. See opus_gemm.cu for rationale.
 void opus_gemm_workspace_init();
+
+// Release the per-stream splitk workspace (buffer + handles + registry entry).
+// `_release` targets the current stream; `_release_all` tears down every
+// registered stream. Both must be called in eager mode (not during capture).
+void opus_gemm_workspace_release();
+void opus_gemm_workspace_release_all();
