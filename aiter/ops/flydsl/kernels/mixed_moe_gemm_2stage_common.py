@@ -185,7 +185,7 @@ def compile_mixed_moe_gemm1_common(
     if heterogeneous_b and not is_f4_b:
         raise ValueError("Heterogeneous B requires MXFP4 routed weights")
 
-    sort_block_m = max(32, tile_m)
+    sort_block_m = tile_m
     num_waves = min(4, tile_n // 32)
     # accumulators are reduced in LDS before the epilogue. k_wave=1 keeps the
     num_n_waves = num_waves
@@ -658,7 +658,12 @@ def compile_mixed_moe_gemm1_common(
             if const_expr(not a_scale_one):
                 c32 = arith.constant(32, index=True)
                 kblk = k_in // c32
-                sx_nbytes_idx = sorted_m * kblk
+                scale_rows = (
+                    (sorted_m + arith.constant(31, index=True))
+                    // arith.constant(32, index=True)
+                    * arith.constant(32, index=True)
+                )
+                sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
@@ -3794,7 +3799,12 @@ def compile_mixed_moe_gemm2_common(
             if const_expr(is_f4_a or is_f8_a):
                 # #3476: use 256-padded K/32 to match host scale padding.
                 kblk = arith.constant(scale_kblk_padded, index=True)
-                sx_nbytes_idx = num_valid_idx * kblk
+                scale_rows = (
+                    (num_valid_idx + arith.constant(31, index=True))
+                    // arith.constant(32, index=True)
+                    * arith.constant(32, index=True)
+                )
+                sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
             else:
