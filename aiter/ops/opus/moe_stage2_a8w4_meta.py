@@ -33,6 +33,8 @@ OPUS_A8W4_KID_K3_ROUTE_BF16_BM32_FULL_N7168_SMALL = 2008
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_SORT128_RBN3072 = 2009
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_SORT128_RBN3584 = 2010
 OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584_VALIDROWS = 2011
+OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3712 = 2014
+OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3712_VALIDROWS = 2015
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_OCC6_B2_WS2 = 2100
 OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_B3_WS2 = 2101
 OPUS_A8W4_KID_K5_ROUTE_BF16_BM64_FULL_N7168 = 2110
@@ -244,6 +246,12 @@ OPUS_A8W4_ROUTE_REDUCE_INSTANCES = (
         threads=448,
         suffix="rbn3584",
     ),
+    OpusA8W4RouteReduceInstance(
+        name="rbn3712",
+        block_n=3712,
+        threads=464,
+        suffix="rbn3712",
+    ),
 )
 
 OPUS_A8W4_ROUTE_REDUCE_BY_NAME = {
@@ -362,6 +370,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         min_tuner_token=8,
         max_tuner_token=4096,
         shape_family=_K3,
+        tuner_candidate=False,
     ),
     _route_stage2_instance(
         kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC5_RBN2304,
@@ -374,6 +383,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         min_tuner_token=8,
         max_tuner_token=4096,
         shape_family=_K3,
+        tuner_candidate=False,
     ),
     _route_stage2_instance(
         kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072,
@@ -471,6 +481,30 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         sort_block_m=64,
         route_reduce="rbn3584",
         assume_sorted_rows_valid=True,
+        tuner_candidate=False,
+        min_tuner_token=2048,
+        shape_family=_K3,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3712,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn3712",
+        tuner_candidate=False,
+        min_tuner_token=2048,
+        shape_family=_K3,
+    ),
+    _route_stage2_instance(
+        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3712_VALIDROWS,
+        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_validrows",
+        out_mode=OPUS_A8W4_OUT_MODE_FP8,
+        block_m=64,
+        sort_block_m=64,
+        route_reduce="rbn3712",
+        assume_sorted_rows_valid=True,
+        tuner_candidate=False,
         min_tuner_token=2048,
         shape_family=_K3,
     ),

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 if TYPE_CHECKING:
@@ -143,6 +144,59 @@ def per_1x32_f4_quant(
     x = x.view(-1, shape_original[-1])
 
     m, n = x.shape
+    chunk_rows_env = os.environ.get("AITER_MXFP4_QUANT_CHUNK_ROWS", "").strip()
+    if chunk_rows_env:
+        chunk_rows = max(1, int(chunk_rows_env))
+        y_out = torch.empty(
+            (*shape_original[:-1], shape_original[-1] // 2),
+            dtype=dtypes.fp4x2,
+            device=x.device,
+        )
+        scale_out = torch.empty(
+            (m, n // block_size),
+            dtype=torch.uint8,
+            device=x.device,
+        )
+        y_out_2d = y_out.view(m, n // 2)
+        for row_begin in range(0, m, chunk_rows):
+            row_end = min(row_begin + chunk_rows, m)
+            x_chunk = x[row_begin:row_end].view(-1, block_size)
+            max_abs = torch.amax(torch.abs(x_chunk.float()), 1)
+            try:
+                scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
+                    max_abs, mode=round_mode, dtype=MxDtypeInt.FP4_E2M1
+                )
+            except ValueError as e:
+                raise ValueError(
+                    "per_1x32_f4_quant: invalid "
+                    f"round_mode={round_mode!r} "
+                    f"(type={type(round_mode).__name__}); "
+                    "expected 0 (RoundDown/FLOOR), 1 (RoundUp/RCEIL), "
+                    "2 (Even), 3 (Ceil), or any MxScaleRoundMode value."
+                ) from e
+
+            scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
+            y_chunk = x_chunk.float() / scale_f32.view(-1, 1)
+            y_chunk = fp4_utils.f32_to_mxfp4(y_chunk)
+            y_out_2d[row_begin:row_end] = y_chunk.view(row_end - row_begin, -1)
+
+            scale_chunk = scale_e8m0_biased.view(row_end - row_begin, -1).view(
+                torch.uint8
+            )
+            scale_out[row_begin:row_end] = scale_chunk
+
+        if shuffle:
+            scale_out = fp4_utils.e8m0_shuffle(scale_out)
+        scale_out = scale_out.view(dtypes.fp8_e8m0)
+
+        if transposed:
+            y_out = y_out.T.contiguous()
+            scale_out = scale_out.view(torch.uint8).T.contiguous().view(
+                dtypes.fp8_e8m0
+            )
+
+        return y_out, scale_out
+
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
 

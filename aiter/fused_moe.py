@@ -2353,6 +2353,9 @@ def torch_moe_stage1(
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    lowmem_mxfp4_w1_ref = False
+    lowmem_mxfp4_w1_scale = None
+    fp4_utils = None
     if quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: int4 weights viewed as int8 for compute
         hidden_states = hidden_states.to(ctype)
@@ -2362,6 +2365,11 @@ def torch_moe_stage1(
 
         if w1.dtype == dtypes.fp8:  # mxfp8 weight
             w1 = w1.to(ctype)
+        elif (
+            w1.dtype == dtypes.fp4x2
+            and os.environ.get("AITER_MXFP4_STAGE1_REF_LOW_MEM", "0") == "1"
+        ):
+            lowmem_mxfp4_w1_ref = True
         else:
             w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
@@ -2410,11 +2418,14 @@ def torch_moe_stage1(
         w1 = w1.reshape(w1_shape)
         # activations are bf16, no scaling needed
     elif quant_type == QuantType.per_1x32:
-        w1_shape = w1.shape
-        w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
-            E, N, model_dim // 32, 1
-        )
-        w1 = w1.view(w1_shape)
+        if not lowmem_mxfp4_w1_ref:
+            w1_shape = w1.shape
+            w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
+                E, N, model_dim // 32, 1
+            )
+            w1 = w1.view(w1_shape)
+        else:
+            lowmem_mxfp4_w1_scale = w1_scale.view(E, N, model_dim // 32, 1)
 
         a1_shape = hidden_states.shape
         hidden_states = hidden_states.view(a1_shape[0], a1_shape[1] // 32, 32)
@@ -2438,7 +2449,17 @@ def torch_moe_stage1(
         mask = topk_ids == E_id
         if mask.sum():
             sub_tokens = hidden_states[mask]
-            act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
+            if lowmem_mxfp4_w1_ref:
+                w1_e = fp4_utils.mxfp4_to_f32(w1[E_id])
+                w1_e_shape = w1_e.shape
+                w1_e = (
+                    w1_e.view(N, model_dim // 32, 32)
+                    * lowmem_mxfp4_w1_scale[E_id]
+                )
+                w1_e = w1_e.view(w1_e_shape)
+            else:
+                w1_e = w1[E_id]
+            act_input = sub_tokens @ (w1_e.transpose(0, 1))
             if doweight:
                 act_input = act_input * topk_weight[mask].view(-1, 1)
             out[mask] = act_input
@@ -2476,6 +2497,9 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    lowmem_mxfp4_w2_ref = False
+    lowmem_mxfp4_w2_scale = None
+    fp4_utils = None
     if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.i4x2:
         # a16wi4: int4 weights viewed as int8 for compute
         hidden_states = hidden_states.to(ctype)
@@ -2485,6 +2509,11 @@ def torch_moe_stage2(
 
         if w2.dtype == dtypes.fp8:  # mxfp8 weight
             w2 = w2.to(ctype)
+        elif (
+            w2.dtype == dtypes.fp4x2
+            and os.environ.get("AITER_MXFP4_STAGE2_REF_LOW_MEM", "0") == "1"
+        ):
+            lowmem_mxfp4_w2_ref = True
         else:
             w2 = fp4_utils.mxfp4_to_f32(w2)
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
@@ -2541,11 +2570,14 @@ def torch_moe_stage2(
             )
         hidden_states = hidden_states.view(a2_shape)
 
-        w2_shape = w2.shape
-        w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
-            E, model_dim, inter_dim // 32, 1
-        )
-        w2 = w2.view(w2_shape)
+        if not lowmem_mxfp4_w2_ref:
+            w2_shape = w2.shape
+            w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
+                E, model_dim, inter_dim // 32, 1
+            )
+            w2 = w2.view(w2_shape)
+        else:
+            lowmem_mxfp4_w2_scale = w2_scale.view(E, model_dim, inter_dim // 32, 1)
 
     out = torch.zeros(
         (token_num, topk, model_dim),
@@ -2556,12 +2588,25 @@ def torch_moe_stage2(
         mask = topk_ids == E_id
         if mask.sum():
             sub_tokens = hidden_states[mask]
-            act_input = sub_tokens @ (w2[E_id].transpose(0, 1))
+            if lowmem_mxfp4_w2_ref:
+                w2_e = fp4_utils.mxfp4_to_f32(w2[E_id])
+                w2_e_shape = w2_e.shape
+                w2_e = (
+                    w2_e.view(model_dim, inter_dim // 32, 32)
+                    * lowmem_mxfp4_w2_scale[E_id]
+                )
+                w2_e = w2_e.view(w2_e_shape)
+            else:
+                w2_e = w2[E_id]
+            act_input = sub_tokens @ (w2_e.transpose(0, 1))
             out[mask] = act_input
             if w2_bias is not None:
                 out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
     if doweight:
-        out = out * topk_weights.view(token_num, -1, 1)
+        if lowmem_mxfp4_w2_ref:
+            out.mul_(topk_weights.view(token_num, -1, 1))
+        else:
+            out = out * topk_weights.view(token_num, -1, 1)
     return out.sum(1).to(dtype)
 
 

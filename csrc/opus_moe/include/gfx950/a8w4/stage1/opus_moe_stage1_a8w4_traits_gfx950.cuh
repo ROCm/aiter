@@ -244,6 +244,8 @@ struct OpusMoeStage1A8W4Shape
 
 using OpusMoeStage1A8W4P0Bm32Bn384GateUpGroupSplitNoClamp =
     OpusMoeStage1A8W4Shape<32, 384, 256, 32, 2, true, 0, 1, false, false>;
+using OpusMoeStage1A8W4P0Bm32Bn384GateUpGroupSplitCapRoutesAssumeRouteSplitBNoClampMin1 =
+    OpusMoeStage1A8W4Shape<32, 384, 256, 32, 2, true, 0, 1, true, false, true, 1, false, true>;
 using OpusMoeStage1A8W4P0Bm16Bn384G6KWave1NoClampGroupSplitMin1AReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, true, 6, 1, true, false, false, 1>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2PairGateUpAReuse =
@@ -264,12 +266,18 @@ using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampMin3PairGateUpAReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, false, 3, false, false, true>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampMin4PairGateUpAReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, false, 4, false, false, true>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1 =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, false, false, false, 1>;
 using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1AsyncACapRoutesAssumeRouteSplitB =
     OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, true, false, true, 1, false, true, false, true>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1AsyncACapRoutesAssumeRouteSplitBNoScaleGuard =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, true, false, true, 1, true, true, false, true>;
 using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin3NoScaleGuardSplitB =
     OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, true, 3, true>;
 using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin2NoScaleGuardFullNextA =
     OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 0, true, false, false, false, true>;
+using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin2NoScaleGuardFullNextASplitB =
+    OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, true, 0, true, false, false, false, true>;
 using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin3NoScaleGuardFullNextA =
     OpusMoeStage1A8W4Shape<128, 384, 256, 128, 2, true, 0, 1, false, false, false, 3, true, false, false, false, true>;
 using OpusMoeStage1A8W4P0Bm128Bn384GateUpGroupSplitNoClampMin4NoScaleGuardFullNextA =

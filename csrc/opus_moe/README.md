@@ -65,51 +65,45 @@ Supported A8W4 kernel ids:
 
 Numbering convention:
 
-- `2000-2099`: K3 decode candidates, assigned contiguously.
+- `2000-2099`: K3 decode candidates; retired ids may leave gaps.
 - `2100-2109`: K5 direct atomic bring-up candidates.
 - `2110-2119`: K5 route-output bring-up candidates.
 
-The current K3 active ids are contiguous. Synthetic balanced / round-robin and
-full-tile experiments were retired because they are not valid for general MoE
-routing.
+Synthetic balanced / round-robin and full-tile experiments were retired because
+they are not valid for the current general MoE routing and formal tuning path.
+Legacy non-wave-aligned reduce KIDs are retained for explicit old configs but
+disabled from the tuner candidate set.
 
 | kid | name | block shape | output contract |
 |---:|---|---|---|
 | `-1` | auto | selected by host shape/block rules | direct-atomic only |
-| `2000` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2` | `BM16 x BN64`, `sort_block_m=16` | direct atomic; tuner candidate only for `token <= 1024` |
-| `2001` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn2560` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2002` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3008` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2003` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2004` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3136` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2005` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3200` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2006` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3264` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2007` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3328` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2008` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3456` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2009` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2010` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64` | `BM64 x BN256`, `sort_block_m=64` | BF16 route output, then reduce; source retained for explicit use, disabled from tuner because it is not competitive for K3 targets |
+| `2000` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2` | `BM16 x BN64`, `sort_block_m=16` | direct atomic; tuner token `<=1024` |
+| `2001` | `opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ4_rbn2240` | `BM32 x BN256`, `sort_block_m=32` | MXFP8 route output, reduce `rbn2240`, `occ4`; explicit only, disabled from tuner |
+| `2002` | `opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ5_rbn2304` | `BM32 x BN256`, `sort_block_m=32` | MXFP8 route output, reduce `rbn2304`, `occ5`; explicit only, disabled from tuner |
+| `2003` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce `rbn3072`, tuner token `>=128` |
+| `2004` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce `rbn3584`, tuner token `>=128` |
+| `2005` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64` | `BM64 x BN256`, `sort_block_m=64` | BF16 route output, full-model reduce, tuner token `>=4096` |
+| `2006` | `opus_moe2_afp8_wfp4_atomic_t32x128x256_sbm32_occ1_cache_b3_ws2` | `BM32 x BN128`, `sort_block_m=32` | direct atomic, `occ1`, tuner token `1..2048` |
+| `2007` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_cache_b3_rbn3072` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce `rbn3072`, `cache_b3`, tuner token `>=128` |
+| `2008` | `opus_moe2_afp8_wfp4_bf16_t32x256x256_sbm32_small` | `BM32 x BN256`, `sort_block_m=32` | BF16 route output, full-model reduce, tuner token `1..64` |
+| `2009` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm128_rbn3072` | `BM64 x BN256`, `sort_block_m=128` | MXFP8 route output, reduce `rbn3072`, tuner token `>=2048` |
+| `2010` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm128_rbn3584` | `BM64 x BN256`, `sort_block_m=128` | MXFP8 route output, reduce `rbn3584`, tuner token `>=2048` |
+| `2011` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_validrows_rbn3584` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce `rbn3584`, explicit only; fast metadata path filters `moe_sorting` padding via `token < token_num` |
 | `2100` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_occ6_cache_b2_ws2_k5` | `BM16 x BN64`, `sort_block_m=16` | K5 direct atomic bring-up |
 | `2101` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2_k5` | `BM16 x BN64`, `sort_block_m=16` | K5 direct atomic bring-up |
 | `2110` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_k5` | `BM64 x BN256`, `sort_block_m=64` | K5 BF16 route output, then reduce |
 | `2111` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_k5_rbn2816` | `BM64 x BN256`, `sort_block_m=64` | K5 MXFP8 route output, then reduce |
 
-Experimental A8W4 stage1 ids use the 10xx namespace:
-
-| kid | name | block shape | status |
-|---:|---|---|---|
-| `1010` | `opus_moe1_a8w4_bm16_bn384_g1_kw4_a_reuse_mfma` | `BM16 x BN384`, `sort_block_m=16`, `K_WAVE=4` | token=1/2 small-token path |
-| `1020` | `opus_moe1_a8w4_bm16_bn64_sbm32_g1_kw2_a_reuse_mfma` | `BM16 x BN64`, `sort_block_m=32`, `K_WAVE=2` | token=4 small-token path |
-| `1030` | `opus_moe1_a8w4_bm16_bn64_sbm32_g1_a_reuse_mfma` | `BM16 x BN64`, `sort_block_m=32` | token=8/16 small-token path |
-| `1040` | `opus_moe1_a8w4_bm32_bn384_a_reuse_mfma` | `BM32 x BN384`, `sort_block_m=32` | token=64/256/512/1024 replay/tuner |
-| `1050` | `opus_moe1_a8w4_bm64_bn384_gateup_groupsplit` | `BM64 x BN384`, `sort_block_m=64` | token=128 replay/tuner |
-| `1060` | `opus_moe1_a8w4_bm128_bn256_gateup_groupsplit` | `BM128 x BN256`, `sort_block_m=128` | token=32 and token>=2048 replay/tuner |
-| `1070` | `opus_moe1_a8w4_bm64_bn256_gateup_groupsplit` | `BM64 x BN256`, `sort_block_m=64` | token=4096 replay/tuner |
+Experimental A8W4 stage1 ids use the 10xx namespace.
 
 These stage1 ids are experimental. They are reachable through the explicit
 `opus_moe_stage1_a8w4_fwd` API, the Python wrapper
 `aiter/ops/opus/moe_stage1_a8w4.py`, and opt-in flags in
 `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`. They are not used by
 fused MoE default dispatch; the current DSV4 tuned CSV does not contain
-`opus_moe1_a8w4_*` entries.
+`opus_moe1_a8w4_*` entries. The authoritative stage1 candidate list lives in
+`aiter/ops/opus_moe_stage1_a8w4_meta.py`; the stage1 subdirectory README
+summarizes the current 10xx table.
 
 In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
 `kernelName2` value from the table above. The generic wrapper name

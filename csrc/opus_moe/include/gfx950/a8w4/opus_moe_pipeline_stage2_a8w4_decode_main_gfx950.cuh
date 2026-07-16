@@ -138,8 +138,11 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
             const int32_t packed = kargs.sorted_token_ids[row];
             const int token = opus_moe_token_id(packed);
             const int slot = opus_moe_topk_slot(packed);
+            // moe_sorting padding rows are encoded as token_num/topk. The fast
+            // variant trusts the slot for real tokens, but still filters
+            // padding tokens so route-out stores and A loads stay in-bounds.
             const bool valid_route =
-                T::ASSUME_SORTED_ROWS_VALID ? true :
+                T::ASSUME_SORTED_ROWS_VALID ? (token < token_num) :
                                                (token < token_num && slot < topk);
             if(valid_route)
             {

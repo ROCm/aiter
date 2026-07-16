@@ -1047,18 +1047,22 @@ class FmoeTuner(TunerCommon):
         torch.manual_seed(0)
         input = torch.randn((token, model_dim), dtype=dtype) / 10
         if use_g1u1:
-            w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
+            w1_shape = (expert, inter_dim * 2, model_dim)
         else:
-            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
-        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
+            w1_shape = (expert, inter_dim, model_dim)
+        w2_shape = (expert, model_dim, inter_dim)
+        w1 = torch.randn(w1_shape, dtype=dtype) / 10
         w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+        del w1
+        w2 = torch.randn(w2_shape, dtype=dtype)
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
+        del w2
         if q_dtype_w is not dtypes.fp4x2:
-            w1_qt = w1_qt.view(w1.shape)
-            w2_qt = w2_qt.view(w2.shape)
+            w1_qt = w1_qt.view(w1_shape)
+            w2_qt = w2_qt.view(w2_shape)
         else:
-            w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-            w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+            w1_qt = w1_qt.view(w1_shape[0], w1_shape[1], w1_shape[2] // 2)
+            w2_qt = w2_qt.view(w2_shape[0], w2_shape[1], w2_shape[2] // 2)
         if TUNE_MOE_EXPERT_BALANCE:
             score = torch.zeros((token, expert), dtype=dtype)
             start_col = 0
@@ -1093,7 +1097,7 @@ class FmoeTuner(TunerCommon):
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
-        del w1, w2, score
+        del score
         if q_dtype_w is not dtypes.fp4x2:
             w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
             w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
@@ -3522,6 +3526,7 @@ class FmoeTuner(TunerCommon):
         ) = info
 
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
+            OPUS_A8W4_STAGE2_INSTANCES,
             get_opus_a8w4_stage2_kernels,
             opus_a8w4_shape_family_for_shape,
         )
@@ -3532,6 +3537,14 @@ class FmoeTuner(TunerCommon):
             expert=expert,
             topk=topk,
         )
+        only_kids_env = os.environ.get("OPUS_STAGE2_A8W4_ONLY_KIDS", "").strip()
+        only_kids = None
+        if only_kids_env:
+            only_kids = {
+                int(kid.strip())
+                for kid in only_kids_env.split(",")
+                if kid.strip()
+            }
         # gfx950 + a8w4 (fp8 act / fp4 weight / per_1x32) + g1u1 + supported
         # shape family. Kids are filtered by their bound shape family below.
         if not (
@@ -3574,16 +3587,30 @@ class FmoeTuner(TunerCommon):
             "bias",
         ]
 
+        if only_kids is None:
+            opus_stage2_kernels = get_opus_a8w4_stage2_kernels(
+                shape_family=shape_family.name,
+                token=token,
+            )
+        else:
+            opus_stage2_kernels = {
+                inst.tuner_name: inst.tuner_params()
+                for inst in OPUS_A8W4_STAGE2_INSTANCES
+                if inst.kid in only_kids
+                if inst.shape_family == shape_family.name
+                if inst.supports_tuner_token(token)
+            }
+
         for blockM in blockMs:
             if blockM not in (16, 32, 64, 128):
                 continue
-            for kname, kparams in get_opus_a8w4_stage2_kernels(
-                shape_family=shape_family.name,
-                token=token,
-            ).items():
+            for kname, kparams in opus_stage2_kernels.items():
                 # tuner blockM is the moe_sorting block_m; valid only when it
                 # equals the kid's SORT_BLOCK_M.
                 if kparams["sort_block_m"] != blockM:
+                    continue
+                kernel_id = int(kparams.get("kid", -1))
+                if only_kids is not None and kernel_id not in only_kids:
                     continue
                 if not shape_family.matches(
                     model_dim=model_dim,
@@ -3735,6 +3762,7 @@ class FmoeTuner(TunerCommon):
 
         from aiter.ops.opus_moe_stage1_a8w4_meta import (
             get_opus_a8w4_stage1_kernels,
+            opus_a8w4_stage1_instance,
         )
 
         only_kids_env = os.environ.get("OPUS_STAGE1_A8W4_ONLY_KIDS", "").strip()
@@ -3745,7 +3773,14 @@ class FmoeTuner(TunerCommon):
                 for kid in only_kids_env.split(",")
                 if kid.strip()
             }
-        stage1_kernels = get_opus_a8w4_stage1_kernels(token)
+        if only_kids is None:
+            stage1_kernels = get_opus_a8w4_stage1_kernels(token)
+        else:
+            stage1_kernels = {}
+            for kernel_id in sorted(only_kids):
+                inst = opus_a8w4_stage1_instance(kernel_id)
+                if inst is not None:
+                    stage1_kernels[inst.name] = inst.tuner_params()
 
         for s1_name, kparams in stage1_kernels.items():
             kernel_block_m = int(kparams["block_m"])

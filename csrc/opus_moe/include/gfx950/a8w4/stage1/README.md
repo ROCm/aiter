@@ -58,8 +58,9 @@ opus_moe_stage1_a8w4_epilogue_gfx950.cuh
   `rc -> shared gate/up -> SiLU -> MXFP8 quant -> output/out_scale`.
 
 opus_moe_stage1_a8w4_pipeline_gfx950.cuh
-  Small orchestration wrapper: allocate shared scratch, create layouts, call
-  mainloop, call epilogue, and expose the kernel symbol.
+  Thin free-function orchestration: allocate shared scratch, map the CTA tile,
+  create layouts/MFMA, call mainloop, call epilogue, and expose the kernel
+  symbol without a wrapper struct.
 
 opus_moe_stage1_a8w4_dispatch_gfx950.cuh
   Stage1 `kid -> traits -> launch` dispatch. The switch cases are generated
@@ -78,55 +79,72 @@ the generated `opus_moe_stage1_a8w4_meta.h` / `opus_moe_stage1_a8w4_manifest.h`
 headers. They use the 10xx range; A8W4 stage2 ids are generated from the
 stage2 meta manifest outside this experimental range.
 
-1010: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
-      single output-group A-reuse path. Candidate for token=1/2/4/8/16/32;
-      currently useful for token8/32 and retained for token16 comparison.
+1006: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G1 K_WAVE=2,
+      cap-routes, split-selector-B, min2 pair-gate/up A-reuse path. Historical
+      tuner token hint: 8.
 
-1020: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32, K_WAVE=2,
-      single output-group A-reuse path. Selected for token=4 only.
+1009: P0 BM128 x BN384 x BK256, SORT_BLOCK_M=128, gate/up group-split,
+      noclamp min2, no-scale-guard full-next-A path. Historical tuner token
+      hints: 8192/16384.
 
-1030: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32,
-      single output-group A-reuse path. Selected for token=8/16.
+1011: P0 BM128 x BN384 x BK256, SORT_BLOCK_M=128, gate/up group-split,
+      noclamp min3, no-scale-guard full-next-A path. Historical tuner token
+      hints: 8192/16384.
 
-1040: P0 BM32 x BN384 x BK256, SORT_BLOCK_M=32,
-      full six-output-group A-reuse path. Candidate for token=64/256/512/1024.
+1013: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G1 K_WAVE=4,
+      cap-routes, split-selector-B, min1 pair-gate/up A-reuse path. Historical
+      tuner token hints: 1/4/16/32/64/128/256/512.
 
-1050: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64,
-      gate/up group-split path. Candidate for token=128.
+1014: P0 BM32 x BN384 x BK256, SORT_BLOCK_M=32, gate/up group-split noclamp
+      path. Historical tuner token hints: 512/1024/2048.
 
-1060: P0 BM128 x BN256 x BK256, SORT_BLOCK_M=128,
-      EPILOGUE_ROW_SPLIT=2, gate/up group-split ownership. Candidate for
-      token=32 and token buckets >=2048.
+1015: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G1 K_WAVE=4,
+      cap-routes, split-selector-B, min2 pair-gate/up A-reuse path. Historical
+      tuner token hints: 4/16/32/64/128/256/512.
 
-1070: P0 BM64 x BN256 x BK256, SORT_BLOCK_M=64,
-      gate/up group-split path with BM64-specific shared-memory swizzle.
-      Candidate for token=4096 replay.
+1017: P0 BM128 x BN384 x BK256, SORT_BLOCK_M=128, gate/up group-split,
+      noclamp min4, no-scale-guard full-next-A path. Historical tuner token
+      hints: 8192/16384.
 
-1083: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=1,
-      single output-group A-reuse path. Candidate for token=16 only.
+1019: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64, t4096 gate/up group-split,
+      noclamp min1 path without async-A/cap-routes/assume-route split-B.
+      Historical tuner token hint: 8192.
 
-1087: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
-      single output-group A-reuse path with route tile cap. Probe for token=8.
+1021: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G1 K_WAVE=4,
+      cap-routes, split-selector-B, min3 pair-gate/up A-reuse path. Historical
+      tuner token hint: 256.
 
-1090: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=2,
-      single output-group A-reuse path with route tile cap. Candidate for
-      token=8.
+1022: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64, t4096 gate/up group-split,
+      noclamp min1, async-A, cap-routes, assume-route split-B path. Historical
+      tuner token hints: 4096/32768.
 
-1091: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32, K_WAVE=2,
-      single output-group A-reuse path with route tile cap. Candidate for
-      token=4.
+1025: P0 BM128 x BN384 x BK256, SORT_BLOCK_M=128, gate/up group-split,
+      noclamp min2, no-scale-guard full-next-A split-B path. Historical tuner
+      token hints: 8192/16384.
 
-1094: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=1,
-      single output-group A-reuse path with output FP8 clamp disabled.
-      Candidate for token=16.
+1026/1027/1028/1029: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G1 K_WAVE=4,
+      cap-routes noclamp min1/min2/min3/min4 pair-gate/up A-reuse variants.
+      Historical tuner token hint: 256.
 
-1095: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
-      single output-group A-reuse path with output FP8 clamp disabled.
-      Candidate for token=32.
+1031: P0 BM128 x BN384 x BK256, SORT_BLOCK_M=128, gate/up group-split,
+      noclamp min3, no-scale-guard split-B path. Historical tuner token hint:
+      4096.
 
-1096/1097: rejected three-output-group K_WAVE=4 probes. They were slower in
-      strict current-code C48/C49/C51 runs and are intentionally not exposed
-      through metadata or wrapper constants.
+1041: P0 BM32 x BN384 x BK256, SORT_BLOCK_M=32, gate/up group-split,
+      cap-routes, assume-route split-B, noclamp min1 path. Historical tuner
+      token hints: 512/1024/2048.
+
+1049: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64, t4096 gate/up group-split,
+      noclamp min1, async-A, cap-routes, assume-route split-B, no-scale-guard
+      path. Historical tuner token hint: 32768.
+
+1074: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G1 K_WAVE=4,
+      cap-routes, split-selector-B A-reuse path. Historical tuner token hints:
+      2/64/128.
+
+1099: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, G6 K_WAVE=1,
+      noclamp group-split min1 A-reuse path. Historical tuner token hints:
+      256/1024.
 ```
 
 Current code structure:
@@ -147,7 +165,8 @@ epilogue
   Owns `rc -> shared gate/up -> SiLU -> MXFP8 quant -> output/out_scale`.
 
 pipeline
-  Composes policy/mainloop/epilogue and exposes the kernel symbol.
+  Uses free-function helpers to preserve codegen while keeping the body in Opus
+  GEMM order: tile/layout creation, MFMA creation, mainloop, then epilogue.
 
 dispatch
   Maps `kid -> traits -> launch`.
