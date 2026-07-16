@@ -37,7 +37,18 @@ from torch import Tensor
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
 _launch_gemm_a8w8_tdm = None
 _ptr_arg = None
-_run_compiled = None
+_flyc = None
+
+# Per-config compiled-kernel cache. The kernel bakes tile_m/tile_n/tile_k/
+# m_warp/n_warp/out_is_f16/batch/layout_mbn/num_buffers in as Constexpr, so each
+# distinct config is a DIFFERENT compiled binary. tensor_shim._run_compiled only
+# caches ONE CompiledFunction per launcher object (exe._cf); reusing the single
+# module-global launcher for every config would collide -- the first-compiled
+# config's binary would be (silently) reused for all later configs, giving wrong
+# results whenever batch/layout/out-dtype changed. So cache the CompiledFunction
+# ourselves, keyed on the full Constexpr tuple. Runtime args (pointers, M, N, K,
+# stream) still vary freely per call.
+_CF_CACHE: dict = {}
 
 _WMMA_K = 128
 _SCALE_BLOCK = 128
@@ -45,15 +56,17 @@ _OUT_IS_F16 = {torch.bfloat16: 0, torch.float16: 1}
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8_tdm, _run_compiled, _ptr_arg
+    global _launch_gemm_a8w8_tdm, _ptr_arg, _flyc
     if _launch_gemm_a8w8_tdm is not None:
         return
+    import flydsl.compiler as flyc
+
     from .kernels.a8w8_bmm_bpreshuffle_gfx1250 import launch_gemm_a8w8_tdm
-    from .kernels.tensor_shim import _run_compiled as runner, ptr_arg
+    from .kernels.tensor_shim import ptr_arg
 
     _launch_gemm_a8w8_tdm = launch_gemm_a8w8_tdm
-    _run_compiled = runner
     _ptr_arg = ptr_arg
+    _flyc = flyc
 
 
 # flydsl_blockscale_bpreshuffle_bmm_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_nb{nb}_sk{sk}_cm{cm}_cn{cn}
@@ -160,10 +173,9 @@ def run_blockscale_bpreshuffle_bmm_gfx1250(
 
     stream = torch.cuda.current_stream(device=A.device)
     # arg_a / arg_b are declared fx.Pointer in the kernel: wrap the torch tensors
-    # as PointerJitArg so the cached fast-dispatch path (cf(*args)) binds them as
-    # raw device pointers. arg_c / scale_a / scale_b stay fx.Tensor (passed raw).
-    _run_compiled(
-        _launch_gemm_a8w8_tdm,
+    # as PointerJitArg so the fast-dispatch path binds them as raw device
+    # pointers. arg_c / scale_a / scale_b stay fx.Tensor (passed raw).
+    args = (
         Out,
         _ptr_arg(A),
         _ptr_arg(B),
@@ -183,6 +195,23 @@ def run_blockscale_bpreshuffle_bmm_gfx1250(
         int(layout_mbn),
         int(num_buffers),
     )
+    cf_key = (
+        int(tile_m),
+        int(tile_n),
+        int(tile_k),
+        int(m_warp),
+        int(n_warp),
+        int(out_is_f16),
+        int(batch),
+        int(layout_mbn),
+        int(num_buffers),
+    )
+    cf = _CF_CACHE.get(cf_key)
+    if cf is None:
+        cf = _flyc.compile(_launch_gemm_a8w8_tdm, *args)
+        _CF_CACHE[cf_key] = cf
+    else:
+        cf(*args)
     return Out
 
 

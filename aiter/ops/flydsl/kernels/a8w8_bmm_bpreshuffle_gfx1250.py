@@ -122,13 +122,13 @@ def launch_gemm_a8w8_tdm(
             c_outer_off, c_inner_off, c_stride = (
                 blk_m64,
                 bz64 * n64 + blk_n64,
-                i32_n * batch,
+                n64 * batch,
             )
         else:
             SA_OUTER_STRIDE = K128
-            # [B, M, K//128]
+            # [B, m, K//128]
             sa_batch_off = bz64 * m64 * K128
-            c_outer_off, c_inner_off, c_stride = bz64 * m64 + blk_m64, blk_n64, i32_n
+            c_outer_off, c_inner_off, c_stride = bz64 * m64 + blk_m64, blk_n64, n64
 
         SB_OUTER_STRIDE = K128
         sb_batch_off = bz64 * (N_SUPERS * K128)
@@ -141,14 +141,8 @@ def launch_gemm_a8w8_tdm(
 
         stC_idx = _bidx(base_ptr)
 
-        _sh = fx.AddressSpace.Shared
-        _p8_align1 = fx.PointerType.get(
-            elem_ty=fx.Int8.ir_type, address_space=_sh, alignment=1
-        )
-        _base_ptr1 = fx.recast_iter(_p8_align1, base_ptr)
-
         def _buf_ptr(s):
-            return fx.add_offset(_base_ptr1, s * PITCH)
+            return fx.add_offset(base_ptr, s * PITCH)
 
         def _gv(base, off, shape, stride):
             return fx.Tensor(
