@@ -901,10 +901,6 @@ def fused_moe_1stage(
             # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
             a1_scale = torch.empty(0, device="cuda")
-            logger.info(
-                f"[xbf16] kernel gets BF16 input: a1.dtype={a1.dtype} a1.shape={a1.shape} "
-                f"a1_scale.shape={a1_scale.shape}"
-            )
         else:
             quant_func = get_quant(quant_type)
             if hidden_states.dtype != q_dtype_a:
