@@ -605,6 +605,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         raw_max_m = max(_cfg_max_m, token_num * topk)
     else:
         raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
+        raw_max_m = max(raw_max_m, token_num * topk)
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
