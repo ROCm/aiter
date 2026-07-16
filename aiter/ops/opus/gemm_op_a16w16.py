@@ -556,7 +556,7 @@ def _opus_gemm_a16w16_bhsd_raw(
 
 
 def _gen_opus_gemm_a16w16_mmajor_fake_tensors(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     kernelId: int = 208,
@@ -566,7 +566,7 @@ def _gen_opus_gemm_a16w16_mmajor_fake_tensors(
 
 
 def _gen_opus_gemm_a8w8_scale_mmajor_fake_tensors(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     x_scale: torch.Tensor,
@@ -586,7 +586,7 @@ def _gen_opus_gemm_a8w8_scale_mmajor_fake_tensors(
     develop=True,
 )
 def _opus_gemm_a8w8_scale_mmajor_raw(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     x_scale: torch.Tensor,
@@ -595,7 +595,7 @@ def _opus_gemm_a8w8_scale_mmajor_raw(
 
 
 def _gen_opus_gemm_uniform_scale_fake_tensors(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     x_scale: torch.Tensor,
@@ -616,7 +616,7 @@ def _gen_opus_gemm_uniform_scale_fake_tensors(
     develop=True,
 )
 def _opus_gemm_uniform_scale_raw(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     x_scale: torch.Tensor,
@@ -626,7 +626,7 @@ def _opus_gemm_uniform_scale_raw(
 
 
 def _gen_opus_gemm_uniform_scale_mmajor_fake_tensors(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     x_scale: torch.Tensor,
@@ -647,7 +647,7 @@ def _gen_opus_gemm_uniform_scale_mmajor_fake_tensors(
     develop=True,
 )
 def _opus_gemm_uniform_scale_mmajor_raw(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     x_scale: torch.Tensor,
@@ -668,7 +668,7 @@ def _opus_gemm_uniform_scale_mmajor_raw(
     develop=True,
 )
 def _opus_gemm_a16w16_mmajor_raw(
-    O: torch.Tensor,
+    x: torch.Tensor,
     wo_a: torch.Tensor,
     Y: torch.Tensor,
     kernelId: int = 208,

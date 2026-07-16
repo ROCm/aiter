@@ -61,11 +61,11 @@ def run_torch(O_fp8, W_fp8, x_scale, w_scale):
     """Reference: dequant fp8 -> fp32 einsum -> [G,M,N]. Not timed."""
     G, M, K = O_fp8.shape
     N = W_fp8.shape[1]
-    O = O_fp8.to(dtypes.fp32).view(G, M, K // GROUP, GROUP)
-    O = (O * x_scale.unsqueeze(-1)).view(G, M, K)
+    act = O_fp8.to(dtypes.fp32).view(G, M, K // GROUP, GROUP)
+    act = (act * x_scale.unsqueeze(-1)).view(G, M, K)
     W = W_fp8.to(dtypes.fp32).view(G, N // GROUP, GROUP, K // GROUP, GROUP)
     W = (W * w_scale.view(G, N // GROUP, 1, K // GROUP, 1)).view(G, N, K)
-    return torch.einsum("gmk,gnk->gmn", O, W).to(dtypes.fp32)
+    return torch.einsum("gmk,gnk->gmn", act, W).to(dtypes.fp32)
 
 
 @benchmark()

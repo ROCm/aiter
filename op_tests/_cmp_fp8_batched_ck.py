@@ -37,11 +37,11 @@ def _q_blk(w):  # [G,N,K]->fp8,[G,N/128,K/128]
 
 
 def run(m, n, k, g):
-    O = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
+    act = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
     W = (torch.rand((g, n, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
 
     # opus: blockscale (mmajor)
-    Ofp8, xs = _q_tok(O)
+    Ofp8, xs = _q_tok(act)
     Wfp8, ws = _q_blk(W)
     Omm, xsmm = Ofp8.transpose(0, 1), xs.transpose(0, 1)
 
@@ -53,8 +53,8 @@ def run(m, n, k, g):
     # CK batched: rowwise (per-token x_scale[b,m,1], per-channel w_scale[b,1,n])
     Ork = (
         (
-            O.to(dtypes.fp32)
-            / O.to(dtypes.fp32).abs().amax(-1, keepdim=True).clamp(min=1e-8)
+            act.to(dtypes.fp32)
+            / act.to(dtypes.fp32).abs().amax(-1, keepdim=True).clamp(min=1e-8)
             * 448
         )
         .clamp(-448, 448)

@@ -40,10 +40,10 @@ def _q_blk(w):  # [G,N,K] -> fp8, [G,N/128,K/128]
     ).to(dtypes.fp32)
 
 
-def ref(O, W, xs, ws):  # [G,M,N] fp32
-    G, M, K = O.shape
+def ref(act, W, xs, ws):  # [G,M,N] fp32
+    G, M, K = act.shape
     N = W.shape[1]
-    Od = (O.to(dtypes.fp32).view(G, M, K // GROUP, GROUP) * xs.unsqueeze(-1)).view(
+    Od = (act.to(dtypes.fp32).view(G, M, K // GROUP, GROUP) * xs.unsqueeze(-1)).view(
         G, M, K
     )
     Wd = (
@@ -54,9 +54,9 @@ def ref(O, W, xs, ws):  # [G,M,N] fp32
 
 
 def run(m, n, k, g):
-    O = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
+    act = (torch.rand((g, m, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
     W = (torch.rand((g, n, k), dtype=dtypes.fp32) / 10).to(dtypes.bf16)
-    Ofp8, xs = _q_tok(O)
+    Ofp8, xs = _q_tok(act)
     Wfp8, ws = _q_blk(W)
     R = ref(Ofp8, Wfp8, xs, ws)  # [g,m,n]
 
