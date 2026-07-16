@@ -16,6 +16,7 @@ from flydsl.expr.typing import (
     BFloat16,
     Constexpr,
     Float4E2M1FN,
+    Float6E2M3FN,
     Float8E4M3FN,
     Float16,
     Float32,
@@ -25,6 +26,7 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
+_A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
 _B_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
 
 
