@@ -70,6 +70,16 @@ _DEFAULT_CAR_MAX_SIZE = 8192 * 8192
 # _resolve_car_max_size for the semantics.
 _CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
 
+# Custom-AR lower size bound (bytes). Inputs at or below this run on RCCL
+# instead of the custom kernels; only inputs strictly above it are routed to
+# custom AR. Default 0 (no lower bound) — unchanged behavior. Together with
+# _CAR_MAX_SIZE_ENV this forms the (min, max] window in which custom AR runs.
+_DEFAULT_CAR_MIN_SIZE = 0
+
+# Env var to override the custom-AR lower size bound (in bytes). See
+# _resolve_car_min_size for the semantics.
+_CAR_MIN_SIZE_ENV = "AITER_CUSTOM_AR_MIN_SIZE"
+
 
 def _resolve_car_max_size(pool_size: int) -> int:
     """Resolve the custom-AR size cutoff (bytes) from ``AITER_CUSTOM_AR_MAX_SIZE``.
@@ -130,6 +140,51 @@ def _resolve_car_max_size(pool_size: int) -> int:
         v,
         _CAR_MAX_SIZE_ENV,
     )
+    return v
+
+
+def _resolve_car_min_size() -> int:
+    """Resolve the custom-AR lower size bound (bytes) from
+    ``AITER_CUSTOM_AR_MIN_SIZE``.
+
+    Semantics:
+      * unset / empty / unparsable -> default (0), i.e. no lower bound.
+      * negative                   -> default (0).
+      * v >= 0                     -> v: inputs at or below v bytes fall back to
+                                      RCCL; only inputs above v run on custom AR.
+
+    Bounds are combined in ``_fits_custom_ar_size`` as a (min, max] window; if
+    the resolved min is >= the max cutoff, no size fits and everything falls
+    back to RCCL.
+    """
+    raw = os.environ.get(_CAR_MIN_SIZE_ENV, "").strip()
+    if raw == "":
+        return _DEFAULT_CAR_MIN_SIZE
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using default %d bytes.",
+            _CAR_MIN_SIZE_ENV,
+            raw,
+            _DEFAULT_CAR_MIN_SIZE,
+        )
+        return _DEFAULT_CAR_MIN_SIZE
+    if v < 0:
+        logger.warning(
+            "%s=%d is negative; using default %d bytes.",
+            _CAR_MIN_SIZE_ENV,
+            v,
+            _DEFAULT_CAR_MIN_SIZE,
+        )
+        return _DEFAULT_CAR_MIN_SIZE
+    if v > 0:
+        logger.info(
+            "Custom allreduce lower size bound set to %d bytes via %s; "
+            "inputs at or below this fall back to RCCL.",
+            v,
+            _CAR_MIN_SIZE_ENV,
+        )
     return v
 
 
@@ -773,6 +828,10 @@ class CustomAllreduce:
         # custom kernels; larger ones fall back to RCCL. Overridable via
         # AITER_CUSTOM_AR_MAX_SIZE (capped at the registered pool size == max_size).
         self._car_max_size = _resolve_car_max_size(max_size)
+        # Custom-AR lower size bound (bytes): inputs at or below this fall back
+        # to RCCL. Default 0 (no lower bound). Overridable via
+        # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
+        self._car_min_size = _resolve_car_min_size()
         self.rank = rank
         self.world_size = world_size
 
@@ -978,6 +1037,11 @@ class CustomAllreduce:
             return False
         # AITER_CUSTOM_AR_MAX_SIZE=0 disables custom AR entirely -> RCCL for all.
         if self._car_max_size <= 0:
+            return False
+        # AITER_CUSTOM_AR_MIN_SIZE lower bound: inputs at or below it fall back
+        # to RCCL (custom AR runs only in the (min, max] window). Default 0 keeps
+        # the historical behavior of accepting all sizes down to 16 bytes.
+        if inp_size <= self._car_min_size:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
