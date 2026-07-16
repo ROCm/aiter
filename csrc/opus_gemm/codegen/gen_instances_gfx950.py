@@ -26,6 +26,7 @@ PIPELINE_HEADER_MAP = {
     "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
     "a16w16_uniform": "gfx950/opus_gemm_pipeline_a16w16_uniform_gfx950.cuh",
+    "a16w16_uniform_scale": "gfx950/opus_gemm_pipeline_a16w16_uniform_scale_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
 }
@@ -46,6 +47,7 @@ TRAITS_HEADER_MAP = {
     "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_uniform": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_uniform_scale": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
 }
@@ -57,6 +59,7 @@ KERNEL_FUNC_MAP = {
     "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
     "a16w16_flatmm_splitk": "gemm_a16w16_flatmm_splitk_kernel",
     "a16w16_uniform": "gemm_a16w16_uniform_kernel",
+    "a16w16_uniform_scale": "gemm_a16w16_uniform_scale_kernel",
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
 }
@@ -74,6 +77,7 @@ TRAITS_NAME_MAP = {
     "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
     "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
     "a16w16_uniform": "opus_uniform_traits_gfx950",
+    "a16w16_uniform_scale": "opus_uniform_scale_traits_gfx950",
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
     "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
 }
@@ -85,6 +89,7 @@ KARGS_NAME_MAP = {
     "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
     "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
     "a16w16_uniform": "opus_gemm_flatmm_splitk_kargs_gfx950",
+    "a16w16_uniform_scale": "opus_gemm_uniform_scale_kargs_gfx950",
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
     "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
 }
@@ -939,6 +944,187 @@ void
     kargs.ptr_sfa = x_scale.value().data_ptr();
     kargs.ptr_sfb = w_scale.value().data_ptr();
     // x_scale mmajor [M, batch, num_groups_k]; w_scale batch-major.
+    kargs.stride_sfa = (int)x_scale.value().stride(0);
+    kargs.stride_sfa_batch = (int)x_scale.value().stride(1);
+    kargs.stride_sfb = num_groups_k;
+    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
+    dim3 block({k.BLOCK_SIZE});
+
+    auto stream = aiter::getCurrentHIPStream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+    with open(os.path.join(cg.impl_path, f"{k.name}.cuh"), "a") as _f:
+        _f.write(INSTANCE_IMPL_MMAJOR)
+
+    for CDtype in k.output_dtypes:
+        host_decl_mmajor = (
+            f"template void\n"
+            f"{k.name}_mmajor<{CDtype}>(\n"
+            f"    aiter_tensor_t &XQ,\n"
+            f"    aiter_tensor_t &WQ,\n"
+            f"    aiter_tensor_t &Y{A8W8_SCALE_HOST_EXTRA});\n"
+        )
+        cg._host_instantiations.append(
+            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl_mmajor}
+        )
+
+
+def gen_uniform_scale_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    record_one_instantiation,
+    A8W8_SCALE_HOST_EXTRA,
+    **_unused,
+):
+    """gfx950 fp8 block-scale uniform launcher emit (4-wave full-tile, direct
+    store, no split-K). Same 5-arg (x_scale/w_scale) surface as a8w8_scale;
+    only the traits alias differs (9-param uniform_scale traits)."""
+    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+        kargs_template_vars(k.kernel_tag, kargs_name)
+    )
+    has_oob_str = "true" if k.has_oob else "false"
+    traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.T_M}, {k.T_N}, 1>,
+    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
+    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
+    {k.WG_PER_CU},
+    {has_oob_str}>;
+"""
+
+    preamble = instance_impl_preamble()
+    host_tu_split = instance_impl_host_tu_split(
+        traits_header,
+        pipeline_header,
+        fwd_decl_kargs_tpl,
+        kernel_func,
+        fwd_decl_kargs_fnarg,
+    )
+    INSTANCE_IMPL = f"""{preamble}
+{host_tu_split}
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale)
+{{{{
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    using Traits = {k.name}_Traits<D_C>;
+
+    int GROUP_M = {k.GROUP_M};
+    int GROUP_N = {k.GROUP_N};
+    int GROUP_K = {k.GROUP_K};
+    int num_groups_m = M / GROUP_M;
+    int num_groups_n = N / GROUP_N;
+    int num_groups_k = K / GROUP_K;
+
+    {kargs_name} kargs{{}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+    kargs.stride_a_batch = M * K;
+    kargs.stride_b_batch = N * K;
+    kargs.stride_c_batch = M * N;
+
+    kargs.ptr_sfa = x_scale.value().data_ptr();
+    kargs.ptr_sfb = w_scale.value().data_ptr();
+    kargs.stride_sfa = num_groups_k;
+    kargs.stride_sfb = num_groups_k;
+    kargs.stride_sfa_batch = num_groups_m * num_groups_k;
+    kargs.stride_sfb_batch = num_groups_n * num_groups_k;
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
+    dim3 block({k.BLOCK_SIZE});
+
+    auto stream = aiter::getCurrentHIPStream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
+
+}}}}
+#endif // launcher only on regular host pass
+"""
+    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    record_one_instantiation(cg, k, kernel_func, kargs_name, A8W8_SCALE_HOST_EXTRA)
+
+    # "_mmajor" sibling: A(XQ)/Y are [M, batch, *] and x_scale is
+    # [M, batch, K/GROUP_K] (per-token M); weight WQ + w_scale stay batch-major.
+    # DSV4 wo_a o=[num_tokens, n_groups, K] feeds with NO caller-side transpose.
+    INSTANCE_IMPL_MMAJOR = f"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void
+{k.name}_mmajor(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale)
+{{{{
+    int M = XQ.size(0);
+    int batch = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    int GROUP_N = {k.GROUP_N};
+    int GROUP_K = {k.GROUP_K};
+    int num_groups_n = N / GROUP_N;
+    int num_groups_k = K / GROUP_K;
+
+    {kargs_name} kargs{{}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = (int)XQ.stride(0);
+    kargs.stride_b = (int)WQ.stride(1);
+    kargs.stride_c = (int)Y.stride(0);
+    kargs.stride_a_batch = (int)XQ.stride(1);
+    kargs.stride_b_batch = (int)WQ.stride(0);
+    kargs.stride_c_batch = (int)Y.stride(1);
+
+    kargs.ptr_sfa = x_scale.value().data_ptr();
+    kargs.ptr_sfb = w_scale.value().data_ptr();
     kargs.stride_sfa = (int)x_scale.value().stride(0);
     kargs.stride_sfa_batch = (int)x_scale.value().stride(1);
     kargs.stride_sfb = num_groups_k;
@@ -1873,6 +2059,7 @@ void
 # ---------- Self-register at import time ----------
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
+register_emit("gfx950", "a16w16_uniform_scale", gen_uniform_scale_instance)
 register_emit("gfx950", "a16w16", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)

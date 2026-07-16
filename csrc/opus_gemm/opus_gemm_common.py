@@ -318,6 +318,44 @@ a16w16_uniform_kernels_list_nooob = {
 }
 
 
+def _a16w16_uniform_scale(bm, bn, bk, wg_per_cu=2, has_oob=True):
+    """fp8 block-scale uniform (Route B fp8): 4-wave full-tile, MFMA 16x16x128,
+    128x128 blockscale, PGR1 + sched_group_barrier, DIRECT store to Y."""
+    vec = 16  # VEC_A = VEC_B = 16 for fp8 (16 bytes / 1 byte)
+    inst = OpusGemmInstance(
+        256,
+        bm,
+        bn,
+        bk,
+        2,
+        2,  # T_M, T_N (4-wave)
+        16,
+        16,
+        128,  # MFMA 16x16x128 (fp8)
+        vec,
+        vec,
+        4,  # VEC
+        1,
+        128,
+        128,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        "a16w16_uniform_scale",
+        ["bf16_t", "fp32_t"],  # direct store: Y bf16 or fp32 (v_c fp32 -> D_C)
+        wg_per_cu,
+        has_oob=has_oob,
+    )
+    inst.name_tag = "uniform_scale"
+    return inst
+
+
+# fp8 block-scale uniform family. B_N must equal GROUP_N (=128) so one sfb value
+# covers the whole tile-N; B_K must equal GROUP_K (=128). Direct store to Y (no
+# split-K workspace/reduce). kid 700 = 128x128x128, kid 701 = 256x128x128.
+a16w16_uniform_scale_kernels_list = {
+    700: _a16w16_uniform_scale(128, 128, 128, 2),
+    701: _a16w16_uniform_scale(256, 128, 128, 1),
+}
+
+
 def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu, has_oob=True):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
@@ -1175,6 +1213,7 @@ kernels_list = {
     **a16w16_flatmm_splitk_kernels_list_nooob,
     **a16w16_uniform_kernels_list,
     **a16w16_uniform_kernels_list_nooob,
+    **a16w16_uniform_scale_kernels_list,
     **a16w16_persistent_kernels_list,
     **a16w16_persistent_kernels_list_cpol,
     **a16w16_persistent_kernels_list_nooob,

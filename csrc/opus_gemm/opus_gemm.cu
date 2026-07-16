@@ -481,6 +481,126 @@ void opus_gemm_a8w8_scale_mmajor(
 #endif
 }
 
+// ── opus_gemm_uniform_scale(_mmajor)() — fp8 block-scale uniform batched GEMM ─
+// fp8 Route-B low-barrier variant (4-wave full-tile, direct store). Two layout
+// surfaces share the same kernel/tiles:
+//   * batch-major: O=[batch,M,K], wo_a=[batch,N,K], Y=[batch,M,N].
+//   * mmajor (zero-copy DSV4 wo_a): O=[M,batch,K], wo_a=[batch,N,K],
+//     Y=[M,batch,N]; x_scale [M,batch,K/128], w_scale [batch,N/128,K/128].
+// kernelId selects the tile (700=128x128, 701=256x128); Y dtype in {fp32,bf16}.
+#ifdef OPUS_BUILD_HAS_GFX950
+template <typename D_C>
+void opus_gemm_uniform_scale_256x128x128x128_2x2_16x16x128_1x128x128(
+    aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+template <typename D_C>
+void opus_gemm_uniform_scale_256x256x128x128_2x2_16x16x128_1x128x128(
+    aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+template <typename D_C>
+void opus_gemm_uniform_scale_256x128x128x128_2x2_16x16x128_1x128x128_mmajor(
+    aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+template <typename D_C>
+void opus_gemm_uniform_scale_256x256x128x128_2x2_16x16x128_1x128x128_mmajor(
+    aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+
+// Route (kernelId, Y-dtype) to the concrete launcher. MMAJOR selects the
+// dim0=M/dim1=batch sibling; otherwise the batch-major launcher.
+template <bool MMAJOR>
+static void opus_uniform_scale_dispatch(int kernelId, aiter_tensor_t &O,
+                                        aiter_tensor_t &wo_a, aiter_tensor_t &Y,
+                                        aiter_tensor_t &x_scale,
+                                        aiter_tensor_t &w_scale)
+{
+  const bool y_bf16 = (Y.dtype() == AITER_DTYPE_bf16);
+  switch (kernelId)
+  {
+    case 701:
+      if constexpr (MMAJOR) {
+        if (y_bf16)
+          opus_gemm_uniform_scale_256x256x128x128_2x2_16x16x128_1x128x128_mmajor<bf16_t>(O, wo_a, Y, x_scale, w_scale);
+        else
+          opus_gemm_uniform_scale_256x256x128x128_2x2_16x16x128_1x128x128_mmajor<fp32_t>(O, wo_a, Y, x_scale, w_scale);
+      } else {
+        if (y_bf16)
+          opus_gemm_uniform_scale_256x256x128x128_2x2_16x16x128_1x128x128<bf16_t>(O, wo_a, Y, x_scale, w_scale);
+        else
+          opus_gemm_uniform_scale_256x256x128x128_2x2_16x16x128_1x128x128<fp32_t>(O, wo_a, Y, x_scale, w_scale);
+      }
+      break;
+    case 700:
+    default:
+      if constexpr (MMAJOR) {
+        if (y_bf16)
+          opus_gemm_uniform_scale_256x128x128x128_2x2_16x16x128_1x128x128_mmajor<bf16_t>(O, wo_a, Y, x_scale, w_scale);
+        else
+          opus_gemm_uniform_scale_256x128x128x128_2x2_16x16x128_1x128x128_mmajor<fp32_t>(O, wo_a, Y, x_scale, w_scale);
+      } else {
+        if (y_bf16)
+          opus_gemm_uniform_scale_256x128x128x128_2x2_16x16x128_1x128x128<bf16_t>(O, wo_a, Y, x_scale, w_scale);
+        else
+          opus_gemm_uniform_scale_256x128x128x128_2x2_16x16x128_1x128x128<fp32_t>(O, wo_a, Y, x_scale, w_scale);
+      }
+      break;
+  }
+}
+#endif
+
+static void opus_uniform_scale_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
+                                             aiter_tensor_t &Y, const char *who)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3,
+              who, ": O/wo_a/Y must be 3D");
+  AITER_CHECK(O.dtype() == AITER_DTYPE_fp8 && wo_a.dtype() == AITER_DTYPE_fp8,
+              who, ": O and wo_a must be fp8");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32 || Y.dtype() == AITER_DTYPE_bf16,
+              who, ": Y must be fp32 or bf16");
+}
+
+void opus_gemm_uniform_scale(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    int kernelId)
+{
+  opus_uniform_scale_common_checks(O, wo_a, Y, "opus_gemm_uniform_scale");
+#ifdef OPUS_BUILD_HAS_GFX950
+  const auto &arch_info = opus_get_arch_info();
+  AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
+              "opus_gemm_uniform_scale is gfx950-only; current device ",
+              arch_info.dev, " has gcnArchName='", arch_info.name, "'");
+  opus_uniform_scale_dispatch<false>(kernelId, O, wo_a, Y, x_scale, w_scale);
+#else
+  AITER_CHECK(false, "opus_gemm_uniform_scale requires OPUS_BUILD_HAS_GFX950");
+#endif
+}
+
+void opus_gemm_uniform_scale_mmajor(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    int kernelId)
+{
+  opus_uniform_scale_common_checks(O, wo_a, Y, "opus_gemm_uniform_scale_mmajor");
+#ifdef OPUS_BUILD_HAS_GFX950
+  const auto &arch_info = opus_get_arch_info();
+  AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
+              "opus_gemm_uniform_scale_mmajor is gfx950-only; current device ",
+              arch_info.dev, " has gcnArchName='", arch_info.name, "'");
+  opus_uniform_scale_dispatch<true>(kernelId, O, wo_a, Y, x_scale, w_scale);
+#else
+  AITER_CHECK(false,
+              "opus_gemm_uniform_scale_mmajor requires OPUS_BUILD_HAS_GFX950");
+#endif
+}
+
 void opus_gemm_a8w8_blockscale_bpreshuffle_tune(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,

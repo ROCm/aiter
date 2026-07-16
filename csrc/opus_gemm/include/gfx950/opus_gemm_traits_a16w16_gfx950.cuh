@@ -461,9 +461,14 @@ struct opus_uniform_traits_gfx950 {
 // ============================================================================
 // fp8 block-scale uniform traits (Route B fp8): same 4-wave full-tile uniform
 // geometry as opus_uniform_traits_gfx950, but fp8 A/B (W_K=128 MFMA) + 128x128
-// block-scale (GROUP). DTYPE is 5-tuple <D_A, D_B, D_C(ws=fp32), D_ACC, D_SF>.
+// block-scale (GROUP). DTYPE is 5-tuple <D_A, D_B, D_C, D_ACC, D_SF>.
 // Per-K-block scaled accumulate: B_K == GROUP_K so each K-tile is exactly one
 // K-scale-block (scale_c_tile applies sfa[m]*sfb[nb] before accumulating).
+//
+// Store is DIRECT to Y (no split-K fp32 workspace / reduce kernel), mirroring
+// the a8w8_scale pipeline: v_c holds fp32 accumulate, store<VEC_C> casts to
+// D_C. D_C is the Y dtype (bf16 or fp32). GROUP_N must equal B_N so one sfb
+// value covers the whole tile-N (scale_c_tile takes a single scale_b).
 // ============================================================================
 template<int BLOCK_SIZE_,
         typename BLOCK_,
@@ -493,8 +498,8 @@ struct opus_uniform_scale_traits_gfx950 {
     using D_ACC = opus::tuple_element_t<3, DTYPE>;
     using D_SF  = opus::tuple_element_t<4, DTYPE>;
     static_assert(std::is_same<D_A, D_B>::value);
-    static_assert(std::is_same_v<D_C, float>,
-                  "uniform_scale splitk main kernel requires D_C = float workspace");
+    static_assert(std::is_same_v<D_C, float> || std::is_same_v<D_C, bf16_t>,
+                  "uniform_scale requires D_C in {float, bf16} (direct store to Y)");
 
     static constexpr int T_M = opus::get<0>(TILE{});
     static constexpr int T_N = opus::get<1>(TILE{});
@@ -529,6 +534,9 @@ struct opus_uniform_scale_traits_gfx950 {
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
     // B_K == GROUP_K keeps one K-scale-block per K-tile (simplest scaled accumulate).
     static_assert(B_K == GROUP_K, "uniform_scale requires B_K == GROUP_K");
+    // B_N == GROUP_N keeps one N-scale-block per tile so scale_c_tile can take a
+    // single scale_b for the whole E_N row (no per-half sfb like a8w8 quadrants).
+    static_assert(B_N == GROUP_N, "uniform_scale requires B_N == GROUP_N (single sfb/tile)");
 
     static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
     static_assert(smem_linear_wave % B_K == 0, "uniform_scale requires B_K | smem_linear_wave");
@@ -564,6 +572,36 @@ struct opus_uniform_scale_traits_gfx950 {
     static constexpr int CACHECTL_A = 0;
     static constexpr int CACHECTL_B = 17;
 };
+
+#ifndef OPUS_GEMM_UNIFORM_SCALE_KARGS_GFX950_DEFINED
+#define OPUS_GEMM_UNIFORM_SCALE_KARGS_GFX950_DEFINED
+// Kernel arguments for the fp8 block-scale uniform pipeline. Same fields as
+// opus_gemm_scale_kargs_gfx950 (a8w8_scale): direct store to ptr_c, per-token
+// A scale (sfa) + block B scale (sfb). Guarded so a fused host TU that pulls
+// in both this header and the a8w8_scale header does not double-define.
+struct opus_gemm_uniform_scale_kargs_gfx950 {
+    const void* __restrict__ ptr_a;
+    const void* __restrict__ ptr_b;
+    void* __restrict__ ptr_c;
+    int m;
+    int n;
+    int k;
+    int batch;
+    int stride_a;
+    int stride_b;
+    int stride_c;
+    int stride_a_batch;
+    int stride_b_batch;
+    int stride_c_batch;
+
+    const void* __restrict__ ptr_sfa;
+    const void* __restrict__ ptr_sfb;
+    int stride_sfa;
+    int stride_sfb;
+    int stride_sfa_batch;
+    int stride_sfb_batch;
+};
+#endif
 
 // ============================================================================
 // Split-K FlatMM traits (two-kernel variant: main writes fp32 workspace,

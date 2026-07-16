@@ -43,5 +43,22 @@ void opus_gemm_a8w8_scale_mmajor(aiter_tensor_t& O,
                                  aiter_tensor_t& x_scale,
                                  aiter_tensor_t& w_scale);
 
+// fp8 block-scale UNIFORM (Route B fp8, 4-wave full-tile, direct store) batched
+// GEMM. Y dtype in {fp32, bf16}; kernelId selects the tile (700=128x128,
+// 701=256x128). Batch-major (O/wo_a/Y = [batch,M,K]/[batch,N,K]/[batch,M,N])
+// and mmajor (O/Y = [M,batch,*], DSV4 wo_a zero-copy) surfaces.
+void opus_gemm_uniform_scale(aiter_tensor_t& O,
+                             aiter_tensor_t& wo_a,
+                             aiter_tensor_t& Y,
+                             aiter_tensor_t& x_scale,
+                             aiter_tensor_t& w_scale,
+                             int kernelId);
+void opus_gemm_uniform_scale_mmajor(aiter_tensor_t& O,
+                                    aiter_tensor_t& wo_a,
+                                    aiter_tensor_t& Y,
+                                    aiter_tensor_t& x_scale,
+                                    aiter_tensor_t& w_scale,
+                                    int kernelId);
+
 // Per-stream splitk workspace init. See opus_gemm.cu for rationale.
 void opus_gemm_workspace_init();

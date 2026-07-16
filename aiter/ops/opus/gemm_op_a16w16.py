@@ -594,6 +594,68 @@ def _opus_gemm_a8w8_scale_mmajor_raw(
 ) -> torch.Tensor: ...
 
 
+def _gen_opus_gemm_uniform_scale_fake_tensors(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    kernelId: int = 700,
+) -> torch.Tensor:
+    return Y
+
+
+# batch-major fp8 block-scale UNIFORM raw binding. O/wo_a/Y are
+# [batch,M,K]/[batch,N,K]/[batch,M,N]; x_scale [batch,M,K/GROUP_K],
+# w_scale [batch,N/GROUP_N,K/GROUP_K]. Y fp32 or bf16.
+# See csrc/opus_gemm/opus_gemm.cu :: opus_gemm_uniform_scale.
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_uniform_scale",
+    gen_fake=_gen_opus_gemm_uniform_scale_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_uniform_scale_raw(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    kernelId: int = 700,
+) -> torch.Tensor: ...
+
+
+def _gen_opus_gemm_uniform_scale_mmajor_fake_tensors(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    kernelId: int = 700,
+) -> torch.Tensor:
+    return Y
+
+
+# mmajor fp8 block-scale UNIFORM (Route B fp8, 4-wave full-tile, direct store)
+# raw binding. Same layout contract as _opus_gemm_a8w8_scale_mmajor_raw;
+# kernelId selects the uniform_scale tile (700=128x128, 701=256x128). Y is fp32.
+# See csrc/opus_gemm/opus_gemm.cu :: opus_gemm_uniform_scale_mmajor.
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_uniform_scale_mmajor",
+    gen_fake=_gen_opus_gemm_uniform_scale_mmajor_fake_tensors,
+    develop=True,
+)
+def _opus_gemm_uniform_scale_mmajor_raw(
+    O: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    kernelId: int = 700,
+) -> torch.Tensor: ...
+
+
 # mmajor raw binding: A(O)/Y are read with dim0=M, dim1=batch, so
 # batch-in-the-middle layouts need no caller-side transpose/permute. Shared by
 # wo_a_gemm_opus (DSV4, A=[num_tokens, n_local_groups, K]) and
