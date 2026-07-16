@@ -119,6 +119,18 @@ _DEFAULT_BV = 16
 # ``get_rocm_arch()`` may return a feature-suffixed string like
 # ``gfx950:sramecc+:xnack-``; normalize before matching.
 _IS_GFX950 = get_rocm_arch().split(":")[0].startswith("gfx950")
+_IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
+
+# gfx942 (MI30x, 80 CUs) CU-fill target for the mfma16_hip fork. Calibrated by
+# sweeping BV in {16,32,64} across the full K5 benchmark shape set on gfx942
+# (see op_tests/flydsl_tests/_bv_sweep_gfx942.py): a target of 64 CTAs (~0.8
+# wave over the 80 CUs) reproduces the measured-best BV for every swept shape.
+# mfma16_hip's larger-BV tiles are efficient enough that forcing a smaller BV
+# just to fill all 80 CUs is a net loss, so the target is intentionally BELOW
+# the live CU count. On gfx942 the baseline/naive forks abort (K=32 MFMA) and
+# every other fork pins its own BV, so mfma16_hip is the only consumer of this
+# heuristic BV -- this target is tuned specifically for it.
+_GFX942_MFMA16HIP_TARGET_CTAS = 64
 
 # gfx950 has 256 CUs. Used as the fallback CU count when the live device
 # query is unavailable (e.g. CPU-only meta runs).
@@ -620,6 +632,13 @@ def _heuristic_bv(
     )
     if target_bv is not None:
         target_ctas = _grid_ctas(H=H, V=V, N=N, BV=target_bv)
+    elif _IS_GFX942:
+        # gfx942 calibrated target for the mfma16_hip fork (the only heuristic-BV
+        # consumer on this arch). Targeting 64 CTAs instead of the live 80 CUs
+        # reproduces the swept per-shape optimum (BV=64 for varlen and larger-H
+        # non-varlen; BV=32/16 only for the small-H non-varlen single-sequence
+        # shapes). See _GFX942_MFMA16HIP_TARGET_CTAS.
+        target_ctas = _GFX942_MFMA16HIP_TARGET_CTAS
     else:
         # Generic default: target one wave of CTAs over the device's CUs.
         # Use the live CU count (256 on gfx950, differs on other arches)
