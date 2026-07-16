@@ -95,6 +95,8 @@ def run_gemm_flydsl(A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype):
         tile_n=ki.tile_n,
         tile_k=ki.tile_k,
         waves_per_eu=ki.waves_per_eu,
+        xcd_swizzle=ki.xcd_swizzle,
+        split_k=ki.split_k,
     )
     return out
 
@@ -138,7 +140,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         ref_keys = ["a_deq", "b_deq"]
         tasks = []
         for kid, ki in candidates_for(a_dtype, b_dtype, M, N, K):
-            info = (info_keys, kid, 0, ki.name, "flydsl")
+            info = (info_keys, kid, ki.split_k, ki.name, "flydsl")
             tasks.append(
                 (
                     info,

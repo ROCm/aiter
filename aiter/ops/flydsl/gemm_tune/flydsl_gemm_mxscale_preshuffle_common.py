@@ -29,6 +29,10 @@ _TILE_N = (128, 256, 512)
 _TILE_K = (128, 256)
 _WAVES_PER_EU = (0, 1, 2, 3, 4)
 _XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
+# split-K factors: each split reduces K/split_k contraction, partials summed in a
+# follow-up fp32 reduce kernel. Capped at 8 (accuracy / launch overhead), mirrors
+# HGEMM_MAX_SPLIT_K. split_k>1 mainly helps small-M / large-K (low-occupancy) shapes.
+_SPLIT_K = (1, 2, 4, 8)
 
 
 def _a_row_bytes(a_dtype: str, tile_k: int) -> int:
@@ -46,6 +50,7 @@ class kernelInstance:
     out_dtype: str  # "bf16" | "fp16"
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     xcd_swizzle: int = 0  # 0=off, >0=XCD L2-rasterization group size
+    split_k: int = 1  # 1=no split-K, >1=K-batch (partials reduced in fp32)
 
     @property
     def name(self) -> str:
@@ -54,24 +59,26 @@ class kernelInstance:
         o = _DTYPE_SHORT[self.out_dtype]
         return (
             f"flydsl_mxpsh_{self.tile_m}x{self.tile_n}x{self.tile_k}"
-            f"_{a}_{b}_{o}_w{self.waves_per_eu}_x{self.xcd_swizzle}"
+            f"_{a}_{b}_{o}_w{self.waves_per_eu}_x{self.xcd_swizzle}_sk{self.split_k}"
         )
 
 
 _NAME_RE = re.compile(
-    r"^flydsl_mxpsh_(\d+)x(\d+)x(\d+)_([A-Z0-9]+)_([A-Z0-9]+)_([A-Z0-9]+)_w(\d+)(?:_x(\d+))?$"
+    r"^flydsl_mxpsh_(\d+)x(\d+)x(\d+)_([A-Z0-9]+)_([A-Z0-9]+)_([A-Z0-9]+)_w(\d+)"
+    r"(?:_x(\d+))?(?:_sk(\d+))?$"
 )
 
 
 def parse_kernel_name(name: str):
     """kernelName string -> dict of launch params (None if it isn't an mxpsh name).
 
-    The _x{xcd} suffix is optional (older names without it default to xcd_swizzle=0).
+    The _x{xcd} and _sk{split_k} suffixes are optional (older names without them
+    default to xcd_swizzle=0 / split_k=1).
     """
     m = _NAME_RE.match(name.strip())
     if not m:
         return None
-    tm, tn, tk, a, b, o, wpe, xcd = m.groups()
+    tm, tn, tk, a, b, o, wpe, xcd, sk = m.groups()
     return dict(
         tile_m=int(tm),
         tile_n=int(tn),
@@ -81,6 +88,7 @@ def parse_kernel_name(name: str):
         out_dtype=_SHORT_DTYPE[o],
         waves_per_eu=int(wpe),
         xcd_swizzle=int(xcd) if xcd is not None else 0,
+        split_k=int(sk) if sk is not None else 1,
     )
 
 
@@ -120,10 +128,24 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
     microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
     word (shuffle_scale rounds K up to a whole 256-K chunk). K%tile_k excludes
-    tile_k=256 when K%256!=0, so a K=384 shape only matches tile_k=128 kernels."""
+    tile_k=256 when K%256!=0, so a K=384 shape only matches tile_k=128 kernels.
+
+    split-K legality (split_k>1): the per-split K length (K/split_k) must stay a
+    whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
+    so the split boundary never straddles a tile or a microscale word."""
     if K % 128 != 0:
         return False
-    return (N % ki.tile_n == 0) and (K % ki.tile_k == 0)
+    if (N % ki.tile_n != 0) or (K % ki.tile_k != 0):
+        return False
+    if ki.split_k > 1:
+        k_per_split = K // ki.split_k
+        if (
+            K % ki.split_k != 0
+            or k_per_split % ki.tile_k != 0
+            or k_per_split % 256 != 0
+        ):
+            return False
+    return True
 
 
 def _build_kernels_list():
@@ -135,12 +157,13 @@ def _build_kernels_list():
                 for tk in _TILE_K:
                     for wpe in _WAVES_PER_EU:
                         for xcd in _XCD_SWIZZLE:
-                            ki = kernelInstance(
-                                tm, tn, tk, a_dtype, b_dtype, "bf16", wpe, xcd
-                            )
-                            if instance_valid(ki):
-                                out[idx] = ki
-                                idx += 1
+                            for sk in _SPLIT_K:
+                                ki = kernelInstance(
+                                    tm, tn, tk, a_dtype, b_dtype, "bf16", wpe, xcd, sk
+                                )
+                                if instance_valid(ki):
+                                    out[idx] = ki
+                                    idx += 1
     return out
 
 

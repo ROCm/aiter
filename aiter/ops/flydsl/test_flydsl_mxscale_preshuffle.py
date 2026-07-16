@@ -44,6 +44,16 @@ _SHAPES = [
     (32, 8192, 8192, 32, 128, 256),
 ]
 
+# split-K cases: small-M / large-K (the low-occupancy regime split-K targets).
+# K/split_k must be a multiple of tile_k AND 256 (e8m0 scale chunk) — see fits_shape.
+# (M, N, K, tile_m, tile_n, tile_k, split_k)
+_SPLITK_SHAPES = [
+    (8, 2048, 7168, 32, 128, 256, 2),
+    (8, 2048, 7168, 32, 128, 256, 4),
+    (1, 2048, 7168, 32, 128, 128, 2),
+    (16, 4096, 8192, 32, 128, 256, 8),
+]
+
 
 def _cos(a, b):
     return torch.nn.functional.cosine_similarity(
@@ -146,8 +156,63 @@ def test_a8w8(M, N, K, tile_m, tile_n, tile_k):
     assert cs > 0.99, f"a8w8 cos={cs:.5f}"
 
 
+@pytest.mark.parametrize("M, N, K, tile_m, tile_n, tile_k, split_k", _SPLITK_SHAPES)
+def test_a8w8_splitk(M, N, K, tile_m, tile_n, tile_k, split_k):
+    """MXFP8 A x MXFP8 B with split-K (fp32 partial slabs + reduce).
+
+    Verifies both correctness vs the dequant reference and that the split-K
+    result matches the single-launch (split_k=1) result."""
+    _skip_if_not_gfx950()
+    dev = torch.device("cuda")
+    a_f, b_f = _rand_ab(M, N, K, dev)
+
+    a_q, sa = per_1x32_f8_scale_f8_quant(
+        a_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    b_q, sb = per_1x32_f8_scale_f8_quant(
+        b_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    a_codes, b_codes = a_q[:M], b_q[:N]
+    b_shuf = shuffle_weight(b_codes, layout=(16, 16))
+    scale_a = shuffle_scale_a16w4(sa, 1, False)
+    scale_b = shuffle_scale_a16w4(sb, 1, False)
+
+    a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(sa[:M].repeat_interleave(32, dim=1))
+    b_deq = b_codes.float() * fp4_utils.e8m0_to_f32(sb[:N].repeat_interleave(32, dim=1))
+    c_ref = (a_deq @ b_deq.T).float()
+
+    def _run(sk):
+        out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
+        flydsl_mxscale_preshuffle_gemm(
+            a_codes,
+            b_shuf,
+            scale_a,
+            scale_b,
+            out,
+            a_dtype="fp8",
+            b_dtype="fp8",
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            split_k=sk,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    out_sk = _run(split_k)
+    out_1 = _run(1)
+    cs = _cos(out_sk, c_ref)
+    assert cs > 0.99, f"a8w8 split_k={split_k} cos={cs:.5f}"
+    # split-K sums fp32 partials -> should closely match the single-launch result.
+    cs_self = _cos(out_sk, out_1)
+    assert cs_self > 0.999, f"a8w8 split_k={split_k} vs split_k=1 cos={cs_self:.6f}"
+
+
 if __name__ == "__main__":
     for shp in _SHAPES:
         test_a4w4(*shp)
         test_a8w8(*shp)
         print(f"OK {shp}")
+    for shp in _SPLITK_SHAPES:
+        test_a8w8_splitk(*shp)
+        print(f"OK split-K {shp}")

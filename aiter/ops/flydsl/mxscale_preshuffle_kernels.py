@@ -40,11 +40,16 @@ def flydsl_mxscale_preshuffle_gemm(
     tile_k: int,
     waves_per_eu: int = 0,
     xcd_swizzle: int = 0,
+    split_k: int = 1,
     stream=None,
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
 
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
+
+    split_k>1 splits the K reduction across grid.z: each split writes an fp32
+    partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
+    slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
     """
     if not is_flydsl_available():
         raise RuntimeError(
@@ -81,8 +86,54 @@ def flydsl_mxscale_preshuffle_gemm(
 
     st = stream if stream is not None else torch.cuda.current_stream()
 
+    split_k = int(split_k)
+    if split_k > 1:
+        # split-K legality (same constraints the tuner enforces in fits_shape):
+        # per-split K must be a whole number of tile_k tiles AND 256-K scale chunks.
+        k_per_split = K // split_k
+        if K % split_k != 0 or k_per_split % int(tile_k) != 0 or k_per_split % 256 != 0:
+            raise ValueError(
+                f"illegal split_k={split_k} for K={K}, tile_k={tile_k}: "
+                f"K/split_k ({k_per_split}) must be a multiple of tile_k and 256"
+            )
+
+    if split_k == 1:
+        launch_gemm(
+            ptr_arg(Out),
+            ptr_arg(A),
+            ptr_arg(B),
+            ptr_arg(a_scale),
+            ptr_arg(b_scale),
+            M,
+            N,
+            st,
+            N,
+            K,
+            int(tile_m),
+            int(tile_n),
+            int(tile_k),
+            a_dtype,
+            out_dtype,
+            b_dtype,
+            1,  # batch
+            -1,  # a_row_stride
+            -1,  # a_batch_stride
+            -1,  # sca_row_stride
+            -1,  # sca_batch_stride
+            -1,  # c_row_stride
+            -1,  # c_batch_stride
+            int(waves_per_eu),
+            int(xcd_swizzle),
+            1,  # k_batch
+        )
+        return Out
+
+    # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
+    from .kernels.mxscale_preshuffle import launch_splitk_reduce
+
+    tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
     launch_gemm(
-        ptr_arg(Out),
+        ptr_arg(tmp),
         ptr_arg(A),
         ptr_arg(B),
         ptr_arg(a_scale),
@@ -107,6 +158,16 @@ def flydsl_mxscale_preshuffle_gemm(
         -1,  # c_batch_stride
         int(waves_per_eu),
         int(xcd_swizzle),
+        split_k,  # k_batch
+    )
+    launch_splitk_reduce(
+        ptr_arg(tmp),
+        ptr_arg(Out),
+        (M * N) // 2,  # n_out_dw (2 out elems per dword)
+        M * N,  # slab_stride_dw (fp32: 1 dword/elem)
+        st,
+        split_k,
+        out_dtype,
     )
     return Out
 
@@ -172,6 +233,7 @@ def gemm_mxscale_preshuffle(
     tile_k=None,
     waves_per_eu=None,
     xcd_swizzle=None,
+    split_k=None,
     config=None,
     stream=None,
 ):
@@ -198,6 +260,8 @@ def gemm_mxscale_preshuffle(
                     waves_per_eu = p["waves_per_eu"]
                 if xcd_swizzle is None:
                     xcd_swizzle = p["xcd_swizzle"]
+                if split_k is None:
+                    split_k = p["split_k"]
         if tile_m is None:  # still unresolved -> heuristic
             ki = _heuristic_tile(a_dtype, b_dtype, M, N, K)
             if ki is None:
@@ -209,6 +273,8 @@ def gemm_mxscale_preshuffle(
                 waves_per_eu = ki.waves_per_eu
             if xcd_swizzle is None:
                 xcd_swizzle = ki.xcd_swizzle
+            if split_k is None:
+                split_k = ki.split_k
 
     return flydsl_mxscale_preshuffle_gemm(
         A,
@@ -223,5 +289,6 @@ def gemm_mxscale_preshuffle(
         tile_k=tile_k,
         waves_per_eu=(0 if waves_per_eu is None else waves_per_eu),
         xcd_swizzle=(0 if xcd_swizzle is None else xcd_swizzle),
+        split_k=(1 if split_k is None else split_k),
         stream=stream,
     )
