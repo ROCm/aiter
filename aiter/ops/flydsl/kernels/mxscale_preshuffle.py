@@ -26,13 +26,13 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
-_A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
+_B_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
 
 
 def _scale_mma_atoms(a_dtype, b_dtype):
     """16 (opsel_a, opsel_b) scaled-MFMA atoms; A elem is fp4/fp6/fp8, B is fp4/fp8."""
     elem_a = _A_ELEM[a_dtype]
-    elem_b = _A_ELEM[b_dtype]
+    elem_b = _B_ELEM[b_dtype]
     return {
         (osa, osb): fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(
