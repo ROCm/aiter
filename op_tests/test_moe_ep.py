@@ -394,12 +394,19 @@ def test_fmoe_ep_mxfp4(
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
 
+    `token` is the **global** token count (total across all ranks). Under
+    balanced routing each rank processes token * topk // ep local tokens
+    (ignoring shared experts). The test builds input and routing tensors
+    sized for that local count so that the benchmark reflects real per-rank
+    work, not the full global batch.
+
     pad_factor>1 simulates the MoRI/network dispatch usage: the input token
-    tensor is over-allocated to (token*pad_factor) rows (padded dispatch buffer);
-    only the first `token` rows are real and are signalled to the kernel via
-    num_local_tokens. The dead-tail rows carry valid random routing so a missing
-    dead-tail guard would either OOB or shift the contiguous layout and corrupt
-    the valid outputs. Reference and comparison use only the first `token` rows."""
+    tensor is over-allocated to (local_token*pad_factor) rows (padded dispatch
+    buffer); only the first `local_token` rows are real and are signalled to
+    the kernel via num_local_tokens. The dead-tail rows carry valid random
+    routing so a missing dead-tail guard would either OOB or shift the
+    contiguous layout and corrupt the valid outputs. Reference and comparison
+    use only the first `local_token` rows."""
     _gfx = get_gfx()
     if _gfx not in ["gfx950", "gfx1250"]:
         print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
@@ -408,6 +415,10 @@ def test_fmoe_ep_mxfp4(
         # gfx1250 grouped EP currently validated for a8w4 only.
         print(f"skip {quant_label} on gfx1250: only a8w4_mxfp4 supported")
         return
+
+    # Under balanced EP each rank sees token * topk // ep local tokens.
+    local_token = token * topk // ep
+    print(f"  [EP sim] global_token={token} topk={topk} ep={ep} -> local_token={local_token}")
 
     ep_id = ep - 1
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
@@ -419,14 +430,16 @@ def test_fmoe_ep_mxfp4(
 
     dtype = dtypes.bf16
     pad_factor = max(1, int(pad_factor))
-    buf_token = token * pad_factor  # padded dispatch buffer (network sim)
+    buf_token = local_token * pad_factor  # padded dispatch buffer (network sim)
     input_ = torch.randn((buf_token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((buf_token, E), dtype=dtype, device="cuda")
 
+    # EP dispatch: each local token picks topk=1 (already dispatched to this rank)
+    local_topk = 1
     total_topk_ids = torch.empty(
-        (buf_token, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+        (buf_token, local_topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
     )
-    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+    ns_topk_ids, s_topk_ids = total_topk_ids.split([local_topk, shared_E + 1], dim=1)
     shared_expert_ids = [E + i for i in range(shared_E + 1)]
     s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * buf_token
     for i in range(ep_id, buf_token, ep):
@@ -434,22 +447,20 @@ def test_fmoe_ep_mxfp4(
     s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device="cuda")
 
     total_topk_weights = torch.empty(
-        (buf_token, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+        (buf_token, local_topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
     )
     ns_topk_weights, s_topk_weights = total_topk_weights.split(
-        [topk, shared_E + 1], dim=1
+        [local_topk, shared_E + 1], dim=1
     )
     s_topk_weights[:] = 0.1
-    fused_topk(input_, score, topk, True, ns_topk_ids, ns_topk_weights)
-    # Full padded dispatch buffer goes to the kernel; only the first `token` rows
-    # are real (signalled via num_local_tokens). Reference uses just those rows.
+    fused_topk(input_, score, local_topk, True, ns_topk_ids, ns_topk_weights)
     topk_ids = total_topk_ids[:buf_token]
     topk_weights = total_topk_weights[:buf_token]
-    ref_input = input_[:token]
-    ref_topk_ids = total_topk_ids[:token]
-    ref_topk_weights = total_topk_weights[:token]
+    ref_input = input_[:local_token]
+    ref_topk_ids = total_topk_ids[:local_token]
+    ref_topk_weights = total_topk_weights[:local_token]
     if pad_factor > 1:
-        num_local_tokens = torch.tensor([token], dtype=dtypes.i32, device="cuda")
+        num_local_tokens = torch.tensor([local_token], dtype=dtypes.i32, device="cuda")
     else:
         num_local_tokens = None
 
@@ -548,7 +559,7 @@ def test_fmoe_ep_mxfp4(
     )
 
     # Padded buffer -> compare only the valid prefix against the reference.
-    out = out[:token]
+    out = out[:local_token]
     diff = (ref - out).float()
     abs_err = diff.abs()
     abs_mean = abs_err.mean().item()
@@ -557,7 +568,7 @@ def test_fmoe_ep_mxfp4(
     logits_diff = _calc_diff(ref, out)
 
     _msg = (
-        f"{quant_label} ep={ep} token={token} model_dim={model_dim} "
+        f"{quant_label} ep={ep} token={token}(local={local_token}) model_dim={model_dim} "
         f"inter_dim={inter_dim} E={E} topk={topk}"
     )
     if _gfx == "gfx1250":
@@ -576,7 +587,8 @@ def test_fmoe_ep_mxfp4(
     summary_table.append(
         {
             "quant": quant_label,
-            "token": token,
+            "global_token": token,
+            "local_token": local_token,
             "model_dim": model_dim,
             "inter_dim": inter_dim,
             "E": E,
@@ -639,7 +651,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[128],
-    help="""Token Num.
+    help="""Global token count. For EP mxfp4 tests each rank runs
+    token*topk//ep local tokens under balanced routing.
     e.g.: -m 128""",
 )
 parser.add_argument(
