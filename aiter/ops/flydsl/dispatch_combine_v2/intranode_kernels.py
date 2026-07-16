@@ -19,30 +19,15 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""FlyDSL intranode device kernels for the cco-LSA dispatch/combine op.
+"""FlyDSL intranode (single-node cco-LSA P2P) device kernels for the dispatch/combine
+op: dispatch (+scales/replay), combine (gather + scatter/quant), StdMoE convert and
+local expert count. Each is a compile-time-parameterised @flyc.jit factory; peer
+addressing goes through cco.Window(handle).lsa_ptr(pe, off).
 
-All kernels here are single-node (cco-LSA P2P over the flat symmetric VA);
-internode (RDMA) kernels would live in a separate internode_kernels.py.
-
-Merged factories: dispatch (+scales/replay), combine (gather + scatter/quant),
-StdMoE convert (ConvertDispatchOutput/CombineInput), and local expert count.
-Each is a compile-time-parameterised @flyc.jit factory; peer addressing goes
-through cco.Window(handle).lsa_ptr(pe, off).
-
-Recurring conventions used throughout:
-  * `window.lsa_ptr(pe, off)` -> address of peer `pe`'s copy of arena region `off`.
-  * `rsrc_*` = a buffer resource descriptor (create_buffer_resource_from_addr).
-  * `safe_*` = a value that is the real one on live lanes but a harmless
-    in-bounds fallback (0 / self-rank) on dropped lanes, so invalid (duplicate
-    or overflow) slots never issue an out-of-bounds load/store.
-  * "sentinel" = the dropped-slot marker in tok_map: a (src_tok, k) whose dest
-    encodes PE == npes (>= any real PE), telling combine to skip it.
-  * "tis" = the per-peer "recv slot -> source token" reverse map; dispatch
-    stores the global source token id (rank*max_tok_per_rank + src_tok) there so
-    combine/scatter can route each result back to its origin.
-  * "xdb" = cross-device barrier: a monotonically bumped i64 flag each rank
-    writes into every peer's xdb_mem slot, then spins until its own slot matches
-    — an all-ranks handshake that publishes peers' writes before the next stage.
+Conventions: `rsrc_*` = buffer resource descriptor; `safe_*` = real value on live
+lanes / in-bounds fallback (0 or self-rank) on dropped lanes; "sentinel" = tok_map
+dropped-slot marker (dest PE == npes); "tis" = recv-slot -> global source-token map;
+"xdb" = cross-device barrier (bumped i64 flag handshaked across all ranks).
 """
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -69,9 +54,8 @@ from flydsl.expr.typing import Int32, Int64
 import mori.cco.device.flydsl as cco
 from . import flydsl_prims as P
 
-# Wavefront size: gfx9 (MI300/MI350) = 64, gfx12 (MI400/gfx1250) = 32. Detected
-# once per process; override with MORI_WAVE_SIZE. get_warp_size(gfx1250) wrongly
-# reports 64, so key off the arch string.
+# Wavefront size: gfx9 = 64, gfx12 (gfx1250) = 32. Override with MORI_WAVE_SIZE;
+# key off the arch string since get_warp_size(gfx1250) wrongly reports 64.
 import os as _os
 
 
@@ -123,15 +107,13 @@ def make_dispatch(
     replay=False,
     fp4=False,
 ):
-    # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
-    # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
+    # fp4 (e2m1) packs 2 values/byte -> token is hidden_dim/2 bytes; dispatch is a
+    # pure byte mover (no fp4 decode).
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
-    # Dropped-slot marker stored in tok_map (see module docstring "sentinel"):
-    # its encoded dest_pe (value // max_recv) equals npes, i.e. no real PE.
+    # sentinel: tok_map dropped-slot marker whose dest_pe (value // max_recv) == npes.
     sentinel_val = npes * max_recv
-    # Optional per-token scales (e.g. fp4/blockwise quant inputs): forwarded
-    # verbatim alongside the token to the dest peer's out_scales (mori parity).
+    # Optional per-token scales forwarded verbatim to the dest peer's out_scales.
     scale_bytes = scale_dim * scale_type_size
     scale_num_i32 = (scale_bytes + 3) // 4
     enable_scales = scale_bytes > 0
@@ -172,11 +154,9 @@ def make_dispatch(
             dest_expert = buffer_load(
                 rsrc_inp_idx, work_idx, vec_width=1, dtype=T.i32()
             )
-            # Dedup: one token routed to several experts on the SAME dest PE must
-            # be sent only once. Each lane l (< k) inspects this token's l-th
-            # expert; if a LOWER lane already targets our dest_pe, this
-            # (src_tok, k_slot) is a duplicate and gets dropped. safe_lane keeps
-            # the probe in-bounds for lanes >= k_slot.
+            # Dedup: a token routed to several experts on the SAME dest PE is sent
+            # once. If a lower lane (< k_slot) already targets our dest_pe, drop this
+            # (src_tok, k_slot); safe_lane keeps the probe in-bounds for lanes >= k_slot.
             safe_lane = arith.select(lane < k_slot, lane, 0)
             lane_expert = buffer_load(
                 rsrc_inp_idx,
@@ -193,7 +173,7 @@ def make_dispatch(
             is_dup = dup_ballot != 0
 
             if const_expr(replay):
-                # decode dest_tok_id from cached tok_map (skip atomic alloc; same layout)
+                # decode dest_tok_id from cached tok_map (skip atomic alloc)
                 cached = buffer_load(rsrc_tok_map, work_idx, vec_width=1, dtype=T.i32())
                 is_dup_or_overflow = cached >= sentinel_val
                 do_publish = cached < sentinel_val
@@ -218,8 +198,8 @@ def make_dispatch(
 
             if lane == 0:
                 if do_publish:
-                    # publish this recv slot's origin into the dest peer's tis
-                    # (recv slot -> global source token id) for combine routing.
+                    # publish this recv slot's origin (global source token id) into
+                    # the dest peer's tis, for combine routing.
                     src_tok_encoded = rank * max_tok_per_rank + src_tok
                     peer_tis = fx.Int64(window.lsa_ptr(dest_pe, off_tis))
                     buffer_store(
@@ -255,8 +235,7 @@ def make_dispatch(
                     )
 
             # Per-token scales scatter: forward the src token's scale_num_i32 dwords
-            # to the dest peer's out_scales[dest_tok_id] (lane-strided to cover
-            # scale_dim > one wavefront). Verbatim copy (opaque bytes).
+            # (lane-strided) to the dest peer's out_scales[dest_tok_id], verbatim.
             if const_expr(enable_scales):
                 if do_publish:
                     rsrc_inp_scales = create_buffer_resource_from_addr(addr_inp_scales)
@@ -276,9 +255,8 @@ def make_dispatch(
                         )
 
             # Token-embedding scatter: each lane owns 4 i32 (16B). Two vec4 streams
-            # (chunk and chunk+_LANE_STRIDE_I32, stride _MAIN_STRIDE_I32) for
-            # memory-level parallelism; a one-stream tail covers the remainder.
-            # Dropped slots (dup/overflow) set copy_end == lane_i32_off → no-op.
+            # for memory-level parallelism, one-stream tail for the remainder;
+            # dropped slots set copy_end == lane_i32_off (no-op).
             peer_tok_base = fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
             remote_tok_addr = peer_tok_base + fx.Int64(dest_tok_id) * fx.Int64(nbytes)
             local_tok_addr = fx.Int64(addr_inp_tok) + fx.Int64(src_tok) * fx.Int64(
@@ -313,11 +291,8 @@ def make_dispatch(
                     buffer_store(vec_a, rsrc_dst, chunk)
 
         if const_expr(enable_signal):
-            # Self-reset total_recv (replaces the host-side total_recv.zero_()):
-            # only warp 0 accumulates into it in Phase 3, so warp 0 zeros it here
-            # and release-fences before the grid barrier; the Phase-2 acquire then
-            # orders the Phase-3 atomic adds after this zero. No other warp touches
-            # total_recv, so there is no cross-block race.
+            # Self-reset total_recv (warp 0 zeros it here + release-fence; only warp 0
+            # accumulates into it in Phase 3, so no cross-block race). CUDAGraph-safe.
             if global_warp_id == 0:
                 if lane == 0:
                     buffer_store(
@@ -430,13 +405,10 @@ def _V1I32():
 def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
     if fp4:  # fp4 e2m1: i32 = 8 packed fp4 -> v8f32
         if WAVE == 32:
-            # gfx1250: one pack-8 instr converts all 8 fp4/i32 at once. The
-            # gfx950 pk-2 (cvt_scalef32_pk_*_fp4, src/dst_sel) don't exist here
-            # ("Cannot select"); dequant only has the E8M0 scale family
-            # (cvt_scale_pk8_f32_fp4), quant has scalef32 (cvt_scalef32_pk8_fp4_f32).
-            # Plain fp4 (no microscaling) => scale 1.0, scale_sel 0.
+            # gfx1250: one pack-8 instr converts all 8 fp4/i32 (the gfx950 pk-2
+            # variants don't exist here). Plain fp4 => scale 1.0, scale_sel 0.
             def to_accum(i32_scalar):
-                # dequant uses the E8M0 block-scale (i32); 1.0 == 2^(127-127) => 127.
+                # dequant uses the E8M0 block-scale; 1.0 == 2^(127-127) => 127.
                 return cvt_scale_pk8_f32_fp4(
                     res=_V8F32(),
                     src=i32_scalar,
@@ -454,9 +426,7 @@ def _accum_funcs(hidden_elem_size, fp8_direct_cast=False, fp4=False):
 
             return to_accum, from_accum, zero_accum
 
-        # NOTE: cvt_scalef32_pk_*_fp4 are gfx950-only (MI350). On gfx942
-        # (MI300X) codegen fails "instruction not supported on this GPU".
-        # Faithful port of the FlyDSL reference fp4 branch; opt-in (fp4=True).
+        # cvt_scalef32_pk_*_fp4 are gfx950-only (fail on gfx942); opt-in (fp4=True).
         def to_accum(i32_scalar):
             one = arith.constant(1.0, type=T.f32())
             pairs = [
@@ -573,17 +543,15 @@ def make_combine(
     fp8_direct_cast=False,
     fp4=False,
     reset_total_recv=True,
-    _s3_cache=2,
     _unroll=2,
 ):
-    # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
-    # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
+    # Transport dtype = external dtype; fp8_direct_cast wires fp8 while the output
+    # stays bf16 (2 i32 per fp8 unit). fp4: i32 = 8 fp4.
     _to_accum2, _from_accum2, _zero_accum = _accum_funcs(
         hidden_elem_size, fp8_direct_cast, fp4
     )
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = hidden_dim // 8 if fp4 else nbytes // 4
-    # fp8_direct_cast: output stride is bf16 (2 i32 per fp8 unit) vs input fp8.
     out_n_i32 = (hidden_dim * 2) // 4 if fp8_direct_cast else n_i32
     # vec4 gather: 4 i32 per load (global_load_dwordx4) when output is 1:1.
     _use_vec4 = (n_i32 % 4 == 0) and not fp8_direct_cast
@@ -616,12 +584,10 @@ def make_combine(
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
-        # ── Stage 1: cross-device entry barrier (xdb, see module docstring) ──
-        # Gather reads only out_tok from the prior dispatch/expert kernel, so a
-        # cross-device barrier suffices (no Stage-1 scatter). The grid barrier
-        # (comb_bar) is REQUIRED: it guarantees every block has already read
-        # xdb_cur_flag before block 0 increments xdb_flag — otherwise a slow
-        # block reads the bumped flag and the per-peer == handshake deadlocks.
+        # ── Stage 1: cross-device entry barrier (xdb) ──
+        # The grid barrier (comb_bar) is REQUIRED so every block reads xdb_cur_flag
+        # before block 0 bumps xdb_flag; else a slow block reads the bumped flag and
+        # the per-peer == handshake deadlocks.
         fx.barrier()
         if tid == 0:
             P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
@@ -652,11 +618,9 @@ def make_combine(
         rsrc_out_wts = create_buffer_resource_from_addr(addr_out_wts)
 
         # ── Stage 2: warp-partitioned remote gather + f32 accumulate ──
-        # Register-light i32 (2 bf16, v2f32) reads + `_unroll`-way unroll: each
-        # lane keeps `_unroll` independent loads/accumulators in flight per k so
-        # a warp hides xGMI read latency with fewer warps (mori WarpAccum,
-        # VecBytes=4, Unroll=2). Partition each token's hidden across
-        # warps_per_tok warps so small batches still fill the grid.
+        # Register-light i32 reads + `_unroll`-way unroll (each lane keeps _unroll
+        # loads/accumulators in flight per k) hide xGMI latency with fewer warps;
+        # each token's hidden is split across warps_per_tok warps to fill the grid.
         STEP = _unroll * WAVE
         safe_tok = arith.select(
             cur_rank_num_token == arith.constant(0),
@@ -688,9 +652,8 @@ def make_combine(
                 valid_k = dest_pe_k < npes
                 safe_pe = arith.select(valid_k, dest_pe_k, arith.constant(rank))
                 safe_tok_k = arith.select(valid_k, dest_tok_k, arith.constant(0))
-                # Remote base peer[dest_pe].out_tok[dest_tok]; gather via global
-                # loads (no per-expert buffer descriptor) to keep all K loads in
-                # flight — see P.load_i32_nt.
+                # Remote base peer[dest_pe].out_tok[dest_tok]; global-load gather
+                # (no per-expert descriptor) keeps all K loads in flight.
                 slot_addr = fx.Int64(window.lsa_ptr(safe_pe, off_out_tok)) + fx.Int64(
                     safe_tok_k
                 ) * fx.Int64(nbytes)
@@ -699,9 +662,8 @@ def make_combine(
                 expert_pes.append(safe_pe)
                 expert_toks.append(safe_tok_k)
 
-            # Weights (mori UseWeights): once per token (part 0), reduce the K
-            # forwarded weight vectors -> out_weights[tok][e]. Reuses the decode
-            # above and overlaps with this warp's hidden gather.
+            # Weights: once per token (part 0), reduce the K forwarded weights ->
+            # out_weights[tok][e]; overlaps with this warp's hidden gather.
             if const_expr(enable_weights):
                 if part_id == arith.constant(0):
                     if lane < experts_per_token:
@@ -910,24 +872,18 @@ def make_combine_scatter(
     reset_total_recv=True,
     _s3_cache=2,
 ):
-    """Scatter combine (mori useExternalInpBuffer / _nop2p path).
+    """Scatter combine (mori _nop2p path): 2 passes vs gather, but compresses the
+    transport to fp8 (the natural home for fp8_direct_cast).
 
-    Stage 1  each computing rank P2P-WRITES its post-expert tokens back to the
-             ORIGIN rank's comb_inp[computing_rank*M + origin_lid] (origin from
-             tis); under fp8_direct_cast the bf16 token is cast to fp8 on write.
+    Stage 1  each computing rank P2P-WRITES post-expert tokens to the ORIGIN's
+             comb_inp[computing_rank*M + origin_lid] (bf16->fp8 if cast).
     Stage 2  cross-device barrier.
-    Stage 3  origin rank LOCAL-reads comb_inp[dest_pe*M + tok] for its token's k
-             expert PEs (from tok_map) and reduces (fp8->bf16 dequant if cast).
-
-    vs the gather path: 2 passes (remote write + local read) but compresses the
-    transport to fp8; the natural home for fp8_direct_cast (gather has no
-    Stage-1 writer to compress at)."""
+    Stage 3  origin LOCAL-reads comb_inp for its token's k expert PEs and reduces."""
     if fp8_blockwise and WAVE != 64:
         raise NotImplementedError(
             "fp8_blockwise combine's coalesced path assumes wave64 (one wave == one "
             "128-elem block); wave32 (gfx12) port is TODO"
         )
-    # blockwise reuses the fp8->bf16 accum (output bf16, wire fp8) + per-block scale.
     _fp8_out = fp8_direct_cast or fp8_blockwise
     wire_elem_size = 1 if _fp8_out else hidden_elem_size
     to_acc, from_acc, zero_acc = _accum_funcs(wire_elem_size, _fp8_out)
@@ -991,14 +947,10 @@ def make_combine_scatter(
             rsrc_src = create_buffer_resource_from_addr(src)
             rsrc_dst = create_buffer_resource_from_addr(dst)
             if const_expr(fp8_blockwise):
-                # Blockwise fp8 quant, COALESCED + warp-reduce (block_elems==128
-                # so one i32/lane spans a full block). Per block scale_block:
-                # lanes load the block coalesced (lane l -> elems 2l,2l+1),
-                # ds_bpermute butterfly gives every lane the block amax, then
-                # lane-pairs combine their 2 fp8 each into one i32 (even lane
-                # writes, coalesced). scale = (amax>MAX)? amax/MAX : 1;
-                # quant = clamp(v*MAX/amax). Token sign sentinel: if ANY block
-                # scaled, negate block-0 scale.
+                # Blockwise fp8 quant, coalesced + warp-reduce (block_elems==128, one
+                # i32/lane spans a block): ds_bpermute butterfly gives every lane the
+                # block amax; scale = (amax>MAX)? amax/MAX : 1, quant = clamp(v*MAX/amax);
+                # sign sentinel: if ANY block scaled, negate block-0 scale.
                 scale_dst = fx.Int64(
                     window.lsa_ptr(origin_pe, off_comb_scales)
                 ) + fx.Int64(rank * max_tok_per_rank + origin_lid) * fx.Int64(
@@ -1089,9 +1041,8 @@ def make_combine_scatter(
                     v = buffer_load(rsrc_src, elem, vec_width=1, dtype=T.i32())
                     buffer_store(v, rsrc_dst, elem)
             if const_expr(enable_weights):
-                # forward this recv slot's weights (dispatch put them in out_wts[recv_slot])
-                # to the ORIGIN's comb_wts[computing_rank*M + lid] (dedicated
-                # region; reusing out_wts would collide with dispatch's layout).
+                # forward this recv slot's weights to the ORIGIN's
+                # comb_wts[computing_rank*M + lid] (dedicated region).
                 weight_src = fx.Int64(
                     window.lsa_ptr(my_lsa_rank, off_out_wts)
                 ) + fx.Int64(recv_slot) * fx.Int64(experts_per_token) * fx.Int64(4)
@@ -1114,8 +1065,7 @@ def make_combine_scatter(
                     )
 
         # ── Stage 2: cross-device barrier ──
-        # release Stage-1's P2P comb_inp writes before signaling peers (else
-        # Stage-3's acquire races them -> dropped contributions)
+        # release Stage-1's P2P writes before signaling peers (else Stage-3 races them)
         P.fence_system_release()
         fx.barrier()
         if tid == 0:
@@ -1335,8 +1285,8 @@ def make_convert_dispatch_output(
     warp_num_per_block,
 ):
     """Per-expert packing of dispatched tokens. One warp per (recv_tok, k_slot):
-    lane0 bumps packed_cnt[localExpert] to claim a slot, then the warp copies the
-    token embedding into packed_x[slot]."""
+    lane0 bumps packed_cnt[localExpert] to claim a slot, warp copies the token
+    embedding into packed_x[slot]."""
     assert hidden_elem_size == 2, "stdmoe convert is bf16-only"
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
@@ -1375,7 +1325,6 @@ def make_convert_dispatch_output(
             is_local = arith.cmpi(
                 arith.CmpIPredicate.ult, local_expert, arith.constant(experts_per_rank)
             )
-            # lane0 claims a per-expert packing slot, then broadcasts.
             slot_lane0 = arith.constant(0)
             if lane == 0:
                 if is_local:
@@ -1452,9 +1401,8 @@ def make_convert_combine_input(
     block_num,
     warp_num_per_block,
 ):
-    """Inverse: reduce each recv token's local-expert outputs with routing
-    weights back into out_tok (the combine input staging). Warp-partitioned over
-    hidden; out_tok[recv_t][e] = sum_{k: slot_k valid} wts[k]*packed_x[slot_k][e]."""
+    """Inverse: weighted-reduce each recv token's local-expert outputs back into
+    out_tok. out_tok[recv_t][e] = sum_{k: slot_k valid} wts[k]*packed_x[slot_k][e]."""
     assert hidden_elem_size == 2, "stdmoe convert is bf16-only"
     nbytes = hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
@@ -1528,9 +1476,7 @@ def make_convert_combine_input(
                         expert_weights[k_slot],
                         arith.constant(0.0, type=T.f32()),
                     )
-                    # v2f32 vector * f32 scalar (broadcast), matching the
-                    # FlyDSL reference _weighted_accum_experts.
-                    acc = acc + _to_accum2(v) * weight_val
+                    acc = acc + _to_accum2(v) * weight_val  # v2f32 * f32 broadcast
                 buffer_store(_from_accum2(acc), rsrc_out, off)
 
             def _loop():
