@@ -23,6 +23,12 @@ void opus_bmm_a8w8_mxscale_mmajor(aiter_tensor_t& O,
                                   aiter_tensor_t& x_scale,
                                   aiter_tensor_t& w_scale,
                                   int kernelId);
+void opus_bmm_a8w8_mxscale_splitk_mmajor(aiter_tensor_t& O,
+                                         aiter_tensor_t& wo_a,
+                                         aiter_tensor_t& Y,
+                                         aiter_tensor_t& x_scale,
+                                         aiter_tensor_t& w_scale,
+                                         int splitK);
 
 // fp8 block-scale UNIFORM (Route B fp8, 4-wave full-tile, direct store) BMM.
 // Y dtype in {fp32, bf16}; kernelId selects tile 700=128x128, 701=256x128.

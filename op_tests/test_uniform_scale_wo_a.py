@@ -24,6 +24,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus.bmm_op import (
     _opus_bmm_a8w8_mxscale_mmajor_raw,
+    _opus_bmm_a8w8_mxscale_splitk_mmajor_raw,
     _opus_bmm_a8w8_uniform_scale_raw,
     _opus_bmm_a8w8_uniform_scale_mmajor_raw,
 )
@@ -161,6 +162,17 @@ def test_uniform_scale(m, n, k, g, layout, out_dtype):
             return Y
 
         candidates["a8w8_mxscale"] = (_a8w8_mx, ref_mx)
+
+        def _a8w8_mx_sk(split_k):
+            Y = torch.empty(y_shape, dtype=ydt)
+            _opus_bmm_a8w8_mxscale_splitk_mmajor_raw(
+                O_mx_in, W_mx, Y, xs_mx_in, ws_mx, split_k
+            )
+            return Y
+
+        candidates["a8w8_mxscale_sk4"] = (lambda: _a8w8_mx_sk(4), ref_mx)
+        candidates["a8w8_mxscale_sk8"] = (lambda: _a8w8_mx_sk(8), ref_mx)
+        candidates["a8w8_mxscale_sk16"] = (lambda: _a8w8_mx_sk(16), ref_mx)
 
     def _bf16_einsum():
         if layout == "mmajor":

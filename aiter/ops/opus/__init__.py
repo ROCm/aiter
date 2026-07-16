@@ -44,6 +44,7 @@ if _arch_ok:
     )
     from .bmm_op import (  # noqa: E402
         _opus_bmm_a8w8_mxscale_mmajor_raw,
+        _opus_bmm_a8w8_mxscale_splitk_mmajor_raw,
         _opus_bmm_a8w8_scale_mmajor_raw,
         _opus_bmm_a8w8_uniform_scale_raw,
         _opus_bmm_a8w8_uniform_scale_mmajor_raw,
@@ -64,6 +65,9 @@ else:
     _opus_bmm_a8w8_mxscale_mmajor_raw = _make_unsupported_arch_stub(
         "_opus_bmm_a8w8_mxscale_mmajor_raw"
     )
+    _opus_bmm_a8w8_mxscale_splitk_mmajor_raw = _make_unsupported_arch_stub(
+        "_opus_bmm_a8w8_mxscale_splitk_mmajor_raw"
+    )
     _opus_bmm_a8w8_scale_mmajor_raw = _make_unsupported_arch_stub(
         "_opus_bmm_a8w8_scale_mmajor_raw"
     )
@@ -83,6 +87,7 @@ __all__ = [
     "opus_gemm_a16w16_tune",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "_opus_bmm_a8w8_mxscale_mmajor_raw",
+    "_opus_bmm_a8w8_mxscale_splitk_mmajor_raw",
     "_opus_bmm_a8w8_scale_mmajor_raw",
     "_opus_bmm_a8w8_uniform_scale_raw",
     "_opus_bmm_a8w8_uniform_scale_mmajor_raw",
