@@ -882,27 +882,48 @@ class EpDispatchCombineOp:
         routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
         """
         comb_stg_ptr = self.arena.local_ptr("comb_stg")
-        # StdMoE already staged comb_stg via convert_combine_input(), so `input` is
-        # unused; non-StdMoE must copy `input` into comb_stg (no longer aliased).
-        if not self.cfg.enable_std_moe and input.data_ptr() != comb_stg_ptr:
-            # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
-            dst = self.combine_in_view().view(-1)[: input.numel()]
-            dst.copy_(input.reshape(-1))
+        if self.cfg.is_scatter:
+            # Scatter Stage 1 only LOCAL-reads its source, so read the post-expert
+            # tokens (GEMM output) directly and skip the copy into symmetric
+            # comb_stg. StdMoE already staged comb_stg, so use that.
+            src_tok_ptr = comb_stg_ptr if self.cfg.enable_std_moe else input.data_ptr()
+        else:
+            # Gather peers REMOTE-read comb_stg, so the post-expert tokens must be
+            # copied into symmetric memory first. StdMoE already staged comb_stg.
+            if not self.cfg.enable_std_moe and input.data_ptr() != comb_stg_ptr:
+                # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
+                dst = self.combine_in_view().view(-1)[: input.numel()]
+                dst.copy_(input.reshape(-1))
         self.combine_out.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
         _, comb_spec = self._pick(routing.cur_rank_num_token)
-        self._combine_variants[comb_spec](
-            self.arena.handle,
-            routing.disp_dest_tok_id_map.data_ptr(),
-            self.combine_barrier.data_ptr(),
-            self.cross_device_flag.data_ptr(),
-            routing.total_recv_token_num.data_ptr(),
-            self.combine_out.data_ptr(),
-            self.combine_out_weights.data_ptr(),
-            self.cfg.rank,
-            routing.cur_rank_num_token,
-            stream,
-        )
+        if self.cfg.is_scatter:
+            self._combine_variants[comb_spec](
+                self.arena.handle,
+                routing.disp_dest_tok_id_map.data_ptr(),
+                self.combine_barrier.data_ptr(),
+                self.cross_device_flag.data_ptr(),
+                routing.total_recv_token_num.data_ptr(),
+                self.combine_out.data_ptr(),
+                self.combine_out_weights.data_ptr(),
+                src_tok_ptr,
+                self.cfg.rank,
+                routing.cur_rank_num_token,
+                stream,
+            )
+        else:
+            self._combine_variants[comb_spec](
+                self.arena.handle,
+                routing.disp_dest_tok_id_map.data_ptr(),
+                self.combine_barrier.data_ptr(),
+                self.cross_device_flag.data_ptr(),
+                routing.total_recv_token_num.data_ptr(),
+                self.combine_out.data_ptr(),
+                self.combine_out_weights.data_ptr(),
+                self.cfg.rank,
+                routing.cur_rank_num_token,
+                stream,
+            )
         count = routing.cur_rank_num_token
         hidden_dim = self.cfg.hidden_dim
         topk = self.cfg.num_experts_per_token

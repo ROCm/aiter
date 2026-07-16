@@ -871,6 +871,7 @@ def make_combine_scatter(
     scale_dim=0,
     reset_total_recv=True,
     _s3_cache=2,
+    _unroll=2,
 ):
     """Scatter combine (mori _nop2p path): 2 passes vs gather, but compresses the
     transport to fp8 (the natural home for fp8_direct_cast).
@@ -908,6 +909,7 @@ def make_combine_scatter(
         addr_total_recv: Int64,
         addr_out: Int64,
         addr_out_wts: Int64,
+        addr_src_tok: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
     ):
@@ -932,7 +934,11 @@ def make_combine_scatter(
         total_recv = buffer_load(rsrc_total_recv, 0, vec_width=1, dtype=T.i32())
 
         # ── Stage 1: scatter post-expert tokens back to origin's comb_inp ──
-        src_tok_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_out_tok))
+        # addr_src_tok is a raw LOCAL pointer to the post-expert tokens (the GEMM
+        # output). Scatter only ever LOCAL-reads its source, so the caller can pass
+        # the GEMM output directly and skip the copy into symmetric comb_stg that
+        # gather requires (gather peers remote-read it, so it must be symmetric).
+        src_tok_base = fx.Int64(addr_src_tok)
         for recv_slot in range(global_warp_id, total_recv, global_warp_num):
             # tis encodes origin = src_pe*max_tok_per_rank + local_id
             encoded_origin = buffer_load(
@@ -1037,7 +1043,21 @@ def make_combine_scatter(
                     )
                     buffer_store(fp8, rsrc_dst, elem)
             else:
-                for elem in range(lane, wire_n_i32, WAVE):
+                # bf16/f32 (no compression): plain local-read -> remote-write copy.
+                # vec4 (global_load/store_dwordx4, 16B) + _unroll-way prefetch to keep
+                # multiple remote stores in flight and hide xGMI write latency.
+                _v4n = wire_n_i32 // 4
+                _step = _unroll * WAVE
+                _main_end = (_v4n // _step) * _step
+                for _b in range(lane, _main_end, _step):
+                    _pre = []
+                    for _r in range_constexpr(_unroll):
+                        _pre.append(P.load_v4i32_nt(src, (_b + _r * WAVE) * 4))
+                    for _r in range_constexpr(_unroll):
+                        buffer_store(_pre[_r], rsrc_dst, (_b + _r * WAVE) * 4)
+                for _u in range(_main_end + lane, _v4n, WAVE):
+                    buffer_store(P.load_v4i32_nt(src, _u * 4), rsrc_dst, _u * 4)
+                for elem in range(_v4n * 4 + lane, wire_n_i32, WAVE):
                     v = buffer_load(rsrc_src, elem, vec_width=1, dtype=T.i32())
                     buffer_store(v, rsrc_dst, elem)
             if const_expr(enable_weights):
@@ -1114,6 +1134,7 @@ def make_combine_scatter(
             unit_base = part_id * units_per_warp
             tok_map_base = tok_id * experts_per_token
             expert_rsrcs = []
+            expert_addrs = []
             expert_valids = []
             expert_pes = []
             expert_scales = []
@@ -1129,6 +1150,7 @@ def make_combine_scatter(
                     fx.Int64(safe_pe) * fx.Int64(max_tok_per_rank) + fx.Int64(tok_id)
                 ) * fx.Int64(wire_nbytes)
                 expert_rsrcs.append(create_buffer_resource_from_addr(src_addr))
+                expert_addrs.append(src_addr)
                 expert_valids.append(valid)
                 expert_pes.append(safe_pe)
                 if const_expr(fp8_blockwise):
@@ -1217,8 +1239,37 @@ def make_combine_scatter(
                 buffer_store(from_acc(acc), rsrc_out, out_base + off * out_step_mult)
 
             def _loop():
-                for u in range(lane, eff, WAVE):
-                    _one(unit_base + u)
+                if const_expr(not _fp8_out):
+                    # Non-quant (bf16/f32) fast path: vec4 local reads (4 i32/lane)
+                    # per expert + per-i32 reduce + vec4 store, WAVE-strided so the
+                    # wave stays coalesced. fp8 paths keep the scalar _one loop.
+                    _v4eff = eff // arith.constant(4)
+                    for _u in range(lane, _v4eff, WAVE):
+                        _off = unit_base + _u * arith.constant(4)
+                        _accs = [zero_acc(), zero_acc(), zero_acc(), zero_acc()]
+                        for k_slot in range_constexpr(experts_per_token):
+                            _vv = P.load_v4i32_nt(expert_addrs[k_slot], _off)
+                            for _j in range_constexpr(4):
+                                _e = vector.extract(_vv, static_position=[_j])
+                                _e = arith.select(
+                                    expert_valids[k_slot], _e, arith.constant(0)
+                                )
+                                _accs[_j] = _accs[_j] + to_acc(_e)
+                        _res = vector.from_elements(
+                            T.VectorType.get([4], T.i32()),
+                            [
+                                from_acc(_accs[0]),
+                                from_acc(_accs[1]),
+                                from_acc(_accs[2]),
+                                from_acc(_accs[3]),
+                            ],
+                        )
+                        buffer_store(_res, rsrc_out, out_base + _off)
+                    for _u in range(_v4eff * arith.constant(4) + lane, eff, WAVE):
+                        _one(unit_base + _u)
+                else:
+                    for u in range(lane, eff, WAVE):
+                        _one(unit_base + u)
 
             _loop()
 
@@ -1231,6 +1282,7 @@ def make_combine_scatter(
         addr_total_recv: Int64,
         addr_out: Int64,
         addr_out_wts: Int64,
+        addr_src_tok: Int64,
         my_lsa_rank: Int32,
         cur_rank_num_token: Int32,
         stream=fx.Stream(None),
@@ -1243,6 +1295,7 @@ def make_combine_scatter(
             addr_total_recv,
             addr_out,
             addr_out_wts,
+            addr_src_tok,
             my_lsa_rank,
             cur_rank_num_token,
         ).launch(
