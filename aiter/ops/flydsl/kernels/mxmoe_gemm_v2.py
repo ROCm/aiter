@@ -38,17 +38,25 @@ BN = BK = 256
 # BM per-launch (default 32): bodies derive kMChunks=BM//16 (MFMA row-groups), kSubBlocks=BM//32.
 BM = 32
 kAStages = 3
+_I32_COPY_BITS = 32
+_CACHE_MODIFIER_DEFAULT = 0
+_CACHE_MODIFIER_NONTEMPORAL = 2
 
 
 # ---- Shared layout-API primitives (B / B-scale data movement + scaled MFMA) ----
 def b_copy_atom(nontemporal):
-    """BufferCopy128b (4x i32 = one 128b weight chunk). nt rides cache_modifier."""
-    return fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if nontemporal else 0), 32)
+    """Copy one 128-bit B-weight chunk as four i32 lanes."""
+    cache_modifier = (
+        _CACHE_MODIFIER_NONTEMPORAL if nontemporal else _CACHE_MODIFIER_DEFAULT
+    )
+    return fx.make_copy_atom(fx.rocdl.BufferCopy128b(cache_modifier), _I32_COPY_BITS)
 
 
 def bscale_copy_atom():
-    """BufferCopy32b (1x i32 e8m0 scale word); always cached (scales reuse heavily)."""
-    return fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), 32)
+    """Copy one cached i32 e8m0 B-scale word."""
+    return fx.make_copy_atom(
+        fx.rocdl.BufferCopy32b(_CACHE_MODIFIER_DEFAULT), _I32_COPY_BITS
+    )
 
 
 def bq_view(arg_bq, row_elems, KH4, K_TILES_TOTAL, num_records_bytes=None):
@@ -108,19 +116,6 @@ def scale_mma_atoms():
         for osa in range(4)
         for osb in range(4)
     }
-
-
-def gemm_mma(atoms, a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb):
-    """One scaled MFMA via fx.gemm over rank-1 fragments; C accumulates in place."""
-    fx.gemm(
-        atoms[(opsel_a, opsel_b)],
-        c_frag,
-        a_frag,
-        b_frag,
-        c_frag,
-        scale_a=sa,
-        scale_b=sb,
-    )
 
 
 # ---- Shared A ds-read + per-J MMA cluster (used by both gemm bodies) ----
@@ -196,7 +191,7 @@ def mma_one_j(
     single_rg=False,
     rg_off=0,
 ):
-    """One J-cluster (4 scaled MFMAs) for a 32-row A-scale group (row-groups i0, i0+1); fp4 gemm_mma / fp8 raw mfma_scale. sa: 32-row A-scale reg. single_rg (BM16): single 16-row group, rg_off picks its byte, 2 MFMAs."""
+    """One J-cluster (4 scaled MFMAs) for a 32-row A-scale group (row-groups i0, i0+1); fp4 fx.gemm / fp8 raw mfma_scale. sa: 32-row A-scale reg. single_rg (BM16): single 16-row group, rg_off picks its byte, 2 MFMAs."""
     if const_expr(single_rg):
         if const_expr(is_f8):
             bJ0 = Vec(bq_frags_kt[J][0].load())
@@ -220,11 +215,23 @@ def mma_one_j(
                 )
         else:
             bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
-            gemm_mma(
-                atoms, a_frags[i0][0], bJ0, c_frags[i0][J], 0 + rg_off, 0 + in_b, sa, sb
+            fx.gemm(
+                atoms[(0 + rg_off, 0 + in_b)],
+                c_frags[i0][J],
+                a_frags[i0][0],
+                bJ0,
+                c_frags[i0][J],
+                scale_a=sa,
+                scale_b=sb,
             )
-            gemm_mma(
-                atoms, a_frags[i0][1], bJ1, c_frags[i0][J], 2 + rg_off, 2 + in_b, sa, sb
+            fx.gemm(
+                atoms[(2 + rg_off, 2 + in_b)],
+                c_frags[i0][J],
+                a_frags[i0][1],
+                bJ1,
+                c_frags[i0][J],
+                scale_a=sa,
+                scale_b=sb,
             )
         return
     if const_expr(is_f8):
@@ -239,17 +246,41 @@ def mma_one_j(
             )
     else:
         bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
-        gemm_mma(
-            atoms, a_frags[i0 + 0][0], bJ0, c_frags[i0 + 0][J], 0, 0 + in_b, sa, sb
+        fx.gemm(
+            atoms[(0, 0 + in_b)],
+            c_frags[i0 + 0][J],
+            a_frags[i0 + 0][0],
+            bJ0,
+            c_frags[i0 + 0][J],
+            scale_a=sa,
+            scale_b=sb,
         )
-        gemm_mma(
-            atoms, a_frags[i0 + 1][0], bJ0, c_frags[i0 + 1][J], 1, 0 + in_b, sa, sb
+        fx.gemm(
+            atoms[(1, 0 + in_b)],
+            c_frags[i0 + 1][J],
+            a_frags[i0 + 1][0],
+            bJ0,
+            c_frags[i0 + 1][J],
+            scale_a=sa,
+            scale_b=sb,
         )
-        gemm_mma(
-            atoms, a_frags[i0 + 0][1], bJ1, c_frags[i0 + 0][J], 2, 2 + in_b, sa, sb
+        fx.gemm(
+            atoms[(2, 2 + in_b)],
+            c_frags[i0 + 0][J],
+            a_frags[i0 + 0][1],
+            bJ1,
+            c_frags[i0 + 0][J],
+            scale_a=sa,
+            scale_b=sb,
         )
-        gemm_mma(
-            atoms, a_frags[i0 + 1][1], bJ1, c_frags[i0 + 1][J], 3, 2 + in_b, sa, sb
+        fx.gemm(
+            atoms[(3, 2 + in_b)],
+            c_frags[i0 + 1][J],
+            a_frags[i0 + 1][1],
+            bJ1,
+            c_frags[i0 + 1][J],
+            scale_a=sa,
+            scale_b=sb,
         )
 
 
