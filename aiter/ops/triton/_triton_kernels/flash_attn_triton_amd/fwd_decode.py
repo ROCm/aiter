@@ -213,8 +213,13 @@ def _attn_fwd_inner(
             # -------- causal + window --------
             diag = N_CTX_K_FINAL - N_CTX_Q  # sk-sq
             causal_ok = col <= row + diag
-            if WINDOW_SIZE_LEFT < 0:  # only right window
+            if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                # both edges unbounded: only the causal cap constrains cols
+                win_ok = causal_ok
+            elif WINDOW_SIZE_LEFT < 0:  # only right window
                 win_ok = col <= row + diag + WINDOW_SIZE_RIGHT
+            elif WINDOW_SIZE_RIGHT < 0:  # only left window (causal caps the right)
+                win_ok = col >= row + diag - WINDOW_SIZE_LEFT
             else:  # both sides
                 win_ok = (col >= row + diag - WINDOW_SIZE_LEFT) & (
                     col <= row + diag + WINDOW_SIZE_RIGHT
@@ -223,8 +228,14 @@ def _attn_fwd_inner(
         else:
             # -------- non-causal window --------
             sk, sq = N_CTX_K_FINAL, N_CTX_Q
-            if WINDOW_SIZE_LEFT < 0:
+            if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                # both edges unbounded: full attention, nothing masked
+                mask = (row < 0) | (col < 0)
+            elif WINDOW_SIZE_LEFT < 0:
                 mask = col > row + (sk - sq) + WINDOW_SIZE_RIGHT
+            elif WINDOW_SIZE_RIGHT < 0:
+                # unbounded right, finite left (mirror of infinite-left)
+                mask = col < row + (sk - sq) - WINDOW_SIZE_LEFT
             else:
                 right = tl.minimum(row + (sk - sq) + WINDOW_SIZE_RIGHT, sk)
                 left = row + (sk - sq) - WINDOW_SIZE_LEFT
@@ -1059,16 +1070,10 @@ def attention_forward_decode_triton_impl(
     )
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
-    # As in the prefill kernel, WINDOW_SIZE_RIGHT is used as a literal finite
-    # offset (no infinite-right branch), so a negative right collapses the band
-    # and silently over-masks. Reject it instead. (right == -1 is only valid as
-    # the off sentinel, paired with left == -1, which leaves this flag False.)
-    if use_sliding_window and window_size_right < 0:
-        raise NotImplementedError(
-            "Sliding-window attention requires window_size_right >= 0 "
-            f"(got window_size_right={window_size_right}). An unbounded right edge "
-            "is not supported; use window_size_right=0 for a causal window."
-        )
+    # As in the prefill kernel, either edge may be unbounded and is handled
+    # uniformly in the per-element window mask: WINDOW_SIZE_LEFT < 0 drops the left
+    # bound, WINDOW_SIZE_RIGHT < 0 drops the right bound (the causal cap still bounds
+    # the right when IS_CAUSAL). (-1, -1) is the only "off" sentinel.
     use_block_table = block_table is not None
 
     # get shapes and strides

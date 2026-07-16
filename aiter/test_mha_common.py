@@ -369,8 +369,15 @@ def construct_local_mask(
         if query_padding_mask is None
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )
-    if window_size[0] < 0:
+    if window_size[0] < 0 and window_size[1] < 0:
+        # both edges unbounded: nothing is masked out
+        return (row_idx < 0) | (col_idx < 0)
+    elif window_size[0] < 0:
+        # unbounded left, finite right
         return col_idx > row_idx + sk - sq + window_size[1]
+    elif window_size[1] < 0:
+        # unbounded right, finite left (mirror of the infinite-left branch)
+        return col_idx < row_idx + sk - sq - window_size[0]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
         return torch.logical_or(

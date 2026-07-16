@@ -2964,9 +2964,18 @@ def _bwd_dkdv_inner(
                 # _sliding_window_q_bounds() is the block-range inversion of this same
                 # inequality (it bounds m for a fixed K block); keep the two in sync.
                 causal_offset = seqlen_k - seqlen_q
-                if WINDOW_SIZE_LEFT < 0:
+                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                    # both edges unbounded -> window keeps every key (the causal
+                    # cap, if any, is applied separately via MASK above)
+                    window_mask = offs_n[:, None] >= 0
+                elif WINDOW_SIZE_LEFT < 0:
                     window_mask = offs_n[:, None] <= (
                         offs_m[None, :] + causal_offset + WINDOW_SIZE_RIGHT
+                    )
+                elif WINDOW_SIZE_RIGHT < 0:
+                    # unbounded right, finite left (mirror of infinite-left)
+                    window_mask = offs_n[:, None] >= (
+                        offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
                     )
                 else:
                     left_bound = offs_m[None, :] + causal_offset - WINDOW_SIZE_LEFT
@@ -3170,9 +3179,18 @@ def _bwd_dq_inner(
                 # _sliding_window_k_bounds() is the block-range inversion of this same
                 # inequality (it bounds n for a fixed Q block); keep the two in sync.
                 causal_offset = seqlen_k - seqlen_q
-                if WINDOW_SIZE_LEFT < 0:
+                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                    # both edges unbounded -> window keeps every key (the causal
+                    # cap, if any, is applied separately via MASK above)
+                    window_mask = offs_n[None, :] >= 0
+                elif WINDOW_SIZE_LEFT < 0:
                     window_mask = offs_n[None, :] <= (
                         offs_m[:, None] + causal_offset + WINDOW_SIZE_RIGHT
+                    )
+                elif WINDOW_SIZE_RIGHT < 0:
+                    # unbounded right, finite left (mirror of infinite-left)
+                    window_mask = offs_n[None, :] >= (
+                        offs_m[:, None] + causal_offset - WINDOW_SIZE_LEFT
                     )
                 else:
                     left_bound = offs_m[:, None] + causal_offset - WINDOW_SIZE_LEFT
@@ -3226,11 +3244,18 @@ def _sliding_window_q_bounds(
         m + (seqlen_k - seqlen_q) - L <= n <= m + (seqlen_k - seqlen_q) + R,
     so the queries that touch any key in this block span
         [start_n - R - off, (start_n + BLOCK_N - 1) + L - off]   (off = seqlen_k - seqlen_q).
+    An unbounded edge drops its bound: L < 0 -> m_hi = seqlen_q - 1 (queries reach
+    forward without limit); R < 0 -> m_lo = 0 (queries reach back without limit).
     Returns (start_m, num_steps) aligned to BLOCK_M; num_steps == 0 means the
     block is entirely outside the window and can be skipped.
     """
     causal_offset = seqlen_k - seqlen_q
-    m_lo = start_n - WINDOW_SIZE_RIGHT - causal_offset
+    if (
+        WINDOW_SIZE_RIGHT < 0
+    ):  # unbounded right -> no lower limit on contributing queries
+        m_lo = 0
+    else:
+        m_lo = start_n - WINDOW_SIZE_RIGHT - causal_offset
     if WINDOW_SIZE_LEFT < 0:  # unbounded left -> no upper limit on contributing queries
         m_hi = seqlen_q - 1
     else:
@@ -3260,6 +3285,8 @@ def _sliding_window_k_bounds(
     dQ sweeps key blocks for the fixed query block [start_m, start_m+BLOCK_M).
     The keys query m attends are [m + off - L, m + off + R] (off = seqlen_k - seqlen_q),
     so across the block they span [start_m + off - L, (start_m + BLOCK_M - 1) + off + R].
+    An unbounded edge drops its bound: L < 0 -> n_lo = 0 (keys reach back to 0);
+    R < 0 -> n_hi = seqlen_k - 1 (keys reach forward to the last key).
     Returns (start_n, num_steps) aligned to BLOCK_N; num_steps == 0 means skip.
     """
     causal_offset = seqlen_k - seqlen_q
@@ -3267,7 +3294,10 @@ def _sliding_window_k_bounds(
         n_lo = 0
     else:
         n_lo = start_m + causal_offset - WINDOW_SIZE_LEFT
-    n_hi = (start_m + BLOCK_M - 1) + causal_offset + WINDOW_SIZE_RIGHT
+    if WINDOW_SIZE_RIGHT < 0:  # unbounded right -> keys reach forward to seqlen_k - 1
+        n_hi = seqlen_k - 1
+    else:
+        n_hi = (start_m + BLOCK_M - 1) + causal_offset + WINDOW_SIZE_RIGHT
     n_lo = tl.maximum(n_lo, 0)
     n_hi = tl.minimum(n_hi, seqlen_k - 1)
     start_n = (n_lo // BLOCK_N) * BLOCK_N
@@ -4642,18 +4672,12 @@ def attention_backward_triton_impl(
         raise NotImplementedError(
             "Sliding-window backward is currently implemented for fused mode only."
         )
-    # The kernels only special-case an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
-    # There is no infinite-right code path, so a negative right bound would collapse
-    # right_bound to (anchor - 1) and silently mask out almost everything. When the
-    # window is active, window_size_right must therefore be >= 0. (window_size_right
-    # == -1 is only valid as the "off" sentinel, i.e. together with
-    # window_size_left == -1, which leaves use_sliding_window False.)
-    if use_sliding_window and window_size_right < 0:
-        raise NotImplementedError(
-            "Sliding-window backward requires window_size_right >= 0 "
-            f"(got window_size_right={window_size_right}). An infinite right edge "
-            "is not supported; use window_size_right=0 for a causal window."
-        )
+    # Either edge may be unbounded and is handled uniformly (mirroring the forward
+    # kernels): WINDOW_SIZE_LEFT < 0 lets keys reach back to 0 / queries have no
+    # upper limit, and WINDOW_SIZE_RIGHT < 0 lets keys reach forward to seqlen_k - 1
+    # / queries have no lower limit. The per-element window mask and the
+    # _sliding_window_{q,k}_bounds block-range helpers both special-case each edge,
+    # so no negative-right guard is needed. (-1, -1) is the only "off" sentinel.
 
     # get closest power of 2 over or equal to 32.
     padded_d_model_qk = 1 << (head_size_qk - 1).bit_length()
