@@ -4,6 +4,7 @@ Mirrors test_moe_gemm_a16w4.py::test_op but forces the gfx1250 native scale
 preshuffle (shuffle_scale_moe(arch='gfx1250') -> 'GFX1250_SCALE') to validate the
 a16w4 kernel's new GFX1250_SCALE unswizzle branch on real gfx1250 hardware.
 """
+
 import sys
 import torch
 
@@ -35,6 +36,7 @@ def run(m, n, k, n_expts_tot, n_expts_act, apply_swiglu, arch, label, device="cu
 
     weight_dtype = torch.uint8  # mxfp4_e2m1 packed
     from aiter.ops.triton.utils.types import str_to_torch_dtype
+
     w_tri, w_scale_tri = downcast_to_mxfp(w, str_to_torch_dtype["mxfp4_e2m1"], axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
 
@@ -47,10 +49,24 @@ def run(m, n, k, n_expts_tot, n_expts_act, apply_swiglu, arch, label, device="cu
         )
         swizzle = label
 
-    ref_y = moe_gemm_torch(x_ref, w_ref, bias_ref, rdata, None, None, None, apply_swiglu)
+    ref_y = moe_gemm_torch(
+        x_ref, w_ref, bias_ref, rdata, None, None, None, apply_swiglu
+    )
     tri_y = moe_gemm_a16w4(
-        x, w_tri, None, w_scale_use, None, None, bias, rdata,
-        None, None, None, swizzle, torch.bfloat16, apply_swiglu,
+        x,
+        w_tri,
+        None,
+        w_scale_use,
+        None,
+        None,
+        bias,
+        rdata,
+        None,
+        None,
+        None,
+        swizzle,
+        torch.bfloat16,
+        apply_swiglu,
     )
 
     ref = ref_y.to(torch.float32)
@@ -62,8 +78,10 @@ def run(m, n, k, n_expts_tot, n_expts_act, apply_swiglu, arch, label, device="cu
     max_err = rel.max().item()
     rms_err = rel.square().mean().sqrt().item()
     ok = max_err <= 4e-1 and rms_err <= 4e-2
-    print(f"[{label:14s} swiglu={int(apply_swiglu)}] max_err={max_err:.4f} "
-          f"rms_err={rms_err:.4f}  -> {'PASS' if ok else 'FAIL'}")
+    print(
+        f"[{label:14s} swiglu={int(apply_swiglu)}] max_err={max_err:.4f} "
+        f"rms_err={rms_err:.4f}  -> {'PASS' if ok else 'FAIL'}"
+    )
     return ok
 
 
