@@ -131,22 +131,25 @@ def pa_decode_sparse(
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
         # If H is too large to fit a single tile, halve until it does.
-        if H >= 128:
-            block_h = 64
-        elif H >= 64:
-            if T >= 2048:
+        if use_gluon:
+            if H >= 128:
                 block_h = 64
-            elif T >= 32:
-                block_h = 32
+            elif H >= 64:
+                if T >= 2048:
+                    block_h = 64
+                elif T >= 32:
+                    block_h = 32
+                else:
+                    block_h = 16
+            elif H >= 32:
+                if T >= 256:
+                    block_h = 32
+                else:
+                    block_h = 16
             else:
-                block_h = 16
-        elif H >= 32:
-            if T >= 256:
-                block_h = 32
-            else:
-                block_h = 16
+                block_h = triton.next_power_of_2(H)
         else:
-            block_h = triton.next_power_of_2(H)
+            block_h = triton.next_power_of_2(min(H, 16))
     else:
         block_h = triton.next_power_of_2(block_h)
     block_h = max(block_h, 16)  # AMD MFMA min tile
