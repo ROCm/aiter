@@ -296,9 +296,39 @@ jobs:
           set -euo pipefail
           {
             echo
-            echo "### Slurm result"
+            echo "### vLLM disagg smoke result"
             echo
+            echo "- Model: \`${MODEL_NAME:-unknown}\`"
+            echo "- Image: \`${IMAGE:-unknown}\`"
             echo "- Job ID: \`${SLURM_JOB_ID:-unknown}\`"
+            if [[ -f slurm-sacct.txt && -n "${SLURM_JOB_ID:-}" ]]; then
+              _row="$(awk -v j="${SLURM_JOB_ID}" '$1==j{print $2, $3, $4; exit}' slurm-sacct.txt || true)"
+              read -r _st _ec _el <<< "${_row}" || true
+              echo "- State: \`${_st:-unknown}\` · ExitCode: \`${_ec:-unknown}\` · Elapsed: \`${_el:-unknown}\`"
+              if [[ "${_ec:-}" == "-1:0" || "${_el:-}" == "00:00:00" ]]; then
+                echo "- ⚠️ Slurm launch failure (NODE_FAIL): the workload never ran — NOT a real pass."
+              fi
+            fi
+            echo
+            _pd_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
+            if [[ -f "${_pd_log}" ]]; then
+              _verdict="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL):' "${_pd_log}" | tail -1 || true)"
+              if [[ -n "${_verdict}" ]]; then
+                echo "#### Accuracy verdict"
+                echo '```text'
+                echo "${_verdict}"
+                echo '```'
+              fi
+              _tbl="$(grep -ahE '^\|' "${_pd_log}" || true)"
+              if [[ -n "${_tbl}" ]]; then
+                echo "#### gsm8k"
+                echo '```text'
+                echo "${_tbl}"
+                echo '```'
+              fi
+            else
+              echo "> No PD log at \`${_pd_log}\` — disagg workload likely never launched."
+            fi
             echo
             if [[ -f slurm-submit.txt ]]; then
               echo "#### sbatch output"
