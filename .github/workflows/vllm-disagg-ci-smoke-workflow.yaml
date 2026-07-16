@@ -69,7 +69,7 @@ jobs:
       VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
       MODEL_NAME_DEFAULT: DeepSeek-V3
       DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
-      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-2,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-3
+      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
       IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
       ROUTER_TYPE_DEFAULT: vllm-router
       MORIIO_READ_MODE_DEFAULT: "0"
@@ -203,12 +203,16 @@ jobs:
           : > "${sacct_log}"
 
           # Spur NODE_FAILs (JobLaunchFailure) any job submitted with sbatch CLI
-          # resource flags (--nodelist/--nodes/--ntasks/--gres/...); the proven
-          # invocation passes NONE and relies entirely on the #SBATCH directives
-          # baked into run_xPyD_disagg.slurm (nodes=2, ntasks-per-node=1,
-          # gres=gpu:8, exclusive), letting Slurm schedule free nodes. See the
-          # reference submitter run-slurm-disagg-test.sh. SPUR_NODELIST is now
-          # informational only (node pinning caused every CI job to NODE_FAIL).
+          # resource flags (--nodelist/--nodes/--ntasks/--gres/...), but in-script
+          # #SBATCH directives ARE honored (proven pattern: ATOM pd_submit.sh
+          # writes #SBATCH --nodelist into the submitted script + bare sbatch).
+          # So pin nodes by injecting an in-script #SBATCH --nodelist rather than
+          # passing it on the CLI; the rest stays in the script's own #SBATCH
+          # (nodes=2, ntasks-per-node=1, gres=gpu:8, exclusive).
+          if [[ -n "${SPUR_NODELIST}" ]] && ! grep -q '^#SBATCH --nodelist=' "${script}"; then
+            sed -i "/^#SBATCH --exclusive/a #SBATCH --nodelist=${SPUR_NODELIST}" "${script}"
+            echo "Pinned nodes via in-script directive: #SBATCH --nodelist=${SPUR_NODELIST}"
+          fi
           sbatch_args=()
 
           echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
