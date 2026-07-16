@@ -19,11 +19,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""mori-parity host op-layer for the cco-LSA intranode dispatch/combine kernels.
-
-One SymmArena window holds the symmetric staging; per-rank metadata are plain
-device tensors surfaced to the caller via from_gpu_ptr.
-"""
+"""Host op-layer for the cco-LSA intranode dispatch/combine kernels. One SymmArena
+window holds the symmetric staging; per-rank metadata are plain device tensors."""
 from dataclasses import dataclass
 
 import torch
@@ -40,7 +37,7 @@ from .intranode_kernels import (
     make_local_expert_count,
 )
 
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+_COMBINE_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
 
 _DT = {
     torch.bfloat16: 2,
@@ -90,9 +87,7 @@ class SymmArena:
         return self._win.local_ptr + self._offsets[name]
 
     def zero(self, name=None):
-        """Zero the whole window, or just region `name` if given. Wraps the raw
-        pointer as a zero-copy int8 torch view (borrowed via
-        __cuda_array_interface__ — no ownership taken) and memsets it."""
+        """Zero the whole window, or just region `name` (zero-copy int8 torch view)."""
         if name is None:
             ptr, nbytes = self._win.local_ptr, self._total
         else:
@@ -113,9 +108,8 @@ class EpDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
-    # Base token dtype; dispatch_data_type / combine_data_type override it per-op
-    # (None => data_type). Asymmetric (fp8 dispatch -> bf16 combine) fits an expert
-    # op that converts dtype between the two. gather mode only.
+    # Base token dtype; dispatch_data_type / combine_data_type override per-op
+    # (None => data_type). Asymmetric (fp8 dispatch -> bf16 combine) is gather-only.
     data_type: torch.dtype = torch.bfloat16
     dispatch_data_type: torch.dtype = None
     combine_data_type: torch.dtype = None
@@ -124,19 +118,18 @@ class EpDispatchCombineConfig:
     scale_type_size: int = 0
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
-    quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
-    # Geometry: None => auto (pull the tuned schedule for this device/shape/dtype
-    # from tuning_configs in __post_init__). Pin any of these to opt out and use a
-    # fixed geometry instead. Combine wants few warps (K-deep per-lane MLP already
-    # saturates), kept separate from dispatch's warp count.
+    # Combine-side wire quantization (scatter-only; distinct from the dispatch
+    # token dtype). Forcing it != "none" switches combine_mode to scatter.
+    combine_quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
+    # Geometry: None => auto (tuned schedule from tuning_configs in __post_init__);
+    # pin any to opt out. Combine's warp count is kept separate from dispatch's.
     dispatch_block_num: int = None
     combine_block_num: int = None
-    warp_num_per_block: int = None
+    dispatch_warp_num_per_block: int = None
     combine_warp_num_per_block: int = None
-    # Optional per-token plan: tuple of (max_tok_inclusive | None, disp_block,
-    # disp_warp, comb_block, comb_warp) buckets. When set, the op precompiles the
-    # distinct (block, warp) variants and picks one at runtime from
-    # cur_rank_num_token. None => auto (from tuning_configs) or single-shot fallback.
+    # Optional per-token plan: (max_tok_inclusive | None, disp_block, disp_warp,
+    # comb_block, comb_warp) buckets; the op precompiles the distinct (block, warp)
+    # variants and picks one at runtime. None => auto or single-shot fallback.
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
@@ -151,26 +144,24 @@ class EpDispatchCombineConfig:
                 "Set data_type alone for a symmetric op, or set both explicitly for "
                 "asymmetric dispatch/combine dtypes."
             )
-        if self.quant_type not in _QUANT_TYPES:
+        if self.combine_quant_type not in _COMBINE_QUANT_TYPES:
             raise ValueError(
-                f"quant_type must be one of {_QUANT_TYPES}, got {self.quant_type!r}"
+                f"combine_quant_type must be one of {_COMBINE_QUANT_TYPES}, "
+                f"got {self.combine_quant_type!r}"
             )
         if self.combine_mode not in ("gather", "scatter"):
             raise ValueError(
                 f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
             )
-        if self.quant_type != "none":
+        if self.combine_quant_type != "none":
             self.combine_mode = "scatter"
-        # The dispatch grid barrier iterates peers as `range(lane, npes, 64)` and
-        # resets the barrier inside the loop, which is only correct when each lane
-        # runs it at most once (npes <= wavefront). Intranode is single-node so
-        # this always holds, but make the assumption explicit.
+        # The dispatch grid barrier iterates peers as range(lane, npes, wave) and
+        # resets inside the loop, correct only when npes <= wavefront.
         if self.world_size > 64:
             raise ValueError(
                 f"intranode op supports world_size <= 64, got {self.world_size}"
             )
-        # Token copy moves whole 16 B (vec4) chunks; a non-16 B-aligned per-token
-        # size would over-read/write a few dwords past the token.
+        # Token copy moves whole 16 B (vec4) chunks; per-token size must be 16 B aligned.
         if self.token_nbytes % 16 != 0:
             raise ValueError(
                 f"per-token transport bytes must be 16 B aligned (vec4 copy); "
@@ -178,17 +169,16 @@ class EpDispatchCombineConfig:
                 f"token_nbytes={self.token_nbytes}"
             )
         if self.is_asymmetric_dtype:
-            # dispatch output (disp_out, dispatch dtype) and combine staging
-            # (out_tok, combine dtype) are separate buffers. gather/non-quant/
-            # non-StdMoE only (the asymmetric path is implemented for gather).
+            # asymmetric dtype (separate disp_out/comb_stg buffers): gather/non-quant/
+            # non-StdMoE only.
             if (
                 self.combine_mode != "gather"
-                or self.quant_type != "none"
+                or self.combine_quant_type != "none"
                 or self.enable_std_moe
             ):
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    "quant_type=none, enable_std_moe=False"
+                    "combine_quant_type=none, enable_std_moe=False"
                 )
             if torch.float4_e2m1fn_x2 in (self.dispatch_dtype, self.combine_dtype):
                 raise ValueError(
@@ -202,18 +192,15 @@ class EpDispatchCombineConfig:
         self._resolve_geometry()
 
     def _resolve_geometry(self):
-        """Fill block/warp/schedule. Tuned-by-default: when the caller pinned
-        neither a schedule nor any block/warp, pull the tuned geometry for this
-        device/shape/dtype from tuning_configs.lookup (so the plain constructor is
-        tuned automatically — EpDispatchCombineConfig.tuned() is now just an
-        explicit alias). If any field is pinned, honor it and fill the rest with
-        the single-shot fallback (no schedule)."""
+        """Fill block/warp/schedule. Tuned-by-default: if the caller pinned nothing,
+        pull the tuned geometry from tuning_configs.lookup; if any field is pinned,
+        honor it and fill the rest with the single-shot fallback (no schedule)."""
         pinned = self.schedule is not None or any(
             g is not None
             for g in (
                 self.dispatch_block_num,
                 self.combine_block_num,
-                self.warp_num_per_block,
+                self.dispatch_warp_num_per_block,
                 self.combine_warp_num_per_block,
             )
         )
@@ -228,7 +215,7 @@ class EpDispatchCombineConfig:
             )
             self.dispatch_block_num = t["dispatch_block_num"]
             self.combine_block_num = t["combine_block_num"]
-            self.warp_num_per_block = t["warp_num_per_block"]
+            self.dispatch_warp_num_per_block = t["dispatch_warp_num_per_block"]
             self.combine_warp_num_per_block = t["combine_warp_num_per_block"]
             self.schedule = t["schedule"]
         else:
@@ -237,8 +224,8 @@ class EpDispatchCombineConfig:
                 self.dispatch_block_num = 64
             if self.combine_block_num is None:
                 self.combine_block_num = 80
-            if self.warp_num_per_block is None:
-                self.warp_num_per_block = 16
+            if self.dispatch_warp_num_per_block is None:
+                self.dispatch_warp_num_per_block = 16
             if self.combine_warp_num_per_block is None:
                 self.combine_warp_num_per_block = 4
 
@@ -248,11 +235,11 @@ class EpDispatchCombineConfig:
 
     @property
     def fp8_direct_cast(self):
-        return self.quant_type == "fp8_direct_cast"
+        return self.combine_quant_type == "fp8_direct_cast"
 
     @property
     def fp8_blockwise(self):
-        return self.quant_type == "fp8_blockwise"
+        return self.combine_quant_type == "fp8_blockwise"
 
     @property
     def combine_scale_dim(self):
@@ -264,16 +251,14 @@ class EpDispatchCombineConfig:
         """comb_inp transport element size: 1 byte for fp8 paths, else elem_size."""
         return (
             1
-            if self.quant_type in ("fp8_direct_cast", "fp8_blockwise")
+            if self.combine_quant_type in ("fp8_direct_cast", "fp8_blockwise")
             else self.elem_size
         )
 
     @classmethod
     def tuned(cls, **kwargs):
-        """Build a config with block/warp geometry pulled from tuning_configs
-        (unless explicitly overridden in kwargs). Kept for back-compat and to
-        force per-field tuning even when some geometry is overridden; the plain
-        constructor is now also tuned-by-default (see _resolve_geometry)."""
+        """Build a config with geometry from tuning_configs (unless overridden in
+        kwargs). Back-compat alias; the plain constructor is also tuned-by-default."""
         from .tuning_configs import lookup
 
         dt = kwargs.get("data_type", torch.bfloat16)
@@ -375,21 +360,15 @@ class EpDispatchCombineConfig:
 
 
 class EpDispatchRoutingHandle:
-    """Per-call routing snapshot (mori EpDispatchRoutingHandle parity).
+    """Per-call routing snapshot.
 
-    disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (v2 tok_map).
-    disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
-    inter_node_*: empty placeholders (v2 is intranode-only; kept for 5-tensor
-    shape parity so downstream unpacking works).
+    disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (tok_map).
+    disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (tis).
+    inter_node_*: empty placeholders (intranode-only; kept for 5-tensor shape parity).
 
-    The reverse map (disp_tok_id_to_src_tok_id_local) is materialized LAZILY on
-    first access. recv_to_src_token is written into this rank's arena by peers via
-    P2P during dispatch and, per the mori contract, is only visible after the
-    caller's post-dispatch comm.barrier(). Cloning it eagerly inside dispatch()
-    (before that barrier) races those P2P writes and captures stale entries on
-    high-CU parts (seen flaky on MI355X at high occupancy). Deferring the clone to
-    first access lets it run after the barrier; it also skips the copy entirely for
-    the common combine path, which never reads the reverse map.
+    The reverse map is materialized LAZILY on first access: recv_to_src_token is
+    written by peers via P2P during dispatch and is only visible after the caller's
+    post-dispatch barrier, so cloning it eagerly would race those writes.
     """
 
     def __init__(
@@ -416,8 +395,8 @@ class EpDispatchRoutingHandle:
     @property
     def disp_tok_id_to_src_tok_id_local(self):
         if self._reverse_cache is None:
-            # First access (post-barrier): clone off the arena so it survives the
-            # next dispatch overwriting the region.
+            # First access (post-barrier): clone off the arena before the next
+            # dispatch overwrites the region.
             self._reverse_cache = self._reverse_src_view.clone()
         return self._reverse_cache
 
@@ -448,7 +427,7 @@ class EpDispatchCombineOp:
         if (is_fp4 or is_fp8) and cfg.is_scatter:
             raise ValueError(
                 "plain fp4/fp8 token dtype is gather-only "
-                "(fp8 quant uses quant_type=fp8_direct_cast, not data_type)"
+                "(fp8 quant uses combine_quant_type=fp8_direct_cast, not data_type)"
             )
         topk = cfg.num_experts_per_token
         hidden_dim = cfg.hidden_dim
@@ -466,12 +445,11 @@ class EpDispatchCombineOp:
             ("recv_to_src_token", recv_cap * 4),
             ("out_idx", recv_cap * topk * 4),
             ("out_wts", recv_cap * topk * 4),
-            # disp_out: dispatch scatter dest / expert-GEMM input (recv_x). Kept
-            # separate from out_tok so combine's copy-in never clobbers the
-            # dispatched tokens the expert still reads — callers can skip .clone().
+            # disp_out: dispatch dest / expert-GEMM input, kept separate from comb_stg
+            # so combine's copy-in never clobbers the dispatched tokens.
             ("disp_out", recv_cap * token_nbytes),
-            # out_tok: combine staging (post-expert results that peers gather).
-            ("out_tok", recv_cap * cfg.combine_token_nbytes),
+            # comb_stg: combine staging (post-expert results that peers gather).
+            ("comb_stg", recv_cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
         if self._enable_scales:
@@ -485,7 +463,7 @@ class EpDispatchCombineOp:
                     cfg.world_size * max_tok_per_rank * hidden_dim * wire_elem_size,
                 )
             )
-            regions.append(("comb_wts", cfg.world_size * max_tok_per_rank * topk * 4))
+            regions.append(("comb_wts", cfg.world_size * max_tok_per_rank * topk * 4))  # delete
             if cfg.fp8_blockwise:
                 regions.append(
                     (
@@ -530,15 +508,14 @@ class EpDispatchCombineOp:
         )
 
         arena = self.arena
-        # Distinct (block, warp) variants to precompile. With a per-token schedule
-        # the op picks the best (block, warp) at runtime from cur_rank_num_token;
-        # otherwise it is single-shot. Scatter combine is not schedule-tuned.
+        # Distinct (block, warp) variants to precompile; a per-token schedule picks
+        # the best at runtime, else single-shot. Scatter combine is not schedule-tuned.
         schedule = cfg.schedule
         if schedule:
             dispatch_specs = sorted({(db, dw) for (_, db, dw, _, _) in schedule})
             combine_specs = sorted({(cb, cw) for (_, _, _, cb, cw) in schedule})
         else:
-            dispatch_specs = [(cfg.dispatch_block_num, cfg.warp_num_per_block)]
+            dispatch_specs = [(cfg.dispatch_block_num, cfg.dispatch_warp_num_per_block)]
             combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
         if cfg.is_scatter:
             combine_specs = [(cfg.combine_block_num, cfg.combine_warp_num_per_block)]
@@ -585,7 +562,7 @@ class EpDispatchCombineOp:
                     max_recv=recv_cap,
                     block_num=b,
                     warp_num_per_block=w,
-                    off_out_tok=arena.offset("out_tok"),
+                    off_out_tok=arena.offset("comb_stg"),
                     off_comb_inp=arena.offset("comb_inp"),
                     off_tis=arena.offset("recv_to_src_token"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
@@ -613,7 +590,7 @@ class EpDispatchCombineOp:
                     max_recv=recv_cap,
                     block_num=b,
                     warp_num_per_block=w,
-                    off_out_tok=arena.offset("out_tok"),
+                    off_out_tok=arena.offset("comb_stg"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
@@ -630,7 +607,7 @@ class EpDispatchCombineOp:
             experts_per_rank=cfg.num_experts_per_rank,
             experts_per_token=topk,
             block_num=cfg.dispatch_block_num,
-            warp_num_per_block=cfg.warp_num_per_block,
+            warp_num_per_block=cfg.dispatch_warp_num_per_block,
         )
 
         if cfg.enable_std_moe:
@@ -660,7 +637,7 @@ class EpDispatchCombineOp:
                 hidden_elem_size=elem_size,
                 max_tok_per_expert=max_tok_per_expert,
                 block_num=cfg.dispatch_block_num,
-                warp_num_per_block=cfg.warp_num_per_block,
+                warp_num_per_block=cfg.dispatch_warp_num_per_block,
             )
             self._convert_combine = make_convert_combine_input(
                 rank=cfg.rank,
@@ -691,7 +668,7 @@ class EpDispatchCombineOp:
 
     def recv_tokens(self):
         """Arena disp_out [max_recv, hidden] (dispatch dest / expert-GEMM input).
-        Separate from out_tok, so combine's copy-in never overwrites it — the
+        Separate from comb_stg, so combine's copy-in never overwrites it — the
         expert can read this in place without a defensive .clone().
         fp4 packs 2 e2m1 per float4_e2m1fn_x2 element -> last dim is hidden/2."""
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
@@ -702,7 +679,7 @@ class EpDispatchCombineOp:
         )
 
     def combine_in_view(self):
-        """out_tok as combine dtype [max_recv, hidden] — combine()'s copy target."""
+        """comb_stg as combine dtype [max_recv, hidden] — combine()'s copy target."""
         cdt = self.cfg.combine_dtype
         cols = (
             self.cfg.hidden_dim // 2
@@ -710,7 +687,7 @@ class EpDispatchCombineOp:
             else self.cfg.hidden_dim
         )
         return from_gpu_ptr(
-            self.arena.local_ptr("out_tok"), (self._recv_cap, cols), cdt
+            self.arena.local_ptr("comb_stg"), (self._recv_cap, cols), cdt
         )
 
     def convert_dispatch_output(self):
@@ -745,12 +722,12 @@ class EpDispatchCombineOp:
 
     def convert_combine_input(self, routing):
         """mori ConvertCombineInput: weighted-reduce each recv token's local-expert
-        outputs from packed_x back into out_tok. Run after GEMM, before combine."""
+        outputs from packed_x back into comb_stg. Run after GEMM, before combine."""
         assert self.cfg.enable_std_moe, "op built without enable_std_moe"
         arena = self.arena
         stream = fx.Stream(torch.cuda.current_stream())
         self._convert_combine(
-            arena.local_ptr("out_tok"),
+            arena.local_ptr("comb_stg"),
             arena.local_ptr("out_wts"),
             routing.total_recv_token_num.data_ptr(),
             self.packed_x.data_ptr(),
@@ -821,7 +798,7 @@ class EpDispatchCombineOp:
         atomic routing). return_routing=: also return the handle. Mutually
         exclusive. Returns (out, out_weights, out_scales, out_indices,
         total_recv[, routing]); out == arena disp_out (safe to read without
-        .clone() — combine stages into a separate out_tok buffer).
+        .clone() — combine stages into a separate comb_stg buffer).
         """
         if routing is not None and return_routing:
             raise ValueError(
@@ -900,17 +877,14 @@ class EpDispatchCombineOp:
 
     def combine(self, input, weights=None, indices=None, *, routing):
         """mori-parity combine. input [<=max_recv,hidden] post-expert tokens
-        (copied into arena out_tok if not already there). weights/indices are
+        (copied into arena comb_stg if not already there). weights/indices are
         accepted for API parity but unused (weights come from forwarded out_wts,
         routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
         """
-        out_tok_ptr = self.arena.local_ptr("out_tok")
-        # StdMoE: convert_combine_input() has already staged the weighted-reduced
-        # tokens into out_tok, so `input` is unused here — copying it in would
-        # clobber that result. (Non-StdMoE: `input` holds the post-expert tokens
-        # to combine; since the disp_out/out_tok split it no longer aliases out_tok,
-        # so the copy is required.)
-        if not self.cfg.enable_std_moe and input.data_ptr() != out_tok_ptr:
+        comb_stg_ptr = self.arena.local_ptr("comb_stg")
+        # StdMoE already staged comb_stg via convert_combine_input(), so `input` is
+        # unused; non-StdMoE must copy `input` into comb_stg (no longer aliased).
+        if not self.cfg.enable_std_moe and input.data_ptr() != comb_stg_ptr:
             # copy in the combine-dtype layout (not recv_tokens()'s dispatch view)
             dst = self.combine_in_view().view(-1)[: input.numel()]
             dst.copy_(input.reshape(-1))
