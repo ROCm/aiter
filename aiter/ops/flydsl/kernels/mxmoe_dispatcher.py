@@ -7,8 +7,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import _to_raw as _raw
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import ArithValue
+from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
@@ -197,9 +196,7 @@ def compile_gemm2_a4w4_port(
         k_bytes = fx.Int32(i32_inter) // fx.Int32(
             1 if is_f8 else 2
         )  # A row stride bytes (runtime)
-        aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
-            fx.Int32(BM) * k_bytes
-        )
+        aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * k_bytes)
         aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num
         )
@@ -299,7 +296,9 @@ def compile_gemm2_a4w4_port(
             rem = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
             n_iters = (rem + c_stride - fx.Int32(1)) // c_stride
             for _it in range(
-                fx.Index(0), ArithValue(_raw(n_iters)).index_cast(T.index), fx.Index(1)
+                fx.Int32(0),
+                n_iters,
+                fx.Int32(1),
             ):
                 m_block = m_tile0 + fx.Int32(_it) * c_stride
                 unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
@@ -376,10 +375,8 @@ def compile_gemm2_a4w4_port(
         stream: fx.Stream,
     ):
         # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks; num_n_blocks = N_OUT//256 runtime.
-        num_n_blocks = arith.index_cast(
-            T.index, _raw(fx.Int32(i32_hidden) // fx.Int32(256))
-        )
-        grid_x = arith.index_cast(T.index, i32_grid_blocks) * num_n_blocks
+        num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(256)
+        grid_x = i32_grid_blocks * num_n_blocks
         gemm2_kernel(
             arg_aq,
             arg_ascale,

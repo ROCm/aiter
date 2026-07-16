@@ -437,7 +437,7 @@ def gemm2_body_v2(
 
     # A-scale buffer resource + uniform base (raw load); chunk = m_block_idx (BM16) else m_row//32.
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
-    asc_num = fx.Index(i32_max_m_blocks) * fx.Index(asc_per_mb)
+    asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
     ascale_rsrc = _buffer_rsrc(arg_ascale, asc_num)
     scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
     a_scale_s_base = rocdl.readfirstlane(
@@ -552,7 +552,7 @@ def gemm2_body_v2(
             kMChunks,
         )
 
-    aq_num_records = fx.Index(i32_max_m_blocks) * fx.Index(fx.Int32(BM) * K_BYTES)
+    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * K_BYTES)
 
     def issue_a_load_lds(slot, kt):
         issue_a_load_lds_dt(
@@ -699,7 +699,10 @@ def gemm2_body_v2(
     elif const_expr(g2_kstages == 1):
         # 1-deep pipe: synchronous B load per K-tile.
         for kt_iv, state in range(
-            fx.Index(0), fx.Index(K_TILES_RT), fx.Index(1), init=load_c_carry()
+            fx.Int32(0),
+            K_TILES_RT,
+            fx.Int32(1),
+            init=load_c_carry(),
         ):
             store_c_carry(state)
             kt_rt = fx.Int32(kt_iv)
@@ -818,7 +821,10 @@ def gemm2_body_v2(
                         nxt_saf[sub].store(cur_saf[sub].load())
 
         for kt_iv, state in range(
-            fx.Index(0), fx.Index(K_TILES_RT), fx.Index(1), init=load_carry()
+            fx.Int32(0),
+            K_TILES_RT,
+            fx.Int32(1),
+            init=load_carry(),
         ):
             store_carry(state)
             kt_rt = fx.Int32(kt_iv)
