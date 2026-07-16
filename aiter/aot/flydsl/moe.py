@@ -38,6 +38,7 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
@@ -113,6 +114,11 @@ def parse_csv(csv_path: str):
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
             stage1_v2_output_layout = stage2_name.startswith("flydsl_moe2_layout_")
+            stage2_v2_params = (
+                parse_flydsl_v2_gemm2_kernel(stage2_name)
+                if stage1_v2_output_layout
+                else None
+            )
 
             # cktile_ stage1 runs a FlyDSL post-activation epilogue (silu ->
             # silu_and_mul_fq, swiglu -> swiglu_and_mul) that the flydsl_-only loop
@@ -172,10 +178,11 @@ def parse_csv(csv_path: str):
                             if stage1_out_dtype in ("fp4", "fp8")
                             else None
                         )
-                    elif params["stage"] == 1 and stage1_v2_output_layout:
-                        job["v2_output_layout"] = True
-
                     full_job = {**job, **params}
+                    if params["stage"] == 1 and stage1_v2_output_layout:
+                        full_job["v2_output_layout"] = True
+                        if stage2_v2_params is not None:                            
+                            full_job["out_dtype"] = stage2_v2_params["a_dtype"]
                     key = job_identity(full_job)
                     if key in seen:
                         continue
