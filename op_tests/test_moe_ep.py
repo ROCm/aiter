@@ -433,6 +433,12 @@ def test_fmoe_ep_mxfp4(
     buf_token = local_token * pad_factor  # padded dispatch buffer (network sim)
     input_ = torch.randn((buf_token, model_dim), dtype=dtype, device="cuda")
     score = torch.randn((buf_token, E), dtype=dtype, device="cuda")
+    # Mask non-local experts so fused_topk only routes to this rank's experts.
+    local_expert_start = ep_id * (E // ep)
+    local_expert_end = (ep_id + 1) * E // ep
+    non_local_mask = torch.ones(E, dtype=torch.bool, device="cuda")
+    non_local_mask[local_expert_start:local_expert_end] = False
+    score[:, non_local_mask] = float("-inf")
 
     # EP dispatch: each local token picks topk=1 (already dispatched to this rank)
     local_topk = 1
