@@ -480,6 +480,7 @@ def test_fmoe(
             "us_stage2": us2_stage,
         }
 
+    test_graph = args.bm16_scale_boundary
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -487,8 +488,10 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=2 if test_graph else 5,
+        num_warmup=1 if test_graph else 2,
+        num_rotate_args=1 if test_graph else 0,
+        testGraph=test_graph,
         **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
@@ -687,6 +690,11 @@ parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
+)
+parser.add_argument(
+    "--bm16-scale-boundary",
+    action="store_true",
+    help="Run only the deterministic BM16 tiled-scale boundary regression.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -1030,14 +1038,89 @@ def _iter_legacy_cases():
                     ), extras
 
 
+def test_bm16_tiled_scale_boundary():
+    """Validate tuned BM16 dispatch and the 33-row scale boundary."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip BM16 tiled-scale boundary test on %s", get_gfx())
+        return
+
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    expected_kernels = (
+        "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_w3_gui_fp8",
+        "flydsl_moe2_afp8_wfp4_bf16_t16x256x256_atomic",
+    )
+    for token in (32, 64):
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            7168,
+            512,
+            385,
+            7,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE.value,
+        )
+        assert metadata.block_m == 16
+        stages = (metadata.stage1, metadata.stage2)
+        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
+        assert kernel_names == expected_kernels
+        stage1_params = get_flydsl_kernel_params(kernel_names[0])
+        stage2_params = get_flydsl_kernel_params(kernel_names[1])
+        assert stage1_params is not None
+        assert stage2_params is not None
+        assert stage1_params["tile_m"] == 16
+        assert stage1_params["waves_per_eu"] == 3
+        assert stage2_params["tile_m"] == 16
+        assert stage2_params["tile_n"] == 256
+        assert stage2_params.get("xcd_swizzle", 0) == 0
+
+    old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    torch.manual_seed(0)
+    try:
+        test_fmoe(
+            dtype=torch.bfloat16,
+            token=33,
+            model_dim=7168,
+            inter_dim=512,
+            E=385,
+            topk=7,
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.INTERLEAVE.value,
+            qType=aiter.QuantType.per_1x32,
+            AQDType=dtypes.fp8,
+            WQDType=dtypes.fp4x2,
+            use_g1u1=True,
+            strict_accuracy=True,
+            check_aot_cache=False,
+        )
+    finally:
+        if old_moe_bound is None:
+            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+        else:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 _case_iters = []
-if not args.no_flydsl_csv:
-    _case_iters.append(_iter_csv_cases())
-if not args.no_legacy:
-    _case_iters.append(_iter_legacy_cases())
+if args.bm16_scale_boundary:
+    test_bm16_tiled_scale_boundary()
+else:
+    if not args.no_flydsl_csv:
+        _case_iters.append(_iter_csv_cases())
+    if not args.no_legacy:
+        _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
