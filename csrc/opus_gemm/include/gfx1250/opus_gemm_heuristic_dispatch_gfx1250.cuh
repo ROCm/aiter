@@ -15,6 +15,72 @@
 // HEURISTIC_DEFAULT_KIDS_GFX1250.
 #pragma once
 
+#include <optional>
+
+#include "aiter_tensor.h"  // aiter_tensor_t (torch-free)
+
+// a16w16-family launcher signature (see the gfx950 twin for the rationale):
+// 3 tensors + std::optional<bias> + int splitK, plain function pointer (no
+// std::function). Defined here -- rather than reused from gfx950's heuristic
+// header -- so opus_gemm_arch_gfx1250.cuh is self-contained and a gfx1250-only
+// build does not depend on any gfx950 header.
+using OpusA16W16NoscaleKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
+
+// Shared flat-array dispatch POD types + comparators for gfx1250 (mirrors the
+// gfx950 set). Only depend on OpusA16W16NoscaleKernel above, so they are cheap
+// to include and carry no generated-lookup-macro cost. gen_instances.py emits
+// the tune / (M,N,K) lookup tables as arrays of these; std::lower_bound does the
+// O(log N) runtime match.
+namespace opus_gfx1250_detail
+{
+struct OpusA16W16Shape
+{
+    int M;
+    int N;
+    int K;
+};
+
+struct OpusA16W16RuntimeEntry
+{
+    OpusA16W16Shape key;
+    OpusA16W16NoscaleKernel func;
+};
+
+// Lex order on (M, N, K). Used both during sorting (gen_instances.py emits
+// entries in lex order) and by std::lower_bound at lookup time.
+constexpr bool entry_less(const OpusA16W16RuntimeEntry& a,
+                          const OpusA16W16RuntimeEntry& b) noexcept
+{
+    if (a.key.M != b.key.M) return a.key.M < b.key.M;
+    if (a.key.N != b.key.N) return a.key.N < b.key.N;
+    return a.key.K < b.key.K;
+}
+
+constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
+                        const OpusA16W16RuntimeEntry& b) noexcept
+{
+    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
+}
+
+// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the codegen
+// always emits in ascending id order).
+struct OpusA16W16TuneEntry
+{
+    int kid;
+    OpusA16W16NoscaleKernel func;
+};
+
+constexpr bool tune_entry_less(const OpusA16W16TuneEntry& a,
+                               const OpusA16W16TuneEntry& b) noexcept
+{
+    return a.kid < b.kid;
+}
+
+using OpusA16W16TuneKernel = OpusA16W16NoscaleKernel;
+}  // namespace opus_gfx1250_detail
+
 // Kid map (B_K=128 chosen here; tuner explores B_K 256/512 + the P/wg space).
 // Tiles whose per-TDM direct-copy request count (rows*B_K*2/256) hits the 256
 // SIMD-pair limit on some operand are NOT generated (e.g. 32x256x128) so the

@@ -552,9 +552,31 @@ def gemm_a16w16_opus(
 def opus_gemm_workspace_init() -> None: ...
 
 
+# Free the per-stream splitk workspace registered by opus_gemm_workspace_init
+# (and grown by the splitk launchers). Call inside `with torch.cuda.stream(s):`
+# in eager mode (not during HIP graph capture) to reclaim the GPU buffer +
+# handles for that stream; no-op if the stream was never registered. Use this
+# for explicit teardown of streams the framework will not reuse.
+@compile_ops(
+    "module_deepgemm_opus", fc_name="opus_gemm_workspace_release", develop=True
+)
+def opus_gemm_workspace_release() -> None: ...
+
+
+# Free the splitk workspace for all registered streams and clear the registry.
+# Eager mode only. Use for a full teardown before the framework reclaims its
+# stream pool / at process shutdown.
+@compile_ops(
+    "module_deepgemm_opus", fc_name="opus_gemm_workspace_release_all", develop=True
+)
+def opus_gemm_workspace_release_all() -> None: ...
+
+
 __all__ = [
     "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
+    "opus_gemm_workspace_release",
+    "opus_gemm_workspace_release_all",
     "is_splitk_kid",
 ]

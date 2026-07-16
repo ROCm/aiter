@@ -311,10 +311,21 @@ Rules:
 
 ### When the buffer is freed
 
-Never automatically. Each registered stream holds one `opus_splitk_ws_handle`
-plus its current `hipMalloc` buffer for the process lifetime. Streams the
-torch CUDAStream pool reuses are correctly reused via the same map entry;
-streams the pool never reclaims leak one handle + buffer (same shape as the
-prior `thread_local` cache's thread-exit leak). A future
-`opus_gemm_workspace_release` can be added if frameworks need explicit
-teardown.
+Not automatically during steady-state. Each registered stream holds one
+`opus_splitk_ws_handle` plus its current `hipMalloc` buffer; on grow the old
+buffer is `hipFree`d (after a device sync) before the larger one is allocated,
+so grow never leaks. Streams the torch CUDAStream pool reuses map to the same
+entry; streams the pool never reclaims would otherwise retain their handle +
+buffer until process exit.
+
+For explicit teardown, call one of:
+
+* `opus_gemm_workspace_release()` -- frees the buffer, host/device handles and
+  registry entry for the **current** stream (call inside
+  `with torch.cuda.stream(s):`). No-op if the stream was never registered.
+* `opus_gemm_workspace_release_all()` -- frees every registered stream's
+  workspace and clears the registry.
+
+Both must run in eager mode (frees are stream-capture-illegal); `_release`
+synchronizes the target stream and `_release_all` does a device sync before
+freeing so no in-flight kernel references a buffer being freed.
