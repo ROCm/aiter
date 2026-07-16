@@ -670,6 +670,34 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
+    # Persistent (CU-resident) grouped GEMM scheduler. It needs the fused masked
+    # layout ([E, max_m, K]) and is mutually exclusive with the contiguous
+    # scheduler, so a persistent request forces contiguous off. Unavailable on
+    # the naive path (which does not build the fused masked scatter layout).
+    _grouped_persistent_req = (
+        os.environ.get("AITER_FLYDSL_GROUPED_PERSISTENT", "0") in _TRUTHY_ENV
+    )
+    if cfg_row is not None:
+        _grouped_persistent_req = _as_bool(
+            cfg_row.get("grouped_persistent_m"), _grouped_persistent_req
+        )
+    # Static tile-assignment policy for the persistent scheduler: grid-stride
+    # (round-robin, default) vs contiguous block partition. Env "0" -> contiguous.
+    _persistent_stride = (
+        os.environ.get("AITER_FLYDSL_GROUPED_PERSISTENT_STRIDE", "1") in _TRUTHY_ENV
+    )
+    if cfg_row is not None:
+        _persistent_stride = _as_bool(
+            cfg_row.get("persistent_stride"), _persistent_stride
+        )
+    _persistent_workers = None
+    _pw_env = os.environ.get("AITER_FLYDSL_GROUPED_PERSISTENT_WORKERS")
+    if _pw_env:
+        _persistent_workers = _as_int(_pw_env, None)
+    if _grouped_persistent_req:
+        grouped_contiguous_m = False
+        _grouped_dbg("persistent grouped GEMM requested; contiguous disabled")
+
     n_route_buckets = E
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
     # The contiguous fast path folds the LUT build into moe_route_g2l_fused; every
@@ -763,6 +791,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     route_E = n_route_buckets
     route_max_m = max_m
     effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
+    effective_grouped_persistent_m = (not _use_naive) and bool(_grouped_persistent_req)
     # Shared gather-weight buffer for the fused EP fast path. The route kernel
     # writes every entry from the f32 route weights (kept -> cast to weight_dtype,
     # dropped -> 0); the same buffer is then read by the final gather-reduce. This
@@ -999,9 +1028,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k1,
         expert_sched_mode=False,
-        grouped_persistent_m=False,
+        grouped_persistent_m=effective_grouped_persistent_m,
         grouped_contiguous_m=effective_grouped_contiguous_m,
-        persistent_workers=None,
+        persistent_workers=_persistent_workers,
+        persistent_stride=_persistent_stride,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
         wave_specialized_tdm=(
@@ -1197,7 +1227,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 ("split_k", split_k2),
                 ("expert_sched_mode", False),
                 ("grouped_contiguous_m", effective_grouped_contiguous_m),
-                ("persistent_workers", None),
+                ("grouped_persistent_m", effective_grouped_persistent_m),
+                ("persistent_workers", _persistent_workers),
+                ("persistent_stride", _persistent_stride),
                 ("cfg_row", cfg_row),
             ]
         )
@@ -1217,9 +1249,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffer_stage2,
         split_k=split_k2,
         expert_sched_mode=False,
-        grouped_persistent_m=False,
+        grouped_persistent_m=effective_grouped_persistent_m,
         grouped_contiguous_m=effective_grouped_contiguous_m,
-        persistent_workers=None,
+        persistent_workers=_persistent_workers,
+        persistent_stride=_persistent_stride,
         wave_specialized_tdm=((m_warp * n_warp) == 4 and wave_specialized_tdm_req),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
     )

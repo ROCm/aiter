@@ -606,23 +606,73 @@ def test_fmoe_ep_mxfp4(
         gate_mode = GateMode.SEPARATED.value
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
-    out, us = run_perftest(
-        fused_moe,
-        input_,
-        w1_a,
-        w2_a,
-        topk_weights,
-        topk_ids,
-        expert_mask=expert_mask,
-        activation=act,
-        gate_mode=gate_mode,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_s,
-        w2_scale=w2_s,
-        num_local_tokens=num_local_tokens,
-        num_warmup=3,
-        num_iters=16,
+    # Optional per-kernel (gemm1/gemm2) timing, gated by AITER_EP_KERNEL_BENCH=1.
+    # Mirrors the TP test's --scenario kernel: one eager fused_moe call with the
+    # grouped kernel_bench hook set captures the gemm1/gemm2 launch callables,
+    # then each is looped in isolation. Default behavior (env unset) is unchanged.
+    _ep_kernel_bench = os.environ.get("AITER_EP_KERNEL_BENCH", "0") in (
+        "1",
+        "true",
+        "True",
+        "yes",
     )
+    gemm1_us = None
+    gemm2_us = None
+    if _ep_kernel_bench and _gfx == "gfx1250":
+        from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+
+        _cap: list = []
+        _grouped.kernel_bench_callable = _cap
+        try:
+            out = fused_moe(
+                input_,
+                w1_a,
+                w2_a,
+                topk_weights,
+                topk_ids,
+                expert_mask=expert_mask,
+                activation=act,
+                gate_mode=gate_mode,
+                quant_type=QuantType.per_1x32,
+                w1_scale=w1_s,
+                w2_scale=w2_s,
+                num_local_tokens=num_local_tokens,
+            )
+        finally:
+            _grouped.kernel_bench_callable = None
+        _ku = {}
+        for _name, _callable in _cap:
+            _, _u = run_perftest(
+                _callable, num_warmup=5, num_iters=101, testGraph=False
+            )
+            _ku[_name] = _u
+        gemm1_us = _ku.get("gemm1")
+        gemm2_us = _ku.get("gemm2")
+        us = (gemm1_us or 0.0) + (gemm2_us or 0.0)
+        _g1s = "n/a" if gemm1_us is None else f"{gemm1_us:.2f}"
+        _g2s = "n/a" if gemm2_us is None else f"{gemm2_us:.2f}"
+        print(
+            f"[ep-kernel-bench] {quant_label} token={token}(local={local_token}) "
+            f"gemm1 us = {_g1s} gemm2 us = {_g2s}"
+        )
+    else:
+        out, us = run_perftest(
+            fused_moe,
+            input_,
+            w1_a,
+            w2_a,
+            topk_weights,
+            topk_ids,
+            expert_mask=expert_mask,
+            activation=act,
+            gate_mode=gate_mode,
+            quant_type=QuantType.per_1x32,
+            w1_scale=w1_s,
+            w2_scale=w2_s,
+            num_local_tokens=num_local_tokens,
+            num_warmup=3,
+            num_iters=16,
+        )
 
     # Trim to valid prefix (total_recv rows); the [total_recv, trim_M) tail is padding.
     out = out[:total_recv]
@@ -664,6 +714,8 @@ def test_fmoe_ep_mxfp4(
             "topk": topk,
             "ep": ep,
             "us": round(us, 2),
+            "gemm1_us": None if gemm1_us is None else round(gemm1_us, 2),
+            "gemm2_us": None if gemm2_us is None else round(gemm2_us, 2),
             "logits_diff": round(logits_diff, 6),
             "abs_mean": round(abs_mean, 4),
             "abs_max": round(abs_max, 4),

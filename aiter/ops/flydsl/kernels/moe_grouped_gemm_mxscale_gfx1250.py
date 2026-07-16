@@ -64,6 +64,7 @@ class _GroupedA8W4Config:
     grouped_persistent_m: bool = True
     grouped_contiguous_m: bool = False
     persistent_workers: Optional[int] = None
+    persistent_stride: bool = True
     data_format: str = "a8w4"
     act: str = "silu"
     swiglu_limit: float | None = None
@@ -1023,6 +1024,7 @@ def _compile_base_a8w4_gemm(
         grouped_persistent_m=cfg.grouped_persistent_m,
         grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
+        persistent_stride=cfg.persistent_stride,
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
@@ -1059,6 +1061,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     grouped_persistent_m: bool = True,
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
+    persistent_stride: bool = True,
     act: str = "silu",
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
@@ -1090,6 +1093,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         grouped_persistent_m=bool(grouped_persistent_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
+        persistent_stride=bool(persistent_stride),
         data_format=str(data_format),
         act=str(act),
         stage1_weight_layout=str(stage1_weight_layout),
@@ -1605,6 +1609,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     grouped_persistent_m: bool = True,
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
+    persistent_stride: bool = True,
     data_format: str = "a8w4",
 ):
     cfg = _GroupedA8W4Config(
@@ -1632,6 +1637,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         grouped_persistent_m=bool(grouped_persistent_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
+        persistent_stride=bool(persistent_stride),
         data_format=str(data_format),
     )
     _validate_common(cfg)

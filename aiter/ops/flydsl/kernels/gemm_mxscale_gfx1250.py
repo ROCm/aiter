@@ -134,6 +134,7 @@ def compile_mxscale_gemm(
     grouped_contiguous_m: bool = False,
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
+    persistent_stride: bool = True,
     stage1_act: str | None = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
@@ -274,6 +275,13 @@ def compile_mxscale_gemm(
             )
     else:
         _persistent_workers = 0
+    # Static persistent tile-assignment policy:
+    #   True  -> grid-stride / round-robin: worker walks tiles
+    #            [worker_id, worker_id + tg, worker_id + 2*tg, ...] (tg = #workers).
+    #   False -> contiguous block: worker owns [worker_id*tpw, (worker_id+1)*tpw).
+    # Grid-stride spreads ragged per-expert tail tiles across workers (better load
+    # balance for skewed expert distributions) at the cost of B-weight reuse.
+    _persistent_stride = bool(persistent_stride)
 
     use_cluster = cluster_m > 1 or cluster_n > 1
     if use_cluster:
@@ -3531,7 +3539,14 @@ def compile_mxscale_gemm(
 
             mi = _for_persist.induction_variable
             still_active = _for_persist.inner_iter_args[0]
-            global_m_tile = worker_id * tiles_per_worker + mi
+            # Static tile assignment. Both forms make global_m_tile monotonically
+            # increasing in mi, so the still_active early-out below stays valid.
+            if const_expr(_persistent_stride):
+                # grid-stride / round-robin: stride = tg = grid_size (#workers).
+                global_m_tile = worker_id + mi * grid_size
+            else:
+                # contiguous block partition (legacy behaviour).
+                global_m_tile = worker_id * tiles_per_worker + mi
             m_tile_in_range = arith.cmpi(
                 arith.CmpIPredicate.slt, global_m_tile, total_m_tiles_idx
             )
@@ -3768,6 +3783,7 @@ def compile_mxscale_gemm(
         grouped_contiguous_m,
         _k_contiguous_1d,
         _persistent_workers,
+        _persistent_stride,
         stage1_act_mode,
         stage1_weight_layout_mode,
         epilogue_bias_mode,
