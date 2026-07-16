@@ -432,8 +432,8 @@ def sparse_mla_decode(
         extra_indices = _as_int32_contiguous_1d(extra_indices)
         extra_indptr = _as_int32_contiguous_1d(extra_indptr)
     else:
-        # HAS_EXTRA=False -> the kernel skips the extra segment, so reuse the main
-        # tensors as unread placeholders (no alloc, no zeroing memset launch).
+        # the kernel skips the extra segment, so reuse the main
+        # tensors as placeholders
         extra_cache = main_cache
         extra_indices = main_indices
         extra_indptr = main_indptr
