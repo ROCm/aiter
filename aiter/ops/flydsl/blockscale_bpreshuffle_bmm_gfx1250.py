@@ -36,6 +36,7 @@ from torch import Tensor
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
 _launch_gemm_a8w8_tdm = None
+_ptr_arg = None
 _run_compiled = None
 
 _WMMA_K = 128
@@ -44,14 +45,15 @@ _OUT_IS_F16 = {torch.bfloat16: 0, torch.float16: 1}
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8_tdm, _run_compiled
+    global _launch_gemm_a8w8_tdm, _run_compiled, _ptr_arg
     if _launch_gemm_a8w8_tdm is not None:
         return
     from .kernels.a8w8_bmm_bpreshuffle_gfx1250 import launch_gemm_a8w8_tdm
-    from .kernels.tensor_shim import _run_compiled as runner
+    from .kernels.tensor_shim import _run_compiled as runner, ptr_arg
 
     _launch_gemm_a8w8_tdm = launch_gemm_a8w8_tdm
     _run_compiled = runner
+    _ptr_arg = ptr_arg
 
 
 # flydsl_blockscale_bpreshuffle_bmm_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_nb{nb}_sk{sk}_cm{cm}_cn{cn}
@@ -157,11 +159,14 @@ def run_blockscale_bpreshuffle_bmm_gfx1250(
         )
 
     stream = torch.cuda.current_stream(device=A.device)
+    # arg_a / arg_b are declared fx.Pointer in the kernel: wrap the torch tensors
+    # as PointerJitArg so the cached fast-dispatch path (cf(*args)) binds them as
+    # raw device pointers. arg_c / scale_a / scale_b stay fx.Tensor (passed raw).
     _run_compiled(
         _launch_gemm_a8w8_tdm,
         Out,
-        A,
-        B,
+        _ptr_arg(A),
+        _ptr_arg(B),
         scale_a,
         scale_b,
         int(M),

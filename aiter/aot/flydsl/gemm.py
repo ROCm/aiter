@@ -442,8 +442,10 @@ def _compile_bmm_to_cache(
         flyc.compile(
             launch_gemm_a8w8_tdm,
             c,
-            a,
-            b,
+            # arg_a / arg_b are fx.Pointer in the kernel -> wrap as PointerJitArg
+            # (handles FakeTensor by producing a null ptr under FakeTensorMode).
+            _ptr_view_safe(a),
+            _ptr_view_safe(b),
             sa,
             sb,
             m,

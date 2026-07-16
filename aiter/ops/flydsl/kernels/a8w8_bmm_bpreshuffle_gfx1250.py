@@ -23,8 +23,8 @@ from .gemm_common_gfx1250 import (
 @flyc.jit
 def launch_gemm_a8w8_tdm(
     arg_c: fx.Tensor,
-    arg_a: fx.Tensor,
-    arg_b: fx.Tensor,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
     arg_scale_a: fx.Tensor,
     arg_scale_b: fx.Tensor,
     i32_m: fx.Int32,
@@ -81,8 +81,8 @@ def launch_gemm_a8w8_tdm(
     @flyc.kernel(known_block_size=[block, 1, 1])
     def kernel(
         arg_c: fx.Tensor,
-        arg_a: fx.Tensor,
-        arg_b: fx.Tensor,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
         i32_m: fx.Int32,
@@ -163,8 +163,8 @@ def launch_gemm_a8w8_tdm(
                 gt, [outer, None], strides=[stride, None], num_warps=num_waves
             )
 
-        gA_base = fx.recast_iter(fx.Int8, fx.get_iter(arg_a))
-        gB_base = fx.recast_iter(fx.Int8, fx.get_iter(arg_b))
+        gA_base = fx.recast_iter(fx.Int8, arg_a)
+        gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
         A_OUTER_STRIDE = (batch * A_KROW) if layout_mbn else A_KROW
 
