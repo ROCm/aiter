@@ -8,10 +8,13 @@ by ``exp(LSE_i - LSE_max)`` (online softmax) into the final bf16/fp16 output.
 
 Three sweeps, each its own table:
   serving    GLM-5.2 serving decode grid: a sparse 16384-tile reduce grid with
-             active ``(active_tiles, splits)`` decode buckets (HIP vs wrapper).
+             active ``(active_tiles, splits)`` decode buckets.
   uniform    dense/uniform occupancy control: ``--tiles`` x ``--uniform-splits``.
   irregular  per-tile split cost factors (tier mismatch, gapped gather map,
              pool slack): ``--splits-per-tile`` x ``--gap-stride`` x ``--pool-slack``.
+
+Pass ``--include-hip`` to also benchmark the production HIP kernel
+(``aiter.mla_reduce_v1``) as a baseline candidate in every sweep.
 
 ``graph us`` is CUDA-graph replay latency; ``TFLOPS`` / ``TB/s`` are derived from it.
 """
@@ -43,6 +46,10 @@ from op_tests.flydsl_mla_reduce_common import (
 )
 
 torch.set_default_device("cuda")
+
+# Opt-in HIP baseline (aiter.mla_reduce_v1) toggled by --include-hip. Module-level
+# so it gates candidates without becoming a benchmark-table column.
+INCLUDE_HIP = False
 
 # (active_tiles, splits) serving decode buckets: 1 tile x 128 splits exercises
 # the split-K path; 8 tiles x N splits exercises the sparse adaptive launch.
@@ -84,15 +91,15 @@ def test_mla_reduce(active, splits, H, Dv, dtype):
         po, pl, indptr[: active + 1], fmap[:active], pmap, H, Dv, dtype, M=1
     )
 
-    candidates = {
+    candidates = {}
+    if INCLUDE_HIP:
         # mla_reduce_v1 signature: (..., max_seqlen_q, num_kv_splits, out, lse)
-        "hip": lambda: aiter.mla_reduce_v1(
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(
             po, pl, indptr, fmap, pmap, 1, 0, fout, flse
-        ),
-        "wrapper": lambda: flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
-        ),
-    }
+        )
+    candidates["wrapper"] = lambda: flydsl_mla_reduce_v1(
+        po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
+    )
 
     flops, nbytes = _roofline(active, splits, H, Dv, dtype)
 
@@ -138,11 +145,14 @@ def test_mla_reduce_uniform(tiles, splits, H, Dv, M, dtype):
     )
     ref_out, ref_lse = torch_ref(po, pl, tiles, splits, H, Dv, dtype, M=M)
 
-    candidates = {
-        "wrapper": lambda: flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, M, fout, flse, num_kv_splits=splits
-        ),
-    }
+    candidates = {}
+    if INCLUDE_HIP:
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, M, 0, fout, flse
+        )
+    candidates["wrapper"] = lambda: flydsl_mla_reduce_v1(
+        po, pl, indptr, fmap, pmap, M, fout, flse, num_kv_splits=splits
+    )
 
     out_bytes = torch.finfo(dtype).bits // 8
     flops = 2 * tiles * splits * H * Dv
@@ -188,19 +198,22 @@ def test_mla_reduce_irregular(splits_per_tile, gap_stride, pool_slack, H, Dv, dt
     )
     ref_out, ref_lse = torch_ref_gather(po, pl, indptr, fmap, pmap, H, Dv, dtype)
 
-    candidates = {
-        "wrapper": lambda: flydsl_mla_reduce_v1(
-            po,
-            pl,
-            indptr,
-            fmap,
-            pmap,
-            1,
-            fout,
-            flse,
-            num_kv_splits=max(splits_per_tile),
-        ),
-    }
+    candidates = {}
+    if INCLUDE_HIP:
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, 0, fout, flse
+        )
+    candidates["wrapper"] = lambda: flydsl_mla_reduce_v1(
+        po,
+        pl,
+        indptr,
+        fmap,
+        pmap,
+        1,
+        fout,
+        flse,
+        num_kv_splits=max(splits_per_tile),
+    )
 
     total_splits = sum(splits_per_tile)
     active = sum(1 for s in splits_per_tile if s > 1)
@@ -300,7 +313,15 @@ def main():
         default=[0],
         help="irregular sweep: extra unused partial-pool rows",
     )
+    parser.add_argument(
+        "--include-hip",
+        action="store_true",
+        help="also benchmark the production HIP kernel (aiter.mla_reduce_v1) as a baseline",
+    )
     args = parser.parse_args()
+
+    global INCLUDE_HIP
+    INCLUDE_HIP = args.include_hip
 
     for dtype in args.dtype:
         df = []
