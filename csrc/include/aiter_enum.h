@@ -24,7 +24,7 @@ enum class QuantType : int
     per_1024x128,
 };
 
-enum class MlaVersion : int32_t
+enum class MlaVersion : int
 {
     V32 = 0,
     V40 = 1,
