@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// BF16 a16w16 4-phase legacy (gfx942). Unified <Traits,Kargs> emits 10002
-// (noscale_kargs, direct C) and splitK kids (splitk_kargs, workspace + reduce).
+// BF16 a16w16 4-phase legacy splitK (gfx942): workspace main kernel + reduce.
 #pragma once
 
 #include <array>
