@@ -389,36 +389,47 @@ summary_table = []
 
 
 def test_fmoe_ep_mxfp4(
-    quant_label, token, model_dim, inter_dim, E, topk, shared_E=2, ep=8, pad_factor=1
+    quant_label,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    shared_E=2,
+    ep=8,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
 
-    `token` is the **global** token count (total across all ranks). Under
-    balanced routing each rank processes token * topk // ep local tokens
-    (ignoring shared experts). The test builds input and routing tensors
-    sized for that local count so that the benchmark reflects real per-rank
-    work, not the full global batch.
+    `token` is the **global** token count (total across all EP ranks).
+    The test mirrors ATOM's real MoriV2ModularKernel shapes after dispatch+trim:
 
-    pad_factor>1 simulates the MoRI/network dispatch usage: the input token
-    tensor is over-allocated to (local_token*pad_factor) rows (padded dispatch
-    buffer); only the first `local_token` rows are real and are signalled to
-    the kernel via num_local_tokens. The dead-tail rows carry valid random
-    routing so a missing dead-tail guard would either OOB or shift the
-    contiguous layout and corrupt the valid outputs. Reference and comparison
-    use only the first `local_token` rows."""
+      graph_bs     = token // ep          (per-rank tokens before dispatch)
+      recv_tokens  = token                (balanced: every token arrives)
+      trim_M       = graph_bs * topk * ep (= token * topk, ATOM's CUDAGraph trim bound)
+
+    The dispatch buffer has `trim_M` rows with the full `topk` routing dimension.
+    Only the first `recv_tokens` rows carry valid data; the `[recv_tokens, trim_M)`
+    tail is dead padding (ATOM uses the device-tensor `num_local_tokens` to skip it).
+    expert_mask filters non-local experts so fused_moe only computes on this rank's
+    experts."""
     _gfx = get_gfx()
     if _gfx not in ["gfx950", "gfx1250"]:
         print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
         return
     if _gfx == "gfx1250" and quant_label != "a8w4_mxfp4":
-        # gfx1250 grouped EP currently validated for a8w4 only.
         print(f"skip {quant_label} on gfx1250: only a8w4_mxfp4 supported")
         return
 
-    # Under balanced EP each rank sees token * topk // ep local tokens.
-    local_token = token * topk // ep
-    print(f"  [EP sim] global_token={token} topk={topk} ep={ep} -> local_token={local_token}")
+    # Match ATOM MoriV2ModularKernel._maybe_trim_dispatch_output shapes:
+    #   total_valid_tokens = context.graph_bs * topk * dp_size
+    graph_bs = token // ep
+    recv_tokens = graph_bs * ep  # balanced: all tokens land on this rank
+    trim_M = graph_bs * topk * ep  # ATOM's trim bound (= token * topk)
+    print(
+        f"  [EP sim] global_token={token} topk={topk} ep={ep} "
+        f"graph_bs={graph_bs} recv_tokens={recv_tokens} trim_M={trim_M}"
+    )
 
     ep_id = ep - 1
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
@@ -429,46 +440,38 @@ def test_fmoe_ep_mxfp4(
     expert_mask[E:-1] = 1
 
     dtype = dtypes.bf16
-    pad_factor = max(1, int(pad_factor))
-    buf_token = local_token * pad_factor  # padded dispatch buffer (network sim)
-    input_ = torch.randn((buf_token, model_dim), dtype=dtype, device="cuda")
-    score = torch.randn((buf_token, E), dtype=dtype, device="cuda")
-    # Mask non-local experts so fused_topk only routes to this rank's experts.
-    local_expert_start = ep_id * (E // ep)
-    local_expert_end = (ep_id + 1) * E // ep
-    non_local_mask = torch.ones(E, dtype=torch.bool, device="cuda")
-    non_local_mask[local_expert_start:local_expert_end] = False
-    score[:, non_local_mask] = float("-inf")
+    input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
+    score = torch.randn((trim_M, E), dtype=dtype, device="cuda")
 
-    # EP dispatch: each local token picks topk=1 (already dispatched to this rank)
-    local_topk = 1
+    # Build topk_ids with the full topk dimension (MORI preserves topk after dispatch).
+    # fused_topk routes across ALL experts (not just local); expert_mask handles filtering.
     total_topk_ids = torch.empty(
-        (buf_token, local_topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+        (trim_M, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
     )
-    ns_topk_ids, s_topk_ids = total_topk_ids.split([local_topk, shared_E + 1], dim=1)
+    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
     shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * buf_token
-    for i in range(ep_id, buf_token, ep):
+    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * trim_M
+    for i in range(ep_id, trim_M, ep):
         s_topk_ids_list[i] = shared_expert_ids
     s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device="cuda")
 
     total_topk_weights = torch.empty(
-        (buf_token, local_topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+        (trim_M, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
     )
     ns_topk_weights, s_topk_weights = total_topk_weights.split(
-        [local_topk, shared_E + 1], dim=1
+        [topk, shared_E + 1], dim=1
     )
     s_topk_weights[:] = 0.1
-    fused_topk(input_, score, local_topk, True, ns_topk_ids, ns_topk_weights)
-    topk_ids = total_topk_ids[:buf_token]
-    topk_weights = total_topk_weights[:buf_token]
-    ref_input = input_[:local_token]
-    ref_topk_ids = total_topk_ids[:local_token]
-    ref_topk_weights = total_topk_weights[:local_token]
-    if pad_factor > 1:
-        num_local_tokens = torch.tensor([local_token], dtype=dtypes.i32, device="cuda")
-    else:
-        num_local_tokens = None
+    fused_topk(input_, score, topk, True, ns_topk_ids, ns_topk_weights)
+    topk_ids = total_topk_ids
+    topk_weights = total_topk_weights
+
+    # num_local_tokens: device tensor matching ATOM's total_recv_t semantic.
+    # Only the first recv_tokens rows are valid; the [recv_tokens, trim_M) tail is padding.
+    num_local_tokens = torch.tensor([recv_tokens], dtype=dtypes.i32, device="cuda")
+    ref_input = input_[:recv_tokens]
+    ref_topk_ids = total_topk_ids[:recv_tokens]
+    ref_topk_weights = total_topk_weights[:recv_tokens]
 
     total_local = local_E + shared_E
     w1 = (
@@ -564,8 +567,8 @@ def test_fmoe_ep_mxfp4(
         num_iters=16,
     )
 
-    # Padded buffer -> compare only the valid prefix against the reference.
-    out = out[:local_token]
+    # Trim to valid prefix (recv_tokens rows); the [recv_tokens, trim_M) tail is padding.
+    out = out[:recv_tokens]
     diff = (ref - out).float()
     abs_err = diff.abs()
     abs_mean = abs_err.mean().item()
@@ -574,8 +577,8 @@ def test_fmoe_ep_mxfp4(
     logits_diff = _calc_diff(ref, out)
 
     _msg = (
-        f"{quant_label} ep={ep} token={token}(local={local_token}) model_dim={model_dim} "
-        f"inter_dim={inter_dim} E={E} topk={topk}"
+        f"{quant_label} ep={ep} token={token}(recv={recv_tokens}, trim_M={trim_M}) "
+        f"model_dim={model_dim} inter_dim={inter_dim} E={E} topk={topk}"
     )
     if _gfx == "gfx1250":
         # The grouped a8w4 path quantizes activations to fp8, so the reference
@@ -585,8 +588,10 @@ def test_fmoe_ep_mxfp4(
         _logits_diff_tol = 0.01
         err = logits_diff
         _verdict = "PASSED" if logits_diff < _logits_diff_tol else "FAILED"
-        print(f"[aiter] {_msg} logits_diff={logits_diff:.6f} "
-              f"(tol {_logits_diff_tol}) {_verdict}")
+        print(
+            f"[aiter] {_msg} logits_diff={logits_diff:.6f} "
+            f"(tol {_logits_diff_tol}) {_verdict}"
+        )
     else:
         err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg)
 
@@ -594,7 +599,8 @@ def test_fmoe_ep_mxfp4(
         {
             "quant": quant_label,
             "global_token": token,
-            "local_token": local_token,
+            "recv_tokens": recv_tokens,
+            "trim_M": trim_M,
             "model_dim": model_dim,
             "inter_dim": inter_dim,
             "E": E,
@@ -657,8 +663,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[128],
-    help="""Global token count. For EP mxfp4 tests each rank runs
-    token*topk//ep local tokens under balanced routing.
+    help="""Global token count. For EP mxfp4 tests the dispatch buffer is
+    token*topk rows (ATOM trim bound) with token valid rows.
     e.g.: -m 128""",
 )
 parser.add_argument(
@@ -705,16 +711,6 @@ parser.add_argument(
     default=[8],
     help="""Expert Parallelism.
     e.g.: -ep 8""",
-)
-parser.add_argument(
-    "-pf",
-    "--pad_factor",
-    type=int,
-    nargs="?",
-    default=1,
-    help="""Dispatch-buffer padding factor (network/MoRI simulation).
-    Allocates token*pad_factor input rows and passes the real count via
-    num_local_tokens. 1 = no padding (default). e.g.: -pf 10""",
 )
 
 args = parser.parse_args()
@@ -852,7 +848,6 @@ for test in args.test:
                             args.topk,
                             shared_E=0,
                             ep=ep,
-                            pad_factor=args.pad_factor,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
