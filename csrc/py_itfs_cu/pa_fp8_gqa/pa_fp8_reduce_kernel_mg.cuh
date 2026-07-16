@@ -589,11 +589,10 @@ void pa_fp8_reduce_kernel_v3(
     const scalar_t* logits_ptr = tmp_out + logits_base;
 
     // Fully-unrolled load + FMA pipeline (preserves the 2-stage prefetch
-    // schedule that hides global_load latency on long contexts).  Dead lanes
-    // (`p_idx >= num_partitions`) skip their FMA via select; the load itself
-    // is allowed to issue — at short ctx the bandwidth cost is negligible
-    // (≤ 64 partitions × 1 lane per partition) and keeping the unroll matters
-    // far more at the long-ctx end where every cycle counts.
+    // schedule that hides global_load latency on long contexts).  FMA is
+    // still masked by `num_partitions`; loads are additionally bounded by
+    // `max_num_partitions` so bucketed templates (e.g. NumPart=16 with
+    // max_num_partitions=10) cannot read past the allocated workspace.
     float acc = 0.f;
     #pragma unroll
     for (int p0 = 0; p0 < NumPart; p0 += kBatch)
@@ -601,7 +600,12 @@ void pa_fp8_reduce_kernel_v3(
         float v_batch[kBatch];
         #pragma unroll
         for (int k = 0; k < kBatch; k++)
-            v_batch[k] = pa_to_float<scalar_t>(logits_ptr[(p0 + k) * kHead]);
+        {
+            const int p_idx = p0 + k;
+            v_batch[k] = (p_idx < max_num_partitions)
+                ? pa_to_float<scalar_t>(logits_ptr[p_idx * kHead])
+                : 0.f;
+        }
         #pragma unroll
         for (int k = 0; k < kBatch; k++)
         {

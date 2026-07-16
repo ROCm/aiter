@@ -314,10 +314,9 @@ class PagedAttention:
             )
             return output
 
-        if p_scale is not None or p_scale_inv is not None:
-            raise NotImplementedError(
-                "p_scale/p_scale_inv are only supported by the FP8 GQA fast path"
-            )
+        # p_scale/p_scale_inv are consumed only by pa_fp8_gqa_decode. When that
+        # fast path is ineligible (e.g. block_size=64 with mtp in {1,2}), fall
+        # through to generic paged_attention_rocm which ignores them.
 
         # ---- pa_gqa v5 .co fast path ----
         # Hand-optimised for the default decode config (bf16, num_kv_heads=1,
