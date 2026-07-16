@@ -43,6 +43,7 @@ if _arch_ok:
         opus_gemm_workspace_init,
     )
     from .bmm_op import (  # noqa: E402
+        _opus_bmm_a8w8_mxscale_mmajor_raw,
         _opus_bmm_a8w8_scale_mmajor_raw,
         _opus_bmm_a8w8_uniform_scale_raw,
         _opus_bmm_a8w8_uniform_scale_mmajor_raw,
@@ -60,6 +61,9 @@ else:
     # it and silently disable the 30+ subsequent op imports.
     gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
     opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
+    _opus_bmm_a8w8_mxscale_mmajor_raw = _make_unsupported_arch_stub(
+        "_opus_bmm_a8w8_mxscale_mmajor_raw"
+    )
     _opus_bmm_a8w8_scale_mmajor_raw = _make_unsupported_arch_stub(
         "_opus_bmm_a8w8_scale_mmajor_raw"
     )
@@ -78,6 +82,7 @@ else:
 __all__ = [
     "opus_gemm_a16w16_tune",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+    "_opus_bmm_a8w8_mxscale_mmajor_raw",
     "_opus_bmm_a8w8_scale_mmajor_raw",
     "_opus_bmm_a8w8_uniform_scale_raw",
     "_opus_bmm_a8w8_uniform_scale_mmajor_raw",

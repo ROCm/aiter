@@ -28,6 +28,7 @@ from opus_gemm_common import (
     OpusGemmInstance,
     heuristic_kids_for_arch,
     a8w8_kernels_list,
+    a8w8_mxscale_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
@@ -138,6 +139,7 @@ def _kernel_func_for(k):
 
 INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale": ("fp8_t", "fp8_t"),
     "a8w8_uniform_scale": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
@@ -1097,6 +1099,7 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
     TAG_TO_LIST = {
         "a8w8_scale": a8w8_scale_kernels_list,
+        "a8w8_mxscale": a8w8_mxscale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
         "a16w16_flatmm": a16w16_flatmm_kernels_list,
@@ -1215,6 +1218,7 @@ if __name__ == "__main__":
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.
     if target_arches is None or "gfx950" in target_arches:
         S |= set(a8w8_scale_kernels_list.keys())
+        S |= set(a8w8_mxscale_kernels_list.keys())
         S |= set(a8w8_uniform_scale_kernels_list.keys())
         S |= set(a8w8_kernels_list.keys())
 
@@ -1227,6 +1231,7 @@ if __name__ == "__main__":
             S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
             if target_arches is None or "gfx950" in target_arches:
                 S |= set(a8w8_scale_kernels_list.keys())
+                S |= set(a8w8_mxscale_kernels_list.keys())
                 S |= set(a8w8_uniform_scale_kernels_list.keys())
                 S |= set(a8w8_kernels_list.keys())
 

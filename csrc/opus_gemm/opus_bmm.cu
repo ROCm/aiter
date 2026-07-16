@@ -23,7 +23,24 @@ template <typename D_C>
 void opus_gemm_512x128x256x128_4x2_16x16x128_1x128x128_mmajor(
     aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
     std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
+template <typename D_C>
+void opus_gemm_a8w8_mxscale_512x128x256x128_4x2_16x16x128_1x128x128_mmajor(
+    aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
 #endif
+
+static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
+                                        aiter_tensor_t &Y, const char *who)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3,
+              who, ": O/wo_a/Y must be 3D "
+              "([M,batch,K] / [batch,N,K] / [M,batch,N])");
+  AITER_CHECK(O.dtype() == AITER_DTYPE_fp8 && wo_a.dtype() == AITER_DTYPE_fp8,
+              who, ": O and wo_a must be fp8");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32 || Y.dtype() == AITER_DTYPE_bf16,
+              who, ": Y must be fp32 or bf16");
+}
 
 void opus_bmm_a8w8_scale_mmajor(
     aiter_tensor_t &O,
@@ -32,14 +49,7 @@ void opus_bmm_a8w8_scale_mmajor(
     aiter_tensor_t &x_scale,
     aiter_tensor_t &w_scale)
 {
-  aiter_detail::g_aiter_can_throw = true;
-  AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3,
-              "opus_bmm_a8w8_scale_mmajor: O/wo_a/Y must be 3D "
-              "([M,batch,K] / [batch,N,K] / [M,batch,N])");
-  AITER_CHECK(O.dtype() == AITER_DTYPE_fp8 && wo_a.dtype() == AITER_DTYPE_fp8,
-              "opus_bmm_a8w8_scale_mmajor: O and wo_a must be fp8");
-  AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32 || Y.dtype() == AITER_DTYPE_bf16,
-              "opus_bmm_a8w8_scale_mmajor: Y must be fp32 or bf16");
+  opus_bmm_a8w8_common_checks(O, wo_a, Y, "opus_bmm_a8w8_scale_mmajor");
 #ifdef OPUS_BUILD_HAS_GFX950
   const auto &arch_info = opus_get_arch_info();
   AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
@@ -55,6 +65,34 @@ void opus_bmm_a8w8_scale_mmajor(
 #else
   AITER_CHECK(false,
               "opus_bmm_a8w8_scale_mmajor requires OPUS_BUILD_HAS_GFX950");
+#endif
+}
+
+void opus_bmm_a8w8_mxscale_mmajor(
+    aiter_tensor_t &O,
+    aiter_tensor_t &wo_a,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &x_scale,
+    aiter_tensor_t &w_scale,
+    int kernelId)
+{
+  opus_bmm_a8w8_common_checks(O, wo_a, Y, "opus_bmm_a8w8_mxscale_mmajor");
+#ifdef OPUS_BUILD_HAS_GFX950
+  const auto &arch_info = opus_get_arch_info();
+  AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
+              "opus_bmm_a8w8_mxscale_mmajor is gfx950-only; current device ",
+              arch_info.dev, " has gcnArchName='", arch_info.name, "'");
+  (void)kernelId;
+  if (Y.dtype() == AITER_DTYPE_bf16) {
+    opus_gemm_a8w8_mxscale_512x128x256x128_4x2_16x16x128_1x128x128_mmajor<bf16_t>(
+        O, wo_a, Y, x_scale, w_scale);
+  } else {
+    opus_gemm_a8w8_mxscale_512x128x256x128_4x2_16x16x128_1x128x128_mmajor<fp32_t>(
+        O, wo_a, Y, x_scale, w_scale);
+  }
+#else
+  AITER_CHECK(false,
+              "opus_bmm_a8w8_mxscale_mmajor requires OPUS_BUILD_HAS_GFX950");
 #endif
 }
 

@@ -15,6 +15,15 @@ void opus_bmm_a8w8_scale_mmajor(aiter_tensor_t& O,
                                 aiter_tensor_t& x_scale,
                                 aiter_tensor_t& w_scale);
 
+// Same BMM layout as opus_bmm_a8w8_scale_mmajor, but consumes E8M0 (uint8)
+// scales and uses gfx950 native scaled MFMA.
+void opus_bmm_a8w8_mxscale_mmajor(aiter_tensor_t& O,
+                                  aiter_tensor_t& wo_a,
+                                  aiter_tensor_t& Y,
+                                  aiter_tensor_t& x_scale,
+                                  aiter_tensor_t& w_scale,
+                                  int kernelId);
+
 // fp8 block-scale UNIFORM (Route B fp8, 4-wave full-tile, direct store) BMM.
 // Y dtype in {fp32, bf16}; kernelId selects tile 700=128x128, 701=256x128.
 // Batch-major (O/wo_a/Y = [batch,M,K]/[batch,N,K]/[batch,M,N]) and mmajor

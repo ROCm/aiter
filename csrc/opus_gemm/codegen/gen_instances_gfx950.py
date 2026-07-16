@@ -21,6 +21,7 @@ from codegen.common import (
 
 PIPELINE_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
     "a16w16_interleave": "gfx950/opus_gemm_pipeline_a16w16_interleave_gfx950.cuh",
@@ -43,6 +44,7 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 
 TRAITS_HEADER_MAP = {
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
     "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_interleave": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
@@ -56,6 +58,7 @@ TRAITS_HEADER_MAP = {
 
 KERNEL_FUNC_MAP = {
     "a8w8_scale": "gemm_a8w8_scale_kernel",
+    "a8w8_mxscale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
     "a16w16": "gemm_a16w16_kernel",
     "a16w16_interleave": "gemm_a16w16_interleave_kernel",
@@ -75,6 +78,7 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 
 TRAITS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
+    "a8w8_mxscale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
     "a16w16": "opus_gemm_a16w16_traits_gfx950",
     "a16w16_interleave": "opus_gemm_a16w16_traits_gfx950",
@@ -88,6 +92,7 @@ TRAITS_NAME_MAP = {
 
 KARGS_NAME_MAP = {
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
+    "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
     "a16w16": "opus_gemm_noscale_kargs_gfx950",
     "a16w16_interleave": "opus_gemm_noscale_kargs_gfx950",
@@ -827,7 +832,7 @@ def gen_scale_instance(
 template <typename D_C>
 using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-    opus::tuple<{da}, {db}, D_C, fp32_t, fp32_t>,
+    opus::tuple<{da}, {db}, D_C, fp32_t, {"unsigned char" if k.kernel_tag == "a8w8_mxscale" else "fp32_t"}>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>>;
 """
@@ -2064,6 +2069,7 @@ void
 # ---------- Self-register at import time ----------
 register_emit("gfx950", "a16w16_persistent", gen_persistent_instance)
 register_emit("gfx950", "a8w8_scale", gen_scale_instance)
+register_emit("gfx950", "a8w8_mxscale", gen_scale_instance)
 register_emit("gfx950", "a8w8_uniform_scale", gen_uniform_scale_instance)
 register_emit("gfx950", "a16w16", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_interleave", gen_noscale_instance_gfx950)

@@ -40,6 +40,22 @@ def _opus_bmm_a8w8_scale_mmajor_raw(
 ) -> torch.Tensor: ...
 
 
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_bmm_a8w8_mxscale_mmajor",
+    gen_fake=_gen_bmm_a8w8_scale_mmajor_fake_tensors,
+    develop=True,
+)
+def _opus_bmm_a8w8_mxscale_mmajor_raw(
+    x: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    kernelId: int = 710,
+) -> torch.Tensor: ...
+
+
 def _gen_bmm_uniform_scale_fake_tensors(
     x: torch.Tensor,
     wo_a: torch.Tensor,
@@ -100,6 +116,7 @@ def _opus_bmm_a8w8_uniform_scale_mmajor_raw(
 
 
 __all__ = [
+    "_opus_bmm_a8w8_mxscale_mmajor_raw",
     "_opus_bmm_a8w8_scale_mmajor_raw",
     "_opus_bmm_a8w8_uniform_scale_raw",
     "_opus_bmm_a8w8_uniform_scale_mmajor_raw",

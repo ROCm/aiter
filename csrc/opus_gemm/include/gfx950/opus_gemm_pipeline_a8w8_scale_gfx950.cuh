@@ -168,6 +168,34 @@ inline __device__ auto make_layout_sfa(int lane_id, int wave_id_m, int stride_sf
         opus::unfold_p_coord(sfa_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
 }
 
+template<typename S>
+OPUS_D int pack_e8m0x4(S scale) {
+    const int e = static_cast<int>(scale);
+    return e * 0x01010101;
+}
+
+template<typename T, int ELEM_C, typename Mma, typename VA, typename VB,
+         typename VSFA, typename VSFB, typename VC>
+OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
+                            const VSFA& v_sfa, const VSFB& v_sfb, VC& v_c) {
+    using D_ACC = typename T::D_ACC;
+    using D_SF = typename T::D_SF;
+    if constexpr (std::is_same_v<D_SF, unsigned char>) {
+        // DSV4 scale is 128-block. The gfx950 scaled MFMA consumes 32-block
+        // E8M0 scale bytes; replicate one checkpoint byte across all four
+        // subblocks in the packed scale word to preserve 128-block semantics.
+        static_assert(T::B_K == T::GROUP_K, "e8m0 path assumes one K scale block per B_K");
+        static_assert(T::E_M == 1, "e8m0 path assumes one A scale per half-tile");
+        static_assert(T::HALF_B_N == T::GROUP_N, "e8m0 path assumes one B scale per half-tile");
+        const int scale_a = pack_e8m0x4(v_sfa[0]);
+        const int scale_b = pack_e8m0x4(v_sfb[0]);
+        v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
+    } else {
+        typename Mma::vtype_c v_mma = mma(v_a, v_b, 0, 0);
+        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa, v_sfb, v_c);
+    }
+}
+
 #endif // __HIP_DEVICE_COMPILE__ (layout functions)
 
 // ============================================================================
@@ -243,7 +271,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
     typename decltype(mma)::vtype_a v_a[2];
     typename decltype(mma)::vtype_b v_b;
-    typename decltype(mma)::vtype_c v_c[2][2], v_mma;
+    typename decltype(mma)::vtype_c v_c[2][2];
     clear(v_c[0][0]);
     clear(v_c[0][1]);
     clear(v_c[1][0]);
@@ -309,8 +337,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -326,8 +353,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -343,8 +369,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -360,8 +385,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -379,8 +403,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[toc][0], v_sfb[toc][0], v_c[0][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[toc][0], v_sfb[toc][0], v_c[0][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -396,8 +419,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[toc][1], v_sfb[toc][0], v_c[1][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[toc][1], v_sfb[toc][0], v_c[1][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -413,8 +435,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[toc][0], v_sfb[toc][1], v_c[0][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[toc][0], v_sfb[toc][1], v_c[0][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -430,8 +451,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[toc][1], v_sfb[toc][1], v_c[1][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[toc][1], v_sfb[toc][1], v_c[1][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
@@ -451,8 +471,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -463,8 +482,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -475,10 +493,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -495,8 +511,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -507,8 +522,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -518,10 +532,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_mma = mma(v_a[0], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
-        v_mma = mma(v_a[1], v_b, 0, 0);
-        scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
+        mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);

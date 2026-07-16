@@ -417,6 +417,12 @@ a8w8_scale_kernels_list = {
     1: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["bf16_t", "fp32_t"]),
 }
 
+a8w8_mxscale_kernels_list = {
+    710: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_mxscale", ["bf16_t", "fp32_t"]),
+}
+for _inst in a8w8_mxscale_kernels_list.values():
+    _inst.name_tag = "a8w8_mxscale"
+
 a8w8_kernels_list = {
     2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8", ["fp32_t"]),
 }
@@ -1203,6 +1209,7 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
+    **a8w8_mxscale_kernels_list,
     **a8w8_kernels_list,
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,

@@ -330,6 +330,18 @@ namespace py = pybind11;
           py::arg("Y"),                                  \
           py::arg("x_scale"),                            \
           py::arg("w_scale"));
+#define OPUS_BMM_A8W8_MXSCALE_MMAJOR_PYBIND             \
+    m.def("opus_bmm_a8w8_mxscale_mmajor",               \
+          &opus_bmm_a8w8_mxscale_mmajor,                \
+          "mmajor fp8 block-scale BMM with native e8m0 " \
+          "scaled MFMA: O/Y [M, batch, *], wo_a/w_scale " \
+          "batch-major, x_scale [M, batch, K/GROUP_K]", \
+          py::arg("O"),                                  \
+          py::arg("wo_a"),                               \
+          py::arg("Y"),                                  \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"),                            \
+          py::arg("kernelId") = 710);
 #define OPUS_BMM_A8W8_UNIFORM_SCALE_PYBIND                   \
     m.def("opus_bmm_a8w8_uniform_scale",                     \
           &opus_bmm_a8w8_uniform_scale,                      \
