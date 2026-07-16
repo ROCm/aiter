@@ -32,7 +32,7 @@
         "kernel_type": "bandwidth_bound"
     },
     "M_LEQ_64": {
-        "BLOCK_M": 64,
+        "BLOCK_M": 32,
         "BLOCK_N": 64,
         "BLOCK_K": 256,
         "NUM_BUFFERS": 4,
