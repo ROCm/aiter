@@ -277,10 +277,6 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                 params.p_reduce_indptr[bid + 1]        = reduce_before + num_frags;
                 params.p_reduce_final_map[bid * 2]     = qo_start;
                 params.p_reduce_final_map[bid * 2 + 1] = qo_end;
-                if(params.p_reduce_max_split != nullptr)
-                {
-                    atomicMax(params.p_reduce_max_split, num_frags);
-                }
             }
             else
             {
@@ -535,10 +531,6 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                 // record a work in work_info_set
                 if(curr_n_split_idx > 0)
                 {
-                    if(lane_idx == 0 && params.p_reduce_max_split != nullptr)
-                    {
-                        atomicMax(params.p_reduce_max_split, num_splits);
-                    }
                     for(int32_t idx = lane_idx; idx < num_splits; idx += opus::get_warp_size())
                     {
                         fill_work_info(idx);
@@ -813,8 +805,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& work_indptr,
                                   torch::Tensor& reduce_indptr,
                                   torch::Tensor& reduce_final_map,
-                                  torch::Tensor& reduce_partial_map,
-                                  const std::optional<torch::Tensor>& reduce_max_split = std::nullopt)
+                                  torch::Tensor& reduce_partial_map)
 {
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -917,12 +908,6 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.p_reduce_indptr              = reduce_indptr.data_ptr<int32_t>();
     params.p_reduce_final_map           = reduce_final_map.data_ptr<int32_t>();
     params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
-    if(reduce_max_split.has_value())
-    {
-        params.p_reduce_max_split = reduce_max_split->data_ptr<int32_t>();
-        // atomicMax accumulator: must start at 0 each launch (capture-safe on stream).
-        hipMemsetAsync(params.p_reduce_max_split, 0, sizeof(int32_t), stream);
-    }
     params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
     params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
     params.p_kv_last_page_lens          = kv_last_page_lens.data_ptr<int32_t>();

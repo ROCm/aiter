@@ -69,10 +69,6 @@ struct MlaMetadataV1KernelParameter
     int32_t* p_reduce_indptr;
     int32_t* p_reduce_final_map;
     int32_t* p_reduce_partial_map;
-    // Optional [1] scalar: max over active tiles of per-tile n_splits
-    // (== max_t(reduce_indptr[t+1]-reduce_indptr[t])). nullptr => not emitted.
-    // Must be pre-zeroed by the launcher (filled via atomicMax).
-    int32_t* p_reduce_max_split;
 
     // Inputs
     const int32_t* p_seqlens_qo_indptr;

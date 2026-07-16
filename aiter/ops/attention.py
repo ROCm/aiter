@@ -1299,7 +1299,6 @@ def _get_mla_metadata_v1_impl(
     dtype_q_rope: Optional[torch.dtype] = None,
     dtype_kv_nope: Optional[torch.dtype] = None,
     dtype_kv_rope: Optional[torch.dtype] = None,
-    reduce_max_split: Optional[torch.Tensor] = None,
 ) -> None:
     """Compiled binding for ``get_mla_metadata_v1`` (bound via ``fc_name``).
 
@@ -1329,12 +1328,6 @@ def _get_mla_metadata_v1_impl(
         mla_version: MLA kernel version (default V32).
         dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
         dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
-        reduce_max_split: (1,) int32, optional. When provided (fast_mode only), receives
-            max over active tiles of the per-tile split count, i.e.
-            max_t(reduce_indptr[t+1]-reduce_indptr[t]). Pre-zeroed and filled via atomicMax
-            inside the metadata kernel, so callers can size/gate the split-K reduce on the
-            true per-tile split count without a separate device reduction. Left untouched
-            (stays 0 if passed as zeros) on non-fast_mode paths.
 
     Outputs (written into the buffers above):
         [0] work_metadata_ptrs  (2)             Two 64-bit pointers to the 1st elements of
@@ -1389,7 +1382,6 @@ def get_mla_metadata_v1(
     dtype_kv_rope: Optional[torch.dtype] = None,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
-    reduce_max_split: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward-compatible wrapper around the compiled ``get_mla_metadata_v1``.
 
@@ -1437,7 +1429,6 @@ def get_mla_metadata_v1(
         dtype_q_rope=dtype_q_rope,
         dtype_kv_nope=dtype_kv_nope,
         dtype_kv_rope=dtype_kv_rope,
-        reduce_max_split=reduce_max_split,
     )
 
 

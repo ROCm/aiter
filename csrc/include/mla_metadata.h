@@ -31,8 +31,7 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr,
                          const std::optional<at::ScalarType> dtype_q_nope  = std::nullopt,
                          const std::optional<at::ScalarType> dtype_q_rope  = std::nullopt,
                          const std::optional<at::ScalarType> dtype_kv_nope = std::nullopt,
-                         const std::optional<at::ScalarType> dtype_kv_rope = std::nullopt,
-                         const std::optional<torch::Tensor> reduce_max_split = std::nullopt);
+                         const std::optional<at::ScalarType> dtype_kv_rope = std::nullopt);
 
 std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr,
                                                             const torch::Tensor& seqlens_kv_indptr,

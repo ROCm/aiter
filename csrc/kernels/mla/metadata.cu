@@ -63,8 +63,7 @@ void get_mla_metadata_v1(
     const std::optional<at::ScalarType> dtype_q_nope,
     const std::optional<at::ScalarType> dtype_q_rope,
     const std::optional<at::ScalarType> dtype_kv_nope,
-    const std::optional<at::ScalarType> dtype_kv_rope,
-    const std::optional<torch::Tensor>  reduce_max_split)
+    const std::optional<at::ScalarType> dtype_kv_rope)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
@@ -119,8 +118,7 @@ void get_mla_metadata_v1(
             work_indptr,
             reduce_indptr,
             reduce_final_map,
-            reduce_partial_map,
-            reduce_max_split);
+            reduce_partial_map);
     }
     else if (intra_batch_mode)
     {
