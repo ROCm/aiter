@@ -29,10 +29,10 @@ _TILE_N = (128, 256, 512)
 _TILE_K = (128, 256)
 _WAVES_PER_EU = (0, 1, 2, 3, 4)
 _XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
-# split-K factors: each split reduces K/split_k contraction, partials summed in a
-# follow-up fp32 reduce kernel. Capped at 8 (accuracy / launch overhead), mirrors
-# HGEMM_MAX_SPLIT_K. split_k>1 mainly helps small-M / large-K (low-occupancy) shapes.
-_SPLIT_K = (1, 2, 4, 8)
+MAX_SPLIT_K = 32
+_SPLIT_K = tuple(range(1, MAX_SPLIT_K + 1))
+_SPLITK_MAX_TMP_BYTES = 1 << 32
+_GFX950_CU_NUM = 256
 
 
 def _a_row_bytes(a_dtype: str, tile_k: int) -> int:
@@ -144,6 +144,13 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
             or k_per_split % ki.tile_k != 0
             or k_per_split % 256 != 0
         ):
+            return False
+        # fp32 scratch tmp[split_k, M, N] must fit the 32-bit num_records field.
+        if M * N * ki.split_k * 4 >= _SPLITK_MAX_TMP_BYTES:
+            return False
+        # occupancy guard: skip split_k>1 when the base grid already fills the CUs.
+        base_wg = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+        if base_wg >= _GFX950_CU_NUM:
             return False
     return True
 
