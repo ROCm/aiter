@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import os
 from typing import Optional
 import torch
 import triton
@@ -127,8 +128,8 @@ def get_meta_param(
 ):
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
-    # a larger logical head count from multiple WGs — e.g. the v4 nm gqa=128
-    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) — the GPU's CU occupancy
+    # a larger logical head count from multiple WGs -- e.g. the v4 nm gqa=128
+    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) -- the GPU's CU occupancy
     # is driven by `bs * tg_factor * num_kv_splits`, not `bs * num_kv_splits`.
     # Only the occupancy term scales; avg_kv, the fp8 block cap, and the indptr
     # all stay keyed on the real `bs`. The auto-search keeps V3's cap of 16.
@@ -194,6 +195,54 @@ def get_meta_param(
     return num_kv_splits, num_kv_splits_indptr
 
 
+# Persistent MLA-decode kernel gate: the persistent kernel
+# ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
+# ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
+# 16-head decode). Fall back to non-persistent at/above the batch threshold.
+# Env-tunable (0 disables the gate). Provisional default pending microbench
+# calibration (AIOSS-5156).
+_MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT = 32
+
+
+@functools.lru_cache(maxsize=1)
+def _persistent_mla_decode_max_batch():
+    """Cached read of AITER_MLA_DECODE_PERSISTENT_MAX_BATCH (read once per process)."""
+    try:
+        return int(
+            os.getenv(
+                "AITER_MLA_DECODE_PERSISTENT_MAX_BATCH",
+                _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        return _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+
+
+def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
+    """Whether to keep the persistent MLA decode kernel.
+
+    True keeps the caller's persistent request; False falls back to the
+    non-persistent split-KV kernel at/above the concurrency (batch) threshold.
+    Scoped to the characterized gfx950 bf16 16-head single-token decode profile.
+    """
+    is_regression_profile = (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and nhead == 16
+        and max_seqlen_q == 1
+    )
+    if not is_regression_profile:
+        return True
+
+    max_batch = _persistent_mla_decode_max_batch()
+
+    # max_batch <= 0 disables the gate (always keep persistent).
+    if max_batch <= 0:
+        return True
+    return bs < max_batch
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -245,6 +294,20 @@ def mla_decode_fwd(
     total_kv = kv_indices.shape[0]
 
     persistent_mode = work_meta_data is not None
+
+    # Above the concurrency threshold the persistent kernel is slower, so
+    # fall back to the non-persistent split-KV path (which rebuilds its own
+    # num_kv_splits and ignores work_meta_data). See _use_persistent_mla_decode.
+    #
+    # Scope: only the dense vLLM-style decode (num_kv_splits left to aiter) is
+    # gated. Callers that pass an explicit num_kv_splits -- the sparse/expert
+    # op paths -- depend on the persistent kernel's work_meta_data layout; the
+    # non-persistent fallback can't honor their top-k/split scheme and would
+    # return wrong results, so never downgrade them.
+    if persistent_mode and num_kv_splits is None:
+        persistent_mode = _use_persistent_mla_decode(
+            bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+        )
 
     io_transformed = False
     qseqlen_folded = False
@@ -441,7 +504,7 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and (
-                    (nhead == 32 and max_seqlen_q == 4)
+                    (nhead == 32 and max_seqlen_q >= 4)
                     or (nhead == 64)
                     or (nhead == 128)
                 )
@@ -1209,7 +1272,7 @@ def mla_prefill_reduce(
 
 
 # ---------------------------------------------------------------------------
-# DSv4 MLA — additive entry point. Does NOT touch any existing
+# DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
 def mla_decode_fwd_v4_nm(
@@ -1224,7 +1287,7 @@ def mla_decode_fwd_v4_nm(
     kv_last_page_lens,  # [num_seqs]
     max_seqlen_q,
     *,
-    sink,  # REQUIRED [num_heads] FP32 — attention sink logit
+    sink,  # REQUIRED [num_heads] FP32 -- attention sink logit
     split_indptr=None,  # [num_seqs+1] int32; auto-built by get_meta_param if None
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
@@ -1236,7 +1299,7 @@ def mla_decode_fwd_v4_nm(
 
     Routes through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
-    `(logits, attn_lse)` — both 4D, in **kernel-native layout**:
+    `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
         attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
     where `total_q = num_seqs * max_seqlen_q` and
@@ -1251,7 +1314,7 @@ def mla_decode_fwd_v4_nm(
     Split-count selection (`num_kv_splits`):
       `None` (default) auto-picks the split count via V3's `get_meta_param`
       heuristic (CU-occupancy x HBM-efficiency, capped by the fp8 min block
-      for the kernel tile) — identical to `mla_decode_fwd`'s non-persistent
+      for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
 
@@ -1260,7 +1323,7 @@ def mla_decode_fwd_v4_nm(
          `[0, N, 2N, ..., bs*N]` so every seq uses all N passes. When
          `num_kv_splits` is auto-picked, `get_meta_param` returns this
          indptr directly.
-      2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
+      2. Force `out_16_nosplit = 0` -- the kernel's bf16-direct-write path
          does not support multi-pass.
       3. After the kernel returns FP32 partials, run V3's
          `_fwd_kernel_stage2_asm` triton kernel which performs the
@@ -1483,8 +1546,8 @@ def mla_decode_fwd_v4_nm(
     # When out_16_nosplit=1 (single-pass only), the kernel does NOT write the
     # `output` buffer. Instead it writes the final result as DENSELY-PACKED
     # BF16 into the `logits` allocation. Global layout is identical to the
-    # fp32 path — [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
-    # num_heads — but each element is 2 bytes (R16_BPP=2), so the per-head
+    # fp32 path -- [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
+    # num_heads -- but each element is 2 bytes (R16_BPP=2), so the per-head
     # stride is v_head_dim*2 bytes = v_head_dim BF16 slots, occupying only the
     # FIRST half of the fp32 `logits` byte range. Reinterpret those bytes as a
     # tight [total_q, num_heads, v_head_dim] BF16 tensor and copy into the
