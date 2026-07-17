@@ -236,7 +236,7 @@ def dynamic_mxfp4_quant(
             NUM_STAGES=NUM_STAGES,
             num_warps=NUM_WARPS,
             waves_per_eu=0,
-        ) 
+        )
 
     elif arch_info.get_arch() in ("gfx1250"):
         _dynamic_mxfp4_quant_kernel_gluon_1250[grid](
