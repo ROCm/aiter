@@ -43,6 +43,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+from flydsl.expr.gpu import barrier as gpu_barrier, get_dyn_shared
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import ArithValue
 from flydsl._mlir import ir
@@ -121,6 +122,30 @@ def _fp4x2_to_bf16(fp4_word_i32, scale_f32, sel: int):
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _lgkmcnt0():
+    """s_waitcnt lgkmcnt(0): wait for all outstanding LDS (ds_read/ds_write) ops."""
+    llvm.inline_asm(
+        None, [], "s_waitcnt lgkmcnt(0)", "",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _ds_write_b32(lds_byte_addr, data_i32):
+    """Write one i32 word to LDS at byte address lds_byte_addr."""
+    llvm.inline_asm(
+        None, [lds_byte_addr, data_i32], "ds_write_b32 $0, $1", "v,v",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _ds_read_b32(lds_byte_addr):
+    """Read one i32 word from LDS at byte address lds_byte_addr."""
+    return llvm.inline_asm(
+        T.i32, [lds_byte_addr], "ds_read_b32 $0, $1", "=v,v",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -1036,6 +1061,7 @@ def compile_wd_moe_down_reduce(
     h_per_warp: int = 1,
     k_batch: int = 1,
     w_dtype: str = "bf16",
+    n_waves: int = 1,
 ):
     """Compile warp-decode down_reduce and return a @flyc.jit launch wrapper.
 
@@ -1085,17 +1111,36 @@ def compile_wd_moe_down_reduce(
         raise ValueError(f"w_dtype must be 'bf16' or 'fp8', got {w_dtype}")
     if w_dtype == "fp8" and not use_dot2:
         raise ValueError("FP8 down_reduce requires use_dot2=True (gfx950)")
+    if n_waves < 1:
+        raise ValueError(f"n_waves must be >= 1, got {n_waves}")
+    if n_waves > 1 and k_batch > 1:
+        raise ValueError("LDS mode (n_waves>1) is incompatible with split-K (k_batch>1)")
+    if n_waves > 1 and w_dtype == "fp8":
+        raise ValueError("LDS mode (n_waves>1) not yet implemented for FP8 weights")
+    _block_threads = n_waves * _WAVE_SIZE
+    if n_waves > 1 and inter % (_block_threads * 2) != 0:
+        raise ValueError(
+            f"LDS mode: inter={inter} must be divisible by n_waves*WAVE_SIZE*2={_block_threads * 2}"
+        )
 
     _use_fp8_w = w_dtype == "fp8"
     _k_fp8_words = k_vector // 4  # FP8: 4 elements per i32
+    _use_lds = n_waves > 1        # cooperative inter_states caching in LDS
+    _lds_bytes = inter * 2 if _use_lds else 0  # BF16 row in LDS
+
+    # Elements of inter each thread loads in the cooperative LDS-fill pass.
+    # With block_threads threads and inter elements: each thread loads
+    # inter // block_threads elements = inter_per_thread (must be even).
+    _inter_per_thread = inter // _block_threads if _use_lds else 0
 
     dot2_tag = "_dot2" if use_dot2 else "_f32"
     h2_tag = "_h2" if h_per_warp == 2 else ""
     kb_tag = f"_kb{k_batch}" if k_batch > 1 else ""
     fp8_tag = "_fp8w" if _use_fp8_w else ""
+    lds_tag = f"_lds{n_waves}" if _use_lds else ""
     module_name = (
         f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}"
-        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}{fp8_tag}"
+        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}{fp8_tag}{lds_tag}"
     )
 
     _k_pairs = k_vector // 2
@@ -1103,7 +1148,7 @@ def compile_wd_moe_down_reduce(
     _n_k_steps = inter // _k_step
     _n_k_steps_per_batch = _n_k_steps // k_batch  # k-steps per split-K workgroup
 
-    @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
+    @flyc.kernel(name=module_name, known_block_size=[_block_threads, 1, 1])
     def _kernel(
         arg_y_out: fx.Pointer,  # [B, HIDDEN] f32, zero-init
         arg_inter: fx.Pointer,  # [B*TOPK, INTER] bf16
@@ -1143,19 +1188,37 @@ def compile_wd_moe_down_reduce(
         y_rsrc = _rsrc(arg_y_out, arith.constant(-1, type=i32))
         # w_down: per-row resources built per slot below (E*HIDDEN*INTER can exceed i32)
 
-        # ── Block → (out_j_0, [out_j_1], token_b) ───────────────────────────
-        # h_per_warp=1: each block handles one output channel out_j.
-        #   grid = B × HIDDEN;  out_j = block_id % HIDDEN
-        # h_per_warp=2 (H2): each block handles two adjacent channels.
-        #   grid = B × (HIDDEN/2);  out_j_0 = (block_id % (HIDDEN/2)) * 2
-        #   Reuses the same inter[slot] activation loads for both W_down rows.
-        lane_i32 = arith.index_cast(i32, gpu.thread_id("x"))
+        # ── Block → (wave_id, lane_id, out_j_0, token_b) ────────────────────
+        # n_waves=1: single-wave blocks; thread_id == lane_id.
+        # n_waves>1: multi-wave blocks; block handles n_waves * h_per_warp
+        #   output channels and cooperatively loads inter_states into LDS.
+        #
+        # Grid layout (h_per_block = n_waves * h_per_warp):
+        #   grid x = B × (HIDDEN / h_per_block)
+        #   out_j_0 = (blk_in_token * h_per_block) + wave_id * h_per_warp
+        _h_per_block = n_waves * h_per_warp
+        tid_i32 = arith.index_cast(i32, gpu.thread_id("x"))
         blk_i32 = arith.index_cast(i32, gpu.block_id("x"))
+        # Wave ID and lane within wave
+        wave_id = tid_i32 // arith.constant(_WAVE_SIZE, type=i32)
+        lane_i32 = tid_i32 % arith.constant(_WAVE_SIZE, type=i32)
 
-        HIDDEN_blocks = arith.constant(hidden // h_per_warp, type=i32)
+        HIDDEN_blocks = arith.constant(hidden // _h_per_block, type=i32)
         blk_in_token = arith.remui(blk_i32, HIDDEN_blocks)
         token_b = arith.divui(blk_i32, HIDDEN_blocks)
-        out_j_0 = blk_in_token * arith.constant(h_per_warp, type=i32)
+        out_j_0 = (
+            blk_in_token * arith.constant(_h_per_block, type=i32)
+            + wave_id * arith.constant(h_per_warp, type=i32)
+        )
+
+        # LDS base pointer — pre-init so AST rewriter can resolve lds_base_i32
+        # in all conditional branches (even the ones it visits but won't execute).
+        # get_dyn_shared() returns a pointer in LDS addrspace (32-bit on AMD).
+        # fx.ptrtoint on an LDS pointer gives i32 directly; no truncation needed.
+        lds_base_i32 = arith.constant(0, type=i32)
+        if _use_lds:
+            lds_ptr = get_dyn_shared()
+            lds_base_i32 = fx.ptrtoint(lds_ptr)
 
         lane_kV = lane_i32 * arith.constant(k_vector, type=i32)
         c_two = arith.constant(2, type=i32)
@@ -1216,6 +1279,25 @@ def compile_wd_moe_down_reduce(
                 )
 
             inter_row_base = flat_slot * INTER_i32
+
+            # ── LDS cooperative load (n_waves > 1 only) ──────────────────────
+            # All n_waves*WAVE_SIZE threads collectively load inter_states[slot]
+            # into LDS, then barrier so all waves can read from it.
+            # Each thread loads _inter_per_thread BF16 elements = _inter_per_thread//2 i32.
+            if _use_lds:
+                my_base_elem = tid_i32 * arith.constant(_inter_per_thread, type=i32)
+                for _i in range_constexpr(_inter_per_thread // 2):
+                    # Global source: inter_rsrc at (flat_slot * INTER + my_base + i*2) // 2
+                    g_off = (inter_row_base + my_base_elem + arith.constant(_i * 2, type=i32)) // c_two
+                    word = buffer_ops.buffer_load(inter_rsrc, g_off, vec_width=1, dtype=i32)
+                    # LDS destination: byte offset (my_base_elem + i*2) * 2 bytes_per_BF16
+                    # = (my_base_elem + i*2) * 2 bytes = local i32 index * 4 bytes
+                    lds_i32_idx = (my_base_elem + arith.constant(_i * 2, type=i32)) // c_two
+                    lds_byte_addr = arith.addi(
+                        lds_base_i32, arith.muli(lds_i32_idx, arith.constant(4, type=i32))
+                    )
+                    _ds_write_b32(lds_byte_addr, word)
+                gpu_barrier()  # s_barrier: ensure all writes are visible before reads
 
             # split-K: this block covers k-steps [k_bid*S .. (k_bid+1)*S-1]
             # where S = _n_k_steps_per_batch.  k_bid=0 when k_batch=1 (no split).
@@ -1293,10 +1375,22 @@ def compile_wd_moe_down_reduce(
                     lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
                     for p in range_constexpr(_k_pairs):
                         p2 = arith.constant(p * 2, type=i32)
-                        x_off = (inter_row_base + lane_k + p2) // c_two
-                        x_word = buffer_ops.buffer_load(
-                            inter_rsrc, x_off, vec_width=1, dtype=i32
-                        )
+                        # Pre-init x_word so AST rewriter resolves it from both branches
+                        x_word = zero_i32
+                        if _use_lds:
+                            # Read from LDS: byte address = (lane_k + p2) // 2 * 4
+                            lds_i32_idx = (lane_k + p2) // c_two
+                            lds_byte_addr = arith.addi(
+                                lds_base_i32,
+                                arith.muli(lds_i32_idx, arith.constant(4, type=i32)),
+                            )
+                            x_word = _ds_read_b32(lds_byte_addr)
+                            _lgkmcnt0()  # ensure LDS read is complete before use
+                        else:
+                            x_off = (inter_row_base + lane_k + p2) // c_two
+                            x_word = buffer_ops.buffer_load(
+                                inter_rsrc, x_off, vec_width=1, dtype=i32
+                            )
                         for h in range_constexpr(h_per_warp):
                             w_off = (lane_k + p2) // c_two
                             w_word = buffer_ops.buffer_load(
@@ -1357,12 +1451,13 @@ def compile_wd_moe_down_reduce(
         stream: fx.Stream,
     ):
         idx = ir.IndexType.get()
-        # Grid x: B × (HIDDEN/h_per_warp) — one block per output channel group
-        # Grid y: k_batch         — each y-slice covers INTER/k_batch elements
+        # Grid x: B × (HIDDEN / h_per_block)  where h_per_block = n_waves * h_per_warp
+        # Grid y: k_batch — each y-slice covers INTER/k_batch elements
+        # h_per_block = n_waves * h_per_warp; use direct expressions for jit closure compatibility
         grid_x = (
             arith.index_cast(idx, i32_B.ir_value())
             * arith.index_cast(idx, i32_HIDDEN.ir_value())
-            // arith.constant(h_per_warp, index=True)
+            // arith.constant(n_waves * h_per_warp, index=True)
         )
         grid_y = arith.constant(k_batch, index=True)
         _dk(
@@ -1377,6 +1472,11 @@ def compile_wd_moe_down_reduce(
             i32_HIDDEN,
             i32_E,
             f32_w_scale,
-        ).launch(grid=(grid_x, grid_y, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
+        ).launch(
+            grid=(grid_x, grid_y, 1),
+            block=(n_waves * _WAVE_SIZE, 1, 1),
+            stream=stream,
+            smem=inter * 2 if n_waves > 1 else 0,
+        )
 
     return _launch_down

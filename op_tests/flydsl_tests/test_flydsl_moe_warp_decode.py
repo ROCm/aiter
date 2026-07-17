@@ -883,6 +883,56 @@ def test_down_reduce_splitk_f32path(
 
 
 # ---------------------------------------------------------------------------
+# LDS-cached down_reduce tests (n_waves > 1, cooperative inter_states load)
+# ---------------------------------------------------------------------------
+
+# LDS valid shapes: inter % (n_waves * WAVE_SIZE * 2) == 0 and hidden % (n_waves * h_per_warp) == 0
+_LDS_PARAMS = [
+    ("qwen3next",  2048,  512, 10, 512, 2),
+    ("minimax",    3072, 1536,  8, 256, 2),
+    ("deepseek-v3",7168, 2048,  8, 256, 4),
+]
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts,n_waves", _LDS_PARAMS)
+@pytest.mark.parametrize("B", BATCHES)
+def test_down_reduce_lds_f32path(shape_name, hidden, inter, topk, experts, n_waves, B):
+    """down_reduce with LDS inter_states caching (n_waves > 1), f32 path — gfx942 + gfx950."""
+    torch.manual_seed(42)
+    inter_states = (
+        torch.randn(B * topk, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_down = (
+        torch.randn(experts * hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    router_ids = torch.randint(0, experts, (B * topk,), dtype=torch.int32, device="cuda")
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    router_wts = (
+        router_wts_raw.view(B, topk)
+        / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    ref = _ref_down_reduce(inter_states, w_down, router_ids, router_wts, B, topk, inter, hidden)
+    y_out = torch.zeros(B, hidden, dtype=torch.float32, device="cuda")
+
+    exe = compile_wd_moe_down_reduce(
+        hidden=hidden,
+        inter=inter,
+        experts=experts,
+        topk=topk,
+        use_dot2=False,
+        h_per_warp=2,
+        n_waves=n_waves,
+    )
+    _run_down_kernel(
+        exe, y_out, inter_states, w_down, router_ids, router_wts,
+        B, topk, inter, hidden, experts,
+    )
+
+    _check(ref, y_out, f"{shape_name} B={B} lds_nw={n_waves} f32path", atol=0.01, rtol=0.05)
+
+
+# ---------------------------------------------------------------------------
 # FP8 weight down_reduce tests (gfx950 only, dot2 path)
 # ---------------------------------------------------------------------------
 
