@@ -516,7 +516,8 @@ def deepgemm_fp8_paged_mqa_logits(
     else:
         grid = (batch_size * next_n * SplitKV, 1, 1)
 
-    if enable_gluon_pa_mqa_logits:
+    use_gluon = enable_gluon_pa_mqa_logits and get_gfx() != "gfx1201"
+    if use_gluon:
         is_padded_mode = kv_cache_fp8.stride(0) % 16 == 0
         kernel = _compile_deepgemm_fp8_paged_mqa_logits(
             ChunkQ=heads,
