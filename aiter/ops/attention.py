@@ -4,7 +4,7 @@
 import math
 from typing import Optional, Tuple
 
-from aiter.ops.enum import QuantType, Enum
+from aiter.ops.enum import QuantType, Enum, MlaVersion
 import torch
 import triton
 import triton.language as tl
@@ -870,6 +870,12 @@ def mla_decode_v4_asm(
     splitLse: torch.Tensor,
     # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
     output: torch.Tensor,
+    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
+    # per-request valid kv-split count the kernel writes (slot 19). Pass a
+    # real tensor when use_valid_split_count_reduce != 0; otherwise the
+    # kernel skips the write and nullptr is fine.
+    valid_split_count: Optional[torch.Tensor] = None,
+    use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
 
@@ -1149,7 +1155,7 @@ def get_mla_metadata_info_v1(
     """
 
     assert num_head_qo % 8 == 0
-    cu_num = get_mla_decode_fwd_max_splits(
+    max_splits = get_mla_decode_fwd_max_splits(
         num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
 
@@ -1196,6 +1202,13 @@ def get_mla_metadata_info_v1(
                 or (num_head_qo == 128)
             )
         )
+        or (
+            get_gfx() in ("gfx942", "gfx950")
+            and num_head_qo == 64
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and effective_seqlen_qo == 1
+        )
     ):
         max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
     elif (
@@ -1214,13 +1227,14 @@ def get_mla_metadata_info_v1(
     tile_cnt = batch_size * max_qo_tiles_per_batch
 
     if fast_mode:
-        max_work = (batch_size + cu_num - 1) * max_qo_tiles_per_batch
+        max_work = (batch_size + max_splits - 1) * max_qo_tiles_per_batch
         max_split_tiles = (
-            min(batch_size + cu_num - 1, (cu_num - 1) * 2) * max_qo_tiles_per_batch
+            min(batch_size + max_splits - 1, (max_splits - 1) * 2)
+            * max_qo_tiles_per_batch
         )
     else:
-        max_work = tile_cnt * cu_num
-        max_split_tiles = tile_cnt * cu_num
+        max_work = tile_cnt * max_splits
+        max_split_tiles = tile_cnt * max_splits
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
     # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
@@ -1234,13 +1248,13 @@ def get_mla_metadata_info_v1(
     # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
     # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
-        per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
+        per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
         max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            ((cu_num + 1), torch.int32),  # work_indptr
+            ((max_splits + 1), torch.int32),  # work_indptr
             ((max_work, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
@@ -1249,7 +1263,7 @@ def get_mla_metadata_info_v1(
     else:
         return (
             ((2), torch.uint64),  # work_metadata_ptrs
-            (cu_num + 1, torch.int32),  # work_indptr
+            (max_splits + 1, torch.int32),  # work_indptr
             ((tile_cnt * num_kv_splits, 8), torch.int32),  # work_info_set
             ((tile_cnt + 1), torch.int32),  # reduce_indptr
             ((tile_cnt, 2), torch.int32),  # reduce_final_map
@@ -1257,7 +1271,88 @@ def get_mla_metadata_info_v1(
         )
 
 
-@compile_ops("module_mla_metadata")
+@compile_ops("module_mla_metadata", fc_name="get_mla_metadata_v1")
+def _get_mla_metadata_v1_impl(
+    seqlens_qo_indptr: torch.Tensor,
+    seqlens_kv_indptr: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    num_heads_per_head_k: int,
+    num_heads_k: int,
+    is_causal: bool,
+    work_metadata_ptrs: torch.Tensor,
+    work_info_set: torch.Tensor,
+    work_indptr: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    page_size: int = 1,
+    kv_granularity: int = 16,
+    max_seqlen_qo: int = -1,
+    uni_seqlen_qo: int = -1,
+    fast_mode: bool = True,
+    topk: int = -1,
+    max_split_per_batch: int = -1,
+    intra_batch_mode: bool = False,
+    is_cp_round_robin: bool = False,
+    mla_version: int = MlaVersion.V32.value,
+    dtype_q_nope: Optional[torch.dtype] = None,
+    dtype_q_rope: Optional[torch.dtype] = None,
+    dtype_kv_nope: Optional[torch.dtype] = None,
+    dtype_kv_rope: Optional[torch.dtype] = None,
+) -> None:
+    """Compiled binding for ``get_mla_metadata_v1`` (bound via ``fc_name``).
+
+    Internal: call the ``get_mla_metadata_v1`` wrapper below instead, which also
+    accepts the legacy ``dtype_q`` / ``dtype_kv`` aliases. This entry takes the
+    per-component dtypes directly.
+
+    Args:
+        seqlens_qo_indptr: (batch_size + 1) int32. Cumulative q/o seqlens.
+        seqlens_kv_indptr: (batch_size + 1) int32. Cumulative k/v page indices.
+        kv_last_page_lens: (batch_size) int32. Length of the last k/v page.
+        num_heads_per_head_k: num_heads_q // num_heads_k.
+        num_heads_k: Number of k heads.
+        is_causal: Whether the causal mask is enabled.
+        work_metadata_ptrs / work_info_set / work_indptr / reduce_indptr /
+            reduce_final_map / reduce_partial_map: Pre-allocated output buffers
+            (see get_mla_metadata_info_v1 for shapes/dtypes) filled in place.
+        page_size: Page size (default 1).
+        kv_granularity: Granularity of kv page counts when splitting a batch (default 16).
+        max_seqlen_qo: Max qo seqlen; used to bound LDS usage. < 1 means unknown (default -1).
+        uni_seqlen_qo: Uniform qo seqlen across batches. < 1 means not fixed (default -1).
+        fast_mode: Prefer fastest metadata generation; may hurt overall perf (default True).
+        topk: Top-k tokens for sparse attention. -1 means non-sparse (default -1).
+        max_split_per_batch: Cap on KV splits per batch. -1 means unbounded (default -1).
+        intra_batch_mode: Fake non-persistent mode; same split count per batch (default False).
+        is_cp_round_robin: Context-parallel round-robin work assignment (default False).
+        mla_version: MLA kernel version (default V32).
+        dtype_q_nope / dtype_kv_nope: Q/KV NoPE dtypes. None -> bf16 (C++ default).
+        dtype_q_rope / dtype_kv_rope: Q/KV RoPE dtypes. None -> the matching NoPE dtype.
+
+    Outputs (written into the buffers above):
+        [0] work_metadata_ptrs  (2)             Two 64-bit pointers to the 1st elements of
+                                                work_indptr and work_info.
+        [1] work_indptr         (#cu_part + 1)  IDs of the work handled by each cu_part.
+        [2] work_info           (#work, 8)      Per-work descriptor, 8 DWs each:
+              [.0] bs_index        Batch index handled by this work.
+              [.1] partial_index   Output-buffer tile index when split; -1 means no split.
+              [.2] q_start         Global seq index where q/o starts.
+              [.3] q_end           Global seq index where q/o ends (exclusive).
+              [.4] kv_start        Global page index where k/v starts.
+              [.5] kv_end          Global page index where k/v ends (exclusive). With causal
+                                   mask and page_size==1, this is the end of the last qo seq
+                                   when the work covers multiple qo sequences.
+              [.6] kv_offset       Remaining seq length from kv_end to the end of the batch.
+              [.7] pad             Padding to 8 DWs.
+        [3] reduce_indptr       (sum(qo_seqlen_blk_count) + 1)  Groups reduce_partial_map
+                                                entries that must be merged together.
+        [4] reduce_final_map    (sum(qo_seqlen_blk_count))      Final output location per group.
+        [5] reduce_partial_map  (#partial_tiles)                Partial-buffer locations of the
+                                                tiles awaiting reduction.
+    """
+    ...
+
+
 def get_mla_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
@@ -1279,54 +1374,62 @@ def get_mla_metadata_v1(
     topk: int = -1,
     max_split_per_batch: int = -1,
     intra_batch_mode: bool = False,
+    is_cp_round_robin: bool = False,
+    mla_version: int = MlaVersion.V32.value,
+    dtype_q_nope: Optional[torch.dtype] = None,
+    dtype_q_rope: Optional[torch.dtype] = None,
+    dtype_kv_nope: Optional[torch.dtype] = None,
+    dtype_kv_rope: Optional[torch.dtype] = None,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
-    is_cp_round_robin: bool = False,
 ) -> None:
+    """Forward-compatible wrapper around the compiled ``get_mla_metadata_v1``.
+
+    ``dtype_q`` / ``dtype_kv`` are legacy aliases kept for callers written
+    before the NoPE/RoPE dtype split. When provided, each fills in the
+    corresponding NoPE and RoPE dtype only if that specific one was not already
+    given (an explicit ``dtype_q_nope`` / ``dtype_q_rope`` etc. always wins).
+    See the compiled op's docstring for the full input/output description.
     """
-    Inputs:
-        cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
-        cumulated page indices of k/v: (batch_size + 1), dtype torch.int32.
-        Length of last page of k/v: (batch_size), dtype torch.int32.
-        num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
-        num_heads_k: num_heads_k.
-        is_causal: Whether causal mask is enabled.
-        Options: Detailed settings for spliting. All of them are optional.
-            page_size: default=1. The size of a page.
-            kv_granularity: default=16. The granularity on kv page nums when cutting batch.
-            max_seqlen_qo: default=-1. Used to check lds usage and save time. value less than 1 means unknown.
-            uni_seqlen_qo: default=-1. Sequence length of qo is uniform across batches. value less than 1 means the
-                           length is not fixed.
-            fast_mode: default=True. Whether user wants metadata become as fast as possible. Note that fast
-                       mode may lead to bad overall performance.
-            intra_batch_mode: default=False. Fake non persistent mode. Same splits for each batch.
-            topk: default=-1. Top-k tokens selected for sparse attention. -1 means non-sparse attention.
-    Outputs:
-        [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
-                                                    work_info.
-        [1] work_indptr:        (#cu_part + 1),     The IDs of work handled by each cu_part.
-        [2] work_info           (#work, 8)
-        [2.0] bs_index:         (#work),            The index of batch handled by each work.
-        [2.1] partial_index:    (#work),            The index of tile in output buffer when splits. -1 means no split.
-        [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
-                                                    reduce memory access count in kernel.
-        [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
-        [2.4] kv_start:         (#work),            The global index in page where k/v starts.
-        [2.5] kv_end:           (#work),            The global index in page where k/v ends (not included). Note that
-                                                    this value indicates the end of last qo sequence if there are
-                                                    multiple qo sequences included in the current work and causal mask
-                                                    is enabled when page_size is 1.
-        [2.6] kv_offset:        (#work),            Remaining length in seq from kv_end to the end of current batch.
-        [2.7] pad               (#work, 1),         Pad to 8 DWs.
-        [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
-                                                    The IDs in reduce_partial_map indicates the tiles should be merged
-                                                    together.
-        [4] reduce_final_map:   (sum(qo_seqlen_blk_count)),
-                                                    The final output location of each group of tiles.
-        [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
-                                                    reduced.
-    """
-    ...
+    if dtype_q is not None:
+        if dtype_q_nope is None:
+            dtype_q_nope = dtype_q
+        if dtype_q_rope is None:
+            dtype_q_rope = dtype_q
+    if dtype_kv is not None:
+        if dtype_kv_nope is None:
+            dtype_kv_nope = dtype_kv
+        if dtype_kv_rope is None:
+            dtype_kv_rope = dtype_kv
+
+    return _get_mla_metadata_v1_impl(
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        kv_last_page_lens,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        work_metadata_ptrs,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=page_size,
+        kv_granularity=kv_granularity,
+        max_seqlen_qo=max_seqlen_qo,
+        uni_seqlen_qo=uni_seqlen_qo,
+        fast_mode=fast_mode,
+        topk=topk,
+        max_split_per_batch=max_split_per_batch,
+        intra_batch_mode=intra_batch_mode,
+        is_cp_round_robin=is_cp_round_robin,
+        mla_version=mla_version,
+        dtype_q_nope=dtype_q_nope,
+        dtype_q_rope=dtype_q_rope,
+        dtype_kv_nope=dtype_kv_nope,
+        dtype_kv_rope=dtype_kv_rope,
+    )
 
 
 @compile_ops("module_mla_metadata")
@@ -1368,7 +1471,7 @@ def get_mla_metadata_v1_no_redundant(
     ...
 
 
-@compile_ops("module_mla_reduce")
+@compile_ops("module_mla_reduce", develop=True)
 def mla_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -1379,7 +1482,41 @@ def mla_reduce_v1(
     num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-) -> None: ...
+) -> None:
+    """
+    Cross-split (flash-style) reduction for split-KV MLA decode.
+
+    The decode kernel splits each (batch, head) sequence into KV tiles and
+    writes one *partial* attention output + log-sum-exp per split. This op
+    combines the partials belonging to the same query tile into the final
+    output using the standard online-softmax combine
+    (``out = sum_k exp(lse_k - lse*) * out_k``), then normalizes.
+
+    Args:
+        partial_output: [max(reduce_partial_map)+s, h, dv] fp32. Per-split
+            partial attention outputs (unnormalized numerators) to merge.
+        partial_lse: [max(reduce_partial_map)+s, h] fp32. Per-split
+            log-sum-exp denominators paired with ``partial_output``.
+        reduce_indptr: [#reduce_tiles + 1] int32. Group boundaries into
+            ``reduce_partial_map``: the partials for reduce tile ``i`` are
+            ``reduce_partial_map[reduce_indptr[i] : reduce_indptr[i+1]]``.
+        reduce_final_map: optional [#reduce_tiles, 2] int32. The final-output
+            location of each merged group. ``None`` means the reduce tiles
+            map to final rows in order (no indirection).
+        reduce_partial_map: [reduce_indptr[-1]] int32. Locations in the
+            partial buffer of the tiles waiting to be reduced.
+        max_seqlen_q: max query length (tokens) per decode step.
+        num_kv_splits: sizing hint for the reducer's per-split LDS scratch
+            (``max_splits = max(device_cu_count, num_kv_splits)``).
+            **``0`` means auto** — size to the device CU count. Pass a value
+            larger than the CU count only to force a bigger split budget;
+            values <= CU count (incl. 0) are clamped up to it.
+        final_output: [bs, h, dv]. Combined, normalized output (written
+            in-place).
+        final_lse: optional [bs, h] fp32. Combined LSE; written only when
+            provided.
+    """
+    ...
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
@@ -1557,8 +1694,10 @@ def decode_update_mla_metadata_v1(
     )
 
 
-@compile_ops("module_hk_mla")
-def hk_mla_decode_fwd(
+@compile_ops(
+    "module_hk_mla_v32_fwd_mi3xx", fc_name="hk_mla_v32_decode_fwd", develop=True
+)
+def hk_mla_v32_decode_fwd_mi3xx(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
@@ -1581,3 +1720,112 @@ def hk_mla_decode_fwd(
     split_lse: torch.Tensor,
     final_output: torch.Tensor,
 ) -> None: ...
+
+
+def hk_mla_v32_decode_fwd(
+    query: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+) -> None:
+    """Arch-dispatching entry point for the HK V3.2 MLA decode kernel."""
+    arch_id = get_gfx()
+    if arch_id in ("gfx942", "gfx950"):
+        hk_mla_v32_decode_fwd_mi3xx(
+            query,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            softmax_scale,
+            split_output,
+            split_lse,
+            final_output,
+        )
+    else:
+        raise NotImplementedError(
+            f"hk_mla_v32_decode_fwd has no implementation for arch {arch_id}"
+        )
+
+
+@compile_ops(
+    "module_hk_mla_v40_fwd_mi3xx", fc_name="hk_mla_v40_decode_fwd", develop=True
+)
+def hk_mla_v40_decode_fwd_mi3xx(
+    # [total_q, num_heads, V4_DIM_QK_PACKED=512]  FP8
+    #   per-token bytes: NOPE 448 + dup-E8M0 14 + pad 50
+    query: torch.Tensor,
+    # [total_q, num_heads, V4_DIM_ROPE=64]        BF16
+    query_rope: torch.Tensor,
+    # [num_page, page_size, num_kv_heads=1, 512]  FP8 (same packing as Q)
+    kv_buffer: torch.Tensor,
+    # [num_page, page_size, num_kv_heads=1, 64]   BF16
+    kv_buffer_rope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
+def hk_mla_v40_decode_fwd(
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    kv_buffer_rope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    split_output: torch.Tensor,
+    split_lse: torch.Tensor,
+    final_output: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> None:
+    """Arch-dispatching entry point for the HK V4.0 MLA decode kernel."""
+    arch_id = get_gfx()
+    if arch_id in ("gfx942", "gfx950"):
+        hk_mla_v40_decode_fwd_mi3xx(
+            query,
+            query_rope,
+            kv_buffer,
+            kv_buffer_rope,
+            qo_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            softmax_scale,
+            split_output,
+            split_lse,
+            final_output,
+            attn_sink,
+        )
+    else:
+        raise NotImplementedError(
+            f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
+        )

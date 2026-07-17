@@ -92,6 +92,7 @@ else:
     from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
     from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
     from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
+    from .ops.gemm_op_a8w4 import *  # noqa: F403,E402
     from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
     from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
     from .ops.deepgemm import *  # noqa: F403,E402
@@ -105,6 +106,7 @@ else:
     from .ops.moe_op import *  # noqa: F403,E402
     from .ops.moe_sorting import *  # noqa: F403,E402
     from .ops.moe_sorting_opus import *  # noqa: F403,E402
+    from .ops.moe_mxfp4_aux import *  # noqa: F403,E402
     from .ops.pa_sparse_prefill_opus import *  # noqa: F403,E402
     from .ops.pos_encoding import *  # noqa: F403,E402
     from .ops.cache import *  # noqa: F403,E402

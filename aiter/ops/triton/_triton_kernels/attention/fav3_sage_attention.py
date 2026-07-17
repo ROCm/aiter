@@ -1,10 +1,8 @@
-import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import (
     compute_alibi_block,
 )
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 
 def map_dims(shape, indices):
@@ -98,9 +96,6 @@ def _sage_fwd_no_mask(
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
             # Bias / alibi live in the scaled domain, so we materialize the
             # scaled qk eagerly to add them, exactly as before.
@@ -114,9 +109,14 @@ def _sage_fwd_no_mask(
                 qk += alibi_block
 
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk += bias
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )
+                qk += bias[None, :]
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             if USE_BIAS:
@@ -297,8 +297,6 @@ def _sage_fwd_blocksparse_nomask(
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
             # Bias / alibi live in the scaled domain, materialize scaled qk.
             qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
@@ -309,9 +307,14 @@ def _sage_fwd_blocksparse_nomask(
                 )
                 qk_scaled += alibi_block
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )
+                qk_scaled += bias[None, :]
 
             m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
             if USE_BIAS:
@@ -468,7 +471,6 @@ def _sage_fwd_blocksparse_mask(
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
         if USE_ALIBI or USE_BIAS:
             # Bias / alibi live in the scaled domain, materialize scaled qk.
             qk_scaled = qk_int.to(ACCUMULATOR_TYPE) * scale
@@ -479,9 +481,14 @@ def _sage_fwd_blocksparse_mask(
                 )
                 qk_scaled += alibi_block
             if USE_BIAS:
-                bias_ptrs = bias_base_ptrs + start_n * stride_bn
-                bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-                qk_scaled += bias
+                offs_kv = tl.arange(0, BLOCK_N)
+                bias_mask = (start_n + offs_kv) < seqlen_k
+                bias = tl.load(
+                    bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                    mask=bias_mask,
+                    other=0.0,
+                )
+                qk_scaled += bias[None, :]
             qk_scaled = tl.where(
                 qk_mask, qk_scaled, float("-inf")
             )  # mask padding before softmax
@@ -765,14 +772,16 @@ def _sage_fwd_mask(
                 causal_mask = offs_m[:, None] >= causal_boundary[None, :]
                 qk = tl.where(causal_mask, qk, float("-inf"))
 
-        # compute qk mask
-        qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-
-        # compute bias
+        # compute bias (delta_s: constant across Q rows in a block)
         if USE_BIAS:
-            bias_ptrs = bias_base_ptrs + start_n * stride_bn
-            bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
-            qk += bias
+            offs_kv = tl.arange(0, BLOCK_N)
+            bias_mask = (start_n + offs_kv) < seqlen_k
+            bias = tl.load(
+                bias_base_ptrs + start_n * stride_bn + offs_kv * stride_bn,
+                mask=bias_mask,
+                other=0.0,
+            )
+            qk += bias[None, :]
 
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
@@ -1316,10 +1325,10 @@ def sage_fwd(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
-    tl.multiple_of(offs_m, BLOCK_M),
+    (tl.multiple_of(offs_m, BLOCK_M),)
     # N dimension
     offs_n = tl.arange(0, BLOCK_N)
-    tl.multiple_of(offs_n, BLOCK_N),
+    (tl.multiple_of(offs_n, BLOCK_N),)
 
     # D dimensions (MOST IMPORTANT)
     offs_d_qk = tl.max_contiguous(
@@ -1487,14 +1496,7 @@ def sage_fwd(
     q_descale = tl.load(q_descale_ptr)  # MHA: use q head index
 
     if USE_BIAS:
-        # Note: this might get large enough to overflow on some configs
-        bias_offset = off_h_q * stride_bh
-        bias_ptrs = (
-            bias
-            + bias_offset
-            + offs_m[:, None] * stride_bm
-            + offs_n[None, :] * stride_bn
-        )
+        bias_ptrs = bias + off_z * stride_bz + off_h_q * stride_bh + start_m * stride_bm
     else:
         bias_ptrs = None
 

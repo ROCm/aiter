@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import triton
+import triton.language as tl
+
+from aiter.ops.triton.utils.conv_config_utils import get_conv_config
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from .helpers import CONV_AUTOTUNE_ENABLED
+from ..activation import _relu, _relu6, _gelu_tanh
+
+
+def _get_config(shape_key=None, M=None):
+    if CONV_AUTOTUNE_ENABLED:
+        return {}
+    return get_conv_config("CONV-1X1", shape_key=shape_key, M=M)
+
+
+_conv2d_1x1_kernel_repr = make_kernel_repr(
+    "_conv2d_1x1_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_SIZE_M",
+        "HAS_BIAS",
+        "ACTIVATION",
+        "LAYOUT",
+    ],
+)
+
+
+@triton.jit(repr=_conv2d_1x1_kernel_repr)
+def _conv2d_1x1_kernel(
+    X,
+    W,
+    BIAS,
+    Y,
+    N,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W_in: tl.constexpr,
+    K_out: tl.constexpr,
+    P: tl.constexpr,
+    Q: tl.constexpr,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    M_total,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    LAYOUT: tl.constexpr,
+):
+    """
+    Specialized 1x1 convolution kernel.
+    - No R*S loop (R=S=1)
+    - Direct channel reduction
+    - Simplified pointer arithmetic
+    LAYOUT: "nchw" or "nhwc"
+    """
+    # W is always [K_out, C] contiguous
+    stride_w_kout: tl.constexpr = C
+    stride_w_c: tl.constexpr = 1
+    if LAYOUT == "nchw":
+        # NCHW: X[N, C, H, W_in], Y[N, K_out, P, Q]
+        stride_x_n: tl.constexpr = C * H * W_in
+        stride_x_c: tl.constexpr = H * W_in
+        stride_x_h: tl.constexpr = W_in
+        stride_x_w: tl.constexpr = 1
+        stride_y_n: tl.constexpr = K_out * P * Q
+        stride_y_k: tl.constexpr = P * Q
+        stride_y_p: tl.constexpr = Q
+        stride_y_q: tl.constexpr = 1
+    else:
+        # NHWC: X[N, H, W_in, C], Y[N, P, Q, K_out]
+        stride_x_n: tl.constexpr = H * W_in * C
+        stride_x_c: tl.constexpr = 1
+        stride_x_h: tl.constexpr = W_in * C
+        stride_x_w: tl.constexpr = C
+        stride_y_n: tl.constexpr = P * Q * K_out
+        stride_y_k: tl.constexpr = 1
+        stride_y_p: tl.constexpr = Q * K_out
+        stride_y_q: tl.constexpr = K_out
+
+    pid = tl.program_id(axis=0)
+
+    # M = N * P * Q (output spatial), N_dim = K_out (output channels)
+    num_pid_m = tl.cdiv(M_total, BLOCK_M)
+    num_pid_n = tl.cdiv(K_out, BLOCK_N)
+
+    # L2 cache swizzle pattern
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Compute output tile indices
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Valid output mask
+    m_mask = offs_m < M_total
+    kout_mask = offs_n < K_out
+
+    # Decode (n, p, q) from linear index
+    n_idx = offs_m[:, None] // (P * Q)
+    pq = offs_m[:, None] % (P * Q)
+    p_idx = pq // Q
+    q_idx = pq % Q
+
+    ih = p_idx * stride_h - pad_h
+    iw = q_idx * stride_w - pad_w
+
+    # Check spatial bounds
+    spatial_valid = (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W_in) & (n_idx < N)
+
+    # Base pointers for this output tile
+    x_base = X + n_idx * stride_x_n + ih * stride_x_h + iw * stride_x_w  # [BLOCK_M, 1]
+    w_base = W + offs_n[None, :] * stride_w_kout  # [1, BLOCK_N]
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Channel reduction loop (GEMM-K axis = C, since R=S=1)
+    for k0 in range(0, C, BLOCK_K):
+        k_offs = k0 + offs_k
+        k_mask = k_offs < C
+
+        # Load input: X[n, c, ih, iw] -> shape [BLOCK_M, BLOCK_K]
+        x_ptrs = x_base + k_offs[None, :] * stride_x_c
+        x_tile = tl.load(x_ptrs, mask=spatial_valid & k_mask[None, :], other=0.0)
+
+        # Load weight: W[k_out, c] -> shape [BLOCK_K, BLOCK_N]
+        w_ptrs = w_base + k_offs[:, None] * stride_w_c
+        w_tile = tl.load(w_ptrs, mask=k_mask[:, None] & kout_mask[None, :], other=0.0)
+
+        # Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
+        acc = tl.dot(x_tile, w_tile, acc=acc)
+
+    # Bias
+    if HAS_BIAS:
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0)
+        acc += b[None, :]
+
+    # Activation
+    if ACTIVATION == "relu":
+        acc = _relu(acc)
+    elif ACTIVATION == "relu6":
+        acc = _relu6(acc)
+    elif ACTIVATION == "gelu":
+        acc = _gelu_tanh(acc)
+
+    # Store output: Y[n, k, p, q]
+    y_ptrs = (
+        Y
+        + n_idx * stride_y_n
+        + offs_n[None, :] * stride_y_k
+        + p_idx * stride_y_p
+        + q_idx * stride_y_q
+    )
+    tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
+
+
+# Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
+AUTOTUNE_1x1_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=8,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        num_warps=4,
+        num_stages=1,
+    ),
+]
+
+
+if CONV_AUTOTUNE_ENABLED:
+    _conv2d_1x1_kernel = triton.autotune(
+        configs=AUTOTUNE_1x1_CONFIGS,
+        key=["M_total", "K_out", "C"],
+        cache_results=True,
+    )(_conv2d_1x1_kernel)
