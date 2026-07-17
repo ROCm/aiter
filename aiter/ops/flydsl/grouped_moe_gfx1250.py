@@ -703,8 +703,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # The contiguous fast path folds the LUT build into moe_route_g2l_fused; every
     # other EP path (masked fast path, naive fallback, or E_global > single-block
     # scan ceiling) needs a standalone LUT + zeroed counter built here.
+    # The single-block fused route kernel (moe_route_g2l_fused) launches grid=(1,)
+    # so only one CU is active -> it serialises the whole route dispatch. The
+    # split path instead builds the LUT single-block (moe_g2l_lut, writes global
+    # LUT + zeroed counter) then dispatches routes multi-block (moe_route_g2l,
+    # grid = numel/256), raising route-phase occupancy by ~100x. Default to the
+    # split path; set AITER_FLYDSL_FUSED_ROUTE_G2L=1 to A/B against the fused one.
+    _fused_route_g2l_env = (
+        os.environ.get("AITER_FLYDSL_FUSED_ROUTE_G2L", "0") in _TRUTHY_ENV
+    )
     _use_fused_route_g2l = (
-        _is_ep
+        _fused_route_g2l_env
+        and _is_ep
         and grouped_contiguous_m
         and (not _use_naive)
         and expert_mask.numel() <= _G2L_MAX_N
@@ -907,6 +917,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 weight_in=gather_weight,
                 counter=_g2l_counter,
                 num_local_tokens=num_local_tokens,
+                num_valid_routes=_ep_nvr,
             )
             _grouped_dbg("route done, start psum+remap")
             _starts_t, psum_t, _ = contiguous_psum_remap(

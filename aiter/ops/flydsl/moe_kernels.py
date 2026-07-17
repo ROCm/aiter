@@ -1743,6 +1743,15 @@ def _get_compiled_route_g2l_fused(weight_dtype: str):
     return build_moe_route_g2l_fused_module(weight_dtype)
 
 
+@functools.cache
+def _get_compiled_route_g2l_lds(weight_dtype: str):
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_route_g2l_lds_module,
+    )
+
+    return build_moe_route_g2l_lds_module(weight_dtype)
+
+
 def flydsl_moe_topids_to_rows(
     topk_ids: torch.Tensor,
     E: int,
@@ -1754,6 +1763,7 @@ def flydsl_moe_topids_to_rows(
     weight_in: Optional[torch.Tensor] = None,
     counter: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.Tensor] = None,
+    num_valid_routes: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build masked-layout route rows and per-expert counts.
 
@@ -1782,7 +1792,15 @@ def flydsl_moe_topids_to_rows(
     # are valid. Build a (1,) int32 DEVICE scalar num_valid_routes = total_recv*topk
     # (no host sync); the route kernel treats routes >= this as dropped. When
     # truncation is disabled we pass ``numel`` so every route stays valid.
-    if num_local_tokens is not None:
+    #
+    # The caller can pass a precomputed ``num_valid_routes`` (the grouped path
+    # already builds ``_ep_nvr = total_recv*topk`` for the psum-remap / quant
+    # kernels); reusing it skips a redundant ``* topk`` elementwise launch here.
+    if num_valid_routes is not None:
+        num_valid_routes = num_valid_routes.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        )
+    elif num_local_tokens is not None:
         num_valid_routes = (
             num_local_tokens.reshape(-1)[:1].to(device=device, dtype=torch.int32)
             * int(topk)
@@ -1821,7 +1839,20 @@ def flydsl_moe_topids_to_rows(
         assert gather_w is not None, "g2l_lut requires gather_w (out)"
         assert weight_in is not None, "g2l_lut requires weight_in (f32 route weights)"
         wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
-        topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
+        # Two-level (LDS -> global) atomic reduction when the bucket count fits
+        # the LDS counter: collapses the per-route device atomics (which serialize
+        # on bucket 0 under EP drops) into one device atomic per non-empty bucket
+        # per block. Falls back to the plain device-atomic kernel for large E.
+        from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
+
+        _use_lds_reduce = (
+            os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
+            and int(E) <= MAX_ROUTE_BUCKETS
+        )
+        if _use_lds_reduce:
+            topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
+        else:
+            topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
         topids_to_rows_kernel(
             ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
             ptr_arg(g2l_lut),
@@ -1829,6 +1860,7 @@ def flydsl_moe_topids_to_rows(
             ptr_arg(topids_to_rows),
             ptr_arg(weight_in.to(torch.float32).reshape(-1)),
             ptr_arg(gather_w.reshape(-1)),
+            ptr_arg(num_valid_routes),
             numel,
             int(max_m),
             int(E),
