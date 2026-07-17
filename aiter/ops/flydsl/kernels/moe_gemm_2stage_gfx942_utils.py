@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
@@ -249,6 +252,8 @@ def sub_tensor(tensor, coord, shape):
 def atom_tensor(tensor, coord, copy_bits):
     assert copy_bits % tensor.dtype.width == 0
     num_values = copy_bits // tensor.dtype.width
+    if isinstance(tensor, fx.Pointer):
+        return fx.make_view(tensor + coord, fx.make_layout(num_values, 1))
     return fx.make_view(
         fx.get_iter(tensor) + tensor.layout(*coord), fx.make_layout(num_values, 1)
     )
