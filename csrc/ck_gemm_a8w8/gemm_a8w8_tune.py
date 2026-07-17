@@ -93,8 +93,9 @@ def generate_data(
 
     if backend == "opus":
         # Opus a8w8 no-scale path consumes raw fp8 tensors (no x_scale/w_scale).
-        x = torch.randn((m, k), dtype=dtypes.fp16, device=device).to(dtypes.fp8)
-        weight = torch.randn((n, k), dtype=dtypes.fp16, device=device).to(dtypes.fp8)
+        # Opus kernels expect 3D tensors [batch=1, M, K], [batch=1, N, K], [batch=1, M, N].
+        x = torch.randn((1, m, k), dtype=dtypes.fp16, device=device).to(dtypes.fp8)
+        weight = torch.randn((1, n, k), dtype=dtypes.fp16, device=device).to(dtypes.fp8)
         x_scale = None
         w_scale = None
     else:
@@ -109,7 +110,12 @@ def generate_data(
             x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=q_dtype_w)
             weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=q_dtype_w)
 
-    out = torch.empty(m, n, dtype=dtype, device=device)
+    if backend == "opus":
+        # Opus output is 3D [batch=1, M, N].
+        out = torch.empty(1, m, n, dtype=dtype, device=device)
+    else:
+        out = torch.empty(m, n, dtype=dtype, device=device)
+    
     return {
         "x": x,
         "weight": weight,
@@ -124,7 +130,12 @@ def gemm_a8w8_ref(x, weight, x_scale, w_scale, dtype=dtypes.bf16, q_dtype_w=dtyp
 
 
 def opus_a8w8_noscale_ref(x, weight, dtype=dtypes.bf16):
-    return torch.matmul(x.float(), weight.float().t()).to(dtype)
+    # x, weight are 3D [batch=1, M, K] and [batch=1, N, K]
+    # Squeeze batch, compute, then unsqueeze back to 3D.
+    x_2d = x.squeeze(0).float()
+    weight_2d = weight.squeeze(0).float()
+    result_2d = torch.matmul(x_2d, weight_2d.t()).to(dtype)
+    return result_2d.unsqueeze(0)
 
 
 def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
