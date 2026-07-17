@@ -79,6 +79,12 @@ _LANE_STRIDE_I32 = WAVE * 4  # one wave of lanes, vec4 (16B) each
 _MAIN_STRIDE_I32 = 2 * _LANE_STRIDE_I32
 _BUTTERFLY_OFFSETS = tuple(WAVE >> i for i in range(1, LOG2_WAVE + 1))
 
+# NOTE: the cross-device xdb barrier is kept inlined per kernel (dispatch Phase 2,
+# combine gather/scatter/fused) rather than a shared helper: FlyDSL only AST-rewrites
+# dynamic `if` in the @flyc.kernel body, not in called helpers, so a helper's
+# `if <lane predicate>:` would raise "cannot evaluate dynamic Boolean" at trace time.
+
+
 # ── dispatch ──────────────────────────────────────────────────────────────
 
 
@@ -930,7 +936,6 @@ def make_combine_scatter(
         )
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         rsrc_out_wts = create_buffer_resource_from_addr(addr_out_wts)
-        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
         total_recv = buffer_load(rsrc_total_recv, 0, vec_width=1, dtype=T.i32())
 
         # ── Stage 1: scatter post-expert tokens back to origin's comb_inp ──
@@ -1083,6 +1088,8 @@ def make_combine_scatter(
                     buffer_store(
                         weight_val, create_buffer_resource_from_addr(weight_dst), lane
                     )
+
+        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
         # ── Stage 2: cross-device barrier ──
         # release Stage-1's P2P writes before signaling peers (else Stage-3 races them)
@@ -1296,6 +1303,172 @@ def make_combine_scatter(
             addr_out,
             addr_out_wts,
             addr_src_tok,
+            my_lsa_rank,
+            cur_rank_num_token,
+        ).launch(
+            grid=(block_num, 1, 1),
+            block=[warp_num_per_block * WAVE, 1, 1],
+            stream=stream,
+        )
+
+    return run
+
+
+def make_combine_fused_reduce(
+    *,
+    rank,
+    npes,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_rank,
+    block_num,
+    warp_num_per_block,
+    off_comb_inp,
+    off_xdb_mem,
+    _s3_cache=2,
+):
+    """Combine for the gemm2-fused scatter path (combine_mode='scatter_fused').
+
+    gemm2 has already P2P-written each token's WEIGHTED per-expert result into this
+    rank's comb_inp[origin_lid*topk + k] (one contiguous topk-block per token). So
+    combine only:
+      Stage A  cross-device barrier -- wait until every peer's gemm2 P2P writes are
+               globally visible before reading comb_inp.
+      Stage B  each origin token: out[t] = sum_{k<topk} comb_inp[t*topk + k]. Weights
+               were pre-applied in gemm2, so this is an unweighted sum. Dropped
+               (token,k) slots must read 0 (caller zeroes comb_inp before gemm2).
+
+    bf16/f32 non-quant only (the fused path carries a bf16 wire).
+    """
+    to_acc, from_acc, zero_acc = _accum_funcs(hidden_elem_size)
+    wire_nbytes = hidden_dim * hidden_elem_size
+    n_i32 = wire_nbytes // 4
+    topk = experts_per_token
+
+    @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
+    def ep_combine_fused(
+        arena: Int64,
+        addr_comb_bar: Int64,
+        addr_xdb_flag: Int64,
+        addr_out: Int64,
+        my_lsa_rank: Int32,
+        cur_rank_num_token: Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        lane = tid & LANE_MASK
+        warp = tid >> LOG2_WAVE
+        global_warp_id = bid * warp_num_per_block + warp
+        global_warp_num = block_num * warp_num_per_block
+        grid_thread_id = bid * (warp_num_per_block * WAVE) + tid
+
+        window = cco.Window(arena)
+        rsrc_out = create_buffer_resource_from_addr(addr_out)
+        rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
+        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
+
+        # ── Stage A: cross-device barrier — wait until all peers' gemm2 P2P writes
+        # into our comb_inp are globally visible (same xdb handshake as combine;
+        # inlined because FlyDSL rewrites dynamic `if` only in the kernel body). ──
+        fx.barrier()
+        if tid == 0:
+            P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+        if grid_thread_id < npes:
+            P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
+            P.fence_system_acquire()
+            buffer_store(arith.constant(0), rsrc_comb_bar, 0)
+            xdb_remote = fx.Int64(
+                window.lsa_ptr(grid_thread_id, off_xdb_mem)
+            ) + fx.Int64(rank) * fx.Int64(8)
+            P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
+        if grid_thread_id == 0:
+            P.atomic_add_global(
+                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
+            )
+        if tid < npes:
+            xdb_peer_slot = fx.Int64(
+                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+            ) + fx.Int64(tid) * fx.Int64(8)
+            P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
+            P.fence_system_acquire()
+        fx.barrier()
+        P.fence_system_acquire()
+
+        # ── Stage B: local read of comb_inp[tok*topk + k] + unweighted topk sum ──
+        comb_inp_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_inp))
+        safe_tok = arith.select(
+            cur_rank_num_token == arith.constant(0),
+            arith.constant(1),
+            cur_rank_num_token,
+        )
+        warps_per_tok = (
+            arith.constant(global_warp_num) + safe_tok - arith.constant(1)
+        ) // safe_tok
+        units_per_warp = (
+            arith.constant(n_i32) + warps_per_tok - arith.constant(1)
+        ) // warps_per_tok
+        stageb_total = cur_rank_num_token * warps_per_tok
+        for stageb_idx in range(global_warp_id, stageb_total, global_warp_num):
+            tok_id = stageb_idx // warps_per_tok
+            part_id = stageb_idx % warps_per_tok
+            unit_base = part_id * units_per_warp
+            slot0 = fx.Int64(tok_id) * fx.Int64(topk)  # comb_inp[tok*topk + 0]
+            expert_addrs = []
+            for k_slot in range_constexpr(topk):
+                expert_addrs.append(
+                    comb_inp_base
+                    + (slot0 + fx.Int64(k_slot)) * fx.Int64(wire_nbytes)
+                )
+            rem = arith.constant(n_i32) - unit_base
+            eff = arith.select(rem < units_per_warp, rem, units_per_warp)
+            out_base = tok_id * n_i32
+
+            def _one(off):
+                acc = zero_acc()
+                for k_slot in range_constexpr(topk):
+                    v = P.load_i32_nt(expert_addrs[k_slot], off)
+                    acc = acc + to_acc(v)
+                buffer_store(from_acc(acc), rsrc_out, out_base + off)
+
+            # vec4 (4 i32/lane) local reads + per-i32 sum + vec4 store, WAVE-strided.
+            _v4eff = eff // arith.constant(4)
+            for _u in range(lane, _v4eff, WAVE):
+                _off = unit_base + _u * arith.constant(4)
+                _accs = [zero_acc(), zero_acc(), zero_acc(), zero_acc()]
+                for k_slot in range_constexpr(topk):
+                    _vv = P.load_v4i32_nt(expert_addrs[k_slot], _off)
+                    for _j in range_constexpr(4):
+                        _e = vector.extract(_vv, static_position=[_j])
+                        _accs[_j] = _accs[_j] + to_acc(_e)
+                _res = vector.from_elements(
+                    T.VectorType.get([4], T.i32()),
+                    [
+                        from_acc(_accs[0]),
+                        from_acc(_accs[1]),
+                        from_acc(_accs[2]),
+                        from_acc(_accs[3]),
+                    ],
+                )
+                buffer_store(_res, rsrc_out, out_base + _off)
+            for _u in range(_v4eff * arith.constant(4) + lane, eff, WAVE):
+                _one(unit_base + _u)
+
+    @flyc.jit
+    def run(
+        arena: Int64,
+        addr_comb_bar: Int64,
+        addr_xdb_flag: Int64,
+        addr_out: Int64,
+        my_lsa_rank: Int32,
+        cur_rank_num_token: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_combine_fused(
+            arena,
+            addr_comb_bar,
+            addr_xdb_flag,
+            addr_out,
             my_lsa_rank,
             cur_rank_num_token,
         ).launch(
