@@ -86,8 +86,8 @@ def generate_data(
     seed,
     dtype=dtypes.bf16,
     q_dtype_w=dtypes.fp8,
-    device="cuda",
     backend="ck",
+    device="cuda",
 ):
     torch.manual_seed(seed)
 
@@ -330,7 +330,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed, dtypes.bf16, q_dtype_w_eval, "cuda", "opus"),
+                        (M, N, K, seed, dtypes.bf16, q_dtype_w_eval, "opus"),
                         run_opus_a8w8_noscale,
                         (gemm_keys, kid, splitK),
                         {
