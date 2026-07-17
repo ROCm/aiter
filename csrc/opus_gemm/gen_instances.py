@@ -961,6 +961,17 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--a8w8_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Build only a8w8-family instances (no a16w16 families). "
+            "For link compatibility, both a8w8_scale and a8w8_noscale "
+            "symbols are still emitted."
+        ),
+    )
+
     # Legacy --tune_file alias kept for backward compat with any existing
     # invocations / scripts. Treated as `--tune_files <path>`.
     parser.add_argument(
@@ -971,6 +982,13 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    # JIT convenience: allow env-only activation without changing
+    # optCompilerConfig blob_gen_cmd.
+    if os.environ.get("OPUS_A8W8_ONLY", "0") == "1":
+        args.a8w8_only = True
+        if args.kernel_tag is None:
+            args.kernel_tag = "a8w8_noscale"
+
     if args.tune_files is None and args.tune_file is not None:
         args.tune_files = args.tune_file
     TAG_TO_LIST = {
@@ -1092,30 +1110,43 @@ if __name__ == "__main__":
         for a in archs_for_header:
             f.write(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n")
 
-    # a8w8 (kid 1, 2) referenced unconditionally by dispatcher; symbols must exist on every arch.
-    S |= set(a8w8_scale_kernels_list.keys())
-    S |= set(a8w8_kernels_list.keys())
+    # a8w8 launchers are referenced by dispatcher codepaths; keep both symbols
+    # available unless the caller explicitly requests an a8w8-only build.
+    if args.a8w8_only:
+        if args.kernel_tag and args.kernel_tag not in (
+            "a8w8_noscale",
+            "a8w8",
+            "a8w8_scale",
+        ):
+            raise ValueError(
+                f"--a8w8_only is incompatible with --kernel_tag {args.kernel_tag!r}; "
+                f"choose one of: a8w8_noscale, a8w8, a8w8_scale"
+            )
+        S = set(a8w8_scale_kernels_list.keys()) | set(a8w8_kernels_list.keys())
+    else:
+        # a8w8 (kid 1,2/10) referenced by dispatcher; symbols must exist.
+        S |= set(a8w8_scale_kernels_list.keys())
+        S |= set(a8w8_kernels_list.keys())
 
-    # Honor --kernel_tag as a developer override that *further restricts* the set (within the a16w16
-    # / a8w8 families).
-    if args.kernel_tag:
-        tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
-        if tag_keys:
-            # Restrict to the requested family + heuristic defaults + a8w8 dispatch.
-            S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
-            S |= set(a8w8_scale_kernels_list.keys())
-            S |= set(a8w8_kernels_list.keys())
+        # Honor --kernel_tag as a developer override that *further restricts* the set.
+        if args.kernel_tag:
+            tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
+            if tag_keys:
+                # Restrict to requested family + heuristic defaults + a8w8 dispatch.
+                S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
+                S |= set(a8w8_scale_kernels_list.keys())
+                S |= set(a8w8_kernels_list.keys())
 
-    # Heuristic-fallback invariant (single source of truth: opus_gemm_common.py).
-    required_heuristic = set(heuristic_kids_for_arch(target_arches))
-    missing_heuristic = required_heuristic - S
-    assert not missing_heuristic, (
-        f"Subset-compile error: heuristic-fallback kids "
-        f"{sorted(missing_heuristic)} are missing from the compile set S; "
-        f"opus_a16w16_heuristic_kid_gfx950() would return an unbakeable "
-        f"kid. Add them to the compile set or update HEURISTIC_DEFAULT_KIDS "
-        f"in csrc/opus_gemm/opus_gemm_common.py."
-    )
+        # Heuristic-fallback invariant (single source of truth: opus_gemm_common.py).
+        required_heuristic = set(heuristic_kids_for_arch(target_arches))
+        missing_heuristic = required_heuristic - S
+        assert not missing_heuristic, (
+            f"Subset-compile error: heuristic-fallback kids "
+            f"{sorted(missing_heuristic)} are missing from the compile set S; "
+            f"opus_a16w16_heuristic_kid_gfx950() would return an unbakeable "
+            f"kid. Add them to the compile set or update HEURISTIC_DEFAULT_KIDS "
+            f"in csrc/opus_gemm/opus_gemm_common.py."
+        )
 
     # Build the per-kid dict that drives codegen.
     kdict = {kid: kernels_list[kid] for kid in sorted(S)}

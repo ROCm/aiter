@@ -5,11 +5,12 @@ import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter import dtypes
+from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
 from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
+from aiter.ops.opus.gemm_op_a16w16 import _opus_gemm_bf16_dispatch as _opus_gemm_dispatch
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -72,20 +73,34 @@ def get_tuned_gemm_list(tuned_gemm_file):
 
 
 def generate_data(
-    m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, device="cuda"
+    m,
+    n,
+    k,
+    seed,
+    dtype=dtypes.bf16,
+    q_dtype_w=dtypes.fp8,
+    device="cuda",
+    backend="ck",
 ):
     torch.manual_seed(seed)
 
-    if q_dtype_w == dtypes.i8:
-        x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device=device)
-        weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device=device)
-        x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device=device)
-        w_scale = torch.rand([1, n], dtype=dtypes.bf16, device=device)
+    if backend == "opus":
+        # Opus a8w8 no-scale path consumes raw fp8 tensors (no x_scale/w_scale).
+        x = torch.randn((m, k), dtype=dtypes.fp16, device=device).to(dtypes.fp8)
+        weight = torch.randn((n, k), dtype=dtypes.fp16, device=device).to(dtypes.fp8)
+        x_scale = None
+        w_scale = None
     else:
-        x_fp = torch.randn((m, k), dtype=dtype, device=device)
-        weight_fp = torch.randn((n, k), dtype=dtype, device=device)
-        x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=q_dtype_w)
-        weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=q_dtype_w)
+        if q_dtype_w == dtypes.i8:
+            x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device=device)
+            weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device=device)
+            x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device=device)
+            w_scale = torch.rand([1, n], dtype=dtypes.bf16, device=device)
+        else:
+            x_fp = torch.randn((m, k), dtype=dtype, device=device)
+            weight_fp = torch.randn((n, k), dtype=dtype, device=device)
+            x, x_scale = aiter.pertoken_quant(x_fp, quant_dtype=q_dtype_w)
+            weight, w_scale = aiter.pertoken_quant(weight_fp, quant_dtype=q_dtype_w)
 
     out = torch.empty(m, n, dtype=dtype, device=device)
     return {
@@ -101,9 +116,20 @@ def gemm_a8w8_ref(x, weight, x_scale, w_scale, dtype=dtypes.bf16, q_dtype_w=dtyp
     return run_torch(x, weight, x_scale, w_scale, dtype=dtype, quant_dtype=q_dtype_w)
 
 
+def opus_a8w8_noscale_ref(x, weight, dtype=dtypes.bf16):
+    return torch.matmul(x.float(), weight.float().t()).to(dtype)
+
+
 def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
 
     aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
+    return out
+
+
+def run_opus_a8w8_noscale(x, weight, x_scale, w_scale, out, kernelId, splitK):
+    # No-scale path: x_scale / w_scale / splitK / kernelId are not consumed by
+    # Opus dispatch, but are kept for mp_tuner run-arg compatibility.
+    _opus_gemm_dispatch(x, weight, out, None, None, None, None)
     return out
 
 
@@ -119,6 +145,8 @@ class GemmA8W8Tuner(GemmCommonTuner):
     }
 
     def getKernelName(self, kernelId):
+        if getattr(self, "backend", "ck") == "opus":
+            return f"opus_a8w8_noscale_kid{kernelId}"
         if kernelId >= len(kernels_list) or kernelId < 0:
             return None
         return kernels_list[kernelId].name
@@ -131,15 +159,37 @@ class GemmA8W8Tuner(GemmCommonTuner):
         _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
-        pass
+        self.parser.add_argument(
+            "--backend",
+            choices=["ck", "opus"],
+            default="ck",
+            help="Backend to tune: 'ck' (existing path) or 'opus' (a8w8 no-scale).",
+        )
+
+    def pre_process(self, args):
+        self.backend = args.backend
+        if self.backend == "opus" and args.tune_file == AITER_CONFIG_GEMM_A8W8:
+            args.tune_file = "/tmp/opus_a8w8_noscale_tuned_gemm.csv"
+            logger.warning(
+                "--backend opus selected; using /tmp/opus_a8w8_noscale_tuned_gemm.csv "
+                "to avoid mixing with CK tuned file."
+            )
+        # Restrict module_deepgemm_opus codegen to a8w8-family instances only
+        # (no a16w16 families) for this tuner backend.
+        if self.backend == "opus":
+            os.environ["OPUS_A8W8_ONLY"] = "1"
+        else:
+            os.environ.pop("OPUS_A8W8_ONLY", None)
+        super().pre_process(args)
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
 
     def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8
         from aiter.test_common import run_perftest, checkAllclose
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8
 
+        backend = getattr(args, "backend", "ck")
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
@@ -153,7 +203,26 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 self._get_run_config_err_ratio_limit(row, args)
             )
             try:
-                gd = generate_data(M, N, K, 0, dtypes.bf16, eval(q_dtype_w))
+                q_dtype_w_eval = eval(q_dtype_w)
+                if backend == "opus" and q_dtype_w_eval != dtypes.fp8:
+                    results.append(
+                        {
+                            "shape": shape_str,
+                            "e2e_us": -1,
+                            "status": "skip:opus backend supports fp8 only",
+                        }
+                    )
+                    continue
+
+                gd = generate_data(
+                    M,
+                    N,
+                    K,
+                    0,
+                    dtypes.bf16,
+                    q_dtype_w_eval,
+                    backend=backend,
+                )
                 x, weight, x_scale, w_scale, out = (
                     gd["x"],
                     gd["weight"],
@@ -161,23 +230,38 @@ class GemmA8W8Tuner(GemmCommonTuner):
                     gd["w_scale"],
                     gd["out"],
                 )
-                out, us = run_perftest(
-                    gemm_a8w8,
-                    x,
-                    weight,
-                    x_scale,
-                    w_scale,
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
-                )
-                ref = gemm_a8w8_ref(
-                    x,
-                    weight,
-                    x_scale,
-                    w_scale,
-                    dtype=dtypes.bf16,
-                    q_dtype_w=eval(q_dtype_w),
-                )
+                if backend == "opus":
+                    out, us = run_perftest(
+                        run_opus_a8w8_noscale,
+                        x,
+                        weight,
+                        x_scale,
+                        w_scale,
+                        out,
+                        10,
+                        0,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
+                    ref = opus_a8w8_noscale_ref(x, weight, dtype=dtypes.bf16)
+                else:
+                    out, us = run_perftest(
+                        gemm_a8w8,
+                        x,
+                        weight,
+                        x_scale,
+                        w_scale,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
+                    ref = gemm_a8w8_ref(
+                        x,
+                        weight,
+                        x_scale,
+                        w_scale,
+                        dtype=dtypes.bf16,
+                        q_dtype_w=q_dtype_w_eval,
+                    )
                 err_ratio = checkAllclose(
                     out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
                 )
@@ -213,56 +297,90 @@ class GemmA8W8Tuner(GemmCommonTuner):
         gemm_keys = ["x", "weight", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         seed = 0
+        backend = getattr(args, "backend", "ck")
 
         for i in range(len(untunedf)):
             M = untunedf.loc[i, "M"]
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
+            q_dtype_w_eval = eval(q_dtype_w)
 
-            kernels_num = len(kernels_list)
             total_kernel_nums = 0
             info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
 
-            for j in range(kernels_num):
-                kernel = kernels_list[j]
-                maxsplitK = (
-                    aiter.compute_gemm_SplitK(
-                        M,
-                        N,
-                        K,
-                        kernel.MPerBLOCK,
-                        kernel.NPerBLOCK,
-                        kernel.KPerBLOCK,
+            if backend == "opus":
+                if q_dtype_w_eval != dtypes.fp8:
+                    tasks_data.append((0, ()))
+                    continue
+
+                kid = 10  # a8w8_noscale bf16-output variant (opus_gemm_common.py)
+                splitK = 0
+                info = (info_keys, kid, splitK, "")
+                task.append(
+                    (
+                        info,
+                        generate_data,
+                        (M, N, K, seed, dtypes.bf16, q_dtype_w_eval, "cuda", "opus"),
+                        run_opus_a8w8_noscale,
+                        (gemm_keys, kid, splitK),
+                        {
+                            "num_warmup": args.warmup,
+                            "num_iters": args.iters,
+                        },
+                        opus_a8w8_noscale_ref,
+                        (["x", "weight"], dtypes.bf16),
+                        {},
+                        None,
+                        1e-2,
+                        1e-2,
+                        None,
+                        None,
+                        ("out",),
                     )
-                    if useSplitK
-                    else 0
                 )
-                for splitK in range(maxsplitK + 1):
-                    info = (info_keys, j, splitK, "")
-                    task.append(
-                        (
-                            info,
-                            generate_data,
-                            (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
-                            run_gemm_a8w8,
-                            (gemm_keys, j, splitK),
-                            {
-                                "num_warmup": args.warmup,
-                                "num_iters": args.iters,
-                            },
-                            gemm_a8w8_ref,
-                            (ref_keys, dtypes.bf16, eval(q_dtype_w)),
-                            {},
-                            None,
-                            1e-2,
-                            1e-2,
-                            None,
-                            None,
-                            ("out",),
+                total_kernel_nums = 1
+            else:
+                kernels_num = len(kernels_list)
+                for j in range(kernels_num):
+                    kernel = kernels_list[j]
+                    maxsplitK = (
+                        aiter.compute_gemm_SplitK(
+                            M,
+                            N,
+                            K,
+                            kernel.MPerBLOCK,
+                            kernel.NPerBLOCK,
+                            kernel.KPerBLOCK,
                         )
+                        if useSplitK
+                        else 0
                     )
-                    total_kernel_nums = total_kernel_nums + 1
+                    for splitK in range(maxsplitK + 1):
+                        info = (info_keys, j, splitK, "")
+                        task.append(
+                            (
+                                info,
+                                generate_data,
+                                (M, N, K, seed, dtypes.bf16, q_dtype_w_eval),
+                                run_gemm_a8w8,
+                                (gemm_keys, j, splitK),
+                                {
+                                    "num_warmup": args.warmup,
+                                    "num_iters": args.iters,
+                                },
+                                gemm_a8w8_ref,
+                                (ref_keys, dtypes.bf16, q_dtype_w_eval),
+                                {},
+                                None,
+                                1e-2,
+                                1e-2,
+                                None,
+                                None,
+                                ("out",),
+                            )
+                        )
+                        total_kernel_nums = total_kernel_nums + 1
 
             tasks_data.append((total_kernel_nums, ()))
 
