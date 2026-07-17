@@ -83,7 +83,8 @@ env:
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
   SLURM_NODELIST_BLOCKED: >-
     ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,
-    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,
+    ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14
   SLURM_PARTITION_DEFAULT: ""
   SLURM_EXCLUSIVE_DEFAULT: "1"
   CONC_LIST_DEFAULT: "1,8,16,32,64,128,256"
