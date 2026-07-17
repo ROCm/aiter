@@ -1220,6 +1220,25 @@ def _get_compiled_gather_reduce(
     )
 
 
+@functools.cache
+def _get_compiled_gather_reduce_row(
+    model_dim: int,
+    topk: int,
+    out_dtype: str,
+    split_k: int = 1,
+    vec_dwords: int = 4,
+    w_dtype: str = "f32",
+):
+    """Compile and cache the row-collapsed MoE gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_row_module,
+    )
+
+    return build_moe_gather_reduce_row_module(
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+    )
+
+
 def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
     """Prefer CTA parallelism first; use wider vec only once CTA count is ample."""
     out_dwords = int(model_dim) // 2
@@ -1465,8 +1484,21 @@ def flydsl_moe_gather_reduce(
         raise ValueError("out must be contiguous for flydsl_moe_gather_reduce")
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
-    launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+    out_dwords = model_dim // 2
+    dwords_per_iter = 256 * gather_vec
+    use_row_gather = (
+        split_k == 1
+        and out_dwords % gather_vec == 0
+        and (out_dwords + dwords_per_iter - 1) // dwords_per_iter <= 4
+    )
+    launch = (
+        _get_compiled_gather_reduce_row(
+            model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        )
+        if use_row_gather
+        else _get_compiled_gather_reduce(
+            model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        )
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     launch(

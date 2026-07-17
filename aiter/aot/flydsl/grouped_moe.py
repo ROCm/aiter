@@ -196,6 +196,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
+        build_moe_gather_reduce_row_module,
     )
     from aiter.ops.flydsl.kernels.moe_route_maps import (
         build_moe_topids_to_rows_blockagg_module,
@@ -380,6 +381,26 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             a2_out_e * a2_out_m,
             stream=0,
         )
+        out_dwords = model_dim // 2
+        dwords_per_iter = 256 * vec
+        if (
+            split_k == 1
+            and out_dwords % vec == 0
+            and (out_dwords + dwords_per_iter - 1) // dwords_per_iter <= 4
+        ):
+            gather_reduce_row = build_moe_gather_reduce_row_module(
+                model_dim, topk, out_dtype, split_k, vec
+            )
+            gather_reduce_row(
+                ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+                ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+                token_num,
+                a2_out_e * a2_out_m * (model_dim // 2),
+                a2_out_e * a2_out_m,
+                stream=0,
+            )
 
 
 def compile_one_config(**job):
