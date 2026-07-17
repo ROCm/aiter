@@ -299,7 +299,7 @@ def issue_a_load_lds_dt(
     K_BYTES,
     BM=BM,
 ):
-    """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via aq_rsrc bounds."""
+    """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
     rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
     a_lane_row = lane // lanes_per_row
@@ -356,7 +356,6 @@ def gemm2_body_v2(
     bx_i32,
     lane,
     wave,
-    aq_rsrc,
     arg_aq,
     i32_inter,
     i32_hidden,

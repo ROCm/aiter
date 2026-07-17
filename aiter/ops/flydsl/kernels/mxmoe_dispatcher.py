@@ -197,9 +197,6 @@ def compile_gemm2_a4w4_port(
             1 if is_f8 else 2
         )  # A row stride bytes (runtime)
         aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * k_bytes)
-        aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num
-        )
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
@@ -237,7 +234,6 @@ def compile_gemm2_a4w4_port(
                 unit_bx,
                 lane,
                 wave,
-                aq_rsrc,
                 arg_aq,
                 i32_inter,
                 i32_hidden,
