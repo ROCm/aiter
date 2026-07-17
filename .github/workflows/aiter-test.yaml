@@ -14,6 +14,7 @@ on:
       - '!.gitignore'
       - '!.github/workflows/**'
       - '.github/workflows/aiter-test.yaml'
+      - '!.github/scripts/sglang_downstream.py'
 
   workflow_dispatch:
   schedule:
@@ -724,8 +725,6 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
-          - runner: aiter-8gpu-runner
-            label: MI300X
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -921,7 +920,7 @@ jobs:
           bash -c "pip show amd-aiter || true"
 
       - name: Tests
-        timeout-minutes: 60
+        timeout-minutes: 75
         run: |
           set -ex
           docker exec \

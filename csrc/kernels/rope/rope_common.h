@@ -7577,7 +7577,11 @@ __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float 
 
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
-warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)
+warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
+               vec_t<T, VEC_SIZE>& gamma,
+               float rms_dim,
+               float rms_eps,
+               bool gemma_norm = false)
 {
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
@@ -7593,7 +7597,8 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_d
 #pragma unroll
     for(int i = 0; i < VEC_SIZE; ++i)
     {
-        input[i] = static_cast<T>((float)input[i] * s_val * (float)gamma[i]);
+        const float weight = gemma_norm ? (1.0f + (float)gamma[i]) : (float)gamma[i];
+        input[i] = static_cast<T>((float)input[i] * s_val * weight);
     }
 }
 
@@ -7783,7 +7788,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int x                    = 0,
                                           int rotary_dim           = 0,
                                           int64_t k_block_stride   = 0,
-                                          int64_t v_block_stride   = 0)
+                                          int64_t v_block_stride   = 0,
+                                          bool gemma_norm          = false)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7880,7 +7886,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     cos_sin_vec.load(&cos_sin[position_ * rotary_dim_ + access_id_in_head]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
                 const int rotary_neighbor_offset = access_id_in_head < half_rotary
@@ -7959,7 +7965,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                         &cos_sin[position_ * rotary_dim_ + access_id_in_head / 2 + half_rotary]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
 #pragma unroll
@@ -8116,7 +8122,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             bool use_shuffle_layout  = false,
                             int64_t block_size       = 0,
                             int64_t x                = 0,
-                            int64_t rotary_dim       = 0)
+                            int64_t rotary_dim       = 0,
+                            bool gemma_norm          = false)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
@@ -8162,7 +8169,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8192,7 +8202,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }
 
     if(is_interleaved)

@@ -61,6 +61,21 @@ def _permute_accepts_constexpr_tuple() -> bool:
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
 FOLDED_REDUCTED_SUPPORT = _permute_accepts_constexpr_tuple()
 
+# gfx942 (MI300X) LDS size per CU.
+_GFX942_CU_LDS_BYTES = 64 * 1024
+
+
+def _gfx942_tile_fits_lds(
+    block_kv: int, head_size: int, num_stages: int, occupancy: int
+) -> bool:
+    # Only the double-buffered KV tile lives in LDS (Q and the fp32 scores
+    # accumulator stay in registers in Triton 3.6+). Account for `occupancy`
+    # co-resident workgroups and keep a 0.9 safety factor for compiler
+    # overhead.
+    # If a future Triton spills Q or scores to LDS, re-add a `q + kv + scores <= 64 KB` upper-bound term here to avoid re-triggering the JIT abort.
+    lds_bytes = occupancy * num_stages * block_kv * head_size
+    return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
+
 
 def fp8_mqa_logits(
     Q,
@@ -117,12 +132,38 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        block_kv = 128
+        # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
+        # the default (128, 2) tile would not fit two co-resident workgroups
+        # on a CU; keep the default tile otherwise.
+        if arch == "gfx942" and not _gfx942_tile_fits_lds(
+            block_kv=128, head_size=head_size, num_stages=2, occupancy=2
+        ):
+            block_kv = 64
+            num_stages = 1
+        else:
+            block_kv = 128
+            num_stages = 2
 
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
         if seq_len <= 1024:
             matrix_instr_nonkdim = 16
+
+        _fnuz = torch.float8_e4m3fnuz
+        # The FN->FNUZ recast + scale compensation is only correct on gfx942,
+        # whose fp8 MFMA interprets operands as FNUZ. Other fp8 archs read the
+        # operands' native dtype, so converting there would corrupt them.
+        convert_q_fn = arch == "gfx942" and Q.dtype != _fnuz
+        convert_kv_fn = arch == "gfx942" and KV.dtype != _fnuz
+        scale_mul = 1.0
+        if convert_q_fn:
+            scale_mul *= 2.0
+            Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
+        if convert_kv_fn:
+            scale_mul *= 2.0
+            KV = (KV.to(torch.float32) * 0.5).to(_fnuz)
+        if scale_mul != 1.0:
+            kv_scales = kv_scales.to(torch.float32) * scale_mul
 
         _fp8_mqa_logits_kernel[(seq_len,)](
             Q_ptr=Q,
@@ -147,7 +188,7 @@ def fp8_mqa_logits(
             stride_logits_k=stride_logits_k,
             BLOCK_KV=block_kv,
             num_warps=4,
-            num_stages=2,
+            num_stages=num_stages,
             waves_per_eu=2,
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )

@@ -8,22 +8,22 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `91`
-- with samples: `92`
-- added: `6`
-- updated: `73`
-- unchanged: `12`
-- defaulted (no history): `0`
+- discovered files: `99`
+- with samples: `97`
+- added: `3`
+- updated: `72`
+- unchanged: `24`
+- defaulted (no history): `2`
 - removed stale entries: `0`
-- defaulted files list: `none`
+- defaulted files list: `op_tests/test_flydsl_pa_mqa_logits_fp4.py, op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py`
 
 ### Triton
 - runs used: `10`
-- discovered files: `100`
-- with samples: `100`
-- added: `1`
-- updated: `75`
-- unchanged: `24`
+- discovered files: `102`
+- with samples: `102`
+- added: `2`
+- updated: `83`
+- unchanged: `17`
 - defaulted (no history): `0`
 - removed stale entries: `0`
 - defaulted files list: `none`

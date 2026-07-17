@@ -242,8 +242,6 @@ def cal_diff(
     x, y = x.double(), y.double()
     # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    # amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -501,10 +499,18 @@ def torch_mla_extend_split_kv(
             and is_fp8_q
             and is_fp8_kvc
             and (
-                (nheads == 32 and max_seqlen_q == 4)
+                (nheads == 32 and max_seqlen_q >= 4)
                 or (nheads == 64)
                 or (nheads == 128)
             )
+        )
+        or (
+            # gfx942 native QH64 fp8/fp8 PS decode
+            get_gfx() == "gfx942"
+            and nheads == 64
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 1
         )
         or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
     ):
@@ -1117,14 +1123,23 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         page_size=page_size,
-        kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
+        kv_granularity=max(
+            page_size,
+            # QH64 fp8/fp8 native PS kernel is a SUB_KV=32 partial producer; 16-token
+            # works trip its multi-pass path (see asm/mla_a8w8_qh64_ps*.py SUB_KV=32).
+            (
+                32
+                if (nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8)
+                else 16
+            ),
+        ),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
