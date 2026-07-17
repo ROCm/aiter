@@ -24,6 +24,72 @@ WMMA_K_GFX1250 = 128
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
 
 
+def flydsl_grouped_gemm_a8w4_masked(
+    out,
+    a,
+    w,
+    a_scales,
+    w_scales,
+    tile_expert,
+    *,
+    E,
+    contiguous_m,
+    N,
+    K,
+    tile_m=64,
+    tile_n=256,
+    tile_k=128,
+    m_warp=1,
+    n_warp=4,
+    num_buffers=3,
+    out_is_f16=0,
+    a_is_fp4=0,
+    stream=None,
+):
+    """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
+
+    Mirrors the MoE grouped-gemm contiguous-M scheduling: a compact grid over the
+    (1, contiguous_m, *) buffers, with a per-M-tile expert id (``tile_expert``)
+    selecting the per-expert B / B-scale slab. Only valid M tiles launch.
+      out          (1, contiguous_m, N)  bf16/f16
+      a            (1, contiguous_m, K)  uint8 (fp8 payload)
+      w            (E, N, K//2) uint8 (moe_shuffle_weight == cat_e shuffle_weight_gfx1250)
+      a_scales     grouped A-scale (1, contiguous_m//wmma_rep, (K//32)*wmma_rep) viewed int32
+      w_scales     n32k4 B-scale (E, N//32, (K//32)*32) viewed int32
+      tile_expert  (ceil(contiguous_m/tile_m),) int32: expert id per M tile
+    contiguous_m must be a multiple of tile_m (holds by construction).
+    """
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    nb = min(num_buffers, max(1, K // tile_k))
+    launch_gemm_a8w4_tdm(
+        out,
+        ptr_arg(a),
+        ptr_arg(w),
+        a_scales.view(torch.int32),
+        w_scales.view(torch.int32),
+        contiguous_m,
+        stream,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        1,  # batch=1 (single contiguous buffer)
+        0,  # layout_mbn
+        nb,
+        a_is_fp4,
+        ptr_arg(tile_expert),
+        1,  # grouped_contig
+    )
+    return out
+
+
 def flydsl_batched_gemm_mxfp4(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -243,5 +309,7 @@ def _run_gfx1250(
         layout_mbn,
         num_buffers,
         a_is_fp4,
+        ptr_arg(a_c),  # masked_m unused when grouped_masked=0
+        0,
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

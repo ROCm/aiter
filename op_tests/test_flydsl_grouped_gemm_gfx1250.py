@@ -652,6 +652,50 @@ def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
     run_moe("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
 
 
+# a8w4 (MXFP8 activation x MXFP4 weight) mirrors the a4w4 cases. The grouped
+# a8w4 path is routed through the batched TDM GEMM (AITER_GROUPED_A8W4_TDM=1,
+# default) and needs AITER_FORCE_A8W4=1 so fused_moe selects the a8w4 path.
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+def test_grouped_a8w4_silu_matches_torch_ref(layout, monkeypatch):
+    monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    run_moe(
+        "a8w4",
+        layout=layout,
+        activation=ActivationType.Silu,
+        model_dim=512,
+        inter_dim=512,
+        tol=VERIFY_TOL_A8W4,
+    )
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+def test_grouped_a8w4_swiglu_matches_torch_ref(layout, monkeypatch):
+    monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    run_moe(
+        "a8w4",
+        layout=layout,
+        activation=ActivationType.Swiglu,
+        model_dim=512,
+        inter_dim=512,
+        tol=VERIFY_TOL_A8W4,
+    )
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+def test_grouped_a8w4_swiglu_limit_clamps(layout, activation, monkeypatch):
+    monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    run_moe(
+        "a8w4",
+        layout=layout,
+        activation=activation,
+        swiglu_limit=1.0,
+        model_dim=512,
+        inter_dim=512,
+        tol=VERIFY_TOL_A8W4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

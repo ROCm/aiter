@@ -7,10 +7,12 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
+from .tensor_shim import ptr_rsrc
 from .gemm_common_gfx1250 import (
     lds_load_b32_raw,
     lds_load_b128_raw,
@@ -40,6 +42,8 @@ def launch_gemm_a8w4_tdm(
     layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
+    arg_tile_expert: fx.Pointer,
+    grouped_contig: Constexpr[int],
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
@@ -68,6 +72,11 @@ def launch_gemm_a8w4_tdm(
 
     SC_INNER = tile_k // 4
     SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
+    # grouped contiguous-M A-scale (wmma_rep-super) layout, matches
+    # _grouped_a8w4_preshuffle_e8m0_scale: super = wmma_m_rep rows folded into
+    # 16-lane stripes with K interleaved into the columns.
+    AS_SUPERS = tile_m // wmma_m_rep          # LDS super-rows for the A-scale tile
+    AS_INNER = (tile_k // 128) * wmma_m_rep   # i32 words / super-row / K-tile
     STAGE_SA = ((SA_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -86,6 +95,7 @@ def launch_gemm_a8w4_tdm(
         arg_b: fx.Pointer,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
+        arg_tile_expert: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -111,8 +121,19 @@ def launch_gemm_a8w4_tdm(
         m64 = fx.Int64(i32_m)
         n64 = fx.Int64(i32_n)
         bz64 = fx.Int64(bid_z) if const_expr(batch > 1) else 0
+        # grouped contiguous-M: per-M-tile expert id selects the B / B-scale slab;
+        # A / A-scale / C stay single-batch (bz=0) over the contiguous (1, cm, *) buffer.
+        if const_expr(grouped_contig):
+            _e_i32 = buffer_ops.buffer_load(
+                ptr_rsrc(arg_tile_expert),
+                arith.index_cast(T.i32, ArithValue(fx.block_idx.x)),
+                vec_width=1, dtype=T.i32)
+            eb64 = fx.Int64(_e_i32)
+        else:
+            eb64 = bz64
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
+        AS_ROW = (k64 // 128) * wmma_m_rep   # grouped A-scale gmem i32 super-row stride
 
         # scale super-strides + C geometry (outer_off, inner_off, runtime N stride).
         if const_expr(layout_mbn):
@@ -124,7 +145,7 @@ def launch_gemm_a8w4_tdm(
             sa_batch_off = bz64 * ((m64 + 31) // 32) * K4
             c_outer_off, c_inner_off, c_stride = bz64 * m64 + blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
-        sb_batch_off = bz64 * (N_SUPERS * K4)
+        sb_batch_off = eb64 * (N_SUPERS * K4)
         mn_oob = i32_m - blk_m                          # valid M rows (A load / C store)
         sa_oob = (i32_m + 31) // 32 - blk_m // 32       # valid M-supers (scale-A)
 
@@ -151,7 +172,7 @@ def launch_gemm_a8w4_tdm(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
         A_OUTER_STRIDE = (batch * A_KROW) if layout_mbn else A_KROW
-        b_outer_row = bz64 * B_BATCH_ROWS + blk_n64 // 16
+        b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
         sa_super_off = blk_m64 // 32
         sb_super_off = blk_n64 // 32
 
@@ -194,8 +215,13 @@ def launch_gemm_a8w4_tdm(
                        on_i32=False, lds_off=0, lds_row=A_LDS_ROW, k_adv=A_ROW_B, wv=waves[0], pad=(A_ROW_B, LDS_PAD_A))
         _add_tdm_loads(gB_base, b_off0, Kp16, None, PACK_TK * 16, tile_n // 16,
                        on_i32=False, lds_off=STAGE_A, lds_row=B_LDS_ROW, k_adv=PACK_TK * 16, wv=waves[1])
-        _add_tdm_loads(gSA_base, sa_off0, SA_OUTER_STRIDE, sa_oob, SC_INNER, SA_SUPERS,
-                       on_i32=True, lds_off=SA_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[2])
+        if const_expr(grouped_contig):
+            _sa_off_g = (blk_m64 // wmma_m_rep) * AS_ROW
+            _add_tdm_loads(gSA_base, _sa_off_g, AS_ROW, None, AS_INNER, AS_SUPERS,
+                           on_i32=True, lds_off=SA_OFF // 4, lds_row=AS_INNER, k_adv=AS_INNER * 4, wv=waves[2])
+        else:
+            _add_tdm_loads(gSA_base, sa_off0, SA_OUTER_STRIDE, sa_oob, SC_INNER, SA_SUPERS,
+                           on_i32=True, lds_off=SA_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[2])
         _add_tdm_loads(gSB_base, sb_off0, SB_OUTER_STRIDE, None, SC_INNER, SB_SUPERS,
                        on_i32=True, lds_off=SB_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[3])
 
@@ -237,6 +263,12 @@ def launch_gemm_a8w4_tdm(
             return v0.shuffle(v1, list(range(8)))
 
         def load_sa(buf, wm, ksl):
+            if const_expr(grouped_contig):
+                # grouped wmma_rep-super A-scale read: byte = warp_lds_row*interleaved_cols
+                # + lane_kgrp*4 + ks*wmma_rep*4 + wm*4 (interleaved_cols = AS_INNER*4 bytes).
+                warp_lds_row = wmb // wmma_m_rep + lane16
+                byte = warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
+                return lds_load_b32_raw(buf, SA_OFF + byte)
             row_rel = wmb + wm * 16 + lane16
             word = (row_rel // 32) * SC_INNER + ksl * 32 + (row_rel % 32)
             return lds_load_b32_raw(buf, SA_OFF + word * 4)
@@ -368,7 +400,7 @@ def launch_gemm_a8w4_tdm(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, N, K).launch(
+    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_tile_expert, i32_m, N, K).launch(
         grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
     )
 

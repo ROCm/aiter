@@ -287,6 +287,186 @@ def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
+
+def _use_a8w4_tdm_path() -> bool:
+    """Route the a8w4 grouped MoE through the batched TDM GEMM (dense masked-M)."""
+    return os.environ.get("AITER_GROUPED_A8W4_TDM", "1") in _TRUTHY_ENV
+
+
+def _tdm_align_up(x: int, a: int) -> int:
+    return ((int(x) + a - 1) // a) * a
+
+
+def _tdm_quant_mxfp8_n32k4(slab_bf16, E, rows, feat):
+    """(E, rows, feat) bf16 -> (fp8 payload uint8 (E,rows,feat), n32k4 A-scale int32 flat).
+
+    A-scale is built in the batched TDM kernel's native n32k4 layout (same
+    shuffle_scale_n32k4 the batched a8w4 test uses)."""
+    from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
+    from aiter.ops.shuffle import shuffle_scale_n32k4
+
+    payload, scale = dynamic_mxfp8_quant(
+        slab_bf16.reshape(-1, feat), quant_dtype=dtypes.fp8
+    )
+    payload = payload.view(torch.uint8).reshape(E, rows, feat)
+    scale = scale.view(torch.uint8).reshape(E, rows, feat // 32)
+    sa = shuffle_scale_n32k4(scale.contiguous(), experts_cnt=E)
+    return payload.contiguous(), sa.reshape(-1).view(torch.int32)
+
+
+def _grouped_a8w4_tdm_moe(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    E,
+    model_dim,
+    inter_dim,
+    dtype,
+    activation,
+    w1_scale,
+    w2_scale,
+    bias1,
+    bias2,
+    swiglu_limit,
+    stage1_weight_layout,
+    doweight_stage1,
+):
+    """a8w4 grouped MoE on the batched TDM kernel via contiguous-M scheduling.
+
+    Mirrors the MoE grouped-gemm: compact contiguous-M grid (only valid M tiles
+    launch), a per-M-tile expert id selecting the per-expert B / B-scale slab, and
+    the grouped wmma_rep A-scale. Reuses the route/quant/gather builders and the
+    pass-through gguu/gugu weights + n32k4 weight scales; the stage activation runs
+    in torch (matches the grouped epilogue + torch reference)."""
+    import functools
+
+    import torch
+
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_moe_fused_quant_preshuffle,
+        flydsl_moe_topids_to_rows,
+    )
+
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    tile_m = 64
+    wmma_rep = tile_m // 16
+    contiguous_m = max(tile_m, _tdm_align_up(token_num * topk + E * tile_m - topk, tile_m))
+    m_tile_bound = contiguous_m // tile_m
+    max_m = max(tile_m, _tdm_align_up(token_num * topk, tile_m))
+
+    # route + contiguous remap -> masked_m (E,), topids_to_rows (T,topk) in contiguous rows
+    if token_num * topk <= 4096 and E <= 512:
+        masked_m, topids_to_rows, _psum = fused_route_psum_remap(topk_ids, E, max_m, tile_m)
+    else:
+        masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        _starts, _psum, _ = contiguous_psum_remap(masked_m, topids_to_rows, E, max_m, tile_m)
+
+    # per-M-tile expert id from the tile-aligned per-expert block prefix
+    aligned = ((masked_m.to(torch.int64) + tile_m - 1) // tile_m) * tile_m
+    starts = (torch.cumsum(aligned, 0) - aligned).to(torch.int32)
+    tile_rows = torch.arange(m_tile_bound, device=device, dtype=torch.int32) * tile_m
+    tile_expert = (
+        torch.searchsorted(starts, tile_rows, right=True) - 1
+    ).clamp_(0, E - 1).to(torch.int32)
+    row_expert = tile_expert.repeat_interleave(tile_m).long()  # (contiguous_m,) for bias
+
+    out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
+    two_inter = 2 * inter_dim
+
+    # stage1 activation quant (route-indexed) -> (1, cm, model_dim) fp8 + grouped A-scale
+    a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+        hidden_states.reshape(1, token_num, model_dim),
+        1,
+        contiguous_m,
+        wmma_rep=wmma_rep,
+        quant_mode="fp8",
+        masked_m=None,
+        topids_to_rows=topids_to_rows,
+        source_topk=topk,
+    )
+
+    # stage1 raw GEMM -> (1, cm, 2*inter)
+    tmp = torch.empty((1, contiguous_m, two_inter), dtype=dtype, device=device)
+    w1_u8 = _grouped_weight_uint8(w1)
+    w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    flydsl_grouped_gemm_a8w4_masked(
+        tmp, a1_payload, w1_u8, a1_scale, w1s_i32, tile_expert,
+        E=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim, out_is_f16=out_is_f16,
+    )
+
+    # stage1 activation (swiglu/silu + per-row bias) -> (1, cm, inter)
+    tf = tmp[0].float()
+    if stage1_weight_layout == "gugu":
+        gate, up = tf[:, 0::2], tf[:, 1::2]
+    else:
+        gate, up = tf[:, :inter_dim], tf[:, inter_dim:]
+    if bias1 is not None and bias1.numel() > 0:
+        b1 = bias1.float()[row_expert]
+        if stage1_weight_layout == "gugu":
+            gate, up = gate + b1[:, 0::2], up + b1[:, 1::2]
+        else:
+            gate, up = gate + b1[:, :inter_dim], up + b1[:, inter_dim:]
+    sl = (
+        float(swiglu_limit)
+        if swiglu_limit
+        else (7.0 if activation == ActivationType.Swiglu else float("inf"))
+    )
+    g = torch.minimum(gate, torch.tensor(sl, dtype=torch.float32, device=device))
+    u = up.clamp(-sl, sl)
+    if activation == ActivationType.Swiglu:
+        y = (g * torch.sigmoid(1.702 * g) * (u + 1.0)).to(dtype)
+    else:
+        y = (g * torch.sigmoid(g) * u).to(dtype)
+    y = y.reshape(1, contiguous_m, inter_dim)
+
+    # a2 quant (already contiguous) + stage2 raw GEMM -> (1, cm, model_dim)
+    a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
+        y, 1, contiguous_m, wmma_rep=wmma_rep, quant_mode="fp8",
+        masked_m=None, topids_to_rows=None,
+    )
+    grouped_out = torch.zeros((1, contiguous_m, model_dim), dtype=dtype, device=device)
+    w2_u8 = _grouped_weight_uint8(w2)
+    w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
+    flydsl_grouped_gemm_a8w4_masked(
+        grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, tile_expert,
+        E=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim, out_is_f16=out_is_f16,
+    )
+    if bias2 is not None and bias2.numel() > 0:
+        grouped_out[0] += bias2.to(dtype)[row_expert]
+
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append((
+            "gemm1",
+            functools.partial(
+                flydsl_grouped_gemm_a8w4_masked, tmp, a1_payload, w1_u8, a1_scale,
+                w1s_i32, tile_expert, E=E, contiguous_m=contiguous_m, N=two_inter,
+                K=model_dim, out_is_f16=out_is_f16,
+            ),
+        ))
+        kernel_bench_callable.append((
+            "gemm2",
+            functools.partial(
+                flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale,
+                w2s_i32, tile_expert, E=E, contiguous_m=contiguous_m, N=model_dim,
+                K=inter_dim, out_is_f16=out_is_f16,
+            ),
+        ))
+
+    # gather-reduce -> (token_num, model_dim)
+    moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+    gather_w = (
+        torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
+        if doweight_stage1
+        else topk_weight.contiguous()
+    )
+    flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
+    return moe_out
+
 def _maybe_grouped_gfx1250_a8w4_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -437,6 +617,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _force_gfx1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in _TRUTHY_ENV
     if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
         return None
+
+    if is_grouped_a8w4 and _use_a8w4_tdm_path():
+        return _grouped_a8w4_tdm_moe(
+            hidden_states, w1, w2, topk_weight, topk_ids,
+            E=E, model_dim=model_dim, inter_dim=inter_dim, dtype=dtype,
+            activation=activation, w1_scale=w1_scale, w2_scale=w2_scale,
+            bias1=bias1, bias2=bias2, swiglu_limit=swiglu_limit,
+            stage1_weight_layout=stage1_weight_layout, doweight_stage1=doweight_stage1,
+        )
 
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
