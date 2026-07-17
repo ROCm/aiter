@@ -843,7 +843,6 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
                 _ptr_view_safe(empty_f32),
                 rows,
                 sorted_token_ids.shape[0],
-                float("inf"),  # swiglu_limit (unused for silu)
                 0,  # stream: null/default (compile-only, kernel is never launched)
             ),
         )
