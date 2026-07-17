@@ -17,12 +17,13 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_nvfp4_quant_kernel,
     _nvfp4_quant_op,
 )
+
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant_mxfp4 import (
-    _dynamic_mxfp4_quant_kernel_gluon_950,
+from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx950,
 )
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant_mxfp4 import (
-    _dynamic_mxfp4_quant_kernel_gluon_1250,
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils._triton import arch_info
@@ -218,7 +219,7 @@ def dynamic_mxfp4_quant(
     even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
     if arch_info.get_arch() in ("gfx950"):
-        _dynamic_mxfp4_quant_kernel_gluon_950[grid](
+        gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
             x,
             x_fp4,
             blockscale_e8m0,
@@ -239,7 +240,7 @@ def dynamic_mxfp4_quant(
         )
 
     elif arch_info.get_arch() in ("gfx1250"):
-        _dynamic_mxfp4_quant_kernel_gluon_1250[grid](
+        gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
             x,
             x_fp4,
             blockscale_e8m0,

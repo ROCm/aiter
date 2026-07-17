@@ -3,7 +3,7 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
-def _mxfp4_quant_op_gluon(
+def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
@@ -106,98 +106,8 @@ def _mxfp4_quant_op_gluon(
 
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
-
 @gluon.jit
-def _dynamic_mxfp4_quant_kernel_gluon_950(
-    x_ptr,
-    x_fp4_ptr,
-    bs_ptr,
-    stride_x_m_in,
-    stride_x_n_in,
-    stride_x_fp4_m_in,
-    stride_x_fp4_n_in,
-    stride_bs_m_in,
-    stride_bs_n_in,
-    M,
-    N,
-    BLOCK_SIZE_M: gl.constexpr,
-    BLOCK_SIZE_N: gl.constexpr,
-    NUM_ITER: gl.constexpr,
-    NUM_STAGES: gl.constexpr,
-    num_warps: gl.constexpr,
-    MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
-    EVEN_M_N: gl.constexpr,
-    SCALING_MODE: gl.constexpr,
-):
-    pid_m = gl.program_id(0)
-    start_n = gl.program_id(1) * NUM_ITER
-    # cast strides to int64, in case M*N > max int32
-    stride_x_m = gl.cast(stride_x_m_in, gl.int64)
-    stride_x_n = gl.cast(stride_x_n_in, gl.int64)
-    stride_x_fp4_m = gl.cast(stride_x_fp4_m_in, gl.int64)
-    stride_x_fp4_n = gl.cast(stride_x_fp4_n_in, gl.int64)
-    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
-    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
-
-    NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[1, num_warps],
-        order=[0, 1],
-    )
-
-    for pid_n in range(start_n, min(start_n + NUM_ITER, N)):
-        x_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
-            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout)
-        )
-        x_offs_n = pid_n * BLOCK_SIZE_N + gl.arange(
-            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, layout)
-        )
-        x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
-
-        if EVEN_M_N:
-            x = gl.load(x_ptr + x_offs, cache_modifier=".cg").to(gl.float32)
-        else:
-            x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-            x = gl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
-                gl.float32
-            )
-
-        out_tensor, bs_e8m0 = _mxfp4_quant_op_gluon(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
-
-        out_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        out_offs_n = pid_n * BLOCK_SIZE_N // 2 + gl.arange(0, BLOCK_SIZE_N // 2)
-        out_offs = (
-            out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
-        )
-
-        if EVEN_M_N:
-            gl.store(x_fp4_ptr + out_offs, out_tensor)
-        else:
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-            gl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
-
-        bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        if EVEN_M_N:
-            gl.store(bs_ptr + bs_offs, bs_e8m0)
-        else:
-            bs_mask = (bs_offs_m < M)[:, None] & (
-                bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-            )[None, :]
-            gl.store(
-                bs_ptr + bs_offs,
-                bs_e8m0,
-                mask=bs_mask,
-            )
-
-
-@gluon.jit
-def _dynamic_mxfp4_quant_kernel_gluon_1250(
+def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
     x_ptr,
     x_fp4_ptr,
     bs_ptr,
@@ -240,7 +150,7 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
 
     # Register layout for LDS reads: order=[1,0] = N fastest, matches row-major LDS
     blocked_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 4],
+        size_per_thread=[1, 8],
         threads_per_warp=[4, 8],
         warps_per_cta=[1, num_warps],
         order=[1, 0],
@@ -310,7 +220,7 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
             .to(gl.float32)
         )
 
-        out_fp4, bs_e8m0 = _mxfp4_quant_op_gluon(
+        out_fp4, bs_e8m0 = _mxfp4_quant_op(
             x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
 
@@ -351,7 +261,7 @@ def _dynamic_mxfp4_quant_kernel_gluon_1250(
             .to(gl.float32)
         )
 
-        out_fp4, bs_e8m0 = _mxfp4_quant_op_gluon(
+        out_fp4, bs_e8m0 = _mxfp4_quant_op(
             x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
 
