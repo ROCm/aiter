@@ -694,9 +694,10 @@ def fused_moe_(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert (
-        not metadata.flat or get_gfx() == "gfx950"
-    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
+    assert not metadata.flat or get_gfx() in (
+        "gfx942",
+        "gfx950",
+    ), f"FLAT fmoe asm kernels require gfx942/gfx950; got {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -2956,11 +2957,12 @@ def torch_moe_stage1(
         )
         w1 = w1.view(w1_shape)
 
-        a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
-        a1_scale = a1_scale.repeat(
-            1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
-        ).view(hidden_states.shape[0], -1)
-        hidden_states = hidden_states * a1_scale
+        if a1_scale is not None and a1_scale.numel() > 0:
+            a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
+            a1_scale = a1_scale.repeat(
+                1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
+            ).view(hidden_states.shape[0], -1)
+            hidden_states = hidden_states * a1_scale
     elif quant_type == QuantType.No:
         pass
     elif (
