@@ -13,6 +13,13 @@ from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.opus.gemm_op_a16w16 import _opus_gemm_bf16_dispatch as _opus_gemm_dispatch
 
 
+# Descriptive labels for Opus a8w8 no-scale instances used by this tuner backend.
+OPUS_A8W8_KERNEL_NAMES = {
+    2: "opus_gemm_512x256x256x128_2x4_16x16x128_0x0x0<fp32_t>",
+    10: "opus_gemm_512x256x256x128_2x4_16x16x128_0x0x0<bf16_t>",
+}
+
+
 def checkClose(a, b, rtol=1e-3, atol=0.01):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = ~isClose
@@ -146,7 +153,9 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
     def getKernelName(self, kernelId):
         if getattr(self, "backend", "ck") == "opus":
-            return f"opus_a8w8_noscale_kid{kernelId}"
+            return OPUS_A8W8_KERNEL_NAMES.get(
+                kernelId, f"opus_a8w8_noscale_kid{kernelId}"
+            )
         if kernelId >= len(kernels_list) or kernelId < 0:
             return None
         return kernels_list[kernelId].name
