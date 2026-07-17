@@ -705,7 +705,7 @@ def test_grouped_a8w4_swiglu_limit_clamps(layout, activation, monkeypatch):
 
 def _assert_tdm_path():
     impl = os.environ.get("AITER_LAST_FUSED_MOE_IMPL", "")
-    assert impl == "grouped_a8w4_tdm", (
+    assert impl in ("grouped_a8w4_tdm", "grouped_a4w4_tdm"), (
         f"expected TDM path but got impl={impl!r}; "
         "check AITER_GROUPED_A8W4_TDM and stage1_weight_layout"
     )
@@ -761,7 +761,8 @@ def test_a8w4_tdm_swiglu_limit(monkeypatch):
     _assert_tdm_path()
 
 
-@pytest.mark.parametrize("tokens", [8, 64, 128, 512, 1024])
+@pytest.mark.parametrize("tokens", [1, 3, 5, 8, 16, 32, 64, 77, 128,
+                                     256, 512, 999, 1024, 16333])
 @pytest.mark.parametrize("balanced", [True, False])
 def test_a8w4_tdm_cudagraph(tokens, balanced, monkeypatch):
     _setup_tdm(monkeypatch, balanced)
@@ -773,12 +774,88 @@ def test_a8w4_tdm_cudagraph(tokens, balanced, monkeypatch):
     _assert_tdm_path()
 
 
-@pytest.mark.parametrize("tokens", [3, 77, 999])
-def test_a8w4_tdm_cudagraph_unaligned(tokens, monkeypatch):
-    _setup_tdm(monkeypatch, False)
-    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+# ---------------------------------------------------------------------------
+# a4w4 correctness (original mxscale pipeline, gguu + gugu)
+# ---------------------------------------------------------------------------
+
+def _setup_a4w4(monkeypatch, balanced=True):
+    monkeypatch.delenv("AITER_FORCE_A8W4", raising=False)
+    if balanced:
+        monkeypatch.setenv("AITER_MOE_EXPERT_BALANCE", "true")
+    else:
+        monkeypatch.delenv("AITER_MOE_EXPERT_BALANCE", raising=False)
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 8, 16, 64, 77, 128, 512, 999, 1024])
+@pytest.mark.parametrize("balanced", [True, False])
+def test_a4w4_tdm_token_sweep(tokens, balanced, monkeypatch):
+    _setup_a4w4(monkeypatch, balanced)
+    run_moe("a4w4", layout="gugu", activation=ActivationType.Silu,
             experts=96, tokens=tokens, topk=6,
             model_dim=7168, inter_dim=3072, use_bias=False,
+            check_aot_cache=False)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+def test_a4w4_tdm_activations(activation, monkeypatch):
+    _setup_a4w4(monkeypatch)
+    run_moe("a4w4", layout="gugu", activation=activation,
+            experts=96, tokens=64, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            check_aot_cache=False)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("tokens", [8, 64, 128, 512])
+def test_a4w4_tdm_cudagraph(tokens, monkeypatch):
+    _setup_a4w4(monkeypatch)
+    run_moe("a4w4", layout="gugu", activation=ActivationType.Silu,
+            experts=96, tokens=tokens, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            check_aot_cache=False, bench=True)
+    _assert_tdm_path()
+
+
+# ---------------------------------------------------------------------------
+# GPT-OSS model shapes (a8w4 TDM + a4w4 original)
+# ---------------------------------------------------------------------------
+# DSv3-lite: model=4096, inter=2048, E=256, topk=6
+# DSv4-MLA:  model=7168, inter=3072, E=96, topk=6
+
+_GPTOSS_SHAPES = [
+    (4096, 2048, 256, 6),   # DSv3-lite
+    (7168, 3072, 96, 6),    # DSv4-MLA
+]
+
+@pytest.mark.parametrize("model_dim,inter_dim,experts,topk", _GPTOSS_SHAPES)
+@pytest.mark.parametrize("tokens", [8, 64, 128, 1024])
+def test_gptoss_a8w4_tdm(model_dim, inter_dim, experts, topk, tokens, monkeypatch):
+    _setup_tdm(monkeypatch, True)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+            experts=experts, tokens=tokens, topk=topk,
+            model_dim=model_dim, inter_dim=inter_dim, use_bias=False,
+            tol=VERIFY_TOL_A8W4, check_aot_cache=False)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("model_dim,inter_dim,experts,topk", _GPTOSS_SHAPES)
+@pytest.mark.parametrize("tokens", [8, 64, 128, 1024])
+def test_gptoss_a4w4(model_dim, inter_dim, experts, topk, tokens, monkeypatch):
+    _setup_a4w4(monkeypatch)
+    run_moe("a4w4", layout="gugu", activation=ActivationType.Silu,
+            experts=experts, tokens=tokens, topk=topk,
+            model_dim=model_dim, inter_dim=inter_dim, use_bias=False,
+            check_aot_cache=False)
+
+
+@pytest.mark.parametrize("model_dim,inter_dim,experts,topk", _GPTOSS_SHAPES)
+@pytest.mark.parametrize("tokens", [64, 512])
+def test_gptoss_a8w4_tdm_cudagraph(model_dim, inter_dim, experts, topk, tokens, monkeypatch):
+    _setup_tdm(monkeypatch, True)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+            experts=experts, tokens=tokens, topk=topk,
+            model_dim=model_dim, inter_dim=inter_dim, use_bias=False,
             tol=VERIFY_TOL_A8W4, check_aot_cache=False,
             bench=True)
     _assert_tdm_path()
