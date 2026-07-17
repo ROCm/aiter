@@ -697,14 +697,24 @@ def _moe_gemm_a8w4_decode_persistent(
         y_buffer.store(out)
         gl.amd.gfx1250.tdm.async_store(y_desc, [block_id * BLOCK_M, 0], y_buffer)
 
-        w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            w_desc,
-            add_offsets=[PACKED_BLOCK_N_W, -num_k_iter * PACKED_BLOCK_K_W],
-            set_bounds=[
-                N - pid_n * PACKED_BLOCK_N_W_PERSISTENT,
-                (K // W_K_DIVISOR) * W_PRESHUFFLE_FACTOR,
-            ],
-        )
+        if PRESHUFFLED:
+            w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                w_desc,
+                add_offsets=[PACKED_BLOCK_N_W, -num_k_iter * PACKED_BLOCK_K_W],
+                set_bounds=[
+                    N // W_PRESHUFFLE_FACTOR - pid_n * PACKED_BLOCK_N_W_PERSISTENT,
+                    (K // W_K_DIVISOR) * W_PRESHUFFLE_FACTOR,
+                ],
+            )
+        else:
+            w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                w_desc,
+                add_offsets=[PACKED_BLOCK_N_W, -num_k_iter * PACKED_BLOCK_K_W],
+                set_bounds=[
+                    N - pid_n * PACKED_BLOCK_N_W_PERSISTENT,
+                    K // W_K_DIVISOR,
+                ],
+            )
         if GatherIndx is None:
             x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_desc, add_offsets=[0, -num_k_iter * BLOCK_K], set_bounds=[M, K]
@@ -718,7 +728,10 @@ def _moe_gemm_a8w4_decode_persistent(
         w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_scales_desc,
             add_offsets=[SCALE_BLOCK_N, -num_k_iter * PACKED_MX_BLOCK],
-            set_bounds=[N - pid_n * SCALE_BLOCK_N_PERSISTENT, K * PRESHUFFLE_FACTOR],
+            set_bounds=[
+                N // PRESHUFFLE_FACTOR - pid_n * SCALE_BLOCK_N_PERSISTENT,
+                (K // MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR,
+            ],
         )
         if is_x_microscaled:
             if GatherIndx is None:
