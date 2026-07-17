@@ -5,7 +5,6 @@ data with E8M0 block scales via V_WMMA_SCALE instructions.
 Select precision with ``data_format="fp4"|"fp8"|"a8w4"``.
 """
 
-import functools
 import os
 
 import flydsl.compiler as flyc
@@ -20,6 +19,8 @@ from flydsl.expr import (
     const_expr,
     gpu,
     idx2crd,
+    make_identity_layout,
+    ptrtoint,
     range_constexpr,
     rocdl,
     tdm_ops,
@@ -46,10 +47,6 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 from aiter.ops.flydsl.kernels.pipeline_utils import (
     make_tail_plan,
     tdm_epilogue_fence_threshold_bytes,
-)
-from aiter.ops.flydsl.kernels.quant_utils import (
-    emit_f32_to_e2m1,
-    emit_mx_e8m0_scale,
 )
 
 # Common constants
@@ -137,8 +134,6 @@ def compile_mxscale_gemm(
     stage1_act: str | None = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
-    stage1_quant_out: str | None = None,
-    stage1_quant_wmma_rep: int = 1,
     kernel_tag: str = "gemm",
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
@@ -229,34 +224,6 @@ def compile_mxscale_gemm(
             )
         if stage1_weight_layout_mode == "gugu" and N % 2 != 0:
             raise ValueError("stage1 gugu fused epilogue requires raw N == 2*inter_dim")
-
-    # Fused stage1 output quant+preshuffle: the activated (silu/swiglu) output is
-    # cast to MXFP4 (e2m1) and the e8m0 block scales are written straight into
-    # gemm2's preshuffled A-scale (WMMA) layout, folding the standalone
-    # moe_fused_quant_preshuffle kernel into this GEMM's epilogue.
-    stage1_quant_out_mode = (
-        None if stage1_quant_out in (None, "", "none") else str(stage1_quant_out)
-    )
-    if stage1_quant_out_mode is not None:
-        if stage1_quant_out_mode != "fp4":
-            raise ValueError(
-                f"stage1_quant_out currently supports only 'fp4', got "
-                f"{stage1_quant_out!r}"
-            )
-        if stage1_act_mode is None or stage1_weight_layout_mode not in (
-            "gugu",
-            "gguu",
-        ):
-            raise ValueError(
-                "stage1_quant_out requires a fused stage1 activation epilogue "
-                "(stage1_act set, stage1_weight_layout in {'gugu','gguu'})"
-            )
-        if epilogue_bias_mode:
-            raise ValueError("stage1_quant_out is not supported together with bias")
-        if split_k != 1:
-            raise ValueError("stage1_quant_out requires split_k == 1")
-        if int(stage1_quant_wmma_rep) < 1:
-            raise ValueError("stage1_quant_wmma_rep must be >= 1")
     if grouped_persistent_m and (cluster_m > 1 or cluster_n > 1):
         raise ValueError(
             "grouped_persistent_m currently requires cluster_m=cluster_n=1"
@@ -337,32 +304,6 @@ def compile_mxscale_gemm(
     B_TOTAL_N = N if stage1_act_interleave else (N * 2 if stage1_dual_b else N)
     C_N = N // 2 if stage1_act_interleave else N
 
-    # Fused stage1 quant epilogue geometry (MXFP4 payload + preshuffled e8m0).
-    # feat_dim = C_N (== inter_dim), quantized in 32-elem MX blocks along the
-    # output feature dim (gemm2's K). The scale-preshuffle tile geometry keys on
-    # gemm2's warp_tile_m (stage1_quant_wmma_rep = gemm2.warp_tile_m // 16), NOT
-    # on this GEMM's own tiling.
-    if stage1_quant_out_mode is not None:
-        # The GEMM's stage1 output (bf16 tensor_store) is replaced by MXFP4
-        # payload + scale buffer_stores, so the LDS D-tile TDM store path is off.
-        use_tdm_store = False
-        if C_N % 32 != 0:
-            raise ValueError(
-                f"stage1_quant_out requires C_N (inter_dim) %32==0, got {C_N}"
-            )
-        _q_feat_dim = C_N
-        _q_scale_bytes_per_row = _q_feat_dim // 32
-        if _q_scale_bytes_per_row % 4 != 0:
-            raise ValueError(
-                f"stage1_quant_out requires (inter_dim//32)%4==0, got "
-                f"{_q_scale_bytes_per_row}"
-            )
-        _q_scale_dwords_per_row = _q_scale_bytes_per_row // 4
-        _q_wmma_rep = int(stage1_quant_wmma_rep)
-        _q_rows_per_tile = _q_wmma_rep * 16
-        _q_dst_scale_dwords_per_row = _q_scale_dwords_per_row * _q_wmma_rep
-        _q_payload_bytes_per_row = _q_feat_dim // 2
-
     if K % tile_k != 0:
         raise ValueError(f"K must be divisible by tile_k={tile_k}, got K={K}")
     if K % split_k != 0:
@@ -392,21 +333,6 @@ def compile_mxscale_gemm(
 
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
-    if stage1_quant_out_mode is not None:
-        # The 32-elem MX block reduction (local amax + one shuffle_xor(16) across
-        # the lane_kgrp pair) is only self-contained when a warp covers a whole
-        # number of 32-col output MX blocks. gugu de-interleaves (output cols =
-        # raw//2) so needs warp_tile_n%64==0; gguu keeps output cols == raw so
-        # needs warp_tile_n%32==0.
-        if not is_fp4:
-            raise ValueError("stage1_quant_out requires data_format='fp4'")
-        _q_warp_align = 32 if stage1_dual_b else 64
-        if warp_tile_n % _q_warp_align != 0:
-            raise ValueError(
-                "stage1_quant_out requires warp_tile_n (tile_n//n_warp) "
-                f"%{_q_warp_align}==0 so each warp spans whole MX blocks, got "
-                f"warp_tile_n={warp_tile_n}"
-            )
     if warp_tile_m % WMMA_M != 0:
         raise ValueError(f"warp_tile_m={warp_tile_m} must be a multiple of {WMMA_M}")
     if warp_tile_n % WMMA_N_EFF != 0:
@@ -500,16 +426,8 @@ def compile_mxscale_gemm(
         stage_layout.ptr = stage_b_up_data_rel_off + lds_b_data_bytes
     else:
         stage_b_up_data_rel_off = 0
-    if tdm_as_in_prologue:
-        # A-scale is hoisted to a single resident full-K buffer (allocated after
-        # the stage arena below); under this mode the per-stage A-scale ring is
-        # neither loaded (the per-step As TDM op is dropped) nor read
-        # (_load_a_scales reads the resident buffer), so don't reserve it per
-        # stage -- that slot would be dead LDS.
-        stage_a_scale_rel_off = 0
-    else:
-        stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
-        stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
+    stage_a_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
+    stage_layout.ptr = stage_a_scale_rel_off + lds_a_scale_bytes
     stage_b_scale_rel_off = stage_layout._align(stage_layout.ptr, 16)
     stage_layout.ptr = stage_b_scale_rel_off + lds_b_scale_bytes
     if stage1_dual_b:
@@ -527,12 +445,7 @@ def compile_mxscale_gemm(
 
     _last_compute_stage = _base_tail_plan[-1][1]
 
-    # When A-scale is hoisted to the prologue we drop the per-stage As slot and
-    # can pack stages tighter: a 512 B pitch (vs 1024) reclaims the alignment
-    # padding, lowering per-workgroup LDS enough to raise occupancy. Other modes
-    # keep the 1024 B pitch the TDM epilogue aliasing was tuned for.
-    _stage_pitch_align = 512 if tdm_as_in_prologue else 1024
-    stage_pitch_bytes = _align_up(stage_bytes, _stage_pitch_align)
+    stage_pitch_bytes = _align_up(stage_bytes, 1024)
     arena_alloc = SmemAllocator(
         None,
         arch=gpu_arch,
@@ -677,25 +590,14 @@ def compile_mxscale_gemm(
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
-    _act_tag = stage1_act_mode if stage1_act_mode is not None else "noact"
-    _quant_tag = (
-        f"_q{stage1_quant_out_mode}r{int(stage1_quant_wmma_rep)}"
-        if stage1_quant_out_mode is not None
-        else ""
-    )
+    # Kernel symbol carries the data format + tile shape + buffer count so
+    # profiles/dumps can tell configs apart (e.g. stage1 vs stage2, different
+    # tile_m/n/k, or the same tile with a different num_buffers). This is the
+    # single canonical place for the tile shape -- callers must NOT also embed
+    # it in kernel_tag, or it shows up twice in the symbol.
     module_name = (
-        f"kernel_mxscale_moe_gemm_{data_format}"
-        f"_m{M}n{N}k{K}e{batch_count}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
-        f"_b{num_buffers}_sk{split_k}"
-        f"_{_act_tag}_{out_dtype}"
-        f"_wst{int(wave_specialized_tdm)}"
-        f"_asprol{int(tdm_as_in_prologue)}"
-        f"_bias{int(epilogue_bias_mode)}"
-        f"_masked{int(grouped_masked_m)}"
-        f"_pers{int(grouped_persistent_m)}"
-        f"_contig{int(grouped_contiguous_m)}"
-        f"{_quant_tag}"
+        f"kernel_mxscale_{kernel_tag_mode}_{data_format}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_b{num_buffers}"
     ).replace("-", "_")
 
     if use_fp4_bank_friendly_schedule:
@@ -764,6 +666,15 @@ def compile_mxscale_gemm(
             tile_m
         )
 
+        def build_buffer_resource_from_ptr(p, *, num_records_bytes=None):
+            addr_i64 = arith.index_cast(T.i64, ptrtoint(p))
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr_i64, num_records_bytes=num_records_bytes
+            )
+
+        def build_memref_from_ptr(p):
+            return p.view(make_identity_layout((1,)))
+
         def _emit_tile(
             batch_idx,
             bx_local,
@@ -796,9 +707,7 @@ def compile_mxscale_gemm(
                 if valid_m_override is not None:
                     valid_m_i32 = valid_m_override
                 else:
-                    masked_m_rsrc = buffer_ops.create_buffer_resource(
-                        arg_masked_m, max_size=True
-                    )
+                    masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
                     valid_m_i32 = buffer_ops.buffer_load(
                         masked_m_rsrc,
                         arith.index_cast(T.i32, batch_idx),
@@ -852,20 +761,21 @@ def compile_mxscale_gemm(
                 c_rows = arith.index(split_k * batch_count * M)
             else:
                 c_rows = m_idx * arith.index(split_k)
-            c_row_byte_offset = flat_m_base * n_stride * arith.index(elem_bytes_d)
-            c_rem_clamped = arith.minsi(c_rows - flat_m_base, arith.index(tile_m))
-            c_nrec = c_rem_clamped * n_stride * arith.index(elem_bytes_d)
-            c_rsrc = buffer_ops.create_buffer_resource(
-                arg_c, num_records_bytes=c_nrec, base_byte_offset=c_row_byte_offset
-            )
+            c_nrec = c_rows * n_stride * arith.index(elem_bytes_d)
+            c_rsrc = build_buffer_resource_from_ptr(arg_c, num_records_bytes=c_nrec)
             if const_expr(epilogue_bias_mode):
-                bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
+                bias_rsrc = build_buffer_resource_from_ptr(arg_bias)
             zero_i32 = arith.constant(0, type=T.i32)
+            _a_src = build_memref_from_ptr(arg_a)
+            _b_src = build_memref_from_ptr(arg_b)
+            _as_src = build_memref_from_ptr(arg_a_scale)
+            _bs_src = build_memref_from_ptr(arg_b_scale)
+            _c_src = build_memref_from_ptr(arg_c)
 
             def make_desc_a(memref, k_base):
                 k_packed_off = k_base // arith.index(PACK_FACTOR_A)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_a,
+                    global_ptr=_a_src,
                     lds_memref=memref,
                     global_offset=(flat_m_base_input, k_packed_off),
                     tensor_shape=(
@@ -886,7 +796,7 @@ def compile_mxscale_gemm(
             def make_desc_b(memref, k_base, n_offset=0):
                 k_packed_off = k_base // arith.index(PACK_FACTOR_B)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_b,
+                    global_ptr=_b_src,
                     lds_memref=memref,
                     global_offset=(
                         batch_b_base
@@ -912,7 +822,7 @@ def compile_mxscale_gemm(
                 if flat_m_base_override is not None:
                     a_scale_row_base = flat_m_base_input // arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_a_scale,
+                    global_ptr=_as_src,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
                     tensor_shape=(
@@ -946,7 +856,7 @@ def compile_mxscale_gemm(
                 if flat_m_base_override is not None:
                     a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_a_scale,
+                    global_ptr=_as_src,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
                     tensor_shape=(
@@ -976,7 +886,7 @@ def compile_mxscale_gemm(
                 )
                 inner_off = k_scale_off * arith.index(BS_N32K4_BLOCK_N)
                 return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_b_scale,
+                    global_ptr=_bs_src,
                     lds_memref=memref,
                     global_offset=(batch_bs_base + outer_off, inner_off),
                     tensor_shape=(
@@ -1740,7 +1650,7 @@ def compile_mxscale_gemm(
                 addrs = []
                 _bf16_out = out_dtype in ("bf16", "f16")
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    row = warp_m_base + arith.index(m_off) + lane16
+                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
                     col_base = (
                         blk_n
                         + warp_n_base
@@ -1946,7 +1856,7 @@ def compile_mxscale_gemm(
                     raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
                     raw_sub8 = _add_bias_vec8(raw_sub8, wn)
                     row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
-                    row = warp_m_base + arith.index(m_off) + lane16
+                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
                     raw_col_base = (
                         blk_n
                         + warp_n_base
@@ -2004,247 +1914,6 @@ def compile_mxscale_gemm(
                                 f_vec, c_rsrc, arith.index_cast(T.i32, elem_off)
                             )
                         scf.YieldOp([])
-
-            def _emit_stage1_quant_blocks(entries):
-                # Shared MXFP4 quant + scale-preshuffle store for the fused stage1
-                # output, folding moe_fused_quant_preshuffle into the epilogue.
-                # `entries` is a list of (m_off, mx_block_i32, chunks) where each
-                # chunk is (out_col_base_i32, [f32 vals]) of consecutive de-quant
-                # output columns (even length). Both the gugu (interleaved) and
-                # gguu (dual-B) front-ends feed this: a warp owns whole 32-col MX
-                # block(s), each block split as 16 cols/lane over the lane_kgrp
-                # pair, so the block amax = local reduce + one shuffle_xor(16).
-                payload_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=True)
-                scale_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
-                c4_i32 = arith.constant(4, type=T.i32)
-                c16_i32 = arith.constant(16, type=T.i32)
-                c23_i32 = arith.constant(23, type=T.i32)
-                c254_i32 = arith.constant(254, type=T.i32)
-                c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
-                lane_kgrp_i32 = arith.index_cast(T.i32, lane_kgrp)
-                is_kgrp0 = arith.cmpi(
-                    arith.CmpIPredicate.eq, lane_kgrp_i32, arith.constant(0, type=T.i32)
-                )
-
-                for m_off, mx_block, chunks in entries:
-                    row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
-                    row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
-                    row_i32 = arith.index_cast(T.i32, row)
-                    row_local_i32 = arith.index_cast(T.i32, row_local)
-
-                    # Match the non-fused path (activated output is written to the
-                    # bf16/f16 intermediate, then quantized): round each activated
-                    # value to the output element type before amax + fp4 cast so
-                    # the fused epilogue is bit-consistent with gemm1(bf16) +
-                    # standalone quant. Skips only when out_dtype is f32.
-                    if const_expr(_bf16_out):
-                        chunks = [
-                            (
-                                _oc,
-                                [
-                                    arith.extf(T.f32, arith.trunc_f(_out_elem_local, v))
-                                    for v in _vals
-                                ],
-                            )
-                            for _oc, _vals in chunks
-                        ]
-
-                    # Per-block amax over this lane's cols, then combine the
-                    # lane_kgrp peer's cols for the full 32-col block amax.
-                    block_amax = arith.constant(0.0, type=T.f32)
-                    for _out_col_base, vals in chunks:
-                        for o in vals:
-                            a = llvm.call_intrinsic(
-                                T.f32, "llvm.fabs.f32", [_raw(o)], [], []
-                            )
-                            block_amax = arith.maxnumf(block_amax, a)
-                    block_amax = arith.minnumf(block_amax, c_flt_max)
-                    peer = block_amax.shuffle_xor(
-                        c16_i32, arith.constant(WAVE_SIZE, type=T.i32)
-                    )
-                    block_amax = arith.maxnumf(block_amax, peer)
-                    e8m0 = emit_mx_e8m0_scale(block_amax)
-                    recip = ((c254_i32 - e8m0) << c23_i32).bitcast(T.f32)
-                    e8m0_byte = arith.trunci(T.i8, e8m0)
-
-                    # Pack each chunk's consecutive cols into fp4x2 bytes.
-                    payload_writes = []
-                    for out_col_base, vals in chunks:
-                        nibs = [emit_f32_to_e2m1(v * recip) for v in vals]
-                        nbytes = len(vals) // 2
-                        byte_vals = [
-                            nibs[2 * k] | (nibs[2 * k + 1] << c4_i32)
-                            for k in range(nbytes)
-                        ]
-                        packed = functools.reduce(
-                            lambda acc, k: acc
-                            | (byte_vals[k] << arith.constant(8 * k, type=T.i32)),
-                            range(1, nbytes),
-                            byte_vals[0],
-                        )
-                        if const_expr(nbytes == 1):
-                            store_val = arith.trunci(T.i8, packed)
-                        elif const_expr(nbytes == 2):
-                            store_val = arith.trunci(T.i16, packed)
-                        else:
-                            store_val = packed  # i32 (nbytes == 4)
-                        # payload byte offset within row = out_col_base // 2.
-                        chunk_byte = out_col_base >> arith.constant(1, type=T.i32)
-                        payload_byte_off = (
-                            row_i32
-                            * arith.constant(_q_payload_bytes_per_row, type=T.i32)
-                            + chunk_byte
-                        )
-                        payload_writes.append((payload_byte_off, store_val))
-
-                    # Preshuffled e8m0 scale destination (mirrors the standalone
-                    # moe_fused_quant_preshuffle geometry).
-                    scale_dword = arith.divui(mx_block, c4_i32)
-                    byte_in_dword = mx_block - scale_dword * c4_i32
-                    if const_expr(grouped_contiguous_m):
-                        base_dwords = arith.constant(0, type=T.i32)
-                        slot_i32 = row_i32
-                    else:
-                        base_dwords = arith.index_cast(
-                            T.i32, batch_idx
-                        ) * arith.constant(M * _q_scale_dwords_per_row, type=T.i32)
-                        slot_i32 = row_local_i32
-                    scale_tile = arith.divui(
-                        slot_i32, arith.constant(_q_rows_per_tile, type=T.i32)
-                    )
-                    row_in_tile = slot_i32 - scale_tile * arith.constant(
-                        _q_rows_per_tile, type=T.i32
-                    )
-                    wmma_row = arith.divui(row_in_tile, c16_i32)
-                    row_lane16 = row_in_tile - wmma_row * c16_i32
-                    out_row = scale_tile * c16_i32 + row_lane16
-                    scale_row_dword_base = (
-                        base_dwords
-                        + out_row
-                        * arith.constant(_q_dst_scale_dwords_per_row, type=T.i32)
-                        + wmma_row
-                    )
-                    dst_scale_dword = (
-                        scale_row_dword_base
-                        + scale_dword * arith.constant(_q_wmma_rep, type=T.i32)
-                    )
-                    dst_scale_byte = dst_scale_dword * c4_i32 + byte_in_dword
-
-                    store_valid = tile_valid
-                    if const_expr(needs_grouped_row_masked_store):
-                        row_valid = arith.cmpi(
-                            arith.CmpIPredicate.slt, row_local_i32, valid_m_i32
-                        )
-                        store_valid = arith.andi(tile_valid, row_valid)
-                    store_if = scf.IfOp(store_valid, results_=[], has_else=False)
-                    with ir.InsertionPoint(store_if.then_block):
-                        for payload_byte_off, store_val in payload_writes:
-                            buffer_ops.buffer_store(
-                                store_val,
-                                payload_rsrc,
-                                payload_byte_off,
-                                offset_is_bytes=True,
-                            )
-                        k0_if = scf.IfOp(is_kgrp0, results_=[], has_else=False)
-                        with ir.InsertionPoint(k0_if.then_block):
-                            buffer_ops.buffer_store(
-                                e8m0_byte, scale_rsrc, dst_scale_byte
-                            )
-                            scf.YieldOp([])
-                        scf.YieldOp([])
-
-            def epilogue_stage1_act_interleaved_quant_stores(final_accs):
-                # gugu (interleaved single-B) front-end: de-interleave raw pairs
-                # -> silu/swiglu -> 4 output cols per sub-tile. C_N == N//2, so
-                # output col == raw_col//2 and one 32-col MX block spans 4 sub-
-                # tiles (wn//4), i.e. warp_tile_n%64==0.
-                c6_i32 = arith.constant(6, type=T.i32)
-                warp_mx_block0 = arith.index_cast(T.i32, blk_n + warp_n_base) >> c6_i32
-                _q_groups = {}
-                for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    _q_groups.setdefault((m_off, wn // 4), []).append(
-                        (acc_idx, vec_base, wn)
-                    )
-                entries = []
-                for (m_off, blk_in_warp), subs in _q_groups.items():
-                    chunks = []
-                    for acc_idx, vec_base, wn in subs:
-                        raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
-                        raw_sub8 = _add_bias_vec8(raw_sub8, wn)
-                        raw_col_base = (
-                            blk_n
-                            + warp_n_base
-                            + arith.index(wn * WMMA_N)
-                            + lane_kgrp * arith.index(8)
-                        )
-                        out_col_base = arith.index_cast(
-                            T.i32, raw_col_base
-                        ) >> arith.constant(1, type=T.i32)
-                        vals = []
-                        for pair in range_constexpr(4):
-                            g = vector.extract(
-                                raw_sub8,
-                                static_position=[pair * 2],
-                                dynamic_position=[],
-                            )
-                            u = vector.extract(
-                                raw_sub8,
-                                static_position=[pair * 2 + 1],
-                                dynamic_position=[],
-                            )
-                            vals.append(_stage1_act_mul_scalar(g, u))
-                        chunks.append((out_col_base, vals))
-                    entries.append(
-                        (
-                            m_off,
-                            warp_mx_block0 + arith.constant(blk_in_warp, type=T.i32),
-                            chunks,
-                        )
-                    )
-                _emit_stage1_quant_blocks(entries)
-
-            def epilogue_stage1_act_dual_b_quant_stores(gate_accs, up_accs):
-                # gguu (dual-B) front-end: silu/swiglu(gate)*up -> 8 output cols
-                # per sub-tile. C_N == N, so output col == raw_col and one 32-col
-                # MX block spans 2 sub-tiles (wn//2), i.e. warp_tile_n%32==0.
-                c5_i32 = arith.constant(5, type=T.i32)
-                warp_mx_block0 = arith.index_cast(T.i32, blk_n + warp_n_base) >> c5_i32
-                _q_groups = {}
-                for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    _q_groups.setdefault((m_off, wn // 2), []).append(
-                        (acc_idx, vec_base, wn)
-                    )
-                entries = []
-                for (m_off, blk_in_warp), subs in _q_groups.items():
-                    chunks = []
-                    for acc_idx, vec_base, wn in subs:
-                        gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
-                        up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
-                        gate_sub8 = _add_bias_vec8(gate_sub8, wn)
-                        up_sub8 = _add_bias_vec8(up_sub8, wn, N)
-                        out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
-                        out_col_base = arith.index_cast(
-                            T.i32,
-                            blk_n
-                            + warp_n_base
-                            + arith.index(wn * WMMA_N)
-                            + lane_kgrp * arith.index(8),
-                        )
-                        vals = [
-                            vector.extract(
-                                out_sub8, static_position=[vi], dynamic_position=[]
-                            )
-                            for vi in range_constexpr(8)
-                        ]
-                        chunks.append((out_col_base, vals))
-                    entries.append(
-                        (
-                            m_off,
-                            warp_mx_block0 + arith.constant(blk_in_warp, type=T.i32),
-                            chunks,
-                        )
-                    )
-                _emit_stage1_quant_blocks(entries)
 
             def epilogue_stage1_act_interleaved_lds_stores(final_accs, d_buf, d_base):
                 # Same de-interleave + swiglu as the buffer-store path, but write
@@ -2406,7 +2075,7 @@ def compile_mxscale_gemm(
                 #     block_threads=block_threads,
                 # )
                 tdm_ops.l2_prefetch_tile(
-                    arg_b,
+                    _b_src,
                     (
                         batch_b_base + blk_n // arith.index(16),
                         pf_k_packed_b * arith.index(16),
@@ -2564,7 +2233,7 @@ def compile_mxscale_gemm(
                     blk_n / arith.index(2) if stage1_act_interleave else blk_n
                 )
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_c,
+                    global_ptr=_c_src,
                     lds_memref=d_lds_base_ptr,
                     global_offset=(
                         flat_m_base + warp_m_off_sgpr,
@@ -3481,12 +3150,6 @@ def compile_mxscale_gemm(
                 rocdl.s_wait_dscnt(0)
                 tdm_ops.tensor_store_2d(d_desc)
                 tdm_ops.tensor_wait(0)
-            elif const_expr(stage1_quant_out_mode is not None):
-                rocdl.sched_barrier(0)
-                if const_expr(stage1_dual_b):
-                    epilogue_stage1_act_dual_b_quant_stores(accs, accs_up)
-                else:
-                    epilogue_stage1_act_interleaved_quant_stores(accs)
             else:
                 rocdl.sched_barrier(0)
                 if const_expr(epi_addrs_box[0] is None):
@@ -3499,10 +3162,8 @@ def compile_mxscale_gemm(
                     epilogue_stores(accs, epi_addrs_box[0])
 
         if const_expr(grouped_persistent_m):
-            prefix_rsrc = buffer_ops.create_buffer_resource(
-                arg_m_tile_prefix, max_size=True
-            )
-            map_rsrc = buffer_ops.create_buffer_resource(arg_m_tile_map, max_size=True)
+            prefix_rsrc = build_buffer_resource_from_ptr(arg_m_tile_prefix)
+            map_rsrc = build_buffer_resource_from_ptr(arg_m_tile_map)
             block_n_id = arith.index_cast(T.index, _raw(gpu.block_idx.x))
             worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
             grid_size = arith.index(_persistent_workers)
@@ -3570,12 +3231,8 @@ def compile_mxscale_gemm(
             _for_ip.__exit__(None, None, None)
         else:
             if const_expr(grouped_contiguous_m):
-                masked_m_rsrc = buffer_ops.create_buffer_resource(
-                    arg_masked_m, max_size=True
-                )
-                layout_rsrc = buffer_ops.create_buffer_resource(
-                    arg_m_tile_map, max_size=True
-                )
+                masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
+                layout_rsrc = build_buffer_resource_from_ptr(arg_m_tile_map)
                 flat_pid = arith.index_cast(T.index, _raw(gpu.block_idx.x))
                 bz = (
                     arith.index_cast(T.index, _raw(gpu.block_idx.z))
@@ -3702,9 +3359,7 @@ def compile_mxscale_gemm(
                         else arith.index(0)
                     )
                 if const_expr(grouped_masked_m):
-                    masked_m_rsrc = buffer_ops.create_buffer_resource(
-                        arg_masked_m, max_size=True
-                    )
+                    masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
                     valid_m_i32 = buffer_ops.buffer_load(
                         masked_m_rsrc,
                         arith.index_cast(T.i32, batch_idx),
@@ -3734,7 +3389,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 32
+    tdm_store_descriptor_version = 31
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
@@ -3761,7 +3416,6 @@ def compile_mxscale_gemm(
         out_dtype,
         inst_prefetch,
         wave_specialized_tdm,
-        tdm_as_in_prologue,
         split_k,
         use_scale_opsel,
         expert_sched_mode,
@@ -3775,8 +3429,6 @@ def compile_mxscale_gemm(
         stage1_act_mode,
         stage1_weight_layout_mode,
         epilogue_bias_mode,
-        stage1_quant_out_mode,
-        int(stage1_quant_wmma_rep),
         kernel_tag_mode,
         tdm_store_descriptor_version,
     )
@@ -4188,10 +3840,7 @@ def compile_mxscale_gemm(
             "amdgpu-expert-scheduling-mode": True,
         }
 
-    # Quant-out mode threads its e8m0 scale-output buffer through the kernel's
-    # bias tensor slot (bias is unused/disallowed in this mode), so it reuses the
-    # *_bias launch wrappers -- arg_c carries the MXFP4 payload, arg_bias the scale.
-    if epilogue_bias_mode or stage1_quant_out_mode is not None:
+    if epilogue_bias_mode:
         if grouped_masked_m:
             return (
                 launch_mxscale_gemm_masked_persistent_bias

@@ -2057,6 +2057,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
+    route_max_m_const: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2068,6 +2069,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         quant_mode=quant_mode,
         source_topk=source_topk,
         remap_rows=remap_rows,
+        route_max_m_const=route_max_m_const if route_max_m_const > 0 else None,
     )
 
 
@@ -2151,6 +2153,7 @@ def flydsl_moe_fused_quant_preshuffle(
             quant_mode=quant_mode,
             source_topk=source_topk,
             remap_rows=remap_rows,
+            route_max_m_const=route_max_m_arg if remap_rows else 0,
         )
         launch(
             ptr_arg(grouped_in.contiguous().view(-1)),

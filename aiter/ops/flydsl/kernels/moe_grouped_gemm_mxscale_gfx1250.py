@@ -1028,8 +1028,6 @@ def _compile_base_a8w4_gemm(
         stage1_act=stage1_act,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
-        stage1_quant_out=stage1_quant_out,
-        stage1_quant_wmma_rep=stage1_quant_wmma_rep,
         kernel_tag=kernel_tag,
     )
 
