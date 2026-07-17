@@ -48,6 +48,7 @@ from aiter.ops.flydsl.kernels.pipeline_utils import (
     tdm_epilogue_fence_threshold_bytes,
 )
 from aiter.ops.flydsl.kernels.quant_utils import (
+    emit_cvt_pk4_fp8_f32,
     emit_cvt_pk8_fp8_f32,
     emit_f32_to_e2m1,
     emit_mx_e8m0_scale,
@@ -2082,22 +2083,33 @@ def compile_mxscale_gemm(
 
                     payload_writes = []
                     if const_expr(_q_is_fp8):
-                        # Pack each chunk's 8 f32 cols into 8 fp8 e4m3
-                        # bytes. Same f32*recip approach as the fp4 path
-                        # so the conversion stays in f32 without a bf16
-                        # round-trip.
+                        # Pack each chunk's f32 cols into fp8 e4m3 bytes.
+                        # Same f32*recip approach as the fp4 path so the
+                        # conversion stays in f32 without a bf16
+                        # round-trip. gguu (dual-B) feeds 8-wide chunks;
+                        # gugu (interleaved) de-interleaves to 4-wide.
                         for out_col_base, vals in chunks:
                             nvals = len(vals)
-                            assert (
-                                nvals == 8
-                            ), f"fp8 pk8 quant expects 8-elem chunks, got {nvals}"
-                            store_val = emit_cvt_pk8_fp8_f32(
-                                vals,
-                                recip,
-                                rocdl=rocdl,
-                                vector=vector,
-                                T=T,
+                            assert nvals in (4, 8), (
+                                "fp8 pk quant expects 4- or 8-elem chunks, "
+                                f"got {nvals}"
                             )
+                            if const_expr(nvals == 8):
+                                store_val = emit_cvt_pk8_fp8_f32(
+                                    vals,
+                                    recip,
+                                    rocdl=rocdl,
+                                    vector=vector,
+                                    T=T,
+                                )
+                            else:
+                                store_val = emit_cvt_pk4_fp8_f32(
+                                    vals,
+                                    recip,
+                                    rocdl=rocdl,
+                                    vector=vector,
+                                    T=T,
+                                )
                             payload_byte_off = (
                                 row_i32
                                 * arith.constant(_q_payload_bytes_per_row, type=T.i32)
