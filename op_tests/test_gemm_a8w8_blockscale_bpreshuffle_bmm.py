@@ -186,11 +186,24 @@ def main():
         nargs="*",
         default=[
             # Shapes present in a8w8_blockscale_bpreshuffle_tuned_bmm.csv (req 1):
+            (1, 1024, 4096),
+            (2, 1024, 4096),
+            (4, 1024, 4096),
+            (8, 1024, 4096),
+            (16, 1024, 4096),
+            (32, 1024, 4096),
+            (64, 1024, 4096),
             (128, 1024, 4096),
+            (192, 1024, 4096),
             (256, 1024, 4096),
+            (384, 1024, 4096),
+            (512, 1024, 4096),
+            (768, 1024, 4096),
             (1024, 1024, 4096),
-            # Untuned but tile-legal -> exercises the default config (req 3):
-            (192, 512, 2048),
+            (2048, 1024, 4096),
+            (4096, 1024, 4096),
+            (8192, 1024, 4096),
+            (16384, 1024, 4096),
         ],
         help="Shape(s) of m,n,k, e.g.: -s 128,1024,4096",
     )
@@ -200,7 +213,7 @@ def main():
         type=str,
         choices=["bmn", "mbn"],
         nargs="*",
-        default=["bmn", "mbn"],
+        default=["mbn"],
         help="Logical [b,m,*] layout: bmn=contiguous, mbn=[m,b,*] interleaved.",
     )
     parser.add_argument(

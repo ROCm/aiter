@@ -437,19 +437,30 @@ def launch_gemm_a8w8_tdm(
             rocdl.sched_barrier(0)
 
         TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
+        _RATE_BY_WAVE_4W = {0: 2, 1: 2, 2: 1, 3: 1}
+
+        def _pipeline_fence_headroom(rounds_headroom):
+            if const_expr(WAVE_SPEC and not WS8):
+                for _w, _rate in _RATE_BY_WAVE_4W.items():
+                    if wave == _w:
+                        tdm_ops.tensor_wait(_rate * rounds_headroom)
+            else:
+                tdm_ops.tensor_wait(TDM_PER * rounds_headroom)
+            workgroup_barrier()
+
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
         n_steady = K_TILES - (num_buffers - 1)
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+            _pipeline_fence_headroom(num_buffers - 2)
             compute_ktile(buf, kt + (num_buffers - 1))
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+            _pipeline_fence_headroom(num_buffers - 2 - j)
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
