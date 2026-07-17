@@ -1999,11 +1999,13 @@ def flydsl_moe_fused_route_quant_scatter(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
+        use_ksplit_s1 = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=model_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             source_topk=topk,
+            ksplit=use_ksplit_s1,
         )
         launch_routeks(
             ptr_arg(hidden_flat),
@@ -2238,6 +2240,9 @@ def _get_compiled_fused_quant_preshuffle(
     )
 
 
+_ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+
+
 @functools.cache
 def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
@@ -2245,6 +2250,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
+    ksplit: bool = True,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2256,6 +2262,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         quant_mode=quant_mode,
         source_topk=source_topk,
         remap_rows=remap_rows,
+        ksplit=ksplit,
     )
 
 
@@ -2334,12 +2341,14 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             source_topk=source_topk,
             remap_rows=remap_rows,
+            ksplit=use_ksplit,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When

@@ -1258,14 +1258,17 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
+    ksplit: bool = True,
 ):
-    """Route-indexed K-split grouped quant+preshuffle for small token counts.
+    """Route-indexed grouped quant+preshuffle.
 
     Instead of launching over every row in the (E, max_m) capacity buffer and
     skipping padding, this kernel launches only over routed rows
-    (``topids_to_rows``) and K groups. It works for both masked and contiguous-M
-    layouts because ``topids_to_rows`` already contains the global row index in
-    the actual output/input buffer.
+    (``topids_to_rows``). When ``ksplit=True`` (designed for small token counts
+    where grid.x is too small to saturate the GPU), the K-dimension is split
+    across ``grid.y = block_iters`` so each workgroup handles one K-group.
+    When ``ksplit=False`` (large token counts where grid.x already saturates),
+    ``grid.y = 1`` and each warp loops over all K-groups internally.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -1293,12 +1296,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows else ""
+    ksplit_tag = "" if ksplit else "_noKS"
     source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
     source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}"
+        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
     )
 
     @flyc.kernel(name=module_name)
@@ -1338,7 +1342,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
         tid = ArithValue(fx.thread_idx.x)
         bid = ArithValue(fx.block_idx.x)
-        k_group = ArithValue(fx.block_idx.y)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave
@@ -1374,8 +1377,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     + slot
                 )
                 is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
-                is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
-                _if_store = scf.IfOp(arith.andi(is_lane0, is_k0))
+                if const_expr(ksplit):
+                    k_group = ArithValue(fx.block_idx.y)
+                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
+                    store_cond = arith.andi(is_lane0, is_k0)
+                else:
+                    store_cond = is_lane0
+                _if_store = scf.IfOp(store_cond)
                 with ir.InsertionPoint(_if_store.then_block):
                     buffer_ops.buffer_store(row, rows_rsrc, route)
                     scf.YieldOp([])
@@ -1405,10 +1413,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
 
-            c = SimpleNamespace(
+            qc = SimpleNamespace(
                 i32=i32,
                 f32=f32,
-                block_iters=1,
+                block_iters=1 if ksplit else block_iters,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
                 mx_blocks_per_row=mx_blocks_per_row,
                 amax_shuffle_dists=amax_shuffle_dists,
@@ -1441,8 +1449,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
             )
-            _emit_quant_one_k_group(c, k_group)
+            if const_expr(ksplit):
+                k_group_val = ArithValue(fx.block_idx.y)
+                _emit_quant_one_k_group(qc, k_group_val)
+            else:
+                _emit_quant_block_loop(qc)
             scf.YieldOp([])
+
+    _grid_y_dim = block_iters if ksplit else 1
 
     @flyc.jit
     def launch_fused(
@@ -1458,7 +1472,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
-        grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
+        grid_y = arith.index_cast(
+            T.index, arith.constant(_grid_y_dim, type=T.i32)
+        )
         fused_kernel(
             grouped_in,
             grouped_payload,
