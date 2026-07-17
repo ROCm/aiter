@@ -2307,9 +2307,11 @@ namespace aiter {
         lds_load_residual_tile(0);
         v_fn0 = vgpr_load_fn_tile(0);
         __builtin_amdgcn_sched_barrier(0);
-        lds_load_x_tile(1);
-        lds_load_residual_tile(1);
-        v_fn1 = vgpr_load_fn_tile(1);
+        if (k_loop > 1) {
+            lds_load_x_tile(1);
+            lds_load_residual_tile(1);
+            v_fn1 = vgpr_load_fn_tile(1);
+        }
 
         float sqrsum_part[m_repeat];
         fp32xovec_t v_cf[m_repeat][repeat_n];
@@ -2571,8 +2573,8 @@ namespace aiter {
         dim3 grid(mb, n_blocks, split_k); \
         TORCH_CHECK(hidden_size % (tile_k * split_k) == 0, \
                     "hidden_size must be divisible by tile_k * split_k"); \
-        TORCH_CHECK(hidden_size >= (tile_k * split_k) * 2, \
-                    "hidden_size must be >= tile_k * split_k * 2 for prefetch"); \
+        TORCH_CHECK(hidden_size >= (tile_k * split_k), \
+                    "hidden_size must be >= tile_k * split_k (>=1 k-tile per split)"); \
         mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt, MHC_FUSED_BF16> \
             <<<grid, block, 0, stream>>>( \
                 reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
