@@ -99,6 +99,31 @@ def _fp8x2_to_bf16(fp8_word_i32, scale_f32, sel: int):
     )
 
 
+def _fp4x2_to_bf16(fp4_word_i32, scale_f32, sel: int):
+    """Convert one packed FP4 pair to packed BF16 (gfx950 only).
+
+    v_cvt_scalef32_pk_bf16_fp4 dst, src, scale [op_sel_modifier]
+      src   : i32 holding 8 packed FP4 (E2M1) values
+      scale : f32 multiplier applied during conversion
+      sel=0 → fp4[0], fp4[1]  (byte 0, bits  [7: 0])  — no op_sel
+      sel=1 → fp4[2], fp4[3]  (byte 1, bits [15: 8])  — op_sel:[1,0,0]
+      sel=2 → fp4[4], fp4[5]  (byte 2, bits [23:16])  — op_sel:[0,1,0]
+      sel=3 → fp4[6], fp4[7]  (byte 3, bits [31:24])  — op_sel:[1,1,0]
+      dst   : i32 holding 2 packed BF16 results
+    """
+    _OP_SEL = {0: "", 1: " op_sel:[1,0,0]", 2: " op_sel:[0,1,0]", 3: " op_sel:[1,1,0]"}
+    asm = f"v_cvt_scalef32_pk_bf16_fp4 $0, $1, $2{_OP_SEL[sel]}"
+    return llvm.inline_asm(
+        T.i32,
+        [fp4_word_i32, scale_f32],
+        asm,
+        "=v,v,v",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def _vmcnt_n(n: int):
     """s_waitcnt vmcnt(N) — wait until N or fewer VMEM ops are outstanding.
 
@@ -214,28 +239,31 @@ def compile_wd_moe_gate_up(
                 if False, use scalar FP32 path (gfx942 + gfx950).
                 Ignored (forced True) when w_dtype="fp8".
     """
-    if w_dtype not in ("bf16", "fp8"):
-        raise ValueError(f"w_dtype must be 'bf16' or 'fp8', got {w_dtype!r}")
+    if w_dtype not in ("bf16", "fp8", "fp4"):
+        raise ValueError(f"w_dtype must be 'bf16', 'fp8', or 'fp4', got {w_dtype!r}")
     if hidden % (_WAVE_SIZE * k_vector) != 0:
         raise ValueError(
             f"hidden={hidden} must be divisible by WAVE_SIZE*k_vector"
             f"={_WAVE_SIZE * k_vector}"
         )
 
-    # FP8 weights always require dot2 (v_cvt_scalef32_pk_bf16_fp8 is gfx950-only)
-    _use_dot2 = True if w_dtype == "fp8" else use_dot2
-    _w_bytes = 1 if w_dtype == "fp8" else 2  # bytes per weight element
+    # FP8/FP4 weights always require dot2 (gfx950-only conversion instructions)
+    _use_dot2 = True if w_dtype in ("fp8", "fp4") else use_dot2
+    # Bytes per weight element: BF16=2, FP8=1, FP4=0.5 (represented as a fraction)
+    # Row buffer size uses integer arithmetic: HIDDEN*2, HIDDEN*1, or HIDDEN//2 bytes.
+    _w_bytes = 2 if w_dtype == "bf16" else 1  # placeholder for row_nb computation
+    _w_fp4 = w_dtype == "fp4"
 
-    # For FP8: k_vector elements = k_vector bytes = k_vector//4 i32 words of weight.
-    # For BF16: k_vector elements = k_vector*2 bytes = k_vector//2 i32 words of weight.
-    # Activation always BF16: k_vector elements = k_vector//2 i32 words.
-    _k_pairs = k_vector // 2  # activation i32 pairs per lane per K-step
-    # FP8: each weight i32 covers 4 elements → k_vector//4 words → each word feeds 2 pairs
+    # Activation always BF16: k_vector elements = k_vector//2 i32 pairs per K-step.
+    _k_pairs = k_vector // 2
+    # FP8: k_vector//4 i32 words per lane (4 FP8 per i32, 2 pairs per word).
     _k_fp8_words = k_vector // 4  # only used for fp8 path
+    # FP4: 1 i32 word per lane (8 FP4 per i32, 4 pairs per word).
+    # _k_fp4_words = 1       (always 1 for k_vector=8)
     _k_step = _WAVE_SIZE * k_vector  # K-elements per loop iteration
     _n_k_steps = hidden // _k_step
 
-    w_tag = "fp8" if w_dtype == "fp8" else ("d2" if _use_dot2 else "f32")
+    w_tag = w_dtype if w_dtype in ("fp8", "fp4") else ("d2" if _use_dot2 else "f32")
     module_name = (
         f"wd_gate_up_h{hidden}_i{inter}_e{experts}_topk{topk}" f"_kv{k_vector}_w{w_tag}"
     )
@@ -299,13 +327,23 @@ def compile_wd_moe_gate_up(
         expert_i64 = arith.extsi(i64, expert_e)
         neuron_i64 = arith.extsi(i64, neuron_j)
         # row byte offset = (expert*INTER + neuron) * HIDDEN * bytes_per_elem
-        w_row_byte_off = (
-            (expert_i64 * INTER_i64 + neuron_i64)
-            * HIDDEN_i64
-            * arith.constant(_w_bytes, type=i64)
-        )
-        # intra-row range: HIDDEN * bytes_per_elem (fits i32; max 14336 for DeepSeek-V3 FP8)
-        row_nb = HIDDEN_i32 * arith.constant(_w_bytes, type=i32)
+        # For FP4: row is HIDDEN/2 bytes (8 FP4 per i32 → HIDDEN/8 i32 words).
+        # Pre-initialise so the AST rewriter resolves both variables in both branches.
+        row_nb = arith.constant(0, type=i32)
+        w_row_byte_off = arith.constant(0, type=i64)
+        if _w_fp4:
+            row_nb = HIDDEN_i32 // arith.constant(2, type=i32)
+            w_row_byte_off = (
+                (expert_i64 * INTER_i64 + neuron_i64)
+                * (HIDDEN_i64 // arith.constant(2, type=i64))
+            )
+        else:
+            row_nb = HIDDEN_i32 * arith.constant(_w_bytes, type=i32)
+            w_row_byte_off = (
+                (expert_i64 * INTER_i64 + neuron_i64)
+                * HIDDEN_i64
+                * arith.constant(_w_bytes, type=i64)
+            )
 
         wg_base = arith.addi(
             arith.index_cast(i64, fx.ptrtoint(arg_w_gate)), w_row_byte_off
@@ -355,7 +393,71 @@ def compile_wd_moe_gate_up(
         g_final = zero_f32
         u_final = zero_f32
 
-        if w_dtype == "fp8":
+        c_eight = arith.constant(8, type=i32)
+
+        if w_dtype == "fp4":
+            # ── FP4: batched load/compute (same structure as FP8 but 2× denser)
+            # One i32 = 8 FP4 values per lane per k_step (vs 2 i32 for FP8).
+            # v_cvt_scalef32_pk_bf16_fp4 with sel=0..3 extracts 4 BF16 pairs.
+            for_op = scf.ForOp(
+                arith.constant(0, index=True),
+                arith.constant(_n_k_steps, index=True),
+                c1_idx,
+                iter_args=[zero_f32, zero_f32],
+            )
+            with ir.InsertionPoint(for_op.body):
+                step_i32 = arith.index_cast(i32, for_op.induction_variable)
+                g_acc = for_op.inner_iter_args[0]
+                u_acc = for_op.inner_iter_args[1]
+                lane_k = step_i32 * c_k_step + lane_kV
+
+                # One FP4 i32 per weight row covers all k_vector=8 elements
+                w_fp4_off = lane_k // c_eight
+                g_fp4_word = buffer_ops.buffer_load(
+                    wg_row_rsrc, w_fp4_off, vec_width=1, dtype=i32
+                )
+                u_fp4_word = buffer_ops.buffer_load(
+                    wu_row_rsrc, w_fp4_off, vec_width=1, dtype=i32
+                )
+                # 4 x loads (one BF16 i32 pair per sel)
+                x_words_fp4: list = []
+                for sel in range_constexpr(4):
+                    pair_elem = arith.constant(sel * 2, type=i32)
+                    x_off = (x_row_base + lane_k + pair_elem) // c_two
+                    x_words_fp4.append(
+                        buffer_ops.buffer_load(x_rsrc, x_off, vec_width=1, dtype=i32)
+                    )
+
+                _vmcnt0()
+
+                g_slots: list = []
+                u_slots: list = []
+                for sel in range_constexpr(4):
+                    xw = x_words_fp4[sel]
+                    g_slots.append(
+                        _dot2_batched(
+                            zero_f32, xw, _fp4x2_to_bf16(g_fp4_word, w_scale, sel)
+                        )
+                    )
+                    u_slots.append(
+                        _dot2_batched(
+                            zero_f32, xw, _fp4x2_to_bf16(u_fp4_word, w_scale, sel)
+                        )
+                    )
+                rocdl.s_nop(2)
+                gp = g_slots[0]
+                up = u_slots[0]
+                for i in range(1, _k_pairs):
+                    gp = arith.addf(gp, g_slots[i])
+                    up = arith.addf(up, u_slots[i])
+                g_cur = arith.addf(g_acc, gp)
+                u_cur = arith.addf(u_acc, up)
+                scf.YieldOp([g_cur, u_cur])
+
+            g_final = for_op.results[0]
+            u_final = for_op.results[1]
+
+        elif w_dtype == "fp8":
             # ── FP8: batched load/compute (proven correct, 44%→65% HBM gain) ─
             # Prefetch pipeline has an unresolved phase bug for FP8 (alternating
             # k-step correctness when n_k_steps is odd).  Use the working batched

@@ -134,6 +134,27 @@ def _run_kernel(
     torch.cuda.synchronize()
 
 
+def _ref_gate_up_lowp(
+    x: torch.Tensor,
+    w_gate_f: torch.Tensor,   # [E*inter, hidden] float32 dequantised weights
+    w_up_f: torch.Tensor,
+    router_ids: torch.Tensor,
+    B: int,
+    topk: int,
+    inter: int,
+) -> torch.Tensor:
+    """Reference for low-precision weight paths (FP8/FP4, round-tripped to float32)."""
+    ref = torch.zeros(B * topk, inter, dtype=torch.float32, device=x.device)
+    xf = x.float()
+    for slot in range(B * topk):
+        tok = slot // topk
+        e = router_ids[slot].item()
+        gv = w_gate_f[e * inter : (e + 1) * inter] @ xf[tok]
+        uv = w_up_f[e * inter : (e + 1) * inter] @ xf[tok]
+        ref[slot] = torch.sigmoid(gv) * gv * uv
+    return ref.to(torch.bfloat16)
+
+
 def _ref_gate_up_fp8(
     x: torch.Tensor,  # [B, hidden] bf16
     w_gate_f: torch.Tensor,  # [E*inter, hidden] float32 (dequantised weights)
@@ -310,6 +331,77 @@ def test_gate_up_bf16x_fp8w(shape_name, hidden, inter, topk, experts, B):
         atol=0.1,
         rtol=0.1,
         pass_pct=90.0,
+    )
+
+
+# FP4 test uses small shapes to keep vectorised packing fast.
+# hidden must be divisible by WAVE_SIZE * k_vector = 64 * 8 = 512.
+_FP4_SHAPES = [
+    ("tiny", 512, 64, 4, 16),
+    ("small", 1024, 128, 4, 32),
+]
+
+_FP4_REP = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+
+
+def _fp4_round_vec(t: torch.Tensor) -> torch.Tensor:
+    """Round float32 tensor to nearest FP4 E2M1 value (vectorised, chunked)."""
+    sign = t.float().sign()
+    t_abs = t.float().abs().clamp(0, 6).reshape(-1)
+    chunk = 1 << 20
+    out = torch.empty_like(t_abs)
+    for s in range(0, t_abs.numel(), chunk):
+        e = min(s + chunk, t_abs.numel())
+        out[s:e] = _FP4_REP[((t_abs[s:e].unsqueeze(-1) - _FP4_REP).abs().argmin(dim=-1))]
+    return out.reshape(t.shape) * sign
+
+
+def _pack_fp4_vec(t_deq: torch.Tensor) -> torch.Tensor:
+    """Pack float32 E2M1 values into uint8 (2 FP4 per byte), vectorised."""
+    flat = t_deq.float().reshape(-1)
+    signs = (flat < 0).to(torch.uint8) * 8
+    abs_v = flat.abs()
+    codes = ((abs_v.unsqueeze(-1) - _FP4_REP).abs().argmin(dim=-1)).to(torch.uint8) | signs
+    return ((codes[1::2] << 4) | codes[0::2]).byte()
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", _FP4_SHAPES)
+@pytest.mark.parametrize("B", [1, 2])
+def test_gate_up_bf16x_fp4w(shape_name, hidden, inter, topk, experts, B):
+    """BF16 act × FP4 weight gate_up — gfx950 only, matches CK gate_fp4_d2."""
+    if not _is_gfx950():
+        pytest.skip(f"w_dtype='fp4' requires gfx950, got {_rocm_arch()}")
+
+    torch.manual_seed(42)
+    x = torch.randn(B, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    wg_f32 = torch.randn(experts * inter, hidden) * 0.1
+    wu_f32 = torch.randn(experts * inter, hidden) * 0.1
+    wg_deq = _fp4_round_vec(wg_f32)
+    wu_deq = _fp4_round_vec(wu_f32)
+    wg_fp4 = _pack_fp4_vec(wg_deq).cuda()
+    wu_fp4 = _pack_fp4_vec(wu_deq).cuda()
+
+    router_ids = torch.randint(0, experts, (B * topk,), dtype=torch.int32, device="cuda")
+    inter_out = torch.zeros(B * topk * inter, dtype=torch.bfloat16, device="cuda")
+
+    ref = _ref_gate_up_lowp(x, wg_deq.cuda(), wu_deq.cuda(), router_ids, B, topk, inter)
+
+    exe = compile_wd_moe_gate_up(
+        hidden=hidden, inter=inter, experts=experts, topk=topk, w_dtype="fp4"
+    )
+    _run_kernel(
+        exe, inter_out, x, wg_fp4, wu_fp4, router_ids, B, topk, inter, hidden, experts,
+        w_scale=1.0,
+    )
+
+    # FP4 rounding introduces quantisation error; use relaxed tolerance.
+    _check(
+        ref,
+        inter_out.view(B * topk, inter),
+        f"{shape_name} B={B} fp4w",
+        atol=0.2,
+        rtol=0.1,
+        pass_pct=85.0,
     )
 
 
