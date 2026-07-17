@@ -449,6 +449,7 @@ def _grouped_a8w4_tdm_moe(
         else topk_weight.contiguous()
     )
     flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
+    os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
     return moe_out
 
 def _maybe_grouped_gfx1250_a8w4_moe(

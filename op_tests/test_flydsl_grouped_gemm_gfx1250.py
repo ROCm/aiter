@@ -697,6 +697,94 @@ def test_grouped_a8w4_swiglu_limit_clamps(layout, activation, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# TDM pipeline: token sweep, activations, CUDAGraph, balanced/unbalanced
+# ---------------------------------------------------------------------------
+# All a8w4 gugu tests route through the TDM pipeline by default on gfx1250.
+# Each test asserts AITER_LAST_FUSED_MOE_IMPL == "grouped_a8w4_tdm" to confirm
+# the TDM path was actually taken (not the original mxscale pipeline).
+
+def _assert_tdm_path():
+    impl = os.environ.get("AITER_LAST_FUSED_MOE_IMPL", "")
+    assert impl == "grouped_a8w4_tdm", (
+        f"expected TDM path but got impl={impl!r}; "
+        "check AITER_GROUPED_A8W4_TDM and stage1_weight_layout"
+    )
+
+
+def _setup_tdm(monkeypatch, balanced):
+    monkeypatch.setenv("AITER_FORCE_A8W4", "1")
+    if balanced:
+        monkeypatch.setenv("AITER_MOE_EXPERT_BALANCE", "true")
+    else:
+        monkeypatch.delenv("AITER_MOE_EXPERT_BALANCE", raising=False)
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 5, 8, 16, 32, 64, 77, 128])
+@pytest.mark.parametrize("balanced", [True, False])
+def test_a8w4_tdm_token_sweep(tokens, balanced, monkeypatch):
+    _setup_tdm(monkeypatch, balanced)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+            experts=96, tokens=tokens, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            tol=VERIFY_TOL_A8W4, check_aot_cache=False)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("tokens", [256, 512, 999, 1024, 16333])
+@pytest.mark.parametrize("balanced", [True, False])
+def test_a8w4_tdm_large_tokens(tokens, balanced, monkeypatch):
+    _setup_tdm(monkeypatch, balanced)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+            experts=96, tokens=tokens, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            tol=VERIFY_TOL_A8W4, check_aot_cache=False)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+def test_a8w4_tdm_activations(activation, monkeypatch):
+    _setup_tdm(monkeypatch, True)
+    run_moe("a8w4", layout="gugu", activation=activation,
+            experts=96, tokens=64, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            tol=VERIFY_TOL_A8W4, check_aot_cache=False)
+    _assert_tdm_path()
+
+
+def test_a8w4_tdm_swiglu_limit(monkeypatch):
+    _setup_tdm(monkeypatch, True)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Swiglu,
+            experts=96, tokens=64, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            swiglu_limit=1.0, tol=VERIFY_TOL_A8W4,
+            check_aot_cache=False)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("tokens", [8, 64, 128, 512, 1024])
+@pytest.mark.parametrize("balanced", [True, False])
+def test_a8w4_tdm_cudagraph(tokens, balanced, monkeypatch):
+    _setup_tdm(monkeypatch, balanced)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+            experts=96, tokens=tokens, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            tol=VERIFY_TOL_A8W4, check_aot_cache=False,
+            bench=True)
+    _assert_tdm_path()
+
+
+@pytest.mark.parametrize("tokens", [3, 77, 999])
+def test_a8w4_tdm_cudagraph_unaligned(tokens, monkeypatch):
+    _setup_tdm(monkeypatch, False)
+    run_moe("a8w4", layout="gugu", activation=ActivationType.Silu,
+            experts=96, tokens=tokens, topk=6,
+            model_dim=7168, inter_dim=3072, use_bias=False,
+            tol=VERIFY_TOL_A8W4, check_aot_cache=False,
+            bench=True)
+    _assert_tdm_path()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _mock_grouped_gemm() -> None:
