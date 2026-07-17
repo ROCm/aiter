@@ -36,6 +36,8 @@ import flydsl.expr as fx  # noqa: E402
 try:
     from aiter.ops.flydsl.kernels.moe_warp_decode import (
         compile_wd_moe_gate_up,
+        compile_wd_moe_gate_up_splitk,
+        compile_wd_moe_gate_finalize,
         compile_wd_moe_down_reduce,
     )
 except ImportError:
@@ -50,6 +52,8 @@ except ImportError:
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     compile_wd_moe_gate_up = _mod.compile_wd_moe_gate_up
+    compile_wd_moe_gate_up_splitk = _mod.compile_wd_moe_gate_up_splitk
+    compile_wd_moe_gate_finalize = _mod.compile_wd_moe_gate_finalize
     compile_wd_moe_down_reduce = _mod.compile_wd_moe_down_reduce
 
 
@@ -788,6 +792,85 @@ def test_down_reduce_splitk_f32path(
         y_out,
         f"{shape_name} B={B} down kb={k_batch} f32path",
         atol=0.01,
+        rtol=0.05,
+    )
+
+
+# ---------------------------------------------------------------------------
+# split-K gate_up tests (two-phase: atomicAdd partials + finalize)
+# ---------------------------------------------------------------------------
+
+# k_batch must satisfy: hidden % (k_batch * 64 * 8) == 0 and k_batch >= 2.
+# qwen3next  hidden=2048: 2048/512=4 → k_batch=2,4 ok
+# minimax    hidden=3072: 3072/512=6 → k_batch=2,3 ok
+# deepseek   hidden=7168: 7168/512=14 → k_batch=2,7 ok
+_SPLITK_GATE_UP_PARAMS = [
+    ("qwen3next", 2048, 512, 10, 512, 2),
+    ("minimax", 3072, 1536, 8, 256, 2),
+    ("deepseek-v3", 7168, 2048, 8, 256, 2),
+]
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts,k_batch", _SPLITK_GATE_UP_PARAMS)
+@pytest.mark.parametrize("B", BATCHES)
+def test_gate_up_splitk_f32path(shape_name, hidden, inter, topk, experts, k_batch, B):
+    """gate_up split-K (two-phase FP32 atomicAdd), arch-agnostic f32 scalar path."""
+    torch.manual_seed(42)
+    x = torch.randn(B, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    w_gate = (
+        torch.randn(experts * inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_up = (
+        torch.randn(experts * inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    router_ids = torch.randint(0, experts, (B * topk,), dtype=torch.int32, device="cuda")
+
+    ref = _ref_gate_up(x, w_gate, w_up, router_ids, B, topk, inter)
+
+    # Phase 1: accumulate FP32 gate/up partials via atomicAdd
+    gate_scratch = torch.zeros(B * topk * inter, dtype=torch.float32, device="cuda")
+    up_scratch = torch.zeros(B * topk * inter, dtype=torch.float32, device="cuda")
+    inter_out = torch.zeros(B * topk * inter, dtype=torch.bfloat16, device="cuda")
+
+    exe_sk = compile_wd_moe_gate_up_splitk(
+        hidden=hidden, inter=inter, experts=experts, topk=topk, k_batch=k_batch
+    )
+    exe_fin = compile_wd_moe_gate_finalize(inter=inter, topk=topk)
+
+    stream = torch.cuda.current_stream()
+    exe_sk(
+        _ptr(gate_scratch),
+        _ptr(up_scratch),
+        _ptr(x),
+        _ptr(w_gate),
+        _ptr(w_up),
+        _ptr(router_ids),
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    # Phase 2: silu(gate) * up → BF16
+    exe_fin(
+        _ptr(inter_out),
+        _ptr(gate_scratch),
+        _ptr(up_scratch),
+        B,
+        topk,
+        inter,
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    _check(
+        ref,
+        inter_out.view(B * topk, inter),
+        f"{shape_name} B={B} gate_up_sk kb={k_batch}",
+        atol=0.1,
         rtol=0.05,
     )
 

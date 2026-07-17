@@ -683,8 +683,6 @@ def compile_wd_moe_gate_up_splitk(
     _k_step = _WAVE_SIZE * k_vector
     _n_k_steps = hidden // _k_step
     _n_k_steps_per_batch = _n_k_steps // k_batch
-    _w_nbytes = experts * inter * hidden * 2  # BF16 weight bytes (w_dtype="bf16")
-
     @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
     def _kernel(
         arg_gate_scratch: fx.Pointer,  # [B*TOPK*INTER] f32, zero-init
