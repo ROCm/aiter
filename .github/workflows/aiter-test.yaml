@@ -87,6 +87,7 @@ jobs:
             git submodule update --init --recursive --depth 1 --jobs 4
           fi
           echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
+          ./.github/scripts/apply_ck_patches.sh
 
       - name: Docker login
         if: ${{ matrix.build_enabled && (!github.event.pull_request || !github.event.pull_request.head.repo.fork) }}
@@ -562,6 +563,7 @@ jobs:
             git submodule sync
             git submodule update --init --recursive --depth 1 --jobs 4
           fi
+          ./.github/scripts/apply_ck_patches.sh
 
       - name: Install Aiter wheel
         run: |
@@ -838,6 +840,7 @@ jobs:
             git submodule sync
             git submodule update --init --recursive --depth 1 --jobs 4
           fi
+          ./.github/scripts/apply_ck_patches.sh
 
       - name: Install Aiter wheel
         run: |

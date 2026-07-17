@@ -144,6 +144,7 @@ jobs:
             git checkout '${GITHUB_COMMIT_SHA}'
             git submodule sync --recursive
             git submodule update --init --recursive
+            ./.github/scripts/apply_ck_patches.sh
             pip install -e .
             # ./.github/scripts/install_triton.sh
             pip show triton || true
