@@ -33,12 +33,31 @@ This file is retained for two reasons only:
 
 The default output path is /tmp/opus_debug_tuned.csv so this script can
 never accidentally pollute the global aiter/configs/ tree.
+
+Allocator fragmentation example (optional)
+-----------------------------------------
+PyTorch GPU allocations in this script go through the caching allocator.
+To reduce fragmentation, set allocator policy in the launcher environment
+BEFORE importing torch, for example:
+
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
+    python3 csrc/opus_gemm/opus_gemm_tune.py -m 4096 -n 4096 -k 4096
+
+Because this file imports torch at module import time, setting
+PYTORCH_CUDA_ALLOC_CONF inside this script is too late.
+
+For a closer C++-style allocator test, pass --raw-hip-alloc. This enables a
+test-only pluggable allocator (hipMalloc/hipFree) for this script process and
+its mp_tuner workers. It is best-effort and falls back to torch's default
+allocator when unsupported.
 """
 
 import json
 import logging
 import os
+import subprocess
 import sys
+import tempfile
 
 import pandas as pd
 import torch
@@ -113,6 +132,111 @@ EVEN_LOOP_SPLITK_TAGS = frozenset(
         "a16w16_quad_mfma32_kbuf1_sk",
     )
 )
+
+
+# Test-only toggle: route torch CUDA allocations through raw hipMalloc/hipFree
+# via PyTorch's pluggable allocator API.
+_RAW_HIP_ALLOC_ENV = "AITER_OPUS_RAW_HIP_ALLOC"
+_raw_hip_allocator_install_attempted = False
+_raw_hip_allocator_installed = False
+
+
+def _build_raw_hip_allocator_so() -> str:
+    """Build (or reuse) a tiny shared library exposing malloc/free symbols
+    compatible with torch.cuda.memory.CUDAPluggableAllocator.
+
+    This is debug/test-only and intentionally local to opus_gemm_tune.py.
+    """
+    build_dir = os.path.join(tempfile.gettempdir(), "aiter_opus_raw_allocator")
+    os.makedirs(build_dir, exist_ok=True)
+    src = os.path.join(build_dir, "raw_hip_alloc.cpp")
+    so = os.path.join(build_dir, "libraw_hip_alloc.so")
+
+    if not os.path.exists(src):
+        code = r'''
+#include <cstddef>
+#include <cstdint>
+#include <hip/hip_runtime_api.h>
+
+extern "C" {
+
+void* aiter_raw_hip_malloc(std::size_t size, int /*device*/, void* /*stream*/) {
+    void* p = nullptr;
+    if (size == 0) return p;
+    if (hipMalloc(&p, size) != hipSuccess) return nullptr;
+    return p;
+}
+
+void aiter_raw_hip_free(void* ptr, std::size_t /*size*/, int /*device*/, void* /*stream*/) {
+    if (ptr) {
+        (void)hipFree(ptr);
+    }
+}
+
+}
+'''
+        with open(src, "w") as f:
+            f.write(code)
+
+    # Rebuild when missing; if build fails we gracefully fall back.
+    if not os.path.exists(so):
+        cxx = os.environ.get("HIPCXX", "hipcc")
+        cmd = [cxx, "-shared", "-fPIC", src, "-o", so]
+        subprocess.check_call(cmd)
+
+    return so
+
+
+def _maybe_install_raw_hip_allocator_once() -> bool:
+    """Install a test-only raw HIP allocator in the current process.
+
+    Returns True only when the allocator is active in this process.
+    """
+    global _raw_hip_allocator_install_attempted, _raw_hip_allocator_installed
+
+    if _raw_hip_allocator_install_attempted:
+        return _raw_hip_allocator_installed
+    _raw_hip_allocator_install_attempted = True
+
+    if os.environ.get(_RAW_HIP_ALLOC_ENV) != "1":
+        return False
+
+    try:
+        mem_mod = getattr(torch.cuda, "memory", None)
+        if mem_mod is None:
+            logger.warning(
+                "OpusGemmA16W16Tuner: torch.cuda.memory API unavailable; "
+                "cannot enable --raw-hip-alloc"
+            )
+            return False
+        if not hasattr(mem_mod, "CUDAPluggableAllocator") or not hasattr(
+            mem_mod, "change_current_allocator"
+        ):
+            logger.warning(
+                "OpusGemmA16W16Tuner: CUDAPluggableAllocator unsupported in this torch build; "
+                "cannot enable --raw-hip-alloc"
+            )
+            return False
+
+        so = _build_raw_hip_allocator_so()
+        alloc = mem_mod.CUDAPluggableAllocator(
+            so,
+            "aiter_raw_hip_malloc",
+            "aiter_raw_hip_free",
+        )
+        mem_mod.change_current_allocator(alloc)
+        _raw_hip_allocator_installed = True
+        logger.info(
+            "OpusGemmA16W16Tuner: enabled test-only raw HIP allocator "
+            "(hipMalloc/hipFree via CUDAPluggableAllocator)"
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "OpusGemmA16W16Tuner: failed to enable --raw-hip-alloc; "
+            f"falling back to default torch allocator ({e})"
+        )
+        return False
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -1053,6 +1177,7 @@ def generate_data(
     # gen_data is the earliest subprocess-side hook mp_tuner.work_group invokes
     # (mp_tuner.py:139-143), before worker() is ever called.
     _install_opus_perftest_once()
+    _maybe_install_raw_hip_allocator_once()
 
     # mp_tuner pickles task tuples with `gen_args` containing primitive types only; torch.dtype
     # objects survive pickling fine, but if...
@@ -1519,6 +1644,15 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "are dropped with a log line. Compile sidecar is auto-expanded "
             "to cover the requested kids if needed.",
         )
+        self.parser.add_argument(
+            "--raw-hip-alloc",
+            action="store_true",
+            default=False,
+            dest="raw_hip_alloc",
+            help="[TEST-ONLY] Use PyTorch's pluggable allocator to route tensor "
+            "allocations through raw hipMalloc/hipFree (closest to C++ allocator "
+            "behavior). Falls back to default torch allocator if unsupported.",
+        )
 
     def pre_process(self, args):
         """Override to:
@@ -1547,6 +1681,13 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         # update_tunedf only receives (df_old, df_updates); cache verbose here so the override can
         # decide whether to dump the per-row rej...
         self._args_verbose_cached = bool(getattr(args, "verbose", False))
+        # Propagate test-only allocator toggle to mp_tuner subprocesses.
+        os.environ[_RAW_HIP_ALLOC_ENV] = "1" if bool(args.raw_hip_alloc) else "0"
+        if args.raw_hip_alloc:
+            # Best-effort install in the parent too (workers install in
+            # generate_data before first allocation).
+            _maybe_install_raw_hip_allocator_once()
+
         cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
         cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
         cli_bias = bool(args.bias)
