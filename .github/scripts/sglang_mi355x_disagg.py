@@ -54,11 +54,25 @@ def patch_launcher(args: argparse.Namespace) -> None:
 -v /it-share:/it-share:ro -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 """,
         """MODEL_MOUNT_ARGS=""
+MODEL_DOWNLOAD_MOUNT_ARGS=""
 for mount_root in ${MODEL_MOUNT_ROOTS:-/it-share /data /models}; do
     if [[ -d "$mount_root" ]]; then
         MODEL_MOUNT_ARGS+=" -v $mount_root:$mount_root:ro"
+        MODEL_DOWNLOAD_MOUNT_ARGS+=" -v $mount_root:$mount_root:rw"
     fi
 done
+
+MODEL_CACHE_ARGS="-e HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}"
+if [[ -d /data ]]; then
+    mkdir -p /data/models2/.hf-cache 2>/dev/null || true
+fi
+if [[ -d /data/models2/.hf-cache ]]; then
+    MODEL_CACHE_ARGS+=" -e HF_HOME=/root/.cache/huggingface -e HF_XET_CACHE=/root/.cache/huggingface/xet"
+    MODEL_CACHE_ARGS+=" -v /data/models2/.hf-cache:/root/.cache/huggingface:rw"
+fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    MODEL_CACHE_ARGS+=" -e HF_TOKEN"
+fi
 
 AITER_MOUNT_ARGS=""
 if [[ -n "${AITER_SOURCE_DIR:-}" ]]; then
@@ -82,7 +96,10 @@ DOCKER_COMMON="--rm --network host --ipc host --shm-size 128g --privileged \\
 --ulimit memlock=-1:-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \\
 --security-opt seccomp=unconfined \\
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \\
--v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $AITER_MOUNT_ARGS $HOST_IBVERBS_ARGS $CHECKOUT_DOCKER_ARGS"
+-v $WORKDIR:/ci_workdir -v $HOME:/host_home $MODEL_MOUNT_ARGS $MODEL_CACHE_ARGS $AITER_MOUNT_ARGS $HOST_IBVERBS_ARGS $CHECKOUT_DOCKER_ARGS"
+DOCKER_DOWNLOAD_COMMON="--rm --network host --ipc host --shm-size 32g \\
+--security-opt seccomp=unconfined \\
+-v $WORKDIR:/ci_workdir $MODEL_DOWNLOAD_MOUNT_ARGS $MODEL_CACHE_ARGS"
 """,
     )
     text = replace_once(
@@ -126,7 +143,7 @@ echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP 
     text = replace_once(
         text,
         'cat > "$WORKDIR/prefill_entry.sh" <<EOF',
-        """cat > "$WORKDIR/install_checkout_aiter.sh" <<'EOF'
+        r"""cat > "$WORKDIR/install_checkout_aiter.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -177,6 +194,150 @@ except Exception:
 PY
 EOF
 
+cat > "$WORKDIR/model_path_helpers.sh" <<'EOF'
+#!/bin/bash
+
+model_has_complete_files() {
+  local p="$1"
+  [[ -f "$p/config.json" ]] || return 1
+  find "$p" -maxdepth 1 -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print -quit 2>/dev/null | grep -q .
+}
+
+resolve_local_model_path() {
+  local original="${1:-}"
+  local p="$original"
+  [[ -n "$p" && "$p" == /* && -e "$p" ]] || return 1
+
+  if model_has_complete_files "$p"; then
+    printf "%s\\n" "$p"
+    return 0
+  fi
+
+  if [[ -d "$p/models--sgl-project--DeepSeek-V4-Pro-FP8" ]]; then
+    p="$p/models--sgl-project--DeepSeek-V4-Pro-FP8"
+  fi
+  if [[ -f "$p/refs/main" && -d "$p/snapshots" ]]; then
+    local hash
+    hash="$(cat "$p/refs/main" 2>/dev/null || true)"
+    if [[ -n "$hash" && -d "$p/snapshots/$hash" ]]; then
+      p="$p/snapshots/$hash"
+    fi
+  fi
+  if model_has_complete_files "$p"; then
+    printf "%s\\n" "$p"
+    return 0
+  fi
+
+  local candidate="" dir
+  while IFS= read -r dir; do
+    if model_has_complete_files "$dir"; then
+      candidate="$dir"
+      break
+    fi
+  done < <(find "$original" -maxdepth 6 -type f -name config.json -printf "%h\\n" 2>/dev/null | sort -u)
+
+  [[ -n "$candidate" ]] || return 1
+  printf "%s\\n" "$candidate"
+}
+
+model_runtime_path() {
+  local original="${1:-}"
+  local fallback="${2:-}"
+  local resolved=""
+
+  if resolved="$(resolve_local_model_path "$original")"; then
+    echo "[model] resolved local model path: ${original} -> ${resolved}" >&2
+    find "$resolved" -maxdepth 1 -type f \( -name config.json -o -name "*.safetensors" -o -name "*.bin" -o -name "*.pt" \) -print 2>/dev/null | head -20 >&2 || true
+    printf "%s\\n" "$resolved"
+    return 0
+  fi
+
+  echo "WARN: MODEL_PATH is missing or incomplete inside container: ${original:-<unset>}" >&2
+  if [[ -n "$original" && "$original" == /* ]]; then
+    find "$original" -maxdepth 4 \( -name config.json -o -name "*.safetensors" -o -name refs -o -name snapshots \) -print 2>/dev/null | head -80 >&2 || true
+  fi
+  if [[ -n "$fallback" ]]; then
+    echo "WARN: falling back to HuggingFace model id: $fallback" >&2
+    printf "%s\\n" "$fallback"
+    return 0
+  fi
+
+  echo "ERROR: no model fallback is set" >&2
+  return 1
+}
+EOF
+
+cat > "$WORKDIR/prepare_model_cache.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+MODEL_PATH="$MODEL_PATH"
+MODEL_ID="$MODEL"
+IMAGE="$IMAGE"
+WORKDIR="$WORKDIR"
+DOCKER_DOWNLOAD_COMMON="$DOCKER_DOWNLOAD_COMMON"
+
+source "\$WORKDIR/model_path_helpers.sh"
+
+if [[ -z "\$MODEL_PATH" || "\$MODEL_PATH" != /* ]]; then
+  echo "[model] skip local predownload because MODEL_PATH is not an absolute path: \${MODEL_PATH:-<unset>}"
+  exit 1
+fi
+
+if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
+  echo "[model] local model already prepared: \$MODEL_PATH -> \$resolved"
+  exit 0
+fi
+
+mkdir -p "\$(dirname "\$MODEL_PATH")"
+LOCK="\${MODEL_PATH}.download.lock"
+
+if mkdir "\$LOCK" 2>/dev/null; then
+  trap 'rmdir "\$LOCK" 2>/dev/null || true' EXIT
+  echo "[model] downloading \$MODEL_ID to \$MODEL_PATH"
+  mkdir -p "\$MODEL_PATH"
+  docker run \$DOCKER_DOWNLOAD_COMMON \
+    -e MODEL="\$MODEL_ID" \
+    -e MODEL_PATH="\$MODEL_PATH" \
+    "\$IMAGE" bash -lc '
+      set -euo pipefail
+      python3 - <<'"'"'PY'"'"'
+import os
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+repo_id = os.environ["MODEL"]
+target = os.environ["MODEL_PATH"]
+Path(target).mkdir(parents=True, exist_ok=True)
+print(f"[model] snapshot_download repo={repo_id} local_dir={target}", flush=True)
+snapshot_download(
+    repo_id=repo_id,
+    local_dir=target,
+    max_workers=int(os.environ.get("HF_HUB_DOWNLOAD_THREADS", "8")),
+)
+PY
+    '
+else
+  echo "[model] another rank is preparing \$MODEL_PATH; waiting for it"
+  for _ in \$(seq 1 180); do
+    if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
+      echo "[model] local model prepared by another rank: \$MODEL_PATH -> \$resolved"
+      exit 0
+    fi
+    [[ -d "\$LOCK" ]] || break
+    sleep 20
+  done
+fi
+
+if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
+  echo "[model] local model prepared: \$MODEL_PATH -> \$resolved"
+  exit 0
+fi
+
+echo "WARN: unable to prepare local model cache at \$MODEL_PATH; runtime will fall back to \$MODEL_ID"
+exit 1
+EOF
+
 cat > "$WORKDIR/prefill_entry.sh" <<EOF
 """,
     )
@@ -192,12 +353,9 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
         text,
         'source "\\$CIDIR/model_flags.sh"\n',
         'source "\\$CIDIR/model_flags.sh"\n'
-        'MODEL_PATH_RUNTIME="$MODEL_PATH"\n'
-        'MODEL_FALLBACK="${MODEL:-$MODEL_PATH}"\n'
-        'if [[ "\\$MODEL_PATH_RUNTIME" == /* && ! -e "\\$MODEL_PATH_RUNTIME" ]]; then\n'
-        '  echo "WARN: MODEL_PATH is not visible inside container, falling back to model id: \\$MODEL_PATH_RUNTIME -> \\$MODEL_FALLBACK" >&2\n'
-        '  MODEL_PATH_RUNTIME="\\$MODEL_FALLBACK"\n'
-        "fi\n",
+        'MODEL_PATH_ORIGINAL="$MODEL_PATH"\n'
+        'source "\\$CIDIR/model_path_helpers.sh"\n'
+        'MODEL_PATH_RUNTIME="\\$(model_runtime_path "\\$MODEL_PATH_ORIGINAL" "$MODEL")"\n',
         min_count=2,
     )
     text = replace_all(
@@ -217,17 +375,58 @@ cat > "$WORKDIR/prefill_entry.sh" <<EOF
         text,
         "    bash \\$CIDIR/install_checkout_router.sh\n",
         "    bash \\$CIDIR/install_checkout_router.sh\n"
-        '    MODEL_PATH_RUNTIME="$MODEL_PATH"\n'
-        '    MODEL_FALLBACK="${MODEL:-$MODEL_PATH}"\n'
-        '    if [[ "\\$MODEL_PATH_RUNTIME" == /* && ! -e "\\$MODEL_PATH_RUNTIME" ]]; then\n'
-        '      echo "WARN: MODEL_PATH is not visible inside bench container, falling back to model id: \\$MODEL_PATH_RUNTIME -> \\$MODEL_FALLBACK" >&2\n'
-        '      MODEL_PATH_RUNTIME="\\$MODEL_FALLBACK"\n'
-        "    fi\n",
+        '    MODEL_PATH_ORIGINAL="$MODEL_PATH"\n'
+        '    source "\\$CIDIR/model_path_helpers.sh"\n'
+        '    MODEL_PATH_RUNTIME="\\$(model_runtime_path "\\$MODEL_PATH_ORIGINAL" "$MODEL")"\n',
     )
     text = replace_once(
         text,
         "--host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \\",
         '--host 127.0.0.1 --port $LBPORT --model "\\$MODEL_PATH_RUNTIME" \\',
+    )
+    text = replace_once(
+        text,
+        """cat > "$WORKDIR/prefill.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+docker rm -f mi355x_prefill 2>/dev/null || true
+""",
+        """cat > "$WORKDIR/prefill.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before prefill; runtime will fall back to model id"
+docker rm -f mi355x_prefill 2>/dev/null || true
+""",
+    )
+    text = replace_once(
+        text,
+        """cat > "$WORKDIR/decode.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+docker rm -f mi355x_decode 2>/dev/null || true
+""",
+        """cat > "$WORKDIR/decode.sh" <<EOF
+#!/bin/bash
+source "$WORKDIR/model_flags.sh"
+bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before decode; runtime will fall back to model id"
+docker rm -f mi355x_decode 2>/dev/null || true
+""",
+    )
+    text = replace_once(
+        text,
+        """cat > "$WORKDIR/bench.sh" <<EOF
+#!/bin/bash
+set -e
+PIP=\\$1; DIP=\\$2
+docker rm -f mi355x_bench 2>/dev/null || true
+""",
+        """cat > "$WORKDIR/bench.sh" <<EOF
+#!/bin/bash
+set -e
+PIP=\\$1; DIP=\\$2
+bash "$WORKDIR/prepare_model_cache.sh" || echo "WARN: local model preparation failed before bench; runtime will fall back to model id"
+docker rm -f mi355x_bench 2>/dev/null || true
+""",
     )
     text = replace_once(
         text,
