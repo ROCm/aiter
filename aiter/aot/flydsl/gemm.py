@@ -459,7 +459,7 @@ def _compile_bmm_to_cache(
         batch,
         layout_mbn,
         num_buffers,
-      )
+    )
 
 
 def compile_one_config(
