@@ -330,6 +330,13 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
         )
+        self.parser.add_argument(
+            "--opus-a8w4-inter-dim-pad",
+            type=int,
+            default=None,
+            help="Opus A8W4 stage2 tuner override for runtime inter_dim_pad. "
+            "If omitted, Opus tunes real inter_dim (pad=0).",
+        )
 
     @staticmethod
     def weight_quant(
@@ -733,40 +740,24 @@ class FmoeTuner(TunerCommon):
             opus_moe_stage2_a8w4_decode_fwd,
             opus_moe_stage2_reduce_token_slot_route_output_fwd,
         )
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT,
-            opus_a8w4_shape_family,
-            opus_a8w4_shape_family_for_shape,
-        )
 
-        shape_family = opus_a8w4_shape_family(
-            kparams.get("shape_family", OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name)
-        )
-        if shape_family is None:
-            shape_family = opus_a8w4_shape_family_for_shape(
-                model_dim=w2_qt.shape[1],
-                inter_dim=a2_qt.shape[-1],
-                expert=w2_qt.shape[0],
-                topk=topk,
-                block_n=kparams.get("kernel_block_n"),
-            )
-        if shape_family is None:
+        inter_dim_pad = int(kparams.get("inter_dim_pad", 0))
+        effective_inter_dim = int(a2_qt.shape[-1]) - inter_dim_pad
+        if inter_dim_pad < 0 or effective_inter_dim <= 0:
             raise ValueError(
-                "unsupported Opus A8W4 shape family: "
-                f"shape_family={kparams.get('shape_family')}"
+                "invalid Opus A8W4 stage2 inter_dim_pad/effective_inter_dim: "
+                f"logical_inter_dim={a2_qt.shape[-1]}, "
+                f"inter_dim_pad={inter_dim_pad}, "
+                f"effective_inter_dim={effective_inter_dim}"
             )
-        if not shape_family.matches(
-            model_dim=w2_qt.shape[1],
-            inter_dim=a2_qt.shape[-1],
-            expert=w2_qt.shape[0],
-            topk=topk,
-            block_n=kparams.get("kernel_block_n"),
-        ):
+        block_n = int(kparams.get("kernel_block_n"))
+        if block_n <= 0 or w2_qt.shape[1] % block_n != 0:
             raise ValueError(
-                "Opus A8W4 stage2 candidate does not match shape family "
-                f"{shape_family.name}: model_dim={w2_qt.shape[1]}, "
-                f"inter_dim={a2_qt.shape[-1]}, expert={w2_qt.shape[0]}, "
-                f"topk={topk}, block_n={kparams.get('kernel_block_n')}"
+                "unsupported Opus A8W4 stage2 block_n: "
+                f"model_dim={w2_qt.shape[1]}, logical_inter_dim={a2_qt.shape[-1]}, "
+                f"expert={w2_qt.shape[0]}, topk={topk}, "
+                f"block_n={kparams.get('kernel_block_n')}, "
+                f"inter_dim_pad={inter_dim_pad}, effective_inter_dim={effective_inter_dim}"
             )
         kid = kparams["kid"]
         kbm = kparams["kernel_block_m"]
@@ -774,9 +765,9 @@ class FmoeTuner(TunerCommon):
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
         # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
-        # The family inter pad was zeroed on the raw weight BEFORE shuffling
-        # (generate_data_2stages), so opus and the torch ref both use the
-        # family's effective inter dim. Verified cosine ~3e-4.
+        # For padded inter dims, opus receives the physical logical-K tensors
+        # plus runtime inter_dim_pad, while the torch ref slices the same tensors
+        # to effective K. Verified cosine ~3e-4.
         w2_use = w2_qt
         w2_scale_opus = w2_scale
         if kparams["route_out"]:
@@ -791,7 +782,7 @@ class FmoeTuner(TunerCommon):
                 num_valid_ids,
                 block_m=kbm,
                 kernel_id=kid,
-                inter_dim_pad=shape_family.inter_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 return_per_slot=True,
             )
             if route_out.dtype == torch.uint8:  # MXFP8 route_out
@@ -817,7 +808,7 @@ class FmoeTuner(TunerCommon):
             out=moe_buf,
             block_m=kbm,
             kernel_id=kid,
-            inter_dim_pad=shape_family.inter_dim_pad,
+            inter_dim_pad=inter_dim_pad,
         )
 
     @staticmethod
@@ -1696,26 +1687,21 @@ class FmoeTuner(TunerCommon):
     def run_torch_moe_stage2_opus_eff(*args, **kwargs):
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
             OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
-            opus_a8w4_shape_family_for_shape,
         )
 
         # Opus A8W4 ref slices padded inter dim before deferring to
-        # run_torch_moe_stage2, matching the decode shape family and kernel layout.
+        # run_torch_moe_stage2, matching runtime effective-K dispatch.
+        inter_dim_pad = kwargs.pop("inter_dim_pad", 0)
+        inter_dim_pad = 0 if inter_dim_pad is None else int(inter_dim_pad)
         a2_qt, w1_qt, w2_qt, *rest = args
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=w2_qt.shape[1],
-            inter_dim=a2_qt.shape[-1],
-            expert=w2_qt.shape[0],
-            topk=a2_qt.shape[1],
-        )
-        if shape_family is None:
+        eff = int(a2_qt.shape[-1]) - inter_dim_pad
+        if inter_dim_pad < 0 or eff <= 0:
             raise ValueError(
-                "unsupported Opus A8W4 shape for reference: "
-                f"model_dim={w2_qt.shape[1]}, inter_dim={a2_qt.shape[-1]}, "
-                f"expert={w2_qt.shape[0]}, topk={a2_qt.shape[1]}"
+                "invalid Opus A8W4 stage2 reference inter_dim_pad/effective_inter_dim: "
+                f"logical_inter_dim={a2_qt.shape[-1]}, "
+                f"inter_dim_pad={inter_dim_pad}, effective_inter_dim={eff}"
             )
         kernel_contract = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
-        eff = shape_family.effective_inter_dim
         a2_qt = a2_qt[..., :eff].contiguous()
         w2_qt = w2_qt[..., : eff // kernel_contract.fp4_values_per_byte].contiguous()
         # rest = [topk_weights, topk_ids, a2_scale, w2_scale, ...]; w2_scale is rest[3]
@@ -3177,11 +3163,17 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def gen_opus_2stages_task(self, info, blockMs):
+    def gen_opus_2stages_task(
+        self,
+        info,
+        blockMs,
+        *,
+        inter_dim_pad=None,
+    ):
         # opus a8w4 stage2 candidates. Stage2-only:
         # the tuner pairs each opus kid with the best stage1 and keeps the
         # lowest-us combo. opus takes the a16w4 MFMA shuffle (w2_qt_shffle_ck /
-        # w2_scale_aiter, same as ck) and computes the family's effective
+        # w2_scale_aiter, same as ck) and dispatches by runtime effective
         # inter dim, so its ref is run_torch_moe_stage2_opus_eff. Inputs verified
         # cosine ~3e-4; raw=0.94 and shuffle-without-slice=0.14 are wrong.
         tasks_opus = []
@@ -3203,30 +3195,32 @@ class FmoeTuner(TunerCommon):
         ) = info
 
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
+            OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
             get_opus_a8w4_stage2_kernels,
-            opus_a8w4_shape_family_for_shape,
         )
 
-        shape_family = opus_a8w4_shape_family_for_shape(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            expert=expert,
-            topk=topk,
+        inter_dim_pad = 0 if inter_dim_pad is None else int(inter_dim_pad)
+        effective_inter_dim = int(inter_dim) - inter_dim_pad
+        k_step_packed = (
+            OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.bk_logical
+            // OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.fp4_values_per_byte
         )
         # gfx950 + a8w4 (fp8 act / fp4 weight / per_1x32) + g1u1 + supported
-        # shape family. Kids are filtered by their bound shape family below.
+        # effective-K. Kids are filtered by their block_n below.
         if not (
             gfx == "gfx950"
             and use_g1u1
             and q_type == QuantType.per_1x32
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp4x2
-            and shape_family is not None
+            and model_dim > 0
+            and 0 <= inter_dim_pad < inter_dim
+            and effective_inter_dim % k_step_packed == 0
         ):
             return tasks_opus
 
         # fp8-activation stage2 ref (shape-level, shared by all opus kids): torch
-        # stage2 on the bf16 stage1 output, sliced by opus_eff to match the family.
+        # stage2 on the bf16 stage1 output, sliced by opus_eff to match runtime effective-K.
         s2_ref_args = (
             [
                 "ref1_bf16",
@@ -3258,21 +3252,15 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             if blockM not in (16, 32, 64, 128):
                 continue
-            for kname, kparams in get_opus_a8w4_stage2_kernels(
-                shape_family=shape_family.name,
-                token=token,
-            ).items():
+            for kname, kparams in get_opus_a8w4_stage2_kernels(token=token).items():
                 # tuner blockM is the moe_sorting block_m; valid only when it
                 # equals the kid's SORT_BLOCK_M.
                 if kparams["sort_block_m"] != blockM:
                     continue
-                if not shape_family.matches(
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                    expert=expert,
-                    topk=topk,
-                    block_n=kparams.get("kernel_block_n"),
-                ):
+                kparams = dict(kparams)
+                kparams["inter_dim_pad"] = inter_dim_pad
+                block_n = int(kparams.get("kernel_block_n"))
+                if block_n <= 0 or model_dim % block_n != 0:
                     continue
                 gen_args = (
                     token,
@@ -3301,7 +3289,7 @@ class FmoeTuner(TunerCommon):
                         {},
                         FmoeTuner.run_torch_moe_stage2_opus_eff,
                         s2_ref_args,
-                        {},
+                        {"inter_dim_pad": inter_dim_pad},
                         None,
                         0.01,
                         0.01,
@@ -3989,7 +3977,13 @@ class FmoeTuner(TunerCommon):
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
-                tasks_ck.extend(self.gen_opus_2stages_task(info, blockMs))
+                tasks_ck.extend(
+                    self.gen_opus_2stages_task(
+                        info,
+                        blockMs,
+                        inter_dim_pad=args.opus_a8w4_inter_dim_pad,
+                    )
+                )
             if _want("asm"):
                 task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
