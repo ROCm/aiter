@@ -11,7 +11,7 @@ def _cdiv_pow2(n, log2_k):
 def _expt_data_compute_stage1(
     pid,
     Hist,
-    n_expts_tot,
+    n_expts_tot: tl.constexpr,
     TokenStart,
     TileStart,
     MDTileInfo,

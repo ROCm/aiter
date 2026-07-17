@@ -232,7 +232,7 @@ def log2_power_of_two(x):
 
 
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    BLOCK = 128
+    BLOCK = triton.next_power_of_2(n_expts_tot)
     cdiv = triton.cdiv
     block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:

@@ -197,7 +197,7 @@ def _combined_routing(
     N_EXPTS_ACT: tl.constexpr,
     N_EXPTS_ACT_PAD: tl.constexpr,
     ExpertHist,
-    n_expts_tot,
+    n_expts_tot: tl.constexpr,
     TokenStart,
     TileStart,
     blocks1a,
