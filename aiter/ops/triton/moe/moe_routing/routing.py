@@ -93,7 +93,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     hist = hist[:n_expts_tot]
     assert hist.dtype == torch.int32
     # scratchpad
-    if n_gates <= 65536:
+    if n_gates <= 65536 - 1:  # save one token id for OOB checks
         combined_indx = torch.empty(n_gates * 2, dtype=torch.uint16, device=device)
     else:
         combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
