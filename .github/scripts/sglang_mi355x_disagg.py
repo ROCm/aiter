@@ -292,8 +292,45 @@ fi
 mkdir -p "\$(dirname "\$MODEL_PATH")"
 LOCK="\${MODEL_PATH}.download.lock"
 
+lock_is_stale() {
+  [[ -d "\$LOCK" ]] || return 1
+  local marker="\$LOCK/heartbeat"
+  [[ -e "\$marker" ]] || marker="\$LOCK"
+  python3 - "\$marker" "\${MODEL_DOWNLOAD_STALE_SECONDS:-900}" <<'PY'
+import os
+import sys
+import time
+
+path = sys.argv[1]
+limit = int(sys.argv[2])
+try:
+    age = time.time() - os.stat(path).st_mtime
+except FileNotFoundError:
+    sys.exit(1)
+sys.exit(0 if age > limit else 1)
+PY
+}
+
+if lock_is_stale; then
+  echo "WARN: removing stale model download lock: \$LOCK"
+  rm -rf "\$LOCK"
+fi
+
 if mkdir "\$LOCK" 2>/dev/null; then
-  trap 'rmdir "\$LOCK" 2>/dev/null || true' EXIT
+  {
+    echo "host=\$(hostname)"
+    echo "pid=\$\$"
+    date -u "+start=%Y-%m-%dT%H:%M:%SZ"
+  } > "\$LOCK/owner" 2>/dev/null || true
+  touch "\$LOCK/heartbeat" 2>/dev/null || true
+  (
+    while :; do
+      touch "\$LOCK/heartbeat" 2>/dev/null || true
+      sleep 60
+    done
+  ) &
+  HEARTBEAT_PID=\$!
+  trap 'kill "\$HEARTBEAT_PID" 2>/dev/null || true; rm -rf "\$LOCK" 2>/dev/null || true' EXIT
   echo "[model] downloading \$MODEL_ID to \$MODEL_PATH"
   mkdir -p "\$MODEL_PATH"
   docker run \$DOCKER_DOWNLOAD_COMMON \
@@ -304,17 +341,28 @@ if mkdir "\$LOCK" 2>/dev/null; then
       python3 - <<'"'"'PY'"'"'
 import os
 from pathlib import Path
+import time
 from huggingface_hub import snapshot_download
 
 repo_id = os.environ["MODEL"]
 target = os.environ["MODEL_PATH"]
 Path(target).mkdir(parents=True, exist_ok=True)
 print(f"[model] snapshot_download repo={repo_id} local_dir={target}", flush=True)
-snapshot_download(
-    repo_id=repo_id,
-    local_dir=target,
-    max_workers=int(os.environ.get("HF_HUB_DOWNLOAD_THREADS", "8")),
-)
+last_error = None
+for attempt in range(1, int(os.environ.get("HF_HUB_DOWNLOAD_ATTEMPTS", "4")) + 1):
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=target,
+            max_workers=int(os.environ.get("HF_HUB_DOWNLOAD_THREADS", "4")),
+        )
+        break
+    except Exception as exc:
+        last_error = exc
+        print(f"[model] snapshot_download attempt {attempt} failed: {exc}", flush=True)
+        time.sleep(min(60 * attempt, 180))
+else:
+    raise last_error
 PY
     '
 else
@@ -324,7 +372,12 @@ else
       echo "[model] local model prepared by another rank: \$MODEL_PATH -> \$resolved"
       exit 0
     fi
-    [[ -d "\$LOCK" ]] || break
+    if lock_is_stale; then
+      echo "WARN: observed stale model download lock while waiting: \$LOCK"
+      rm -rf "\$LOCK"
+      exec "\$0"
+    fi
+    [[ -d "\$LOCK" ]] || exec "\$0"
     sleep 20
   done
 fi
