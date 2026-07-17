@@ -353,7 +353,12 @@ def _grouped_a8w4_tdm_moe(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    tile_m = 64
+    # tile_m is tunable: smaller tiles (16/32) waste less intra-tile WMMA for
+    # balanced many-expert / small-token MoE; 64 stays best for compute-bound
+    # large-token. Must be a multiple of 16.
+    tile_m = int(os.environ.get("AITER_GROUPED_A8W4_TDM_TILE_M", "64"))
+    if tile_m % 16 != 0 or tile_m <= 0:
+        raise ValueError(f"AITER_GROUPED_A8W4_TDM_TILE_M must be a positive multiple of 16, got {tile_m}")
     wmma_rep = tile_m // 16
     contiguous_m = max(tile_m, _tdm_align_up(token_num * topk + E * tile_m - topk, tile_m))
     max_m = max(tile_m, _tdm_align_up(token_num * topk, tile_m))
@@ -391,6 +396,7 @@ def _grouped_a8w4_tdm_moe(
     flydsl_grouped_gemm_a8w4_masked(
         y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
         n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+        tile_m=tile_m,
         out_is_f16=out_is_f16, stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
         num_buffers=3,
     )
@@ -406,6 +412,7 @@ def _grouped_a8w4_tdm_moe(
     flydsl_grouped_gemm_a8w4_masked(
         grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum,
         n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
+        tile_m=tile_m,
         out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=2,
     )
 
@@ -413,11 +420,13 @@ def _grouped_a8w4_tdm_moe(
         kernel_bench_callable.append(("gemm1", functools.partial(
             flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
             n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+            tile_m=tile_m,
             out_is_f16=out_is_f16, stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
             num_buffers=3)))
         kernel_bench_callable.append(("gemm2", functools.partial(
             flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32,
             psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
+            tile_m=tile_m,
             out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=2)))
 
     # gather-reduce -> (token_num, model_dim)

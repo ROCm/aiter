@@ -3,6 +3,7 @@
 
 import argparse
 import itertools
+import os
 
 import pandas as pd
 import torch
@@ -10,7 +11,8 @@ import torch
 import aiter
 import aiter.fused_moe as fm
 from aiter import dtypes
-from aiter.fused_moe import fused_topk, moe_sorting
+from aiter.fused_moe import moe_sorting
+from aiter.jit.core import CK_DIR, ENABLE_CK
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -19,6 +21,13 @@ torch.set_default_device("cuda")
 
 BLOCK_SIZE_M = 32
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
+
+
+def is_ck_available() -> bool:
+    """The CK moe_sorting backend needs the composable_kernel submodule checked out."""
+    if not ENABLE_CK:
+        return False
+    return os.path.exists(os.path.join(CK_DIR, "include", "ck_tile", "core.hpp"))
 
 
 def set_moe_sorting_backend(backend: str) -> None:
@@ -168,9 +177,15 @@ def _build_moe_sorting_inputs(
     has_expert_mask,
     padding_extra,
 ):
-    input_tensor = torch.randn((token, model_dim), dtype=dtype, device="cuda")
+    # NOTE: generate routing with torch.topk rather than fused_topk/topk_softmax.
+    # The asm topk_softmax kernel yields degenerate/out-of-range topk_ids on some
+    # archs (e.g. gfx1250 returns near-all-zero rows plus an out-of-range id == E),
+    # which makes the sort correctness comparison meaningless. torch.topk gives
+    # valid, distinct experts in [0, E), matching a correct router.
     score = torch.rand((token, E), device="cuda", dtype=dtype)
-    topk_weights, topk_ids = fused_topk(input_tensor, score, topk, True)
+    topk_vals, topk_ids = torch.topk(score.float(), topk, dim=-1)
+    topk_ids = topk_ids.to(dtypes.i32)
+    topk_weights = torch.softmax(topk_vals, dim=-1).to(dtypes.fp32)
 
     expert_mask = (
         torch.randint(0, 2, (E,), dtype=topk_ids.dtype, device="cuda")
@@ -233,7 +248,10 @@ def test_moe_sorting(
             num_local_tokens,
             dispatch_policy,
         ),
-        "ck": lambda: moe_sorting(
+    }
+    # CK backend needs the composable_kernel submodule (skip when unavailable).
+    if is_ck_available():
+        candidates["ck"] = lambda: moe_sorting(
             topk_ids,
             topk_weights,
             E,
@@ -243,8 +261,7 @@ def test_moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-        ),
-    }
+        )
     # FlyDSL kernel only supports dispatch_policy=0 today.
     if is_flydsl_available() and dispatch_policy == 0:
         candidates["flydsl"] = lambda: moe_sorting(

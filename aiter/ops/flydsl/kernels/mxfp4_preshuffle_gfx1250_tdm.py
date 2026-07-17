@@ -7,15 +7,11 @@ Stage-1 grouped GEMM with in-kernel psum bisect (per-M-tile expert), DeepGEMM
 contiguous-M swizzle, and a fused silu/swiglu (+ optional bias) epilogue."""
 
 import math
-from contextlib import contextmanager
 from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
-from flydsl.expr.arith import _to_raw as _raw
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from .gemm_common_gfx1250 import (
@@ -29,17 +25,10 @@ from .gemm_common_gfx1250 import (
 
 LOG2E = 1.4426950408889634
 
+# Bump to invalidate a stale JIT/AOT artifact after IR-only changes (the Constexpr
+# signature is otherwise the whole cache key; N/K/M ride runtime i32 args).
+_TDM_DESCRIPTOR_VERSION = 1
 
-@contextmanager
-def _if_then(if_op):  # scf.IfOp then-region; if_op None -> no-op. Auto-yields empty.
-    if if_op is None:
-        yield
-        return
-    with ir.InsertionPoint(if_op.then_block):
-        yield
-        blk = if_op.then_block
-        if not blk.operations or not isinstance(blk.operations[-1], scf.YieldOp):
-            scf.YieldOp([])
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
@@ -67,6 +56,14 @@ def launch_gemm_a8w4_tdm(
     arg_bias: fx.Pointer,
     f32_swiglu_limit: fx.Float32,
 ):
+    # JIT/AOT cache key: every Constexpr specialization point + a manual version.
+    # N/K/M are runtime i32 args (address math is fully dynamic), so one compiled
+    # kernel is safely reused across shapes for a fixed config -- nothing baked in.
+    cache_tag = (
+        tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
+        a_is_fp4, n_experts, stage1_act, has_bias, _TDM_DESCRIPTOR_VERSION,
+    )
+    _ = cache_tag
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -99,11 +96,17 @@ def launch_gemm_a8w4_tdm(
     # 16-lane stripes with K interleaved into the columns.
     AS_SUPERS = tile_m // wmma_m_rep          # LDS super-rows for the A-scale tile
     AS_INNER = (tile_k // 128) * wmma_m_rep   # i32 words / super-row / K-tile
-    STAGE_SA = ((SA_SUPERS * SC_INNER * 4 + 15) // 16) * 16
+    # Size the A-scale stage by its true footprint (AS_SUPERS*AS_INNER i32/buf);
+    # SA_SUPERS = tile_m//32 collapses to 0 for tile_m<32 (this equals the old
+    # SA_SUPERS*SC_INNER expression for tile_m>=32).
+    STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
-    PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 127) // 128) * 128
+    # 512-align each ring slot so per-buffer add_offset preserves the LDS ptr
+    # alignment the TDM/ds_b128 ops require (tile_m<64 otherwise infers <512 and
+    # fails to compile). tile_m=64's footprint is already 512-aligned -> no change.
+    PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
 
@@ -372,8 +375,7 @@ def launch_gemm_a8w4_tdm(
 
         # Skip whole padding tiles (expert id == n_experts). tile-active is uniform
         # across the workgroup, so the barriers below never diverge.
-        _tif = scf.IfOp(_raw(_e_i32 < fx.Int32(n_experts)), results_=[], has_else=False)
-        with _if_then(_tif):
+        if _e_i32 < fx.Int32(n_experts):
             # per-wave TDM loads per K-tile: cooperative=4; wave-spec=1 (>=8 waves) or 2.
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
             # Prologue preloads nb K-tiles; the steady loop issues tile kt+nb
