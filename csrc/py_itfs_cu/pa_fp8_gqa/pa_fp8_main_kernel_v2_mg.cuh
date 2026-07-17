@@ -163,10 +163,13 @@ void pa_fp8_main_kernel_v2_mg(
     constexpr int kBlocksPerKbi = kTParSize / kBlockSize;
     __shared__ int  bt_lds[2][kBlocksPerKbi];   // double-buffered for prefetch
 
-    const __amdgpu_buffer_rsrc_t k_rsrc =
-        pa_make_buffer_rsrc(k_cache + wg_start_kv_head_idx * kv_head_stride);
-    const __amdgpu_buffer_rsrc_t v_rsrc =
-        pa_make_buffer_rsrc(v_cache + wg_start_kv_head_idx * kv_head_stride);
+    // int64 base rebasing for K/V buffer_loads (same as pa_fp8_main_kernel_v2):
+    // page*kv_block_stride must NOT be folded into the uint32 voffset — with
+    // cross-layer KV (large stride(0)) that product overflows int32 and reads
+    // zeros, producing fluent garbage.  Rebasing the buffer rsrc per phys page
+    // keeps voffset intra-block only.
+    const int64_t kv_head_base_offset =
+        static_cast<int64_t>(wg_start_kv_head_idx) * kv_head_stride;
 
     const float v_scale_perhead = v_scale_ptr[kv_head_idx];
     float p_scale_lane = 1.f, p_scale_inv_lane = 1.f;
@@ -215,12 +218,18 @@ void pa_fp8_main_kernel_v2_mg(
         }
         #pragma unroll
         for (int t = 0; t < kTLoop; t++) {
-            const unsigned int kbn   = (unsigned int)bt_lds[kbi_in & 1][blk_pf[t]];
-            const unsigned int kbase = kbn * (unsigned int)kv_block_stride + k_lane_off[t];
+            const int64_t kblock_number =
+                static_cast<int64_t>(bt_lds[kbi_in & 1][blk_pf[t]]);
+            const __amdgpu_buffer_rsrc_t k_block_rsrc =
+                pa_make_buffer_rsrc(
+                    k_cache + kv_head_base_offset
+                    + kblock_number * static_cast<int64_t>(kv_block_stride));
+            const unsigned int k_base_voffset = k_lane_off[t];
             #pragma unroll
             for (int qkhe = 0; qkhe < v2::kWideQkheLoop; qkhe++) {
                 const pa_u32x4 v = pa_buffer_load_b128(
-                    k_rsrc, kbase + (unsigned int)qkhe * kBytesPerWideQkhe_l);
+                    k_block_rsrc,
+                    k_base_voffset + (unsigned int)qkhe * kBytesPerWideQkhe_l);
                 Klocal_carried[t][qkhe].lo = pa_u32x4_low_long(v);
                 Klocal_carried[t][qkhe].hi = pa_u32x4_high_long(v);
             }
@@ -362,11 +371,17 @@ void pa_fp8_main_kernel_v2_mg(
             #pragma unroll
             for (int t = 0; t < kTLoop; t++) {
                 if (g == 0) {
-                    const unsigned int v_phys = v_phys_block_wide[t];
-                    const unsigned int v_base_voffset =
-                        v_phys * (unsigned int)kv_block_stride + v_lane_off[t];
-                    V_wide[t][0] = pa_buffer_load_b128_nt(v_rsrc, v_base_voffset);
-                    V_wide[t][1] = pa_buffer_load_b128_nt(v_rsrc, v_base_voffset + kVBytesPerVhe);
+                    const int64_t v_phys =
+                        static_cast<int64_t>(v_phys_block_wide[t]);
+                    const __amdgpu_buffer_rsrc_t v_block_rsrc =
+                        pa_make_buffer_rsrc(
+                            v_cache + kv_head_base_offset
+                            + v_phys * static_cast<int64_t>(kv_block_stride));
+                    const unsigned int v_base_voffset = v_lane_off[t];
+                    V_wide[t][0] = pa_buffer_load_b128_nt(
+                        v_block_rsrc, v_base_voffset);
+                    V_wide[t][1] = pa_buffer_load_b128_nt(
+                        v_block_rsrc, v_base_voffset + kVBytesPerVhe);
                 }
 
                 d_out[g][t] = floatx4{0.f, 0.f, 0.f, 0.f};
