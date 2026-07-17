@@ -942,6 +942,7 @@ def compile_wd_moe_down_reduce(
     use_dot2: bool = False,
     h_per_warp: int = 1,
     k_batch: int = 1,
+    w_dtype: str = "bf16",
 ):
     """Compile warp-decode down_reduce and return a @flyc.jit launch wrapper.
 
@@ -958,16 +959,16 @@ def compile_wd_moe_down_reduce(
     k_vector    : BF16 elements per lane per K-step (default 8).
     use_dot2    : if True, use v_dot2_f32_bf16 (gfx950 only).
     h_per_warp  : output channels per wave (1 or 2).
-    k_batch     : split-K factor (default 1 = no split).  Splits the INTER
-                  contraction across k_batch workgroups; each adds its partial
-                  result via atomicAdd.  Grid y-dimension = k_batch.  Increases
-                  total grid size by k_batch× to improve occupancy for small-grid
-                  shapes (e.g. Qwen3Next B=1 inter=512: k_batch=4 → 4× more blocks).
-                  Requires inter % (k_batch * WAVE_SIZE * k_vector) == 0.
+    k_batch     : split-K factor (default 1 = no split).
+    w_dtype     : "bf16" or "fp8" (FP8 requires use_dot2=True, gfx950 only).
 
-    Launch signature:
+    Launch signature (BF16 weights):
         exe(_ptr(y_out), _ptr(inter_states), _ptr(w_down), _ptr(router_ids),
             _ptr(router_wts), B, topk, inter, hidden, experts, stream)
+
+    Launch signature (FP8 weights):
+        exe(_ptr(y_out), _ptr(inter_states), _ptr(w_down), _ptr(router_ids),
+            _ptr(router_wts), B, topk, inter, hidden, experts, w_scale, stream)
     """
     if hidden % (_WAVE_SIZE * k_vector) != 0:
         raise ValueError(
@@ -987,13 +988,21 @@ def compile_wd_moe_down_reduce(
         )
     if k_batch < 1:
         raise ValueError(f"k_batch must be >= 1, got {k_batch}")
+    if w_dtype not in ("bf16", "fp8"):
+        raise ValueError(f"w_dtype must be 'bf16' or 'fp8', got {w_dtype}")
+    if w_dtype == "fp8" and not use_dot2:
+        raise ValueError("FP8 down_reduce requires use_dot2=True (gfx950)")
+
+    _use_fp8_w = w_dtype == "fp8"
+    _k_fp8_words = k_vector // 4  # FP8: 4 elements per i32
 
     dot2_tag = "_dot2" if use_dot2 else "_f32"
     h2_tag = "_h2" if h_per_warp == 2 else ""
     kb_tag = f"_kb{k_batch}" if k_batch > 1 else ""
+    fp8_tag = "_fp8w" if _use_fp8_w else ""
     module_name = (
         f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}"
-        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}"
+        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}{fp8_tag}"
     )
 
     _k_pairs = k_vector // 2
@@ -1005,7 +1014,7 @@ def compile_wd_moe_down_reduce(
     def _kernel(
         arg_y_out: fx.Pointer,  # [B, HIDDEN] f32, zero-init
         arg_inter: fx.Pointer,  # [B*TOPK, INTER] bf16
-        arg_w_down: fx.Pointer,  # [E*HIDDEN, INTER] bf16
+        arg_w_down: fx.Pointer,  # [E*HIDDEN, INTER] bf16 or fp8
         arg_router_ids: fx.Pointer,  # [B*TOPK] i32
         arg_router_wts: fx.Pointer,  # [B*TOPK] f32
         i32_B: fx.Int32,
@@ -1013,6 +1022,7 @@ def compile_wd_moe_down_reduce(
         i32_INTER: fx.Int32,
         i32_HIDDEN: fx.Int32,
         i32_E: fx.Int32,
+        f32_w_scale: fx.Float32,  # FP8 per-tensor scale (unused/1.0 for BF16)
     ):
         f32 = T.f32
         i32 = T.i32
@@ -1062,7 +1072,11 @@ def compile_wd_moe_down_reduce(
         HIDDEN_i64 = arith.extsi(i64, HIDDEN_i32)
         INTER_i64 = arith.extsi(i64, INTER_i32)
         out_j0_i64 = arith.extsi(i64, out_j_0)
-        row_nb = INTER_i32 * arith.constant(2, type=i32)
+        # Row size: INTER*2 bytes for BF16, INTER bytes for FP8.
+        _w_elem_bytes = 1 if _use_fp8_w else 2
+        row_nb = INTER_i32 * arith.constant(_w_elem_bytes, type=i32)
+
+        w_scale = f32_w_scale.ir_value()
 
         # Outer for: slot = 0..TOPK
         # Carries: [total_acc_0] for h_per_warp=1,
@@ -1090,13 +1104,14 @@ def compile_wd_moe_down_reduce(
             expert_i64 = arith.extsi(i64, expert_e)
 
             # Build per-row w_down resources for each output channel this wave owns.
+            # Byte offset: element_byte = 2 (BF16) or 1 (FP8).
             w_row_rsrcs: list = []
             for h in range_constexpr(h_per_warp):
                 out_jh_i64 = arith.addi(out_j0_i64, arith.constant(h, type=i64))
                 w_row_byte_off = (
                     (expert_i64 * HIDDEN_i64 + out_jh_i64)
                     * INTER_i64
-                    * arith.constant(2, type=i64)
+                    * arith.constant(_w_elem_bytes, type=i64)
                 )
                 w_base = arith.addi(
                     arith.index_cast(i64, fx.ptrtoint(arg_w_down)), w_row_byte_off
@@ -1140,18 +1155,43 @@ def compile_wd_moe_down_reduce(
                     cur_accs: list = list(inner_for.inner_iter_args)
                     k_base_c = k_step_i32 * arith.constant(_k_step, type=i32)
                     lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
-                    for p in range_constexpr(_k_pairs):
-                        p2 = arith.constant(p * 2, type=i32)
-                        x_off = (inter_row_base + lane_k + p2) // c_two
-                        w_off = (lane_k + p2) // c_two
-                        for h in range_constexpr(h_per_warp):
-                            x_word_h = buffer_ops.buffer_load(
-                                inter_rsrc, x_off, vec_width=1, dtype=i32
-                            )
-                            w_word = buffer_ops.buffer_load(
-                                w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
-                            )
-                            cur_accs[h] = _dot2_dep(cur_accs[h], x_word_h, w_word)
+
+                    if _use_fp8_w:
+                        # FP8 weight path: load one i32 = 4 FP8 per lane per
+                        # fp8_word, then sel=0/1 decode to 2 BF16 pairs each.
+                        c_four = arith.constant(4, type=i32)
+                        for wi in range_constexpr(_k_fp8_words):
+                            wi4 = arith.constant(wi * 4, type=i32)
+                            w_i32_off = (lane_k + wi4) // c_four
+                            # Load FP8 word for each h channel
+                            w_fp8_h: list = []
+                            for h in range_constexpr(h_per_warp):
+                                w_fp8_h.append(buffer_ops.buffer_load(
+                                    w_row_rsrcs[h], w_i32_off, vec_width=1, dtype=i32
+                                ))
+                            for sel in range_constexpr(2):
+                                pair_elem = arith.constant((wi * 2 + sel) * 2, type=i32)
+                                x_off = (inter_row_base + lane_k + pair_elem) // c_two
+                                for h in range_constexpr(h_per_warp):
+                                    x_word_h = buffer_ops.buffer_load(
+                                        inter_rsrc, x_off, vec_width=1, dtype=i32
+                                    )
+                                    w_bf16 = _fp8x2_to_bf16(w_fp8_h[h], w_scale, sel)
+                                    cur_accs[h] = _dot2_dep(cur_accs[h], x_word_h, w_bf16)
+                    else:
+                        # BF16 weight path: load one i32 = 2 BF16 per pair.
+                        for p in range_constexpr(_k_pairs):
+                            p2 = arith.constant(p * 2, type=i32)
+                            x_off = (inter_row_base + lane_k + p2) // c_two
+                            w_off = (lane_k + p2) // c_two
+                            for h in range_constexpr(h_per_warp):
+                                x_word_h = buffer_ops.buffer_load(
+                                    inter_rsrc, x_off, vec_width=1, dtype=i32
+                                )
+                                w_word = buffer_ops.buffer_load(
+                                    w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
+                                )
+                                cur_accs[h] = _dot2_dep(cur_accs[h], x_word_h, w_word)
                     scf.YieldOp(cur_accs)
                 curs = list(inner_for.results)
             else:
@@ -1220,6 +1260,7 @@ def compile_wd_moe_down_reduce(
         i32_INTER: fx.Int32,
         i32_HIDDEN: fx.Int32,
         i32_E: fx.Int32,
+        f32_w_scale: fx.Float32,
         stream: fx.Stream,
     ):
         idx = ir.IndexType.get()
@@ -1242,6 +1283,7 @@ def compile_wd_moe_down_reduce(
             i32_INTER,
             i32_HIDDEN,
             i32_E,
+            f32_w_scale,
         ).launch(grid=(grid_x, grid_y, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
 
     return _launch_down
