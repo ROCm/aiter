@@ -333,6 +333,14 @@ def _grouped_a8w4_tdm_moe(
     swiglu_limit,
     stage1_weight_layout,
     doweight_stage1,
+    tile_m=64,
+    tile_n=256,
+    tile_k=256,
+    num_buffers=3,
+    tile_m2=None,
+    tile_n2=None,
+    tile_k2=None,
+    num_buffers2=None,
 ):
     """a8w4 grouped MoE on the batched TDM kernel (contiguous-M, gugu only).
 
@@ -353,15 +361,19 @@ def _grouped_a8w4_tdm_moe(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    # tile_m is tunable: smaller tiles (16/32) waste less intra-tile WMMA for
-    # balanced many-expert / small-token MoE; 64 stays best for compute-bound
-    # large-token. Must be a multiple of 16.
-    tile_m = int(os.environ.get("AITER_GROUPED_A8W4_TDM_TILE_M", "64"))
-    if tile_m % 16 != 0 or tile_m <= 0:
-        raise ValueError(f"AITER_GROUPED_A8W4_TDM_TILE_M must be a positive multiple of 16, got {tile_m}")
+    if tile_m2 is None:
+        tile_m2 = tile_m
+    if tile_n2 is None:
+        tile_n2 = tile_n
+    if tile_k2 is None:
+        tile_k2 = tile_k
+    if num_buffers2 is None:
+        num_buffers2 = num_buffers
     wmma_rep = tile_m // 16
-    contiguous_m = max(tile_m, _tdm_align_up(token_num * topk + E * tile_m - topk, tile_m))
-    max_m = max(tile_m, _tdm_align_up(token_num * topk, tile_m))
+    wmma_rep2 = tile_m2 // 16
+    _align_m = max(tile_m, tile_m2)
+    contiguous_m = max(_align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m))
+    max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
 
     # route + contiguous remap -> masked_m (E,), topids_to_rows (contiguous rows), psum (E,)
     if token_num * topk <= 4096 and E <= 512:
@@ -396,14 +408,14 @@ def _grouped_a8w4_tdm_moe(
     flydsl_grouped_gemm_a8w4_masked(
         y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
         n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-        tile_m=tile_m,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
         out_is_f16=out_is_f16, stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
-        num_buffers=3,
+        num_buffers=num_buffers,
     )
 
     # a2 quant -> stage2 GEMM (+bias2) -> grouped_out (1, cm, model_dim)
     a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
-        y, 1, contiguous_m, wmma_rep=wmma_rep, quant_mode="fp8",
+        y, 1, contiguous_m, wmma_rep=wmma_rep2, quant_mode="fp8",
         masked_m=None, topids_to_rows=None,
     )
     grouped_out = torch.zeros((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -412,22 +424,22 @@ def _grouped_a8w4_tdm_moe(
     flydsl_grouped_gemm_a8w4_masked(
         grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum,
         n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
-        tile_m=tile_m,
-        out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=2,
+        tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
+        out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=num_buffers2,
     )
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("gemm1", functools.partial(
             flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
             n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-            tile_m=tile_m,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
             out_is_f16=out_is_f16, stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
-            num_buffers=3)))
+            num_buffers=num_buffers)))
         kernel_bench_callable.append(("gemm2", functools.partial(
             flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32,
             psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
-            tile_m=tile_m,
-            out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=2)))
+            tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
+            out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=num_buffers2)))
 
     # gather-reduce -> (token_num, model_dim)
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
@@ -590,6 +602,48 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
         return None
 
+    # CSV lookup runs before the TDM dispatch so both paths share the same
+    # tuned tile config. The TDM path reads tile_m/tile_n/tile_k/num_buffers
+    # from the CSV; the original path reads the full row below.
+    _grouped_dbg("start CSV lookup")
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    tile_m, tile_n, tile_k = 64, 256, 256
+    m_warp, n_warp = 1, 4
+    num_buffers = 2
+    num_buffer_stage2 = None  # None -> fall back to num_buffers below
+    split_k1 = 1
+    split_k2 = 1
+    grouped_contiguous_m = False
+    wave_specialized_tdm_req = False
+    tdm_as_in_prologue_req = False
+    cfg_row = _find_grouped_config(
+        token_num=_get_padded_M(token_num),
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        activation=activation,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w_key,
+        quant_type=quant_type,
+        gate_mode=gate_mode,
+    )
+    if cfg_row is not None:
+        tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
+        tile_n = _as_int(cfg_row.get("tile_n"), tile_n)
+        tile_k = _as_int(cfg_row.get("tile_k"), tile_k)
+        n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
+        num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
+        num_buffer_stage2 = _as_int(cfg_row.get("num_buffer_stage2"), num_buffer_stage2)
+        _grouped_dbg(f"CSV config: tile_m={tile_m} tile_n={tile_n} tile_k={tile_k}")
+    tile_m2 = _as_int(cfg_row.get("tile_m2"), tile_m) if cfg_row else tile_m
+    tile_n2 = _as_int(cfg_row.get("tile_n2"), tile_n) if cfg_row else tile_n
+    tile_k2 = _as_int(cfg_row.get("tile_k2"), tile_k) if cfg_row else tile_k
+    if num_buffer_stage2 is None:
+        num_buffer_stage2 = num_buffers
+
     if is_grouped_a8w4 and _use_a8w4_tdm_path() and stage1_weight_layout == "gugu":
         return _grouped_a8w4_tdm_moe(
             hidden_states, w1, w2, topk_weight, topk_ids,
@@ -597,6 +651,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             activation=activation, w1_scale=w1_scale, w2_scale=w2_scale,
             bias1=bias1, bias2=bias2, swiglu_limit=swiglu_limit,
             stage1_weight_layout=stage1_weight_layout, doweight_stage1=doweight_stage1,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, num_buffers=num_buffers,
+            tile_m2=tile_m2, tile_n2=tile_n2, tile_k2=tile_k2,
+            num_buffers2=num_buffer_stage2,
         )
 
     try:
@@ -622,41 +679,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             return None
 
     _grouped_dbg("imports done")
-    device = hidden_states.device
-    token_num, topk = topk_ids.shape
-    tile_m, tile_n, tile_k = 64, 256, 256
-    m_warp, n_warp = 1, 4
-    num_buffers = 2
-    num_buffer_stage2 = None  # None -> fall back to num_buffers below
-    split_k1 = 1
-    split_k2 = 1
-    grouped_contiguous_m = False
-    # WST / As-prologue requests, applied to BOTH gemm1 and gemm2. Precedence:
-    # env var (if set) > CSV column > default(off). CSV sets the per-row default;
-    # an explicitly-set env var overrides it.
-    wave_specialized_tdm_req = False
-    tdm_as_in_prologue_req = False
-    cfg_row = _find_grouped_config(
-        token_num=_get_padded_M(token_num),
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        activation=activation,
-        dtype=dtype,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w_key,
-        quant_type=quant_type,
-        gate_mode=gate_mode,
-    )
+    # tile_m/tile_n/tile_k/n_warp/num_buffers/num_buffer_stage2 already read
+    # from cfg_row above (shared with the TDM path). Read remaining
+    # original-path-only fields here.
     if cfg_row is not None:
-        tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
-        tile_n = _as_int(cfg_row.get("tile_n"), tile_n)
-        tile_k = _as_int(cfg_row.get("tile_k"), tile_k)
-        n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
-        num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
-        # stage2 buffer count; absent column -> keep None so it inherits num_buffers
-        num_buffer_stage2 = _as_int(cfg_row.get("num_buffer_stage2"), num_buffer_stage2)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
         grouped_contiguous_m = _as_bool(
@@ -719,12 +745,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # tile_{m,n,k} above. Absent columns keep the old behavior. max_m / routing
     # use the shared tile_m; correctness of any non-default override is the
     # caller's responsibility.
-    tile_m2 = _as_int(cfg_row.get("tile_m2"), tile_m) if cfg_row else tile_m
-    tile_n2 = _as_int(cfg_row.get("tile_n2"), tile_n) if cfg_row else tile_n
-    tile_k2 = _as_int(cfg_row.get("tile_k2"), tile_k) if cfg_row else tile_k
-    # stage2 buffer count: dedicated column if present, else inherit gemm1's.
-    if num_buffer_stage2 is None:
-        num_buffer_stage2 = num_buffers
+    # tile_m2/tile_n2/tile_k2/num_buffer_stage2 already read above (shared section).
     warp_tile_m2 = tile_m2 // m_warp
     warp_tile_n = tile_n // n_warp
 

@@ -305,6 +305,38 @@ def store_acc_vec8_to_buffer(
         return 2
 
 
+import math as _math
+
+LOG2E = _math.log2(_math.e)
+
+
+def fmin_f32(a, b):
+    """Scalar f32 min (select-based, no NaN handling)."""
+    import flydsl.expr as _fx
+    return _fx.Float32((a < b).select(a, b))
+
+
+def fmax_f32(a, b):
+    """Scalar f32 max (select-based, no NaN handling)."""
+    import flydsl.expr as _fx
+    return _fx.Float32((a > b).select(a, b))
+
+
+def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+    import flydsl.expr as _fx
+    _one = _fx.Float32(1.0)
+    g = fmin_f32(g, limit_f32)
+    u = fmin_f32(fmax_f32(u, neg_limit_f32), limit_f32)
+    if swiglu:
+        nlog2e = _fx.Float32(-1.702 * LOG2E)
+        sig = _fx.Float32(rocdl.rcp(T.f32, _one + (g * nlog2e).exp2()))
+        return g * sig * (u + _one)
+    nlog2e = _fx.Float32(-LOG2E)
+    sig = _fx.Float32(rocdl.rcp(T.f32, _one + (g * nlog2e).exp2()))
+    return g * sig * u
+
+
 __all__ = [
     # LDS helpers
     "get_lds_memref",
@@ -321,4 +353,9 @@ __all__ = [
     # Epilogue
     "store_acc_vec8_to_lds",
     "store_acc_vec8_to_buffer",
+    # Scalar math
+    "LOG2E",
+    "fmin_f32",
+    "fmax_f32",
+    "fused_silu_swiglu_elem",
 ]
