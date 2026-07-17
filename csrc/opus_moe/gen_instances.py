@@ -10,6 +10,9 @@ single source of truth for kid -> launcher mapping.
 from __future__ import annotations
 
 import argparse
+import csv
+import glob
+import os
 import sys
 from pathlib import Path
 
@@ -18,11 +21,10 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from opus_moe_common import (  # noqa: E402
-    OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT,
+    OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS,
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_ATOMIC,
     OPUS_A8W4_ROUTE_REDUCE_INSTANCES,
-    OPUS_A8W4_SHAPE_FAMILY_CONTRACTS,
     STAGE2_A8W4_KERNELS,
     STAGE2_BF16_KERNELS,
     opus_a8w4_decode_kid,
@@ -115,134 +117,99 @@ def _cpp_name_suffix(name: str) -> str:
     )
 
 
-def _cpp_contract_alias(name: str) -> str:
-    alias_name = str(name)
-    if alias_name.startswith("a8w4_"):
-        alias_name = alias_name[len("a8w4_") :]
-    suffix = _cpp_name_suffix(alias_name)
-    return f"OpusMoeStage2A8W4{suffix}Contract"
+def _cpp_effective_contract_alias(effective_inter_dim: int) -> str:
+    return f"OpusMoeStage2A8W4Eff{effective_inter_dim}Contract"
 
 
-# ---- A8W4 metadata and dispatch manifests ---------------------------------
+def _expand_tune_paths(spec: str | None) -> list[Path]:
+    if spec:
+        patterns = [pattern.strip() for pattern in str(spec).split(os.pathsep)]
+    else:
+        configs_dir = THIS_DIR.parents[1] / "aiter" / "configs"
+        patterns = [
+            str(configs_dir / "tuned_fmoe.csv"),
+            str(configs_dir / "model_configs" / "*tuned_fmoe*.csv"),
+        ]
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        if not pattern:
+            continue
+        for raw_path in sorted(glob.glob(pattern)):
+            path = Path(raw_path)
+            if "untuned" in path.name or path in seen:
+                continue
+            seen.add(path)
+            out.append(path)
+    return out
 
 
-def _emit_a8w4_meta_header() -> str:
-    lines = [A8W4_META_HEADER]
+def _is_a8w4_tuned_row(row: dict[str, str]) -> bool:
+    return (
+        (row.get("q_dtype_a") or "").strip() == "torch.float8_e4m3fn"
+        and (row.get("q_dtype_w") or "").strip() == "torch.float4_e2m1fn_x2"
+        and (row.get("q_type") or "").strip() == "QuantType.per_1x32"
+    )
+
+
+def _validate_effective_inter_dims(effective_inter_dims: set[int]) -> tuple[int, ...]:
     k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
-    default_family = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT
-    shape_families = sorted(
-        OPUS_A8W4_SHAPE_FAMILY_CONTRACTS.values(), key=lambda s: s.name
-    )
-    a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
-    unsupported_shape_families = sorted(
-        {
-            inst.shape_family
-            for inst in a8w4_kernels
-            if inst.shape_family not in OPUS_A8W4_SHAPE_FAMILY_CONTRACTS
-        }
-    )
-    if unsupported_shape_families:
-        raise ValueError(
-            "unsupported Opus A8W4 shape family contract(s): "
-            + ", ".join(unsupported_shape_families)
-        )
-    unsupported_kernel_contracts = sorted(
-        {
-            inst.kernel_contract
-            for inst in a8w4_kernels
-            if inst.kernel_contract != k.name
-        }
-    )
-    if unsupported_kernel_contracts:
-        raise ValueError(
-            "unsupported Opus A8W4 kernel contract(s): "
-            + ", ".join(unsupported_kernel_contracts)
-        )
-    block_ms = sorted({inst.block_m for inst in a8w4_kernels})
-    block_ns = sorted({inst.block_n for inst in a8w4_kernels})
-    mode_default_keys = [
-        (inst.shape_family, inst.out_mode, inst.block_m)
-        for inst in a8w4_kernels
-        if inst.mode_default
-    ]
-    duplicate_mode_defaults = sorted(
-        {key for key in mode_default_keys if mode_default_keys.count(key) > 1}
-    )
-    if duplicate_mode_defaults:
-        raise ValueError(
-            "duplicate Opus A8W4 mode default(s): "
-            + ", ".join(
-                f"shape_family={shape_family},out_mode={out_mode},block_m={block_m}"
-                for shape_family, out_mode, block_m in duplicate_mode_defaults
-            )
-        )
-    k_step_packed = k.bk_logical // k.fp4_values_per_byte
     if k.bk_logical % k.fp4_values_per_byte != 0:
         raise ValueError(
             "Opus A8W4 kernel contract requires bk_logical divisible by "
             "fp4_values_per_byte"
         )
-    for family in shape_families:
-        if family.logical_inter_dim % k.scale_group_logical_k != 0:
+    k_step_packed = k.bk_logical // k.fp4_values_per_byte
+    dims = tuple(sorted({int(dim) for dim in effective_inter_dims}))
+    for dim in dims:
+        if dim <= 0 or dim % k_step_packed != 0:
             raise ValueError(
-                f"shape family {family.name} logical_inter_dim must be divisible "
-                f"by scale_group_logical_k={k.scale_group_logical_k}"
+                "Opus A8W4 effective inter dims must be positive and divisible "
+                f"by K_STEP_PACKED={k_step_packed}, got {dim}"
             )
-        if family.effective_inter_dim <= 0:
-            raise ValueError(
-                f"shape family {family.name} effective_inter_dim must be positive"
-            )
-        if family.effective_inter_dim % k_step_packed != 0:
-            raise ValueError(
-                f"shape family {family.name} effective_inter_dim must be divisible "
-                f"by K_STEP_PACKED={k_step_packed}"
-            )
-    auto_reduce_model_dims = [
-        model_dim
-        for inst in OPUS_A8W4_ROUTE_REDUCE_INSTANCES
-        for model_dim in inst.auto_model_dims
-    ]
-    duplicate_auto_reduce_model_dims = sorted(
-        {
-            model_dim
-            for model_dim in auto_reduce_model_dims
-            if auto_reduce_model_dims.count(model_dim) > 1
-        }
-    )
-    if duplicate_auto_reduce_model_dims:
-        raise ValueError(
-            "duplicate Opus A8W4 route-reduce auto model_dim(s): "
-            + ", ".join(
-                str(model_dim) for model_dim in duplicate_auto_reduce_model_dims
-            )
-        )
+    return dims
+
+
+def _collect_a8w4_effective_inter_dims(tune_files: str | None) -> tuple[int, ...]:
+    effective_inter_dims = set(OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS)
+    for path in _expand_tune_paths(tune_files):
+        with path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                if _is_a8w4_tuned_row(row):
+                    effective_inter_dims.add(int(row["inter_dim"]))
+    return _validate_effective_inter_dims(effective_inter_dims)
+
+
+# ---- A8W4 metadata and dispatch manifests ---------------------------------
+
+
+def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
+    lines = [A8W4_META_HEADER]
+    k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+    a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
+    block_ms = sorted({inst.block_m for inst in a8w4_kernels})
+    block_ns = sorted({inst.block_n for inst in a8w4_kernels})
 
     lines.extend(
         [
-            "template<int LogicalInterDim, int InterDimPad>\n",
+            "template<int EffectiveInterDim>\n",
             "struct OpusMoeStage2A8W4DecodeContract\n{\n",
-            "    static constexpr int DECODE_LOGICAL_INTER_DIM = LogicalInterDim;\n",
-            "    static constexpr int DECODE_INTER_DIM_PAD = InterDimPad;\n",
-            "    static constexpr int DECODE_EFFECTIVE_INTER_DIM = "
-            "LogicalInterDim - InterDimPad;\n",
+            "    static constexpr int DECODE_LOGICAL_INTER_DIM = EffectiveInterDim;\n",
+            "    static constexpr int DECODE_INTER_DIM_PAD = 0;\n",
+            "    static constexpr int DECODE_EFFECTIVE_INTER_DIM = EffectiveInterDim;\n",
             "};\n\n",
         ]
     )
-    for family in shape_families:
+    for effective_inter_dim in effective_inter_dims:
         lines.append(
-            f"using {_cpp_contract_alias(family.name)} = "
+            f"using {_cpp_effective_contract_alias(effective_inter_dim)} = "
             "OpusMoeStage2A8W4DecodeContract<"
-            f"{family.logical_inter_dim}, {family.inter_dim_pad}>;\n"
+            f"{effective_inter_dim}>;\n"
         )
     lines.extend(
         [
             "using OpusMoeStage2A8W4DefaultContract = "
-            f"{_cpp_contract_alias(default_family.name)};\n\n",
-            f"constexpr int kStage2MXFP4ScaleGroupLogicalK = {k.scale_group_logical_k};\n",
-            "constexpr int kStage2A8W4DecodeLogicalInterDim = "
-            "OpusMoeStage2A8W4DefaultContract::DECODE_LOGICAL_INTER_DIM;\n",
-            "constexpr int kStage2A8W4DecodeInterDimPad = "
-            "OpusMoeStage2A8W4DefaultContract::DECODE_INTER_DIM_PAD;\n",
+            f"{_cpp_effective_contract_alias(effective_inter_dims[0])};\n\n",
         ]
     )
     for block_m in block_ms:
@@ -263,7 +230,7 @@ def _emit_a8w4_meta_header() -> str:
             f"constexpr int kStage2A8W4DecodeFp4ValuesPerByte = {k.fp4_values_per_byte};\n",
             f"constexpr int kStage2A8W4DecodeVectorBytes = {k.vector_bytes};\n",
             "constexpr int kStage2A8W4DecodeScaleGroupLogicalK = "
-            "kStage2MXFP4ScaleGroupLogicalK;\n",
+            f"{k.scale_group_logical_k};\n",
             "constexpr int kStage2A8W4DecodeScaleGroupsPerRowPack = "
             f"{k.scale_groups_per_row_pack};\n",
             "constexpr int kStage2A8W4DecodeScaleWordsPerGroupPack = "
@@ -318,13 +285,6 @@ def _emit_a8w4_meta_header() -> str:
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
-        "constexpr bool stage2_a8w4_block_m_is_valid(int block_m)\n{\n    switch(block_m)\n    {\n"
-    )
-    for block_m in block_ms:
-        lines.append(f"    case {block_m}:\n")
-    lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
-
-    lines.append(
         "constexpr bool stage2_a8w4_kid_is_valid(int kid)\n{\n    switch(kid)\n    {\n"
     )
     for inst in a8w4_kernels:
@@ -346,36 +306,12 @@ def _emit_a8w4_meta_header() -> str:
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
-        "constexpr int stage2_a8w4_kid_sort_block_m(int kid)\n{\n    switch(kid)\n    {\n"
+        "constexpr bool stage2_a8w4_effective_inter_dim_is_supported(int effective_inter_dim)\n"
+        "{\n    switch(effective_inter_dim)\n    {\n"
     )
-    for inst in a8w4_kernels:
-        lines.append(f"    case {inst.kid}: return {inst.sort_block_m};\n")
-    lines.append("    default: return -1;\n    }\n}\n\n")
-
-    kid_family_fields = (
-        ("logical_inter_dim", "logical_inter_dim"),
-        ("inter_dim_pad", "inter_dim_pad"),
-        ("effective_inter_dim", "effective_inter_dim"),
-    )
-    for fn_suffix, attr in kid_family_fields:
-        lines.append(
-            f"constexpr int stage2_a8w4_kid_{fn_suffix}(int kid)\n"
-            "{\n    switch(kid)\n    {\n"
-        )
-        for inst in a8w4_kernels:
-            family = OPUS_A8W4_SHAPE_FAMILY_CONTRACTS[inst.shape_family]
-            lines.append(f"    case {inst.kid}: return {getattr(family, attr)};\n")
-        lines.append("    default: return -1;\n    }\n}\n\n")
-
-    lines.append(
-        "constexpr int stage2_a8w4_kid_k_tiles(int kid)\n{\n    switch(kid)\n    {\n"
-    )
-    for inst in a8w4_kernels:
-        family = OPUS_A8W4_SHAPE_FAMILY_CONTRACTS[inst.shape_family]
-        lines.append(
-            f"    case {inst.kid}: return {family.effective_inter_dim // k_step_packed};\n"
-        )
-    lines.append("    default: return -1;\n    }\n}\n\n")
+    for effective_inter_dim in effective_inter_dims:
+        lines.append(f"    case {effective_inter_dim}:\n")
+    lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
 
     lines.append(
         "constexpr bool stage2_a8w4_kid_uses_route_out(int kid)\n{\n    switch(kid)\n    {\n"
@@ -400,33 +336,27 @@ def _emit_a8w4_meta_header() -> str:
 
     lines.append(
         "constexpr int stage2_a8w4_auto_direct_atomic_kid("
-        "int logical_inter_dim, int inter_dim_pad, int block_m)\n{\n"
+        "int effective_inter_dim, int block_m)\n{\n"
+        "    if(!stage2_a8w4_effective_inter_dim_is_supported(effective_inter_dim))\n"
+        "        return -1;\n"
+        "    switch(block_m)\n"
+        "    {\n"
     )
-    for family in shape_families:
-        lines.append(
-            f"    if(logical_inter_dim == {family.logical_inter_dim} && "
-            f"inter_dim_pad == {family.inter_dim_pad})\n"
-            "    {\n"
-            "        switch(block_m)\n"
-            "        {\n"
-        )
-        for block_m in block_ms:
-            try:
-                kid = opus_a8w4_decode_kid(
-                    OPUS_A8W4_OUT_MODE_ATOMIC,
-                    block_m,
-                    shape_family=family.name,
-                )
-            except ValueError:
-                continue
-            lines.append(f"        case {block_m}: return {kid};\n")
-        lines.append("        default: return -1;\n        }\n    }\n")
-    lines.append("    return -1;\n}\n")
+    for block_m in block_ms:
+        try:
+            kid = opus_a8w4_decode_kid(
+                OPUS_A8W4_OUT_MODE_ATOMIC,
+                block_m,
+            )
+        except ValueError:
+            continue
+        lines.append(f"    case {block_m}: return {kid};\n")
+    lines.append("    default: return -1;\n    }\n}\n")
     lines.append(A8W4_META_FOOTER)
     return "".join(lines)
 
 
-def _emit_a8w4_manifest_header() -> str:
+def _emit_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines = [A8W4_MANIFEST_HEADER]
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
 
@@ -440,21 +370,29 @@ def _emit_a8w4_manifest_header() -> str:
     lines.append("#define GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES \\\n")
     for idx, inst in enumerate(a8w4_kernels):
         suffix = " \\\n" if idx != len(a8w4_kernels) - 1 else "\n"
+        contract_cases = []
+        for effective_dim in effective_inter_dims:
+            contract_cases.append(
+                f"case {effective_dim}: "
+                "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
+                "OpusMoeStage2A8W4DecodeShape<"
+                f"opus_moe::{_cpp_effective_contract_alias(effective_dim)}, "
+                f"{inst.block_m}, "
+                f"{inst.block_n}, "
+                f"{inst.sort_block_m}, "
+                f"{_cpp_bool(inst.direct_atomic)}, "
+                f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
+                f"{inst.block_threads}, "
+                f"{inst.min_blocks_per_cu}, "
+                f"{inst.cachectl_b}, "
+                f"{inst.cachectl_wscale}"
+                ">>(kargs, stream);"
+            )
         lines.append(
-            f"    case {inst.kid}: "
-            "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
-            "OpusMoeStage2A8W4DecodeShape<"
-            f"opus_moe::{_cpp_contract_alias(inst.shape_family)}, "
-            f"{inst.block_m}, "
-            f"{inst.block_n}, "
-            f"{inst.sort_block_m}, "
-            f"{_cpp_bool(inst.direct_atomic)}, "
-            f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
-            f"{inst.block_threads}, "
-            f"{inst.min_blocks_per_cu}, "
-            f"{inst.cachectl_b}, "
-            f"{inst.cachectl_wscale}"
-            ">>(kargs, stream);" + suffix
+            f"    case {inst.kid}: switch(effective_inter_dim) {{ "
+            + " ".join(contract_cases)
+            + " default: break; } break;"
+            + suffix
         )
     lines.append("\n")
     return "".join(lines)
@@ -478,16 +416,23 @@ def main() -> None:
         "--cu-num", type=int, default=None, help="Optional CU-count filter"
     )
     args = parser.parse_args()
+    if not args.tune_files and args.tune_file:
+        args.tune_files = args.tune_file
 
     out_dir = Path(args.working_path)
     out_dir.mkdir(parents=True, exist_ok=True)
+    effective_inter_dims = _collect_a8w4_effective_inter_dims(args.tune_files)
 
     bf16_manifest_path = out_dir / "opus_moe_stage2_manifest.h"
     bf16_manifest_path.write_text(_emit_bf16_manifest_header(), encoding="utf-8")
     a8w4_meta_path = out_dir / "opus_moe_stage2_a8w4_meta.h"
-    a8w4_meta_path.write_text(_emit_a8w4_meta_header(), encoding="utf-8")
+    a8w4_meta_path.write_text(
+        _emit_a8w4_meta_header(effective_inter_dims), encoding="utf-8"
+    )
     a8w4_manifest_path = out_dir / "opus_moe_stage2_a8w4_manifest.h"
-    a8w4_manifest_path.write_text(_emit_a8w4_manifest_header(), encoding="utf-8")
+    a8w4_manifest_path.write_text(
+        _emit_a8w4_manifest_header(effective_inter_dims), encoding="utf-8"
+    )
 
     print(
         f"[opus_moe gen_instances] wrote {bf16_manifest_path} with "
@@ -495,7 +440,8 @@ def main() -> None:
     )
     print(
         f"[opus_moe gen_instances] wrote {a8w4_manifest_path} with "
-        f"{len(STAGE2_A8W4_KERNELS)} A8W4 stage2 kid(s)"
+        f"{len(STAGE2_A8W4_KERNELS)} A8W4 stage2 kid(s), "
+        f"effective_inter_dims={effective_inter_dims}"
     )
     print(f"[opus_moe gen_instances] wrote {a8w4_meta_path}")
 

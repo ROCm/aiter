@@ -19,8 +19,10 @@ cd "$SCRIPT_DIR"
 HIPCC="${HIPCC:-hipcc}"
 CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -I${REPO_ROOT}/csrc/include"
 
-TESTS=(test_opus_basic)
-SOURCES=(test_opus_basic.cpp)
+# test_opus_basic      : host-only container/proxy checks (runs without a GPU)
+# test_opus_fp4_device : on-device fp4 round-trip + packing (SKIPs cleanly without gfx950)
+TESTS=(test_opus_basic test_opus_fp4_device)
+SOURCES=(test_opus_basic.cpp test_opus_fp4_device.cu)
 
 build() {
   if ! command -v "$HIPCC" &>/dev/null; then

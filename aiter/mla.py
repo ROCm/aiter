@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import os
 from typing import Optional
 import torch
 import triton
@@ -127,8 +128,8 @@ def get_meta_param(
 ):
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
-    # a larger logical head count from multiple WGs — e.g. the v4 nm gqa=128
-    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) — the GPU's CU occupancy
+    # a larger logical head count from multiple WGs -- e.g. the v4 nm gqa=128
+    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) -- the GPU's CU occupancy
     # is driven by `bs * tg_factor * num_kv_splits`, not `bs * num_kv_splits`.
     # Only the occupancy term scales; avg_kv, the fp8 block cap, and the indptr
     # all stay keyed on the real `bs`. The auto-search keeps V3's cap of 16.
@@ -194,6 +195,54 @@ def get_meta_param(
     return num_kv_splits, num_kv_splits_indptr
 
 
+# Persistent MLA-decode kernel gate: the persistent kernel
+# ("mla_a16w16_qh16..._ps") is slower than the non-persistent split-KV kernel
+# ("mla_dec_stage1...") above a concurrency threshold (~batch 16-64 on gfx950 bf16
+# 16-head decode). Fall back to non-persistent at/above the batch threshold.
+# Env-tunable (0 disables the gate). Provisional default pending microbench
+# calibration (AIOSS-5156).
+_MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT = 32
+
+
+@functools.lru_cache(maxsize=1)
+def _persistent_mla_decode_max_batch():
+    """Cached read of AITER_MLA_DECODE_PERSISTENT_MAX_BATCH (read once per process)."""
+    try:
+        return int(
+            os.getenv(
+                "AITER_MLA_DECODE_PERSISTENT_MAX_BATCH",
+                _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        return _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+
+
+def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
+    """Whether to keep the persistent MLA decode kernel.
+
+    True keeps the caller's persistent request; False falls back to the
+    non-persistent split-KV kernel at/above the concurrency (batch) threshold.
+    Scoped to the characterized gfx950 bf16 16-head single-token decode profile.
+    """
+    is_regression_profile = (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and nhead == 16
+        and max_seqlen_q == 1
+    )
+    if not is_regression_profile:
+        return True
+
+    max_batch = _persistent_mla_decode_max_batch()
+
+    # max_batch <= 0 disables the gate (always keep persistent).
+    if max_batch <= 0:
+        return True
+    return bs < max_batch
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -245,6 +294,20 @@ def mla_decode_fwd(
     total_kv = kv_indices.shape[0]
 
     persistent_mode = work_meta_data is not None
+
+    # Above the concurrency threshold the persistent kernel is slower, so
+    # fall back to the non-persistent split-KV path (which rebuilds its own
+    # num_kv_splits and ignores work_meta_data). See _use_persistent_mla_decode.
+    #
+    # Scope: only the dense vLLM-style decode (num_kv_splits left to aiter) is
+    # gated. Callers that pass an explicit num_kv_splits -- the sparse/expert
+    # op paths -- depend on the persistent kernel's work_meta_data layout; the
+    # non-persistent fallback can't honor their top-k/split scheme and would
+    # return wrong results, so never downgrade them.
+    if persistent_mode and num_kv_splits is None:
+        persistent_mode = _use_persistent_mla_decode(
+            bs, nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
+        )
 
     io_transformed = False
     qseqlen_folded = False
@@ -317,9 +380,11 @@ def mla_decode_fwd(
         # Per-batch valid KV split count writeback buffer. Always allocated (and
         # passed to stage1) so the asm kernel has a valid destination; whether
         # stage2 actually uses it is gated by use_valid_split_count_reduce.
-        # Left uninitialized: the asm kernel writes the real (valid) count before
-        # stage2 reads it, so pre-filling would be dead work.
-        valid_split_count = torch.empty((bs,), dtype=dtypes.i32, device=device)
+        # Initialized to num_kv_splits so a min() against it is a no-op until the
+        # kernel overwrites it with the real (smaller) valid count.
+        valid_split_count = torch.full(
+            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
+        )
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
         aiter.mla_decode_stage1_asm_fwd(
@@ -439,7 +504,7 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and (
-                    (nhead == 32 and max_seqlen_q == 4)
+                    (nhead == 32 and max_seqlen_q >= 4)
                     or (nhead == 64)
                     or (nhead == 128)
                 )
@@ -545,7 +610,7 @@ def mla_decode_fwd(
         )
 
         if use_hk:
-            aiter.hk_mla_decode_fwd(
+            aiter.hk_mla_v32_decode_fwd(
                 q,
                 kv_buffer,
                 qo_indptr,
@@ -638,6 +703,141 @@ def mla_decode_fwd(
                     .reshape(ori_total_s, ori_nhead)
                     .contiguous()
                 )
+
+    return logits, final_lse
+
+
+# V4.0 layout constants (mirrored from op_tests/test_mla_v4_persistent.py).
+_V40_DIM_NOPE = 448
+_V40_DIM_ROPE = 64
+_V40_DIM_QK_PACKED = 512  # NOPE 448 + dup-E8M0 14 + unused trailing pad 50
+
+
+def mla_v40_decode_fwd(
+    q,  # [total_q, nhead, 512]                         FP8 (NOPE+scale+pad)
+    q_rope,  # [total_q, nhead, 64]                          BF16
+    kv_buffer,  # [num_page, page_size, 1, 512]                 FP8
+    kv_buffer_rope,  # [num_page, page_size, 1, 64]                  BF16
+    o,  # [total_q, nhead, 512]                         BF16
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    work_indptr,
+    work_info_set,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    sm_scale=None,  # default 1.0/sqrt(512)
+    return_lse=False,
+    attn_sink=None,  # optional [nhead] fp32: per-head sink logit (virtual K, zero V)
+):
+    """
+    V4.0 MLA decode router. Picks a suitable backend (HK persistent today;
+    asm / triton / gluon / flydsl as they land) given the layout, dtype, and
+    target chip. Writes attention output into `o` in-place; returns
+    `(logits, final_lse)` for the caller (final_lse is None unless
+    return_lse=True).
+
+    attn_sink (optional): [nhead] fp32. Per-head bias logit treated as a
+    virtual K column with zero V. The kernel folds it into the LAST
+    split's running denominator (gated by kv_offset == 0); the reducer's
+    standard formula then routes exp(sink) into the global denominator
+    exactly once.
+    """
+    device = q.device
+    total_s, nhead, v_head_dim = o.shape
+
+    assert q.shape[-1] == _V40_DIM_QK_PACKED, (
+        f"mla_v40_decode_fwd: packed Q last dim must be {_V40_DIM_QK_PACKED}, "
+        f"got q.shape={tuple(q.shape)}"
+    )
+    assert kv_buffer.shape[-1] == _V40_DIM_QK_PACKED, (
+        f"mla_v40_decode_fwd: packed KV last dim must be {_V40_DIM_QK_PACKED}, "
+        f"got kv_buffer.shape={tuple(kv_buffer.shape)}"
+    )
+    assert q_rope.shape[-1] == _V40_DIM_ROPE, (
+        f"mla_v40_decode_fwd: Q rope last dim must be {_V40_DIM_ROPE}, "
+        f"got q_rope.shape={tuple(q_rope.shape)}"
+    )
+    assert kv_buffer_rope.shape[-1] == _V40_DIM_ROPE, (
+        f"mla_v40_decode_fwd: KV rope last dim must be {_V40_DIM_ROPE}, "
+        f"got kv_buffer_rope.shape={tuple(kv_buffer_rope.shape)}"
+    )
+
+    if sm_scale is None:
+        sm_scale = 1.0 / ((_V40_DIM_NOPE + _V40_DIM_ROPE) ** 0.5)  # 1/sqrt(512)
+
+    page_size = kv_buffer.shape[1]
+
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (reduce_partial_map.size(0) * max_seqlen_q, 1, nhead, 1),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else None
+    )
+
+    use_hk = (
+        get_gfx() == "gfx950"
+        and nhead * max_seqlen_q in (64, 128)
+        and q.dtype == dtypes.fp8
+        and kv_buffer.dtype == dtypes.fp8
+        and q_rope.dtype == dtypes.bf16
+        and kv_buffer_rope.dtype == dtypes.bf16
+        and page_size in (1, 64)
+        and is_experimental_enabled()
+    )
+
+    if use_hk:
+        aiter.hk_mla_v40_decode_fwd(
+            q,
+            q_rope,
+            kv_buffer,
+            kv_buffer_rope,
+            qo_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            work_indptr,
+            work_info_set,
+            max_seqlen_q,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+            attn_sink,
+        )
+    else:
+        # TODO: dispatch to asm / triton / gluon / flydsl V4.0 backends once
+        # they land. Today HK is the only available implementation.
+        raise NotImplementedError(
+            f"mla_v40_decode_fwd: no backend available for "
+            f"gfx={get_gfx()} nhead={nhead} max_seqlen_q={max_seqlen_q} "
+            f"q.dtype={q.dtype} kv_buffer.dtype={kv_buffer.dtype} "
+            f"q_rope.dtype={q_rope.dtype} kv_buffer_rope.dtype={kv_buffer_rope.dtype} "
+            f"page_size={page_size} experimental={is_experimental_enabled()}"
+        )
+
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        0,
+        o,
+        final_lse,
+    )
 
     return logits, final_lse
 
@@ -1072,7 +1272,7 @@ def mla_prefill_reduce(
 
 
 # ---------------------------------------------------------------------------
-# DSv4 MLA — additive entry point. Does NOT touch any existing
+# DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
 def mla_decode_fwd_v4_nm(
@@ -1087,7 +1287,7 @@ def mla_decode_fwd_v4_nm(
     kv_last_page_lens,  # [num_seqs]
     max_seqlen_q,
     *,
-    sink,  # REQUIRED [num_heads] FP32 — attention sink logit
+    sink,  # REQUIRED [num_heads] FP32 -- attention sink logit
     split_indptr=None,  # [num_seqs+1] int32; auto-built by get_meta_param if None
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
@@ -1099,7 +1299,7 @@ def mla_decode_fwd_v4_nm(
 
     Routes through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
-    `(logits, attn_lse)` — both 4D, in **kernel-native layout**:
+    `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
         attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
     where `total_q = num_seqs * max_seqlen_q` and
@@ -1114,7 +1314,7 @@ def mla_decode_fwd_v4_nm(
     Split-count selection (`num_kv_splits`):
       `None` (default) auto-picks the split count via V3's `get_meta_param`
       heuristic (CU-occupancy x HBM-efficiency, capped by the fp8 min block
-      for the kernel tile) — identical to `mla_decode_fwd`'s non-persistent
+      for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
 
@@ -1123,7 +1323,7 @@ def mla_decode_fwd_v4_nm(
          `[0, N, 2N, ..., bs*N]` so every seq uses all N passes. When
          `num_kv_splits` is auto-picked, `get_meta_param` returns this
          indptr directly.
-      2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
+      2. Force `out_16_nosplit = 0` -- the kernel's bf16-direct-write path
          does not support multi-pass.
       3. After the kernel returns FP32 partials, run V3's
          `_fwd_kernel_stage2_asm` triton kernel which performs the
@@ -1265,17 +1465,9 @@ def mla_decode_fwd_v4_nm(
     # we still pass *something* through to satisfy the C ABI.
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
 
-    # Per-batch valid KV split count buffer. Always allocated (and passed to the
-    # asm kernel) so the ABI has a valid device destination, but INTENTIONALLY
-    # left uninitialized: v4 nm ships only for gfx950, where the stage2 reduce
-    # runs with USE_VALID_SPLIT_COUNT_REDUCE=0 (see the stage2 launch below) so
-    # it never reads this buffer's content, and the v4 nm decode kernel doesn't
-    # write it back either -- only the pointer matters. torch.empty avoids the
-    # per-call fill that torch.full would launch (a vectorized_elementwise_kernel
-    # that shows up as an extra slice right before the decode kernel in a
-    # per-call perf trace). NOTE: this relies on v4 nm being gfx950-only; a
-    # future non-gfx950 kernel whose stage2 reads valid_split_count would need a
-    # real init (torch.full) here.
+    # Per-seq valid split count writeback buffer (mirrors the stage1 path above).
+    # Left uninitialized: the valid-split-exporting decode kernel writes the real
+    # (valid) count before stage2 reads it, so pre-filling is dead work.
     valid_split_count = torch.empty((num_seqs,), dtype=dtypes.i32, device=q.device)
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
@@ -1307,7 +1499,16 @@ def mla_decode_fwd_v4_nm(
         device = logits.device
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
-        mgc = 64 if (max_seqlen_q == 1 and num_heads in (8, 16)) else 16
+        # mgc = reduce's per-split KV granularity. On gfx950 the v4 nm decode
+        # tiles at SUB_KV=32, so mgc must be 32 (not 64): otherwise cdiv(kv, mgc)
+        # floors below the per-seq valid split count the kernel exports and drops
+        # a short seq's splits (that mismatch is what previously required the host
+        # ragged rebuild). Other archs keep the original mgc=64 for the gqa16/8
+        # single-token tile.
+        if max_seqlen_q == 1 and num_heads in (8, 16):
+            mgc = 32 if get_gfx() == "gfx950" else 64
+        else:
+            mgc = 16
 
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
@@ -1331,13 +1532,7 @@ def mla_decode_fwd_v4_nm(
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
             MAYBE_FINAL_OUT=True,
             HAS_FINAL_LSE=False,
-            # gfx950 v4 nm uses uniform full-coverage splits with no
-            # empty-split skipping, so the valid-split reduce is a no-op there;
-            # force 0 to keep the legacy reduce path. Other archs follow the
-            # main convention (enable when multi-split).
-            USE_VALID_SPLIT_COUNT_REDUCE=(
-                0 if get_gfx() == "gfx950" else int(num_kv_splits > 1)
-            ),
+            USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
             BATCH_NUM=num_seqs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
@@ -1351,8 +1546,8 @@ def mla_decode_fwd_v4_nm(
     # When out_16_nosplit=1 (single-pass only), the kernel does NOT write the
     # `output` buffer. Instead it writes the final result as DENSELY-PACKED
     # BF16 into the `logits` allocation. Global layout is identical to the
-    # fp32 path — [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
-    # num_heads — but each element is 2 bytes (R16_BPP=2), so the per-head
+    # fp32 path -- [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
+    # num_heads -- but each element is 2 bytes (R16_BPP=2), so the per-head
     # stride is v_head_dim*2 bytes = v_head_dim BF16 slots, occupying only the
     # FIRST half of the fp32 `logits` byte range. Reinterpret those bytes as a
     # tight [total_q, num_heads, v_head_dim] BF16 tensor and copy into the
