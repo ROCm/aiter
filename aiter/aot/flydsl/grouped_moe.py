@@ -218,24 +218,27 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     def _route_ksplit(feat_dim, source_topk, out_e, out_m):
         # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
         # sets remap_rows on the grouped MoE fast path (row_starts stays None).
-        launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
-            feat_dim=feat_dim,
-            wmma_rep=wmma_rep,
-            quant_mode=quant_mode,
-            source_topk=source_topk,
-            remap_rows=False,
-        )
-        launch(
-            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
-            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
-            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
-            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-            1,
-            numel,
-            grid,
-            stream=0,
-        )
+        # Precompile both ksplit=True (small token) and ksplit=False (large token).
+        for ks in (True, False):
+            launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                source_topk=source_topk,
+                remap_rows=False,
+                ksplit=ks,
+            )
+            launch(
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                1,
+                numel,
+                grid,
+                stream=0,
+            )
 
     def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding):
         launch = build_moe_fused_quant_preshuffle_module(
