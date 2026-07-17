@@ -522,15 +522,6 @@ def test_down_reduce_h2_dot2path(shape_name, hidden, inter, topk, experts, B):
     """down_reduce H2 layout (2 outputs/wave) dot2 path — gfx950 only."""
     if not _is_gfx950():
         pytest.skip(f"v_dot2_f32_bf16 requires gfx950, got {_rocm_arch()}")
-    # H2 + dot2 has an unresolved phase bug for even n_k_steps (same root cause as
-    # the FP8 gate_up prefetch issue: alternating correctness with even/odd loop counts).
-    # Deepseek-v3 has inter=2048 → n_k_steps=4 (even) → fails.
-    # TODO: debug and fix; skip until then.
-    n_k_steps = inter // (64 * 8)
-    if n_k_steps % 2 == 0:
-        pytest.skip(f"H2 dot2 unresolved for even n_k_steps={n_k_steps} (TODO)")
-    if not _is_gfx950():
-        pytest.skip(f"v_dot2_f32_bf16 requires gfx950, got {_rocm_arch()}")
 
     torch.manual_seed(42)
     inter_states = (

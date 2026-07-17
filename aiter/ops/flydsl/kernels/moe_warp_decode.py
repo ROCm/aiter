@@ -1116,26 +1116,59 @@ def compile_wd_moe_down_reduce(
                 _n_k_steps_per_batch * _k_step, type=i32
             )
 
-            # Inner loops compile-time unrolled for each output channel.
-            # x loads are shared across all h_per_warp channels; only w loads differ.
+            # Inner accumulation over k_steps and k_pairs.
+            #
+            # dot2 path uses an scf.ForOp for the k_step loop instead of
+            # range_constexpr.  Fully unrolling k_steps materialises all pair
+            # offsets simultaneously; for large n_k_steps (>= 5 with H2) this
+            # exhausts VGPRs and the register allocator aliases x_word's VGPR
+            # with a dot2 output, producing wrong results.  A ForOp keeps the
+            # inner body to k_pairs * h_per_warp dot2 calls per iteration,
+            # bounding register pressure regardless of n_k_steps.
+            #
+            # f32 path: no vmcnt constraints, range_constexpr is fine.
             curs: list = [zero_f32] * h_per_warp
-            for k_step in range_constexpr(_n_k_steps_per_batch):
-                k_base_c = arith.constant(k_step * _k_step, type=i32)
-                lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
-                for p in range_constexpr(_k_pairs):
-                    p2 = arith.constant(p * 2, type=i32)
-                    x_off = (inter_row_base + lane_k + p2) // c_two
-                    x_word = buffer_ops.buffer_load(
-                        inter_rsrc, x_off, vec_width=1, dtype=i32
-                    )
-                    for h in range_constexpr(h_per_warp):
+            if use_dot2:
+                inner_for = scf.ForOp(
+                    arith.constant(0, index=True),
+                    arith.constant(_n_k_steps_per_batch, index=True),
+                    arith.constant(1, index=True),
+                    iter_args=[zero_f32] * h_per_warp,
+                )
+                with ir.InsertionPoint(inner_for.body):
+                    k_step_i32 = arith.index_cast(i32, inner_for.induction_variable)
+                    cur_accs: list = list(inner_for.inner_iter_args)
+                    k_base_c = k_step_i32 * arith.constant(_k_step, type=i32)
+                    lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
+                    for p in range_constexpr(_k_pairs):
+                        p2 = arith.constant(p * 2, type=i32)
+                        x_off = (inter_row_base + lane_k + p2) // c_two
                         w_off = (lane_k + p2) // c_two
-                        w_word = buffer_ops.buffer_load(
-                            w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
+                        for h in range_constexpr(h_per_warp):
+                            x_word_h = buffer_ops.buffer_load(
+                                inter_rsrc, x_off, vec_width=1, dtype=i32
+                            )
+                            w_word = buffer_ops.buffer_load(
+                                w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
+                            )
+                            cur_accs[h] = _dot2_dep(cur_accs[h], x_word_h, w_word)
+                    scf.YieldOp(cur_accs)
+                curs = list(inner_for.results)
+            else:
+                for k_step in range_constexpr(_n_k_steps_per_batch):
+                    k_base_c = arith.constant(k_step * _k_step, type=i32)
+                    lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
+                    for p in range_constexpr(_k_pairs):
+                        p2 = arith.constant(p * 2, type=i32)
+                        x_off = (inter_row_base + lane_k + p2) // c_two
+                        x_word = buffer_ops.buffer_load(
+                            inter_rsrc, x_off, vec_width=1, dtype=i32
                         )
-                        if use_dot2:
-                            curs[h] = _dot2_dep(curs[h], x_word, w_word)
-                        else:
+                        for h in range_constexpr(h_per_warp):
+                            w_off = (lane_k + p2) // c_two
+                            w_word = buffer_ops.buffer_load(
+                                w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
+                            )
                             x0 = _bf16_pair_to_f32(x_word, 0)
                             x1 = _bf16_pair_to_f32(x_word, 1)
                             curs[h] = arith.addf(
