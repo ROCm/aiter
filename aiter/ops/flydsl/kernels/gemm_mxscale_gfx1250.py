@@ -27,6 +27,7 @@ from flydsl.expr import (
     tdm_ops,
     vector,
 )
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -868,8 +869,8 @@ def compile_mxscale_gemm(
                 _oob_a_row_bound = group_m_base + arith.index_cast(T.index, valid_m_i32)
 
             if const_expr(use_cluster):
-                local_x, local_y = gpu.compute_cluster_position()
-                a_mcast_mask, b_mcast_mask = gpu.compute_mcast_masks(
+                local_x, local_y = cluster.compute_cluster_position()
+                a_mcast_mask, b_mcast_mask = cluster.compute_mcast_masks(
                     local_x, local_y, cluster_m, cluster_n
                 )
             else:

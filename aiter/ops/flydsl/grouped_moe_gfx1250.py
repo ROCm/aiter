@@ -582,6 +582,24 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
+    # Experimental: workgroup-cluster mcast for the grouped masked GEMMs.
+    # cluster_m/cluster_n > 1 multicast A/B tiles across workgroups in a
+    # cluster. The kernel forbids cluster together with the contiguous-M
+    # (and persistent-M) schedulers, so enabling cluster forces the masked
+    # scheduler. cluster_m*cluster_n must be <= 16.
+    grouped_cluster_m = _as_int(os.environ.get("AITER_GROUPED_CLUSTER_M"), 1)
+    grouped_cluster_n = _as_int(os.environ.get("AITER_GROUPED_CLUSTER_N"), 1)
+    grouped_cluster_m = max(1, grouped_cluster_m)
+    grouped_cluster_n = max(1, grouped_cluster_n)
+    _use_grouped_cluster = grouped_cluster_m > 1 or grouped_cluster_n > 1
+    if _use_grouped_cluster:
+        if grouped_contiguous_m:
+            _grouped_dbg(
+                f"cluster {grouped_cluster_m}x{grouped_cluster_n} requested; "
+                "disabling contiguous-M scheduler (cluster requires masked path)"
+            )
+        grouped_contiguous_m = False
+
     flat_experts = topk_ids.reshape(-1)
 
     _grouped_sync_dbg = (
@@ -847,6 +865,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
+        cluster_m=grouped_cluster_m,
+        cluster_n=grouped_cluster_n,
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
@@ -1051,6 +1071,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         expert_sched_mode=False,
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
+        cluster_m=grouped_cluster_m,
+        cluster_n=grouped_cluster_n,
         persistent_workers=None,
         wave_specialized_tdm=((m_warp * n_warp) == 4 and wave_specialized_tdm_req),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
