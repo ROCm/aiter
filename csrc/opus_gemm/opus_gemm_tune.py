@@ -55,6 +55,7 @@ allocator when unsupported.
 import json
 import logging
 import os
+import copy
 import subprocess
 import sys
 import tempfile
@@ -1419,12 +1420,29 @@ def _opus_run_perftest(
       event, synchronize, compute `elapsed_time(start, end) / num_iters`.
     * Convert ms -> us (cuda.Event.elapsed_time returns ms).
     """
+    def _run_iters_rotate(_num_iters, _f, _rotate_args):
+        out = None
+        n = len(_rotate_args)
+        for i in range(_num_iters):
+            a, k = _rotate_args[i % n]
+            out = _f(*a, **k)
+        return out
+
     # Inside the subprocess the bench func is `func` directly (kwargs may be empty).
+    rotate_num = int(num_rotate_args) if num_rotate_args is not None else 0
+    if rotate_num > 1:
+        rotate_num = min(rotate_num, max(int(num_iters), 1))
+        # Mirror aiter.test_common.perftest behavior: keep the original
+        # args/kwargs as the final element and deep-copy the rest.
+        rotate_args = [
+            (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(rotate_num - 1)
+        ] + [(args, kwargs)]
+    else:
+        rotate_args = [(args, kwargs)]
 
     # Warmup on the main stream. Keeps the first measurement stable and
     # triggers JIT / kernel loads before capture.
-    for _ in range(max(1, num_warmup)):
-        data = func(*args, **kwargs)
+    data = _run_iters_rotate(max(1, num_warmup), func, rotate_args)
     torch.cuda.synchronize()
 
     # Capture the timing loop.
@@ -1434,11 +1452,12 @@ def _opus_run_perftest(
     with torch.cuda.stream(side):
         # A second warmup is recommended on the side stream to "prime" the allocator and any per-stream
         # state so capture records a stable...
-        data = func(*args, **kwargs)
+        data = _run_iters_rotate(1, func, rotate_args)
         side.synchronize()
         with torch.cuda.graph(graph, stream=side):
             for _ in range(num_iters):
-                data = func(*args, **kwargs)
+                a, k = rotate_args[_ % len(rotate_args)]
+                data = func(*a, **k)
     torch.cuda.current_stream().wait_stream(side)
 
     # Measure replay with cuda.Event. hipEventElapsedTime returns ms.
@@ -1652,6 +1671,15 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             help="[TEST-ONLY] Use PyTorch's pluggable allocator to route tensor "
             "allocations through raw hipMalloc/hipFree (closest to C++ allocator "
             "behavior). Falls back to default torch allocator if unsupported.",
+        )
+        self.parser.add_argument(
+            "--rotate-args",
+            dest="rotate_args",
+            type=int,
+            default=0,
+            help="Rotate benchmark inputs across N deep-copied arg buffers during "
+            "warmup/capture/replay (0 or 1 disables rotation). Useful for "
+            "allocator/cache sensitivity testing.",
         )
 
     def pre_process(self, args):
@@ -2058,7 +2086,11 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench
-        perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+        perf_kwargs = {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+            "num_rotate_args": max(int(getattr(args, "rotate_args", 0)), 0),
+        }
 
         logger.info(
             "OpusGemmA16W16Tuner: CUDA graph timing via cuda.Event "
