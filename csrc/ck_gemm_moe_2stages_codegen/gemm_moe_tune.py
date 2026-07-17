@@ -4090,12 +4090,9 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
-            # Fused (_fp4/_fp8) stage1 kernels embed the inter-stage quant+sort;
-            # non-fused kernels get that cost added later (quant-fairness penalty).
-            # Dedup fused and non-fused SEPARATELY per (stage, block_m, flat) so a
-            # marginally-faster RAW non-fused kernel cannot evict the fused kernel
-            # before the fairness penalty is applied (which would otherwise flip the
-            # final pick toward non-fused/CK).
+            # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
+            # penalty below is applied only to non-fused, so dedup must not drop the
+            # fused kernel by raw us before that penalty runs.
             profileDF["_is_fused"] = (
                 profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
             )
