@@ -649,7 +649,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
                     const int linear = ((si + li) * T::BLOCK_SIZE + tid) * STORE_VEC;
                     const int rd_row = linear / T::HALF_B_N;
                     const int rd_col = linear % T::HALF_B_N;
-                    const int gmem_v_off = rd_row * kargs.stride_c + rd_col;
+                    const int gmem_v_off = rd_row * stride_out + rd_col;
                     if (li == 0) {
                         g_c.template store<STORE_VEC>(coal0, gmem_v_off,
                             c_offset(hm, hn), opus::number<4>{});
