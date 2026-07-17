@@ -106,6 +106,7 @@ def _mxfp4_quant_op(
 
     return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
+
 @gluon.jit
 def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
     x_ptr,
