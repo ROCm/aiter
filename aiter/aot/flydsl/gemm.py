@@ -412,7 +412,6 @@ def _compile_bmm_to_cache(
 ):
     del kwargs, split_k, cluster_m, cluster_n
 
-    import flydsl.compiler as flyc
     import torch
 
     from aiter.ops.flydsl.kernels.a8w8_bmm_bpreshuffle_gfx1250 import (
@@ -438,30 +437,29 @@ def _compile_bmm_to_cache(
     sb = torch.empty((batch, scale_n, scale_k), device=dev, dtype=torch.uint8)
     stream = fx.Stream(0)
 
-    with compile_only_env():
-        flyc.compile(
-            launch_gemm_a8w8_tdm,
-            c,
-            # arg_a / arg_b are fx.Pointer in the kernel -> wrap as PointerJitArg
-            # (handles FakeTensor by producing a null ptr under FakeTensorMode).
-            _ptr_view_safe(a),
-            _ptr_view_safe(b),
-            sa,
-            sb,
-            m,
-            stream,
-            n,
-            k,
-            tile_m,
-            tile_n,
-            tile_k,
-            m_warp,
-            n_warp,
-            out_is_f16,
-            batch,
-            layout_mbn,
-            num_buffers,
-        )
+    _compile_executable_to_cache(
+        launch_gemm_a8w8_tdm,
+        c,
+        # arg_a / arg_b are fx.Pointer in the kernel -> wrap as PointerJitArg
+        # (handles FakeTensor by producing a null ptr under FakeTensorMode).
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        sa,
+        sb,
+        m,
+        stream,
+        n,
+        k,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        batch,
+        layout_mbn,
+        num_buffers,
+      )
 
 
 def compile_one_config(
