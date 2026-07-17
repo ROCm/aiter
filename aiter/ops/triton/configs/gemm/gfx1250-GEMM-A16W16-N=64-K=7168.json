@@ -3,7 +3,7 @@
         "BLOCK_M": 16,
         "BLOCK_N": 16,
         "BLOCK_K": 512,
-        "NUM_BUFFERS": 7,
+        "NUM_BUFFERS": 5,
         "num_warps": 1,
         "kernel_type": "compute_bound"
     },
@@ -27,8 +27,8 @@
         "BLOCK_M": 16,
         "BLOCK_N": 16,
         "BLOCK_K": 512,
-        "NUM_BUFFERS": 7,
-        "num_warps": 2,
+        "NUM_BUFFERS": 5,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_64": {
@@ -36,7 +36,7 @@
         "BLOCK_N": 16,
         "BLOCK_K": 512,
         "NUM_BUFFERS": 5,
-        "num_warps": 2,
+        "num_warps": 1,
         "kernel_type": "compute_bound"
     },
     "M_LEQ_128": {
