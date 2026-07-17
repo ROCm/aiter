@@ -30,20 +30,23 @@ def flydsl_grouped_gemm_a8w4_masked(
     w,
     a_scales,
     w_scales,
-    tile_expert,
+    m_tile_map,
     *,
-    E,
+    n_experts,
     contiguous_m,
     N,
     K,
     tile_m=64,
     tile_n=256,
-    tile_k=128,
+    tile_k=256,
     m_warp=1,
     n_warp=4,
     num_buffers=3,
     out_is_f16=0,
     a_is_fp4=0,
+    stage1_act=0,
+    bias=None,
+    swiglu_limit=7.0,
     stream=None,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
@@ -56,7 +59,7 @@ def flydsl_grouped_gemm_a8w4_masked(
       w            (E, N, K//2) uint8 (moe_shuffle_weight == cat_e shuffle_weight_gfx1250)
       a_scales     grouped A-scale (1, contiguous_m//wmma_rep, (K//32)*wmma_rep) viewed int32
       w_scales     n32k4 B-scale (E, N//32, (K//32)*32) viewed int32
-      tile_expert  (ceil(contiguous_m/tile_m),) int32: expert id per M tile
+      m_tile_map   (n_experts,) int32 psum (per-expert exclusive end-row)
     contiguous_m must be a multiple of tile_m (holds by construction).
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -64,6 +67,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     if stream is None:
         stream = torch.cuda.current_stream()
     nb = min(num_buffers, max(1, K // tile_k))
+    has_bias = 1 if bias is not None else 0
+    bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -84,8 +89,13 @@ def flydsl_grouped_gemm_a8w4_masked(
         0,  # layout_mbn
         nb,
         a_is_fp4,
-        ptr_arg(tile_expert),
+        ptr_arg(m_tile_map),
         1,  # grouped_contig
+        n_experts,
+        stage1_act,
+        has_bias,
+        bias_ptr,
+        float(swiglu_limit),
     )
     return out
 

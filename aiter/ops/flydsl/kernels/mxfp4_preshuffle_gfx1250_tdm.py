@@ -3,12 +3,16 @@
 
 """Strided-batched A8W4 (MXFP8 E4M3 A x MXFP4 B) preshuffle GEMM for gfx1250"""
 
+import math
 from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import ArithValue
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
+from flydsl._mlir.dialects import llvm
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -17,6 +21,7 @@ from .gemm_common_gfx1250 import (
     lds_load_b32_raw,
     lds_load_b128_raw,
     lds_store_b128_raw,
+    lds_store_b64_raw,
     pipeline_fence,
     workgroup_barrier,
 )
@@ -42,8 +47,13 @@ def launch_gemm_a8w4_tdm(
     layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
-    arg_tile_expert: fx.Pointer,
+    arg_m_tile_map: fx.Pointer,
     grouped_contig: Constexpr[int],
+    n_experts: Constexpr[int],
+    stage1_act: Constexpr[int],
+    has_bias: Constexpr[int],
+    arg_bias: fx.Pointer,
+    f32_swiglu_limit: fx.Float32,
 ):
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
@@ -95,10 +105,12 @@ def launch_gemm_a8w4_tdm(
         arg_b: fx.Pointer,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
-        arg_tile_expert: fx.Pointer,
+        arg_m_tile_map: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
     ):
         rocdl.disable_xdl_arb_stall()  # SCHED_MODE bit[4]: allow back-to-back WMMA issue
 
@@ -114,8 +126,30 @@ def launch_gemm_a8w4_tdm(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
-        blk_m = bid_x * tile_m
-        blk_n = bid_y * tile_n
+        if const_expr(grouped_contig):
+            # DeepGEMM MGroupedContiguous swizzle (M-primary): a group of K_1D
+            # m-tiles sweeps all n-tiles, so each n-tile's B stays hot in L2.
+            _i32 = T.i32
+            _K1D = arith.constant(16, type=_i32)
+            _tn = arith.constant(tile_n, type=_i32)
+            _tm = arith.constant(tile_m, type=_i32)
+            _ntot = (ArithValue(i32_n.ir_value()) + arith.constant(tile_n - 1, type=_i32)) // _tn
+            _mtot = (ArithValue(i32_m.ir_value()) + arith.constant(tile_m - 1, type=_i32)) // _tm
+            _pid = arith.index_cast(_i32, ArithValue(fx.block_idx.x))
+            _bpg = _ntot * _K1D
+            _gid = _pid // _bpg
+            _first = _gid * _K1D
+            _ing = _pid - _gid * _bpg
+            _rem = _mtot - _first
+            _nin = arith.select(arith.cmpi(arith.CmpIPredicate.slt, _rem, _K1D), _rem, _K1D)
+            _mtile_id = _first + (_ing - (_ing // _nin) * _nin)
+            _ntile_id = _ing // _nin
+            blk_m = _mtile_id * _tm
+            blk_n = _ntile_id * _tn
+        else:
+            blk_m = bid_x * tile_m
+            blk_n = bid_y * tile_n
+            _mtile_id = bid_x
         blk_m64 = fx.Int64(blk_m)  # i64 element offsets keep address math off fx.index
         blk_n64 = fx.Int64(blk_n)
         m64 = fx.Int64(i32_m)
@@ -124,10 +158,20 @@ def launch_gemm_a8w4_tdm(
         # grouped contiguous-M: per-M-tile expert id selects the B / B-scale slab;
         # A / A-scale / C stay single-batch (bz=0) over the contiguous (1, cm, *) buffer.
         if const_expr(grouped_contig):
-            _e_i32 = buffer_ops.buffer_load(
-                ptr_rsrc(arg_tile_expert),
-                arith.index_cast(T.i32, ArithValue(fx.block_idx.x)),
-                vec_width=1, dtype=T.i32)
+            # in-kernel bisect over psum (m_tile_map): expert = min e with psum[e] > row.
+            _mrsrc = ptr_rsrc(arg_m_tile_map)
+            _lo = arith.constant(0, type=T.i32)
+            _hi = arith.constant(n_experts, type=T.i32)
+            _one_i = arith.constant(1, type=T.i32)
+            _emax = arith.constant(n_experts - 1, type=T.i32)
+            for _bs in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
+                _mid = (_lo + _hi) >> _one_i
+                _mid_c = arith.select(arith.cmpi(arith.CmpIPredicate.slt, _mid, _emax), _mid, _emax)
+                _pend = buffer_ops.buffer_load(_mrsrc, _mid_c, vec_width=1, dtype=T.i32)
+                _go = arith.cmpi(arith.CmpIPredicate.sle, _pend, blk_m)
+                _lo = arith.select(_go, _mid + _one_i, _lo)
+                _hi = arith.select(_go, _hi, _mid)
+            _e_i32 = _lo
             eb64 = fx.Int64(_e_i32)
         else:
             eb64 = bz64
@@ -349,6 +393,14 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(_BS_DS)
             rocdl.sched_barrier(0)
 
+        # grouped_contig: skip whole padding tiles (expert id < 0). tile_active is
+        # uniform across the workgroup, so the barriers below never diverge.
+        if const_expr(grouped_contig):
+            _tif = scf.IfOp(
+                arith.cmpi(arith.CmpIPredicate.slt, _e_i32, arith.constant(n_experts, type=T.i32)),
+                results_=[], has_else=False)
+            _tif_ip = ir.InsertionPoint(_tif.then_block)
+            _tif_ip.__enter__()
         # per-wave TDM loads per K-tile: cooperative=4; wave-spec=1 (>=8 waves) or 2.
         TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
         # Prologue preloads nb K-tiles; the steady loop issues tile kt+nb
@@ -381,26 +433,80 @@ def launch_gemm_a8w4_tdm(
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
-        # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
+        # Epilogue: (optional bias +) fused silu/swiglu, stage through LDS, TDM-store.
+        # gugu stage1_act de-interleaves the 8 acc cols (gate=even, up=odd) -> 4 outs
+        # (C_N = tile_n//2); stage1_act=0 is the plain N-wide store (+ optional bias).
         pipeline_fence(outstanding=0)
+        STORE_N = (tile_n // 2) if stage1_act else tile_n
+        _lim = ArithValue(f32_swiglu_limit.ir_value())
+        _nl = arith.negf(_lim)
+        _onef = arith.constant(1.0, type=T.f32)
+        _nlog2e = arith.constant(-1.4426950408889634, type=T.f32)
+
+        def _act(g, u):
+            g = arith.negf(arith.maximumf(arith.negf(g), _nl))                      # min(g, lim)
+            u = arith.maximumf(arith.negf(arith.maximumf(arith.negf(u), _nl)), _nl)  # clamp(u,-lim,lim)
+            if const_expr(stage1_act == 2):  # swiglu (gpt-oss)
+                _al = arith.constant(1.702, type=T.f32)
+                _t = arith.mulf(arith.mulf(g, _al), _nlog2e)
+                _ex = llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [_t], [], [])
+                _sg = llvm.call_intrinsic(T.f32, "llvm.amdgcn.rcp.f32", [arith.addf(_onef, _ex)], [], [])
+                return arith.mulf(arith.mulf(g, _sg), arith.addf(u, _onef))
+            _ex = llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [arith.mulf(g, _nlog2e)], [], [])
+            _sg = llvm.call_intrinsic(T.f32, "llvm.amdgcn.rcp.f32", [arith.addf(_onef, _ex)], [], [])
+            return arith.mulf(arith.mulf(g, _sg), u)
+
+        _brsrc = ptr_rsrc(arg_bias) if const_expr(has_bias) else None
+        _n_i32 = ArithValue(i32_n.ir_value())
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
-                i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
-                lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
+                acc = accs[wm * wmma_n_rep + wn]
+                _cbase = eb64 * fx.Int64(i32_n) + fx.Int64(col_rel)
+
+                def _el(i):
+                    v = fx.vector.extract(acc, static_position=[i], dynamic_position=[])
+                    if const_expr(has_bias):
+                        b = buffer_ops.buffer_load(
+                            _brsrc, _cbase + i, vec_width=1, dtype=out_elem).extf(T.f32)
+                        v = arith.addf(v, b)
+                    return v
+
+                if const_expr(stage1_act):
+                    outv = [arith.trunc_f(out_elem, _act(_el(2 * p), _el(2 * p + 1)))
+                            for p in range_constexpr(4)]
+                    hv = fx.vector.from_elements(T.vec(4, out_elem), outv)
+                    i32v2 = fx.vector.bitcast(T.vec(2, T.i32), hv)
+                    lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, i32v2)
+                else:
+                    outv = [arith.trunc_f(out_elem, _el(i)) for i in range_constexpr(8)]
+                    hv = fx.vector.from_elements(T.vec(8, out_elem), outv)
+                    i32v = fx.vector.bitcast(T.vec(4, T.i32), hv)
+                    lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, i32v)
         workgroup_barrier()
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
-        c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
-        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
-        atomC = _tdm(gtC, mn_oob, c_stride)  # runtime N stride via strides=
-        fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
+        if const_expr(stage1_act):
+            _cN = i32_n // 2
+            _cinner = blk_n64 // 2
+        else:
+            _cN = c_stride
+            _cinner = c_inner_off
+        c_off_rt = c_outer_off * fx.Int64(_cN) + _cinner
+        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+        atomC = _tdm(gtC, mn_oob, _cN)  # runtime N stride via strides=
+        fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
         tdm_ops.tensor_wait(0)
+        if const_expr(grouped_contig):
+            scf.YieldOp([])
+            _tif_ip.__exit__(None, None, None)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_tile_expert, i32_m, N, K).launch(
+    if const_expr(grouped_contig):
+        gx = gx * gy
+        gy = 1
+    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, i32_m, N, K, f32_swiglu_limit).launch(
         grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
     )
 

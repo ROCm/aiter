@@ -334,13 +334,13 @@ def _grouped_a8w4_tdm_moe(
     stage1_weight_layout,
     doweight_stage1,
 ):
-    """a8w4 grouped MoE on the batched TDM kernel via contiguous-M scheduling.
+    """a8w4 grouped MoE on the batched TDM kernel (contiguous-M, gugu only).
 
-    Mirrors the MoE grouped-gemm: compact contiguous-M grid (only valid M tiles
-    launch), a per-M-tile expert id selecting the per-expert B / B-scale slab, and
-    the grouped wmma_rep A-scale. Reuses the route/quant/gather builders and the
-    pass-through gguu/gugu weights + n32k4 weight scales; the stage activation runs
-    in torch (matches the grouped epilogue + torch reference)."""
+    Faithful mirror of the MoE grouped gemm: compact contiguous-M grid with an
+    in-kernel psum bisect (no host tile->expert compute), the grouped wmma_rep
+    A-scale, and a fused stage1 silu/swiglu(+bias) epilogue. Stage2 fuses bias2.
+    Reuses the route/quant/gather builders and the pass-through gugu weights +
+    n32k4 weight scales."""
     import functools
 
     import torch
@@ -356,75 +356,46 @@ def _grouped_a8w4_tdm_moe(
     tile_m = 64
     wmma_rep = tile_m // 16
     contiguous_m = max(tile_m, _tdm_align_up(token_num * topk + E * tile_m - topk, tile_m))
-    m_tile_bound = contiguous_m // tile_m
     max_m = max(tile_m, _tdm_align_up(token_num * topk, tile_m))
 
-    # route + contiguous remap -> masked_m (E,), topids_to_rows (T,topk) in contiguous rows
+    # route + contiguous remap -> masked_m (E,), topids_to_rows (contiguous rows), psum (E,)
     if token_num * topk <= 4096 and E <= 512:
-        masked_m, topids_to_rows, _psum = fused_route_psum_remap(topk_ids, E, max_m, tile_m)
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap(topk_ids, E, max_m, tile_m)
     else:
-        masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-        _starts, _psum, _ = contiguous_psum_remap(masked_m, topids_to_rows, E, max_m, tile_m)
-
-    # per-M-tile expert id from the tile-aligned per-expert block prefix
-    aligned = ((masked_m.to(torch.int64) + tile_m - 1) // tile_m) * tile_m
-    starts = (torch.cumsum(aligned, 0) - aligned).to(torch.int32)
-    tile_rows = torch.arange(m_tile_bound, device=device, dtype=torch.int32) * tile_m
-    tile_expert = (
-        torch.searchsorted(starts, tile_rows, right=True) - 1
-    ).clamp_(0, E - 1).to(torch.int32)
-    row_expert = tile_expert.repeat_interleave(tile_m).long()  # (contiguous_m,) for bias
+        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        _starts, psum, _ = contiguous_psum_remap(_masked_m, topids_to_rows, E, max_m, tile_m)
+    psum = psum.to(torch.int32).contiguous()
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
-
-    # stage1 activation quant (route-indexed) -> (1, cm, model_dim) fp8 + grouped A-scale
-    a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
-        hidden_states.reshape(1, token_num, model_dim),
-        1,
-        contiguous_m,
-        wmma_rep=wmma_rep,
-        quant_mode="fp8",
-        masked_m=None,
-        topids_to_rows=topids_to_rows,
-        source_topk=topk,
-    )
-
-    # stage1 raw GEMM -> (1, cm, 2*inter)
-    tmp = torch.empty((1, contiguous_m, two_inter), dtype=dtype, device=device)
-    w1_u8 = _grouped_weight_uint8(w1)
-    w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
-    flydsl_grouped_gemm_a8w4_masked(
-        tmp, a1_payload, w1_u8, a1_scale, w1s_i32, tile_expert,
-        E=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim, out_is_f16=out_is_f16,
-    )
-
-    # stage1 activation (swiglu/silu + per-row bias) -> (1, cm, inter)
-    tf = tmp[0].float()
-    if stage1_weight_layout == "gugu":
-        gate, up = tf[:, 0::2], tf[:, 1::2]
-    else:
-        gate, up = tf[:, :inter_dim], tf[:, inter_dim:]
-    if bias1 is not None and bias1.numel() > 0:
-        b1 = bias1.float()[row_expert]
-        if stage1_weight_layout == "gugu":
-            gate, up = gate + b1[:, 0::2], up + b1[:, 1::2]
-        else:
-            gate, up = gate + b1[:, :inter_dim], up + b1[:, inter_dim:]
+    stage1_act = 2 if activation == ActivationType.Swiglu else 1
     sl = (
         float(swiglu_limit)
         if swiglu_limit
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
-    g = torch.minimum(gate, torch.tensor(sl, dtype=torch.float32, device=device))
-    u = up.clamp(-sl, sl)
-    if activation == ActivationType.Swiglu:
-        y = (g * torch.sigmoid(1.702 * g) * (u + 1.0)).to(dtype)
-    else:
-        y = (g * torch.sigmoid(g) * u).to(dtype)
-    y = y.reshape(1, contiguous_m, inter_dim)
+    _b1 = bias1.to(dtype).contiguous() if (bias1 is not None and bias1.numel() > 0) else None
+    _b2 = bias2.to(dtype).contiguous() if (bias2 is not None and bias2.numel() > 0) else None
 
-    # a2 quant (already contiguous) + stage2 raw GEMM -> (1, cm, model_dim)
+    # stage1: route-indexed MXFP8 quant of A -> (1, cm, K) fp8 + grouped A-scale
+    a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+        hidden_states.reshape(1, token_num, model_dim), 1, contiguous_m,
+        wmma_rep=wmma_rep, quant_mode="fp8", masked_m=None,
+        topids_to_rows=topids_to_rows, source_topk=topk,
+    )
+
+    # stage1 GEMM with fused silu/swiglu(+bias1) -> y (1, cm, inter)
+    y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
+    w1_u8 = _grouped_weight_uint8(w1)
+    w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    flydsl_grouped_gemm_a8w4_masked(
+        y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+        n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+        out_is_f16=out_is_f16, stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+        num_buffers=3,
+    )
+
+    # a2 quant -> stage2 GEMM (+bias2) -> grouped_out (1, cm, model_dim)
     a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
         y, 1, contiguous_m, wmma_rep=wmma_rep, quant_mode="fp8",
         masked_m=None, topids_to_rows=None,
@@ -433,29 +404,21 @@ def _grouped_a8w4_tdm_moe(
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     flydsl_grouped_gemm_a8w4_masked(
-        grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, tile_expert,
-        E=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim, out_is_f16=out_is_f16,
+        grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum,
+        n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
+        out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=2,
     )
-    if bias2 is not None and bias2.numel() > 0:
-        grouped_out[0] += bias2.to(dtype)[row_expert]
 
     if kernel_bench_callable is not None:
-        kernel_bench_callable.append((
-            "gemm1",
-            functools.partial(
-                flydsl_grouped_gemm_a8w4_masked, tmp, a1_payload, w1_u8, a1_scale,
-                w1s_i32, tile_expert, E=E, contiguous_m=contiguous_m, N=two_inter,
-                K=model_dim, out_is_f16=out_is_f16,
-            ),
-        ))
-        kernel_bench_callable.append((
-            "gemm2",
-            functools.partial(
-                flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale,
-                w2s_i32, tile_expert, E=E, contiguous_m=contiguous_m, N=model_dim,
-                K=inter_dim, out_is_f16=out_is_f16,
-            ),
-        ))
+        kernel_bench_callable.append(("gemm1", functools.partial(
+            flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+            out_is_f16=out_is_f16, stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+            num_buffers=3)))
+        kernel_bench_callable.append(("gemm2", functools.partial(
+            flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32,
+            psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
+            out_is_f16=out_is_f16, stage1_act=0, bias=_b2, num_buffers=2)))
 
     # gather-reduce -> (token_num, model_dim)
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
@@ -618,7 +581,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if get_gfx() != "gfx1250" and "gfx1250" not in _gfx_env and not _force_gfx1250:
         return None
 
-    if is_grouped_a8w4 and _use_a8w4_tdm_path():
+    if is_grouped_a8w4 and _use_a8w4_tdm_path() and stage1_weight_layout == "gugu":
         return _grouped_a8w4_tdm_moe(
             hidden_states, w1, w2, topk_weight, topk_ids,
             E=E, model_dim=model_dim, inter_dim=inter_dim, dtype=dtype,
