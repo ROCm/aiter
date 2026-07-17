@@ -397,9 +397,24 @@ def test_fmoe_ep_mxfp4(
     topk,
     shared_E=2,
     ep=8,
+    ep_mode="real",
+    fake_ep_rank=0,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
+
+    ep_mode selects how tokens/routing reach fused_moe:
+      * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
+        a source token is received iff it owns >=1 local expert (deduplicated), so
+        total_recv <= token and non-local routes are masked. Buffer is trimmed to
+        trim_M = token*topk (ATOM CUDAGraph bound) with a padded tail.
+      * "fake": mirror ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb,
+        atom/model_ops/moe.py:121-136). `token` is the PER-RANK batch M; every
+        token's topk picks are redirected onto this rank's local expert block via a
+        rolling window, so all M*topk routes are local (no mask, no dedup) and the
+        grouped GEMM runs the full M*topk load. total_recv == trim_M == M.
+        fake_ep_rank selects the local block [rank*L,(rank+1)*L) (default 0, matches
+        ATOM_FAKE_EP_RANK); ignored in real mode (which uses ep-1).
 
     `token` is the **global** token count (total across all EP ranks).
     The test mirrors ATOM's real MoriV2ModularKernel shapes after dispatch+trim:
@@ -445,12 +460,14 @@ def test_fmoe_ep_mxfp4(
     #   experts_per_rank = E // ep. total_recv is computed from the actual routing
     #   (tokens owning >=1 local expert, deduplicated) -- MORI's total_recv_t --
     #   rather than assuming every token arrives. total_recv <= n_src = token.
-    graph_bs = token // ep
     experts_per_rank = E // ep
-    n_src = graph_bs * ep  # global source tokens (all EP ranks' pre-dispatch tokens)
-    trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound (buffer rows)
 
-    ep_id = ep - 1
+    # Which EP rank this process simulates. real mode keeps the historical last
+    # rank (ep-1); fake mode uses fake_ep_rank to match ATOM_FAKE_EP_RANK (default
+    # 0) so the local expert block lines up block-for-block with the fake-EP
+    # server (init_balance_router_logits' fake_ep_rank, moe.py:134).
+    ep_id = fake_ep_rank if ep_mode == "fake" else ep - 1
+    assert 0 <= ep_id < ep, f"ep_id={ep_id} out of range [0,{ep})"
     local_expert_start = ep_id * experts_per_rank
     local_expert_end = (ep_id + 1) * experts_per_rank
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
@@ -462,73 +479,148 @@ def test_fmoe_ep_mxfp4(
 
     dtype = dtypes.bf16
 
-    # ---------- Simulate MORI dispatch output ----------
-    # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold before
-    #   dispatch). Each token picks topk experts from ALL E experts via fused_topk
-    #   (the router runs *before* dispatch on the source rank).
-    src_input = torch.randn((n_src, model_dim), dtype=dtype, device="cuda")
-    src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
-    src_topk_ids = torch.empty(
-        (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
-    )
-    ns_ids, s_ids = src_topk_ids.split([topk, shared_E + 1], dim=1)
-    shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_ids_list = [[fake_expertid] * (shared_E + 1)] * n_src
-    for i in range(ep_id, n_src, ep):
-        s_ids_list[i] = shared_expert_ids
-    s_ids[:] = torch.tensor(s_ids_list, dtype=dtypes.i32, device="cuda")
-    src_topk_weights = torch.empty(
-        (n_src, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
-    )
-    ns_wts, s_wts = src_topk_weights.split([topk, shared_E + 1], dim=1)
-    s_wts[:] = 0.1
-    fused_topk(src_input, src_score, topk, True, ns_ids, ns_wts)
+    if ep_mode == "fake":
+        # ---------- ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb) shape model ----------
+        # Mirrors init_balance_router_logits()'s fake_ep_rank branch,
+        # atom/model_ops/moe.py:121-136. Under ATOM_FAKE_EP the parallel config is
+        # forced to dp_size=1 (FusedMoEParallelConfig.make, moe.py:191-202), so
+        # use_all2all_kernels is False (moe.py:171-173) and there is NO MORI
+        # dispatch/combine: the full per-rank batch flows straight into fused_moe
+        # (forward_impl, moe.py:3654-3687). --fake-eplb then rewrites the router so
+        # every token's topk picks land on THIS rank's local block via a rolling
+        # window (moe.py:131-135). Consequences vs the real path:
+        #   * `token` is the PER-RANK forward batch M (server-side M), not a global
+        #     count -- nothing shrinks it.
+        #   * all M*topk routes are local => no expert_mask drop, no dedup.
+        #   * total_recv == M and trim_M == M (no CUDAGraph pad tail); the grouped
+        #     GEMM computes the full M*topk load (a fully-loaded EP rank).
+        M = token
+        L = experts_per_rank
+        graph_bs = M
+        n_src = M
+        total_recv = M
+        trim_M = M
 
-    # Step 2: MORI dispatch keeps only the tokens that own >=1 *local* expert on
-    #   this rank (routed OR active shared), deduplicated to one row per token --
-    #   exactly run_ref()'s `mask.any(1)` selection in test_mori_all2all.py. The
-    #   received count is the device scalar MORI returns as total_recv_t.
-    recv_mask = expert_mask[src_topk_ids.long()].bool().any(dim=1)
-    recv_input = src_input[recv_mask].contiguous()
-    recv_topk_ids = src_topk_ids[recv_mask].contiguous()
-    recv_topk_weights = src_topk_weights[recv_mask].contiguous()
-    total_recv = int(recv_input.shape[0])
-    assert total_recv <= trim_M, f"total_recv={total_recv} exceeds trim_M={trim_M}"
-    print(
-        f"  [EP sim] global_token={token} topk={topk} ep={ep} graph_bs={graph_bs} "
-        f"n_src={n_src} total_recv={total_recv} trim_M={trim_M}"
-    )
+        input_ = torch.randn((M, model_dim), dtype=dtype, device="cuda")
 
-    # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
-    #   First total_recv rows = valid received tokens (from step 2).
-    #   Rows [total_recv, trim_M) = dead padding (MORI arena tail).
-    input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
-    input_[:total_recv] = recv_input
+        # Rolling-window local routing == moe.py:131-135:
+        #   local_slot = (t*topk + k) % L ; expert_ids = ep_id*L + local_slot
+        # topk <= L keeps the topk picks distinct within a token, and the window
+        # advancing by topk each row keeps the L local experts balanced.
+        assert topk <= L, f"fake-eplb requires topk({topk}) <= experts_per_rank({L})"
+        t = torch.arange(M, device="cuda").unsqueeze(1)
+        k = torch.arange(topk, device="cuda").unsqueeze(0)
+        local_slot = (t * topk + k) % L
+        expert_ids = ep_id * L + local_slot  # (M, topk) int64, all local
 
-    total_topk_ids = torch.zeros(
-        (trim_M, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
-    )
-    total_topk_ids[:total_recv] = recv_topk_ids
+        # Faithful replay of moe.py:130-135 followed by the REAL routing primitive:
+        # scatter 1.0 into synthetic router_logits exactly like the fake-eplb branch
+        # (moe.py builds a full (max_num_tokens, E) table then slices [:M]; because
+        # the formula is per-row, building M rows here is identical), then run
+        # fused_topk with renormalize=True -- the same topk the real branch uses --
+        # so topk_ids AND topk_weights come from the actual kernel, not hardcoded.
+        # Equal selected logits => softmax+renormalize gives uniform weights, but
+        # now via the real path. (routed_scaling_factor is a later model-forward
+        # multiply, not part of routing, and the real branch doesn't model it
+        # either.)
+        router_logits = torch.zeros((M, E), dtype=dtype, device="cuda")
+        router_logits.scatter_(1, expert_ids, 1.0)
+        # No shared/fake column: moe_sorting reads topk from topk_ids.shape[1]
+        # (aiter/fused_moe.py:396,527,569), so (M, topk) expands to exactly M*topk
+        # local routes -- no masked padding column.
+        topk_ids = torch.empty((M, topk), dtype=dtypes.i32, device="cuda")
+        topk_weights = torch.empty((M, topk), dtype=dtypes.fp32, device="cuda")
+        fused_topk(input_, router_logits, topk, True, topk_ids, topk_weights)
 
-    total_topk_weights = torch.zeros(
-        (trim_M, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
-    )
-    total_topk_weights[:total_recv] = recv_topk_weights
+        # Every row is valid; no padded tail to skip.
+        num_local_tokens = torch.tensor(
+            [total_recv], dtype=dtypes.i32, device="cuda"
+        )
 
-    topk_ids = total_topk_ids
-    topk_weights = total_topk_weights
+        # Reference sees exactly the same batch + routing.
+        ref_input = input_
+        ref_topk_ids = topk_ids
+        ref_topk_weights = topk_weights
 
-    # total_recv_t: device scalar matching MORI's dispatch return; fused_moe gets
-    # it as num_local_tokens and processes only the first total_recv rows, skipping
-    # the padded tail (mirrors DeviceMoEPipeline._layer_step in test_mega_moe.py,
-    # where total_recv_t from op.dispatch feeds moe_forward's num_local_tokens).
-    total_recv_t = torch.tensor([total_recv], dtype=dtypes.i32, device="cuda")
-    num_local_tokens = total_recv_t
+        print(
+            f"  [EP sim/fake] per_rank_M={M} topk={topk} ep={ep} L={L} "
+            f"local_experts=[{local_expert_start},{local_expert_end}) "
+            f"routes={M * topk} (all local, no mask/dedup) trim_M={trim_M}"
+        )
+    else:
+        graph_bs = token // ep
+        n_src = graph_bs * ep  # global source tokens (all EP ranks' pre-dispatch)
+        trim_M = graph_bs * topk * ep  # ATOM's CUDAGraph trim bound (buffer rows)
 
-    # Reference: same received tokens, same routing, same expert_mask.
-    ref_input = recv_input
-    ref_topk_ids = recv_topk_ids
-    ref_topk_weights = recv_topk_weights
+        # ---------- Simulate MORI dispatch output ----------
+        # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold
+        #   before dispatch). Each token picks topk experts from ALL E experts via
+        #   fused_topk (the router runs *before* dispatch on the source rank).
+        src_input = torch.randn((n_src, model_dim), dtype=dtype, device="cuda")
+        src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
+        src_topk_ids = torch.empty(
+            (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+        )
+        ns_ids, s_ids = src_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_ids_list = [[fake_expertid] * (shared_E + 1)] * n_src
+        for i in range(ep_id, n_src, ep):
+            s_ids_list[i] = shared_expert_ids
+        s_ids[:] = torch.tensor(s_ids_list, dtype=dtypes.i32, device="cuda")
+        src_topk_weights = torch.empty(
+            (n_src, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+        )
+        ns_wts, s_wts = src_topk_weights.split([topk, shared_E + 1], dim=1)
+        s_wts[:] = 0.1
+        fused_topk(src_input, src_score, topk, True, ns_ids, ns_wts)
+
+        # Step 2: MORI dispatch keeps only the tokens that own >=1 *local* expert
+        #   on this rank (routed OR active shared), deduplicated to one row per
+        #   token -- exactly run_ref()'s `mask.any(1)` selection in
+        #   test_mori_all2all.py. The received count is the device scalar MORI
+        #   returns as total_recv_t.
+        recv_mask = expert_mask[src_topk_ids.long()].bool().any(dim=1)
+        recv_input = src_input[recv_mask].contiguous()
+        recv_topk_ids = src_topk_ids[recv_mask].contiguous()
+        recv_topk_weights = src_topk_weights[recv_mask].contiguous()
+        total_recv = int(recv_input.shape[0])
+        assert total_recv <= trim_M, f"total_recv={total_recv} exceeds trim_M={trim_M}"
+        print(
+            f"  [EP sim] global_token={token} topk={topk} ep={ep} graph_bs={graph_bs} "
+            f"n_src={n_src} total_recv={total_recv} trim_M={trim_M}"
+        )
+
+        # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
+        #   First total_recv rows = valid received tokens (from step 2).
+        #   Rows [total_recv, trim_M) = dead padding (MORI arena tail).
+        input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
+        input_[:total_recv] = recv_input
+
+        total_topk_ids = torch.zeros(
+            (trim_M, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
+        )
+        total_topk_ids[:total_recv] = recv_topk_ids
+
+        total_topk_weights = torch.zeros(
+            (trim_M, topk + shared_E + 1), dtype=dtypes.fp32, device="cuda"
+        )
+        total_topk_weights[:total_recv] = recv_topk_weights
+
+        topk_ids = total_topk_ids
+        topk_weights = total_topk_weights
+
+        # total_recv_t: device scalar matching MORI's dispatch return; fused_moe
+        # gets it as num_local_tokens and processes only the first total_recv rows,
+        # skipping the padded tail (mirrors DeviceMoEPipeline._layer_step in
+        # test_mega_moe.py, where total_recv_t from op.dispatch feeds moe_forward's
+        # num_local_tokens).
+        total_recv_t = torch.tensor([total_recv], dtype=dtypes.i32, device="cuda")
+        num_local_tokens = total_recv_t
+
+        # Reference: same received tokens, same routing, same expert_mask.
+        ref_input = recv_input
+        ref_topk_ids = recv_topk_ids
+        ref_topk_weights = recv_topk_weights
 
     total_local = local_E + shared_E
     w1 = (
@@ -705,6 +797,7 @@ def test_fmoe_ep_mxfp4(
     summary_table.append(
         {
             "quant": quant_label,
+            "ep_mode": ep_mode,
             "global_token": token,
             "total_recv": total_recv,
             "trim_M": trim_M,
@@ -820,6 +913,27 @@ parser.add_argument(
     default=[8],
     help="""Expert Parallelism.
     e.g.: -ep 8""",
+)
+parser.add_argument(
+    "--ep-mode",
+    type=str,
+    choices=["real", "fake"],
+    default="real",
+    help="""Routing model for the mxfp4 EP tests (g1u1_a8w4_mxfp4/g1u1_a4w4_mxfp4):
+    real = simulate MORI dispatch: -m is GLOBAL tokens, dedup + mask, only
+           ~1/ep of routes land locally (total_recv <= token).
+    fake = ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb, moe.py:121-136): -m is the
+           PER-RANK batch M, every token's topk redirected onto local experts
+           (full M*topk local routes, no mask/dedup). Aligns with
+           serve_dsv4_fake_ep_trace.sh.""",
+)
+parser.add_argument(
+    "--fake-ep-rank",
+    type=int,
+    default=0,
+    help="""EP rank to simulate in --ep-mode fake (matches ATOM_FAKE_EP_RANK,
+    default 0). Selects the local expert block [rank*L, (rank+1)*L).
+    Ignored in --ep-mode real (which always uses ep-1).""",
 )
 
 args = parser.parse_args()
@@ -957,6 +1071,8 @@ for test in args.test:
                             args.topk,
                             shared_E=0,
                             ep=ep,
+                            ep_mode=args.ep_mode,
+                            fake_ep_rank=args.fake_ep_rank,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
