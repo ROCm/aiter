@@ -458,11 +458,16 @@ def compile_wd_moe_gate_up(
             u_final = for_op.results[1]
 
         elif w_dtype == "fp8":
-            # ── FP8: batched load/compute (proven correct, 44%→65% HBM gain) ─
-            # Prefetch pipeline has an unresolved phase bug for FP8 (alternating
-            # k-step correctness when n_k_steps is odd).  Use the working batched
-            # pattern: issue all loads → one vmcnt → compute.  TODO: debug the
-            # prefetch path and enable it for FP8 as well.
+            # ── FP8: batched load/compute ─────────────────────────────────────
+            # A software-pipelined prefetch variant was investigated but produces
+            # incorrect results for various n_k_steps values.  Root cause: the
+            # FP8 compute kernel re-uses the same g_fp8/u_fp8 SSA values for two
+            # different sel conversions; LLVM's register allocator aliases the
+            # first dot2 output with that shared VGPR, corrupting the second
+            # conversion.  Issuing separate loads per (wi,sel) doesn't help
+            # because LLVM CSEs the duplicate loads (same address, no side effect).
+            # The batched pattern (issue all loads → vmcnt0 → compute) is reliable
+            # and already recovered HBM utilisation from 44% → 65%.
             for_op = scf.ForOp(
                 arith.constant(0, index=True),
                 arith.constant(_n_k_steps, index=True),
@@ -482,22 +487,16 @@ def compile_wd_moe_gate_up(
                     wi4 = arith.constant(wi * 4, type=i32)
                     w_i32_off = (lane_k + wi4) // c_four
                     g_fp8_words.append(
-                        buffer_ops.buffer_load(
-                            wg_row_rsrc, w_i32_off, vec_width=1, dtype=i32
-                        )
+                        buffer_ops.buffer_load(wg_row_rsrc, w_i32_off, vec_width=1, dtype=i32)
                     )
                     u_fp8_words.append(
-                        buffer_ops.buffer_load(
-                            wu_row_rsrc, w_i32_off, vec_width=1, dtype=i32
-                        )
+                        buffer_ops.buffer_load(wu_row_rsrc, w_i32_off, vec_width=1, dtype=i32)
                     )
                     for sel in range_constexpr(2):
                         pair_elem = arith.constant((wi * 2 + sel) * 2, type=i32)
                         x_off = (x_row_base + lane_k + pair_elem) // c_two
                         x_words_fp8.append(
-                            buffer_ops.buffer_load(
-                                x_rsrc, x_off, vec_width=1, dtype=i32
-                            )
+                            buffer_ops.buffer_load(x_rsrc, x_off, vec_width=1, dtype=i32)
                         )
 
                 _vmcnt0()
@@ -509,18 +508,10 @@ def compile_wd_moe_gate_up(
                         idx = wi * 2 + sel
                         xw = x_words_fp8[idx]
                         g_slots.append(
-                            _dot2_batched(
-                                zero_f32,
-                                xw,
-                                _fp8x2_to_bf16(g_fp8_words[wi], w_scale, sel),
-                            )
+                            _dot2_batched(zero_f32, xw, _fp8x2_to_bf16(g_fp8_words[wi], w_scale, sel))
                         )
                         u_slots.append(
-                            _dot2_batched(
-                                zero_f32,
-                                xw,
-                                _fp8x2_to_bf16(u_fp8_words[wi], w_scale, sel),
-                            )
+                            _dot2_batched(zero_f32, xw, _fp8x2_to_bf16(u_fp8_words[wi], w_scale, sel))
                         )
                 rocdl.s_nop(2)
                 gp = g_slots[0]
