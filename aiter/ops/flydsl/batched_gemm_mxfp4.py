@@ -85,12 +85,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         m_warp,
         n_warp,
         out_is_f16,
-        1,  # batch=1 (single contiguous buffer)
-        0,  # layout_mbn
         nb,
         a_is_fp4,
         ptr_arg(m_tile_map),
-        1,  # grouped_contig
         n_experts,
         stage1_act,
         has_bias,

@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Strided-batched A8W4 (MXFP8 E4M3 A x MXFP4 B) preshuffle GEMM for gfx1250"""
+"""Grouped contiguous-M A8W4 (MXFP8 E4M3 A x MXFP4 B) preshuffle MoE GEMM for gfx1250.
+
+Stage-1 grouped GEMM with in-kernel psum bisect (per-M-tile expert), DeepGEMM
+contiguous-M swizzle, and a fused silu/swiglu (+ optional bias) epilogue."""
 
 import math
+from contextlib import contextmanager
 from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl, tdm_ops
-from flydsl.expr.arith import ArithValue
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
-from flydsl._mlir.dialects import llvm
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
-
-from .tensor_shim import ptr_rsrc
 from .gemm_common_gfx1250 import (
     lds_load_b32_raw,
     lds_load_b128_raw,
@@ -25,6 +26,20 @@ from .gemm_common_gfx1250 import (
     pipeline_fence,
     workgroup_barrier,
 )
+
+LOG2E = 1.4426950408889634
+
+
+@contextmanager
+def _if_then(if_op):  # scf.IfOp then-region; if_op None -> no-op. Auto-yields empty.
+    if if_op is None:
+        yield
+        return
+    with ir.InsertionPoint(if_op.then_block):
+        yield
+        blk = if_op.then_block
+        if not blk.operations or not isinstance(blk.operations[-1], scf.YieldOp):
+            scf.YieldOp([])
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
@@ -43,12 +58,9 @@ def launch_gemm_a8w4_tdm(
     m_warp: Constexpr[int],
     n_warp: Constexpr[int],
     out_is_f16: Constexpr[int],
-    batch: Constexpr[int],
-    layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
     arg_m_tile_map: fx.Pointer,
-    grouped_contig: Constexpr[int],
     n_experts: Constexpr[int],
     stage1_act: Constexpr[int],
     has_bias: Constexpr[int],
@@ -119,79 +131,58 @@ def launch_gemm_a8w4_tdm(
         A_KROW, Kp16, K4 = k64 // A_PACK, (k64 // 2) * 16, k64 // 4
 
         tid = fx.Int32(fx.thread_idx.x)
-        bid_x, bid_y, bid_z = fx.block_idx
+        bid_x = fx.block_idx.x
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)  # uniform -> SGPR
         lane = tid % WAVE
         lane16 = lane % 16
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
-        if const_expr(grouped_contig):
-            # DeepGEMM MGroupedContiguous swizzle (M-primary): a group of K_1D
-            # m-tiles sweeps all n-tiles, so each n-tile's B stays hot in L2.
-            _i32 = T.i32
-            _K1D = arith.constant(16, type=_i32)
-            _tn = arith.constant(tile_n, type=_i32)
-            _tm = arith.constant(tile_m, type=_i32)
-            _ntot = (ArithValue(i32_n.ir_value()) + arith.constant(tile_n - 1, type=_i32)) // _tn
-            _mtot = (ArithValue(i32_m.ir_value()) + arith.constant(tile_m - 1, type=_i32)) // _tm
-            _pid = arith.index_cast(_i32, ArithValue(fx.block_idx.x))
-            _bpg = _ntot * _K1D
-            _gid = _pid // _bpg
-            _first = _gid * _K1D
-            _ing = _pid - _gid * _bpg
-            _rem = _mtot - _first
-            _nin = arith.select(arith.cmpi(arith.CmpIPredicate.slt, _rem, _K1D), _rem, _K1D)
-            _mtile_id = _first + (_ing - (_ing // _nin) * _nin)
-            _ntile_id = _ing // _nin
-            blk_m = _mtile_id * _tm
-            blk_n = _ntile_id * _tn
-        else:
-            blk_m = bid_x * tile_m
-            blk_n = bid_y * tile_n
-            _mtile_id = bid_x
+        # DeepGEMM MGroupedContiguous swizzle (M-primary): a group of K_1D m-tiles
+        # sweeps all n-tiles, so each n-tile's B stays hot in L2.
+        _K1D = fx.Int32(16)
+        _ntot = (i32_n + (tile_n - 1)) // tile_n
+        _mtot = (i32_m + (tile_m - 1)) // tile_m
+        _pid = fx.Int32(bid_x)
+        _bpg = _ntot * _K1D
+        _gid = _pid // _bpg
+        _first = _gid * _K1D
+        _ing = _pid - _gid * _bpg
+        _rem = _mtot - _first
+        _nin = (_rem < _K1D).select(_rem, _K1D)
+        _mtile_id = _first + (_ing - (_ing // _nin) * _nin)
+        blk_m = _mtile_id * tile_m
+        blk_n = (_ing // _nin) * tile_n
         blk_m64 = fx.Int64(blk_m)  # i64 element offsets keep address math off fx.index
         blk_n64 = fx.Int64(blk_n)
-        m64 = fx.Int64(i32_m)
         n64 = fx.Int64(i32_n)
-        bz64 = fx.Int64(bid_z) if const_expr(batch > 1) else 0
-        # grouped contiguous-M: per-M-tile expert id selects the B / B-scale slab;
-        # A / A-scale / C stay single-batch (bz=0) over the contiguous (1, cm, *) buffer.
-        if const_expr(grouped_contig):
-            # in-kernel bisect over psum (m_tile_map): expert = min e with psum[e] > row.
-            _mrsrc = ptr_rsrc(arg_m_tile_map)
-            _lo = arith.constant(0, type=T.i32)
-            _hi = arith.constant(n_experts, type=T.i32)
-            _one_i = arith.constant(1, type=T.i32)
-            _emax = arith.constant(n_experts - 1, type=T.i32)
-            for _bs in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
-                _mid = (_lo + _hi) >> _one_i
-                _mid_c = arith.select(arith.cmpi(arith.CmpIPredicate.slt, _mid, _emax), _mid, _emax)
-                _pend = buffer_ops.buffer_load(_mrsrc, _mid_c, vec_width=1, dtype=T.i32)
-                _go = arith.cmpi(arith.CmpIPredicate.sle, _pend, blk_m)
-                _lo = arith.select(_go, _mid + _one_i, _lo)
-                _hi = arith.select(_go, _hi, _mid)
-            _e_i32 = _lo
-            eb64 = fx.Int64(_e_i32)
-        else:
-            eb64 = bz64
+        # in-kernel bisect over psum (m_tile_map): expert = min e with psum[e] > row.
+        # the per-M-tile expert id selects the per-expert B / B-scale slab; A / A-scale
+        # / C are single-batch over the contiguous (1, cm, *) buffer.
+        _pi32 = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
+        _mmap = fx.recast_iter(_pi32, arg_m_tile_map)
+        _lo = fx.Int32(0)
+        _hi = fx.Int32(n_experts)
+        _one_i = fx.Int32(1)
+        _emax = fx.Int32(n_experts - 1)
+        for _bs in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
+            _mid = (_lo + _hi) >> _one_i
+            _mid_c = (_mid < _emax).select(_mid, _emax)
+            _pend = _mmap[_mid_c]
+            _go = _pend <= blk_m
+            _lo = _go.select(_mid + _one_i, _lo)
+            _hi = _go.select(_hi, _mid)
+        _e_i32 = _lo
+        eb64 = fx.Int64(_e_i32)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
         AS_ROW = (k64 // 128) * wmma_m_rep   # grouped A-scale gmem i32 super-row stride
 
-        # scale super-strides + C geometry (outer_off, inner_off, runtime N stride).
-        if const_expr(layout_mbn):
-            SA_OUTER_STRIDE = batch * K4
-            sa_batch_off = bz64 * K4
-            c_outer_off, c_inner_off, c_stride = blk_m64, bz64 * n64 + blk_n64, i32_n * batch
-        else:
-            SA_OUTER_STRIDE = K4
-            sa_batch_off = bz64 * ((m64 + 31) // 32) * K4
-            c_outer_off, c_inner_off, c_stride = bz64 * m64 + blk_m64, blk_n64, i32_n
+        # C geometry (outer_off, inner_off, runtime N stride) + per-expert B-scale slab.
+        c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
         mn_oob = i32_m - blk_m                          # valid M rows (A load / C store)
-        sa_oob = (i32_m + 31) // 32 - blk_m // 32       # valid M-supers (scale-A)
 
         base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr  # uint8 shared
 
@@ -215,17 +206,11 @@ def launch_gemm_a8w4_tdm(
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
-        A_OUTER_STRIDE = (batch * A_KROW) if layout_mbn else A_KROW
+        A_OUTER_STRIDE = A_KROW
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
-        sa_super_off = blk_m64 // 32
         sb_super_off = blk_n64 // 32
-
-        if const_expr(layout_mbn):
-            a_off0 = blk_m64 * (batch * A_KROW) + bz64 * A_KROW
-        else:
-            a_off0 = (bz64 * m64 + blk_m64) * A_KROW
+        a_off0 = blk_m64 * A_KROW
         b_off0 = b_outer_row * Kp16
-        sa_off0 = sa_super_off * SA_OUTER_STRIDE + sa_batch_off
         sb_off0 = sb_super_off * SB_OUTER_STRIDE + sb_batch_off
         WS8 = num_waves >= 8
         # Wave-specialized TDM (A->(0,1) B->(2,3) scales->(4,5)/(6,7) or reuse A/B pairs): split each tile's outer dim across a loader-wave pair (num_warps=1); else one cooperative all-wave copy.
@@ -259,13 +244,9 @@ def launch_gemm_a8w4_tdm(
                        on_i32=False, lds_off=0, lds_row=A_LDS_ROW, k_adv=A_ROW_B, wv=waves[0], pad=(A_ROW_B, LDS_PAD_A))
         _add_tdm_loads(gB_base, b_off0, Kp16, None, PACK_TK * 16, tile_n // 16,
                        on_i32=False, lds_off=STAGE_A, lds_row=B_LDS_ROW, k_adv=PACK_TK * 16, wv=waves[1])
-        if const_expr(grouped_contig):
-            _sa_off_g = (blk_m64 // wmma_m_rep) * AS_ROW
-            _add_tdm_loads(gSA_base, _sa_off_g, AS_ROW, None, AS_INNER, AS_SUPERS,
-                           on_i32=True, lds_off=SA_OFF // 4, lds_row=AS_INNER, k_adv=AS_INNER * 4, wv=waves[2])
-        else:
-            _add_tdm_loads(gSA_base, sa_off0, SA_OUTER_STRIDE, sa_oob, SC_INNER, SA_SUPERS,
-                           on_i32=True, lds_off=SA_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[2])
+        _sa_off_g = (blk_m64 // wmma_m_rep) * AS_ROW
+        _add_tdm_loads(gSA_base, _sa_off_g, AS_ROW, None, AS_INNER, AS_SUPERS,
+                       on_i32=True, lds_off=SA_OFF // 4, lds_row=AS_INNER, k_adv=AS_INNER * 4, wv=waves[2])
         _add_tdm_loads(gSB_base, sb_off0, SB_OUTER_STRIDE, None, SC_INNER, SB_SUPERS,
                        on_i32=True, lds_off=SB_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[3])
 
@@ -307,15 +288,11 @@ def launch_gemm_a8w4_tdm(
             return v0.shuffle(v1, list(range(8)))
 
         def load_sa(buf, wm, ksl):
-            if const_expr(grouped_contig):
-                # grouped wmma_rep-super A-scale read: byte = warp_lds_row*interleaved_cols
-                # + lane_kgrp*4 + ks*wmma_rep*4 + wm*4 (interleaved_cols = AS_INNER*4 bytes).
-                warp_lds_row = wmb // wmma_m_rep + lane16
-                byte = warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
-                return lds_load_b32_raw(buf, SA_OFF + byte)
-            row_rel = wmb + wm * 16 + lane16
-            word = (row_rel // 32) * SC_INNER + ksl * 32 + (row_rel % 32)
-            return lds_load_b32_raw(buf, SA_OFF + word * 4)
+            # grouped wmma_rep-super A-scale read: byte = warp_lds_row*interleaved_cols
+            # + lane_kgrp*4 + ks*wmma_rep*4 + wm*4 (interleaved_cols = AS_INNER*4 bytes).
+            warp_lds_row = wmb // wmma_m_rep + lane16
+            byte = warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
+            return lds_load_b32_raw(buf, SA_OFF + byte)
 
         def load_sb(buf, wn, ksl):
             col_rel = wnb + wn * 16 + lane16
@@ -393,121 +370,94 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(_BS_DS)
             rocdl.sched_barrier(0)
 
-        # grouped_contig: skip whole padding tiles (expert id < 0). tile_active is
-        # uniform across the workgroup, so the barriers below never diverge.
-        if const_expr(grouped_contig):
-            _tif = scf.IfOp(
-                arith.cmpi(arith.CmpIPredicate.slt, _e_i32, arith.constant(n_experts, type=T.i32)),
-                results_=[], has_else=False)
-            _tif_ip = ir.InsertionPoint(_tif.then_block)
-            _tif_ip.__enter__()
-        # per-wave TDM loads per K-tile: cooperative=4; wave-spec=1 (>=8 waves) or 2.
-        TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
-        # Prologue preloads nb K-tiles; the steady loop issues tile kt+nb
-        # after compute drains the slot (post-compute issue avoids WAR hazard).
-        for i in range_constexpr(num_buffers):
-            issue(i, i)
-        n_steady = K_TILES - num_buffers
+        # Skip whole padding tiles (expert id == n_experts). tile-active is uniform
+        # across the workgroup, so the barriers below never diverge.
+        _tif = scf.IfOp(_raw(_e_i32 < fx.Int32(n_experts)), results_=[], has_else=False)
+        with _if_then(_tif):
+            # per-wave TDM loads per K-tile: cooperative=4; wave-spec=1 (>=8 waves) or 2.
+            TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
+            # Prologue preloads nb K-tiles; the steady loop issues tile kt+nb
+            # after compute drains the slot (post-compute issue avoids WAR hazard).
+            for i in range_constexpr(num_buffers):
+                issue(i, i)
+            n_steady = K_TILES - num_buffers
+            for kt in range(n_steady):
+                s = kt % num_buffers
+                buf = _bidx(_buf_ptr(s))
+                # -- pre-compute: wait TDM into slot s, then barrier so all waves see it --
+                tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                workgroup_barrier()
+                compute_ktile(buf, None)
+                # -- post-compute: barrier so all waves finish reading slot s before re-issue --
+                workgroup_barrier()
+                issue(s, kt + num_buffers)
+            # Tail: last num_buffers tiles are resident; drain progressively.
+            for j in range_constexpr(num_buffers):
+                kt = n_steady + j
+                s = kt % num_buffers
+                buf = _bidx(_buf_ptr(s))
+                pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
+                compute_ktile(buf, None)
 
-        # pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+            accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
-        for kt in range(n_steady):
-            s = kt % num_buffers
-            buf = _bidx(_buf_ptr(s))
-            # -- pre-compute: wait TDM into slot s, then barrier so all waves see it --
-            tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+            # Epilogue: (optional bias +) fused silu/swiglu (gugu de-interleave), TDM-store.
+            pipeline_fence(outstanding=0)
+            STORE_N = (tile_n // 2) if stage1_act else tile_n
+            _neg_lim = fx.Float32(0.0) - f32_swiglu_limit
+            _one = fx.Float32(1.0)
+            _nlog2e = fx.Float32(-LOG2E)
+            _nlog2e_s = fx.Float32(-1.702 * LOG2E)
+            oc = fx.Float16 if out_is_f16 else fx.BFloat16
+
+            def _fmin(a, b):
+                return fx.Float32((a < b).select(a, b))
+
+            def _fmax(a, b):
+                return fx.Float32((a > b).select(a, b))
+
+            def _act(g, u):  # gugu pair -> fused silu/swiglu (gpt-oss clamp)
+                g = _fmin(g, f32_swiglu_limit)                    # gate <= +limit
+                u = _fmin(_fmax(u, _neg_lim), f32_swiglu_limit)   # up in [-limit, +limit]
+                if const_expr(stage1_act == 2):  # swiglu: g * sigmoid(1.702 g) * (u + 1)
+                    sig = fx.Float32(rocdl.rcp(T.f32, _one + (g * _nlog2e_s).exp2()))
+                    return g * sig * (u + _one)
+                sig = fx.Float32(rocdl.rcp(T.f32, _one + (g * _nlog2e).exp2()))  # silu
+                return g * sig * u
+
+            if const_expr(has_bias):
+                _pb = fx.PointerType.get(elem_ty=out_elem, address_space=fx.AddressSpace.Global, alignment=2)
+                _bmap = fx.recast_iter(_pb, arg_bias)
+            for wm in range_constexpr(wmma_m_rep):
+                row_rel = wmb + wm * 16 + lane16
+                for wn in range_constexpr(wmma_n_rep):
+                    col_rel = wnb + wn * 16 + kgrp * 8
+                    acc = Vec(accs[wm * wmma_n_rep + wn])
+                    if const_expr(has_bias):  # + bias[e, col_rel : col_rel+8] (one vec load)
+                        acc = acc + Vec(fx.ptr_load(_bmap + _e_i32 * i32_n + col_rel, result_type=T.vec(8, out_elem))).to(fx.Float32)
+                    if const_expr(stage1_act):
+                        hv = Vec.from_elements([_act(acc[2 * p], acc[2 * p + 1]) for p in range_constexpr(4)], fx.Float32).to(oc)
+                        lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
+                    else:
+                        hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
+                        lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
             workgroup_barrier()
-            compute_ktile(buf, None)
-            # -- post-compute: barrier so all waves finish reading slot s before re-issue --
-            workgroup_barrier()
-            # tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-            issue(s, kt + num_buffers)
-        # Tail: last num_buffers tiles are resident; drain progressively.
-        #  pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
-        for j in range_constexpr(num_buffers):
-            kt = n_steady + j
-            s = kt % num_buffers
-            buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-            compute_ktile(buf, None)
+            if const_expr(stage1_act):
+                _cN = i32_n // 2
+                _cinner = blk_n64 // 2
+            else:
+                _cN = c_stride
+                _cinner = c_inner_off
+            c_off_rt = c_outer_off * fx.Int64(_cN) + _cinner
+            gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+            atomC = _tdm(gtC, mn_oob, _cN)
+            fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
+            tdm_ops.tensor_wait(0)
 
-        accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
-
-        # Epilogue: (optional bias +) fused silu/swiglu, stage through LDS, TDM-store.
-        # gugu stage1_act de-interleaves the 8 acc cols (gate=even, up=odd) -> 4 outs
-        # (C_N = tile_n//2); stage1_act=0 is the plain N-wide store (+ optional bias).
-        pipeline_fence(outstanding=0)
-        STORE_N = (tile_n // 2) if stage1_act else tile_n
-        _lim = ArithValue(f32_swiglu_limit.ir_value())
-        _nl = arith.negf(_lim)
-        _onef = arith.constant(1.0, type=T.f32)
-        _nlog2e = arith.constant(-1.4426950408889634, type=T.f32)
-
-        def _act(g, u):
-            g = arith.negf(arith.maximumf(arith.negf(g), _nl))                      # min(g, lim)
-            u = arith.maximumf(arith.negf(arith.maximumf(arith.negf(u), _nl)), _nl)  # clamp(u,-lim,lim)
-            if const_expr(stage1_act == 2):  # swiglu (gpt-oss)
-                _al = arith.constant(1.702, type=T.f32)
-                _t = arith.mulf(arith.mulf(g, _al), _nlog2e)
-                _ex = llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [_t], [], [])
-                _sg = llvm.call_intrinsic(T.f32, "llvm.amdgcn.rcp.f32", [arith.addf(_onef, _ex)], [], [])
-                return arith.mulf(arith.mulf(g, _sg), arith.addf(u, _onef))
-            _ex = llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [arith.mulf(g, _nlog2e)], [], [])
-            _sg = llvm.call_intrinsic(T.f32, "llvm.amdgcn.rcp.f32", [arith.addf(_onef, _ex)], [], [])
-            return arith.mulf(arith.mulf(g, _sg), u)
-
-        _brsrc = ptr_rsrc(arg_bias) if const_expr(has_bias) else None
-        _n_i32 = ArithValue(i32_n.ir_value())
-        for wm in range_constexpr(wmma_m_rep):
-            row_rel = wmb + wm * 16 + lane16
-            for wn in range_constexpr(wmma_n_rep):
-                col_rel = wnb + wn * 16 + kgrp * 8
-                acc = accs[wm * wmma_n_rep + wn]
-                _cbase = eb64 * fx.Int64(i32_n) + fx.Int64(col_rel)
-
-                def _el(i):
-                    v = fx.vector.extract(acc, static_position=[i], dynamic_position=[])
-                    if const_expr(has_bias):
-                        b = buffer_ops.buffer_load(
-                            _brsrc, _cbase + i, vec_width=1, dtype=out_elem).extf(T.f32)
-                        v = arith.addf(v, b)
-                    return v
-
-                if const_expr(stage1_act):
-                    outv = [arith.trunc_f(out_elem, _act(_el(2 * p), _el(2 * p + 1)))
-                            for p in range_constexpr(4)]
-                    hv = fx.vector.from_elements(T.vec(4, out_elem), outv)
-                    i32v2 = fx.vector.bitcast(T.vec(2, T.i32), hv)
-                    lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, i32v2)
-                else:
-                    outv = [arith.trunc_f(out_elem, _el(i)) for i in range_constexpr(8)]
-                    hv = fx.vector.from_elements(T.vec(8, out_elem), outv)
-                    i32v = fx.vector.bitcast(T.vec(4, T.i32), hv)
-                    lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, i32v)
-        workgroup_barrier()
-        oc = fx.Float16 if out_is_f16 else fx.BFloat16
-        if const_expr(stage1_act):
-            _cN = i32_n // 2
-            _cinner = blk_n64 // 2
-        else:
-            _cN = c_stride
-            _cinner = c_inner_off
-        c_off_rt = c_outer_off * fx.Int64(_cN) + _cinner
-        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
-        atomC = _tdm(gtC, mn_oob, _cN)  # runtime N stride via strides=
-        fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
-        tdm_ops.tensor_wait(0)
-        if const_expr(grouped_contig):
-            scf.YieldOp([])
-            _tif_ip.__exit__(None, None, None)
-
-    gx = (i32_m + (tile_m - 1)) // tile_m
-    gy = (N + (tile_n - 1)) // tile_n
-    if const_expr(grouped_contig):
-        gx = gx * gy
-        gy = 1
+    m_tiles = (i32_m + (tile_m - 1)) // tile_m
+    n_tiles = (N + (tile_n - 1)) // tile_n
     kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, i32_m, N, K, f32_swiglu_limit).launch(
-        grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
+        grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
     )
 
 
