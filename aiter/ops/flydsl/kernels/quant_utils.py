@@ -299,6 +299,44 @@ def emit_cvt_pk8_fp8_f32(vals, recip, *, rocdl, vector, T):
     return vector.from_elements(T.vec(2, T.i32), [word0, word1])
 
 
+def emit_cvt_pk4_fp8_f32(vals, recip, *, rocdl, vector, T):
+    """Pack 4 pre-activated f32 values into 4 fp8 e4m3 bytes (i32).
+
+    The 4-wide counterpart of :func:`emit_cvt_pk8_fp8_f32`, used by the gugu
+    (gate/up interleaved) stage1 epilogue: there each sub-tile de-interleaves
+    to 4 output columns per lane, versus 8 for the gguu dual-B path.  Uses two
+    ``v_cvt_pk_fp8_f32`` calls (2 f32 -> 2 fp8 each) to fill one i32 word, with
+    the same ``* recip`` block-scale multiply as the 8-wide path.
+
+    Args:
+        vals:   list of 4 f32 IR values (activated GEMM output columns).
+        recip:  f32 IR value, ``2^(254-e8m0-23)`` reciprocal block scale.
+        rocdl:  the ``rocdl`` dialect module.
+        vector: kept for call-site symmetry with the pk8 helper (unused).
+        T:      the flydsl type namespace.
+
+    Returns:
+        ``i32`` IR value containing 4 packed fp8 e4m3 bytes.
+    """
+    assert len(vals) == 4, f"emit_cvt_pk4_fp8_f32 expects 4 values, got {len(vals)}"
+    c0 = arith.constant(0, type=T.i32)
+    word0 = rocdl.cvt_pk_fp8_f32(
+        T.i32,
+        _raw(vals[0] * recip),
+        _raw(vals[1] * recip),
+        _raw(c0),
+        0,
+    )
+    word0 = rocdl.cvt_pk_fp8_f32(
+        T.i32,
+        _raw(vals[2] * recip),
+        _raw(vals[3] * recip),
+        _raw(word0),
+        1,
+    )
+    return word0
+
+
 def _raw(value):
     """Unwrap a DSL Numeric to a raw ir.Value (rocdl/inline_asm need raw operands)."""
     return value.ir_value() if hasattr(value, "ir_value") else value
