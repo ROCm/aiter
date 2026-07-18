@@ -245,7 +245,7 @@ def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
         w2_scale_shuf=_mxfp4_shuffle_scale_a16w4(w2_scale, E, gate_up=False),
         a1_scale_sort=moe_mxfp4_sort(
             a1_scale[:token, :].view(token, 1, -1), sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids, token_num=token, block_size=block_m,
+            num_valid_ids=num_valid_ids, token_num=token, block_size=max(32, block_m),
         ),
         a2_qt=None,
         a2_scale=None,
@@ -359,7 +359,7 @@ def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
         sorted_ids=v["sti"],
         num_valid_ids=v["cumsum"],
         token_num=token,
-        block_size=BM_S1,
+        block_size=max(32, BM_S1),
     )
     adtype = d["base"].get("adtype", "fp8")
     stage2_adtype = d["base"].get("a2_dtype", adtype)

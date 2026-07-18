@@ -740,7 +740,7 @@ class FmoeTuner(TunerCommon):
             sorted_ids=v["sti"],
             num_valid_ids=v["cumsum"],
             token_num=token,
-            block_size=blockM,
+            block_size=max(32, blockM),
         )
         return {
             "a1_qt": d["a1_qt"],
@@ -1562,7 +1562,7 @@ class FmoeTuner(TunerCommon):
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
-                    block_size=blockM,
+                    block_size=max(32, blockM),
                 )
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
                 # FlyDSL stage2 receives fp8 input
@@ -1691,7 +1691,7 @@ class FmoeTuner(TunerCommon):
                 sorted_ids,
                 num_valid_ids,
                 token,
-                blockM,
+                max(32, blockM),
             )
             w1_scale = w1_scale.view(expert, -1)
             w2_scale = w2_scale.view(expert, -1)
@@ -3076,7 +3076,7 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -3323,7 +3323,7 @@ class FmoeTuner(TunerCommon):
         s1_kernels = get_flydsl_stage1_kernels(adtype, "fp4", out_dtype_str)
 
         for blockM in blockMs:
-            if blockM not in (32, 64, 128):
+            if blockM not in (16, 32, 64, 128):
                 continue
             # ---- v2 stage1 tasks: sweep the FULL fused stage1 candidate set ----
             # Mirror gen_flydsl_2stages_task's fused-variant construction so
@@ -4568,7 +4568,7 @@ class FmoeTuner(TunerCommon):
                 # not end with _fp8 (those fuse the cast in stage1).
                 if q_dtype_a == dtypes.fp4x2:
                     from aiter.test_common import run_perftest
-                    from aiter.ops.triton.quant.fused_mxfp4_quant import (
+                    from aiter.ops.quant import (
                         fused_dynamic_mxfp4_quant_moe_sort,
                     )
 
