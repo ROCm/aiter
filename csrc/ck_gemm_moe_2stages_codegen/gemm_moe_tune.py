@@ -3535,7 +3535,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(self, args, target_fused_moe=None, try_extra_ref=False, config_string=""):
+    def run_config(self, args, target_fused_moe=None, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
 
@@ -3829,40 +3829,12 @@ class FmoeTuner(TunerCommon):
                     cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
                     if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
                         status = "ok"
-                    elif try_extra_ref:
-                        # Compare with bf16 weight-decompression reference
-                        try:
-                            w1_deq = w1_qt.to(dtype=hidden.dtype) * w1_scale.view(
-                                w1_scale.shape[0], -1, 1
-                            ).to(dtype=hidden.dtype)
-                            w2_deq = w2_qt.to(dtype=hidden.dtype) * w2_scale.view(
-                                w2_scale.shape[0], -1, 1
-                            ).to(dtype=hidden.dtype)
-                            ref2 = self.torch_moe_2stages(
-                                hidden,
-                                w1_deq,
-                                w2_deq,
-                                topk_weights,
-                                topk_ids,
-                                dtype=dtype,
-                                activation=act_type,
-                                quant_type=QuantType.No,
-                                doweight_stage1=doweight_stage1,
-                            )
-                            err_ratio2 = checkAllclose(
-                                out, ref2, msg=f"run_config {shape_str} (bf16 ref)"
-                            )
-                            err_ratio = min(err_ratio, err_ratio2)
-                        except Exception:
-                            pass
-                    if err_ratio <= allowed_err_ratio:
-                        status = "ok"
                     else:
                         diag = tensor_compare_diagnostics(ref, out)
                         status = (
                             f"mismatch:err_ratio={err_ratio:.6g}"
                             f"(>{allowed_err_ratio_desc}),"
-                            f"logits_diff={logits_diff:.6g}(>{diag})"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol})(>{diag})"
                         )
                 results.append(
                     {
@@ -4761,7 +4733,7 @@ class FmoeTuner(TunerCommon):
         from aiter.fused_moe_gfx942 import fused_moe_gfx942, get_tune_space
         from functools import partial
 
-        results_base = self.run_config(args, try_extra_ref=True)
+        results_base = self.run_config(args)
         better_kernels = {}
 
         for i in range(len(self.untunedf)):
@@ -4824,7 +4796,6 @@ class FmoeTuner(TunerCommon):
                     target_fused_moe=partial(
                         target_fused_moe, config_string=config_string
                     ),
-                    try_extra_ref=True,
                     config_string = config_string,
                 )
             except Exception as e:

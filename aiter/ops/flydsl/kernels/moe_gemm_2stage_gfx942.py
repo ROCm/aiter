@@ -39,6 +39,7 @@ def _as_ptr(p, dtype=None):
             p = fx.recast_iter(dtype, p)
         return p
 
+
 def div_up(x, y):
     return (x + y - 1) // y
 
@@ -1455,7 +1456,8 @@ def compile_gemm(
             out_tensor = fx.rocdl.make_buffer_tensor(
                 arg_p_output,
                 max_size=False,
-                num_records_bytes=M * TOPK * N // 2 * fx.BFloat16.width // 8,
+                num_records_bytes=fx.Int64(M)
+                * (TOPK * N // 2 * fx.BFloat16.width // 8),
             )
             tiled_copy_sortid_lds = fx.make_tiled_copy(
                 fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
@@ -1599,7 +1601,7 @@ def compile_gemm(
                 arg_p_output = fx.rocdl.make_buffer_tensor(
                     arg_p_output,
                     max_size=False,
-                    num_records_bytes=M * TOPK * N * fx.BFloat16.width // 8,
+                    num_records_bytes=fx.Int64(M) * (TOPK * N * fx.BFloat16.width // 8),
                 )
                 cp_atom_w = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
                 is_atomic_write = False
@@ -1783,7 +1785,8 @@ def compile_gemm(
             out_tensor = fx.rocdl.make_buffer_tensor(
                 arg_p_output,
                 max_size=False,
-                num_records_bytes=M * TOPK * N // 2 * fx.BFloat16.width // 8,
+                num_records_bytes=fx.Int64(M)
+                * (TOPK * N // 2 * fx.BFloat16.width // 8),
             )
             buf_atom_w128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
             # CShuffle read/scatter over the single (BM x contiguous_n) region. The read uses a
@@ -2000,11 +2003,11 @@ def compile_gemm(
 
         flyobj.bid = e_idx
 
-        arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
-        arg_p_output = fxh.view_as_torch_tensor(p_output, (M, TOPK, N))
         max_valid_id = fxh.view_as_torch_tensor(p_num_valid_ids, (1,), fx.Int32)[0]
 
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
+            arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
+            arg_p_output = fxh.view_as_torch_tensor(p_output, (M, TOPK, N))
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
                 _as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
                 (BLOCK_TILE_SIZE_M,),
@@ -2059,29 +2062,40 @@ def compile_gemm(
                 fx.make_ordered_layout((BLOCK_M, BLOCK_N, 2), (1, 0, 2)),
             )
             layoutCt = fx.make_composed_layout(
-                fx.static(swz),
-                fx.make_ordered_layout((BLOCK_N, BLOCK_M, 2), (0, 1, 2))
+                fx.static(swz), fx.make_ordered_layout((BLOCK_N, BLOCK_M, 2), (0, 1, 2))
             )
             ldsC = lds.C.peek().view(layoutC)
             ldsCt = lds.C.peek().view(layoutCt)
 
-            # cp_atom = flyobj.get_universal_copy_atom(arg_p_input.dtype, 128)
-            tcopy, cp_atom = flyobj.get_tiled_copy_coalesced_mn(
-                ldsA0, copy_atom_bits=128, num_threads=256
+            arg_p_input = fx.rocdl.make_buffer_tensor(
+                arg_p_input,
+                max_size=False,
+                num_records_bytes=fx.Int64(M)
+                * (TOPK * K)
+                * (arg_p_input.dtype.width // 8),
             )
-            for dst, row, col in fxh.all_element_of_tensors(
-                ldsA0,
-                fxh.make_1d_coord_tensor(ldsA0, 0, fx.get_iter(arg_p_sorted_ids)),
-                fxh.make_1d_coord_tensor(ldsA0, 1, fx.make_int_tuple(0)),
-                tiled_copy=tcopy,
+            cp_atom = flyobj.get_buffer_copy_atom(arg_p_input.dtype, 128)
+
+            def flatten_A(x):
+                # second mode is innermost, so swap before flattening
+                # to get the right order for the tiled copy
+                x = fx.select(x, [1, 0])
+                return fx.group(x, 0, -1)
+
+            cp_ldsA0 = flatten_A(ldsA0)
+            cp_rows = flatten_A(
+                fxh.make_1d_coord_tensor(ldsA0, 0, fx.get_iter(arg_p_sorted_ids))
+            )
+            cp_cols = flatten_A(
+                fxh.make_1d_coord_tensor(ldsA0, 1, fx.make_int_tuple(0))
+            )
+            for dst, row, col in fxh.all_copy_atoms(
+                cp_ldsA0, cp_rows, cp_cols, atom_bits=128, num_threads=256
             ):
                 sorted_id = row[0].bitcast(fx.Uint32)
-                topk = sorted_id >> 24
-                # avoid using if brach in such small loop-body
-                valid = topk < TOPK
-                token_id = valid.select(sorted_id & 0xFFFFFF, 0)
-                topk = valid.select(topk, 0)
-                atom_A = fxh.atom_tensor(arg_p_input, (token_id, topk, col[0]), 128)
+                atom_A = fxh.atom_tensor(
+                    arg_p_input, (sorted_id & 0xFFFFFF, sorted_id >> 24, col[0]), 128
+                )
                 fx.copy(cp_atom, atom_A, dst)
             fx.gpu.barrier()
 
@@ -2128,10 +2142,22 @@ def compile_gemm(
                     fx.recast_iter(fx.Float32, _as_ptr(p_a_scale)),
                     fx.make_layout((M, TOPK), (0, 0)),
                 )
+                arg_a_scale = fx.rocdl.make_buffer_tensor(
+                    arg_a_scale,
+                    max_size=False,
+                    num_records_bytes=fx.Int64(1) * (arg_a_scale.dtype.width // 8),
+                )
             if const_expr(act_quant_type == "ptpc"):
                 arg_a_scale = fx.make_view(
                     fx.recast_iter(fx.Float32, _as_ptr(p_a_scale)),
                     fx.make_layout((M, TOPK), (TOPK, 1)),
+                )
+                arg_a_scale = fx.rocdl.make_buffer_tensor(
+                    arg_a_scale,
+                    max_size=False,
+                    num_records_bytes=fx.Int64(M)
+                    * TOPK
+                    * (arg_a_scale.dtype.width // 8),
                 )
 
             sorted_weights = fx.make_view(
@@ -2145,7 +2171,7 @@ def compile_gemm(
 
             if fx.const_expr(arg_a_scale is not None):
                 """load & combine per-token scales with per-token weights, and store into lds.C"""
-                cp_atom = flyobj.get_universal_copy_atom(p_a_scale.dtype, 32)
+                cp_atom = flyobj.get_buffer_copy_atom(p_a_scale.dtype, 32)
                 coord_tensor = fx.make_view(
                     fx.get_iter(arg_p_sorted_ids),
                     fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
