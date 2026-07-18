@@ -467,7 +467,10 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            # One (token, head) per CTA, no cross-lane reduction: the merge is
+            # memory-latency bound, so max occupancy (num_warps=1) beats wider
+            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+            num_warps=1,
             num_stages=2,
             **extra_kargs,
         )
@@ -1537,7 +1540,10 @@ def mla_decode_fwd_v4_nm(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            # One (token, head) per CTA, no cross-lane reduction: the merge is
+            # memory-latency bound, so max occupancy (num_warps=1) beats wider
+            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+            num_warps=1,
             num_stages=2,
             waves_per_eu=4,
         )
