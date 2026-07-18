@@ -714,7 +714,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
             route_E = 1
             route_max_m = int(contiguous_m)
-            _use_routeks_remap = False
 
             _use_fused_route_psum = (
                 int(token_num) * int(topk) <= _FUSED_ROUTE_PSUM_MAX_NUMEL
@@ -738,32 +737,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                     E,
                     max_m,
                 )
-                route_numel = int(token_num) * int(topk)
-                _routeks_remap_threshold = _as_int(
-                    os.environ.get("AITER_GROUPED_ROUTEKS_REMAP_THRESHOLD"),
-                    _FUSED_ROUTE_PSUM_MAX_NUMEL,
+                _grouped_dbg("route done, start psum+remap")
+                _starts_t, psum_t, _ = contiguous_psum_remap(
+                    masked_m, topids_to_rows, E, max_m, tile_m
                 )
-                _force_routeks_remap = os.environ.get(
-                    "AITER_GROUPED_FORCE_ROUTEKS_REMAP", "0"
-                ) in _TRUTHY_ENV
-                _disable_routeks_remap = os.environ.get(
-                    "AITER_GROUPED_DISABLE_ROUTEKS_REMAP", "0"
-                ) in _TRUTHY_ENV
-                _use_routeks_remap = (not _disable_routeks_remap) and (
-                    _force_routeks_remap
-                    or route_numel >= int(_routeks_remap_threshold)
-                )
-                if _use_routeks_remap:
-                    _grouped_dbg("route done, start psum")
-                    _starts_t, psum_t, _ = contiguous_psum(masked_m, E, tile_m)
-                else:
-                    _grouped_dbg("route done, start psum+remap")
-                    _starts_t, psum_t, _ = contiguous_psum_remap(
-                        masked_m, topids_to_rows, E, max_m, tile_m
-                    )
                 m_tile_map = psum_t
                 rows_to_tokens = None
-                _grouped_dbg("psum done" if _use_routeks_remap else "psum+remap done")
+                _grouped_dbg("psum+remap done")
 
             _grouped_dbg(f"start route-indexed quant+preshuffle ({fused_quant_mode})")
             grouped_a1, grouped_a1_scale = flydsl_moe_fused_quant_preshuffle(
@@ -775,8 +755,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 masked_m=None,
                 topids_to_rows=topids_to_rows,
                 source_topk=topk,
-                row_starts=_starts_t if _use_routeks_remap else None,
-                route_max_m=max_m if _use_routeks_remap else 0,
             )
             _grouped_dbg("route-indexed quant+preshuffle done")
         else:
