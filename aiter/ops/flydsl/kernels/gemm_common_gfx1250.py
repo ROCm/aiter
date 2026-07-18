@@ -85,10 +85,17 @@ def extract_lds_base_idx(smem_ptr):
 
 
 def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
+    """Materialize an LLVM LDS pointer from a pre-extracted byte base.
+
+    ``byte_offset`` may be an index value or an i32/int (e.g. a raw byte
+    expression from the caller); non-index offsets are cast to index here so
+    call sites don't have to wrap every offset in ``index_cast``.
+    """
     from flydsl._mlir.dialects import llvm as _llvm
     from flydsl.expr.arith import ArithValue as _AV
 
+    if not isinstance(_raw(byte_offset).type, ir.IndexType):
+        byte_offset = arith.index_cast(T.index, byte_offset)
     lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
     total_byte = _AV(lds_base_idx) + byte_offset
     addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
@@ -119,6 +126,28 @@ def lds_load_b32_raw(lds_base_idx, byte_offset):
     """
     ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
     return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+
+
+def lds_store_b128_raw(lds_base_idx, byte_offset, data):
+    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM).
+
+    Mirror of :func:`lds_load_b128_raw` for the store direction; used when the
+    LDS is a bump-allocated fly SharedAllocator base (no raw memref for the
+    ``vector.store`` path). ``data`` must be a 128-bit vector (``vec<4xi32>``).
+
+    Args:
+        lds_base_idx: LDS byte-base index (e.g. ``ptrtoint`` of a shared ptr).
+        byte_offset: Byte offset (index-type) relative to the base.
+        data: 128-bit value to store (``vector<4xi32>``).
+    """
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
+
+
+def lds_store_b64_raw(lds_base_idx, byte_offset, data):
+    """Store 8 bytes to LDS using a pre-extracted base index (vector<2xi32>)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
 
 
 def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
@@ -276,6 +305,38 @@ def store_acc_vec8_to_buffer(
         return 2
 
 
+import math as _math
+
+LOG2E = _math.log2(_math.e)
+
+
+def fmin_f32(a, b):
+    """Scalar f32 min (select-based, no NaN handling)."""
+    import flydsl.expr as _fx
+    return _fx.Float32((a < b).select(a, b))
+
+
+def fmax_f32(a, b):
+    """Scalar f32 max (select-based, no NaN handling)."""
+    import flydsl.expr as _fx
+    return _fx.Float32((a > b).select(a, b))
+
+
+def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+    import flydsl.expr as _fx
+    _one = _fx.Float32(1.0)
+    g = fmin_f32(g, limit_f32)
+    u = fmin_f32(fmax_f32(u, neg_limit_f32), limit_f32)
+    if swiglu:
+        nlog2e = _fx.Float32(-1.702 * LOG2E)
+        sig = _fx.Float32(rocdl.rcp(T.f32, _one + (g * nlog2e).exp2()))
+        return g * sig * (u + _one)
+    nlog2e = _fx.Float32(-LOG2E)
+    sig = _fx.Float32(rocdl.rcp(T.f32, _one + (g * nlog2e).exp2()))
+    return g * sig * u
+
+
 __all__ = [
     # LDS helpers
     "get_lds_memref",
@@ -292,4 +353,9 @@ __all__ = [
     # Epilogue
     "store_acc_vec8_to_lds",
     "store_acc_vec8_to_buffer",
+    # Scalar math
+    "LOG2E",
+    "fmin_f32",
+    "fmax_f32",
+    "fused_silu_swiglu_elem",
 ]

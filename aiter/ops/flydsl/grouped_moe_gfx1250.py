@@ -359,6 +359,124 @@ def _build_g2l_lut(
     return lut, None
 
 
+def _use_a8w4_tdm_path() -> bool:
+    return os.environ.get("AITER_GROUPED_A8W4_TDM", "1") in _TRUTHY_ENV
+
+
+def _tdm_align_up(x: int, a: int) -> int:
+    return ((int(x) + a - 1) // a) * a
+
+
+def _grouped_a8w4_tdm_moe(
+    hidden_states, w1, w2, topk_weight, topk_ids, *,
+    E, model_dim, inter_dim, dtype, activation,
+    w1_scale, w2_scale, bias1, bias2, swiglu_limit,
+    stage1_weight_layout, doweight_stage1,
+    tile_m=64, tile_n=256, tile_k=256, num_buffers=3,
+    tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
+    data_format="a8w4",
+):
+    import functools
+    import torch
+
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_moe_fused_quant_preshuffle,
+        flydsl_moe_topids_to_rows,
+    )
+
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    if tile_m2 is None:
+        tile_m2 = tile_m
+    if tile_n2 is None:
+        tile_n2 = tile_n
+    if tile_k2 is None:
+        tile_k2 = tile_k
+    if num_buffers2 is None:
+        num_buffers2 = num_buffers
+    wmma_rep = tile_m // 16
+    wmma_rep2 = tile_m2 // 16
+    _align_m = max(tile_m, tile_m2)
+    contiguous_m = max(_align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m))
+    max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
+
+    _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+    _starts, psum, _ = contiguous_psum_remap(_masked_m, topids_to_rows, E, max_m, tile_m)
+    psum = psum.to(torch.int32).contiguous()
+
+    out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
+    two_inter = 2 * inter_dim
+    stage1_act = 2 if activation == ActivationType.Swiglu else 1
+    sl = (
+        float(swiglu_limit) if swiglu_limit
+        else (7.0 if activation == ActivationType.Swiglu else float("inf"))
+    )
+    _b1 = bias1.to(dtype).contiguous() if (bias1 is not None and bias1.numel() > 0) else None
+    _b2 = bias2.to(dtype).contiguous() if (bias2 is not None and bias2.numel() > 0) else None
+    _is_fp4 = data_format == "fp4"
+    _quant_mode = "fp4" if _is_fp4 else "fp8"
+    _a_is_fp4 = 1 if _is_fp4 else 0
+
+    a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+        hidden_states.reshape(1, token_num, model_dim), 1, contiguous_m,
+        wmma_rep=wmma_rep, quant_mode=_quant_mode, masked_m=None,
+        topids_to_rows=topids_to_rows, source_topk=topk,
+    )
+
+    y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
+    w1_u8 = _grouped_weight_uint8(w1)
+    w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    flydsl_grouped_gemm_a8w4_masked(
+        y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+        n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+        out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+        stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+        num_buffers=num_buffers,
+    )
+
+    a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
+        y, 1, contiguous_m, wmma_rep=wmma_rep2, quant_mode=_quant_mode,
+        masked_m=None, topids_to_rows=None,
+    )
+    grouped_out = torch.zeros((1, contiguous_m, model_dim), dtype=dtype, device=device)
+    w2_u8 = _grouped_weight_uint8(w2)
+    w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
+    flydsl_grouped_gemm_a8w4_masked(
+        grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum,
+        n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
+        tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
+        out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+        stage1_act=0, bias=_b2, num_buffers=num_buffers2,
+    )
+
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(("gemm1", functools.partial(
+            flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+            num_buffers=num_buffers)))
+        kernel_bench_callable.append(("gemm2", functools.partial(
+            flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32,
+            psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
+            tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
+            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+            stage1_act=0, bias=_b2, num_buffers=num_buffers2)))
+
+    moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+    gather_w = (
+        torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
+        if doweight_stage1
+        else topk_weight.contiguous()
+    )
+    flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
+    os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
+    return moe_out
+
+
 def _maybe_grouped_gfx1250_a8w4_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -633,6 +751,32 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tdm_as_in_prologue_req = (
             os.environ["AITER_GROUPED_GEMM_AS_PROLOGUE"] in _TRUTHY_ENV
         )
+    # TDM batched kernel dispatch (gugu only, non-EP).
+    # tile_m<32 + tile_k=512 hits a flydsl PITCH alignment bug; gate out.
+    _tdm_tile_m = _as_int(cfg_row.get("tile_m"), tile_m) if cfg_row else tile_m
+    if _use_a8w4_tdm_path() and stage1_weight_layout == "gugu" and (
+        expert_mask is None
+    ) and _tdm_tile_m >= 32:
+        _tdm_kw = {}
+        if cfg_row is not None:
+            _tdm_kw["tile_m"] = _as_int(cfg_row.get("tile_m"), tile_m)
+            _tdm_kw["tile_n"] = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
+            _tdm_kw["tile_k"] = _as_int(cfg_row.get("tile_k"), 256)
+            _tdm_kw["num_buffers"] = _as_int(cfg_row.get("num_buffers"), num_buffers)
+            _tdm_kw["tile_m2"] = _as_int(cfg_row.get("tile_m2"), _tdm_kw["tile_m"])
+            _tdm_kw["tile_n2"] = _as_int(cfg_row.get("tile_n2"), _tdm_kw["tile_n"])
+            _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
+            _tdm_kw["num_buffers2"] = _as_int(cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"])
+        return _grouped_a8w4_tdm_moe(
+            hidden_states, w1, w2, topk_weight, topk_ids,
+            E=E, model_dim=model_dim, inter_dim=inter_dim, dtype=dtype,
+            activation=activation, w1_scale=w1_scale, w2_scale=w2_scale,
+            bias1=bias1, bias2=bias2, swiglu_limit=swiglu_limit,
+            stage1_weight_layout=stage1_weight_layout,
+            doweight_stage1=doweight_stage1,
+            data_format=data_format, **_tdm_kw,
+        )
+
     # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
     # to n_warp*64 / 256 when the column is absent.
     tile_n = (
