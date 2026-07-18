@@ -752,11 +752,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             os.environ["AITER_GROUPED_GEMM_AS_PROLOGUE"] in _TRUTHY_ENV
         )
     # TDM batched kernel dispatch (gugu only, non-EP).
-    # tile_m<32 + tile_k=512 hits a flydsl PITCH alignment bug; gate out.
-    _tdm_tile_m = _as_int(cfg_row.get("tile_m"), tile_m) if cfg_row else tile_m
     if _use_a8w4_tdm_path() and stage1_weight_layout == "gugu" and (
         expert_mask is None
-    ) and _tdm_tile_m >= 32:
+    ):
         _tdm_kw = {}
         if cfg_row is not None:
             _tdm_kw["tile_m"] = _as_int(cfg_row.get("tile_m"), tile_m)
