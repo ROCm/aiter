@@ -121,9 +121,7 @@ def _stage2_merge_vec(
         z = tl.sum(alpha, axis=0)
 
         v_off = (
-            qo_lse * Lv
-            + splits[:, None] * stride_mid_os * Lv
-            + offs_d[None, :]
+            qo_lse * Lv + splits[:, None] * stride_mid_os * Lv + offs_d[None, :]
         )  # [MAX_KV_SPLITS, BLOCK_DV]
         tv = tl.load(
             Mid_O + v_off,
@@ -158,7 +156,9 @@ def run_torch(logits, attn_lse, num_valid, out_dtype):
 
 
 @benchmark()
-def test_stage2_merge(num_seqs, num_heads, num_kv_splits, dv, dtype, warps=1, stages=2, wpe=4):
+def test_stage2_merge(
+    num_seqs, num_heads, num_kv_splits, dv, dtype, warps=1, stages=2, wpe=4
+):
     T = num_seqs  # decode: one q token per seq (max_seqlen_q == 1)
     N = num_kv_splits
     H = num_heads
