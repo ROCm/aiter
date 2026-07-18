@@ -62,7 +62,11 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl.expr.vector import ReductionOp
+from flydsl.expr.rocdl import tdm_ops
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .tensor_shim import GTensor, _to_raw, _run_compiled
 
@@ -137,6 +141,14 @@ SMALL_T_THRESHOLD = 96
 # USE_MROW_PREFILL=False to fall back to the stock kernel everywhere.
 USE_MROW_PREFILL = True
 XHEAD_HEADS_PER_WAVE = 8
+
+# TDM deep-prefetch prefill: a further ~14% over cross-head on the BF16 prefill
+# fast path (per-wave s_wait_dscnt fence + K=6 deep prefetch + cos/sin hoist;
+# ~514us / 8.4 TB/s vs cross-head ~599us at H=128/D=512). Kernel is inlined at
+# the end of this file (flydsl_qk_norm_rope_tdm_prefill); see
+# ../temp-doc/aiter/qk_norm_rope_tdm_handoff.md. Requires VEC=D/32 divisible by 8
+# (D % 256 == 0) and power-of-two H. Set False to fall back to the cross-head kernel.
+USE_TDM_PREFILL = True
 
 # SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
@@ -1171,6 +1183,27 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         and not paged
         and T_tok > SMALL_T_THRESHOLD
     ):
+        # TDM deep-prefetch is a further ~15% over cross-head, but needs
+        # VEC=D/32 divisible by 8 (D % 256 == 0) and power-of-two H. Fall back to
+        # the cross-head kernel when those don't hold.
+        if USE_TDM_PREFILL and (D % 256 == 0) and (H & (H - 1) == 0):
+            q_out, kv_out = flydsl_qk_norm_rope_tdm_prefill(
+                q,
+                kv,
+                kv_weight,
+                cos_cache,
+                sin_cache,
+                positions,
+                num_q_heads=H,
+                head_dim=D,
+                rope_head_dim=RD,
+                q_weight=q_weight if q_weighted else None,
+                q_out=q_out,
+                kv_out=kv_out,
+                stream=stream,
+            )
+            return q_out, kv_out, None, None
+
         q_out, kv_out = flydsl_qk_norm_rope_xhead(
             q,
             kv,
@@ -1648,4 +1681,711 @@ def flydsl_qk_norm_rope_xhead(
             _stm(),
         )
         _run_compiled(launcher, *args)
+    return q_out, kv_out
+
+
+# ===========================================================================
+# TDM deep-prefetch BF16 prefill (fastest path; ~14% over cross-head).
+# Dispatched above behind USE_TDM_PREFILL. Q via per-wave s_wait_dscnt fence +
+# K=6 deep prefetch + cos/sin hoist; KV via a direct-load row-per-wave kernel.
+# See ../temp-doc/aiter/qk_norm_rope_tdm_handoff.md for the full derivation.
+# ===========================================================================
+
+ROWS_PER_TILE = 32  # = waves per WG (1024-thread WG)
+NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*32KB=192KB LDS)
+TILES_PER_WG = 40  # CT: tiles streamed per WG (unrolled; CT % (H/RT) == 0)
+
+
+# ---------------------------------------------------------------------------
+# Q kernel: cross-head-contiguous TDM deep-prefetch stream
+# ---------------------------------------------------------------------------
+
+
+def _build_tdm(
+    *,
+    num_q_heads,
+    head_dim,
+    rope_head_dim,
+    num_buffers=NUM_BUFFERS,
+    tiles_per_wg=TILES_PER_WG,
+    hoist_cs=True,
+    q_weighted=False,
+):
+    H, D, RD = num_q_heads, head_dim, rope_head_dim
+    NOPE = D - RD
+    VEC = D // BLOCK_THREADS
+    ROPE_LO = NOPE // VEC
+    PAIRS = VEC // 2
+    K = num_buffers
+    CT = tiles_per_wg
+    RT = ROWS_PER_TILE
+    eb = 2
+    log2b = int(math.log2(BLOCK_THREADS))
+    log2H = int(math.log2(H)) if (H & (H - 1)) == 0 else None
+    tile_bytes = RT * D * eb
+
+    lds = SmemAllocator(
+        None, arch="gfx1250", global_sym_name=f"qknorm_tdm_H{H}_D{D}_K{K}"
+    )
+    lds.ptr = K * tile_bytes
+
+    name = f"qk_norm_rope_tdm_H{H}_D{D}_RD{RD}_k{K}_ct{CT}"
+    if hoist_cs:
+        name += "_h"
+    if q_weighted:
+        name += "_qw"
+    name += "_w32_flydsl"
+
+    @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, RT, 1])
+    def kernel(
+        q_in: fx.Tensor,  # [T*H, D] bf16
+        cos_cache: fx.Tensor,
+        sin_cache: fx.Tensor,
+        positions: fx.Pointer,  # [T] i64
+        q_out: fx.Pointer,  # [T*H, D] bf16
+        q_weight: fx.Tensor,  # [D] bf16 (dummy when not q_weighted)
+        num_rows: Int32,  # T*H
+    ):
+        f32 = T.f32
+        i32 = T.i32
+        fm = arith.FastMathFlags.fast
+        tid = fx.thread_idx.x
+        wave = fx.thread_idx.y
+        g = fx.block_idx.x
+
+        base = lds.get_base()
+        bufs = [
+            SmemPtr(base, k * tile_bytes, T.bf16, shape=(RT * D,)).get()
+            for k in range(K)
+        ]
+
+        cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
+        sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+        is_rope = _to_raw(tid >= ROPE_LO)
+        rope_rel = arith.maxsi(_to_raw(tid - ROPE_LO), arith.constant(0, type=i32))
+
+        # q_weight [D] is per-channel and constant across all rows/tokens -> load
+        # this wave's VEC channels once (tid-indexed), reuse for every tile.
+        def _load_qw():
+            # 256-bit (v16bf16) buffer_load isn't selectable; load in 128-bit
+            # (vec8) chunks. Nested def so the AST rewriter doesn't treat the
+            # accumulator list as a loop-carried scf.for var.
+            qw_rsrc = buffer_ops.create_buffer_resource(q_weight, max_size=True)
+            out = []
+            for c in range_constexpr(VEC // 8):
+                base_off = _to_raw(ArithValue(tid) * VEC + (c * 8))
+                qwraw = buffer_ops.buffer_load(
+                    qw_rsrc, base_off, vec_width=8, dtype=T.bf16
+                )
+                for i in range_constexpr(8):
+                    out.append(
+                        vector.extract(
+                            qwraw, static_position=[i], dynamic_position=[]
+                        ).extf(f32)
+                    )
+            return out
+
+        qw = _load_qw() if const_expr(q_weighted) else None
+
+        def _ptr_res(ptr):
+            return buffer_ops.create_buffer_resource_from_addr(
+                arith.index_cast(T.i64, fx.ptrtoint(ptr))
+            )
+
+        pos_rsrc = _ptr_res(positions)
+        q_out_rsrc = _ptr_res(q_out)
+        _BIG = 1 << 24
+        _nr_m1 = _to_raw(num_rows - 1)
+        tile_base = g * CT  # first tile index this WG owns
+        lds_off = fx.Index(_to_raw(wave)) * arith.index(D * eb)
+        row_elem = (
+            ArithValue(wave) * D + ArithValue(tid) * VEC
+        )  # LDS read pos (this wave)
+
+        def issue(buf, tile_idx):
+            # this wave's row of tile_idx -> buf slot wave*D (clamped to valid row)
+            my_row = ArithValue(
+                arith.minsi(
+                    _to_raw(ArithValue(tile_idx) * RT + ArithValue(wave)), _nr_m1
+                )
+            )
+            desc = tdm_ops.make_tensor_descriptor_2d(
+                q_in,
+                buf,
+                global_offset=(
+                    fx.Index(_to_raw(my_row)) * arith.index(1),
+                    arith.index(0),
+                ),
+                tensor_shape=(_BIG, D),
+                strides=(D, 1),
+                tile_shape=(1, D),
+                elem_bytes=eb,
+                num_warps=1,
+                lds_byte_offset=lds_off,
+                oob_outer_bound=_to_raw(num_rows),
+            )
+            tdm_ops.tensor_load_2d(desc)
+
+        def load_cs(tile_idx):
+            # pos/cos/sin for the token of (tile_idx, this wave). Callers hoist
+            # this across the GROUP tiles of one token (see the stream loop).
+            my_row = ArithValue(
+                arith.minsi(
+                    _to_raw(ArithValue(tile_idx) * RT + ArithValue(wave)), _nr_m1
+                )
+            )
+            if const_expr(log2H is not None):
+                tok = my_row >> log2H
+            else:
+                tok = ArithValue(
+                    arith.divsi(_to_raw(my_row), arith.constant(H, type=i32))
+                )
+            pos_i32 = buffer_ops.buffer_load(
+                pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
+            ).trunci(i32)
+            cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
+            if const_expr(PAIRS == 1):
+                return (
+                    [
+                        buffer_ops.buffer_load(
+                            cos_rsrc, cs, vec_width=1, dtype=T.bf16
+                        ).extf(f32)
+                    ],
+                    [
+                        buffer_ops.buffer_load(
+                            sin_rsrc, cs, vec_width=1, dtype=T.bf16
+                        ).extf(f32)
+                    ],
+                )
+            craw = buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            sraw = buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            cos_v = [
+                vector.extract(craw, static_position=[i], dynamic_position=[]).extf(f32)
+                for i in range(PAIRS)
+            ]
+            sin_v = [
+                vector.extract(sraw, static_position=[i], dynamic_position=[]).extf(f32)
+                for i in range(PAIRS)
+            ]
+            return cos_v, sin_v
+
+        def compute_store(buf, tile_idx, cos_v, sin_v):
+            my_row = ArithValue(
+                arith.minsi(
+                    _to_raw(ArithValue(tile_idx) * RT + ArithValue(wave)), _nr_m1
+                )
+            )
+            x = []
+            for c in range_constexpr(VEC // 8):
+                off = row_elem + (c * 8)
+                v = vector.load_op(
+                    T.vec(8, T.bf16),
+                    buf,
+                    [_to_raw(arith.index_cast(T.index, _to_raw(off)))],
+                )
+                for i in range_constexpr(8):
+                    x.append(
+                        vector.extract(
+                            v, static_position=[i], dynamic_position=[]
+                        ).extf(f32)
+                    )
+            sq = arith.constant(0.0, type=f32)
+            for vi in range_constexpr(VEC):
+                sq = arith.AddFOp(
+                    sq, arith.MulFOp(x[vi], x[vi], fastmath=fm).result, fastmath=fm
+                ).result
+            w = _to_raw(sq)
+            for sh in range_constexpr(log2b):
+                o = BLOCK_THREADS // (2 << sh)
+                w = arith.AddFOp(
+                    w, _to_raw(ArithValue(w).shuffle_xor(o, BLOCK_THREADS)), fastmath=fm
+                ).result
+            rstd = fmath.rsqrt(w * (1.0 / D) + 1e-6, fastmath=fm)
+            # RMSNorm (+ optional per-channel q_weight): (x * w) * rstd. rstd is
+            # from unweighted x^2 (matches stock/xhead semantics); mul commutes.
+            if const_expr(q_weighted):
+                scaled = [
+                    arith.MulFOp(
+                        arith.MulFOp(
+                            _to_raw(x[vi]), _to_raw(qw[vi]), fastmath=fm
+                        ).result,
+                        _to_raw(rstd),
+                        fastmath=fm,
+                    ).result
+                    for vi in range_constexpr(VEC)
+                ]
+            else:
+                scaled = [
+                    arith.MulFOp(_to_raw(x[vi]), _to_raw(rstd), fastmath=fm).result
+                    for vi in range_constexpr(VEC)
+                ]
+            rot = list(scaled)
+            for kk in range_constexpr(PAIRS):
+                e = scaled[2 * kk]
+                o = scaled[2 * kk + 1]
+                c = cos_v[kk]
+                s = sin_v[kk]
+                rot[2 * kk] = (
+                    arith.MulFOp(e, c, fastmath=fm).result
+                    - arith.MulFOp(o, s, fastmath=fm).result
+                )
+                rot[2 * kk + 1] = arith.AddFOp(
+                    arith.MulFOp(e, s, fastmath=fm).result,
+                    arith.MulFOp(o, c, fastmath=fm).result,
+                    fastmath=fm,
+                ).result
+            final = [
+                ArithValue(is_rope).select(rot[i], scaled[i])
+                for i in range_constexpr(VEC)
+            ]
+            _store_bf16_vec(final, q_out_rsrc, ArithValue(my_row) * (D * 2), tid, VEC)
+
+        def fence():
+            # Keep K-1 TDM loads in flight (tensorcnt), then wait the DS counter
+            # for this wave's oldest LDS write to land -> per-wave, no barrier.
+            tdm_ops.tensor_wait(K - 1)
+            rocdl.s_wait_dscnt(0)
+
+        # GROUP consecutive tiles are the same token (H/RT heads split RT-per-tile)
+        # -> load pos/cos/sin once per token when tile_base is GROUP-aligned.
+        GROUP = (H // RT) if (log2H is not None and H % RT == 0) else 1
+        do_hoist = hoist_cs and GROUP > 1 and (CT % GROUP == 0)
+
+        # --- prologue: fill K buffers ---
+        for k in range_constexpr(K):
+            issue(bufs[k], tile_base + k)
+        # --- stream: keep K-1 loads in flight; overlap load with compute ---
+        cs_cache = [None, None]
+        for i in range_constexpr(CT):
+            fence()
+            if const_expr(do_hoist):
+                if const_expr(i % GROUP == 0):
+                    cs_cache[0], cs_cache[1] = load_cs(tile_base + i)
+                cos_v, sin_v = cs_cache[0], cs_cache[1]
+            else:
+                cos_v, sin_v = load_cs(tile_base + i)
+            compute_store(bufs[i % K], tile_base + i, cos_v, sin_v)  # reads buf i%K
+            if const_expr(i + K < CT):
+                issue(bufs[i % K], tile_base + i + K)  # reuse buf i%K (after read)
+
+    @flyc.jit
+    def launch(
+        q_in: fx.Tensor,
+        cos_cache: fx.Tensor,
+        sin_cache: fx.Tensor,
+        positions: fx.Pointer,
+        q_out: fx.Pointer,
+        q_weight: fx.Tensor,
+        num_rows: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            lds.finalized = False
+            lds.finalize()
+        per_wg = RT * CT
+        gx = arith.divsi(
+            _to_raw(num_rows + (per_wg - 1)), arith.constant(per_wg, type=T.i32)
+        )
+        k = kernel(q_in, cos_cache, sin_cache, positions, q_out, q_weight, num_rows)
+        k.launch(
+            grid=(gx.index_cast(T.index), 1, 1),
+            block=(BLOCK_THREADS, RT, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@lru_cache(maxsize=16)
+def _compile_tdm(
+    *,
+    num_q_heads,
+    head_dim,
+    rope_head_dim,
+    num_buffers=NUM_BUFFERS,
+    tiles_per_wg=TILES_PER_WG,
+    hoist_cs=True,
+    q_weighted=False,
+):
+    launcher = _build_tdm(
+        num_q_heads=num_q_heads,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        num_buffers=num_buffers,
+        tiles_per_wg=tiles_per_wg,
+        hoist_cs=hoist_cs,
+        q_weighted=q_weighted,
+    )
+    launcher.compile_hints = {
+        "waves_per_eu": 8,
+        "fast_fp_math": True,
+        "unsafe_fp_math": True,
+    }
+    return launcher
+
+
+def flydsl_qk_norm_rope_tdm_q(
+    q,
+    cos_cache,
+    sin_cache,
+    positions,
+    *,
+    num_q_heads,
+    head_dim,
+    rope_head_dim,
+    q_out=None,
+    q_weight=None,
+    num_buffers=NUM_BUFFERS,
+    tiles_per_wg=TILES_PER_WG,
+    hoist_cs=True,
+    stream=None,
+):
+    """Q path: fused RMSNorm + GPT-J RoPE (+ optional q_weight) via TDM deep
+    prefetch. q is [T, H*D] or [T, H, D]; writes q_out [T, H, D]."""
+    H, D, RD = num_q_heads, head_dim, rope_head_dim
+    T_tok = q.shape[0]
+    q_view = q.view(T_tok, H, D) if q.dim() == 2 else q
+    q_2d = q_view.reshape(T_tok * H, D)
+    cos_2d = cos_cache.reshape(-1, RD // 2)
+    sin_2d = sin_cache.reshape(-1, RD // 2)
+    if q_out is None:
+        q_out = torch.empty((T_tok, H, D), dtype=torch.bfloat16, device=q.device)
+    q_weighted = q_weight is not None
+    qw_tensor = q_weight if q_weighted else cos_cache  # dummy tensor when unused
+    launcher = _compile_tdm(
+        num_q_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        num_buffers=num_buffers,
+        tiles_per_wg=tiles_per_wg,
+        hoist_cs=hoist_cs,
+        q_weighted=q_weighted,
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream()
+
+    def _ds():
+        return getattr(launcher, "_direct_call_state", None) is not None
+
+    def _ptr(t):
+        return (
+            int(t.data_ptr()) if _ds() else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+        )
+
+    def _stm():
+        return stream if _ds() else Stream(stream)
+
+    q_s = _cached_from_dlpack(q_2d)
+    cos_s = _cached_from_dlpack(cos_2d)
+    sin_s = _cached_from_dlpack(sin_2d)
+    qw_s = _cached_from_dlpack(qw_tensor.reshape(-1))
+    args = (
+        q_s,
+        cos_s,
+        sin_s,
+        _ptr(positions),
+        _ptr(q_out.view(T_tok * H, D)),
+        qw_s,
+        T_tok * H,
+        _stm(),
+    )
+    _run_compiled(launcher, *args)
+    return q_out
+
+
+# ---------------------------------------------------------------------------
+# KV kernel: direct-load, one wave per token (no TDM/LDS/dscnt)
+# ---------------------------------------------------------------------------
+
+KV_ROWS_PER_WG = 32  # tokens per WG for the direct KV kernel
+
+
+def _build_tdm_kv(*, head_dim, rope_head_dim):
+    """Direct-load KV kernel: one wave per token, RMSNorm + GPT-J RoPE +
+    kv_weight. KV is 1 head/token (~1/H of Q traffic); TDM's deep-prefetch +
+    dscnt machinery is pure overhead here (measured ~74us vs ~6us direct), so
+    this streams row-by-row at full-GPU occupancy with no fence."""
+    D, RD = head_dim, rope_head_dim
+    NOPE = D - RD
+    VEC = D // BLOCK_THREADS
+    ROPE_LO = NOPE // VEC
+    PAIRS = VEC // 2
+    R = KV_ROWS_PER_WG
+    log2b = int(math.log2(BLOCK_THREADS))
+    name = f"qk_norm_rope_tdm_kv_D{D}_RD{RD}_w32_flydsl"
+
+    @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, R, 1])
+    def kernel(
+        kv_in: fx.Pointer,  # [T, D] bf16 (contiguous)
+        cos_cache: fx.Tensor,
+        sin_cache: fx.Tensor,
+        positions: fx.Pointer,  # [T] i64
+        kv_out: fx.Pointer,  # [T, D] bf16
+        kv_weight: fx.Tensor,  # [D] bf16
+        num_tokens: Int32,
+    ):
+        f32 = T.f32
+        i32 = T.i32
+        fm = arith.FastMathFlags.fast
+        tid = fx.thread_idx.x
+        wave = fx.thread_idx.y
+        g = fx.block_idx.x
+        tok = ArithValue(
+            arith.minsi(
+                _to_raw(ArithValue(g) * R + ArithValue(wave)), _to_raw(num_tokens - 1)
+            )
+        )
+
+        cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
+        sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+        is_rope = _to_raw(tid >= ROPE_LO)
+        rope_rel = arith.maxsi(_to_raw(tid - ROPE_LO), arith.constant(0, type=i32))
+
+        def _ptr_res(ptr):
+            return buffer_ops.create_buffer_resource_from_addr(
+                arith.index_cast(T.i64, fx.ptrtoint(ptr))
+            )
+
+        pos_rsrc = _ptr_res(positions)
+        kv_in_rsrc = _ptr_res(kv_in)
+        kv_out_rsrc = _ptr_res(kv_out)
+        kw_rsrc = buffer_ops.create_buffer_resource(kv_weight, max_size=True)
+
+        # this token's D-vector (VEC per thread), direct global load in vec8 chunks
+        row_base = ArithValue(tok) * D + ArithValue(tid) * VEC
+        x = []
+        w = []
+        for c in range_constexpr(VEC // 8):
+            xr = buffer_ops.buffer_load(
+                kv_in_rsrc, _to_raw(row_base + (c * 8)), vec_width=8, dtype=T.bf16
+            )
+            wr = buffer_ops.buffer_load(
+                kw_rsrc,
+                _to_raw(ArithValue(tid) * VEC + (c * 8)),
+                vec_width=8,
+                dtype=T.bf16,
+            )
+            for i in range_constexpr(8):
+                x.append(
+                    vector.extract(xr, static_position=[i], dynamic_position=[]).extf(
+                        f32
+                    )
+                )
+                w.append(
+                    vector.extract(wr, static_position=[i], dynamic_position=[]).extf(
+                        f32
+                    )
+                )
+
+        pos_i32 = buffer_ops.buffer_load(
+            pos_rsrc, _to_raw(tok), vec_width=1, dtype=T.i64
+        ).trunci(i32)
+        cs = pos_i32 * (RD // 2) + rope_rel * PAIRS
+        if const_expr(PAIRS == 1):
+            cos_v = [
+                buffer_ops.buffer_load(cos_rsrc, cs, vec_width=1, dtype=T.bf16).extf(
+                    f32
+                )
+            ]
+            sin_v = [
+                buffer_ops.buffer_load(sin_rsrc, cs, vec_width=1, dtype=T.bf16).extf(
+                    f32
+                )
+            ]
+        else:
+            craw = buffer_ops.buffer_load(cos_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            sraw = buffer_ops.buffer_load(sin_rsrc, cs, vec_width=PAIRS, dtype=T.bf16)
+            cos_v = [
+                vector.extract(craw, static_position=[i], dynamic_position=[]).extf(f32)
+                for i in range(PAIRS)
+            ]
+            sin_v = [
+                vector.extract(sraw, static_position=[i], dynamic_position=[]).extf(f32)
+                for i in range(PAIRS)
+            ]
+
+        sq = arith.constant(0.0, type=f32)
+        for vi in range_constexpr(VEC):
+            sq = arith.AddFOp(
+                sq, arith.MulFOp(x[vi], x[vi], fastmath=fm).result, fastmath=fm
+            ).result
+        red = _to_raw(sq)
+        for sh in range_constexpr(log2b):
+            o = BLOCK_THREADS // (2 << sh)
+            red = arith.AddFOp(
+                red, _to_raw(ArithValue(red).shuffle_xor(o, BLOCK_THREADS)), fastmath=fm
+            ).result
+        rstd = fmath.rsqrt(red * (1.0 / D) + 1e-6, fastmath=fm)
+        scaled = [
+            arith.MulFOp(
+                arith.MulFOp(_to_raw(x[vi]), _to_raw(w[vi]), fastmath=fm).result,
+                _to_raw(rstd),
+                fastmath=fm,
+            ).result
+            for vi in range_constexpr(VEC)
+        ]
+        rot = list(scaled)
+        for kk in range_constexpr(PAIRS):
+            e = scaled[2 * kk]
+            o = scaled[2 * kk + 1]
+            c = cos_v[kk]
+            s = sin_v[kk]
+            rot[2 * kk] = (
+                arith.MulFOp(e, c, fastmath=fm).result
+                - arith.MulFOp(o, s, fastmath=fm).result
+            )
+            rot[2 * kk + 1] = arith.AddFOp(
+                arith.MulFOp(e, s, fastmath=fm).result,
+                arith.MulFOp(o, c, fastmath=fm).result,
+                fastmath=fm,
+            ).result
+        final = [
+            ArithValue(is_rope).select(rot[i], scaled[i]) for i in range_constexpr(VEC)
+        ]
+        _store_bf16_vec(final, kv_out_rsrc, ArithValue(tok) * (D * 2), tid, VEC)
+
+    @flyc.jit
+    def launch(
+        kv_in: fx.Pointer,
+        cos_cache: fx.Tensor,
+        sin_cache: fx.Tensor,
+        positions: fx.Pointer,
+        kv_out: fx.Pointer,
+        kv_weight: fx.Tensor,
+        num_tokens: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        gx = arith.divsi(_to_raw(num_tokens + (R - 1)), arith.constant(R, type=T.i32))
+        k = kernel(
+            kv_in, cos_cache, sin_cache, positions, kv_out, kv_weight, num_tokens
+        )
+        k.launch(
+            grid=(gx.index_cast(T.index), 1, 1),
+            block=(BLOCK_THREADS, R, 1),
+            stream=stream,
+        )
+
+    return launch
+
+
+@lru_cache(maxsize=16)
+def _compile_tdm_kv(*, head_dim, rope_head_dim):
+    launcher = _build_tdm_kv(head_dim=head_dim, rope_head_dim=rope_head_dim)
+    launcher.compile_hints = {
+        "waves_per_eu": 8,
+        "fast_fp_math": True,
+        "unsafe_fp_math": True,
+    }
+    return launcher
+
+
+def flydsl_qk_norm_rope_kv_direct(
+    kv,
+    cos_cache,
+    sin_cache,
+    positions,
+    kv_weight,
+    *,
+    head_dim,
+    rope_head_dim,
+    kv_out=None,
+    stream=None,
+):
+    """KV path: fused RMSNorm + GPT-J RoPE + kv_weight, one wave per token."""
+    D, RD = head_dim, rope_head_dim
+    T_tok = kv.shape[0]
+    kv_c = kv if kv.is_contiguous() else kv.contiguous()
+    cos_2d = cos_cache.reshape(-1, RD // 2)
+    sin_2d = sin_cache.reshape(-1, RD // 2)
+    if kv_out is None:
+        kv_out = torch.empty((T_tok, D), dtype=torch.bfloat16, device=kv.device)
+    launcher = _compile_tdm_kv(head_dim=D, rope_head_dim=RD)
+    if stream is None:
+        stream = torch.cuda.current_stream()
+
+    def _ds():
+        return getattr(launcher, "_direct_call_state", None) is not None
+
+    def _ptr(t):
+        return (
+            int(t.data_ptr()) if _ds() else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+        )
+
+    def _stm():
+        return stream if _ds() else Stream(stream)
+
+    cos_s = _cached_from_dlpack(cos_2d)
+    sin_s = _cached_from_dlpack(sin_2d)
+    kw_s = _cached_from_dlpack(kv_weight.reshape(-1))
+    args = (
+        _ptr(kv_c),
+        cos_s,
+        sin_s,
+        _ptr(positions),
+        _ptr(kv_out),
+        kw_s,
+        T_tok,
+        _stm(),
+    )
+    _run_compiled(launcher, *args)
+    return kv_out
+
+
+# ---------------------------------------------------------------------------
+# Combined prefill entry (drop-in for flydsl_qk_norm_rope_xhead)
+# ---------------------------------------------------------------------------
+
+
+def flydsl_qk_norm_rope_tdm_prefill(
+    q,
+    kv,
+    kv_weight,
+    cos_cache,
+    sin_cache,
+    positions,
+    *,
+    num_q_heads,
+    head_dim,
+    rope_head_dim,
+    q_weight=None,
+    q_out=None,
+    kv_out=None,
+    stream=None,
+):
+    """Fused RMSNorm + GPT-J RoPE prefill (BF16, gfx1250). Q via TDM deep
+    prefetch, KV via the direct-load kernel. Returns (q_out, kv_out)."""
+    H, D, RD = num_q_heads, head_dim, rope_head_dim
+    T_tok = q.shape[0]
+    if q_out is None:
+        q_out = torch.empty((T_tok, H, D), dtype=torch.bfloat16, device=q.device)
+    if kv_out is None:
+        kv_out = torch.empty((T_tok, D), dtype=torch.bfloat16, device=kv.device)
+
+    flydsl_qk_norm_rope_tdm_q(
+        q,
+        cos_cache,
+        sin_cache,
+        positions,
+        num_q_heads=H,
+        head_dim=D,
+        rope_head_dim=RD,
+        q_out=q_out,
+        q_weight=q_weight,
+        hoist_cs=True,
+        stream=stream,
+    )
+
+    flydsl_qk_norm_rope_kv_direct(
+        kv,
+        cos_cache,
+        sin_cache,
+        positions,
+        kv_weight,
+        head_dim=D,
+        rope_head_dim=RD,
+        kv_out=kv_out,
+        stream=stream,
+    )
+
     return q_out, kv_out
