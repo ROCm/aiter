@@ -440,7 +440,9 @@ def _moe_gemm_a8w4_decode(
             else:
                 gl.amd.gfx1250.tdm.async_gather(
                     gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                        x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                        x_scales_desc,
+                        add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                        clamp_bounds=True,
                     ),
                     offs_x_m,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
@@ -484,7 +486,9 @@ def _moe_gemm_a8w4_decode(
             else:
                 gl.amd.gfx1250.tdm.async_gather(
                     gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                        x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                        x_scales_desc,
+                        add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                        clamp_bounds=True,
                     ),
                     offs_x_m,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
@@ -1029,7 +1033,9 @@ def _moe_gemm_a8w4_prefill(
                 else:
                     gl.amd.gfx1250.tdm.async_gather(
                         gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                            x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                            x_scales_desc,
+                            add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                            clamp_bounds=True,
                         ),
                         offs_x_m,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
@@ -1121,7 +1127,9 @@ def _moe_gemm_a8w4_prefill(
                 else:
                     gl.amd.gfx1250.tdm.async_gather(
                         gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                            x_scales_desc, add_offsets=[0, write_idx * MX_SCALE_BLOCK_K], clamp_bounds=True
+                            x_scales_desc,
+                            add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                            clamp_bounds=True,
                         ),
                         offs_x_m,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
