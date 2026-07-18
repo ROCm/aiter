@@ -8,7 +8,9 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl, tdm_ops, vector
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from .gemm_common_gfx1250 import (
@@ -20,6 +22,8 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
     fused_silu_swiglu_elem,
 )
+from .quant_utils import emit_mx_e8m0_scale, emit_cvt_pk4_fp8_f32
+from aiter.utility.mx_types import MxDtypeInt as _MxDtype
 
 _TDM_DESCRIPTOR_VERSION = 1
 
@@ -49,10 +53,14 @@ def launch_gemm_a8w4_tdm(
     has_bias: Constexpr[int],
     arg_bias: fx.Pointer,
     f32_swiglu_limit: fx.Float32,
+    stage1_quant_out: Constexpr[int] = 0,
+    quant_wmma_rep: Constexpr[int] = 1,
+    arg_quant_scale: fx.Tensor = None,
 ):
     cache_tag = (
         tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
         a_is_fp4, n_experts, stage1_act, has_bias, _TDM_DESCRIPTOR_VERSION,
+        stage1_quant_out, quant_wmma_rep,
     )
     _ = cache_tag
     WMMA_M = WMMA_N = 16
@@ -94,7 +102,15 @@ def launch_gemm_a8w4_tdm(
 
     out_elem = T.f16 if out_is_f16 else T.bf16
     C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
-    ARENA_B = max(num_buffers * PITCH, C_STORE_B)
+    # When the quant epilogue is active, the output is buffer_stored directly
+    # to global memory (no LDS staging), so no C_STORE_B LDS is needed.
+    ARENA_B = max(num_buffers * PITCH, 0 if stage1_quant_out else C_STORE_B)
+
+    # Quant epilogue compile-time constants.
+    _Q_ROWS_PER_TILE = quant_wmma_rep * 16
+    # Each wn subtile produces 8 output cols (4 per kgrp) after silu/swiglu;
+    # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
+    _Q_WN_PER_MX = 4
 
     @flyc.kernel(known_block_size=[block, 1, 1])
     def kernel(
@@ -105,6 +121,7 @@ def launch_gemm_a8w4_tdm(
         arg_scale_b: fx.Tensor,
         arg_m_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_quant_scale: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -337,22 +354,39 @@ def launch_gemm_a8w4_tdm(
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if _e_i32 < n_experts:
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
-            for i in range_constexpr(num_buffers):
-                issue(i, i)
-            n_steady = K_TILES - num_buffers
-            for kt in range(n_steady):
-                s = kt % num_buffers
-                buf = _bidx(_buf_ptr(s))
-                tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                workgroup_barrier()
-                compute_ktile(buf, None)
-                workgroup_barrier()
-                issue(s, kt + num_buffers)
-            for j in range_constexpr(num_buffers):
-                kt = n_steady + j
-                buf = _bidx(_buf_ptr(kt % num_buffers))
-                pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                compute_ktile(buf, None)
+            if const_expr(tile_m <= 64):
+                # Post-compute issue: better for decode (small tile_m).
+                for i in range_constexpr(num_buffers):
+                    issue(i, i)
+                n_steady = K_TILES - num_buffers
+                for kt in range(n_steady):
+                    s = kt % num_buffers
+                    buf = _bidx(_buf_ptr(s))
+                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                    workgroup_barrier()
+                    compute_ktile(buf, None)
+                    workgroup_barrier()
+                    issue(s, kt + num_buffers)
+                for j in range_constexpr(num_buffers):
+                    kt = n_steady + j
+                    buf = _bidx(_buf_ptr(kt % num_buffers))
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
+                    compute_ktile(buf, None)
+            else:
+                # Mid-compute prefetch: better for prefill (large tile_m).
+                for i in range_constexpr(num_buffers - 1):
+                    issue(i, i)
+                n_steady = K_TILES - (num_buffers - 1)
+                for kt in range(n_steady):
+                    s = kt % num_buffers
+                    buf = _bidx(_buf_ptr(s))
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                    compute_ktile(buf, kt + (num_buffers - 1))
+                for j in range_constexpr(num_buffers - 1):
+                    kt = n_steady + j
+                    buf = _bidx(_buf_ptr(kt % num_buffers))
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+                    compute_ktile(buf, None)
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
@@ -361,38 +395,145 @@ def launch_gemm_a8w4_tdm(
             _is_swiglu = stage1_act == 2
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
-            if const_expr(has_bias):
-                _pb = fx.PointerType.get(elem_ty=out_elem, address_space=fx.AddressSpace.Global, alignment=2)
-                _bmap = fx.recast_iter(_pb, arg_bias)
-            for wm in range_constexpr(wmma_m_rep):
-                row_rel = wmb + wm * 16 + lane16
-                for wn in range_constexpr(wmma_n_rep):
-                    col_rel = wnb + wn * 16 + kgrp * 8
-                    acc = Vec(accs[wm * wmma_n_rep + wn])
-                    if const_expr(has_bias):
-                        acc = acc + Vec(fx.ptr_load(_bmap + _e_i32 * i32_n + col_rel, result_type=T.vec(8, out_elem))).to(fx.Float32)
-                    if const_expr(stage1_act):
-                        hv = Vec.from_elements([fused_silu_swiglu_elem(acc[2 * p], acc[2 * p + 1], swiglu=_is_swiglu, limit_f32=f32_swiglu_limit, neg_limit_f32=_neg_lim) for p in range_constexpr(4)], fx.Float32).to(oc)
-                        lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
-                    else:
-                        hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
-                        lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
-            workgroup_barrier()
-            if const_expr(stage1_act):
-                _cN = i32_n // 2
-                _cinner = blk_n64 // 2
+            if const_expr(stage1_quant_out and stage1_act):
+                # ---- Fused silu/swiglu + fp8 quant + scale preshuffle ----
+                # Instead of bf16 -> LDS -> TDM -> global, we quantize the
+                # f32 activated values directly and buffer_store fp8 payload
+                # + preshuffled e8m0 scale to global memory.  This eliminates
+                # the separate flydsl_moe_fused_quant_preshuffle kernel call.
+                payload_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=True)
+                scale_rsrc = buffer_ops.create_buffer_resource(arg_quant_scale, max_size=True)
+                c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
+                c16_a = arith.constant(16, type=T.i32)
+                c23_a = arith.constant(23, type=T.i32)
+                c254_a = arith.constant(254, type=T.i32)
+                lane_kgrp_i32 = fx.Int32(kgrp)
+                is_kgrp0 = lane_kgrp_i32 == fx.Int32(0)
+                # Payload row stride = inter_dim = N//2 (gugu halves N).
+                q_payload_bpr = i32_n // 2
+                # Preshuffled scale dwords per output row =
+                #   (inter_dim // 32 // 4) * quant_wmma_rep = inter_dim // 128 * quant_wmma_rep.
+                q_dst_scale_dwpr = (i32_n // 256) * quant_wmma_rep
+
+                for wm in range_constexpr(wmma_m_rep):
+                    row_rel = wmb + wm * 16 + lane16
+                    row_i32 = fx.Int32(blk_m + row_rel)
+
+                    # Group wn sub-tiles into MX blocks of 32 output cols.
+                    for mx_blk in range_constexpr(wmma_n_rep // _Q_WN_PER_MX):
+                        # Activate all sub-tiles in this MX block and collect
+                        # the 4 output f32 values from each.
+                        all_vals = []
+                        for sub_wn in range_constexpr(_Q_WN_PER_MX):
+                            wn = mx_blk * _Q_WN_PER_MX + sub_wn
+                            acc = Vec(accs[wm * wmma_n_rep + wn])
+                            for p in range_constexpr(4):
+                                all_vals.append(
+                                    fused_silu_swiglu_elem(
+                                        acc[2 * p], acc[2 * p + 1],
+                                        swiglu=_is_swiglu,
+                                        limit_f32=f32_swiglu_limit,
+                                        neg_limit_f32=_neg_lim,
+                                    )
+                                )
+
+                        # Per-lane amax over the 16 activated values,
+                        # then shuffle_xor(16) to combine both kgrp halves
+                        # for the full 32-col MX block amax.
+                        block_amax = arith.constant(0.0, type=T.f32)
+                        for _v in all_vals:
+                            _a = llvm.call_intrinsic(
+                                T.f32, "llvm.fabs.f32", [_raw(_v)], [], []
+                            )
+                            block_amax = arith.maxnumf(block_amax, _a)
+                        block_amax = arith.minnumf(block_amax, c_flt_max)
+                        peer = block_amax.shuffle_xor(
+                            c16_a, arith.constant(WAVE, type=T.i32)
+                        )
+                        block_amax = arith.maxnumf(block_amax, peer)
+
+                        e8m0 = emit_mx_e8m0_scale(
+                            block_amax, dtype=_MxDtype.FP8_E4M3
+                        )
+                        recip = ((c254_a - e8m0) << c23_a).bitcast(T.f32)
+                        e8m0_byte = arith.trunci(T.i8, e8m0)
+
+                        # MX block index = output_col // 32 = raw_col // 64.
+                        mx_blk_i = fx.Int32(blk_n + wnb + mx_blk * _Q_WN_PER_MX * 16) // 64
+
+                        # Pack each sub-tile's 4 output f32s to 4 fp8 bytes
+                        # and buffer_store the payload.
+                        if row_rel < mn_oob:
+                            for sub_wn in range_constexpr(_Q_WN_PER_MX):
+                                wn = mx_blk * _Q_WN_PER_MX + sub_wn
+                                chunk_vals = all_vals[sub_wn * 4 : (sub_wn + 1) * 4]
+                                packed_i32 = emit_cvt_pk4_fp8_f32(
+                                    chunk_vals, recip,
+                                    rocdl=rocdl, vector=vector, T=T,
+                                )
+                                out_col = fx.Int32(blk_n + wnb + wn * 16 + kgrp * 8) // 2
+                                payload_off = row_i32 * q_payload_bpr + out_col
+                                buffer_ops.buffer_store(
+                                    packed_i32, payload_rsrc,
+                                    payload_off, offset_is_bytes=True,
+                                )
+
+                            # Preshuffled e8m0 scale store (only kgrp==0).
+                            # Mirrors the standalone moe_fused_quant_preshuffle
+                            # activation scale preshuffle geometry (n32k4-like).
+                            if is_kgrp0:
+                                scale_dw = mx_blk_i // 4
+                                byte_in_dw = mx_blk_i - scale_dw * 4
+                                scale_tile = row_i32 // _Q_ROWS_PER_TILE
+                                row_in_tile = row_i32 - scale_tile * _Q_ROWS_PER_TILE
+                                wmma_row = row_in_tile // 16
+                                row_lane16 = row_in_tile - wmma_row * 16
+                                out_row = scale_tile * 16 + row_lane16
+                                dst_dw = (
+                                    out_row * q_dst_scale_dwpr
+                                    + wmma_row
+                                    + scale_dw * quant_wmma_rep
+                                )
+                                dst_byte = dst_dw * 4 + byte_in_dw
+                                buffer_ops.buffer_store(
+                                    e8m0_byte, scale_rsrc, dst_byte,
+                                    offset_is_bytes=True,
+                                )
+
             else:
-                _cN = c_stride
-                _cinner = c_inner_off
-            c_off_rt = c_outer_off * fx.Int64(_cN) + _cinner
-            gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
-            atomC = _tdm(gtC, mn_oob, _cN)
-            fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
-            tdm_ops.tensor_wait(0)
+                # ---- Original bf16/f16 LDS + TDM store path ----
+                if const_expr(has_bias):
+                    _pb = fx.PointerType.get(elem_ty=out_elem, address_space=fx.AddressSpace.Global, alignment=2)
+                    _bmap = fx.recast_iter(_pb, arg_bias)
+                for wm in range_constexpr(wmma_m_rep):
+                    row_rel = wmb + wm * 16 + lane16
+                    for wn in range_constexpr(wmma_n_rep):
+                        col_rel = wnb + wn * 16 + kgrp * 8
+                        acc = Vec(accs[wm * wmma_n_rep + wn])
+                        if const_expr(has_bias):
+                            acc = acc + Vec(fx.ptr_load(_bmap + _e_i32 * i32_n + col_rel, result_type=T.vec(8, out_elem))).to(fx.Float32)
+                        if const_expr(stage1_act):
+                            hv = Vec.from_elements([fused_silu_swiglu_elem(acc[2 * p], acc[2 * p + 1], swiglu=_is_swiglu, limit_f32=f32_swiglu_limit, neg_limit_f32=_neg_lim) for p in range_constexpr(4)], fx.Float32).to(oc)
+                            lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
+                        else:
+                            hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
+                            lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
+                workgroup_barrier()
+                if const_expr(stage1_act):
+                    _cN = i32_n // 2
+                    _cinner = blk_n64 // 2
+                else:
+                    _cN = c_stride
+                    _cinner = c_inner_off
+                c_off_rt = c_outer_off * fx.Int64(_cN) + _cinner
+                gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+                atomC = _tdm(gtC, mn_oob, _cN)
+                fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
+                tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, i32_m, N, K, f32_swiglu_limit).launch(
+    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, i32_m, N, K, f32_swiglu_limit).launch(
         grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
     )
 

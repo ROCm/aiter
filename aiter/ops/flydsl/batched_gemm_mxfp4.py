@@ -48,19 +48,28 @@ def flydsl_grouped_gemm_a8w4_masked(
     bias=None,
     swiglu_limit=7.0,
     stream=None,
+    stage1_quant_out=0,
+    quant_scale=None,
+    quant_wmma_rep=1,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
     Mirrors the MoE grouped-gemm contiguous-M scheduling: a compact grid over the
     (1, contiguous_m, *) buffers, with a per-M-tile expert id (``tile_expert``)
     selecting the per-expert B / B-scale slab. Only valid M tiles launch.
-      out          (1, contiguous_m, N)  bf16/f16
+      out          (1, contiguous_m, N)  bf16/f16  (or fp8 payload when stage1_quant_out)
       a            (1, contiguous_m, K)  uint8 (fp8 payload)
       w            (E, N, K//2) uint8 (moe_shuffle_weight == cat_e shuffle_weight_gfx1250)
       a_scales     grouped A-scale (1, contiguous_m//wmma_rep, (K//32)*wmma_rep) viewed int32
       w_scales     n32k4 B-scale (E, N//32, (K//32)*32) viewed int32
       m_tile_map   (n_experts,) int32 psum (per-expert exclusive end-row)
     contiguous_m must be a multiple of tile_m (holds by construction).
+
+    When ``stage1_quant_out=1`` (fp8), the epilogue fuses silu/swiglu + MX fp8
+    quantization + e8m0 scale preshuffle into the kernel.  ``out`` receives the
+    fp8 payload (uint8, 1 byte/elem) and ``quant_scale`` receives the preshuffled
+    e8m0 scale (uint8).  ``quant_wmma_rep`` is gemm2's ``warp_tile_m // 16``,
+    controlling the scale preshuffle tile geometry.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
@@ -69,6 +78,11 @@ def flydsl_grouped_gemm_a8w4_masked(
     nb = min(num_buffers, max(1, K // tile_k))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
+    # When quant is off, pass a dummy tensor for arg_quant_scale (unused).
+    if quant_scale is None:
+        quant_scale_tensor = out  # dummy, never written
+    else:
+        quant_scale_tensor = quant_scale.view(torch.uint8)
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -93,6 +107,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         has_bias,
         bias_ptr,
         float(swiglu_limit),
+        stage1_quant_out,
+        quant_wmma_rep,
+        quant_scale_tensor,
     )
     return out
 

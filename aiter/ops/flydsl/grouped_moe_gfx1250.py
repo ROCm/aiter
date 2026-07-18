@@ -424,22 +424,52 @@ def _grouped_a8w4_tdm_moe(
         topids_to_rows=topids_to_rows, source_topk=topk,
     )
 
-    y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
+    # Fuse gemm1 silu/swiglu + fp8 quantization + scale preshuffle into the
+    # kernel epilogue (a8w4 only), eliminating the standalone
+    # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
+    _fuse_quant = (not _is_fp4) and (_b1 is None)
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
-    flydsl_grouped_gemm_a8w4_masked(
-        y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
-        n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-        out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-        stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
-        num_buffers=num_buffers,
-    )
 
-    a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
-        y, 1, contiguous_m, wmma_rep=wmma_rep2, quant_mode=_quant_mode,
-        masked_m=None, topids_to_rows=None,
-    )
+    if _fuse_quant:
+        # Pre-allocate fp8 payload + preshuffled e8m0 scale for gemm1 output.
+        # These are written directly by the kernel's fused quant epilogue.
+        _Pb = inter_dim  # fp8: 1 byte per element
+        _Ws = inter_dim // 32  # one e8m0 byte per 32-element MX block
+        a2_payload = torch.empty((1, contiguous_m, _Pb), dtype=torch.uint8, device=device)
+        a2_scale = torch.empty(
+            (1, contiguous_m // wmma_rep2, _Ws * wmma_rep2),
+            dtype=torch.uint8, device=device,
+        )
+        # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
+        # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
+        # quant_scale / arg_quant_scale).
+        flydsl_grouped_gemm_a8w4_masked(
+            a2_payload.view(torch.uint8), a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+            num_buffers=num_buffers,
+            stage1_quant_out=1, quant_scale=a2_scale,
+            quant_wmma_rep=wmma_rep2,
+        )
+    else:
+        # Original path: bf16 intermediate + separate quant kernel.
+        y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
+        flydsl_grouped_gemm_a8w4_masked(
+            y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+            num_buffers=num_buffers,
+        )
+        a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
+            y, 1, contiguous_m, wmma_rep=wmma_rep2, quant_mode=_quant_mode,
+            masked_m=None, topids_to_rows=None,
+        )
+
     grouped_out = torch.zeros((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
@@ -452,13 +482,25 @@ def _grouped_a8w4_tdm_moe(
     )
 
     if kernel_bench_callable is not None:
-        kernel_bench_callable.append(("gemm1", functools.partial(
-            flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
-            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-            stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
-            num_buffers=num_buffers)))
+        if _fuse_quant:
+            kernel_bench_callable.append(("gemm1", functools.partial(
+                flydsl_grouped_gemm_a8w4_masked,
+                a2_payload.view(torch.uint8), a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+                n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+                stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+                num_buffers=num_buffers,
+                stage1_quant_out=1, quant_scale=a2_scale,
+                quant_wmma_rep=wmma_rep2)))
+        else:
+            kernel_bench_callable.append(("gemm1", functools.partial(
+                flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
+                n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
+                stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+                num_buffers=num_buffers)))
         kernel_bench_callable.append(("gemm2", functools.partial(
             flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32,
             psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
