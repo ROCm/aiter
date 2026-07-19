@@ -1026,6 +1026,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     h,
     h0,
     ht,
+    initial_state_indices,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -1043,6 +1044,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
+    USE_STATE_INDICES: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -1085,10 +1087,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
             v_new += (((i_n * H + i_h) * T_flat) * V).to(tl.int64)
     stride_h = H * V * K
     stride_k = Hg * K
-    if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * V * K
-    if STORE_FINAL_STATE:
-        ht = ht + i_nh * V * K
+    if USE_STATE_INDICES:
+        # In-place scatter: h0 and ht both index the SAME recurrent-state pool
+        # at slot `initial_state_indices[i_n]` (read initial state, write final
+        # state back in place). Matches the paged/radix-cache contract; mirrors
+        # the sgl-fla VK h-scan. Pool layout is [num_slots, H, V, K].
+        index = tl.load(initial_state_indices + i_n).to(tl.int32)
+        if USE_INITIAL_STATE:
+            h0 = h0 + (index * H + i_h) * V * K
+        if STORE_FINAL_STATE:
+            ht = ht + (index * H + i_h) * V * K
+    else:
+        if USE_INITIAL_STATE:
+            h0 = h0 + i_nh * V * K
+        if STORE_FINAL_STATE:
+            ht = ht + i_nh * V * K
 
     if USE_G:
         if IS_VARLEN:
@@ -1292,6 +1305,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     state_dtype: torch.dtype | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1308,6 +1322,10 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     ORIGINAL cu_seqlens (data tensors are expected pre-sliced); offsets are
     rebased internally via the cached prologue helpers so the chunk-index /
     offset build stays cache-warm across forward calls.
+    initial_state_indices: optional [N] int slot indices. When given, the initial
+    state is read from and the final state written back to ``initial_state`` in
+    place at these pool slots (in-kernel scatter), instead of treating
+    ``initial_state`` as a dense per-sequence [N, H, V, K] buffer.
     """
     B, T, Hg, K = k.shape
     BT = chunk_size
@@ -1359,9 +1377,19 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
             gk = gk * RCP_LN2
 
     h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=_state_dtype) if output_final_state else None
-    )
+    use_state_indices = initial_state_indices is not None
+    if use_state_indices:
+        # In-place scatter: the final state is written back into the
+        # `initial_state` pool at slot `initial_state_indices[i_n]` (no separate
+        # final_state buffer). Requires `initial_state` to be the full pool.
+        final_state = initial_state
+        idx_arg = initial_state_indices
+    else:
+        final_state = (
+            k.new_empty(N, H, V, K, dtype=_state_dtype) if output_final_state else None
+        )
+        # Dummy pointer for the disabled (dead) code path; never dereferenced.
+        idx_arg = k.new_empty(1, dtype=torch.int32)
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 
     def grid(meta):
@@ -1377,6 +1405,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         h=h,
         h0=initial_state,
         ht=final_state,
+        initial_state_indices=idx_arg,
         cu_seqlens=kernel_cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
@@ -1387,6 +1416,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         V=V,
         BT=BT,
         USE_EXP2=use_exp2,
+        USE_STATE_INDICES=use_state_indices,
     )
     return h, v_new, final_state
 

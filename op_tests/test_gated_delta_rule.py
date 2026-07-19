@@ -1120,5 +1120,91 @@ def test_chunk_opt_vk_varlen(
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
 
 
+@pytest.mark.parametrize(
+    ("seqlens", "Hg", "H", "K", "V", "dtype"),
+    [
+        pytest.param(*t, id="seqlens{}-Hg{}-H{}-K{}-V{}-{}".format(*t))
+        for t in [
+            # GVA (H = 3*Hg, Qwen3.x-like), varlen, aligned + unaligned chunk lens
+            ([200, 64, 130], 2, 6, 128, 128, torch.bfloat16),
+            ([256, 100], 2, 6, 64, 128, torch.bfloat16),  # K!=V
+            ([300], 4, 4, 128, 128, torch.bfloat16),  # non-GVA
+            ([200, 64, 130], 2, 6, 128, 128, torch.float16),
+            ([256, 100], 2, 6, 64, 128, torch.float16),  # K!=V
+        ]
+    ],
+)
+def test_chunk_opt_vk_state_indices(
+    seqlens: list[int],
+    Hg: int,
+    H: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    """The in-place scatter path (``initial_state_indices``) must be equivalent
+    to the trusted dense path for the SAME logical initial states, and
+    ``return_h`` must expose the per-chunk snapshots as [B, NT, H, V, K].
+
+    This lets a paged / radix recurrent-state pool (num_slots >= N, one slot per
+    sequence) read the initial state and write the final state back in place at
+    ``initial_state_indices[i]`` -- without gathering to a dense [N, ...] buffer
+    -- and hand the per-chunk ``h`` to a state-tracking cache."""
+    torch.manual_seed(42)
+    N = len(seqlens)
+    T = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device=device, dtype=torch.int32
+    )
+    scale = K**-0.5
+
+    q = torch.randn(1, T, Hg, K, device=device, dtype=dtype)
+    k = torch.randn(1, T, Hg, K, device=device, dtype=dtype)
+    v = torch.randn(1, T, H, V, device=device, dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, device=device, dtype=torch.float32))
+    beta = torch.rand(1, T, H, device=device, dtype=dtype).sigmoid()
+    st = torch.randn(N, H, V, K, device=device, dtype=torch.float32) * 0.1  # [V, K]
+
+    # Dense reference: sequence i at row i, separate final-state buffer.
+    o_dense, ht_dense = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=st.clone(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    # In-place scatter: scatter states into a larger pool at shuffled slots.
+    num_slots = N + 3
+    idx = torch.randperm(num_slots, device=device)[:N].to(torch.int32)
+    pool = torch.zeros(num_slots, H, V, K, device=device, dtype=torch.float32)
+    pool[idx.long()] = st.clone()
+    o_idx, _final, h = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=pool,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+        initial_state_indices=idx,
+        return_h=True,
+    )
+    ht_idx = pool[idx.long()]  # final state written back in place
+
+    NT = sum((s + 63) // 64 for s in seqlens)
+    assert tuple(h.shape) == (1, NT, H, V, K), f"h shape {tuple(h.shape)}"
+    assert_close("o", o_dense, o_idx, 0.005)
+    assert_close("final_state", ht_dense, ht_idx, 0.005)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
