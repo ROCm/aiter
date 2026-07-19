@@ -161,10 +161,10 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     # Fill the pipeline
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS), cache_modifier=".cv"
+            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
         gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
         )
 
         if LAYOUT[0] == "T":
@@ -190,10 +190,10 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     # Main pipeline loop
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1) - 1):
         gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS), cache_modifier=".cv"
+            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
         gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
         )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
