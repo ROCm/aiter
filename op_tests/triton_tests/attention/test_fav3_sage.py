@@ -27,6 +27,25 @@ ATOL_fp8 = 3.0e-1
 RTOL_fp8 = 2.5e-1
 
 
+def test_block_attn_mask_to_ragged_lut_metadata_dtype():
+    block_attn_mask = torch.tensor(
+        [[[[True, False, True], [False, True, True]]]],
+        dtype=torch.bool,
+        device="cuda",
+    )
+
+    _, lut_start, lut_count = block_attn_mask_to_ragged_lut(block_attn_mask)
+
+    assert lut_start.dtype == torch.int32
+    assert lut_count.dtype == torch.int32
+    torch.testing.assert_close(
+        lut_start, torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        lut_count, torch.tensor([2, 2], device="cuda", dtype=torch.int32)
+    )
+
+
 def compare_accuracy(current, reference):
     """Print quick statistics comparing FP8 and SageAttn tensors."""
     current_f = current.float()
