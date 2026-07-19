@@ -170,6 +170,7 @@ def parse_csv(csv_path: str):
             n = int(row["N"])
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
+            gfx = row.get("gfx", "").strip()
             batch = int(row.get("B", "1") or "1")
 
             if kernel_name.startswith("flydsl_blockscale_bpreshuffle_bmm_"):
@@ -199,6 +200,7 @@ def parse_csv(csv_path: str):
                 "n": n,
                 "k": k,
                 "cu_num": cu_num,
+                "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
                 **params,
             }
@@ -468,7 +470,11 @@ def compile_one_config(
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    gfx = kwargs.get("gfx", "").strip()
+    if gfx:
+        aot_arch = gfx
+    else:
+        aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
     batch = int(kwargs.get("batch", 1))
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     if kind == "bmm":
