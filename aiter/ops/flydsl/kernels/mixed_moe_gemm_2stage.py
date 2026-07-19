@@ -47,6 +47,8 @@ from flydsl.expr.gpu import lds_space as _lds_space
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
+from aiter.ops.flydsl.moe_common import xcd_swizzle_workgroup_id
+
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
@@ -562,8 +564,15 @@ def compile_mixed_moe_gemm1(
                 num_wgs = gx * gy
 
                 c_xcds = arith.constant(NUM_XCDS_S1, index=True)
-                wgs_per_xcd = num_wgs // c_xcds
-                wgid = (linear_id % c_xcds) * wgs_per_xcd + (linear_id // c_xcds)
+                wgid = xcd_swizzle_workgroup_id(
+                    linear_id,
+                    num_wgs,
+                    c_xcds,
+                    divide=lambda lhs, rhs: lhs // rhs,
+                    minimum=lambda lhs, rhs: arith.select(
+                        arith.cmpi(CmpIPredicate.ult, lhs, rhs), lhs, rhs
+                    ),
+                )
 
                 WGM_S1 = xcd_swizzle
                 c_wgm = arith.constant(WGM_S1, index=True)
@@ -3365,8 +3374,15 @@ def compile_mixed_moe_gemm2(
                 num_wgs = gx * gy
 
                 c_xcds = arith.constant(NUM_XCDS_S, index=True)
-                wgs_per_xcd = num_wgs // c_xcds
-                wgid = (linear_id % c_xcds) * wgs_per_xcd + (linear_id // c_xcds)
+                wgid = xcd_swizzle_workgroup_id(
+                    linear_id,
+                    num_wgs,
+                    c_xcds,
+                    divide=lambda lhs, rhs: lhs // rhs,
+                    minimum=lambda lhs, rhs: arith.select(
+                        arith.cmpi(CmpIPredicate.ult, lhs, rhs), lhs, rhs
+                    ),
+                )
 
                 WGM_S = xcd_swizzle
                 c_wgm = arith.constant(WGM_S, index=True)
