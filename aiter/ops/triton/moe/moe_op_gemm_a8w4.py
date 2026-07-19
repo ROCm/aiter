@@ -352,6 +352,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
                 block_k = 512 if k % 512 == 0 else 256
             else:
                 block_k = 512
+            while block_k > 32 and k % block_k != 0:
+                block_k //= 2
 
             if n_gates <= 32:
                 block_n = 64
