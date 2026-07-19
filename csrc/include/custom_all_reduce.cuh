@@ -154,9 +154,9 @@ DINLINE O downcast(V val)
 }
 
 // This function is meant to be used as the first synchronization in the all
-// reduce kernel. Thus, it doesn't need to make any visibility guarantees for
-// prior memory accesses. Note: volatile writes will not be reordered against
-// other volatile writes.
+// reduce kernel. In eager mode, the input is copied into an IPC-registered
+// buffer immediately before the kernel launch, so the ready signal must publish
+// that copy before peers read the buffer.
 template <int ngpus>
 DINLINE void start_sync(const RankSignals& sg,
 #ifndef USE_ROCM
@@ -169,20 +169,17 @@ DINLINE void start_sync(const RankSignals& sg,
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if(threadIdx.x < ngpus)
     {
-        // simultaneously write to the corresponding flag of all ranks.
-        // Latency = 1 p2p write
         __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                                 flag,
-                                __ATOMIC_RELAXED,
+                                __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
-        // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                      __ATOMIC_RELAXED,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __MEMORY_SCOPE_SYSTEM) < flag)
             ;
+        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
     }
     __syncthreads();
-    // use one thread to update flag
     if(threadIdx.x == 0)
         self_sg->_flag[blockIdx.x] = flag;
 #else
@@ -202,8 +199,10 @@ DINLINE void start_sync(const RankSignals& sg,
 }
 
 // This function is meant to be used as the second or the final synchronization
-// barrier in the all reduce kernel. If it's the final synchronization barrier,
-// we don't need to make any visibility guarantees for prior memory accesses.
+// barrier in the all reduce kernel. A non-final barrier publishes intermediate
+// writes consumed by the next stage. A final barrier only waits for peer reads
+// to finish before the input can be reused; its uncached signal does not carry
+// output data.
 template <int ngpus, bool final_sync = false>
 DINLINE void end_sync(const RankSignals& sg,
 #ifndef USE_ROCM
@@ -214,10 +213,6 @@ DINLINE void end_sync(const RankSignals& sg,
 {
 #ifdef USE_ROCM
     __syncthreads();
-    // eliminate the case that prior writes are not visible after signals become
-    // visible. Note that I did not managed to make this happen through a lot of
-    // testing. Might be the case that hardware provides stronger guarantee than
-    // the memory model.
     uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
     if(threadIdx.x < ngpus)
     {
@@ -229,9 +224,12 @@ DINLINE void end_sync(const RankSignals& sg,
                                 __MEMORY_SCOPE_SYSTEM);
         // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                                     final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     __MEMORY_SCOPE_DEVICE) < flag)
+                                     __ATOMIC_RELAXED,
+                                     final_sync ? __MEMORY_SCOPE_DEVICE : __MEMORY_SCOPE_SYSTEM) <
+              flag)
             ;
+        if constexpr(!final_sync)
+            __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
     }
     __syncthreads();
     // use one thread to update flag
