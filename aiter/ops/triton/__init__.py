@@ -36,6 +36,12 @@ __all__ = []
 if quant is not None:
     __all__.append("quant")
 
+try:
+    from .cross_entropy import cross_entropy_forward, cross_entropy_backward
+    __all__.extend(["cross_entropy_forward", "cross_entropy_backward"])
+except (ImportError, AttributeError):
+    pass
+
 if _COMMS_AVAILABLE:
     __all__.extend(
         [
@@ -123,6 +129,7 @@ _BACKWARD_COMPAT_MAP = {
     "prefill_attention": "attention.prefill_attention",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
+    "mxfp8_attention": "attention.mxfp8_attention",
     # Fusions modules (fusions/)
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
