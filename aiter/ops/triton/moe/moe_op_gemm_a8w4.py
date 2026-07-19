@@ -243,36 +243,142 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     }
 
 
+_GLUON_TUNED_CONFIGS = {
+    #                                      block_n  block_k  num_buffers
+    # --- K=384 (down-proj, inter_dim=384) ---
+    (16, 7168, 384, "tiny"):               (64,     128,     3),
+    (16, 7168, 384, "small"):              (64,     128,     3),
+    (16, 7168, 384, "medium"):             (64,     128,     3),
+    (16, 7168, 384, "medium2"):            (128,    128,     3),
+    (16, 7168, 384, "large"):              (256,    128,     1),
+    (16, 7168, 384, "xlarge"):             (256,    128,     2),
+    # --- K=512 (down-proj, inter_dim=512) ---
+    (16, 7168, 512, "tiny"):               (64,     256,     3),
+    (16, 7168, 512, "small"):              (512,    512,     2),
+    (16, 7168, 512, "medium"):             (512,    256,     2),
+    (16, 7168, 512, "medium2"):            (512,    512,     1),
+    (16, 7168, 512, "large"):              (512,    256,     1),
+    (16, 7168, 512, "xlarge"):             (512,    512,     1),
+    # --- K=768 (down-proj, inter_dim=768) ---
+    (16, 7168, 768, "tiny"):               (64,     256,     3),
+    (16, 7168, 768, "small"):              (64,     256,     3),
+    (16, 7168, 768, "medium"):             (512,    256,     2),
+    (16, 7168, 768, "medium2"):            (512,    256,     2),
+    (16, 7168, 768, "large"):              (512,    256,     1),
+    (16, 7168, 768, "xlarge"):             (512,    256,     2),
+    # --- K=1536 (down-proj, inter_dim=1536) ---
+    (16, 7168, 1536, "tiny"):              (256,    512,     2),
+    (16, 7168, 1536, "small"):             (512,    512,     2),
+    (16, 7168, 1536, "medium"):            (128,    512,     2),
+    (16, 7168, 1536, "medium2"):           (512,    512,     1),
+    (16, 7168, 1536, "large"):             (256,    256,     2),
+    (16, 7168, 1536, "xlarge"):            (512,    256,     2),
+    # --- K=2048 (down-proj, inter_dim=2048) ---
+    (16, 4096, 2048, "tiny"):              (64,     512,     3),
+    (16, 4096, 2048, "small"):             (64,     512,     3),
+    (16, 4096, 2048, "medium"):            (128,    512,     2),
+    (16, 4096, 2048, "medium2"):           (512,    512,     2),
+    (16, 4096, 2048, "large"):             (512,    512,     1),
+    (16, 4096, 2048, "xlarge"):            (512,    256,     3),
+    # --- K=4096 (gate_up, model_dim=4096) ---
+    (16, 4096, 4096, "tiny"):              (64,     512,     3),
+    (16, 4096, 4096, "small"):             (64,     512,     3),
+    (16, 4096, 4096, "medium"):            (128,    512,     2),
+    (16, 4096, 4096, "medium2"):           (128,    512,     2),
+    (16, 4096, 4096, "large"):             (512,    512,     1),
+    (16, 4096, 4096, "xlarge"):            (512,    256,     3),
+    # --- K=7168, N=768 (gate_up, inter_dim=384) ---
+    (16, 768, 7168, "tiny"):               (64,     512,     3),
+    (16, 768, 7168, "small"):              (64,     512,     3),
+    (16, 768, 7168, "medium"):             (64,     512,     3),
+    (16, 768, 7168, "medium2"):            (64,     512,     3),
+    (16, 768, 7168, "large"):              (64,     512,     3),
+    (16, 768, 7168, "xlarge"):             (256,    512,     2),
+    # --- K=7168, N=1024 (gate_up, inter_dim=512) ---
+    (16, 1024, 7168, "tiny"):              (64,     512,     3),
+    (16, 1024, 7168, "small"):             (64,     512,     3),
+    (16, 1024, 7168, "medium"):            (64,     512,     3),
+    (16, 1024, 7168, "medium2"):           (64,     512,     3),
+    (16, 1024, 7168, "large"):             (128,    512,     2),
+    (16, 1024, 7168, "xlarge"):            (512,    512,     1),
+    # --- K=7168, N=1536 (gate_up, inter_dim=768) ---
+    (16, 1536, 7168, "tiny"):              (64,     512,     3),
+    (16, 1536, 7168, "small"):             (64,     512,     3),
+    (16, 1536, 7168, "medium"):            (64,     512,     3),
+    (16, 1536, 7168, "medium2"):           (64,     512,     3),
+    (16, 1536, 7168, "large"):             (256,    512,     3),
+    (16, 1536, 7168, "xlarge"):            (256,    256,     2),
+    # --- K=7168, N=3072 (gate_up, inter_dim=1536) ---
+    (16, 3072, 7168, "tiny"):              (64,     512,     3),
+    (16, 3072, 7168, "small"):             (64,     512,     3),
+    (16, 3072, 7168, "medium"):            (512,    512,     2),
+    (16, 3072, 7168, "medium2"):           (512,    512,     2),
+    (16, 3072, 7168, "large"):             (256,    256,     2),
+    (16, 3072, 7168, "xlarge"):            (512,    256,     3),
+}
+
+
+def _ng_bucket(n_gates):
+    if n_gates <= 8:
+        return "tiny"
+    if n_gates <= 32:
+        return "small"
+    if n_gates <= 128:
+        return "medium"
+    if n_gates <= 256:
+        return "medium2"
+    if n_gates <= 512:
+        return "large"
+    return "xlarge"
+
+
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_buffers = 3
+    num_warps = 4
     split_k = 1
-    block_k = 512
+    n_gates = m
 
     if block_m == 16:
-        block_k = 512
-        num_warps = 4
-        if n <= 3072:
-            block_n = 128
-            num_buffers = 2
+        bucket = _ng_bucket(n_gates)
+        key = (block_m, n, k, bucket)
+        if key in _GLUON_TUNED_CONFIGS:
+            block_n, block_k, num_buffers = _GLUON_TUNED_CONFIGS[key]
         else:
-            block_n = 256
-            num_buffers = 1
+            if k <= 512:
+                block_k = 256
+            elif k <= 1024:
+                block_k = 512 if k % 512 == 0 else 256
+            else:
+                block_k = 512
+
+            if n_gates <= 32:
+                block_n = 64
+                num_buffers = 3
+            elif n_gates <= 256:
+                block_n = 64 if n <= 1536 else 512
+                num_buffers = 3 if n <= 1536 else 2
+            elif n_gates <= 512:
+                block_n = 256
+                num_buffers = 2
+            else:
+                block_n = 256 if n <= 1536 else 512
+                num_buffers = 2
+                block_k = min(block_k, 256)
 
     elif block_m == 32:
         if n <= 1024:
             block_n = 128
-            num_warps = 4
         else:
             block_n = 256
-            num_warps = 4
+        block_k = 512
+        num_buffers = 3
 
     else:
         block_n = 256
         block_k = 256
-        num_warps = 4
+        num_buffers = 3
 
     ret = {
         "block_m": block_m,
