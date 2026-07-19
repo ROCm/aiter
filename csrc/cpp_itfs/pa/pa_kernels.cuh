@@ -121,11 +121,25 @@ _paged_attention_kernel(const int* block_table_seq,
     }
 
     // fetch Q in shared across warps and then write to registers
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // gfx12 (wave32) qhead distribution: NWARPS=8, ROWS_PER_WARP=2 -> 16
+    // (warpid, rowid) combos. gfx9's `4 * warpid + rowid` overflows the
+    // shared_logits qhead-dim [16] when warpid>=4 (4*7+rowid up to 29). Use
+    // ROWS_PER_WARP-based stride so the 16 combos map 1:1 to qhead slots
+    // [0..15]; combos with idx >= GQA_RATIO_MTP_PARALLEL are masked out by the
+    // existing `local_mtp_qhead_idx < GQA_RATIO_MTP_PARALLEL` guard.
+    constexpr int WARPS_PER_MTP_GFX12 = NWARPS / MTP_PARALLEL_THREADS;
+    const int warp_mtp_idx            = warpid / WARPS_PER_MTP_GFX12;
+    const int warp_row_idx            = warpid % WARPS_PER_MTP_GFX12;
+    const int local_qhead_idx         = ROWS_PER_WARP * warpid + rowid;
+    const int local_mtp_qhead_idx     = ROWS_PER_WARP * warp_row_idx + rowid;
+#else
     const int warp_mtp_idx = warpid / (4 / MTP_PARALLEL_THREADS);
     const int warp_row_idx = warpid % (4 / MTP_PARALLEL_THREADS);
 
     const int local_qhead_idx     = 4 * warpid + rowid;
     const int local_mtp_qhead_idx = 4 * warp_row_idx + rowid;
+#endif
     const int global_qhead_idx    = wg_start_head_idx + local_mtp_qhead_idx;
     const int64_t query_start_off = static_cast<int64_t>(query_loc + warp_mtp_idx);
     constexpr int mtp_loop        = MTP_PER_THREAD;
@@ -150,6 +164,19 @@ _paged_attention_kernel(const int* block_table_seq,
 
                     if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto)
                     {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                        // gfx12: ROWS_PER_WARP=2 so head-elem chunk size is
+                        // 16 (CONTIGUOUS_SCALAR_ELEMS_16B * ROWS_PER_WARP).
+                        // offset1 = lane16id/2 in [0,8) indexes [NWARPS=8] used
+                        // here as head-chunk dim; offset2 = lane16id%2 picks the
+                        // 8-elem sub-chunk within the 16-elem chunk.
+                        const int offset1 = lane16id / ROWS_PER_WARP; // 0..7
+                        const int offset2 = lane16id % ROWS_PER_WARP; // 0..1
+                        shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
+                                     [local_qhead_idx][0] = tmp.xy[0];
+                        shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
+                                     [local_qhead_idx][1] = tmp.xy[1];
+#else
                         const int offset1 =
                             lane16id /
                             4; // 16 contiguous chunks of head elems are spread across 4x4lanes
@@ -157,9 +184,26 @@ _paged_attention_kernel(const int* block_table_seq,
                                      [local_qhead_idx][0] = tmp.xy[0];
                         shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][lane4id]
                                      [local_qhead_idx][1] = tmp.xy[1];
+#endif
                     }
                     else
                     {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                        // gfx12 fp8 KV (Option A): we run bf16/fp16 WMMA after
+                        // dequanting K lane-locally, so Q must be laid out the
+                        // same way as the bf16 path above (offset1 indexes
+                        // qkhe_depth*QK_SIZE_RATIO+qkratio, offset2=rowid). The
+                        // gfx9-fp8 layout below stores into offset1=head_elem/16
+                        // ∈ [0,1] only, leaving dim-3 slots [2,QKHELOOP)
+                        // uninitialized when read back via Qlocal[qkhe_depth]
+                        // with QKHELOOP=4 in fp8 mode -- gfx9-mfma-only.
+                        const int offset1 = lane16id / ROWS_PER_WARP; // 0..7
+                        const int offset2 = lane16id % ROWS_PER_WARP; // 0..1
+                        shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
+                                     [local_qhead_idx][0] = tmp.xy[0];
+                        shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
+                                     [local_qhead_idx][1] = tmp.xy[1];
+#else
                         for(int i = 0; i < 2; i++)
                         {
                             const int head_elem = lane16id * 2 + i; // element id in _B16x4 terms
@@ -169,6 +213,7 @@ _paged_attention_kernel(const int* block_table_seq,
                             shared_logits[gqa_ratio_loop][head_loop][mtp][offset1][offset2]
                                          [local_qhead_idx][offset3] = tmp.xy[i];
                         }
+#endif
                     }
                 }
             }
@@ -188,9 +233,24 @@ _paged_attention_kernel(const int* block_table_seq,
                     {
                         for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
                         {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                            // gfx12: Q is stored bf16-style in shared_logits
+                            // (dim-3 = qkhe_depth*QK_SIZE_RATIO + qkratio,
+                            // dim-4 = rowid, dim-6 = i). For QK_SIZE_RATIO=1
+                            // (bf16 KV) this reduces to dim-3=qkhe_depth /
+                            // dim-6=i, equivalent to the original gfx9 fetch.
+                            // For QK_SIZE_RATIO=2 (fp8 KV) we span all 8
+                            // shared_logits NWARPS slots filled by the bf16
+                            // store path activated above for fp8.
+                            Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i] =
+                                shared_logits[gqa_ratio_loop][head_loop][mtp]
+                                             [qkhe_depth * QK_SIZE_RATIO + qkratio][rowid]
+                                             [lane16id % GQA_RATIO_MTP_PARALLEL][i];
+#else
                             Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i] =
                                 shared_logits[gqa_ratio_loop][head_loop][mtp][qkhe_depth][rowid]
                                              [lane16id % GQA_RATIO_MTP_PARALLEL][2 * qkratio + i];
+#endif
                         }
                     }
                 }
@@ -338,7 +398,16 @@ _paged_attention_kernel(const int* block_table_seq,
         }
     }();
 
-    floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
+    // Per-lane width of d_out (and post-QK fragment): gfx9 MFMA 16x16x16 puts
+    // 4 m-coords per lane, gfx12 WMMA 16x16x16 wave32 puts 8 n-coords per lane.
+    // == 16 (tile) / ROWS_PER_WARP, so this auto-scales (4 on gfx9, 8 on gfx12).
+    constexpr int OUT_PER_LANE = 16 / ROWS_PER_WARP;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    using d_out_t = _Wf32x8;
+#else
+    using d_out_t = floatx4;
+#endif
+    d_out_t d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
     for(int mtp = 0; mtp < mtp_loop; mtp++)
     {
@@ -361,6 +430,18 @@ _paged_attention_kernel(const int* block_table_seq,
                                         Klocal[head_loop][token_depth][qkhe_depth],
                                         Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
                                         d_out[gqa_ratio_loop][mtp][token_depth]);
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+                                // gfx12 wave32: one 8-wide WMMA per qkhe_depth
+                                // covers K=16 fully (rowid in {0,1} carries 8
+                                // K-elems each). The 4-wide gcn_mfma16x16x16
+                                // helper above zero-pads the high half and is
+                                // numerically wrong on gfx12; do not use it
+                                // here.
+                                d_out[gqa_ratio_loop][mtp][token_depth] =
+                                    gcn_wmma16x16x16_instr<scalar_t>(
+                                        Klocal[head_loop][token_depth][qkhe_depth],
+                                        Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio],
+                                        d_out[gqa_ratio_loop][mtp][token_depth]);
 #else
                                 for(int i = 0; i < 2; i++)
                                 {
@@ -377,6 +458,68 @@ _paged_attention_kernel(const int* block_table_seq,
                         }
                         else
                         { // kv cache dtype fp8
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                            // gfx12 wave32 fp8 KV (Option A): KV is fp8 in HBM
+                            // (Klocal._B16x8 actually packs 16 fp8 elems via
+                            // cache_t=uint8_t; QK_SIZE_RATIO=2 splits it into
+                            // two _B8x8 halves), Q stays bf16/fp16. We dequant
+                            // each fp8 half to a bf16/fp16 _B16x8 lane-locally
+                            // and run the same gcn_wmma16x16x16 helper as the
+                            // bf16 branch. k_scale is multiplied into post-mfma
+                            // scale2 (see scale2 *= k_scale_ptr above).
+                            //
+                            // Layout-fix: lane(rowid=L) loads 16 contiguous
+                            // head-elems = head[qkhe_depth*32 + L*16 .. +15],
+                            // i.e. lane(rowid=0) holds K-tile X, lane(rowid=1)
+                            // holds K-tile X+1. WMMA 16x16x16 contract instead
+                            // wants lane(rowid=0).A_frag = head[k=base..base+7]
+                            // and lane(rowid=1).A_frag = head[k=base+8..+15] of
+                            // the SAME K-tile. So we cross-lane-swap between
+                            // lane L and lane L XOR 16 to assemble:
+                            //   lane(rowid=0).Kperm.xy = {head[base+0..7] of
+                            //     K-tile X, head[base+0..7] of K-tile X+1}
+                            //   lane(rowid=1).Kperm.xy = {head[base+8..15] of
+                            //     K-tile X, head[base+8..15] of K-tile X+1}
+                            // Then xy[qkratio] is exactly A_frag for WMMA on
+                            // K-tile (qkhe_depth*2 + qkratio).
+                            auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
+                            _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
+                            union {
+                                _B8x16 b8x16;
+                                uint32_t u32[4];
+                            } src_u, paired_u;
+                            src_u.b8x16 = Ktmp8x16;
+                            for(int w = 0; w < 4; ++w)
+                                paired_u.u32[w] = __shfl_xor(src_u.u32[w], 16);
+                            _B8x16 Kperm;
+                            if(rowid == 0)
+                            {
+                                // keep my xy[0] (head[..+0..7] of K-tile X)
+                                // pull paired's xy[0] = head[..+16..23] of
+                                // K-tile X+1 into my xy[1]
+                                Kperm.xy[0] = src_u.b8x16.xy[0];
+                                Kperm.xy[1] = paired_u.b8x16.xy[0];
+                            }
+                            else
+                            {
+                                // pull paired's xy[1] = head[..+8..15] of
+                                // K-tile X into my xy[0]; keep my xy[1] =
+                                // head[..+24..31] of K-tile X+1.
+                                Kperm.xy[0] = paired_u.b8x16.xy[1];
+                                Kperm.xy[1] = src_u.b8x16.xy[1];
+                            }
+                            for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
+                            {
+                                _B16x8 Kbf =
+                                    dequant_fp8x8_to_b16x8<scalar_t, KV_DTYPE>(Kperm.xy[qkratio]);
+                                d_out[gqa_ratio_loop][mtp][token_depth] =
+                                    gcn_wmma16x16x16_instr<scalar_t>(
+                                        Kbf,
+                                        Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth]
+                                              [qkratio],
+                                        d_out[gqa_ratio_loop][mtp][token_depth]);
+                            }
+#else
                             auto Ktmp       = Klocal[head_loop][token_depth][qkhe_depth];
                             _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
                             for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
@@ -408,10 +551,11 @@ _paged_attention_kernel(const int* block_table_seq,
                                         Qtmp8x8.i64,
                                         d_out[gqa_ratio_loop][mtp][token_depth]);
                             }
+#endif
                         }
                     }
                 }
-                for(int i = 0; i < 4; i++)
+                for(int i = 0; i < OUT_PER_LANE; i++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = variant->QueryTransform(
                         variant_params, d_out[gqa_ratio_loop][mtp][token_depth][i]);
@@ -419,7 +563,10 @@ _paged_attention_kernel(const int* block_table_seq,
             }
         }
     }
-    const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
+    // gfx9: per-lane stride = 4 (rowid in {0..3}, m-coord = rowid*4+i, i<4).
+    // gfx12 wave32: per-lane stride = 8 (rowid in {0,1}, n-coord = rowid*8+e, e<8).
+    const int qkout_token_idx =
+        partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * OUT_PER_LANE;
 
     // apply alibi
     if constexpr(ALIBI_ENABLED)
@@ -432,7 +579,7 @@ _paged_attention_kernel(const int* block_table_seq,
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
-                    for(int i = 0; i < 4; i++)
+                    for(int i = 0; i < OUT_PER_LANE; i++)
                     {
                         d_out[gqa_ratio_loop][mtp][token_depth][i] +=
                             alibi_slope[gqa_ratio_loop] * (alibi_offset + i);
@@ -451,7 +598,7 @@ _paged_attention_kernel(const int* block_table_seq,
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
-                    for(int i = 0; i < 4; i++)
+                    for(int i = 0; i < OUT_PER_LANE; i++)
                     {
                         float tmp = d_out[gqa_ratio_loop][mtp][token_depth][i];
                         if(local_token_idx + i < context_len - sliding_window)
@@ -469,7 +616,7 @@ _paged_attention_kernel(const int* block_table_seq,
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
-                for(int i = 0; i < 4; i++)
+                for(int i = 0; i < OUT_PER_LANE; i++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth][i] = variant->LogitsTransform(
                         variant_params,
@@ -494,7 +641,7 @@ _paged_attention_kernel(const int* block_table_seq,
             for(int token_depth = 0; token_depth < TLOOP; token_depth++)
             {
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
-                for(int i = 0; i < 4; i++)
+                for(int i = 0; i < OUT_PER_LANE; i++)
                 {
                     const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
                                           ? d_out[gqa_ratio_loop][mtp][token_depth][i]
@@ -512,7 +659,7 @@ _paged_attention_kernel(const int* block_table_seq,
             for(int token_depth = 0; token_depth < TLOOP; token_depth++)
             {
                 const int local_token_idx = qkout_token_idx + token_depth * 16;
-                for(int i = 0; i < 4; i++)
+                for(int i = 0; i < OUT_PER_LANE; i++)
                 {
                     const float tmp = ((local_token_idx + i) < context_len * (warp_mtp_idx + 1))
                                           ? __expf(d_out[gqa_ratio_loop][mtp][token_depth][i] -
@@ -602,6 +749,34 @@ _paged_attention_kernel(const int* block_table_seq,
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
                     d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                    // gfx12: d_out is float8 per lane. Split into low/high
+                    // floatx4 halves and write into the two _B16x4 slots that
+                    // belong to this rowid. Token mapping per WMMA tile:
+                    //   slot[rowid*2+0]: tokens (rowid*8 + 0..3)
+                    //   slot[rowid*2+1]: tokens (rowid*8 + 4..7)
+                    // PV is left in its gfx9 form for now; this writeback layout
+                    // does NOT match what PV reads, so out[] stays incorrect on
+                    // gfx12 -- only max_logits / exp_sums will recover here
+                    // (per pa_gfx1201_wmma_layout.md step 6.1).
+                    const _Wf32x8& d8 = d_out[gqa_ratio_loop][mtp][token_depth];
+                    floatx4 lo        = {d8[0], d8[1], d8[2], d8[3]};
+                    floatx4 hi        = {d8[4], d8[5], d8[6], d8[7]};
+                    if constexpr(LOGITS_RTZ_CONVERSION)
+                    {
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 0] = from_floatx4_rtz<scalar_t>(lo);
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 1] = from_floatx4_rtz<scalar_t>(hi);
+                    }
+                    else
+                    {
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 0] = from_floatx4<scalar_t>(lo);
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 1] = from_floatx4<scalar_t>(hi);
+                    }
+#else
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
                         // use rtz conversion for better performance, with negligible impact on
@@ -616,12 +791,47 @@ _paged_attention_kernel(const int* block_table_seq,
                                      [rowid] = from_floatx4<scalar_t>(
                                          d_out[gqa_ratio_loop][mtp][token_depth]);
                     }
+#endif
                 }
             }
         }
     }
     else
     {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        // gfx12 fp8 KV (Option A): PV runs bf16 WMMA after dequant, so we need
+        // logits in shared_logits to be bf16/fp16 in the SAME layout as the
+        // gfx12 bf16 path above (slot[rowid*2+0/1] = lo/hi 4-bf16 halves of
+        // d_out per lane). The gfx9-fp8 cvt_pk_fp8_f32 path below writes
+        // packed fp8 logits which our PV WMMA cannot consume.
+        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+        {
+            for(int mtp = 0; mtp < mtp_loop; mtp++)
+            {
+                for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
+                {
+                    d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
+                    const _Wf32x8& d8 = d_out[gqa_ratio_loop][mtp][token_depth];
+                    floatx4 lo        = {d8[0], d8[1], d8[2], d8[3]};
+                    floatx4 hi        = {d8[4], d8[5], d8[6], d8[7]};
+                    if constexpr(LOGITS_RTZ_CONVERSION)
+                    {
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 0] = from_floatx4_rtz<scalar_t>(lo);
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 1] = from_floatx4_rtz<scalar_t>(hi);
+                    }
+                    else
+                    {
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 0] = from_floatx4<scalar_t>(lo);
+                        shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
+                                     [rowid * 2 + 1] = from_floatx4<scalar_t>(hi);
+                    }
+                }
+            }
+        }
+#else
         int rowid_8x8 = rowid / 2;
         int offset    = rowid % 2;
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
@@ -648,6 +858,7 @@ _paged_attention_kernel(const int* block_table_seq,
                 }
             }
         }
+#endif
     }
     // write out partition max_logits and exp_sum
     if(threadIdx.x < GQA_RATIO_MTP_PARALLEL)
@@ -700,6 +911,64 @@ _paged_attention_kernel(const int* block_table_seq,
                 const int vlds_col_idx  = vlocal_head_elem / CONTIGUOUS_KV_ELEMS_16B_LOAD;
                 const int vlds_elem_idx = vlocal_head_elem % CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    // gfx12 wave32 PV (fp8 KV, Option A): bf16 WMMA contract
+                    // requires lane(rowid=0) to hold K=0..7 of a 16-token
+                    // K-tile and lane(rowid=1) to hold K=8..15 of THE SAME
+                    // K-tile. With CONTIGUOUS_KV_ELEMS_16B_LOAD=16 and
+                    // VTLANELOOP=1 in fp8, the bf16 formula above would put
+                    // tokens 0..15 in rowid=0 and 16..31 in rowid=1 -- two
+                    // DIFFERENT K-tiles -- which is incompatible. Re-lay the
+                    // fragment so xy[0] = K-tile{0..15}'s rowid-half (8 fp8
+                    // tokens) and xy[1] = K-tile{16..31}'s rowid-half. The
+                    // PV WMMA loop below then dispatches 2 bf16 WMMAs per
+                    // vfetch_depth, half==token_depth slot in shared_logits.
+                    constexpr int FP8_HALF = 8;
+                    cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD]; // = 16 fp8
+                    for(int half = 0; half < 2; ++half)
+                    {
+                        for(int d2 = 0; d2 < FP8_HALF; ++d2)
+                        {
+                            const int vlocal_token_idx =
+                                half * 16 + rowid * FP8_HALF + d2;
+                            const cache_t* fetched_elems =
+                                reinterpret_cast<const cache_t*>(
+                                    vlds_ptr +
+                                    (vlocal_token_idx * n_thread_per_block + vlds_col_idx) *
+                                        16);
+                            elems[half * FP8_HALF + d2] = fetched_elems[vlds_elem_idx];
+                        }
+                    }
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(elems);
+                }
+                else
+                {
+                    // gfx12 wave32 PV: WMMA contract for B (V) is
+                    //   B_frag[e=0..7] = V[n=lane%16=he][k=group*8+e=token-in-K-tile]
+                    // So one WMMA call covers K=16 contiguous tokens and lane(rowid)
+                    // must hold tokens K-tile-base + rowid*8 + 0..7. With
+                    // VTOKENS_PER_LANE=16 and VTLANELOOP=2, vfetch_depth indexes
+                    // K-tiles (each 16 tokens wide); within a K-tile, rowid groups
+                    // contribute the two halves.
+                    const int vlocal_token_idx =
+                        rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD +
+                        vfetch_depth * (ROWS_PER_WARP * CONTIGUOUS_KV_ELEMS_16B_LOAD);
+                    cache_t elems[CONTIGUOUS_KV_ELEMS_16B_LOAD];
+                    for(int d2 = 0; d2 < CONTIGUOUS_KV_ELEMS_16B_LOAD; ++d2)
+                    {
+                        const cache_t* fetched_elems = reinterpret_cast<const cache_t*>(
+                            vlds_ptr + (/*row=*/(vlocal_token_idx + d2) * n_thread_per_block +
+                                        /*col=*/vlds_col_idx) *
+                                           16);
+                        elems[d2] = fetched_elems[vlds_elem_idx];
+                    }
+                    Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
+                        *reinterpret_cast<const _B16x8*>(elems);
+                }
+#else
                 const int vlocal_token_idx =
                     rowid * VTOKENS_PER_LANE + vfetch_depth * CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
@@ -718,12 +987,20 @@ _paged_attention_kernel(const int* block_table_seq,
                 // copy all the read data points together
                 Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
                     *reinterpret_cast<const _B16x8*>(elems);
+#endif
             }
             __syncthreads();
         }
     }
 
+    // gfx9: each lane holds 4 he-coords of the PV WMMA output, so outelems
+    // is _B16x4. gfx12 wave32: each lane holds 8 he-coords (n=group*8+e per
+    // lane), so outelems is _B16x8 (= two _B16x4 halves stored as xy[0]/xy[1]).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    _B16x8 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
+#else
     _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
+#endif
 
     // Softmax V mfma
     // v layout: 16he across lanes x 16 tokens per lane
@@ -733,7 +1010,9 @@ _paged_attention_kernel(const int* block_table_seq,
         {
             for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
             {
-                floatx4 tmp_out = {0};
+                // tmp_out per-lane width: gfx9 mfma -> floatx4, gfx12 wmma -> _Wf32x8.
+                // d_out_t was declared earlier (QK section) for the same purpose.
+                d_out_t tmp_out = {0};
 
                 for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
                 {
@@ -754,6 +1033,28 @@ _paged_attention_kernel(const int* block_table_seq,
                             }
                             tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
                                 Vlocal[vtoken_depth][vhe_depth][vfetch_depth], tmp_in, tmp_out);
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+                            // gfx12 wave32 PV: one 8-wide WMMA per vfetch_depth
+                            // covers K=16 (16 contiguous tokens). With WMMA's
+                            // group=rowid contributing K=group*8+e per lane,
+                            // and the V-load-from-LDS formula below (gfx12
+                            // branch) putting tokens K-tile-base+rowid*8+0..7
+                            // in lane(rowid), we just feed the full _B16x8
+                            // V_frag and an 8-token P_frag whose halves come
+                            // from QK's two writeback slots [rowid*2+0/1].
+                            //   slot[rowid*2+0] -> lo: tokens rowid*8 + 0..3
+                            //   slot[rowid*2+1] -> hi: tokens rowid*8 + 4..7
+                            _B16x8 p_frag;
+                            p_frag.xy[0] =
+                                shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                             [vfetch_depth][lane16id][rowid * 2 + 0];
+                            p_frag.xy[1] =
+                                shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                             [vfetch_depth][lane16id][rowid * 2 + 1];
+                            tmp_out = gcn_wmma16x16x16_instr<scalar_t>(
+                                Vlocal[vtoken_depth][vhe_depth][vfetch_depth],
+                                p_frag,
+                                tmp_out);
 #else
                             for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                             {
@@ -774,6 +1075,34 @@ _paged_attention_kernel(const int* block_table_seq,
                     }
                     else
                     {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                        // gfx12 wave32 fp8 KV PV (Option A): the LDS->Vlocal
+                        // step above re-laid Vlocal so xy[0] = K-tile{0..15}'s
+                        // rowid-half (8 fp8 tokens) and xy[1] = K-tile{16..31}'s
+                        // rowid-half. Run two bf16 WMMAs per vfetch_depth, one
+                        // per half, with p_frag pulled from the matching
+                        // shared_logits[token_depth=half] slot. tmp_out *=
+                        // *v_scale_ptr (below) folds in v_scale post-WMMA.
+                        for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
+                        {
+                            _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
+                            _B8x16 Vtmp8x16 = *reinterpret_cast<_B8x16*>(&Vtmp);
+                            for(int half = 0; half < 2; ++half)
+                            {
+                                const int token_depth_idx = vfetch_depth * 2 + half;
+                                _B16x8 Vbf =
+                                    dequant_fp8x8_to_b16x8<scalar_t, KV_DTYPE>(Vtmp8x16.xy[half]);
+                                _B16x8 p_frag;
+                                p_frag.xy[0] =
+                                    shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                 [token_depth_idx][lane16id][rowid * 2 + 0];
+                                p_frag.xy[1] =
+                                    shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth]
+                                                 [token_depth_idx][lane16id][rowid * 2 + 1];
+                                tmp_out = gcn_wmma16x16x16_instr<scalar_t>(Vbf, p_frag, tmp_out);
+                            }
+                        }
+#else
                         for(int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++)
                         {
                             _B16x8 Vtmp = Vlocal[vtoken_depth][vhe_depth][vfetch_depth];
@@ -801,6 +1130,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                 }
                             }
                         }
+#endif
                     }
                     __syncthreads();
                 }
@@ -809,7 +1139,22 @@ _paged_attention_kernel(const int* block_table_seq,
                 {
                     tmp_out *= *v_scale_ptr;
                 }
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                // tmp_out is _Wf32x8; pack into 8 he-coords as two _B16x4 halves.
+                // Mapping (per WMMA D layout: D[m=qhead][n=group*8+e]):
+                //   xy[0]: he within 16-he tile = rowid*8 + 0..3
+                //   xy[1]: he within 16-he tile = rowid*8 + 4..7
+                {
+                    floatx4 lo = {tmp_out[0], tmp_out[1], tmp_out[2], tmp_out[3]};
+                    floatx4 hi = {tmp_out[4], tmp_out[5], tmp_out[6], tmp_out[7]};
+                    outelems[gqa_ratio_loop][mtp][vhe_depth].xy[0] =
+                        from_floatx4<scalar_t>(lo);
+                    outelems[gqa_ratio_loop][mtp][vhe_depth].xy[1] =
+                        from_floatx4<scalar_t>(hi);
+                }
+#else
                 outelems[gqa_ratio_loop][mtp][vhe_depth] = from_floatx4<scalar_t>(tmp_out);
+#endif
             }
         }
     }
@@ -824,8 +1169,21 @@ _paged_attention_kernel(const int* block_table_seq,
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                // gfx12: each lane writes 8 he-coords across two _B16x4 slots
+                // (rowid*2+0/1). Reader (warp 0 readback below) walks two
+                // consecutive slots via offset3+i, i in {0,1}, which naturally
+                // picks (rowid*2+0, rowid*2+1) for each rowid.
+                shared_logits[gqa_ratio_loop][0][mtp][warpid][vhe_depth][lane16id]
+                             [rowid * 2 + 0] =
+                                 outelems[gqa_ratio_loop][mtp][vhe_depth].xy[0];
+                shared_logits[gqa_ratio_loop][0][mtp][warpid][vhe_depth][lane16id]
+                             [rowid * 2 + 1] =
+                                 outelems[gqa_ratio_loop][mtp][vhe_depth].xy[1];
+#else
                 shared_logits[gqa_ratio_loop][0][mtp][warpid][vhe_depth][lane16id][rowid] =
                     outelems[gqa_ratio_loop][mtp][vhe_depth];
+#endif
             }
         }
     }
@@ -841,11 +1199,38 @@ _paged_attention_kernel(const int* block_table_seq,
             {
                 for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
                 {
+                    // gfx12 wave32 distributes 128 he across NWARPS=8 warps
+                    // (one 16-he chunk each, VHELOOP=1) and ROWS_PER_WARP=2
+                    // rowids per warp; each lane writes 8 he via two _B16x4
+                    // slots [rowid*2+0/1]. The reader formula for offset3+i
+                    // (i in {0,1}) naturally picks those two slots, but the
+                    // warpid (offset1) and qhead-within-warp stride
+                    // (local_head_idx) hardcoded to 4 must be relaxed.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                    constexpr int GQA_RATIO_PER_ROWS =
+                        DIVIDE_ROUND_UP(GQA_RATIO_MTP_PARALLEL, ROWS_PER_WARP);
+                    _B16x8 vout[GQA_RATIO_PER_ROWS];
+#else
                     _B16x8 vout[GQA_RATIO4];
+#endif
                     // each lane writes out 16Bytes of tmp_out along head elem dimension
                     const int head_elem_idx = lane16id * 8 + head_loop * HEAD_SIZE_PER_LOOP;
                     if(head_elem_idx < HEAD_SIZE)
                     {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                        for(int h = 0; h < GQA_RATIO_PER_ROWS; h++)
+                        {
+                            const int local_head_idx = ROWS_PER_WARP * h + rowid;
+                            const int offset1        = (head_elem_idx / 16) % NWARPS;
+                            const int offset2        = head_elem_idx / 16 / NWARPS;
+                            const int offset3        = (head_elem_idx / 4) % 4;
+                            for(int i = 0; i < 2; i++)
+                            {
+                                vout[h].xy[i] = shared_logits[gqa_ratio_loop][0][mtp][offset1]
+                                                             [offset2][local_head_idx][offset3 + i];
+                            }
+                        }
+#else
                         for(int h = 0; h < GQA_RATIO4; h++)
                         {
                             const int local_head_idx = 4 * h + rowid;
@@ -858,6 +1243,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                                              [offset2][local_head_idx][offset3 + i];
                             }
                         }
+#endif
 
                         const int64_t hsz_maxp_mult =
                             static_cast<int64_t>(HEAD_SIZE * max_num_partitions);
@@ -866,6 +1252,22 @@ _paged_attention_kernel(const int* block_table_seq,
                                             (seq_idx + mtp * MTP_PARALLEL_THREADS) *
                                                 total_num_heads * hsz_maxp_mult +
                                             partition_idx * HEAD_SIZE;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+                        for(int h = 0; h < GQA_RATIO_PER_ROWS; h++)
+                        {
+                            const int local_head_idx = ROWS_PER_WARP * h + rowid;
+                            if(local_head_idx < GQA_RATIO_MTP_PARALLEL)
+                            {
+                                const int64_t out_head_idx =
+                                    static_cast<int64_t>(wg_start_head_idx + local_head_idx +
+                                                         gqa_ratio_loop * GQA_RATIO_PER_LOOP);
+                                scalar_t* out_ptr2    = out_ptr + out_head_idx * hsz_maxp_mult;
+                                scalar_t* out_ptr3    = out_ptr2 + head_elem_idx;
+                                _B16x8* out_ptr_B16x8 = reinterpret_cast<_B16x8*>(out_ptr3);
+                                *out_ptr_B16x8        = vout[h];
+                            }
+                        }
+#else
                         for(int h = 0; h < GQA_RATIO4; h++)
                         {
                             const int local_head_idx = 4 * h + rowid;
@@ -880,6 +1282,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                 *out_ptr_B16x8        = vout[h];
                             }
                         }
+#endif
                     }
                 }
             }

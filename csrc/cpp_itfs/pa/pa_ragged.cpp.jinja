@@ -76,6 +76,8 @@ void {{func_name}}(void* out_ptr,
                                             {{kv_dtype}},                            
                                             {% if fp8_kv_dtype == 'auto' %}
                                             vllm::Fp8KVCacheDataType::kAuto,
+                                            {% elif fp8_kv_dtype == 'fp8_e5m2' %}
+                                            vllm::Fp8KVCacheDataType::kFp8E5M2,
                                             {% else %}
                                             vllm::Fp8KVCacheDataType::kFp8E4M3,
                                             {% endif %}                 

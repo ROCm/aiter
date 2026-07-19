@@ -136,6 +136,126 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
     }
 }
 
+#elif(defined(__gfx1200__) || defined(__gfx1201__))
+// ===========================================================================
+// RDNA4 (Navi4x: gfx1200 / gfx1201) WMMA path -- isolated from the gfx9 MFMA
+// path above. NOTE: narrowed to gfx1200/gfx1201 on purpose; __GFX12__ is also
+// defined for gfx1250, which is a different microarchitecture with its own
+// *_gfx1250 WMMA intrinsics and must NOT take this path.
+// gfx12 has no Matrix-Arithmetic-Instructions (mai-insts), so MFMA builtins do
+// not exist here. Instead we use the 3rd-gen WMMA matrix cores (wave32).
+// Verified intrinsics on this toolchain (ROCm 7.2.1 / clang 22):
+//   float8 __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(short8 A, short8 B, float8 C)
+//   float8 __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12 (half8  A, half8  B, float8 C)
+//
+// LAYOUT NOTE (important, still TODO at the kernel level):
+//   MFMA on gfx9 is wave64 and each lane holds a 4-wide fragment (_B16x4 in,
+//   floatx4 out). WMMA on gfx12 is wave32 and each lane holds an 8-wide
+//   fragment (short8/half8 in, float8 out). To keep the SAME helper signature
+//   the kernel uses (so it compiles and we can advance error-by-error), we pack
+//   the incoming 4-wide fragment into the LOW half of the 8-wide WMMA fragment
+//   and return the LOW floatx4 of the 8-wide result. The cross-lane fragment
+//   redistribution required for full numeric correctness must be done where the
+//   kernel loads/stores fragments -- that is the next thing to port.
+// ===========================================================================
+using _Wf32x8  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+using _Wbf16x8 = __attribute__((__vector_size__(8 * sizeof(short)))) short;
+using _Wf16x8  = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+
+template <typename T, int absz, int cbid, int blgp>
+__device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
+                                                          const _B16x4& inpB,
+                                                          const floatx4& inpC)
+{
+    _Wf32x8 c8 = {inpC[0], inpC[1], inpC[2], inpC[3], 0.f, 0.f, 0.f, 0.f};
+    if constexpr(std::is_same<T, _Float16>::value)
+    {
+        _Wf16x8 a8{}, b8{};
+        const _Float16* ap = reinterpret_cast<const _Float16*>(&inpA);
+        const _Float16* bp = reinterpret_cast<const _Float16*>(&inpB);
+        for(int i = 0; i < 4; ++i)
+        {
+            a8[i] = ap[i];
+            b8[i] = bp[i];
+        }
+        _Wf32x8 d8 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a8, b8, c8);
+        return floatx4{d8[0], d8[1], d8[2], d8[3]};
+    }
+    else if constexpr(std::is_same<T, __hip_bfloat16>::value)
+    {
+        _Wbf16x8 a8{}, b8{};
+        const short* ap = reinterpret_cast<const short*>(&inpA);
+        const short* bp = reinterpret_cast<const short*>(&inpB);
+        for(int i = 0; i < 4; ++i)
+        {
+            a8[i] = ap[i];
+            b8[i] = bp[i];
+        }
+        _Wf32x8 d8 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a8, b8, c8);
+        return floatx4{d8[0], d8[1], d8[2], d8[3]};
+    }
+    else
+    {
+        static_assert(false, "unsupported 16b dtype");
+    }
+}
+
+template <typename T, int absz, int cbid, int blgp>
+__device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
+                                                          const long& inpB,
+                                                          const floatx4& inpC)
+{
+    // TODO(gfx12): fp8 KV path. gfx12 fp8 WMMA is
+    //   __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12 (K=16), whereas the
+    //   MFMA helper this replaces is 16x16x32 (K=32) with a different fragment
+    //   layout. Not instantiated for the bf16 config under test, so left as an
+    //   identity placeholder until the fp8 KV path is ported.
+    static_assert(std::is_same<T, __hip_fp8_e4m3>::value ||
+                      std::is_same<T, __hip_fp8_e5m2>::value,
+                  "unsupported 8b dtype");
+    return inpC;
+}
+
+// 8-wide WMMA helper for gfx1200/gfx1201. This is the NUMERICALLY CORRECT
+// gfx12 path: the 4-wide gcn_mfma16x16x16_instr above zero-pads the high half
+// of the 8-wide WMMA fragment, which is mathematically wrong. The kernel must
+// switch to 8-wide loads + this helper on gfx12; see pa_gfx1201_wmma_layout.md.
+//
+// Verified gfx12 builtin contract (op_tests/wmma_min_test.cpp):
+//   builtin(B_frag, A_frag, C) computes D[m=lane%16][n=group*8+e]
+//                                       = sum_k A[m][k] * B[n][k]
+//   with A_frag[e]=A[m=lane%16][k=group*8+e], B_frag[e]=B[n=lane%16][k=group*8+e].
+// QK uses K_frag as A (M=token) and Q_frag as B (N=qhead) -> output D[token][qhead].
+// To match the gfx9 MFMA call site (which passes K first, Q second, and gets
+// lane=qhead/rowid*4+i=token output), we instead pick M=qhead so the kernel can
+// keep its lane=qhead post-processing layout: A_matrix=Q (qhead-major) is passed
+// as inpB and B_matrix=K (token-major) as inpA, then builtin first-arg=B=inpA.
+// Net: callers keep `helper(Klocal, Qlocal, C)` and we forward `(inpA, inpB, inpC)`
+// to the builtin unchanged.
+template <typename T>
+__device__ __forceinline__ _Wf32x8 gcn_wmma16x16x16_instr(const _B16x8& inpA,
+                                                          const _B16x8& inpB,
+                                                          const _Wf32x8& inpC)
+{
+    if constexpr(std::is_same<T, _Float16>::value)
+    {
+        _Wf16x8 a8, b8;
+        __builtin_memcpy(&a8, &inpA, sizeof(a8));
+        __builtin_memcpy(&b8, &inpB, sizeof(b8));
+        return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a8, b8, inpC);
+    }
+    else if constexpr(std::is_same<T, __hip_bfloat16>::value)
+    {
+        _Wbf16x8 a8, b8;
+        __builtin_memcpy(&a8, &inpA, sizeof(a8));
+        __builtin_memcpy(&b8, &inpB, sizeof(b8));
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a8, b8, inpC);
+    }
+    else
+    {
+        static_assert(sizeof(T) == 0, "unsupported 16b dtype");
+    }
+}
 #else
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
@@ -295,6 +415,50 @@ __device__ __forceinline__ floatx4 to_float_fp8x4(const _B8x4& inp)
     ret[2] = f1[0];
     ret[3] = f1[1];
     return ret;
+}
+
+__device__ __forceinline__ floatx4 to_float_bf8x4(const _B8x4& inp)
+{
+    const auto f0 = __builtin_amdgcn_cvt_pk_f32_bf8(inp, false);
+    const auto f1 = __builtin_amdgcn_cvt_pk_f32_bf8(inp, true);
+    floatx4 ret;
+    ret[0] = f0[0];
+    ret[1] = f0[1];
+    ret[2] = f1[0];
+    ret[3] = f1[1];
+    return ret;
+}
+
+// Lane-local dequant of a packed 8-fp8 fragment (_B8x8 = uint2 = 8 bytes)
+// into an 8-elem bf16/fp16 fragment (_B16x8). Used by the gfx12 fp8-KV PA
+// path (Option A): we keep HBM at fp8, but feed the existing bf16/fp16 WMMA
+// helper after this in-register dequant. KV_DTYPE selects the fp8 variant
+// ABI (e4m3 -> cvt_pk_f32_fp8, e5m2 -> cvt_pk_f32_bf8). No scaling here;
+// k_scale/v_scale are folded into post-mfma `scale2 *= *k_scale_ptr` and
+// `tmp_out *= *v_scale_ptr` at the kernel level, same as gfx9.
+template <typename ScalarT, vllm::Fp8KVCacheDataType KV_DTYPE>
+__device__ __forceinline__ _B16x8 dequant_fp8x8_to_b16x8(const _B8x8& in)
+{
+    static_assert(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3 ||
+                      KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E5M2,
+                  "dequant_fp8x8_to_b16x8: KV_DTYPE must be a fp8 variant");
+    _B8x4 lo = static_cast<_B8x4>(in.x);
+    _B8x4 hi = static_cast<_B8x4>(in.y);
+    floatx4 f_lo, f_hi;
+    if constexpr(KV_DTYPE == vllm::Fp8KVCacheDataType::kFp8E4M3)
+    {
+        f_lo = to_float_fp8x4(lo);
+        f_hi = to_float_fp8x4(hi);
+    }
+    else
+    {
+        f_lo = to_float_bf8x4(lo);
+        f_hi = to_float_bf8x4(hi);
+    }
+    _B16x8 out;
+    out.xy[0] = from_floatx4<ScalarT>(f_lo);
+    out.xy[1] = from_floatx4<ScalarT>(f_hi);
+    return out;
 }
 
 template <typename T>

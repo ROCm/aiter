@@ -98,7 +98,7 @@ def paged_attention_ragged(
             kv_dtype = "_Float16"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
-    elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
+    elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3" or kv_cache_dtype == "fp8_e5m2":
         if query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
             kv_dtype = "uint8_t"
