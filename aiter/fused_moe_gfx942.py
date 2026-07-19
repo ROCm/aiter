@@ -56,11 +56,21 @@ def get_tune_space():
     return [
         # decoding ignored BLOCK_N/BLOCK_K
         Config(16, 16, 16, False).to_string(),
-        Config(64, 256, 64, True).to_string(),
-        Config(64, 256, 128, True).to_string(),
+        # Config(64, 256, 64, True).to_string(),
+        # Config(64, 256, 128, True).to_string(),
         Config(64, 128, 256, True).to_string(),
         Config(64, 128, 128, True).to_string(),
     ]
+
+
+@cache
+def _get_compiled_sum_kernel(TOPK, N):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_sum
+
+    return compile_sum(
+        TOPK=TOPK,
+        N=N,
+    )
 
 
 @cache
@@ -200,7 +210,7 @@ def fused_moe_gfx942(
             TOPK=TOPK,
             BLOCK_TILE_SIZE_M=kcfgs.BLOCK_M,
             BLOCK_TILE_SIZE_N=kcfgs.BLOCK_N,
-            BLOCK_TILE_SIZE_K=None, # kcfgs.BLOCK_K,
+            BLOCK_TILE_SIZE_K=None,  # kcfgs.BLOCK_K,
             stage="gateup",
             alg="prefill_1x4",
             E=E,
@@ -236,11 +246,13 @@ def fused_moe_gfx942(
             )
         else:
             down_in = gemm1_out
-            down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
+            down_in_scale = torch.empty(
+                1, dtype=torch.float32, device=hidden_states.device
+            )
 
-        gemm2_out = torch.empty([B, TOPK, N2],
-                                dtype=hidden_states.dtype,
-                                device=hidden_states.device)
+        gemm2_out = torch.empty(
+            [B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device
+        )
 
         # Compile and launch down kernel (splitk; consumes the bf16 gateup output directly,
         # no inter-stage quantization).
@@ -274,7 +286,11 @@ def fused_moe_gfx942(
             B,
             task_num,
         )
-        cur_out = torch.sum(gemm2_out, dim=1)
+
+        sum_kernel = _get_compiled_sum_kernel(TOPK=TOPK, N=N2)
+        _launch(sum_kernel, gemm2_out, cur_out, B)
+        #cur_out = torch.sum(gemm2_out, dim=1)
+
         return cur_out
 
     if B == 1:
