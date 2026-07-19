@@ -105,8 +105,22 @@ def parse_csv(csv_path: str):
             )
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
+            q_dtype_a = row.get("q_dtype_a", "")
             q_dtype_w = row.get("q_dtype_w", "")
             swiglu_limit = _row_swiglu_limit(row)
+            is_dsv4_heterogeneous = (
+                model_dim == 7168
+                and inter_dim == 512
+                and experts == 385
+                and topk == 7
+                and act == "silu"
+                and dtype == "torch.bfloat16"
+                and row.get("use_g1u1", "") == "1"
+                and "_gui" in row.get("kernelName1", "")
+                and q_type.strip().split(".")[-1] == "per_1x32"
+                and "float8_e4m3fn" in q_dtype_a
+                and "float4_e2m1fn_x2" in q_dtype_w
+            )
             # Cover both runtime bias choices for fp4-weight MoE. Model configs
             # share kernel families, and runtime bias selection can vary by
             # activation dtype/model semantics.
@@ -192,6 +206,15 @@ def parse_csv(csv_path: str):
                     seen.add(key)
 
                     jobs.append(full_job)
+                    if is_dsv4_heterogeneous and not enable_bias:
+                        heterogeneous_job = {
+                            **full_job,
+                            "shared_expert_id": experts - 1,
+                        }
+                        heterogeneous_key = job_identity(heterogeneous_job)
+                        if heterogeneous_key not in seen:
+                            seen.add(heterogeneous_key)
+                            jobs.append(heterogeneous_job)
 
     return jobs
 
@@ -237,6 +260,7 @@ def _precompile_to_cache(
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    shared_expert_id: int = -1,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -258,6 +282,7 @@ def _precompile_to_cache(
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
+    heterogeneous_b = shared_expert_id >= 0
     _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
     _block_m_for_sort = block_m if block_m > 0 else _sort_block_m
 
@@ -403,6 +428,23 @@ def _precompile_to_cache(
         # mxfp4 e8m0 scale — viewed as uint8 by _view_safe before kernel launch.
         return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
+    def _make_shared_w1():
+        return torch.zeros((1, 2 * inter_dim, model_dim), dtype=torch.uint8, device=dev)
+
+    def _make_shared_w2():
+        return torch.zeros((1, model_dim, inter_dim), dtype=torch.uint8, device=dev)
+
+    def _make_shared_w1_scale():
+        rows = (2 * inter_dim + 255) // 256 * 256
+        cols = (model_dim // 32 + 7) // 8 * 8
+        return torch.zeros((rows, cols), dtype=torch.uint8, device=dev)
+
+    def _make_shared_w2_scale():
+        rows = (model_dim + 255) // 256 * 256
+        scale_k = (inter_dim + 255) // 256 * 256
+        cols = (scale_k // 32 + 7) // 8 * 8
+        return torch.zeros((rows, cols), dtype=torch.uint8, device=dev)
+
     def _make_a_user(a_dtype_user_shape):
         return _alloc(a_dtype_user_shape, _storage_dtype(a_dtype))
 
@@ -506,6 +548,10 @@ def _precompile_to_cache(
                 if w1_scale is not None
                 else torch.empty(0, device=dev)
             )
+            shared_w1 = _make_shared_w1() if heterogeneous_b else w1
+            shared_w1_scale = (
+                _make_shared_w1_scale() if heterogeneous_b else flat_w_scale
+            )
             sw_arg = (
                 sw
                 if sw is not None
@@ -534,6 +580,8 @@ def _precompile_to_cache(
                     w1.view(-1),
                     flat_a_scale,
                     flat_w_scale,
+                    shared_w1.view(-1),
+                    shared_w1_scale.view(-1),
                     sorted_token_ids,
                     sorted_expert_ids,
                     sw_arg,
@@ -591,6 +639,7 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
+                shared_expert_id=shared_expert_id,
             )
             _run_compiled(exe, args)
 
@@ -679,6 +728,10 @@ def _precompile_to_cache(
                 if w2_scale is not None
                 else torch.empty(0, device=dev)
             )
+            shared_w2 = _make_shared_w2() if heterogeneous_b else w2
+            shared_w2_scale = (
+                _make_shared_w2_scale() if heterogeneous_b else flat_w_scale
+            )
             sw_arg = (
                 sw
                 if sw is not None
@@ -712,6 +765,8 @@ def _precompile_to_cache(
                     w2,
                     flat_a_scale,
                     flat_w_scale,
+                    shared_w2,
+                    shared_w2_scale,
                     sorted_token_ids,
                     sorted_expert_ids,
                     sw_arg,
@@ -763,6 +818,7 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                shared_expert_id=shared_expert_id,
             )
             _run_compiled(exe, args)
 

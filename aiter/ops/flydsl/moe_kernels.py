@@ -355,6 +355,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    shared_expert_id: int = -1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype in ("fp4", "fp8"):
@@ -386,6 +387,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
+            shared_expert_id=shared_expert_id,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -439,6 +441,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    shared_expert_id: int = -1,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype in ("fp4", "fp8"):
@@ -472,6 +475,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            shared_expert_id=shared_expert_id,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -532,6 +536,8 @@ def _s1_args_fp4(
     w,
     a_scale,
     w_scale,
+    shared_w,
+    shared_w_scale,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -555,6 +561,8 @@ def _s1_args_fp4(
         _ptr_view_safe(w),
         _ptr_view_safe(a_scale),
         _ptr_view_safe(w_scale),
+        _ptr_view_safe(shared_w),
+        _ptr_view_safe(shared_w_scale),
         _ptr_view_safe(sorted_ids),
         _ptr_view_safe(sorted_expert_ids),
         _ptr_view_safe(sorted_weights),
@@ -611,6 +619,8 @@ def _s2_args_fp4(
     w,
     a_scale,
     w_scale,
+    shared_w,
+    shared_w_scale,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -636,6 +646,8 @@ def _s2_args_fp4(
         _ptr_view_safe(w),
         _ptr_view_safe(a_scale),
         _ptr_view_safe(w_scale),
+        _ptr_view_safe(shared_w),
+        _ptr_view_safe(shared_w_scale),
         _ptr_view_safe(sorted_ids),
         _ptr_view_safe(sorted_expert_ids),
         _ptr_view_safe(sorted_weights),
@@ -858,6 +870,9 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    shared_w1: Optional[torch.Tensor] = None,
+    shared_w1_scale: Optional[torch.Tensor] = None,
+    shared_expert_id: int = -1,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -935,6 +950,10 @@ def flydsl_moe_stage1(
     flat_w_scale = (
         w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
     )
+    flat_shared_w = shared_w1.view(-1) if shared_w1 is not None else w1.view(-1)
+    flat_shared_w_scale = (
+        shared_w1_scale.view(-1) if shared_w1_scale is not None else flat_w_scale
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -987,6 +1006,8 @@ def flydsl_moe_stage1(
             w1.view(-1),
             flat_a_scale,
             flat_w_scale,
+            flat_shared_w,
+            flat_shared_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1045,6 +1066,7 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
+        shared_expert_id=shared_expert_id,
     )
     _run_compiled(exe, args)
 
@@ -1209,6 +1231,9 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
+    shared_w2: Optional[torch.Tensor] = None,
+    shared_w2_scale: Optional[torch.Tensor] = None,
+    shared_expert_id: int = -1,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1277,6 +1302,10 @@ def flydsl_moe_stage2(
     flat_w_scale = (
         w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
     )
+    flat_shared_w = shared_w2.view(-1) if shared_w2 is not None else w2.view(-1)
+    flat_shared_w_scale = (
+        shared_w2_scale.view(-1) if shared_w2_scale is not None else flat_w_scale
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1324,6 +1353,8 @@ def flydsl_moe_stage2(
             w2,
             flat_a_scale,
             flat_w_scale,
+            flat_shared_w,
+            flat_shared_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1375,6 +1406,7 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        shared_expert_id=shared_expert_id,
     )
     _run_compiled(exe, args)
 

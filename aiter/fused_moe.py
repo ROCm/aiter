@@ -378,6 +378,11 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    shared_w1: Optional[torch.Tensor] = None,
+    shared_w2: Optional[torch.Tensor] = None,
+    shared_w1_scale: Optional[torch.Tensor] = None,
+    shared_w2_scale: Optional[torch.Tensor] = None,
+    shared_expert_id: int = -1,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -405,6 +410,11 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        shared_w1=shared_w1,
+        shared_w2=shared_w2,
+        shared_w1_scale=shared_w1_scale,
+        shared_w2_scale=shared_w2_scale,
+        shared_expert_id=shared_expert_id,
     )
 
 
@@ -434,6 +444,11 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    shared_w1: Optional[torch.Tensor] = None,
+    shared_w2: Optional[torch.Tensor] = None,
+    shared_w1_scale: Optional[torch.Tensor] = None,
+    shared_w2_scale: Optional[torch.Tensor] = None,
+    shared_expert_id: int = -1,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -470,6 +485,11 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    shared_w1: Optional[torch.Tensor] = None,
+    shared_w2: Optional[torch.Tensor] = None,
+    shared_w1_scale: Optional[torch.Tensor] = None,
+    shared_w2_scale: Optional[torch.Tensor] = None,
+    shared_expert_id: int = -1,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -480,6 +500,129 @@ def fused_moe_(
     """user API"""
     M, topk = topk_ids.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+
+    shared_args = (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
+    has_shared_expert = all(arg is not None for arg in shared_args)
+    if any(arg is not None for arg in shared_args) != has_shared_expert:
+        raise ValueError(
+            "shared_w1, shared_w2, shared_w1_scale, and shared_w2_scale "
+            "must be provided together"
+        )
+    if not has_shared_expert and shared_expert_id != -1:
+        raise ValueError(
+            "shared_expert_id requires shared_w1, shared_w2, and their scales"
+        )
+    if has_shared_expert:
+        if get_gfx() != "gfx950":
+            raise NotImplementedError(
+                "Heterogeneous MXFP4/FP8 experts currently require gfx950"
+            )
+        if quant_type != QuantType.per_1x32:
+            raise ValueError(
+                "Heterogeneous MXFP4/FP8 experts require per_1x32 quantization"
+            )
+        if activation != ActivationType.Silu:
+            raise ValueError("Heterogeneous MXFP4/FP8 experts currently require SiLU")
+        if gate_mode not in (GateMode.INTERLEAVE, GateMode.SEPARATED):
+            raise ValueError(
+                "Heterogeneous MXFP4/FP8 experts require interleaved or "
+                "separated gate/up weights"
+            )
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "Heterogeneous MXFP4/FP8 experts do not yet support expert masks"
+            )
+        if bias1 is not None or bias2 is not None:
+            raise NotImplementedError(
+                "Heterogeneous MXFP4/FP8 experts do not support expert biases"
+            )
+        if shared_expert_id != E - 1:
+            raise ValueError(
+                "The heterogeneous FlyDSL path requires a dummy final routed "
+                f"weight row and shared_expert_id == E - 1; got {shared_expert_id=} "
+                f"and E={E}"
+            )
+        if w1.dtype != dtypes.fp4x2 or w2.dtype != dtypes.fp4x2:
+            raise ValueError("Heterogeneous routed weights must use MXFP4")
+        if w1.shape[1] != 2 * inter_dim:
+            raise ValueError(
+                "Heterogeneous MXFP4/FP8 experts require gate and up projections"
+            )
+        if shared_w1.dtype != dtypes.fp8 or shared_w2.dtype != dtypes.fp8:
+            raise ValueError("Heterogeneous shared weights must use FP8 E4M3")
+        if shared_w1.shape != (1, w1.shape[1], model_dim):
+            raise ValueError(
+                f"Expected shared_w1 shape {(1, w1.shape[1], model_dim)}, "
+                f"got {tuple(shared_w1.shape)}"
+            )
+        if shared_w2.shape != (1, model_dim, inter_dim):
+            raise ValueError(
+                f"Expected shared_w2 shape {(1, model_dim, inter_dim)}, "
+                f"got {tuple(shared_w2.shape)}"
+            )
+        scale_dtypes = (dtypes.fp8_e8m0, torch.uint8)
+        scale_tensors = (w1_scale, w2_scale, shared_w1_scale, shared_w2_scale)
+        if any(
+            scale is None or scale.dtype not in scale_dtypes for scale in scale_tensors
+        ):
+            raise ValueError(
+                "Heterogeneous routed/shared scales must use FP8 E8M0 or raw "
+                "uint8 E8M0 storage"
+            )
+
+        stage1_scale_shape = (
+            ((2 * inter_dim + 255) // 256) * 256,
+            ((model_dim // 32 + 7) // 8) * 8,
+        )
+        stage2_scale_k = ((inter_dim + 255) // 256) * 256
+        stage2_scale_shape = (
+            ((model_dim + 255) // 256) * 256,
+            ((stage2_scale_k // 32 + 7) // 8) * 8,
+        )
+        if tuple(shared_w1_scale.shape) != stage1_scale_shape:
+            raise ValueError(
+                f"Expected preshuffled shared_w1_scale shape {stage1_scale_shape}, "
+                f"got {tuple(shared_w1_scale.shape)}"
+            )
+        if tuple(shared_w2_scale.shape) != stage2_scale_shape:
+            raise ValueError(
+                f"Expected preshuffled shared_w2_scale shape {stage2_scale_shape}, "
+                f"got {tuple(shared_w2_scale.shape)}"
+            )
+        expected_w1_scale_numel = E * 2 * inter_dim * (model_dim // 32)
+        expected_w2_scale_numel = E * model_dim * (stage2_scale_k // 32)
+        if w1_scale.numel() != expected_w1_scale_numel:
+            raise ValueError(
+                "Expected preshuffled routed w1_scale to contain "
+                f"{expected_w1_scale_numel} elements, got {w1_scale.numel()}"
+            )
+        if w2_scale.numel() != expected_w2_scale_numel:
+            raise ValueError(
+                "Expected preshuffled routed w2_scale to contain "
+                f"{expected_w2_scale_numel} elements, got {w2_scale.numel()}"
+            )
+
+        heterogeneous_tensors = (
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w2,
+            shared_w1_scale,
+            shared_w2_scale,
+        )
+        if any(
+            tensor.device != hidden_states.device for tensor in heterogeneous_tensors
+        ):
+            raise ValueError(
+                "Heterogeneous routed/shared weights and scales must be on the "
+                "hidden-state device"
+            )
+        if any(not tensor.is_contiguous() for tensor in heterogeneous_tensors):
+            raise ValueError(
+                "Heterogeneous routed/shared weights and scales must be contiguous"
+            )
 
     assert w1.shape[1] in [
         inter_dim,
@@ -525,6 +668,8 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    if has_shared_expert:
+        q_dtype_a = dtypes.fp8 if gate_mode == GateMode.INTERLEAVE else dtypes.fp4x2
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -544,6 +689,18 @@ def fused_moe_(
         gate_mode,
         is_ep=expert_mask is not None,
     )
+
+    if has_shared_expert:
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+        if (
+            metadata.run_1stage
+            or stage1_func is not _flydsl_stage1_wrapper
+            or stage2_func is not _flydsl_stage2_wrapper
+        ):
+            raise NotImplementedError(
+                "Heterogeneous MXFP4/FP8 experts require the two-stage FlyDSL path"
+            )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -686,6 +843,11 @@ def fused_moe_(
             expert_mask=expert_mask,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
+            shared_w1=shared_w1,
+            shared_w2=shared_w2,
+            shared_w1_scale=shared_w1_scale,
+            shared_w2_scale=shared_w2_scale,
+            shared_expert_id=shared_expert_id,
         )
 
 
@@ -1013,6 +1175,9 @@ def _flydsl_stage1_wrapper(
     swiglu_limit: float = 0.0,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    shared_w1=None,
+    shared_w1_scale=None,
+    shared_expert_id: int = -1,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1053,6 +1218,9 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        shared_w1=shared_w1,
+        shared_w1_scale=shared_w1_scale,
+        shared_expert_id=shared_expert_id,
     )
 
 
@@ -1074,6 +1242,9 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    shared_w2=None,
+    shared_w2_scale=None,
+    shared_expert_id: int = -1,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1122,6 +1293,9 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        shared_w2=shared_w2,
+        shared_w2_scale=shared_w2_scale,
+        shared_expert_id=shared_expert_id,
     )
 
 
@@ -2263,6 +2437,11 @@ def fused_moe_2stages(
     expert_mask=None,
     m_indices=None,
     reverse_sorted=None,
+    shared_w1=None,
+    shared_w2=None,
+    shared_w1_scale=None,
+    shared_w2_scale=None,
+    shared_expert_id: int = -1,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2392,6 +2571,17 @@ def fused_moe_2stages(
         )
     extra_stage1_args = {}
     extra_stage2_args = {}
+    if shared_w1 is not None:
+        extra_stage1_args.update(
+            shared_w1=shared_w1,
+            shared_w1_scale=shared_w1_scale,
+            shared_expert_id=shared_expert_id,
+        )
+        extra_stage2_args.update(
+            shared_w2=shared_w2,
+            shared_w2_scale=shared_w2_scale,
+            shared_expert_id=shared_expert_id,
+        )
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
