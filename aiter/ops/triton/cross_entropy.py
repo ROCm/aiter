@@ -26,6 +26,7 @@ from aiter.ops.triton._triton_kernels.cross_entropy import (
 
 __all__ = [
     "cross_entropy_forward",
+    "cross_entropy_forward_chunked",
     "cross_entropy_backward",
 ]
 
@@ -98,6 +99,96 @@ def cross_entropy_forward(
     )
 
     loss = loss_1d.reshape(B, SQ) if not reduce_loss else (loss_1d.sum() / n_rows)
+    return loss, _input
+
+
+def cross_entropy_forward_chunked(
+    _input: torch.Tensor,
+    target: torch.Tensor,
+    label_smoothing: float,
+    reduce_loss: bool,
+    dist_group: Union[dist.ProcessGroup, None],
+    ignore_idx: int,
+    chunk_rows: int,
+):
+    """Chunked vocab-parallel cross-entropy forward.
+
+    Splits the row dimension (B*SQ) into chunks of ``chunk_rows`` and
+    processes each independently: online_softmax → allgather → ce_kernel.
+    Peak activation memory is proportional to ``chunk_rows * V_local``
+    rather than ``B*SQ * V_local``.
+
+    The gradient is written in-place into ``_input`` exactly as in the
+    non-chunked path.  The caller must ensure ``_input`` is contiguous.
+
+    Args:
+        _input:    Logit shard ``[B, SQ, V_local]`` — modified in-place.
+        target:    Label indices ``[B, SQ]`` (global vocab ids).
+        chunk_rows: Number of rows per chunk.  Must be >= 1.
+        (other args: same semantics as :func:`cross_entropy_forward`)
+
+    Returns:
+        ``(loss, _input)`` where *loss* is ``[B, SQ]`` or a scalar.
+    """
+    B, SQ, V = _input.shape
+    n_rows = B * SQ
+
+    # Flatten to 2-D views so we can slice by row without copying.
+    input_2d = _input.reshape(n_rows, V)      # view, no alloc
+    target_1d = target.reshape(n_rows)         # view, no alloc
+    loss_1d = torch.empty(n_rows, dtype=torch.float32, device=_input.device)
+
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+    world_size = 1 if dist_group is None else dist.get_world_size(dist_group)
+    rank = 0 if dist_group is None else dist.get_rank(dist_group)
+
+    # Allocate scratch buffers once at max chunk size to avoid per-chunk alloc.
+    m_d_Xy = torch.empty(chunk_rows * 3, dtype=torch.float32, device=_input.device)
+    gathered_buf = (
+        torch.empty(chunk_rows * 3 * world_size, dtype=torch.float32, device=_input.device)
+        if world_size > 1
+        else None
+    )
+
+    row = 0
+    while row < n_rows:
+        rows_this = min(chunk_rows, n_rows - row)
+        chunk_x = input_2d[row : row + rows_this]      # view [rows_this, V]
+        chunk_y = target_1d[row : row + rows_this]     # view [rows_this]
+        chunk_loss = loss_1d[row : row + rows_this]    # view [rows_this]
+        m_d_Xy_chunk = m_d_Xy[: rows_this * 3]
+
+        online_softmax_kernel[(rows_this,)](
+            chunk_x, chunk_x.stride(0),
+            chunk_y, chunk_y.stride(0),
+            m_d_Xy_chunk, 1,  # stride=1: (m,d,Xy) packed per row
+            rank, V,
+            BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+        )
+
+        if world_size > 1:
+            gathered = gathered_buf[: rows_this * 3 * world_size]
+            dist.all_gather_into_tensor(gathered, m_d_Xy_chunk, group=dist_group)
+        else:
+            gathered = m_d_Xy_chunk
+
+        cross_entropy_kernel[(rows_this,)](
+            chunk_x, chunk_x.stride(0),
+            chunk_y, chunk_y.stride(0),
+            chunk_loss, chunk_loss.stride(0),
+            gathered, 1,  # stride=1: same packed layout
+            rank, world_size, ignore_idx, V, rows_this,
+            reduce_loss=False,  # accumulate manually after loop
+            label_smoothing=label_smoothing,
+            BLOCK_SIZE=BLOCK_SIZE, num_warps=NUM_WARPS,
+        )
+
+        row += rows_this
+
+    if reduce_loss:
+        loss = loss_1d.sum() / n_rows
+    else:
+        loss = loss_1d.reshape(B, SQ)
     return loss, _input
 
 

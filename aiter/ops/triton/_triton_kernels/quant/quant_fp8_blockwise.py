@@ -224,3 +224,55 @@ def quant_fp8_blockwise_for_act_grad_kernel(
         x_scales_tile_col_inv,
         mask=offs_n < N,
     )
+
+
+# Re-quantize FP8 (row-wise 1×BLOCK) → FP8 (col-wise BLOCK×1) in one pass.
+# Avoids a BF16 roundtrip: dequant with saved row scales, then re-quant along the
+# column axis.  Used in the blockwise2d WGrad backward (Jet-RL §4.2) where the
+# forward activation was stored as FP8 (1×128) and WGrad needs it col-wise (128×1).
+#
+# x_fp8_ptr    [M, K]              FP8 input, row-wise 1×BLOCK quantized
+# x_scales_ptr [M, K//BLOCK_SIZE]  float32 dequant row scales
+# y_fp8_ptr    [M, K]              FP8 output, col-wise BLOCK×1 quantized
+# y_scales_ptr [M//BLOCK_SIZE, K]  float32 dequant col scales
+@triton.jit
+def requant_fp8_row_to_col_kernel(
+    x_fp8_ptr,
+    x_scales_ptr,
+    y_fp8_ptr,
+    y_scales_ptr,
+    M,
+    K,
+    BLOCK_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    offs_m = tl.cast(pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    offs_k = tl.cast(pid_k * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE), tl.int64)
+    mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+
+    # Load FP8 tile and dequant to float32 using saved row scales.
+    # Row scale index: each row has K//BLOCK_SIZE scales; tile (pid_m, pid_k) reads
+    # one scale per row — the scale for the pid_k-th block along K.
+    x_fp8_tile = tl.load(x_fp8_ptr + offs_m[:, None] * K + offs_k[None, :],
+                         mask=mask, other=0.0)
+    x_f32 = x_fp8_tile.to(tl.float32)
+
+    row_scale_offs = offs_m * tl.cdiv(K, BLOCK_SIZE) + pid_k
+    row_scales = tl.load(x_scales_ptr + row_scale_offs, mask=offs_m < M, other=1.0)
+    x_f32 = x_f32 * row_scales[:, None]   # broadcast: (BLOCK,1) * (BLOCK, BLOCK)
+
+    # Col-wise (axis=0) requant: one scale per column in this tile.
+    x_abs = tl.abs(x_f32)
+    col_amax = tl.max(x_abs, axis=0, keep_dims=True)   # (1, BLOCK)
+    col_amax = tl.maximum(col_amax, 1e-4)
+    col_scale = FP8_MAX / col_amax
+    y_f32 = tl.clamp(x_f32 * col_scale, min=-FP8_MAX, max=FP8_MAX)
+
+    tl.store(y_fp8_ptr + offs_m[:, None] * K + offs_k[None, :],
+             y_f32.to(y_fp8_ptr.dtype.element_ty), mask=mask)
+
+    # Col dequant scales: shape (M//BLOCK_SIZE, K), one float per column element.
+    col_scale_inv = tl.reshape(1.0 / col_scale, BLOCK_SIZE)   # (BLOCK,) dequant per col
+    tl.store(y_scales_ptr + pid_m * K + offs_k, col_scale_inv, mask=offs_k < K)
