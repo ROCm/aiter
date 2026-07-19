@@ -4,6 +4,13 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
+
+@triton.jit
+def _quantize_v(v, v_scales, output_dtype: tl.constexpr):
+    safe_scales = tl.where(v_scales == 0, 1.0, v_scales)
+    return (v / safe_scales).to(output_dtype)
+
+
 ################# Sage V2 quantization kernels ####################
 
 
@@ -166,8 +173,7 @@ def sage_quant_v_kernel(
     v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
     v = v.to(tl.float32)
     v_scales = tl.load(v_scale_ptrs)
-    v_quant = v / v_scales
-    v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+    v_quant = _quantize_v(v, v_scales, v_output_ptrs.dtype.element_ty)
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
@@ -1036,8 +1042,7 @@ def sage_quant_kernel(
         v = tl.load(v_input_ptrs, mask=offs_kn[:, None] < SEQLEN_K, other=0.0)
         v = v.to(tl.float32)
         v_scales = tl.load(v_scale_ptrs)
-        v_quant = v / v_scales
-        v_quant = v_quant.to(v_output_ptrs.dtype.element_ty)
+        v_quant = _quantize_v(v, v_scales, v_output_ptrs.dtype.element_ty)
         tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
