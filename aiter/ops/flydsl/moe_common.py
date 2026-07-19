@@ -1,9 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Common types shared across MoE FlyDSL kernel modules."""
+"""Common helpers and types shared across MoE FlyDSL kernel modules."""
 
 from enum import Enum
+
+
+def xcd_swizzle_workgroup_id(linear_id, num_workgroups, num_xcds, divide, minimum):
+    """Map round-robin workgroup IDs into balanced contiguous XCD ranges."""
+    workgroups_per_xcd = divide(num_workgroups, num_xcds)
+    remainder = num_workgroups % num_xcds
+    xcd_id = linear_id % num_xcds
+    local_id = divide(linear_id, num_xcds)
+    return xcd_id * workgroups_per_xcd + minimum(xcd_id, remainder) + local_id
 
 
 class GateMode(str, Enum):
