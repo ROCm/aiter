@@ -231,6 +231,7 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
+    prefill_ref_token_cap = 512 * 1024
     # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
     # (1M+) never trigger the O(N^2) ref.
@@ -238,6 +239,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
@@ -333,6 +335,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm

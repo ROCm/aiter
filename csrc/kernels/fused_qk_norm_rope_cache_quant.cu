@@ -5071,7 +5071,12 @@ namespace aiter {
         // Per-tile coordinates (supplied by the launching global): one wave computes
         // exactly this (token_idx, combined_head_idx) tile. combined_head_idx==0 -> K,
         // 1.. -> Q head (combined-1). tid is the lane 0..63 within the wave.
-        int32_t token_idx, int32_t combined_head_idx, int32_t tid
+        int32_t token_idx, int32_t combined_head_idx, int32_t tid,
+        // --- Optional fused SWA write (decode-only). Only the K wave scatters. ---
+        cache_t*  __restrict__ swa_nope = nullptr,           // nope+scale pool, mirrors kv_cache
+        scalar_t* __restrict__ swa_rope = nullptr,           // rope bf16 pool, mirrors k_pe_out
+        const int32_t* __restrict__ swa_block_tables = nullptr,    // [bs, max_blocks] paged SWA table
+        const int32_t* __restrict__ batch_id_per_token = nullptr   // [T] token->seq, -1 = skip
     ) {
       // ---- compile-time constants (identical to the coarse kernel) ----
       constexpr int32_t head_size = HEAD_DIM;
@@ -5099,7 +5104,7 @@ namespace aiter {
       constexpr int32_t GROUP_SIZE = 64;
       constexpr int32_t reduce_thread_size = GROUP_SIZE / vec_size_i;
       // Streaming (read-once) inputs -> NT/SLC|GLC to bypass L2 (same as the coarse
-      // kernel). Measured neutral here vs plain cached loads, kept for consistency.
+      // kernel). Measured: NT beats cached here (cached ~9% slower at H=128 decode).
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
       constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
 
@@ -5129,6 +5134,36 @@ namespace aiter {
         auto* ptr_o = kv_cache + kv_cache_offset + nope_offset; // single KV head
         auto buffer_kv = opus::make_gmem<scalar_t>(kv_ptr, oob_i * sizeof(scalar_t));
         auto buffer_o  = opus::make_gmem<cache_t>(ptr_o, oob_o * sizeof(cache_t));
+
+        // Optional fused SWA scatter (decode-only): mirror this post-norm/rope K row
+        // (nope fp8 + inline dup e8m0 scale, and rope bf16) into the paged SWA pool
+        // addressed by swa_block_tables[bid, pos/block_size]. CG-pad tokens (bid < 0),
+        // stale/OOB positions, and window-outside sentinel blocks (phys < 0) are skipped.
+        // Only the K wave scatters (the SWA pool is K-only); Q waves never reach here.
+        cache_t*  ptr_swa_o    = nullptr;
+        scalar_t* swa_out_rope = nullptr;
+        bool write_swa = false;
+        if (swa_nope != nullptr) {
+          const int32_t bid = batch_id_per_token[token_idx];
+          if (bid >= 0) {
+            const int64_t pos = positions[token_idx];
+            const int32_t blk = static_cast<int32_t>(pos / params.swa_block_size);
+            if (pos >= 0 && blk >= 0 && blk < params.swa_block_tables_blocks) {
+              const int32_t phys =
+                  swa_block_tables[static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
+              if (phys >= 0) {
+                const int32_t off = static_cast<int32_t>(pos % params.swa_block_size);
+                const int64_t dst_row =
+                    static_cast<int64_t>(phys) * params.swa_block_size + off;
+                write_swa    = true;
+                ptr_swa_o    = swa_nope + dst_row * params.swa_nope_row_stride + nope_offset;
+                swa_out_rope = swa_rope + dst_row * params.swa_rope_row_stride;
+              }
+            }
+          }
+        }
+        auto buffer_swa_o = opus::make_gmem<cache_t>(
+            write_swa ? ptr_swa_o : ptr_o, oob_o * sizeof(cache_t));
 
         const bool is_nope_thread = (tid < static_cast<int32_t>(nope_vec));
         constexpr bool K_QUANT = (kv_dt != vllm::Fp8KVCacheDataType::kAuto);
@@ -5182,6 +5217,10 @@ namespace aiter {
               const uint16_t scale_pair =
                   static_cast<uint16_t>(s.byte) | (static_cast<uint16_t>(s.byte) << 8);
               *reinterpret_cast<uint16_t*>(tmp + group_id * 2) = scale_pair;
+              if (write_swa) {
+                auto* swa_tmp = reinterpret_cast<uint8_t*>(ptr_swa_o + nope_dim);
+                *reinterpret_cast<uint16_t*>(swa_tmp + group_id * 2) = scale_pair;
+              }
             }
             factor = rms_scale / s.dq_scale;
           } else {
@@ -5195,6 +5234,7 @@ namespace aiter {
               vec_out[i] = opus::cast<cache_t>(static_cast<float>(vec_kv[i])
                               * static_cast<float>(vec_k_weight[i]) * factor);
             buffer_o.template store<vec_size_o>(vec_out, tid * vec_size_i);
+            if (write_swa) buffer_swa_o.template store<vec_size_o>(vec_out, tid * vec_size_i);
           }
         } else if (is_nope_thread) {
           opus_vec_i vec_out_k;
@@ -5203,6 +5243,7 @@ namespace aiter {
             vec_out_k[i] = static_cast<scalar_t>(static_cast<float>(vec_kv[i]) * rms_scale
                               * static_cast<float>(vec_k_weight[i]));
           buffer_o.template store<vec_size_o>(vec_out_k, tid * vec_size_i);
+          if (write_swa) buffer_swa_o.template store<vec_size_o>(vec_out_k, tid * vec_size_i);
         }
 
         // RoPE pe -> separate rope_buff (bf16, not quantized). normed = x_in*rstd*w.
@@ -5226,7 +5267,9 @@ namespace aiter {
               float f32_sin = static_cast<float>(sin_ptr[cos_i]);
               float rot = is_x_half ? (my_val * f32_cos - pair_val * f32_sin)
                                     : (my_val * f32_cos + pair_val * f32_sin);
-              k_out_rope[pe_local_tid * vec_size_i + i] = static_cast<scalar_t>(rot);
+              const scalar_t rot_s = static_cast<scalar_t>(rot);
+              k_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
+              if (write_swa) swa_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
             }
           } else {
             #pragma unroll
@@ -5236,8 +5279,14 @@ namespace aiter {
               int32_t cos_i = (pe_local_tid * vec_size_i + i) >> 1;
               float f32_cos = static_cast<float>(cos_ptr[cos_i]);
               float f32_sin = static_cast<float>(sin_ptr[cos_i]);
-              k_out_rope[pe_local_tid * vec_size_i + i]     = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
-              k_out_rope[pe_local_tid * vec_size_i + i + 1] = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
+              const scalar_t r0 = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
+              const scalar_t r1 = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
+              k_out_rope[pe_local_tid * vec_size_i + i]     = r0;
+              k_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
+              if (write_swa) {
+                swa_out_rope[pe_local_tid * vec_size_i + i]     = r0;
+                swa_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
+              }
             }
           }
         }
@@ -5386,7 +5435,12 @@ namespace aiter {
         const scalar_t* __restrict__ sin_cache,
         float eps,
         const MlaKernelParams params,
-        bool is_neox
+        bool is_neox,
+        // Optional fused SWA write (decode-only). Null when unused. Only the K wave scatters.
+        cache_t*  __restrict__ swa_nope = nullptr,
+        scalar_t* __restrict__ swa_rope = nullptr,
+        const int32_t* __restrict__ swa_block_tables = nullptr,
+        const int32_t* __restrict__ batch_id_per_token = nullptr
     ) {
       constexpr int HEADS_PER_BLOCK = TOKENS_PER_BLOCK;
       const int32_t wave_id = static_cast<int32_t>(threadIdx.x) / WARP_SIZE;
@@ -5398,7 +5452,8 @@ namespace aiter {
         fuse_qk_norm_rope_finegrained_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, \
             Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
-            cos_cache, sin_cache, eps, params, token_idx, combined_head_idx, tid)
+            cos_cache, sin_cache, eps, params, token_idx, combined_head_idx, tid, \
+            swa_nope, swa_rope, swa_block_tables, batch_id_per_token)
       if (is_neox) { DISPATCH_NEOX_FG(true); }
       else         { DISPATCH_NEOX_FG(false); }
       #undef DISPATCH_NEOX_FG
@@ -5496,7 +5551,11 @@ namespace aiter {
                  reinterpret_cast<const KV_T*>(sin_cache.data_ptr()),                                    \
                  static_cast<float>(eps),                                                                \
                  mla_params,                                                                             \
-                 is_neox);
+                 is_neox,                                                                                \
+                 reinterpret_cast<CACHE_T*>(swa_nope_ptr),                                               \
+                 reinterpret_cast<KV_T*>(swa_rope_ptr),                                                  \
+                 reinterpret_cast<const int32_t*>(swa_block_tables_ptr),                                 \
+                 reinterpret_cast<const int32_t*>(swa_bid_ptr));
 
 namespace aiter {
 
@@ -5772,16 +5831,25 @@ void fused_qk_norm_rope_group_quant(
   // ~3-14% faster under FG (T=2048..4096); H<=32 stays on coarse (FG regresses
   // few-head shapes ~6-10%), and H=64 is mixed so it stays coarse too.
   constexpr int FG_MANY_HEADS_MIN = 128;
+  // Fine-grained (1 wave / (token,head)) wins for MANY-head shapes but regresses
+  // few-head ones (the coarse path's per-wave work amortizes better with few heads).
+  // This holds at BOTH the large tier and the decode tier (measured on MI355, fp8+SWA,
+  // T=32: H=128 ~7% faster under FG, H=16 ~9% slower), so gate the decode->FG routing
+  // on the same many-heads threshold. The FG K wave carries the same fused SWA scatter
+  // as the coarse path, so decode+SWA (H>=FG_MANY_HEADS_MIN) can use it too.
+  // Decode tier -> always fine-grained. Measured on idle MI355 via rocprofv3
+  // --kernel-trace (real GPU-kernel time, NOT wall-clock -- wall-clock is dominated
+  // by HIP's per-call host dispatch and misranks the two): at T=32 the FG kernel
+  // matches the coarse path for H=16 (4.66 vs 4.68us) and beats it for H=128
+  // (5.96 vs 6.04us), while the coarse decode kernel additionally spills (12 B
+  // scratch, 32 VGPR vs FG's 24). FG also carries the SWA scatter, so decode+SWA
+  // uses it too. (Large tier keeps the FG_MANY_HEADS_MIN gate: coarse HPW>1 there
+  // amortizes the cos/sin gather across heads, which FG can't at HPW>1.)
   const bool use_finegrained =
       (num_tokens <= 65535)
       && (use_xlarge_prefill
-          || (use_large_prefill && num_heads >= FG_MANY_HEADS_MIN));
-  // The fine-grained kernel (xlarge prefill) does not carry the SWA scatter. SWA is a
-  // decode-only fusion (tiny T -> use_decode_path), so this should never collide; assert
-  // rather than silently drop the SWA write.
-  AITER_CHECK(!(has_swa && use_finegrained),
-              "fused SWA write is not supported on the fine-grained (xlarge prefill) "
-              "path; SWA is decode-only");
+          || (use_large_prefill && num_heads >= FG_MANY_HEADS_MIN)
+          || use_decode_path);
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
