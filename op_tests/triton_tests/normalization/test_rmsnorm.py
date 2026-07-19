@@ -118,6 +118,10 @@ def get_vals():
         (71, 3571),
         (364800, 128),
         (16380, 1536),
+        # large-M / small-N backward specialization (Qwen3 per-head q/k norm:
+        # M = batch*seq*heads, N = head_dim)
+        (65536, 128),
+        (16384, 128),
         # (29, 17389), // Temporarily disable this test due to abort issues on CI
     ]
 
