@@ -61,9 +61,7 @@ AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
 # Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
 # JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
 # env var, e.g. Triton-backend users with no C++ toolchain or CK.
-AITER_TRITON_ONLY = (
-    os.getenv("AITER_TRITON_ONLY", "0") == "1"
-)
+AITER_TRITON_ONLY = os.getenv("AITER_TRITON_ONLY", "0") == "1"
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
 _flydsl_cache = os.path.join(os.path.dirname(__file__), "jit", "flydsl_cache")

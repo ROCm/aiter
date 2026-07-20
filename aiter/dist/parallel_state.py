@@ -33,6 +33,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+
 try:
     from torch.distributed import Backend, ProcessGroup
 except (ImportError, AttributeError):

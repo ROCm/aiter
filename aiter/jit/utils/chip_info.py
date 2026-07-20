@@ -28,6 +28,7 @@ def _resolve_gpu_info_tool() -> tuple:
     """
     if sys.platform == "win32":
         import sysconfig
+
         platlib = sysconfig.get_paths()["platlib"]
         hipinfo = os.path.join(platlib, "_rocm_sdk_core", "bin", "hipInfo.exe")
         if not os.path.isfile(hipinfo):
@@ -52,8 +53,12 @@ def _detect_native() -> list[str]:
             if match:
                 return [match.group(1).lower()]
     except Exception as e:
-        raise RuntimeError(f"Get GPU arch from {os.path.basename(gpu_info_tool)} failed: {e}") from e
-    raise RuntimeError(f"No gfx arch found in {os.path.basename(gpu_info_tool)} output.")
+        raise RuntimeError(
+            f"Get GPU arch from {os.path.basename(gpu_info_tool)} failed: {e}"
+        ) from e
+    raise RuntimeError(
+        f"No gfx arch found in {os.path.basename(gpu_info_tool)} output."
+    )
 
 
 @torch_compile_guard()
@@ -159,7 +164,8 @@ def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
-            rocminfo, _ = _resolve_gpu_info_tool()  # regex not needed here; each branch uses its own pattern
+            # regex not needed here; each branch uses its own pattern
+            rocminfo, _ = _resolve_gpu_info_tool()
             result = subprocess.run(
                 [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )

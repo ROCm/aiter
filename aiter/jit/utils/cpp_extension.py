@@ -100,9 +100,9 @@ def _get_hip_version_from_file() -> Optional[str]:
     """
     try:
         import sysconfig as _sc_hv
+
         _platlib = _sc_hv.get_paths()["platlib"]
-        _hip_ver_file = os.path.join(
-            _platlib, "_rocm_sdk_devel", "bin", ".hipVersion")
+        _hip_ver_file = os.path.join(_platlib, "_rocm_sdk_devel", "bin", ".hipVersion")
         if os.path.isfile(_hip_ver_file):
             with open(_hip_ver_file) as _f:
                 _major = _minor = None
@@ -120,14 +120,12 @@ def _get_hip_version_from_file() -> Optional[str]:
 
 def get_hip_version():
     if IS_WINDOWS:
-        import importlib.util
-        if importlib.util.find_spec("rocm_sdk_core") is None:
-            # rocm_sdk_core is absent (e.g. build-isolated env); hipconfig.exe
-            # would fail because it depends on it. Read .hipVersion directly.
-            ver = _get_hip_version_from_file()
-            if ver is not None:
-                return ver
-            raise RuntimeError("ROCm version file not found")
+        # In build-isolated environments rocm_sdk_core may be absent and
+        # hipconfig.exe unavailable. Try reading .hipVersion from the SDK
+        # first; if not found, fall through to the hipconfig path below.
+        ver = _get_hip_version_from_file()
+        if ver is not None:
+            return ver
     try:
         hipconfig = executable_path("hipconfig")
         output = subprocess.check_output([hipconfig, "--version"], text=True)
@@ -1567,7 +1565,7 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
     if with_cuda and IS_HIP_EXTENSION:
         if verbose:
             print("Detected CUDA files, patching ldflags", file=sys.stderr)
-    
+
         _rocm_lib = _join_rocm_home("lib").replace(os.sep, "/")
         extra_ldflags.append(f"-L{_rocm_lib}")
         extra_ldflags.append("-lamdhip64")
@@ -1589,6 +1587,7 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
 
         if IS_WINDOWS:
             from chip_info import _detect_native
+
             archs = _detect_native()
         else:
             archFlags = torch._C._cuda_getArchFlags()
@@ -1761,8 +1760,11 @@ def _write_ninja_file_to_build_library(
             # contains spaces, otherwise leave it bare.
             return f'"{p}"' if " " in p else p
         return shlex.quote(p)
+
     common_cflags += [f"-I{_format_include_path(include)}" for include in user_includes]
-    common_cflags += [f"-isystem {_format_include_path(include)}" for include in system_includes]
+    common_cflags += [
+        f"-isystem {_format_include_path(include)}" for include in system_includes
+    ]
 
     _fpic = [] if IS_WINDOWS else ["-fPIC"]
     cflags = common_cflags + _fpic + ["-std=c++20"] + extra_cflags
