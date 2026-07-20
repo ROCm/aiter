@@ -403,7 +403,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     else:
         block_n = 256
         block_k = 512
-        num_buffers = 3
+        num_buffers = 2
         num_warps = 4
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
