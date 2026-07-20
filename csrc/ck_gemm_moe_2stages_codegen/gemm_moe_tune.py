@@ -32,6 +32,7 @@ from aiter.fused_moe import (
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
+    parse_flydsl_v2_gemm2_kernel,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
@@ -5308,14 +5309,29 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
+        g2_bms = {v[0] for v in G2}
         cands = []
-        for bm in sorted({v[0] for v in G1} & {v[0] for v in G2}):
+        for bm in sorted({v[0] for v in G1}):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
-                for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                    cands.append(
-                        self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep))
-                    )
+                # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
+                if bm in g2_bms:
+                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                        cands.append(
+                            self._candidate_row(
+                                row, bm, kn1, self._g2_kname(bm, n2, ep)
+                            )
+                        )
+                # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
+                # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
+                # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
+                # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
+                for kn2v, kp in get_flydsl_stage2_v2_kernels(
+                    "fp4", "fp4", "bf16", bm
+                ).items():
+                    if kp["tile_m"] != bm:
+                        continue
+                    cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
     @staticmethod
@@ -5354,8 +5370,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
-        BM = _parse_mxfp4_g2_kname(kn2)["BM"]
-        atomic = _parse_mxfp4_g2_kname(kn2)["atomic"]
+        # Path B: kn2 may be a flydsl_moe2_layout v2 gemm2 name (mxmoe g1 front-end
+        # + v2 gemm2). Parse BM/atomic from whichever format applies.
+        _v2 = parse_flydsl_v2_gemm2_kernel(kn2)
+        if _v2 is not None:
+            BM = _v2["tile_m"]
+            atomic = _v2["epilog"] == "atomic"
+        else:
+            BM = _parse_mxfp4_g2_kname(kn2)["BM"]
+            atomic = _parse_mxfp4_g2_kname(kn2)["atomic"]
         BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
