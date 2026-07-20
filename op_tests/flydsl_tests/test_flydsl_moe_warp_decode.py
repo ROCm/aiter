@@ -40,6 +40,11 @@ try:
         compile_wd_moe_gate_finalize,
         compile_wd_moe_down_reduce,
     )
+    from aiter.ops.flydsl.warp_decode_moe import (
+        flydsl_wd_moe_gate_up,
+        flydsl_wd_moe_down_reduce,
+    )
+    _HAS_WRAPPERS = True
 except ImportError:
     import importlib.util
     import pathlib
@@ -55,6 +60,10 @@ except ImportError:
     compile_wd_moe_gate_up_splitk = _mod.compile_wd_moe_gate_up_splitk
     compile_wd_moe_gate_finalize = _mod.compile_wd_moe_gate_finalize
     compile_wd_moe_down_reduce = _mod.compile_wd_moe_down_reduce
+    # Wrappers may not be importable in fallback path; mark unavailable.
+    flydsl_wd_moe_gate_up = None
+    flydsl_wd_moe_down_reduce = None
+    _HAS_WRAPPERS = False
 
 
 # ---------------------------------------------------------------------------
@@ -1099,7 +1108,62 @@ def test_gate_up_splitk_f32path(shape_name, hidden, inter, topk, experts, k_batc
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# High-level wrapper smoke tests (gfx942 + gfx950)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAS_WRAPPERS, reason="warp_decode_moe wrappers not importable")
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", SHAPES)
+@pytest.mark.parametrize("B", [1, 2])
+def test_wrapper_gate_up_bf16(shape_name, hidden, inter, topk, experts, B):
+    """Smoke test for flydsl_wd_moe_gate_up — gfx942 + gfx950, bf16 fallback."""
+    torch.manual_seed(42)
+    x = torch.randn(B, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    w_gate = torch.randn(experts * inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    w_up = torch.randn(experts * inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    router_ids = torch.randint(0, experts, (B * topk,), dtype=torch.int32, device="cuda")
+
+    ref = _ref_gate_up(x, w_gate, w_up, router_ids, B, topk, inter)
+
+    # Force bf16 path so the test runs on both gfx942 and gfx950.
+    inter_out = flydsl_wd_moe_gate_up(
+        x, w_gate, w_up, router_ids,
+        B, topk, inter, hidden, experts,
+        w_dtype="bf16",
+    )
+    torch.cuda.synchronize()
+    _check(ref, inter_out.view(B * topk, inter), f"{shape_name} B={B} wrapper_gate_up")
+
+
+@pytest.mark.skipif(not _HAS_WRAPPERS, reason="warp_decode_moe wrappers not importable")
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", SHAPES)
+@pytest.mark.parametrize("B", [1, 2])
+def test_wrapper_down_reduce_bf16(shape_name, hidden, inter, topk, experts, B):
+    """Smoke test for flydsl_wd_moe_down_reduce — gfx942 + gfx950, bf16 fallback."""
+    torch.manual_seed(42)
+    inter_states = torch.randn(B * topk, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    w_down = torch.randn(experts * hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    router_ids = torch.randint(0, experts, (B * topk,), dtype=torch.int32, device="cuda")
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    router_wts = (
+        router_wts_raw.view(B, topk) / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    ref = _ref_down_reduce(inter_states, w_down, router_ids, router_wts, B, topk, inter, hidden)
+
+    y_out = flydsl_wd_moe_down_reduce(
+        inter_states, w_down, router_ids, router_wts,
+        B, topk, inter, hidden, experts,
+        w_dtype="bf16",
+    )
+    torch.cuda.synchronize()
+    _check(ref, y_out, f"{shape_name} B={B} wrapper_down_reduce", atol=0.01, rtol=0.05)
+
+
+# ---------------------------------------------------------------------------
 # Benchmark (not collected by pytest by default; run directly)
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
