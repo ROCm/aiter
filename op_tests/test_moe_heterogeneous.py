@@ -80,7 +80,7 @@ class _Weights:
 def _profile() -> _Profile:
     if os.environ.get("AITER_HETERO_MOE_DSV4", "0") == "1":
         return _Profile(7168, 512, 384, 385, 6)
-    return _Profile(256, 128, 128, 9, 2)
+    return _Profile(256, 256, 256, 9, 2)
 
 
 def _m_values() -> list[int]:
@@ -214,21 +214,15 @@ def _make_shared_weights(
 
     shared_w1, shared_s1 = _shuffle_w1(padded_w1, padded_s1, interleave)
     shared_w2, shared_s2 = _shuffle_w2(padded_w2, padded_s2, interleave)
-    native_w1_shuf, native_s1_shuf = _shuffle_w1(
-        native_w1, native_s1.unsqueeze(0), interleave
-    )
-    native_w2_shuf, native_s2_shuf = _shuffle_w2(
-        native_w2, native_s2.unsqueeze(0), interleave
-    )
     return (
         shared_w1,
         shared_w2,
         shared_s1,
         shared_s2,
-        native_w1_shuf,
-        native_w2_shuf,
-        native_s1_shuf,
-        native_s2_shuf,
+        shared_w1,
+        shared_w2,
+        shared_s1,
+        shared_s2,
         native_w1,
         native_w2,
         native_s1,
@@ -496,7 +490,7 @@ def _run_composed_oracle(
     shared_weight = torch.ones((m, 1), dtype=dtypes.fp32, device=hidden.device)
     native_profile = _Profile(
         profile.hidden,
-        profile.logical_inter,
+        profile.inter,
         profile.logical_inter,
         1,
         1,
