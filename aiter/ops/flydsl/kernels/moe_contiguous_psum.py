@@ -288,11 +288,27 @@ def build_moe_contiguous_psum_remap_module():
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            m = ArithValue(route_max_m)
-            expert = ArithValue(arith.divui(row, m))
-            slot = row - expert * m
-            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
+            row_valid = arith.cmpi(
+                CmpIPredicate.sge, row, arith.constant(0, type=i32)
+            )
+            _if_row = scf.IfOp(row_valid)
+            with ir.InsertionPoint(_if_row.then_block):
+                m = ArithValue(route_max_m)
+                expert = ArithValue(arith.divui(row, m))
+                slot = row - expert * m
+                has_prev = arith.cmpi(
+                    CmpIPredicate.ugt, expert, arith.constant(0, type=i32)
+                )
+                start_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
+                with ir.InsertionPoint(start_if.then_block):
+                    prev = src[fx.Index(expert - arith.constant(1, type=i32))]
+                    scf.YieldOp([_raw(prev)])
+                with ir.InsertionPoint(start_if.else_block):
+                    scf.YieldOp([arith.constant(0, type=i32)])
+                buffer_ops.buffer_store(
+                    ArithValue(start_if.results[0]) + slot, rows_rsrc, route_i32
+                )
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit
@@ -423,24 +439,33 @@ def build_moe_route_psum_fused_module():
         with ir.InsertionPoint(route_loop.body):
             route_i32 = arith.index_cast(i32, route_loop.induction_variable)
             e = buffer_ops.buffer_load(topk_rsrc, route_i32, vec_width=1, dtype=i32)
-            e_idx = arith.index_cast(T.index, e)
-            addr = (
-                fx.Index(cnt_base_idx)
-                + fx.Index(cnt_off)
-                + fx.Index(e_idx) * fx.Index(4)
-            )
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                arith.constant(1, type=i32),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            ).result
-            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
-            buffer_ops.buffer_store(row, rows_rsrc, route_i32)
+            ge0 = arith.cmpi(CmpIPredicate.sge, e, arith.constant(0, type=i32))
+            ltE = arith.cmpi(CmpIPredicate.slt, e, ArithValue(experts))
+            valid_e = arith.andi(ge0, ltE)
+            _if_valid = scf.IfOp(valid_e, has_else=True)
+            with ir.InsertionPoint(_if_valid.then_block):
+                e_idx = arith.index_cast(T.index, e)
+                addr = (
+                    fx.Index(cnt_base_idx)
+                    + fx.Index(cnt_off)
+                    + fx.Index(e_idx) * fx.Index(4)
+                )
+                ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
+                ptr = ptr._value if hasattr(ptr, "_value") else ptr
+                slot = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    ptr,
+                    arith.constant(1, type=i32),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="workgroup",
+                    alignment=4,
+                ).result
+                row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+                buffer_ops.buffer_store(row, rows_rsrc, route_i32)
+                scf.YieldOp([])
+            with ir.InsertionPoint(_if_valid.else_block):
+                buffer_ops.buffer_store(arith.constant(-1, type=i32), rows_rsrc, route_i32)
+                scf.YieldOp([])
             scf.YieldOp([])
         gpu.barrier()
 
@@ -500,11 +525,27 @@ def build_moe_route_psum_fused_module():
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            m = ArithValue(max_m)
-            expert = ArithValue(arith.divui(row, m))
-            slot = row - expert * m
-            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
+            row_valid = arith.cmpi(
+                CmpIPredicate.sge, row, arith.constant(0, type=i32)
+            )
+            _if_row = scf.IfOp(row_valid)
+            with ir.InsertionPoint(_if_row.then_block):
+                m = ArithValue(max_m)
+                expert = ArithValue(arith.divui(row, m))
+                slot = row - expert * m
+                has_prev = arith.cmpi(
+                    CmpIPredicate.ugt, expert, arith.constant(0, type=i32)
+                )
+                start_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
+                with ir.InsertionPoint(start_if.then_block):
+                    prev = src[fx.Index(expert - arith.constant(1, type=i32))]
+                    scf.YieldOp([_raw(prev)])
+                with ir.InsertionPoint(start_if.else_block):
+                    scf.YieldOp([arith.constant(0, type=i32)])
+                buffer_ops.buffer_store(
+                    ArithValue(start_if.results[0]) + slot, rows_rsrc, route_i32
+                )
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit

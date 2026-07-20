@@ -42,9 +42,9 @@ nothing and need no branch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, vector
+from flydsl.expr import arith, ptrtoint, range_constexpr, vector
 from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
@@ -138,12 +138,15 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: Int32,
         slice_stride_dw: Int32,
+        num_grouped_rows: Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
 
         f32 = T.f32
         i32 = T.i32
+        c0_i32 = arith.constant(0, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
         vec_i32_ty = T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route
         # weights straight through (no pre-cast); bf16/f16 get extended below.
@@ -153,19 +156,32 @@ def build_moe_gather_reduce_module(
 
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
-        row_dwords_i32 = arith.constant(row_dwords, type=i32)
         vec_i32 = arith.constant(VEC, type=i32)
         num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
         slice_stride_dw_i32 = ArithValue(slice_stride_dw)
+        num_grouped_rows_i32 = ArithValue(num_grouped_rows)
 
         tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
-            in_rsrc = ptr_rsrc(grouped_out_flat)
             rows_rsrc = ptr_rsrc(topids_to_rows)
             w_rsrc = ptr_rsrc(gather_w)
             out_rsrc = ptr_rsrc(out)
+            in_base_i64 = arith.index_cast(T.i64, ptrtoint(grouped_out_flat))
+            row_bytes_i64 = arith.constant(model_dim * 2, type=T.i64)
+            slice_stride_by_i64 = arith.extui(
+                T.i64, slice_stride_dw_i32
+            ) * arith.constant(4, type=T.i64)
+
+            def src_row_rsrc(row_i32, sk):
+                base = in_base_i64 + arith.extui(T.i64, row_i32) * row_bytes_i64
+                if sk != 0:
+                    base = base + arith.constant(sk, type=T.i64) * slice_stride_by_i64
+                return buffer_ops.create_buffer_resource_from_addr(
+                    base, num_records_bytes=model_dim * 2
+                )
+
             thread_id = ArithValue(tid)
             iter_idx_i32 = ArithValue(fx.block_idx.y)
 
@@ -177,7 +193,7 @@ def build_moe_gather_reduce_module(
             def _load_row_weight(k):
                 """Load (source grouped row, route weight as f32) for slot k."""
                 map_off = map_base + arith.constant(k, type=i32)
-                row_i32 = ArithValue(
+                row_raw = ArithValue(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
                 # weight loaded in its native dtype; extend to f32 unless it is
@@ -190,6 +206,12 @@ def build_moe_gather_reduce_module(
                     if w_dtype == "f32"
                     else ArithValue(arith.extf(f32, w_loaded))
                 )
+                # Unsigned compare treats negative route rows as invalid too.
+                row_valid = arith.cmpi(
+                    CmpIPredicate.ult, row_raw, num_grouped_rows_i32
+                )
+                row_i32 = ArithValue(arith.select(row_valid, _raw(row_raw), c0_i32))
+                w_f32 = ArithValue(arith.select(row_valid, _raw(w_f32), c0_f32))
                 return row_i32, w_f32
 
             dw_base = thread_id * vec_i32 + iter_idx_i32 * arith.constant(
@@ -210,16 +232,14 @@ def build_moe_gather_reduce_module(
 
                     for k in range_constexpr(topk):
                         row_i32, w_f32 = _load_row_weight(k)
-                        src_dw_base = row_i32 * row_dwords_i32 + dw_base
                         red = [
                             ArithValue(arith.constant(0.0, type=f32))
                             for _ in range(2 * VEC)
                         ]
                         for sk in range_constexpr(split_k):
-                            sk_off = arith.constant(sk, type=i32) * slice_stride_dw_i32
                             raw_vec = buffer_ops.buffer_load(
-                                in_rsrc,
-                                src_dw_base + sk_off,
+                                src_row_rsrc(row_i32, sk),
+                                dw_base,
                                 vec_width=VEC,
                                 dtype=i32,
                             )
@@ -265,18 +285,13 @@ def build_moe_gather_reduce_module(
                             acc_hi = ArithValue(arith.constant(0.0, type=f32))
                             for k in range_constexpr(topk):
                                 row_i32, w_f32 = _load_row_weight(k)
-                                src_dw_base = row_i32 * row_dwords_i32 + dw_idx
                                 red_lo = ArithValue(arith.constant(0.0, type=f32))
                                 red_hi = ArithValue(arith.constant(0.0, type=f32))
                                 for sk in range_constexpr(split_k):
-                                    sk_off = (
-                                        arith.constant(sk, type=i32)
-                                        * slice_stride_dw_i32
-                                    )
                                     raw_dw = ArithValue(
                                         buffer_ops.buffer_load(
-                                            in_rsrc,
-                                            src_dw_base + sk_off,
+                                            src_row_rsrc(row_i32, sk),
+                                            dw_idx,
                                             vec_width=1,
                                             dtype=i32,
                                         )
@@ -308,6 +323,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
+        num_grouped_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -322,6 +338,7 @@ def build_moe_gather_reduce_module(
             out,
             num_tokens,
             slice_stride_dw,
+            num_grouped_rows,
         )
         launcher.launch(
             grid=(idx_tokens, n_iters, 1),
@@ -336,3 +353,187 @@ def build_moe_gather_reduce_module(
         },
     }
     return launch_moe_gather_reduce
+
+
+def build_moe_gather_reduce_row_module(
+    model_dim: int,
+    topk: int,
+    out_dtype: str = "bf16",
+    split_k: int = 1,
+    vec_dwords: int = 4,
+    w_dtype: str = "f32",
+):
+    """One CTA per token; loop over all column chunks inside the CTA."""
+    assert split_k == 1, "row-collapsed gather-reduce currently supports split_k=1"
+    assert model_dim % 2 == 0, "model_dim must be even (2 elems per dword)"
+    assert out_dtype in ("bf16", "f16")
+    assert w_dtype in ("f32", "bf16", "f16")
+    if vec_dwords not in (2, 4):
+        raise ValueError(f"vec_dwords must be 2 or 4, got {vec_dwords}")
+
+    VEC = int(vec_dwords)
+    out_dwords = model_dim // 2
+    DWORDS_PER_ITER = BLOCK_THREADS * VEC
+    n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
+    if out_dwords % VEC != 0:
+        raise ValueError("row-collapsed gather-reduce requires no scalar dword tail")
+
+    module_name = (
+        f"moe_gather_reduce_row_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}"
+        f"_v{VEC}_w{w_dtype}"
+    )
+
+    @flyc.kernel(name=module_name)
+    def moe_gather_reduce_row_kernel(
+        grouped_out_flat: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        out: fx.Pointer,
+        num_tokens: Int32,
+        slice_stride_dw: Int32,
+        num_grouped_rows: Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        f32 = T.f32
+        i32 = T.i32
+        c0_i32 = arith.constant(0, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+        vec_i32_ty = T.vec(VEC, i32)
+        w_dt = T.f32 if w_dtype == "f32" else (T.bf16 if w_dtype == "bf16" else T.f16)
+
+        out_dwords_i32 = arith.constant(out_dwords, type=i32)
+        topk_i32 = arith.constant(topk, type=i32)
+        vec_i32 = arith.constant(VEC, type=i32)
+        num_tokens_i32 = ArithValue(num_tokens)
+        bid_i32 = ArithValue(bid)
+        num_grouped_rows_i32 = ArithValue(num_grouped_rows)
+
+        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
+        _if_tok = scf.IfOp(tok_valid)
+        with ir.InsertionPoint(_if_tok.then_block):
+            rows_rsrc = ptr_rsrc(topids_to_rows)
+            w_rsrc = ptr_rsrc(gather_w)
+            out_rsrc = ptr_rsrc(out)
+            in_base_i64 = arith.index_cast(T.i64, ptrtoint(grouped_out_flat))
+            row_bytes_i64 = arith.constant(model_dim * 2, type=T.i64)
+
+            def src_row_rsrc(row_i32):
+                base = in_base_i64 + arith.extui(T.i64, row_i32) * row_bytes_i64
+                return buffer_ops.create_buffer_resource_from_addr(
+                    base, num_records_bytes=model_dim * 2
+                )
+
+            thread_id = ArithValue(tid)
+            map_base = bid_i32 * topk_i32
+            out_row_dw_base = bid_i32 * out_dwords_i32
+
+            def _load_row_weight(k):
+                map_off = map_base + arith.constant(k, type=i32)
+                row_raw = ArithValue(
+                    buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
+                )
+                w_loaded = buffer_ops.buffer_load(
+                    w_rsrc, map_off, vec_width=1, dtype=w_dt
+                )
+                w_f32 = (
+                    ArithValue(w_loaded)
+                    if w_dtype == "f32"
+                    else ArithValue(arith.extf(f32, w_loaded))
+                )
+                row_valid = arith.cmpi(
+                    CmpIPredicate.ult, row_raw, num_grouped_rows_i32
+                )
+                row_i32 = ArithValue(arith.select(row_valid, _raw(row_raw), c0_i32))
+                w_f32 = ArithValue(arith.select(row_valid, _raw(w_f32), c0_f32))
+                return row_i32, w_f32
+
+            route_pairs = ()
+            for k in range_constexpr(topk):
+                route_pairs = route_pairs + (_load_row_weight(k),)
+
+            for iter_idx in range_constexpr(n_iters):
+                dw_base = thread_id * vec_i32 + arith.constant(
+                    iter_idx * DWORDS_PER_ITER, type=i32
+                )
+                dw_valid = arith.cmpi(CmpIPredicate.ult, dw_base, out_dwords_i32)
+                _if_dw = scf.IfOp(dw_valid)
+                with ir.InsertionPoint(_if_dw.then_block):
+                    acc = [
+                        ArithValue(arith.constant(0.0, type=f32))
+                        for _ in range(2 * VEC)
+                    ]
+                    for row_i32, w_f32 in route_pairs:
+                        raw_vec = buffer_ops.buffer_load(
+                            src_row_rsrc(row_i32),
+                            dw_base,
+                            vec_width=VEC,
+                            dtype=i32,
+                        )
+                        for lane in range_constexpr(VEC):
+                            raw_dw = ArithValue(
+                                vector.extract(
+                                    raw_vec,
+                                    static_position=[lane],
+                                    dynamic_position=[],
+                                )
+                            )
+                            lo_f32, hi_f32 = _unpack_pair_to_f32(
+                                raw_dw, out_dtype, f32=f32, i32=i32
+                            )
+                            acc[2 * lane] = acc[2 * lane] + w_f32 * lo_f32
+                            acc[2 * lane + 1] = (
+                                acc[2 * lane + 1] + w_f32 * hi_f32
+                            )
+
+                    packed = [
+                        _pack_pair_from_f32(
+                            acc[2 * lane], acc[2 * lane + 1], out_dtype, i32=i32
+                        )
+                        for lane in range(VEC)
+                    ]
+                    out_vec = vector.from_elements(vec_i32_ty, packed)
+                    buffer_ops.buffer_store(
+                        out_vec, out_rsrc, out_row_dw_base + dw_base
+                    )
+                    scf.YieldOp([])
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_moe_gather_reduce_row(
+        grouped_out_flat: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        out: fx.Pointer,
+        num_tokens: fx.Int32,
+        slice_stride_dw: fx.Int32,
+        num_grouped_rows: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            pass
+
+        idx_tokens = arith.index_cast(T.index, num_tokens)
+        moe_gather_reduce_row_kernel(
+            grouped_out_flat,
+            topids_to_rows,
+            gather_w,
+            out,
+            num_tokens,
+            slice_stride_dw,
+            num_grouped_rows,
+        ).launch(
+            grid=(idx_tokens, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_moe_gather_reduce_row.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_moe_gather_reduce_row

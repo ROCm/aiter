@@ -274,16 +274,21 @@ def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     flat_e = topk_ids.reshape(-1).to(torch.long)
+    valid = (flat_e >= 0) & (flat_e < E)
+    safe_e = torch.where(valid, flat_e, torch.zeros_like(flat_e))
     # slot = number of earlier routes to the same expert (token-major order).
-    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
-    topids_to_rows = (flat_e * max_m + slot).to(torch.int32)
+    route_hot = F.one_hot(safe_e, E) * valid[:, None]
+    slot = route_hot.cumsum(0).gather(1, safe_e[:, None]).squeeze(1) - 1
+    topids_to_rows = torch.where(
+        valid, safe_e * max_m + slot, torch.full_like(flat_e, -1)
+    ).to(torch.int32)
     # Inverse map: grouped row -> source token (-1 for unused padding rows).
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
     src_tokens = torch.arange(
         token_num, device=device, dtype=torch.int32
     ).repeat_interleave(topk)
-    rows_to_tokens[topids_to_rows.to(torch.long)] = src_tokens
-    masked_m = torch.bincount(flat_e, minlength=E).to(torch.int32)
+    rows_to_tokens[topids_to_rows[valid].to(torch.long)] = src_tokens[valid]
+    masked_m = torch.bincount(safe_e[valid], minlength=E).to(torch.int32)
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
 
@@ -492,6 +497,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         tile_n = _as_int(cfg_row.get("tile_n"), tile_n)
         tile_k = _as_int(cfg_row.get("tile_k"), tile_k)
+        m_warp = _as_int(cfg_row.get("m_warp"), m_warp)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
         # stage2 buffer count; absent column -> keep None so it inherits num_buffers
@@ -595,9 +601,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and not torch.cuda.is_current_stream_capturing()
     )
 
-    if _grouped_sync_dbg:
-        if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-            raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = None
 
     if grouped_contiguous_m:
@@ -636,8 +639,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         return payload, scale_u8
 
     if _use_naive:
-        if counts is None:
-            counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
@@ -670,13 +671,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
         flat_tokens = flat_routes // topk
         flat_rows = topids_to_rows.reshape(-1).to(torch.long)
-        grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
+        valid_routes = flat_rows >= 0
+        grouped_a1.view(E * max_m, -1)[flat_rows[valid_routes]] = a1_payload[
+            flat_tokens[valid_routes]
+        ]
         if a1_scale_token_u8 is not None:
-            a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
+            a1_scale_raw.view(E * max_m, -1)[flat_rows[valid_routes]] = (
+                a1_scale_token_u8[flat_tokens[valid_routes]]
+            )
         route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-        route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
-            route_weights.dtype
-        )
+        route_weights.view(-1)[flat_rows[valid_routes]] = topk_weight.reshape(-1)[
+            valid_routes
+        ].to(route_weights.dtype)
         grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
             a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
@@ -749,8 +755,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 masked_m=None,
                 topids_to_rows=topids_to_rows,
                 source_topk=topk,
-                row_starts=None,
-                route_max_m=0,
             )
             _grouped_dbg("route-indexed quant+preshuffle done")
         else:
@@ -778,6 +782,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             rows_to_tokens = None
             _grouped_dbg("fused route+quant+scatter done")
 
+    counts = masked_m
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
@@ -793,16 +798,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _bias1_arg = _bias1_arg.to(dtype)
 
     # Fuse gemm1's output MXFP4 quant + scale-preshuffle into the GEMM epilogue
-    # (folds the standalone moe_fused_quant_preshuffle kernel). Enabled by default
-    # for the eligible fp4 gugu (interleaved) / gguu (dual-B) paths; opt out with
-    # AITER_FLYDSL_FUSE_GEMM1_QUANT=0. The scale is laid out for gemm2's A-scale
+    # (folds the standalone moe_fused_quant_preshuffle kernel). Disabled by default
+    # until the underlying gfx1250 GEMM supports stage1_quant_out; opt in with
+    # AITER_FLYDSL_FUSE_GEMM1_QUANT=1. The scale is laid out for gemm2's A-scale
     # (wmma_rep = warp_tile_m2 // 16). gugu de-interleaves output cols (needs
     # warp_tile_n%64==0); gguu keeps them (needs warp_tile_n%32==0).
     _wr2 = warp_tile_m2 // 16
     _q_warp_align = 32 if stage1_weight_layout == "gguu" else 64
     _fuse_gemm1_quant = (
-        os.environ.get("AITER_FLYDSL_FUSE_GEMM1_QUANT", "1")
-        not in ("", "0", "false", "False")
+        os.environ.get("AITER_FLYDSL_FUSE_GEMM1_QUANT", "0")
+        in ("1", "true", "True", "yes", "YES")
         and (not _use_naive)
         and data_format == "fp4"
         and stage1_weight_layout in ("gugu", "gguu")
@@ -1193,6 +1198,25 @@ def _get_compiled_gather_reduce(
     )
 
 
+@functools.cache
+def _get_compiled_gather_reduce_row(
+    model_dim: int,
+    topk: int,
+    out_dtype: str,
+    split_k: int = 1,
+    vec_dwords: int = 4,
+    w_dtype: str = "f32",
+):
+    """Compile and cache the row-collapsed MoE gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_row_module,
+    )
+
+    return build_moe_gather_reduce_row_module(
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
+    )
+
+
 def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
     """Prefer CTA parallelism first; use wider vec only once CTA count is ample."""
     out_dwords = int(model_dim) // 2
@@ -1210,9 +1234,13 @@ def build_topids_to_rows(
 
     token_num, topk = topk_ids.shape
     flat_e = topk_ids.reshape(-1).to(torch.long)
+    valid = (flat_e >= 0) & (flat_e < E)
+    safe_e = torch.where(valid, flat_e, torch.zeros_like(flat_e))
     # slot[r] = (# earlier routes to the same expert) = running count - 1
-    slot = F.one_hot(flat_e, E).cumsum(0).gather(1, flat_e[:, None]).squeeze(1) - 1
-    return (flat_e * max_m + slot).view(token_num, topk).to(torch.int32)
+    route_hot = F.one_hot(safe_e, E) * valid[:, None]
+    slot = route_hot.cumsum(0).gather(1, safe_e[:, None]).squeeze(1) - 1
+    rows = torch.where(valid, safe_e * max_m + slot, torch.full_like(flat_e, -1))
+    return rows.view(token_num, topk).to(torch.int32)
 
 
 @functools.cache
@@ -1365,6 +1393,7 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
         rows_to_tokens,
         numel,
         topk,
+        E,
         max_m,
         grid_blocks,
         stream=torch.cuda.current_stream(),
@@ -1391,6 +1420,10 @@ def flydsl_moe_gather_reduce(
         E, max_m, model_dim = grouped_out.shape
     token_num, topk = topids_to_rows.shape
     device = grouped_out.device
+    if gather_w.shape != (token_num, topk):
+        raise ValueError(
+            f"gather_w shape must be {(token_num, topk)}, got {tuple(gather_w.shape)}"
+        )
     if grouped_out.dtype == torch.bfloat16:
         out_dtype = "bf16"
     elif grouped_out.dtype == torch.float16:
@@ -1408,15 +1441,42 @@ def flydsl_moe_gather_reduce(
             f"unsupported gather_w dtype {gather_w.dtype}; need f32/bf16/f16"
         )
 
+    # The FlyDSL kernel uses flat pointer offsets, so pass compact buffers only.
+    topids_to_rows = topids_to_rows.to(device=device, dtype=torch.int32).contiguous()
+    gather_w = gather_w.to(device=device).contiguous()
+
     grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
     if out is None:
         out = torch.empty(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
+    elif out.shape != (token_num, model_dim):
+        raise ValueError(
+            f"out shape must be {(token_num, model_dim)}, got {tuple(out.shape)}"
+        )
+    elif out.dtype != grouped_out.dtype:
+        raise ValueError(f"out dtype must be {grouped_out.dtype}, got {out.dtype}")
+    elif out.device != device:
+        raise ValueError(f"out device must be {device}, got {out.device}")
+    elif not out.is_contiguous():
+        raise ValueError("out must be contiguous for flydsl_moe_gather_reduce")
 
     gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
-    launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+    out_dwords = model_dim // 2
+    dwords_per_iter = 256 * gather_vec
+    use_row_gather = (
+        split_k == 1
+        and out_dwords % gather_vec == 0
+        and (out_dwords + dwords_per_iter - 1) // dwords_per_iter <= 4
+    )
+    launch = (
+        _get_compiled_gather_reduce_row(
+            model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        )
+        if use_row_gather
+        else _get_compiled_gather_reduce(
+            model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        )
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     launch(
@@ -1426,6 +1486,7 @@ def flydsl_moe_gather_reduce(
         ptr_arg(out),
         token_num,
         slice_stride_dw,
+        E * max_m,
         stream=torch.cuda.current_stream(),
     )
     return out
