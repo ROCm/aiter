@@ -3627,11 +3627,12 @@ def compile_mxscale_gemm(
             _for_ip.__exit__(None, None, None)
         else:
             if const_expr(grouped_contiguous_m):
+                _rsrc_nbytes = int(batch_count) * 4
                 masked_m_rsrc = buffer_ops.create_buffer_resource(
-                    arg_masked_m, max_size=True
+                    arg_masked_m, num_records_bytes=_rsrc_nbytes
                 )
                 layout_rsrc = buffer_ops.create_buffer_resource(
-                    arg_m_tile_map, max_size=True
+                    arg_m_tile_map, num_records_bytes=_rsrc_nbytes
                 )
                 flat_pid = arith.index_cast(T.index, _raw(gpu.block_idx.x))
                 bz = (
