@@ -2,32 +2,20 @@
 
 Backward of HSTU attention. Given dO, recompute S = alpha*Q*K^T and sigma from
 Q,K (nothing is stashed by the forward), form the masked, silu-gated attention
-weights, and produce BOTH KV-owned gradient families from the single recompute:
+weights, and produce both KV-owned gradient families from the single recompute:
 
     dV[kv, d]  = (1/N) * sum_q P[q, kv] * dO[q, d],   P  = mask .* silu(alpha*S)
     dK[kv, hc] = alpha  * sum_q dS[q, kv] * Q[q, hc], dS = mask .* (1/N) * silu'(alpha*S) .* (dO*V^T)
 
-**Why fuse dV and dK?** Both reduce over the **query** index and share the same
+Both dV and dKreduce over the **query** index and share the same
 S/dS fragment orientation with *no transpose*, so one program can carry both
-accumulator families and compute S **once** per streamed-query tile instead of
-twice (the split design recomputed S in a separate dV and dK kernel). At the
-deployment regime (d=64, N=16384) the fused kernel — at `num_waves=2, block_m=96`
-to keep occupancy up despite the two accumulator families — beats the two split
-kernels by ~12-13% on dV+dK (and stacks with the group-aware `perm` load
-balancing), i.e. ~+8% end-to-end backward vs split+sort. dQ (which reduces over
-kv and needs a dS transpose) stays a separate kernel (hstu_attention_bwd_dq.py).
-
-History: an earlier revision split dV and dK into two single-family kernels
-because, at the old d=128/N=2048 regime, the fused kernel's two accumulator
-families pinned occupancy at ~1 wave/SIMD and lost more than the one S-recompute
-it saved. The d=64 deployment regime + a smaller occupancy-preserving tile + no
-redundant Q reload flips that trade; see docs/2026-07-13_more_ideas.md (Exp 5-7).
+accumulator families and compute S **once** per streamed-query tile.
 
 Orientation (same as the forward with roles swapped): dV reduces over the query
 index, so each program owns a BLOCK_M KV tile and streams BLOCK_N query tiles; K
 and V are resident register operands; Q and dO are streamed through LDS. GEMM1's
 C[q, kv] = S is reused as the dV/dK GEMM2 A-operand (contracting q). dV/dK rows
-are single-writer -> lock-free (no atomics).
+are single-writer.
 
 Constraints:
   - causal + mask variants (num_targets / max_attn_len / contextual_seq_len).
@@ -47,8 +35,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import ArithValue
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
@@ -108,14 +94,11 @@ _LOG2E = host_math.log2(host_math.e)
 #     the dO loads land, then store dO->LDS and take barrier #2. The extra barrier
 #     buys a dO-load / S-GEMM *overlap* whose value scales with the dO tile size
 #     (BLOCK_N * hidden_dim).
-# Measured (2026-07-15, MI300X, uniform, perm ON): single-barrier is +0..+3.5% at
-# hidden_dim=64 (the deployment target) but -6.1% on hidden_dim=128 / N=16384
-# (the overlap it drops is worth more than the barrier it saves). So it is a
-# **tunable per-shape param** (`single_barrier`, carried in the tuned CSV like
+# It is a tunable per-shape param (`single_barrier`, carried in the tuned CSV like
 # block_m); when unspecified it falls back to a shape heuristic (single barrier for
 # small dO tiles, hidden_dim <= 64). Numerically identical either way (bf16 reorder
 # noise ~3e-6). Precedence: env override > explicit param (from CSV/caller) >
-# heuristic. `HSTU_BWD_SINGLE_BARRIER=0/1` forces one path (A/B / debug).
+# heuristic. `HSTU_BWD_SINGLE_BARRIER=0/1` forces one path.
 _SB_ENV = os.environ.get("HSTU_BWD_SINGLE_BARRIER")  # None unless explicitly set
 
 
@@ -242,7 +225,7 @@ def build_hstu_attention_bwd_dvdk(
     num_waves: int = 4,
     waves_per_eu: int = 0,
     has_perm: bool = False,
-    single_barrier=None,
+    single_barrier: bool | None = None,
 ):
     validate_hstu_attention_bwd(
         num_heads, head_dim, hidden_dim, batch, causal, max_attn_len,
@@ -429,12 +412,6 @@ def build_hstu_attention_bwd_dvdk(
                 per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
             v_packs.append(per_og)
 
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=arith.FastMathFlags.fast)
-
-        def _fmul(a, b):
-            return arith.mulf(_raw(a), _raw(b), fastmath=arith.FastMathFlags.fast)
-
         c_alpha = fx.Float32(alpha)
         c_inv_n = fx.Float32(1.0 / max_seq_len)
         c_neg_log2e = fx.Float32(-_LOG2E)
@@ -443,16 +420,22 @@ def build_hstu_attention_bwd_dvdk(
         c_zero_f = fx.Float32(0.0)
 
         def silu_and_grad_batch(s_list):
-            sc = [_fmul(s, c_alpha) for s in s_list]
-            tt = [_fmul(s, c_neg_log2e) for s in sc]
-            emu = [llvm.call_intrinsic(compute_type, "llvm.amdgcn.exp2.f32", [t], [], []) for t in tt]
-            den = [_fadd(c_one_f, e) for e in emu]
-            sig = [llvm.call_intrinsic(compute_type, "llvm.amdgcn.rcp.f32", [d], [], []) for d in den]
-            silu = [_fmul(sc[i], sig[i]) for i in range(len(s_list))]
-            grad = [
-                _fmul(sig[i], _fadd(c_one_f, _fmul(sc[i], _fadd(c_one_f, _fmul(c_neg_one_f, sig[i])))))
-                for i in range(len(s_list))
-            ]
+            # Fast (non-IEEE) SiLU + derivative on fp32 lanes. The fastmath context
+            # gives every add/mul the `fast` flag (matches the compile hints). exp2
+            # and rcp stay on the amdgcn approximate hardware ops: exp2 is emitted as
+            # the v_exp_f32 intrinsic directly because math.exp2 lowers to a slower
+            # expansion here (~1.6% on the dV/dK kernel); rcp uses the rocdl builder.
+            with arith.fastmath(arith.FastMathFlags.fast):
+                sc = [s * c_alpha for s in s_list]
+                tt = [s * c_neg_log2e for s in sc]
+                emu = [fx.Float32(llvm.call_intrinsic(compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], [])) for t in tt]
+                den = [c_one_f + e for e in emu]
+                sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
+                silu = [sc[i] * sig[i] for i in range(len(s_list))]
+                grad = [
+                    sig[i] * (c_one_f + sc[i] * (c_one_f + c_neg_one_f * sig[i]))
+                    for i in range(len(s_list))
+                ]
             return silu, grad
 
         def pack_p(vals):
@@ -461,8 +444,8 @@ def build_hstu_attention_bwd_dvdk(
                 cmask = fx.Int32(0xFFFF0000)
 
                 def bf16_pair(lo_f32, hi_f32):
-                    lo_i32 = fx.Int32(ArithValue(lo_f32).bitcast(fx.Int32.ir_type))
-                    hi_i32 = fx.Int32(ArithValue(hi_f32).bitcast(fx.Int32.ir_type))
+                    lo_i32 = fx.Float32(lo_f32).bitcast(fx.Int32)
+                    hi_i32 = fx.Float32(hi_f32).bitcast(fx.Int32)
                     return (hi_i32 & cmask) | lo_i32.shrui(c16)
 
                 pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
@@ -671,9 +654,10 @@ def build_hstu_attention_bwd_dvdk(
                     da_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                     grad_vals, keep = s_meta[ng][og]
                     ds_vals = []
-                    for i in range_constexpr(MFMA_ELEMS_PER_LANE):
-                        gated = _fmul(_fmul(c_inv_n, grad_vals[i]), da_vals[i])
-                        ds_vals.append(keep[i].select(gated, c_zero_f))
+                    with arith.fastmath(arith.FastMathFlags.fast):
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE):
+                            gated = c_inv_n * grad_vals[i] * da_vals[i]
+                            ds_vals.append(keep[i].select(gated, c_zero_f))
                     ds_packs[ng][og] = pack_p(ds_vals)
             return ds_packs
 
@@ -755,21 +739,22 @@ def build_hstu_attention_bwd_dvdk(
                 loop_results = yield acc
 
             results = list(loop_results) if isinstance(loop_results, (list, tuple)) else [loop_results]
-            for og in range_constexpr(KV_OWNED_SUBTILES):
-                kv_row_base = kv_wave_base + fx.Int32(og * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                    kv_row_e = kv_row_base + fx.Int32(e)
-                    if kv_row_e < seq_len:
-                        for c in range_constexpr(D_CHUNKS):
-                            ov = results[c * KV_OWNED_SUBTILES + og]
-                            col = fx.Int32(c * MFMA_M) + lane_mod_16
-                            val = fx.Float32(_fmul(Vec(ov)[e], c_inv_n)).to(elem_dtype)
-                            out_dv[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
-                        for c in range_constexpr(HC_CHUNKS):
-                            ov = results[N_ACC_DV + c * KV_OWNED_SUBTILES + og]
-                            col = fx.Int32(c * MFMA_M) + lane_mod_16
-                            val = fx.Float32(_fmul(Vec(ov)[e], c_alpha)).to(elem_dtype)
-                            out_dk[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
+            with arith.fastmath(arith.FastMathFlags.fast):
+                for og in range_constexpr(KV_OWNED_SUBTILES):
+                    kv_row_base = kv_wave_base + fx.Int32(og * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        kv_row_e = kv_row_base + fx.Int32(e)
+                        if kv_row_e < seq_len:
+                            for c in range_constexpr(D_CHUNKS):
+                                ov = results[c * KV_OWNED_SUBTILES + og]
+                                col = fx.Int32(c * MFMA_M) + lane_mod_16
+                                val = (Vec(ov)[e] * c_inv_n).to(elem_dtype)
+                                out_dv[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
+                            for c in range_constexpr(HC_CHUNKS):
+                                ov = results[N_ACC_DV + c * KV_OWNED_SUBTILES + og]
+                                col = fx.Int32(c * MFMA_M) + lane_mod_16
+                                val = (Vec(ov)[e] * c_alpha).to(elem_dtype)
+                                out_dk[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
 
     _hstu_compile_hints = {"fast_fp_math": True, "unsafe_fp_math": True}
 
