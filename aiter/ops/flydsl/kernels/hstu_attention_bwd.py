@@ -33,6 +33,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -365,7 +366,6 @@ def build_hstu_attention_bwd_dvdk(
 
         q_head_offset = head_idx * fx.Int32(head_dim)
         q_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)) * fx.Int64(2)
-        q_rsrc = buffer_ops.create_buffer_resource(q, max_size=True, base_byte_offset=q_base_byte_offset)
 
         lds_base = allocator.get_base()
         q_smem = SmemPtr(lds_base, q_lds_offset, elem_type, shape=(BLOCK_N, Q_STRIDE))
@@ -377,8 +377,39 @@ def build_hstu_attention_bwd_dvdk(
         stride_do_n = num_heads * hidden_dim
         do_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_do_n)
                                + fx.Int64(head_idx) * fx.Int64(hidden_dim)) * fx.Int64(2)
-        do_rsrc = buffer_ops.create_buffer_resource(do, max_size=True, base_byte_offset=do_base_byte_offset)
         do_lds_byte_base = buffer_ops.extract_base_index(do_smem.get(), address_space=3)
+
+        # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
+        # Mirrors flash_attn_gfx950's _buffer_load_lds helper: a BufferCopyLDS atom
+        # drives the same buffer_load_lds instruction the raw ROCDL path did, but
+        # through the FlyDSL copy-atom API (rebased buffer view + fx.copy). The atom
+        # only exposes soffset/imm-offset state and hardcodes the cache-policy/aux
+        # operand to 0, so this intentionally drops the raw path's aux=1.
+        _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
+        _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8)
+        _lds_ptr_ty = fx.PointerType.get(elem_type, 2, DMA_BYTES)
+
+        def _rebased_buffer_div(base_iter, byte_off, n_elems):
+            # Fold the (large) seq/head base into the 48-bit descriptor base so the
+            # per-lane element index stays a small 32-bit voffset; max_size records.
+            base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+            shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
+            buf_ptr_ty = fx.PointerType.get(
+                elem_ty=elem_type,
+                address_space=_TargetAddressSpace.BufferDesc,
+                alignment=base_iter.alignment,
+            )
+            buf_ptr = fx.make_ptr(
+                buf_ptr_ty,
+                [shifted, fx.Int16(0).ir_value(), fx.Int64(0xFFFFFFFF).ir_value(), _buf_flags_i32.ir_value()],
+            )
+            return fx.logical_divide(
+                fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
+                fx.make_layout(1, 1),
+            )
+
+        q_div = _rebased_buffer_div(fx.get_iter(q), q_base_byte_offset, max_seq_len * stride_qk_n)
+        do_div = _rebased_buffer_div(fx.get_iter(do), do_base_byte_offset, max_seq_len * stride_do_n)
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
@@ -487,10 +518,6 @@ def build_hstu_attention_bwd_dvdk(
 
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
-        dma_size = fx.Int32(DMA_BYTES)
-        dma_soff = fx.Int32(0)
-        dma_off = fx.Int32(0)
-        dma_aux = fx.Int32(1)
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_q = fx.Int32(PAIRS_PER_ROW_Q)
 
@@ -513,10 +540,11 @@ def build_hstu_attention_bwd_dvdk(
                 row = q_dma_rows[d]
                 in_bounds = (q_start + row) < seq_len
                 local_tok = in_bounds.select(q_start + row, fx.Int32(0))
-                g_elem = local_tok * c_stride_qk_n + q_dma_gcols[d]
-                voffset = g_elem * fx.Int32(2)
-                lds_ptr = buffer_ops.create_llvm_ptr(wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES), address_space=3)
-                rocdl.raw_ptr_buffer_load_lds(q_rsrc, lds_ptr, dma_size, voffset, dma_soff, dma_off, dma_aux)
+                src_elem = local_tok * c_stride_qk_n + q_dma_gcols[d]
+                lds_byte = fx.Int32(wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES))
+                dst = fx.make_view(fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1))
+                src = fx.slice(q_div, (None, fx.Int32(src_elem)))
+                fx.copy(_dma_atom, src, dst)
 
         # Direct dO global->LDS DMA (single-barrier variant), row-major [q, d].
         # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
@@ -536,10 +564,11 @@ def build_hstu_attention_bwd_dvdk(
                 row = do_dma_rows[d]
                 in_bounds = (q_start + row) < seq_len
                 local_tok = in_bounds.select(q_start + row, fx.Int32(0))
-                g_elem = local_tok * c_stride_do_n + do_dma_cols[d]
-                voffset = g_elem * fx.Int32(2)
-                lds_ptr = buffer_ops.create_llvm_ptr(wave_lds_lane0_do + fx.Int64(d * BLOCK_THREADS * DMA_BYTES), address_space=3)
-                rocdl.raw_ptr_buffer_load_lds(do_rsrc, lds_ptr, dma_size, voffset, dma_soff, dma_off, dma_aux)
+                src_elem = local_tok * c_stride_do_n + do_dma_cols[d]
+                lds_byte = fx.Int32(wave_lds_lane0_do + fx.Int64(d * BLOCK_THREADS * DMA_BYTES))
+                dst = fx.make_view(fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1))
+                src = fx.slice(do_div, (None, fx.Int32(src_elem)))
+                fx.copy(_dma_atom, src, dst)
 
         do_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_DO)
         do_load_lane_in_row = tid % fx.Int32(THREADS_PER_ROW_DO)
