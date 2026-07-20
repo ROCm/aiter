@@ -377,7 +377,7 @@ def launch_gemm(
             fx.make_layout(1, 1),
         )
         a_sc_base = [(bx_m // 32 + mp) * sca_rstride for mp in range_constexpr(m_pairs)]
-        nsb = by_n // 32 + wave * (BN // 128)
+        nsb = (by_n + wave * (BN // 4)) // 32
         b_sc_base = [(nsb + np) * _scale_chunk_dw for np in range_constexpr(n_pairs)]
         sc_lane = lane_div_16 * 16 + lane_mod_16
 
@@ -449,6 +449,9 @@ def launch_gemm(
             if const_expr(scale_shift is not None):
                 sa_v = [v.shrui(scale_shift) for v in sa_v]
                 sb_v = [v.shrui(scale_shift) for v in sb_v]
+            if const_expr(BN < 128):
+                _bnsh = ((wave * (BN // 4)) % 32) // 16 * 8
+                sb_v = [v.shrui(_bnsh) for v in sb_v]
             # kh OUTERMOST: consecutive MFMAs hit distinct accumulators (dense issue). Each
             # scaled MFMA = fx.gemm over rank-1 i32[4] A/B frags, e8m0 word on scale_a=/scale_b=.
             c_frags = [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(n_acc)]

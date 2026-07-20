@@ -25,7 +25,7 @@ _SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
 # a/b operand combos the kernel supports (a4w4 / a6w4 / a8w8).
 _COMBOS = [("fp4", "fp4"), ("fp6", "fp4"), ("fp8", "fp8")]
 _TILE_M = (32, 64, 96, 128, 256)
-_TILE_N = (128, 256, 512)
+_TILE_N = (64, 128, 256, 512)
 _TILE_K = (128, 256)
 _WAVES_PER_EU = (0, 1, 2, 3, 4)
 _XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
@@ -112,7 +112,7 @@ def instance_valid(ki: kernelInstance) -> bool:
         return False
     if ki.tile_m % 32 != 0:  # microscale packs M by 2 -> m_chunks = tile_m//16 even
         return False
-    if ki.tile_n % 128 != 0:  # packs N by 2 -> num_acc_n = tile_n//64 even
+    if ki.tile_n % 64 != 0:  # 16-col n-subblocks per wave: tile_n multiple of 64
         return False
     arb = _a_row_bytes(ki.a_dtype, ki.tile_k)
     if (
