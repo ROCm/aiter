@@ -140,14 +140,18 @@ def validate_hstu_attention_bwd(
     if arch is None:
         arch = get_rocm_arch()
     if not arch.startswith("gfx942") and not arch.startswith("gfx950"):
-        raise ValueError(f"hstu attention bwd unsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')")
+        raise ValueError(
+            f"hstu attention bwd unsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')"
+        )
 
     if dtype_str not in {"f16", "bf16"}:
         raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
     if not causal:
         raise ValueError("hstu_attention_bwd only supports causal attention")
     if contextual_seq_len < 0:
-        raise ValueError(f"contextual_seq_len must be non-negative, got {contextual_seq_len}")
+        raise ValueError(
+            f"contextual_seq_len must be non-negative, got {contextual_seq_len}"
+        )
     if max_attn_len < 0:
         raise ValueError(f"max_attn_len must be non-negative, got {max_attn_len}")
 
@@ -160,11 +164,17 @@ def validate_hstu_attention_bwd(
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
     if head_dim <= 0 or head_dim % MFMA_K != 0:
-        raise ValueError(f"head_dim must be positive and a multiple of MFMA_K={MFMA_K}, got {head_dim}")
+        raise ValueError(
+            f"head_dim must be positive and a multiple of MFMA_K={MFMA_K}, got {head_dim}"
+        )
     if hidden_dim <= 0 or hidden_dim % MFMA_M != 0:
-        raise ValueError(f"hidden_dim must be positive and a multiple of MFMA_M={MFMA_M}, got {hidden_dim}")
+        raise ValueError(
+            f"hidden_dim must be positive and a multiple of MFMA_M={MFMA_M}, got {hidden_dim}"
+        )
     if (batch * num_heads) % NUM_GRID_GROUPS != 0:
-        raise ValueError(f"require (batch*num_heads) % {NUM_GRID_GROUPS} == 0, got {batch * num_heads}")
+        raise ValueError(
+            f"require (batch*num_heads) % {NUM_GRID_GROUPS} == 0, got {batch * num_heads}"
+        )
 
     if block_m <= 0:
         raise ValueError(f"block_m must be positive, got {block_m}")
@@ -175,7 +185,9 @@ def validate_hstu_attention_bwd(
     if waves_per_eu < 0:
         raise ValueError(f"waves_per_eu must be non-negative, got {waves_per_eu}")
     if block_m % (num_waves * MFMA_M) != 0:
-        raise ValueError(f"block_m {block_m} must be a multiple of num_waves*MFMA_M ({num_waves * MFMA_M})")
+        raise ValueError(
+            f"block_m {block_m} must be a multiple of num_waves*MFMA_M ({num_waves * MFMA_M})"
+        )
     if block_n % MFMA_M != 0:
         raise ValueError(f"block_n {block_n} must be a multiple of MFMA_M={MFMA_M}")
 
@@ -190,13 +202,21 @@ def validate_hstu_attention_bwd(
     if (block_n * hidden_dim) % elems_per_dma_pass != 0:
         raise ValueError("dO DMA tile does not divide the dword DMA pass evenly")
 
-    vec_v = 8 if (hidden_dim % 8 == 0 and (block_n * hidden_dim) % (block_threads * 8) == 0) else dma_elems
+    vec_v = (
+        8
+        if (hidden_dim % 8 == 0 and (block_n * hidden_dim) % (block_threads * 8) == 0)
+        else dma_elems
+    )
     threads_per_row_v = hidden_dim // vec_v
     if block_threads % threads_per_row_v != 0:
-        raise ValueError(f"block_threads={block_threads} must be divisible by threads_per_row_v={threads_per_row_v}")
+        raise ValueError(
+            f"block_threads={block_threads} must be divisible by threads_per_row_v={threads_per_row_v}"
+        )
     rows_per_batch_v = block_threads // threads_per_row_v
     if not (block_n % rows_per_batch_v == 0 or rows_per_batch_v > block_n):
-        raise ValueError(f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n")
+        raise ValueError(
+            f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n"
+        )
 
     lds_cap = lds_cap_bytes()
     lds_bytes = block_n * head_dim_k * 2 + block_n * hidden_dim * 2
@@ -226,9 +246,21 @@ def build_hstu_attention_bwd_dvdk(
     single_barrier: bool | None = None,
 ):
     validate_hstu_attention_bwd(
-        num_heads, head_dim, hidden_dim, batch, causal, max_attn_len,
-        contextual_seq_len, has_targets, alpha, dtype_str, max_seq_len,
-        block_m=block_m, block_n=block_n, num_waves=num_waves, waves_per_eu=waves_per_eu,
+        num_heads,
+        head_dim,
+        hidden_dim,
+        batch,
+        causal,
+        max_attn_len,
+        contextual_seq_len,
+        has_targets,
+        alpha,
+        dtype_str,
+        max_seq_len,
+        block_m=block_m,
+        block_n=block_n,
+        num_waves=num_waves,
+        waves_per_eu=waves_per_eu,
     )
 
     BLOCK_M = block_m
@@ -277,7 +309,11 @@ def build_hstu_attention_bwd_dvdk(
     PAIRS_PER_ROW_DO = DO_STRIDE // DMA_ELEMS
     SINGLE_BARRIER = _resolve_single_barrier(hidden_dim, single_barrier)
 
-    VEC_DO = 8 if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0) else DMA_ELEMS
+    VEC_DO = (
+        8
+        if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0)
+        else DMA_ELEMS
+    )
     THREADS_PER_ROW_DO = hidden_dim // VEC_DO
     assert BLOCK_THREADS % THREADS_PER_ROW_DO == 0
     ROWS_PER_BATCH_DO = BLOCK_THREADS // THREADS_PER_ROW_DO
@@ -319,7 +355,9 @@ def build_hstu_attention_bwd_dvdk(
             return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
 
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(tid, NUM_WAVES, WARP_SIZE, MFMA_N)
+        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+            tid, NUM_WAVES, WARP_SIZE, MFMA_N
+        )
 
         block_id = fx.Int32(gpu.block_idx.x)
         grid_group = block_id % fx.Int32(NUM_GRID_GROUPS)
@@ -362,18 +400,24 @@ def build_hstu_attention_bwd_dvdk(
         do_load = grouped_loader(do, hidden_dim, VEC_DO)
 
         q_head_offset = head_idx * fx.Int32(head_dim)
-        q_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)) * fx.Int64(2)
+        q_base_byte_offset = (
+            fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
+        ) * fx.Int64(2)
 
         lds_base = allocator.get_base()
         q_smem = SmemPtr(lds_base, q_lds_offset, elem_type, shape=(BLOCK_N, Q_STRIDE))
-        do_smem = SmemPtr(lds_base, do_lds_offset, elem_type, shape=(BLOCK_N, DO_STRIDE))
+        do_smem = SmemPtr(
+            lds_base, do_lds_offset, elem_type, shape=(BLOCK_N, DO_STRIDE)
+        )
         q_lds_byte_base = buffer_ops.extract_base_index(q_smem.get(), address_space=3)
 
         # Direct dO global->LDS DMA (single-barrier variant). dO is [L, H, hidden],
         # so the per-token stride is num_heads*hidden_dim; base at this head's slice.
         stride_do_n = num_heads * hidden_dim
-        do_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_do_n)
-                               + fx.Int64(head_idx) * fx.Int64(hidden_dim)) * fx.Int64(2)
+        do_base_byte_offset = (
+            fx.Int64(seq_start) * fx.Int64(stride_do_n)
+            + fx.Int64(head_idx) * fx.Int64(hidden_dim)
+        ) * fx.Int64(2)
         do_lds_byte_base = buffer_ops.extract_base_index(do_smem.get(), address_space=3)
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
@@ -383,7 +427,9 @@ def build_hstu_attention_bwd_dvdk(
         # only exposes soffset/imm-offset state and hardcodes the cache-policy/aux
         # operand to 0, so this intentionally drops the raw path's aux=1.
         _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
-        _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8)
+        _dma_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8
+        )
         _lds_ptr_ty = fx.PointerType.get(elem_type, 2, DMA_BYTES)
 
         def _rebased_buffer_div(base_iter, byte_off, n_elems):
@@ -398,20 +444,31 @@ def build_hstu_attention_bwd_dvdk(
             )
             buf_ptr = fx.make_ptr(
                 buf_ptr_ty,
-                [shifted, fx.Int16(0).ir_value(), fx.Int64(0xFFFFFFFF).ir_value(), _buf_flags_i32.ir_value()],
+                [
+                    shifted,
+                    fx.Int16(0).ir_value(),
+                    fx.Int64(0xFFFFFFFF).ir_value(),
+                    _buf_flags_i32.ir_value(),
+                ],
             )
             return fx.logical_divide(
                 fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
                 fx.make_layout(1, 1),
             )
 
-        q_div = _rebased_buffer_div(fx.get_iter(q), q_base_byte_offset, max_seq_len * stride_qk_n)
-        do_div = _rebased_buffer_div(fx.get_iter(do), do_base_byte_offset, max_seq_len * stride_do_n)
+        q_div = _rebased_buffer_div(
+            fx.get_iter(q), q_base_byte_offset, max_seq_len * stride_qk_n
+        )
+        do_div = _rebased_buffer_div(
+            fx.get_iter(do), do_base_byte_offset, max_seq_len * stride_do_n
+        )
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
 
-        kv_wave_base = kv_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(ROWS_PER_WAVE)
+        kv_wave_base = kv_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(
+            ROWS_PER_WAVE
+        )
 
         kv_rows = []
         kv_in_bounds = []
@@ -426,7 +483,9 @@ def build_hstu_attention_bwd_dvdk(
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
                 safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
-                raw = k_load(fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_LANE_K)).ir_value()
+                raw = k_load(
+                    fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_LANE_K)
+                ).ir_value()
                 per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
             k_packs.append(per_og)
 
@@ -436,7 +495,9 @@ def build_hstu_attention_bwd_dvdk(
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
                 safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
-                raw = v_load(fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_LANE_K)).ir_value()
+                raw = v_load(
+                    fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_LANE_K)
+                ).ir_value()
                 per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
             v_packs.append(per_og)
 
@@ -456,7 +517,14 @@ def build_hstu_attention_bwd_dvdk(
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
-                emu = [fx.Float32(llvm.call_intrinsic(compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], [])) for t in tt]
+                emu = [
+                    fx.Float32(
+                        llvm.call_intrinsic(
+                            compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], []
+                        )
+                    )
+                    for t in tt
+                ]
                 den = [c_one_f + e for e in emu]
                 sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
                 silu = [sc[i] * sig[i] for i in range(len(s_list))]
@@ -518,8 +586,12 @@ def build_hstu_attention_bwd_dvdk(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_q = fx.Int32(PAIRS_PER_ROW_Q)
 
-        wave_lds_base_q = q_lds_byte_base + fx.Index(wave_id) * fx.Index(WARP_SIZE * DMA_BYTES)
-        wave_lds_lane0_q = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_lds_base_q))
+        wave_lds_base_q = q_lds_byte_base + fx.Index(wave_id) * fx.Index(
+            WARP_SIZE * DMA_BYTES
+        )
+        wave_lds_lane0_q = rocdl.readfirstlane(
+            fx.Int64.ir_type, fx.Int64(wave_lds_base_q)
+        )
         q_dma_rows = []
         q_dma_gcols = []
         for d in range_constexpr(NUM_DMA_Q):
@@ -538,8 +610,12 @@ def build_hstu_attention_bwd_dvdk(
                 in_bounds = (q_start + row) < seq_len
                 local_tok = in_bounds.select(q_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_qk_n + q_dma_gcols[d]
-                lds_byte = fx.Int32(wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES))
-                dst = fx.make_view(fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1))
+                lds_byte = fx.Int32(
+                    wave_lds_lane0_q + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
+                )
+                dst = fx.make_view(
+                    fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1)
+                )
                 src = fx.slice(q_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
@@ -547,8 +623,12 @@ def build_hstu_attention_bwd_dvdk(
         # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
         # value is multiplied out — same safe-garbage contract as the Q DMA.
         c_stride_do_n = fx.Int32(stride_do_n)
-        wave_lds_base_do = do_lds_byte_base + fx.Index(wave_id) * fx.Index(WARP_SIZE * DMA_BYTES)
-        wave_lds_lane0_do = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_lds_base_do))
+        wave_lds_base_do = do_lds_byte_base + fx.Index(wave_id) * fx.Index(
+            WARP_SIZE * DMA_BYTES
+        )
+        wave_lds_lane0_do = rocdl.readfirstlane(
+            fx.Int64.ir_type, fx.Int64(wave_lds_base_do)
+        )
         do_dma_rows = []
         do_dma_cols = []
         for d in range_constexpr(NUM_DMA_DO):
@@ -562,8 +642,12 @@ def build_hstu_attention_bwd_dvdk(
                 in_bounds = (q_start + row) < seq_len
                 local_tok = in_bounds.select(q_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_do_n + do_dma_cols[d]
-                lds_byte = fx.Int32(wave_lds_lane0_do + fx.Int64(d * BLOCK_THREADS * DMA_BYTES))
-                dst = fx.make_view(fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1))
+                lds_byte = fx.Int32(
+                    wave_lds_lane0_do + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
+                )
+                dst = fx.make_view(
+                    fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1)
+                )
                 src = fx.slice(do_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
@@ -580,31 +664,61 @@ def build_hstu_attention_bwd_dvdk(
                 if DO_NEEDS_GUARD:
                     in_bounds = in_bounds & (row < fx.Int32(BLOCK_N))
                 safe_tok = in_bounds.select(seq_start + tok, seq_start)
-                raw = do_load(fx.Int64(safe_tok), head_idx, do_load_col // fx.Int32(VEC_DO)).ir_value()
-                vecs.append(in_bounds.select(raw, Vec.filled(VEC_DO, 0.0, elem_dtype).ir_value()))
+                raw = do_load(
+                    fx.Int64(safe_tok), head_idx, do_load_col // fx.Int32(VEC_DO)
+                ).ir_value()
+                vecs.append(
+                    in_bounds.select(
+                        raw, Vec.filled(VEC_DO, 0.0, elem_dtype).ir_value()
+                    )
+                )
             return vecs
 
         def store_do_regs_to_lds(vecs):
             for b in range_constexpr(NUM_BATCHES_DO):
                 row = do_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_DO)
-                Vec.store(Vec(vecs[b]), do_smem.get(), [fx.Index(row), fx.Index(do_load_col)])
+                Vec.store(
+                    Vec(vecs[b]), do_smem.get(), [fx.Index(row), fx.Index(do_load_col)]
+                )
 
         def read_q_packs(ng):
             q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
             packs = []
             for ks in range_constexpr(K_STEPS_K):
                 q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                packs.append(Vec.load(mfma_pack_type, q_smem.get(), [fx.Index(q_row), fx.Index(q_swz_col(q_row, q_col))]))
+                packs.append(
+                    Vec.load(
+                        mfma_pack_type,
+                        q_smem.get(),
+                        [fx.Index(q_row), fx.Index(q_swz_col(q_row, q_col))],
+                    )
+                )
             return packs
 
         def compute_s_tile(q_start, q_packs_by_ng):
-            p_packs = [[None for _ in range_constexpr(KV_OWNED_SUBTILES)] for _ in range_constexpr(Q_STREAM_SUBTILES)]
-            s_meta = [[None for _ in range_constexpr(KV_OWNED_SUBTILES)] for _ in range_constexpr(Q_STREAM_SUBTILES)]
+            p_packs = [
+                [None for _ in range_constexpr(KV_OWNED_SUBTILES)]
+                for _ in range_constexpr(Q_STREAM_SUBTILES)
+            ]
+            s_meta = [
+                [None for _ in range_constexpr(KV_OWNED_SUBTILES)]
+                for _ in range_constexpr(Q_STREAM_SUBTILES)
+            ]
             for ng in range_constexpr(Q_STREAM_SUBTILES):
-                q_packs = [Vec(q_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)]
-                q_base = q_start + fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                q_raw = [q_base + fx.Int32(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                q_in_seq = [q_raw[i] < seq_len for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                q_packs = [
+                    Vec(q_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)
+                ]
+                q_base = (
+                    q_start
+                    + fx.Int32(ng * MFMA_M)
+                    + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                )
+                q_raw = [
+                    q_base + fx.Int32(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
+                q_in_seq = [
+                    q_raw[i] < seq_len for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
                 q_ids = [to_id(q_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
@@ -619,14 +733,19 @@ def build_hstu_attention_bwd_dvdk(
                         if has_window:
                             keep = keep & (dist <= fx.Int32(max_attn_len))
                         if has_contextual:
-                            ctx = (q_ids[i] == fx.Int32(0)) & (kv_owned_ids[og] < max_id)
+                            ctx = (q_ids[i] == fx.Int32(0)) & (
+                                kv_owned_ids[og] < max_id
+                            )
                             keep = keep | ctx
                         keep = keep & q_in_seq[i] & kv_in_bounds[og]
                         return keep
 
                     keep = [keep_row(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
                     silu_vals, grad_vals = silu_and_grad_batch(s_vals)
-                    p_vals = [keep[i].select(silu_vals[i], c_zero_f) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                    p_vals = [
+                        keep[i].select(silu_vals[i], c_zero_f)
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    ]
                     p_packs[ng][og] = pack_p(p_vals)
                     s_meta[ng][og] = (grad_vals, keep)
             return p_packs, s_meta
@@ -639,8 +758,16 @@ def build_hstu_attention_bwd_dvdk(
                 q_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 elems = []
                 for i in range_constexpr(MFMA_LANE_K):
-                    elems.append(Vec.load(Vec.make_type(1, elem_dtype), do_smem.get(), [fx.Index(q_lane + fx.Int32(i)), fx.Index(d_col)]))
-                do_packs.append(Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value())
+                    elems.append(
+                        Vec.load(
+                            Vec.make_type(1, elem_dtype),
+                            do_smem.get(),
+                            [fx.Index(q_lane + fx.Int32(i)), fx.Index(d_col)],
+                        )
+                    )
+                do_packs.append(
+                    Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value()
+                )
             return do_packs
 
         def accum_dv_tile(dv_acc, p_packs):
@@ -666,18 +793,29 @@ def build_hstu_attention_bwd_dvdk(
             packs = []
             for ks in range_constexpr(DK_STEPS):
                 d_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                packs.append(Vec.load(mfma_pack_type, do_smem.get(), [fx.Index(q_row), fx.Index(d_col)]))
+                packs.append(
+                    Vec.load(
+                        mfma_pack_type,
+                        do_smem.get(),
+                        [fx.Index(q_row), fx.Index(d_col)],
+                    )
+                )
             return packs
 
         def compute_ds_packs(s_meta):
-            ds_packs = [[None for _ in range_constexpr(KV_OWNED_SUBTILES)] for _ in range_constexpr(Q_STREAM_SUBTILES)]
+            ds_packs = [
+                [None for _ in range_constexpr(KV_OWNED_SUBTILES)]
+                for _ in range_constexpr(Q_STREAM_SUBTILES)
+            ]
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 do_a = read_do_a_packs(ng)
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(DK_STEPS):
                         cur = mfma_acc(do_a[ks].ir_value(), v_packs[ks][og], cur)
-                    da_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                    da_vals = [
+                        Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    ]
                     grad_vals, keep = s_meta[ng][og]
                     ds_vals = []
                     with arith.fastmath(arith.FastMathFlags.fast):
@@ -699,8 +837,16 @@ def build_hstu_attention_bwd_dvdk(
                 elems = []
                 for i in range_constexpr(MFMA_LANE_K):
                     q_row = q_lane + fx.Int32(i)
-                    elems.append(Vec.load(Vec.make_type(1, elem_dtype), q_smem.get(), [fx.Index(q_row), fx.Index(q_swz_col(q_row, hc_col))]))
-                qb_packs.append(Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value())
+                    elems.append(
+                        Vec.load(
+                            Vec.make_type(1, elem_dtype),
+                            q_smem.get(),
+                            [fx.Index(q_row), fx.Index(q_swz_col(q_row, hc_col))],
+                        )
+                    )
+                qb_packs.append(
+                    Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value()
+                )
             return qb_packs
 
         def accum_dk_tile(dk_acc, ds_packs):
@@ -730,7 +876,9 @@ def build_hstu_attention_bwd_dvdk(
                 async_load_do_lds(q_start)
                 _waitcnt_vm_n(0)
                 gpu.barrier()
-                q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
+                q_packs = [
+                    read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)
+                ]
                 p_packs, s_meta = compute_s_tile(q_start, q_packs)
                 dv_acc = [acc[i] for i in range(N_ACC_DV)]
                 dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
@@ -757,17 +905,27 @@ def build_hstu_attention_bwd_dvdk(
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
-            for q_tile, it in range(fx.Index(q_tile_start), fx.Index(n_q_tiles), fx.Index(1), init=acc_init):  # ty: ignore
+            for q_tile, it in range(
+                fx.Index(q_tile_start), fx.Index(n_q_tiles), fx.Index(1), init=acc_init
+            ):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
                 acc = [it_list[i] for i in range(N_ACC)]
                 q_start = fx.Int32(q_tile) * fx.Int32(BLOCK_N)
                 acc = run_q_tile(acc, q_start)
                 loop_results = yield acc
 
-            results = list(loop_results) if isinstance(loop_results, (list, tuple)) else [loop_results]
+            results = (
+                list(loop_results)
+                if isinstance(loop_results, (list, tuple))
+                else [loop_results]
+            )
             with arith.fastmath(arith.FastMathFlags.fast):
                 for og in range_constexpr(KV_OWNED_SUBTILES):
-                    kv_row_base = kv_wave_base + fx.Int32(og * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    kv_row_base = (
+                        kv_wave_base
+                        + fx.Int32(og * MFMA_M)
+                        + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    )
                     for e in range_constexpr(MFMA_ELEMS_PER_LANE):
                         kv_row_e = kv_row_base + fx.Int32(e)
                         if kv_row_e < seq_len:
@@ -775,12 +933,16 @@ def build_hstu_attention_bwd_dvdk(
                                 ov = results[c * KV_OWNED_SUBTILES + og]
                                 col = fx.Int32(c * MFMA_M) + lane_mod_16
                                 val = (Vec(ov)[e] * c_inv_n).to(elem_dtype)
-                                out_dv[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
+                                out_dv[
+                                    fx.Int64(seq_start + kv_row_e), head_idx, col
+                                ] = val
                             for c in range_constexpr(HC_CHUNKS):
                                 ov = results[N_ACC_DV + c * KV_OWNED_SUBTILES + og]
                                 col = fx.Int32(c * MFMA_M) + lane_mod_16
                                 val = (Vec(ov)[e] * c_alpha).to(elem_dtype)
-                                out_dk[fx.Int64(seq_start + kv_row_e), head_idx, col] = val
+                                out_dk[
+                                    fx.Int64(seq_start + kv_row_e), head_idx, col
+                                ] = val
 
     _hstu_compile_hints = {"fast_fp_math": True, "unsafe_fp_math": True}
 
@@ -804,7 +966,15 @@ def build_hstu_attention_bwd_dvdk(
 
         grid = num_kv_tiles * batch * num_heads
         hstu_attention_bwd_dvdk(
-            q, k, v, do, seq_offsets, num_targets, perm, out_dv, out_dk,
+            q,
+            k,
+            v,
+            do,
+            seq_offsets,
+            num_targets,
+            perm,
+            out_dv,
+            out_dk,
             value_attrs={
                 "passthrough": [
                     ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
