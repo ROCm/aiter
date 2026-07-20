@@ -21,8 +21,10 @@ _batched_gemm_bf16_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
     ],
 )
 
@@ -31,8 +33,6 @@ _batched_gemm_bf16_repr = make_kernel_repr(
     {
         "EVEN_K": lambda args: (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_batched_gemm_bf16_repr)
@@ -72,8 +72,10 @@ def _batched_gemm_bf16_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_bf16 function
@@ -179,17 +181,17 @@ def _batched_gemm_bf16_kernel(
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                a = tl.load(a_ptrs)
             else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
-                )
                 b = tl.load(
                     b_ptrs,
                     mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K,
                     other=0.0,
                     cache_modifier=cache_modifier,
+                )
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
 
             accumulator = tl.dot(a, b, acc=accumulator)
@@ -229,8 +231,9 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
 
     # BF16 uses the shared 16-bit activation / 16-bit weight batched GEMM config.
-    config, is_tunned = get_gemm_config("BATCHED_GEMM-A16W16", M, N, K)
+    config, is_tunned = get_gemm_config("BATCHED_GEMM-A16W16", M, N, K, B=B)
     return compute_splitk_params(config, K), is_tunned
