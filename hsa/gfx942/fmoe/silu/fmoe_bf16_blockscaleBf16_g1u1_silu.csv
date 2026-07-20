@@ -1,0 +1,2 @@
+knl_name,co_name,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n,flat
+_ZN5aiter60fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3E,fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flat_pf3.co,0,1,0,1,0,1,128,1

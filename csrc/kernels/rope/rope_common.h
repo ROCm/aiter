@@ -4455,7 +4455,7 @@ __launch_bounds__(256, 8) __global__
 template <int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
           bool Is2D,
-          typename scalar_t = ck_tile::fp16_t>
+          typename scalar_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                          const int32_t size_s_w,
                                                          const int32_t size_b,
@@ -4481,8 +4481,8 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
         vec_pairs >>= 1;
 
     // Fall back to smaller VP if not enough waves to saturate the GPU.
-    const int32_t gpu_capacity  = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    constexpr int32_t warp_size = 64;
+    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+    const int32_t warp_size    = static_cast<int32_t>(get_warp_size_func());
     while(vec_pairs > 1)
     {
         const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
@@ -7237,7 +7237,7 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // implementation. ds_swizzle and DPP latencies are symmetric, so reversing the
 // order vs the natural DPP-first form is a free constraint that buys us
 // bitwise-identical output to the prior bpermute-based reduce.
-// All lanes hold the full sum on return — XOR butterfly is symmetric, so no
+// All lanes hold the full sum on return -- XOR butterfly is symmetric, so no
 // follow-up broadcast is needed.
 //
 // Body is wrapped in #ifdef __HIP_DEVICE_COMPILE__ to match the rest of this
@@ -7246,7 +7246,7 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // and break any TU that includes rope_common.h without otherwise pulling in
 // opus.hpp (e.g. csrc/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu).
 // In the host pass the body is empty and the function returns `val`
-// unchanged — fine because these helpers are __device__-only.
+// unchanged -- fine because these helpers are __device__-only.
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
@@ -7398,7 +7398,7 @@ struct alignas(sizeof(T) * vec_size) vec_t
             }
             else
             {
-                data[i] = ck_tile::type_convert<T>(ck_tile::type_convert<float>(src[i]) / scale);
+                data[i] = static_cast<T>(static_cast<float>(src[i]) / scale);
             }
         }
     }
@@ -7428,12 +7428,12 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
 // Unlike warp_reduce_sum / half_warp_reduce_sum where opus::* only appears in
 // the body (and so can be hidden with #ifdef __HIP_DEVICE_COMPILE__ to keep
 // the host pass building), here opus::number<XorOffset> is a default
-// argument in the SIGNATURE — the signature is parsed in both passes, so
+// argument in the SIGNATURE -- the signature is parsed in both passes, so
 // it cannot be #ifdef'd. We use std::integral_constant<int, XorOffset>
 // instead (which doesn't need opus.hpp). Existing callers passing
 // opus::number<X>{} continue to work because opus::number<I> is publicly
 // derived from std::integral_constant<index_t, I> (csrc/include/opus/opus.hpp:57)
-// — pass-by-value slicing of the empty derived type to its empty base is a no-op.
+// -- pass-by-value slicing of the empty derived type to its empty base is a no-op.
 template <typename T, int vec_size, int XorOffset>
 __inline__ __device__ vec_t<T, vec_size>
 warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
@@ -7474,7 +7474,7 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 //
 // Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
 //   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
-// This is the standard RNE bias trick — adds 0x7FFF for normal rounding, plus the
+// This is the standard RNE bias trick -- adds 0x7FFF for normal rounding, plus the
 // 17-bit ("round") position to break ties to even.
 //
 // NaN handling differs from the ctor: the ctor preserves the NaN payload upper
@@ -7488,15 +7488,19 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 // mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
 // expansions, each of which serializes the warp via s_and_saveexec / s_xor /
 // s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
-// v_cvt_pk_bf16_f32 — not implemented here yet.
+// v_cvt_pk_bf16_f32 -- not implemented here yet.
 __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 {
     constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias
-    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN → BF16 0x7fff
+    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN -> BF16 0x7fff
     constexpr uint32_t MERGE_MASK = 0xffff0000u; // upper-half mask for and_or merge
     uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
     uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
     uint32_t result;
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+    // CDNA path: v_cmp_u_f32 with explicit SGPR dest + v_add3 + v_and_or_b32
     // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
     // We declare them as early-clobber outputs so the compiler doesn't alias them
     // with any input register.
@@ -7522,6 +7526,22 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
           [bias] "v"(ROUND_BIAS),
           [nan] "v"(FP32_NAN),
           [mmsk] "v"(MERGE_MASK));
+#else
+    // Portable path for RDNA and other archs that lack explicit-dest v_cmp
+    // and/or v_add3_u32. Implements the same RNE + NaN logic in C++.
+    auto rne_f32_to_bf16 = [](uint32_t bits) -> uint32_t {
+        // If NaN, return canonical BF16 NaN (0x7fff)
+        if (__builtin_expect((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0, 0))
+            return 0x7fffu;
+        // Round-to-nearest-even: add bias + lsb of target
+        uint32_t lsb = (bits >> 16) & 1u;
+        uint32_t rounded = bits + 0x7fffu + lsb;
+        return rounded >> 16;
+    };
+    uint32_t lo = rne_f32_to_bf16(a_bits);
+    uint32_t hi = rne_f32_to_bf16(b_bits);
+    result = lo | (hi << 16);
+#endif
     return result;
 }
 
@@ -7530,7 +7550,7 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 // scalar static_cast for other element types. N must be even.
 //
 // The bf16 path saves ~50% of the conversion cost relative to the default
-// per-element static_cast<bf16>(float) — see the comment on
+// per-element static_cast<bf16>(float) -- see the comment on
 // f32x2_to_bf16x2_rne above.
 template <typename T, int N>
 __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float (&src)[N])
@@ -7557,7 +7577,11 @@ __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float 
 
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
-warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)
+warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
+               vec_t<T, VEC_SIZE>& gamma,
+               float rms_dim,
+               float rms_eps,
+               bool gemma_norm = false)
 {
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
@@ -7567,13 +7591,14 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_d
         float v = (float)input[i];
         acc += v * v;
     }
-    // XOR butterfly leaves the same sum in every lane — no extra broadcast needed.
+    // XOR butterfly leaves the same sum in every lane -- no extra broadcast needed.
     acc        = block_utils::warp_reduce_sum<float>(acc);
     auto s_val = rsqrtf(acc / rms_dim + rms_eps);
 #pragma unroll
     for(int i = 0; i < VEC_SIZE; ++i)
     {
-        input[i] = static_cast<T>((float)input[i] * s_val * (float)gamma[i]);
+        const float weight = gemma_norm ? (1.0f + (float)gamma[i]) : (float)gamma[i];
+        input[i] = static_cast<T>((float)input[i] * s_val * weight);
     }
 }
 
@@ -7687,14 +7712,16 @@ __device__ __forceinline__ int64_t get_shuffle_layout_k_base(const int64_t slot_
                                                              const int num_heads_k,
                                                              const int head_id_k,
                                                              const int access_id_in_head,
-                                                             const int x)
+                                                             const int x,
+                                                             const int64_t k_block_stride)
 {
     // Shuffle layout: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     const int block_id      = static_cast<int>(slot_id / block_size);
     const int block_offset  = static_cast<int>(slot_id % block_size);
     const int k_head_stride = HEAD_SIZE * block_size;
-    const int64_t dst_base =
-        static_cast<int64_t>(block_id) * num_heads_k * k_head_stride + head_id_k * k_head_stride;
+    const int64_t k_per_block =
+        (k_block_stride != 0) ? k_block_stride : static_cast<int64_t>(num_heads_k) * k_head_stride;
+    const int64_t dst_base = static_cast<int64_t>(block_id) * k_per_block + head_id_k * k_head_stride;
     // Pre-compute K base offset: since VEC_SIZE <= x, all elements are in the same
     // chunk
     const int chunk_id     = access_id_in_head / x;
@@ -7710,14 +7737,16 @@ __device__ __forceinline__ int64_t get_shuffle_layout_v_base(const int64_t slot_
                                                              const int num_heads_v,
                                                              const int head_id_v,
                                                              const int access_id_in_head,
-                                                             const int x)
+                                                             const int x,
+                                                             const int64_t v_block_stride)
 {
     // Shuffle layout: [num_blocks, num_kv_heads, block_size // x, head_size, x]
     const int block_id      = static_cast<int>(slot_id / block_size);
     const int block_offset  = static_cast<int>(slot_id % block_size);
     const int v_head_stride = (block_size / x) * HEAD_SIZE * x;
-    const int64_t dst_base =
-        static_cast<int64_t>(block_id) * num_heads_v * v_head_stride + head_id_v * v_head_stride;
+    const int64_t v_per_block =
+        (v_block_stride != 0) ? v_block_stride : static_cast<int64_t>(num_heads_v) * v_head_stride;
+    const int64_t dst_base = static_cast<int64_t>(block_id) * v_per_block + head_id_v * v_head_stride;
     // Pre-compute V base offset (fixed for this token)
     const int v_slot_chunk    = block_offset / x;
     const int v_slot_in_chunk = block_offset % x;
@@ -7757,7 +7786,10 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           bool use_shuffle_layout  = false,
                                           int block_size           = 0,
                                           int x                    = 0,
-                                          int rotary_dim           = 0)
+                                          int rotary_dim           = 0,
+                                          int64_t k_block_stride   = 0,
+                                          int64_t v_block_stride   = 0,
+                                          bool gemma_norm          = false)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7854,7 +7886,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     cos_sin_vec.load(&cos_sin[position_ * rotary_dim_ + access_id_in_head]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
                 const int rotary_neighbor_offset = access_id_in_head < half_rotary
@@ -7933,7 +7965,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                         &cos_sin[position_ * rotary_dim_ + access_id_in_head / 2 + half_rotary]);
                 }
             }
-            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+            warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps, gemma_norm);
             if(in_rotary)
             {
 #pragma unroll
@@ -7970,13 +8002,31 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             if(use_shuffle_layout)
             {
                 int64_t k_base = get_shuffle_layout_k_base<HEAD_SIZE>(
-                    slot_id, block_size, num_heads_k, head_id_k, access_id_in_head, x);
+                    slot_id, block_size, num_heads_k, head_id_k, access_id_in_head, x, k_block_stride);
                 out_kv_vec.store(k_cache + k_base);
             }
             else
             {
-                const int64_t offset =
-                    (slot_id * num_heads_k + head_id_k) * HEAD_SIZE + access_id_in_head;
+                // block_size == 0 => non-paged cache (flat [num_slots, num_heads_k, HEAD_SIZE]):
+                // index directly by slot. Otherwise the cache is paged and K/V are interleaved
+                // per block, so index with the cache's real per-block stride (k_block_stride):
+                // offset = block_id*block_stride + block_offset*slot_size + head*HEAD_SIZE + elem
+                const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
+                int64_t offset;
+                if(block_size == 0)
+                {
+                    offset = slot_id * slot_size + head_id_k * HEAD_SIZE + access_id_in_head;
+                }
+                else
+                {
+                    const int block_id         = static_cast<int>(slot_id / block_size);
+                    const int block_offset     = static_cast<int>(slot_id % block_size);
+                    const int64_t block_stride = (k_block_stride != 0)
+                                                     ? k_block_stride
+                                                     : static_cast<int64_t>(block_size) * slot_size;
+                    offset = block_id * block_stride + block_offset * slot_size +
+                             head_id_k * HEAD_SIZE + access_id_in_head;
+                }
                 out_kv_vec.store(k_cache + offset);
             }
             if(k_out != nullptr)
@@ -8001,7 +8051,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         if(use_shuffle_layout)
         {
             int64_t v_base = get_shuffle_layout_v_base<HEAD_SIZE>(
-                slot_id, block_size, num_heads_v, head_id_v, access_id_in_head, x);
+                slot_id, block_size, num_heads_v, head_id_v, access_id_in_head, x, v_block_stride);
 #pragma unroll
             for(int i = 0; i < VEC_SIZE; ++i)
             {
@@ -8011,8 +8061,24 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
-            const int64_t offset =
-                (slot_id * num_heads_v + head_id_v) * HEAD_SIZE + access_id_in_head;
+            // Same scheme as the K path above, for the V cache.
+            // block_size == 0 => non-paged cache, index directly by slot.
+            const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            int64_t offset;
+            if(block_size == 0)
+            {
+                offset = slot_id * slot_size + head_id_v * HEAD_SIZE + access_id_in_head;
+            }
+            else
+            {
+                const int block_id         = static_cast<int>(slot_id / block_size);
+                const int block_offset     = static_cast<int>(slot_id % block_size);
+                const int64_t block_stride = (v_block_stride != 0)
+                                                 ? v_block_stride
+                                                 : static_cast<int64_t>(block_size) * slot_size;
+                offset                     = block_id * block_stride + block_offset * slot_size +
+                         head_id_v * HEAD_SIZE + access_id_in_head;
+            }
             out_kv_vec.store(v_cache + offset);
         }
         if(v_out != nullptr)
@@ -8025,6 +8091,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
     }
 }
 
+// mrope-3D launcher: intentionally relies on the default-0 (contiguous) block stride
+// in fused_mrope_rms_kv_kernel; the stride-aware path is the pts launcher below.
 template <typename T, int M, typename KVT>
 void fused_mrope_rms_set_kv(const T* qkv,
                             const T* q_w,
@@ -8054,7 +8122,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             bool use_shuffle_layout  = false,
                             int64_t block_size       = 0,
                             int64_t x                = 0,
-                            int64_t rotary_dim       = 0)
+                            int64_t rotary_dim       = 0,
+                            bool gemma_norm          = false)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
@@ -8100,7 +8169,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8130,7 +8202,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,          \
                                                         block_size,                  \
                                                         x,                           \
-                                                        (int)rotary_dim);            \
+                                                        (int)rotary_dim,             \
+                                                        (int64_t)0,                  \
+                                                        (int64_t)0,                  \
+                                                        gemma_norm);                 \
     }
 
     if(is_interleaved)
@@ -8182,7 +8257,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                            bool use_shuffle_layout  = false,
                            int64_t block_size       = 0,
                            int64_t x                = 0,
-                           int64_t rotary_dim       = 0)
+                           int64_t rotary_dim       = 0,
+                           int64_t k_block_stride   = 0,
+                           int64_t v_block_stride   = 0)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int THREAD_BLOCK_SIZE = 256;
@@ -8221,7 +8298,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,  \
                                                         block_size,          \
                                                         x,                   \
-                                                        (int)rotary_dim);    \
+                                                        (int)rotary_dim,     \
+                                                        k_block_stride,      \
+                                                        v_block_stride);     \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -8251,7 +8330,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,  \
                                                         block_size,          \
                                                         x,                   \
-                                                        (int)rotary_dim);    \
+                                                        (int)rotary_dim,     \
+                                                        k_block_stride,      \
+                                                        v_block_stride);     \
     }
 
     switch(head_size)

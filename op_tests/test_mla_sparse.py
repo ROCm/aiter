@@ -464,8 +464,8 @@ def test_mla(
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
         topk=2048,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
     )
 
     # generate kv topk per token & convert indices into per token

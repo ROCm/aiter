@@ -242,8 +242,6 @@ def cal_diff(
     x, y = x.double(), y.double()
     # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    # amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -443,24 +441,15 @@ def torch_mla_extend_split_kv(
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
     num_works = work_indptr[-1].item()
-    partial_os = []
-    partial_lses = []
+    partial_records = []  # (partial_qo_loc, o, lse) for kv-split (partial) works
     final_out = torch.empty(total_q, nheads, kv_lora_rank, dtype=dtype, device=dev)
     final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
 
     io_transformed = False
-    use_qseqlen_fold = False
     q_ratio = 1
     if (
         nheads == 16
         or (get_gfx() == "gfx942" and nheads == 128 and is_fp8_q and is_fp8_kvc)
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 128
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q != 4
-        )
         or (
             get_gfx() == "gfx950"
             and nheads == 128
@@ -481,14 +470,14 @@ def torch_mla_extend_split_kv(
             and nheads == 32
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q == 4
+            and max_seqlen_q == 2
         )
         or (
             get_gfx() == "gfx950"
             and nheads == 32
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q == 2
+            and max_seqlen_q == 1
         )
         or (
             get_gfx() == "gfx950"
@@ -505,7 +494,19 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 2
         )
         or (
+            # fp8/fp8 PS GQA catch-all -- mirrors aiter/mla.py / asm_mla.cu
             get_gfx() == "gfx950"
+            and is_fp8_q
+            and is_fp8_kvc
+            and (
+                (nheads == 32 and max_seqlen_q >= 4)
+                or (nheads == 64)
+                or (nheads == 128)
+            )
+        )
+        or (
+            # gfx942 native QH64 fp8/fp8 PS decode
+            get_gfx() == "gfx942"
             and nheads == 64
             and is_fp8_q
             and is_fp8_kvc
@@ -519,29 +520,11 @@ def torch_mla_extend_split_kv(
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
         ori_nheads = nheads
-        use_qseqlen_fold = (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and (
-                (max_seqlen_q * (nheads // 16)) == 4
-                or (nheads == 64 and max_seqlen_q == 2)
-            )
-        )
 
-        if use_qseqlen_fold and nheads == 64 and max_seqlen_q == 2:
-            fold_factor = nheads // 32
-            nheads = 32
-        else:
-            fold_factor = nheads // 16
-            nheads = 16
-
+        fold_factor = nheads // 16
+        nheads = 16
         total_s = total_q * fold_factor
-        if use_qseqlen_fold:
-            max_seqlen_q = max_seqlen_q * fold_factor
-            q_ratio = 1
-            q = q.view(total_s, nheads, -1)
-        elif max_seqlen_q == 1:
+        if max_seqlen_q == 1:
             q_ratio = fold_factor
             q = q.view(total_s, nheads, -1)
         else:
@@ -620,19 +603,24 @@ def torch_mla_extend_split_kv(
             final_out[qo_start:qo_end, :, :] = o
             final_lse[qo_start:qo_end, :] = lse.transpose(0, 1)  # [seq_q, num_heads]
         else:
-            partial_os.append(o)
-            partial_lses.append(lse)
+            partial_records.append((partial_qo_loc, o, lse))
 
-    partial_o = (
-        torch.concat(partial_os)
-        if partial_os
-        else torch.empty(0, nheads, qk_rope_head_dim, dtype=torch.float32, device=dev)
-    )
-    partial_lse = (
-        torch.concat(partial_lses, dim=1).transpose(0, 1)
-        if partial_lses
-        else torch.empty(0, nheads, dtype=torch.float32, device=dev)
-    )
+    if partial_records:
+        dv = partial_records[0][1].shape[-1]
+        buf_rows = max(loc + o.shape[0] for loc, o, _ in partial_records)
+        partial_o = torch.zeros(buf_rows, nheads, dv, dtype=torch.float32, device=dev)
+        partial_lse = torch.full(
+            (buf_rows, nheads), float("-inf"), dtype=torch.float32, device=dev
+        )
+        for loc, o, lse in partial_records:
+            n = o.shape[0]
+            partial_o[loc : loc + n] = o.to(torch.float32)
+            partial_lse[loc : loc + n] = lse.transpose(0, 1).to(torch.float32)
+    else:
+        partial_o = torch.empty(
+            0, nheads, kv_lora_rank, dtype=torch.float32, device=dev
+        )
+        partial_lse = torch.empty(0, nheads, dtype=torch.float32, device=dev)
     partial_o = torch.where(
         torch.isnan(partial_o), torch.zeros_like(partial_o), partial_o
     )
@@ -643,14 +631,7 @@ def torch_mla_extend_split_kv(
         partial_lse,
     )
 
-    return (
-        partial_o,
-        partial_lse,
-        final_out,
-        final_lse,
-        io_transformed,
-        use_qseqlen_fold,
-    )
+    return (partial_o, partial_lse, final_out, final_lse, io_transformed)
 
 
 def torch_mla_reduce_v1(
@@ -824,7 +805,7 @@ def torch_mla_split_kv_and_reduce(
     kv_scale=None,
 ):
     total_q, nhead, _ = q.shape
-    partial_out, partial_lse, split_out, split_lse, io_transformed, use_qseqlen_fold = (
+    partial_out, partial_lse, split_out, split_lse, io_transformed = (
         torch_mla_extend_split_kv(
             q,
             kv_cache,
@@ -858,7 +839,7 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        if max_seqlen_q == 1 or use_qseqlen_fold:
+        if max_seqlen_q == 1:
             split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
             split_lse = split_lse.reshape(total_q, nhead)
         else:
@@ -1142,14 +1123,23 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
         page_size=page_size,
-        kv_granularity=max(page_size, 16),  # for qh32 kv split is disabled
+        kv_granularity=max(
+            page_size,
+            # QH64 fp8/fp8 native PS kernel is a SUB_KV=32 partial producer; 16-token
+            # works trip its multi-pass path (see asm/mla_a8w8_qh64_ps*.py SUB_KV=32).
+            (
+                32
+                if (nhead == 64 and dtype == dtypes.fp8 and kvtype == dtypes.fp8)
+                else 16
+            ),
+        ),  # for qh32 kv split is disabled
         max_seqlen_qo=int(max_seqlen_qo),
         uni_seqlen_qo=decode_qlen,
         fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
@@ -1179,7 +1169,7 @@ def test_mla(
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
     # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:work_indptr[-1].item()]=}")
+    # print(f"{work_info_set[:32]}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1794,7 +1784,6 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
     df = []

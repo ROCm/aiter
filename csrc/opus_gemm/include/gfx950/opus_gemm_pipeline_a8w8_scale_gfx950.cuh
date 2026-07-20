@@ -178,6 +178,7 @@ inline __device__ auto make_layout_sfa(int lane_id, int wave_id_m, int stride_sf
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -540,5 +541,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
     store<T::VEC_C>(g_c, v_c[0][1], u_gc, c_offset(0, 1));
     store<T::VEC_C>(g_c, v_c[1][0], u_gc, c_offset(1, 0));
     store<T::VEC_C>(g_c, v_c[1][1], u_gc, c_offset(1, 1));
+#else
+    // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host
+    // launcher symbol must still exist for the unconditional dispatcher
+    // reference, but the body uses gfx950-only intrinsics.
+#endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }

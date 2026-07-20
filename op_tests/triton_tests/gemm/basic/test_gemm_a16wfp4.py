@@ -5,7 +5,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     gemm_a16wfp4_preshuffle,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
 from aiter.ops.shuffle import shuffle_weight
 
 # Note this is specified by the HW and cannot be changed.
@@ -65,7 +65,10 @@ def generate_gemm_a16wfp4_inputs(
             w.shape[1] * weight_shuffle_layout[0],
         )
 
-        w_scales_shuffled = shuffle_scales(w_scales)
+        # CDNA4-only triton kernel -> always the gfx950 scale layout.
+        w_scales_shuffled = shuffle_scale_gemm(
+            w_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
     else:
         w_shuffed = w
         w_scales_shuffled = w_scales

@@ -13,8 +13,8 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
-    swizzle_scales,
 )
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -265,7 +265,9 @@ def test_op(
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
         swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        w_scale_tri = shuffle_scale_moe(
+            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
     else:
         swizzle_mx_scale = None
 

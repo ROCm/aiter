@@ -24,7 +24,9 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> num_local_tokens,
                           std::optional<aiter_tensor_t> workspace,
                           int dispatch_policy,
-                          std::optional<aiter_tensor_t> local_topk_ids)
+                          std::optional<aiter_tensor_t> local_topk_ids,
+                          std::optional<aiter_tensor_t> m_indices,
+                          std::optional<aiter_tensor_t> reverse_sorted)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
@@ -70,6 +72,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          moe_buf.data_ptr(),
          ws_ptr,
          local_topk_ids.has_value() ? local_topk_ids.value().data_ptr() : nullptr,
+         m_indices.has_value() ? m_indices.value().data_ptr() : nullptr,
+         reverse_sorted.has_value() ? reverse_sorted.value().data_ptr() : nullptr,
          num_tokens,
          unit_size,
          num_experts,

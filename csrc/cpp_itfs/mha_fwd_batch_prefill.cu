@@ -49,7 +49,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     int head_size_q  = args.hdim_q;
     int head_size_v  = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
-    bool has_sink    = args.sink_size > 0;
+    bool has_sink    = args.sink_size > 0 || args.sink_ptr != nullptr;
 
     // The kUseGlobalLoad decision (>2GB KV cache → use `global_load_lds_*`
     // instead of SRD `buffer_load_*`) is made per-arm inside the auto-generated

@@ -99,10 +99,13 @@ def test_allreduce_quick(
     dtype,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    quantization: str = "INT4",
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
-    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    # Quantization regime: FP / FP8 / INT6 / INT4 / INT3 / NONE.
+    # INT3 is only supported on TP2 (world_size == 2).
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = quantization
     pool = Pool(processes=tp_size)
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
@@ -167,7 +170,7 @@ def qr_variable_input(rank, world_size):
             s2 = 2048
             inp1 = torch.ones((s1, s2), dtype=dtype, device=torch.cuda.current_device())
         result = torch.empty_like(inp1)
-        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 NONE = 4
+        # FP = 0 FP8 = 1 INT6 = 2 INT4 = 3 INT3 = 4 NONE = 5
         ops.qr_all_reduce(_ptr, inp1, result, 3, cast_bf2half=True)
         try:
             if inp1[0, 0] == 0:
@@ -254,6 +257,21 @@ if __name__ == "__main__":
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),
+            )
+
+    # INT3 quantization is only supported on TP2 (world_size == 2).
+    for dtype in l_dtype:
+        for shape in l_shape:
+            test_allreduce_quick(
+                2,
+                1,
+                shape,
+                dtype,
+                withGraph=False,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+                quantization="INT3",
             )
 
     # check variable input for qr

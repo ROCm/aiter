@@ -342,6 +342,9 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     float* group_scores = reinterpret_cast<float*>(ptr);
     ptr += NUM_GRP * sizeof(float);
 
+    float* sig_scores = reinterpret_cast<float*>(ptr);
+    if constexpr(isBiased)
+        ptr += num_experts * sizeof(float);
     // float* bias = reinterpret_cast<float*>(ptr);
     // ptr += num_experts * sizeof(float);
 
@@ -357,6 +360,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
     f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
+    f32vec* sig_vec               = reinterpret_cast<f32vec*>(sig_scores);
     using cktype_i                = typename t2opus<DTYPE_I>::type;
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
@@ -373,22 +377,22 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             if constexpr(isBiased)
                 tmp2 = reinterpret_cast<vec_i const*>(correction_bias)[e];
             f32vec gating;
+            f32vec sig;
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
                 gating[i] = static_cast<float>(tmp[i]);
-                gating[i] = 1.0f / (1.0f + expf(-gating[i]));
+                gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
                 if constexpr(isBiased)
                 {
+                    sig[i] = gating[i]; // pre-bias sigmoid = routing weight
                     tmp2_f32[i] = static_cast<float>(tmp2[i]);
                     gating[i] += tmp2_f32[i];
                 }
             }
             scores_vec[e] = gating;
-            // if constexpr(isBiased)
-            // {
-            //     reinterpret_cast<f32vec*>(bias)[e] = tmp2_f32;
-            // }
+            if constexpr(isBiased)
+                sig_vec[e] = sig;
         }
         __syncthreads();
     }
@@ -577,7 +581,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             // max_idx = result_kvp.key;
             if constexpr(isBiased)
             {
-                max_val -= correction_bias[max_idx];
+                max_val = sig_scores[max_idx];
                 // max_val -= bias[max_idx];
             }
             scores[max_idx] = -INFINITY;
@@ -1244,7 +1248,8 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
-    size_t shared_mem_size = (num_experts * sizeof(float) + num_expert_group * sizeof(float));
+    size_t shared_mem_size =
+        (2 * num_experts * sizeof(float) + num_expert_group * sizeof(float)); // additional buf for sig_scores
     shared_mem_size += !use_opt_sort
                            ? 0
                            : (num_expert_group * sizeof(int) /*group_map_idx*/

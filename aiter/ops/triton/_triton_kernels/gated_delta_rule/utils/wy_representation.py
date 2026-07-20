@@ -13,7 +13,10 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import autotune_cache_kwargs
+from ..gated_delta_rule_utils import (
+    autotune_cache_kwargs,
+    gated_delta_rule_autotune_configs,
+)
 from .index import prepare_chunk_indices
 from .op import exp
 
@@ -153,11 +156,14 @@ def chunk_scaled_dot_kkt_fwd(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ],
+        triton.Config({}, num_warps=2, num_stages=2),
+    ),
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )

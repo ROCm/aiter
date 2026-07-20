@@ -44,7 +44,12 @@ def ensure_spawn_method():
 
 
 def perftest(
-    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=101,
+    num_warmup=2,
+    testGraph=False,
+    num_rotate_args=0,
+    needTrace=False,
+    use_cuda_event=False,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -70,7 +75,7 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if int(os.environ.get("AITER_LOG_MORE", 0)):
+            if int(os.environ.get("AITER_LOG_MORE", 0)) or use_cuda_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -83,6 +88,8 @@ def perftest(
                     torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
+                if use_cuda_event:
+                    return data, avg
 
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
@@ -202,6 +209,7 @@ def run_perftest(
     testGraph=False,
     num_rotate_args=0,
     needTrace=False,
+    use_cuda_event=False,
     **kwargs,
 ):
     @perftest(
@@ -210,6 +218,7 @@ def run_perftest(
         testGraph=testGraph,
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
+        use_cuda_event=use_cuda_event,
     )
     def worker(*args, **kwargs):
         return func(*args, **kwargs)

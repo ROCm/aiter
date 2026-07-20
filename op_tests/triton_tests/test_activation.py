@@ -2,10 +2,7 @@ import torch
 import torch.nn.functional as F
 import pytest
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    shuffle_scales,
-    un_shuffle_scales,
-)
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -52,7 +49,9 @@ def torch_act_mul_and_mxfp4_quant(
             (scaleM, scaleN), dtype=out_scale.dtype, device=out_scale.device
         )
         out_scale_pad[:M, :scaleN] = out_scale[:M, :scaleN]
-        out_scale = shuffle_scales(out_scale_pad)
+        out_scale = shuffle_scale_gemm(
+            out_scale_pad, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
     return out, out_scale
 
@@ -123,11 +122,11 @@ def test_act_mul_and_mxfp4_quant(
     )
 
     if shuffle:
-        triton_scale = un_shuffle_scales(
-            triton_scale.view(triton_scale.shape[0] // 32, -1)
+        triton_scale = unshuffle_scale_gemm(
+            triton_scale.view(triton_scale.shape[0] // 32, -1), arch="gfx950"
         )
-        torch_scale = un_shuffle_scales(
-            torch_scale.view(torch_scale.shape[0] // 32, -1)
+        torch_scale = unshuffle_scale_gemm(
+            torch_scale.view(torch_scale.shape[0] // 32, -1), arch="gfx950"
         )
 
     if DEBUG_MODE:

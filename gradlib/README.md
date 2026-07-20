@@ -22,28 +22,51 @@ AITER_TUNE_GEMM=1 python {workload_tests}
 Captured shapes are written to `aiter/configs/bf16_untuned_gemm.csv`.
 
 ### 2) Tune GEMMs
-Run the tuner:
+
+The multi-backend tuner lives at `csrc/gemm_a16w16/gemm_a16w16_tune.py` and supports
+asm, opus, flydsl, triton, skinny, torch, and hipblaslt (opt-in) backends:
 
 ```bash
-python3 gradlib/gradlib/gemm_tuner.py \
+python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
   --tuned_file aiter/configs/bf16_tuned_gemm.csv \
   --input_file aiter/configs/bf16_untuned_gemm.csv
 ```
+
+To tune with a specific backend:
+
+```bash
+# opus only
+python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
+  --input_file aiter/configs/bf16_untuned_gemm.csv \
+  --libtype opus
+
+# all backends including hipblaslt (opt-in, requires gradlib)
+python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
+  --input_file aiter/configs/bf16_untuned_gemm.csv \
+  --with-hipblaslt
+
+# hipblaslt only
+python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
+  --input_file aiter/configs/bf16_untuned_gemm.csv \
+  --libtype hipblaslt --with-hipblaslt
+```
+
+The legacy hipblaslt-only tuner is still available at `gradlib/gradlib/gemm_tuner.py`.
 
 Tuned results are saved to `aiter/configs/bf16_tuned_gemm.csv`.
 
 Example columns:
 
-|**cu_num**|**M**|**N**|**K**|**bias**|**dtype**|**outdtype**|**scaleAB**|**bpreshuffle**|**libtype**|**solidx**|**splitK**|**soltimes**|**kernelName**|**tflops**|**bw**|
-|----------|-----|-----|-----|--------|---------|-----------|-----------|---------------|-----------|----------|----------|------------|--------------|----------|------|
-|80|128|1536|7168|False|torch.bfloat16|torch.float32|False|False|hipblaslt|667788|0|10.6|xxxxxxx|xx|xx|
+|**cu_num**|**M**|**N**|**K**|**bias**|**dtype**|**outdtype**|**scaleAB**|**bpreshuffle**|**libtype**|**solidx**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|
+|----------|-----|-----|-----|--------|---------|-----------|-----------|---------------|-----------|----------|----------|------|--------------|----------|------|
+|80|128|1536|7168|False|torch.bfloat16|torch.float32|False|False|asm|5|2|10.6|bf16gemm_fp32bf16_tn_64x64_splitk_clean|xx|xx|
 
 Notes:
 - `cu_num`: compute units for current GPU.
 - `bpreshuffle`: whether weight is shuffled.
 - `dtype`: input dtype (`hipblaslt` supports fp8/bf16/fp16; asm/triton supports bf16/fp16).
-- `libtype`: kernel backend (`hipblaslt` / `rocblas` / `asm` / `triton`).
-- `splitK`: valid when `libtype == asm`.
+- `libtype`: kernel backend (`asm` / `opus` / `flydsl` / `triton` / `skinny` / `torch` / `hipblaslt`).
+- `splitK`: split-K factor (backend-dependent).
 - `tflops`: throughput in TFLOPS.
 - `bw`: bandwidth in GB/s.
 
@@ -74,6 +97,29 @@ After tuning, run your model/tests as usual.
 ```
 
 ### Tuning Configuration
+
+#### `--libtype`
+- **Type**: String (comma-separated list)
+- **Default**: `all`
+- **Description**: Choose which backends to tune: `all`, `asm`, `opus`, `flydsl`, `triton`, `skinny`, `torch`, `hipblaslt`. `hipblaslt` requires `--with-hipblaslt`.
+
+**Example**:
+```bash
+--libtype asm
+--libtype opus,flydsl
+--libtype hipblaslt --with-hipblaslt
+```
+
+#### `--with-hipblaslt`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Include hipblaslt in tuning (disabled by default). hipblaslt tuning is also available standalone via `gradlib/gradlib/gemm_tuner.py`.
+
+#### `--outdtype`
+- **Type**: String
+- **Default**: None (uses CSV column value or bf16)
+- **Choices**: `f32`, `f16`, `bf16`, `fp8`
+- **Description**: Output dtype override.
 
 #### `--errRatio`
 - **Type**: Float
@@ -118,12 +164,12 @@ After tuning, run your model/tests as usual.
 **Examples**:
 ```bash
 # benchmark tuned kernels from specified tuned config
-python3 gradlib/gradlib/gemm_tuner.py \
+python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
   --input_file aiter/configs/bf16_untuned_gemm.csv \
   --run_config aiter/configs/bf16_tuned_gemm.csv
 
 # benchmark default kernels using shapes from --input_file
-python3 gradlib/gradlib/gemm_tuner.py \
+python3 csrc/gemm_a16w16/gemm_a16w16_tune.py \
   --input_file aiter/configs/bf16_untuned_gemm.csv \
   --run_config
 ```
@@ -179,4 +225,3 @@ export HIP_ONLINE_TUNING=1
 ```
 
 The one-time overhead can take several minutes. Results are saved to `hip_online_tuning_res.csv`.
-

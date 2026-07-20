@@ -228,6 +228,29 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
+def test_fused_add_rmsnorm_gemma_norm(in_dtype_str):
+    in_dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+
+    M, N = 4, 1024
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    weight = torch.randn(N, device="cuda", dtype=in_dtype)
+    res = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    residual_out = torch.empty_like(x)
+    output = torch.empty_like(x)
+
+    aiter.rmsnorm2d_fwd_with_add(
+        output, x, res, residual_out, weight, 1e-5, gemma_norm=True
+    )
+
+    ref_residual = x + res
+    ref_output = torch_rmsnorm(ref_residual, weight + 1, in_dtype, 1e-5)
+
+    torch.testing.assert_close(residual_out, ref_residual, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
 @pytest.mark.parametrize(

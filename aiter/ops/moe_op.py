@@ -5,7 +5,7 @@ import torch
 from torch import Tensor
 from typing import Optional
 from ..jit.core import compile_ops, AITER_CSRC_DIR
-from .enum import ActivationType, Enum, QuantType
+from .enum import ActivationType, QuantType
 from ..utility import dtypes
 import functools
 
@@ -36,7 +36,7 @@ def topk_softmax_asm(
 ) -> None: ...
 
 
-@compile_ops("module_moe_topk")
+@compile_ops("module_moe_topk_ck")
 def topk_sigmoid(
     topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
 ) -> None: ...

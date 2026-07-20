@@ -48,7 +48,6 @@ HIDE_DISPLAY_COLS = (
     "preshuffle",
     "strict_accuracy",
     "check_aot_cache",
-    "swiglu_limit",
     # Source cols folded into derived `hip` column below
     "hidden_pad",
     "intermediate_pad",

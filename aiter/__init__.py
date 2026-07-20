@@ -58,14 +58,20 @@ def getLogger():
 
 logger = getLogger()
 AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
+# Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
+# JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
+# env var, e.g. Triton-backend users with no C++ toolchain or CK.
+AITER_TRITON_ONLY = (
+    os.getenv("AITER_TRITON_ONLY", "0") == "1" or sys.platform == "win32"
+)
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
 _flydsl_cache = os.path.join(os.path.dirname(__file__), "jit", "flydsl_cache")
 if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ:
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = _flydsl_cache
 
-if sys.platform == "win32":
-    logger.info("Windows: CK and HIP ops are not available. Triton ops only.")
+if AITER_TRITON_ONLY:
+    logger.info("Triton ops only: CK and HIP ops (and their JIT build) are skipped.")
 elif AITER_AOT_IMPORT:
     from .jit import core as core  # noqa: E402
 else:
@@ -86,6 +92,7 @@ else:
     from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
     from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
     from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
+    from .ops.gemm_op_a8w4 import *  # noqa: F403,E402
     from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
     from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
     from .ops.deepgemm import *  # noqa: F403,E402
@@ -99,6 +106,7 @@ else:
     from .ops.moe_op import *  # noqa: F403,E402
     from .ops.moe_sorting import *  # noqa: F403,E402
     from .ops.moe_sorting_opus import *  # noqa: F403,E402
+    from .ops.moe_mxfp4_aux import *  # noqa: F403,E402
     from .ops.pa_sparse_prefill_opus import *  # noqa: F403,E402
     from .ops.pos_encoding import *  # noqa: F403,E402
     from .ops.cache import *  # noqa: F403,E402
@@ -112,11 +120,14 @@ else:
     from .ops.trans_ragged_layout import *  # noqa: F403,E402
     from .ops.sample import *  # noqa: F403,E402
     from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
+    from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401,E402
+        fused_qknorm_idxrqknorm,
+    )
     from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
     from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
     from .ops.groupnorm import *  # noqa: F403,E402
     from .ops.mhc import *  # noqa: F403,E402
-    from .ops.causal_conv1d import *  # noqa: F403,E402
+    from .ops.causal_conv1d_update import *  # noqa: F403,E402
     from .ops.fused_split_gdr_update import *  # noqa: F403,E402
     from . import mla  # noqa: F403,F401,E402
 

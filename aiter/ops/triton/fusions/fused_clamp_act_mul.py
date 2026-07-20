@@ -25,6 +25,9 @@ def fused_clamp_act_mul(
     weights: Optional[torch.Tensor] = None,
     dtype_quant: torch.dtype | None = None,
     transpose_scale: bool = False,
+    quant_block_size: int = 128,
+    scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
+    shuffle_scale: bool = False,
 ):
     """
     Fused clamp (SwiGLU-style) + act(gate) * up + optional weights, with optional FP8 group quant.
@@ -54,6 +57,26 @@ def fused_clamp_act_mul(
 
     HAS_QUANT = dtype_quant is not None
 
+    assert scale_dtype_fmt in ("fp32", "ue8m0")
+    if scale_dtype_fmt == "ue8m0":
+        assert HAS_QUANT, "scale_dtype_fmt='ue8m0' requires dtype_quant"
+        assert (
+            quant_block_size == 32
+        ), f"ue8m0 requires quant_block_size=32 got {quant_block_size}"
+        assert dtype_quant in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ), f"ue8m0 requires fp8 e4m3, got {dtype_quant}"
+        assert not (
+            shuffle_scale and transpose_scale
+        ), "shuffle_scale incompatible with transpose_scale"
+        _scale_storage_dtype = torch.uint8
+    else:
+        assert (
+            not shuffle_scale
+        ), "shuffle_scale only valid with scale_dtype_fmt='ue8m0'"
+        _scale_storage_dtype = torch.float32
+
     if HAS_QUANT:
         if out is None:
             out = torch.empty((M, n_half), dtype=dtype_quant, device=inp.device)
@@ -65,15 +88,29 @@ def fused_clamp_act_mul(
                     dtype_quant,
                     out.dtype,
                 )
-        num_blocks = (n_half + 127) // 128
-        if scale is None:
+        num_blocks = (n_half + quant_block_size - 1) // quant_block_size
+        if shuffle_scale:
+            # Scales are preshuffled inside the kernel (see e8m0_shuffle /
+            # aiter.ops.shuffle.shuffle_scale): rows padded to a multiple of 256
+            # and block-cols to a multiple of 8, written in the tiled layout.
+            scale_m_pad = (M + 255) // 256 * 256
+            scale_n_pad = (num_blocks + 7) // 8 * 8
+            if scale is None:
+                scale = torch.empty(
+                    (scale_m_pad, scale_n_pad),
+                    dtype=_scale_storage_dtype,
+                    device=inp.device,
+                )
+            else:
+                assert scale.shape == (scale_m_pad, scale_n_pad)
+        elif scale is None:
             if transpose_scale:
                 scale = torch.empty(
-                    (num_blocks, M), dtype=torch.float32, device=inp.device
+                    (num_blocks, M), dtype=_scale_storage_dtype, device=inp.device
                 )
             else:
                 scale = torch.empty(
-                    (M, num_blocks), dtype=torch.float32, device=inp.device
+                    (M, num_blocks), dtype=_scale_storage_dtype, device=inp.device
                 )
         else:
             if transpose_scale:
@@ -121,8 +158,16 @@ def fused_clamp_act_mul(
 
     HAVE_SWIGLU_CLAMP = swiglu_limit > 0
 
+    scale_n_pad = 0
     if HAS_QUANT:
-        if transpose_scale:
+        if shuffle_scale:
+            # Kernel writes directly into the (scale_m_pad, scale_n_pad) buffer
+            # using the shuffled offset, so the plain row/col strides are unused.
+            scale_row_stride = scale.stride(0)
+            scale_col_stride = scale.stride(1)
+            num_bs_cols = scale.shape[1]
+            scale_n_pad = scale.shape[1]
+        elif transpose_scale:
             scale_row_stride = scale.stride(1)
             scale_col_stride = scale.stride(0)
             num_bs_cols = scale.shape[0]
@@ -153,7 +198,8 @@ def fused_clamp_act_mul(
         weights.stride(1) if HAVE_WEIGHTS else 0,
         swiglu_limit,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=128,
+        QUANT_BLOCK_SIZE=quant_block_size,
+        SCALE_FMT=scale_dtype_fmt,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         HAVE_WEIGHTS=HAVE_WEIGHTS,
@@ -161,6 +207,8 @@ def fused_clamp_act_mul(
         HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
         HAS_QUANT=HAS_QUANT,
         ACTIVATION=activation,
+        SHUFFLE=shuffle_scale,
+        SCALE_N_PAD=scale_n_pad,
         num_warps=num_warps,
     )
 

@@ -16,12 +16,23 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
-    _pa_decode_sparse,
-    _pa_decode_sparse_reduce,
+    _pa_decode_sparse as triton_pa_decode_sparse,
+    _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse as gluon_pa_decode_sparse,
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
+
+DEVICE_ARCH = arch_info.get_arch()
 
 _LOGGER = AiterTritonLogger()
+
+
+_FP8_GROUP_SIZE = 64
+_FP8_DTYPE = torch.float8_e4m3fnuz
 
 
 def pa_decode_sparse(
@@ -31,8 +42,12 @@ def pa_decode_sparse(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    kv_scales: Optional[torch.Tensor] = None,
     block_h: Optional[int] = None,
     kv_splits: Optional[int] = None,
+    has_invalid: Optional[bool] = True,
+    skip_reduce: Optional[bool] = False,
+    USE_EXP2: Optional[bool] = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -51,9 +66,19 @@ def pa_decode_sparse(
             auto-infers to fill ~512 total CTAs while capping below the number
             of K-blocks, then rounds up to a power of 2.
         num_stages: software-pipeline depth of the K loop (default 2).
+        skip_reduce: when the split-K path is active (``kv_splits > 1``), return
+            the pre-reduce ``(acc_partial, m_partial, l_partial)`` partials
+            instead of launching the reduce kernel. Has no effect when
+            ``kv_splits == 1`` (the single-CTA path already produces the final
+            ``out`` directly). Useful for profiling the main kernel in
+            isolation and for callers that fold the reduce into a downstream op.
 
     Returns:
-        ``[N, H, D]`` attention output, same dtype as ``q``.
+        ``[N, H, D]`` attention output, same dtype as ``q``. When
+        ``skip_reduce`` is set and ``kv_splits > 1`` instead returns the tuple
+        ``(acc_partial, m_partial, l_partial)`` with shapes
+        ``([N, KV_SPLITS, H_padded, D], [N, KV_SPLITS, H_padded],
+        [N, KV_SPLITS, H_padded])`` (all fp32).
 
     Optimizations targeted:
       (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA →
@@ -66,10 +91,31 @@ def pa_decode_sparse(
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
-    if unified_kv.dtype != q.dtype:
-        raise RuntimeError(
-            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+
+    quant_kv = kv_scales is not None
+    if quant_kv:
+        assert unified_kv.dtype == _FP8_DTYPE, (
+            f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
+            f"expected {_FP8_DTYPE}"
         )
+        assert (
+            kv_scales.dtype == torch.float32
+        ), f"kv_scales must be fp32, got {kv_scales.dtype}"
+        D_check = unified_kv.shape[-1]
+        assert (
+            D_check % _FP8_GROUP_SIZE == 0
+        ), f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
+        expected_g = D_check // _FP8_GROUP_SIZE
+        assert kv_scales.shape == (unified_kv.shape[0], expected_g), (
+            f"kv_scales shape {tuple(kv_scales.shape)} does not match "
+            f"expected ({unified_kv.shape[0]}, {expected_g})"
+        )
+        assert kv_scales.is_contiguous()
+    else:
+        if unified_kv.dtype != q.dtype:
+            raise RuntimeError(
+                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+            )
 
     T, H, D = q.shape
     _LOGGER.info(
@@ -77,13 +123,15 @@ def pa_decode_sparse(
     )
 
     out = torch.empty_like(q)
-    kv_indices = kv_indices.to(torch.int32).contiguous()
-    kv_indptr = kv_indptr.to(torch.int32).contiguous()
+    assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
+    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
+    # kv_indices = kv_indices.to(torch.int32).contiguous()
+    # kv_indptr = kv_indptr.to(torch.int32).contiguous()
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
         # If H is too large to fit a single tile, halve until it does.
-        block_h = triton.next_power_of_2(min(H, 64))
+        block_h = triton.next_power_of_2(min(H, 16))
     else:
         block_h = triton.next_power_of_2(block_h)
     block_h = max(block_h, 16)  # AMD MFMA min tile
@@ -91,11 +139,29 @@ def pa_decode_sparse(
     n_head_blocks = triton.cdiv(H, block_h)
     h_padded = n_head_blocks * block_h
     block_d = triton.next_power_of_2(D)
-    block_k = 16 if D >= 256 else 32
+    assert block_d == D
+
+    use_gluon = DEVICE_ARCH == "gfx1250"
+
+    # gfx1250 stages slots through LDS via TDM async_load, which hides the
+    # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
+    # arches use the synchronous slot path, where 32 exposes memory latency.
+    if use_gluon:
+        block_k = 16
+        attn_num_warps = 1
+        max_num_wg = 1024
+    else:
+        block_k = 16 if D >= 256 else 32
+        attn_num_warps = 4
+        max_num_wg = 256
     num_stages = 2
-    attn_num_warps = 4
-    waves_per_eu = 0
-    reduce_num_warps = 4
+    waves_per_eu = 1
+    # gluon reduce with BLOCK_H=1 keeps KV_SPLITS and BLOCK_H entirely
+    # in-thread; a single warp suffices and avoids shared-memory layout
+    # mismatches between 2D (m/l) and 3D (acc) loads.
+    reduce_num_warps = 1 if use_gluon else 4
+    reduce_waves_per_eu = 4 if use_gluon else 1
+    USE_EXP2 = True
 
     # Infer KV_SPLITS from inputs when caller doesn't override.
     # Fill ~512 total CTAs (MI300X has 304 CUs) while never splitting K into
@@ -103,46 +169,84 @@ def pa_decode_sparse(
     # reduce kernel's tl.arange(0, KV_SPLITS) compiles; over-splitting past
     # max_kv_splits is handled by the kernel (empty splits early-return and
     # the reduce masks their stale partial-buffer slots).
+    # print(f"{kv_indices.shape[0]=}")
     if kv_splits is None:
         max_kv_len = kv_indices.shape[0]
-        max_num_wg = 512
         max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
 
-    m_partial = torch.empty(
-        (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
-    )
-    l_partial = torch.empty_like(m_partial)
-    acc_partial = torch.empty(
-        (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
-    )
+    if use_gluon:
+        if kv_splits > 8:
+            reduce_num_warps = 4
+            reduce_waves_per_eu = 1
+
+    if kv_splits == 1:
+        m_partial = l_partial = acc_partial = out  # unused inside the kernel
+        mp_strides = (0, 0, 0)
+        lp_strides = (0, 0, 0)
+        ap_strides = (0, 0, 0, 0)
+    else:
+        m_partial = torch.empty(
+            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+        )
+        l_partial = torch.empty_like(m_partial)
+        acc_partial = torch.empty(
+            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+        )
+        mp_strides = m_partial.stride()
+        lp_strides = l_partial.stride()
+        ap_strides = acc_partial.stride()
+
+    if quant_kv:
+        kv_scales_arg = kv_scales
+        ks_stride_n_arg = kv_scales.stride(0)
+        num_groups_arg = D // _FP8_GROUP_SIZE
+    else:
+        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
+        ks_stride_n_arg = 1
+        num_groups_arg = 1
+
+    if use_gluon:
+        impl = gluon_pa_decode_sparse
+        reduce_impl = gluon_pa_decode_sparse_reduce
+    else:
+        impl = triton_pa_decode_sparse
+        reduce_impl = triton_pa_decode_sparse_reduce
 
     grid_attn = (T, n_head_blocks, kv_splits)
-    _pa_decode_sparse[grid_attn](
+    impl[grid_attn](
         q,
         unified_kv,
+        kv_scales_arg,
         kv_indices,
         kv_indptr,
         m_partial,
         l_partial,
         acc_partial,
+        attn_sink,
+        out,
+        unified_kv.shape[0],
         q.stride(0),
         q.stride(1),
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
-        m_partial.stride(0),
-        m_partial.stride(1),
-        m_partial.stride(2),
-        l_partial.stride(0),
-        l_partial.stride(1),
-        l_partial.stride(2),
-        acc_partial.stride(0),
-        acc_partial.stride(1),
-        acc_partial.stride(2),
-        acc_partial.stride(3),
+        ks_stride_n_arg,
+        mp_strides[0],
+        mp_strides[1],
+        mp_strides[2],
+        lp_strides[0],
+        lp_strides[1],
+        lp_strides[2],
+        ap_strides[0],
+        ap_strides[1],
+        ap_strides[2],
+        ap_strides[3],
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
         H,
         D,
         kv_splits,
@@ -150,10 +254,23 @@ def pa_decode_sparse(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        HAS_INVALID=has_invalid,
+        QUANT_KV=quant_kv,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        NUM_GROUPS=num_groups_arg,
+        USE_EXP2=USE_EXP2,
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
     )
+
+    if kv_splits == 1:
+        return out
+
+    if skip_reduce:
+        # Hand back the pre-reduce partials; the caller (or a downstream op)
+        # is responsible for the log-sum-exp combine + sink fold.
+        return acc_partial, m_partial, l_partial
 
     # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
@@ -161,7 +278,8 @@ def pa_decode_sparse(
     # latency. tl.arange(0, 1) is a valid power-of-2 range.
     block_h_reduce = 1
     grid_reduce = (T, triton.cdiv(H, block_h_reduce))
-    _pa_decode_sparse_reduce[grid_reduce](
+
+    reduce_impl[grid_reduce](
         m_partial,
         l_partial,
         acc_partial,
@@ -187,6 +305,8 @@ def pa_decode_sparse(
         BLOCK_H=block_h_reduce,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        USE_EXP2=USE_EXP2,
         num_warps=reduce_num_warps,
+        waves_per_eu=reduce_waves_per_eu,
     )
     return out

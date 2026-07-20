@@ -474,6 +474,21 @@ def make_kernel_runner(
     softmax_scale = head_dim**-0.5
 
     if args.kernel == "sage_fp8":
+        block_r = args.block_r
+        r = None
+        if args.hadamard_rotate:
+            if block_r > head_dim:
+                raise ValueError(
+                    f"block_r ({block_r}) must be <= head dim ({head_dim})"
+                )
+            if head_dim % block_r != 0:
+                raise ValueError(
+                    f"head dim ({head_dim}) must be divisible by block_r ({block_r})"
+                )
+            r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+                block_r**0.5
+            )
+
         if args.e2e:
             return lambda: fav3_sage_wrapper_func(
                 q,
@@ -484,6 +499,9 @@ def make_kernel_runner(
                 return_lse=False,
                 layout=args.layout,
                 block_lut=block_lut,
+                hadamard_rotation=args.hadamard_rotate,
+                R=r,
+                BLOCK_R=block_r if args.hadamard_rotate else None,
             )
 
         cfg = get_sage_fwd_configs()
@@ -500,6 +518,9 @@ def make_kernel_runner(
             BLKK=cfg["BLOCK_N"],
             sm_scale=softmax_scale,
             layout=args.layout,
+            hadamard_rotation=args.hadamard_rotate,
+            R=r,
+            BLOCK_R=block_r if args.hadamard_rotate else None,
         )
 
         kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
@@ -956,10 +977,14 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    if args.kernel not in ("sage_mxfp4", "all") and (
+    _hadamard_kernels = ("sage_fp8", "sage_mxfp4", "all")
+
+    if args.kernel not in _hadamard_kernels and (
         args.qsmooth or args.hadamard_rotate is False
     ):
-        logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
+        logger.warning(
+            "Hadamard/qsmooth flags are ignored unless --kernel is sage_fp8, sage_mxfp4, or all"
+        )
 
 
 def run_benchmark_generated(
@@ -1342,18 +1367,18 @@ def parse_args() -> argparse.Namespace:
         "--hadamard-rotate",
         type=lambda v: bool(int(v)),
         default=True,
-        help="(MXFP4 only) Apply Hadamard rotation: 1/0",
+        help="Apply Hadamard rotation before Q/K quant: 1/0 (sage_fp8, sage_mxfp4)",
     )
     parser.add_argument(
         "--block-r",
         type=int,
         default=128,
-        help="(MXFP4 only) Hadamard block size, must be <= head dim",
+        help="Hadamard block size; must divide head dim (sage_fp8, sage_mxfp4)",
     )
     parser.add_argument(
         "--qsmooth",
         action="store_true",
-        help="(MXFP4 only) Enable Q smoothing",
+        help="(sage_mxfp4 only) Enable Q smoothing",
     )
 
     parser.add_argument(

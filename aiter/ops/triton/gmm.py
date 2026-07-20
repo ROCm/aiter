@@ -5,6 +5,9 @@
 # Imports.
 # ------------------------------------------------------------------------------
 
+# Python standard library
+import warnings
+
 # PyTorch
 import torch
 from torch import Tensor
@@ -39,12 +42,31 @@ from aiter.ops.triton._triton_kernels.gmm import (
 # ------------------------------------------------------------------------------
 
 
+# Per-(device, stream) cache for the work stealing tile counter. A single `int32`
+# scratch buffer is reused across launches to avoid an allocator round-trip plus
+# 4-byte host to device copy on every call.
+_GMM_TILE_COUNTER_CACHE: dict[tuple[torch.device, int], Tensor] = {}
+
+
+def _get_gmm_tile_counter(device: torch.device, grid_dim: int) -> Tensor:
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    tile_counter = _GMM_TILE_COUNTER_CACHE.get((device, stream))
+    if tile_counter is None:
+        tile_counter = torch.empty(1, dtype=torch.int32, device=device)
+        _GMM_TILE_COUNTER_CACHE[(device, stream)] = tile_counter
+    tile_counter.fill_(grid_dim)
+    return tile_counter
+
+
 def _gmm_grid(
     N: int,
     block_size_m: int,
     block_size_n: int,
     group_sizes: Tensor,
     grid_dim: int,
+    # Expensive assertions launch GPU kernels on `group_sizes` and dominate the
+    # host-side launch cost. Only enable them in development.
+    enable_expensive_assertions: bool = False,
 ) -> tuple[int]:
     assert N > 0, f"N must be positive, it's {N}."
     assert is_power_of_2(
@@ -53,15 +75,26 @@ def _gmm_grid(
     assert is_power_of_2(
         block_size_n
     ), f"N-dimension tile size must be a power of 2 (it's {block_size_n})."
-    assert torch.all(group_sizes >= 0).item(), "All group_sizes must be non-negative."
     assert grid_dim > 0, f"Grid dimension must be positive (it's {grid_dim})."
-    num_m_tiles = (group_sizes + block_size_m - 1) // block_size_m
-    assert torch.all(num_m_tiles >= 0).item(), "All num_m_tiles must be non-negative."
     num_n_tiles = triton.cdiv(N, block_size_n)
     assert num_n_tiles > 0, f"num_n_tiles must be positive, it's {num_n_tiles}."
-    num_tiles = torch.sum(num_m_tiles * num_n_tiles).item()
-    assert num_tiles > 0, f"num_tiles must be positive, it's {num_tiles}."
-    num_programs = int(min(grid_dim, num_tiles))
+
+    # Cheap-path default. The kernel handle the case where grid_dim exceeds the
+    # total tile count: extra programs just exit without doing any work.
+    num_programs = grid_dim
+
+    if enable_expensive_assertions:
+        assert torch.all(
+            group_sizes >= 0
+        ).item(), "All group_sizes must be non-negative."
+        num_m_tiles = (group_sizes + block_size_m - 1) // block_size_m
+        assert torch.all(
+            num_m_tiles >= 0
+        ).item(), "All num_m_tiles must be non-negative."
+        num_tiles = torch.sum(num_m_tiles * num_n_tiles).item()
+        assert num_tiles > 0, f"num_tiles must be positive, it's {num_tiles}."
+        num_programs = int(min(grid_dim, num_tiles))
+
     assert num_programs > 0, f"num_programs must be positive, it's {num_programs}."
     return (num_programs,)
 
@@ -70,10 +103,12 @@ def gmm(
     lhs: Tensor,
     rhs: Tensor,
     group_sizes: Tensor,
+    bias: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
+    work_stealing: bool = False,
     config: dict[str, int] | None = None,
-    bias: Tensor | None = None,
+    grid_dim: int | None = None,
 ) -> Tensor:
     """
     Perform Group Matrix Multiplication (GMM): out = lhs @ rhs + bias
@@ -96,13 +131,21 @@ def gmm(
         lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
         lhs must be on the same device of rhs and group_sizes.
     rhs : torch.Tensor
-        Right-hand side 3D input tensor. Shape: (G, K, N).
+        Right-hand side 3D input tensor. Shape is (G, K, N) when rhs is non-transposed. When rhs is
+        transposed, two physically equivalent metadata layouts are supported: shape (G, K, N) with a
+        column-major-like stride, and shape (G, N, K) with a row-major stride. See Implementation
+        Notes below for the supported (shape, stride) combinations.
         rhs data type must be torch.float16 or torch.bfloat16, and must match lhs data type.
         rhs must be on the same device of lhs and group_sizes.
     group_sizes : torch.Tensor
         1D input tensor describing group sizes. Shape: (G,).
-        group_sizes data type must be torch.int32 and all its elements must be non-negative.
+        group_sizes data type must be torch.int32 or torch.int64, and all its elements must be
+        non-negative.
         group_sizes must be on the same device of lhs and rhs.
+    bias : torch.Tensor or None, optional
+        Optional bias tensor. Shape: (G, N).
+        If provided, bias data type must match lhs and rhs data type, and bias must be on the same
+        device as other input tensors. Each group g adds bias[g] to the output.
     preferred_element_type : torch.dtype, optional
         Desired data type for output tensor. Default is torch.bfloat16.
         Supported output types are torch.float16 and torch.bfloat16.
@@ -112,13 +155,16 @@ def gmm(
         allocated.
         If provided then it must have shape (M, N), its data type must match preferred_element_type
         and it must be on the same device of other input tensors.
+    work_stealing : bool, defaults to False
+        Enable work stealing, i.e. dynamic load-balancing where CUs with no assigned tiles "steal"
+        the next available tile to be computed.
     config : dict[str, int] or None, optional
         Optional dictionary with kernel metaparameters. If absent, config will be queried from
         internal tuning database.
-    bias : torch.Tensor or None, optional
-        Optional bias tensor. Shape: (G, N).
-        If provided, bias data type must match lhs and rhs data type, and bias must be on the same
-        device as other input tensors. Each group g adds bias[g] to the output.
+    grid_dim : positive int or None, optional
+        Optional override for GRID_DIM config. It's useful to override it while doing performance
+        experiments or launching the GMM kernel in parallel with a comms kernel (reserve some CUs
+        for comms).
 
     Returns
     -------
@@ -131,11 +177,20 @@ def gmm(
     --------------------
     - GMM is implemented with a persistent Triton kernel.
     - lhs must be row-major (lhs.stride() == (K, 1)).
-    - rhs can be row-major (rhs.stride() == (K * N, N, 1)) or column-major (rhs.stride() ==
-      (K * N, 1, K)). If rhs is row-major then kernel parameter TRANS_RHS == False, this is useful
-      for implementing forward pass. If rhs is column-major then kernel parameter TRANS_RHS == True,
-      this is useful for computing the lhs derivative in the backward pass, while fusing the
-      transposition.
+    - rhs supports three storage layouts. The two transposed layouts are physically
+      equivalent (same memory ordering, K varies fastest, then N, then G); only the
+      tensor metadata (shape and stride) differs. Both transposed layouts select
+      kernel parameter TRANS_RHS == True and produce identical byte offsets in the
+      kernel's pointer arithmetic, so they execute the same code:
+        * Non-transposed: shape (G, K, N), stride (K*N, N, 1). Kernel parameter
+          TRANS_RHS == False. Useful for the forward pass.
+        * Transposed (layout 1): shape (G, K, N), stride (K*N, 1, K). Kernel parameter
+          TRANS_RHS == True. The (K, N) sub-matrix per group is column-major.
+        * Transposed (layout 2): shape (G, N, K), stride (K*N, K, 1). Kernel parameter
+          TRANS_RHS == True. The (N, K) sub-matrix per group is row-major.
+      Both transposed layouts are useful for computing the lhs derivative in the
+      backward pass while fusing the transposition. The choice between layout 1 and
+      layout 2 is purely a metadata preference of the calling code.
     - out must be row-major (out.stride() == (N, 1)).
     - bias must be row-major (bias.stride() == (N, 1)) if provided.
     """
@@ -177,6 +232,20 @@ def gmm(
         }
     ), "Invalid GMM kernel config."
 
+    # Override grid dimension, if optional argument is provided.
+    assert (grid_dim is None) or (
+        grid_dim > 0
+    ), f"Invalid grid dimension {grid_dim}. It must be None or a positive integer."
+    if grid_dim is not None and grid_dim != config["GRID_DIM"]:
+        warnings.warn(
+            f"Overriding GMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
+        )
+        # Copy before mutating: when `config` comes from `get_config` it's the
+        # dict cached by `@functools.lru_cache`, so an in-place write would leak
+        # the override into subsequent calls.
+        config = dict(config)
+        config["GRID_DIM"] = grid_dim
+
     grid = _gmm_grid(
         N,
         config["BLOCK_SIZE_M"],
@@ -185,15 +254,20 @@ def gmm(
         config["GRID_DIM"],
     )
 
+    tile_counter: Tensor | None = (
+        _get_gmm_tile_counter(lhs.device, config["GRID_DIM"]) if work_stealing else None
+    )
+
     # fmt: off
     gmm_kernel[grid](
         # Tensor pointers:
-        lhs, rhs, group_sizes, out, bias,
+        lhs, rhs, group_sizes, out, bias, tile_counter,
         # Tensor shapes:
         M, K, N, G,
         # Meta-parameters:
         TRANS_RHS=trans_rhs,
         USE_BIAS=use_bias,
+        WORK_STEALING=work_stealing,
         **config,
     )
     # fmt: on
@@ -238,11 +312,12 @@ def ptgmm(
     lhs: Tensor,
     rhs: Tensor,
     group_sizes: Tensor,
+    bias_grad: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
-    config: dict[str, int] | None = None,
-    bias_grad: Tensor | None = None,
     accumulate: bool = False,
+    config: dict[str, int] | None = None,
+    grid_dim: int | None = None,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -265,7 +340,10 @@ def ptgmm(
     Parameters
     ----------
     lhs : torch.Tensor
-        Left-hand side 2D input tensor. Shape: (K, M).
+        Left-hand side 2D input tensor. Shape is (K, M) when lhs is non-transposed. When lhs is
+        transposed, two physically equivalent metadata layouts are supported: shape (K, M) with a
+        column-major stride, and shape (M, K) with a row-major stride. See Implementation Notes
+        below for the supported (shape, stride) combinations.
         lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
         lhs must be on the same device of rhs and group_sizes.
     rhs : torch.Tensor
@@ -274,8 +352,13 @@ def ptgmm(
         rhs must be on the same device of lhs and group_sizes.
     group_sizes : torch.Tensor
         1D input tensor describing group sizes. Shape: (G,).
-        group_sizes data type must be torch.int32 and all its elements must be non-negative.
+        group_sizes data type must be torch.int32 or torch.int64, and all its elements must be
+        non-negative.
         group_sizes must be on the same device of lhs and rhs.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     preferred_element_type : torch.dtype, optional
         Desired data type for output tensor. Default is torch.bfloat16.
         Supported output types are torch.float16 and torch.bfloat16.
@@ -285,17 +368,17 @@ def ptgmm(
         allocated.
         If provided then it must have shape (G, K, N), its data type must match
         preferred_element_type and it must be on the same device of other input tensors.
-    config : dict[str, int] or None, optional
-        Optional dictionary with kernel metaparameters. If absent, config will be queried from
-        internal tuning database.
-    bias_grad : torch.Tensor or None, optional
-        Optional bias gradient output tensor. Shape: (G, K).
-        If provided, the kernel will compute the bias gradient and write it to this tensor.
-        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     accumulate : bool, optional
         Whether to accumulate into existing output tensor values. Default is False.
         If False, output will be overwritten with fresh computation.
         If True, results will be added to existing output tensor values.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
+    grid_dim : positive int or None, optional
+        Optional override for GRID_DIM config. It's useful to override it while doing performance
+        experiments or launching the persistent TGMM kernel in parallel with a comms kernel (reserve
+        some CUs for comms).
 
     Returns
     -------
@@ -307,10 +390,20 @@ def ptgmm(
     Implementation Notes
     --------------------
     - PTGMM is implemented with a persistent Triton kernel.
-    - lhs can be row-major (lhs.stride() == (M, 1)) or column-major (lhs.stride() == (1, K)). If lhs
-      is row-major then kernel parameter TRANS_LHS == False. If lhs is column-major then kernel
-      parameter TRANS_LHS == True, this is useful for computing the rhs derivative in the backward
-      pass, while fusing the transposition.
+    - lhs supports three storage layouts. The two transposed layouts are physically
+      equivalent (same memory ordering, K varies fastest, then M); only the tensor
+      metadata (shape and stride) differs. Both transposed layouts select kernel
+      parameter TRANS_LHS == True and produce identical byte offsets in the kernel's
+      pointer arithmetic, so they execute the same code:
+        * Non-transposed: shape (K, M), stride (M, 1). Kernel parameter
+          TRANS_LHS == False.
+        * Transposed (layout 1): shape (K, M), stride (1, K). Kernel parameter
+          TRANS_LHS == True. lhs is column-major.
+        * Transposed (layout 2): shape (M, K), stride (K, 1). Kernel parameter
+          TRANS_LHS == True. lhs is row-major over the swapped shape.
+      Both transposed layouts are useful for computing the rhs derivative in the
+      backward pass while fusing the transposition. The choice between layout 1 and
+      layout 2 is purely a metadata preference of the calling code.
     - rhs must be row-major (rhs.stride() == (N, 1)).
     - out must be row-major (out.stride() == (K * N, N, 1)).
     """
@@ -348,6 +441,20 @@ def ptgmm(
             "GRID_DIM",
         }
     ), "Invalid PTGMM kernel config."
+
+    # Override grid dimension, if optional argument is provided.
+    assert (grid_dim is None) or (
+        grid_dim > 0
+    ), f"Invalid grid dimension {grid_dim}. It must be None or a positive integer."
+    if grid_dim is not None and grid_dim != config["GRID_DIM"]:
+        warnings.warn(
+            f"Overriding PTGMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
+        )
+        # Copy before mutating: when `config` comes from `get_config` it's the
+        # dict cached by `@functools.lru_cache`, so an in-place write would leak
+        # the override into subsequent calls.
+        config = dict(config)
+        config["GRID_DIM"] = grid_dim
 
     # Bias gradient handling.
     # -----------------------
@@ -421,11 +528,11 @@ def nptgmm(
     lhs: Tensor,
     rhs: Tensor,
     group_sizes: Tensor,
+    bias_grad: Tensor | None = None,
     preferred_element_type: torch.dtype = DTYPE,
     existing_out: Tensor | None = None,
-    config: dict[str, int] | None = None,
-    bias_grad: Tensor | None = None,
     accumulate: bool = False,
+    config: dict[str, int] | None = None,
 ) -> Tensor:
     """
     Perform a Group Matrix Multiplication (GMM) variant: out = lhs @ rhs
@@ -448,7 +555,10 @@ def nptgmm(
     Parameters
     ----------
     lhs : torch.Tensor
-        Left-hand side 2D input tensor. Shape: (K, M).
+        Left-hand side 2D input tensor. Shape is (K, M) when lhs is non-transposed. When lhs is
+        transposed, two physically equivalent metadata layouts are supported: shape (K, M) with a
+        column-major stride, and shape (M, K) with a row-major stride. See Implementation Notes
+        below for the supported (shape, stride) combinations.
         lhs data type must be torch.float16 or torch.bfloat16, and must match rhs data type.
         lhs must be on the same device of rhs and group_sizes.
     rhs : torch.Tensor
@@ -457,8 +567,13 @@ def nptgmm(
         rhs must be on the same device of lhs and group_sizes.
     group_sizes : torch.Tensor
         1D input tensor describing group sizes. Shape: (G,).
-        group_sizes data type must be torch.int32 and all its elements must be non-negative.
+        group_sizes data type must be torch.int32 or torch.int64, and all its elements must be
+        non-negative.
         group_sizes must be on the same device of lhs and rhs.
+    bias_grad : torch.Tensor or None, optional
+        Optional bias gradient output tensor. Shape: (G, K).
+        If provided, the kernel will compute the bias gradient and write it to this tensor.
+        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     preferred_element_type : torch.dtype, optional
         Desired data type for output tensor. Default is torch.bfloat16.
         Supported output types are torch.float16 and torch.bfloat16.
@@ -468,17 +583,13 @@ def nptgmm(
         allocated.
         If provided then it must have shape (G, K, N), its data type must match
         preferred_element_type and it must be on the same device of other input tensors.
-    config : dict[str, int] or None, optional
-        Optional dictionary with kernel metaparameters. If absent, config will be queried from
-        internal tuning database.
-    bias_grad : torch.Tensor or None, optional
-        Optional bias gradient output tensor. Shape: (G, K).
-        If provided, the kernel will compute the bias gradient and write it to this tensor.
-        bias_grad must be torch.float32 (kernel uses atomic_add which requires float32),
     accumulate : bool, optional
         Whether to accumulate into existing output tensor values. Default is False.
         If False, output will be overwritten with fresh computation.
         If True, results will be added to existing output tensor values.
+    config : dict[str, int] or None, optional
+        Optional dictionary with kernel metaparameters. If absent, config will be queried from
+        internal tuning database.
 
     Returns
     -------
@@ -490,10 +601,20 @@ def nptgmm(
     Implementation Notes
     --------------------
     - NPTGMM is implemented with a non-persistent regular Triton kernel.
-    - lhs can be row-major (lhs.stride() == (M, 1)) or column-major (lhs.stride() == (1, K)). If lhs
-      is row-major then kernel parameter TRANS_LHS == False. If lhs is column-major then kernel
-      parameter TRANS_LHS == True, this is useful for computing the rhs derivative in the backward
-      pass, while fusing the transposition.
+    - lhs supports three storage layouts. The two transposed layouts are physically
+      equivalent (same memory ordering, K varies fastest, then M); only the tensor
+      metadata (shape and stride) differs. Both transposed layouts select kernel
+      parameter TRANS_LHS == True and produce identical byte offsets in the kernel's
+      pointer arithmetic, so they execute the same code:
+        * Non-transposed: shape (K, M), stride (M, 1). Kernel parameter
+          TRANS_LHS == False.
+        * Transposed (layout 1): shape (K, M), stride (1, K). Kernel parameter
+          TRANS_LHS == True. lhs is column-major.
+        * Transposed (layout 2): shape (M, K), stride (K, 1). Kernel parameter
+          TRANS_LHS == True. lhs is row-major over the swapped shape.
+      Both transposed layouts are useful for computing the rhs derivative in the
+      backward pass while fusing the transposition. The choice between layout 1 and
+      layout 2 is purely a metadata preference of the calling code.
     - rhs must be row-major (rhs.stride() == (N, 1)).
     - out must be row-major (out.stride() == (K * N, N, 1)).
     """

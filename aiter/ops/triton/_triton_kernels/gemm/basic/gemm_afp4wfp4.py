@@ -724,7 +724,7 @@ def _get_config(
     # Note: Config files use K=2*K in their naming
     K = 2 * K
     if shuffle:
-        return get_gemm_config(
+        cfg, is_tuned = get_gemm_config(
             "GEMM-AFP4WFP4_PRESHUFFLED",
             M,
             N,
@@ -732,4 +732,12 @@ def _get_config(
             bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
         )
     else:
-        return get_gemm_config("GEMM-AFP4WFP4", M, N, K)
+        cfg, is_tuned = get_gemm_config("GEMM-AFP4WFP4", M, N, K)
+    if cfg.get("NUM_KSPLIT", None) is None:
+        cfg["NUM_KSPLIT"] = 1
+    cfg.setdefault("GROUP_SIZE_M", 8)
+    cfg.setdefault("num_stages", 0)
+    cfg.setdefault("waves_per_eu", 0)
+    cfg.setdefault("matrix_instr_nonkdim", 16)
+    cfg.setdefault("cache_modifier", ".cg")
+    return cfg, is_tuned

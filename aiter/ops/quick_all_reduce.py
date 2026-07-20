@@ -31,6 +31,21 @@ def qr_all_reduce(
 
 
 @compile_ops("module_quick_all_reduce")
+def qr_all_reduce_rmsnorm(
+    fa: int,
+    inp: torch.Tensor,
+    residual_inp: torch.Tensor,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    hidden_dim: int,
+    quant_level: int,
+    cast_bf2half: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_quick_all_reduce")
 def qr_get_handle(fa: int) -> torch.Tensor: ...
 
 

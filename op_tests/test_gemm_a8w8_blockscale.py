@@ -60,6 +60,26 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     )
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=None):
+    # Direct call into the triton preshuffle kernel, mirroring the dispatch in
+    # gemm_a8w8_blockscale_bpreshuffle: reshape the (n, k) preshuffled weight to
+    # (n // 16, k * 16) and pass the transposed x_scale.
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale_preshuffle,
+    )
+
+    n, k = weightshuffle.shape
+    return gemm_a8w8_blockscale_preshuffle(
+        x,
+        weightshuffle.reshape(n // 16, k * 16),
+        x_scale,
+        w_scale,
+        dtype=dtype,
+        backend=backend,
+    )
+
+
 @benchmark()
 def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret = {}
@@ -96,6 +116,17 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
     ret[f"{tag} err"] = err_asm
     ret["asm/ck"] = avg_c / avg_b
+
+    # Triton path requires a preshuffled weight. When not preshuffled we simply omit
+    # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
+    if ck_preshuffle:
+        d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
+        err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
+        ret["triton us"] = avg_d
+        ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
+        ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
+        ret["triton err"] = err_triton
+        ret["triton/ck"] = avg_d / avg_b
 
     return ret
 
@@ -201,35 +232,6 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    choices=[
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
-    ],
     default=[
         1,
         2,

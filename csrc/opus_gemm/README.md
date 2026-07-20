@@ -252,3 +252,69 @@ The build must finish without errors; both `--offload-arch=gfx950` and
 `--offload-arch=gfx942` must appear in the hipcc invocation; and the
 runtime call on whichever device the host machine has must produce
 correct results (no clean way to cross-test on a single-arch host).
+
+## Splitk workspace and TBO (two-batch overlap)
+
+The splitk kid family (kid 200..299, a16w16_flatmm_splitk) writes per-split
+partials into an fp32 scratch buffer that the reduce kernel folds into the
+final output. That buffer is owned host-side as a stable
+`opus_splitk_ws_handle*` slot: the kernel reads `slot->ptr` at launch, so
+captured HIP graphs bake in the slot address, not the raw buffer. The
+launcher grows `slot->ptr` lazily (4 MiB-aligned), draining outstanding work
+with `hipDeviceSynchronize` before freeing the old buffer.
+
+### Ownership: per-stream, not per-thread
+
+The slot is registered in a **process-global, mutex-protected map keyed by
+`hipStream_t`** (see `opus_splitk_ws_get` in `opus_gemm.cu`). vLLM/sglang-
+style TBO drives two CUDA streams from two CPU threads; each captured graph
+must bake in its own buffer pointer so concurrent replays write disjoint
+scratch. A per-thread cache would either share one buffer between the two
+streams (corrupting concurrent replays) or fail the in-capture grow guard on
+the second thread's first call.
+
+### Framework usage
+
+```python
+import aiter
+
+compute = torch.cuda.Stream()
+comm    = torch.cuda.Stream()
+
+with torch.cuda.stream(compute):
+    aiter.opus_gemm_workspace_init()         # register handle for this stream
+    _ = gemm_a16w16_opus(A_max, B_max)       # warm: grow buffer to max size
+    # ... capture compute graph ...
+
+with torch.cuda.stream(comm):
+    aiter.opus_gemm_workspace_init()
+    _ = gemm_a16w16_opus(A_max, B_max)
+    # ... capture comm graph ...
+
+# Replay both graphs concurrently from two threads -- each sees its own
+# workspace; no aborts, no cross-stream interference.
+```
+
+Rules:
+
+* Call `opus_gemm_workspace_init()` once per TBO stream, **eagerly** (outside
+  HIP graph capture). Calling it during capture raises; capture cannot run
+  `hipHostMalloc`.
+* Before capture, run the largest expected splitk shape on that stream once,
+  so the buffer grows to its final size. Grow inside capture is illegal
+  (`hipMalloc` / `hipFree` are stream-capture-illegal) and aborts with a
+  message pointing back here.
+* Single-stream, single-thread (non-TBO) callers do **not** need to call
+  `opus_gemm_workspace_init` -- the registry lazy-creates a handle on the
+  first eager call on each new stream. Init only becomes mandatory when the
+  first call on a stream is inside HIP graph capture.
+
+### When the buffer is freed
+
+Never automatically. Each registered stream holds one `opus_splitk_ws_handle`
+plus its current `hipMalloc` buffer for the process lifetime. Streams the
+torch CUDAStream pool reuses are correctly reused via the same map entry;
+streams the pool never reclaims leak one handle + buffer (same shape as the
+prior `thread_local` cache's thread-exit leak). A future
+`opus_gemm_workspace_release` can be added if frameworks need explicit
+teardown.

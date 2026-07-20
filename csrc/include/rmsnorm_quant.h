@@ -14,14 +14,16 @@ void add_rmsnorm_quant(torch::Tensor& out,
                        torch::Tensor& weight,
                        double epsilon,
                        int group_size     = 0,
-                       bool shuffle_scale = false);
+                       bool shuffle_scale = false,
+                       bool gemma_norm    = false);
 
 void add_rmsnorm(torch::Tensor& out,
                  torch::Tensor& input,
                  torch::Tensor& residual_in,
                  torch::Tensor& residual_out,
                  torch::Tensor& weight,
-                 double epsilon);
+                 double epsilon,
+                 bool gemma_norm = false);
 
 void rmsnorm_quant(torch::Tensor& out,
                    torch::Tensor& input,
@@ -29,8 +31,13 @@ void rmsnorm_quant(torch::Tensor& out,
                    torch::Tensor& weight,
                    double epsilon,
                    int group_size     = 0,
-                   bool shuffle_scale = false);
+                   bool shuffle_scale = false,
+                   bool gemma_norm    = false);
 
-void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double epsilon);
+void rmsnorm(torch::Tensor& out,
+             torch::Tensor& input,
+             torch::Tensor& weight,
+             double epsilon,
+             bool gemma_norm = false);
 
 } // namespace aiter

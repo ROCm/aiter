@@ -21,7 +21,7 @@ from aiter.jit.core import (
     bd_dir,
     mp_lock,
 )
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, gfx_from_cu_num
 from aiter.fused_moe import moe_sorting
 
 BLOCK_SIZE_M = 32
@@ -383,8 +383,20 @@ def get_2stage_cfgs(
         import pandas as pd
 
         cfg_2stages = pd.read_csv(tune_file)
+        # Migrate legacy cu_num-only CSVs to the (gfx, cu_num, ...) schema.
+        if "gfx" not in cfg_2stages.columns:
+            cfg_2stages["gfx"] = cfg_2stages["cu_num"].map(gfx_from_cu_num)
+        else:
+            bad = cfg_2stages["gfx"].isna() | cfg_2stages["gfx"].astype(str).isin(
+                ["0", "", "nan", "None"]
+            )
+            if bad.any():
+                cfg_2stages.loc[bad, "gfx"] = cfg_2stages.loc[bad, "cu_num"].map(
+                    gfx_from_cu_num
+                )
         cfg_2stages = cfg_2stages.set_index(
             [
+                "gfx",
                 "cu_num",
                 "token",
                 "model_dim",
@@ -410,7 +422,9 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
+    gfx = get_gfx_runtime()
     keys = (
+        gfx,
         cu_num,
         token,
         model_dim,

@@ -16,9 +16,9 @@ from ..gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
     check_shared_mem,
-    maybe_autotune,
+    gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices
+from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from ..utils.op import exp
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -32,12 +32,14 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
+            triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
+            triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
+        ]
+    ),
     key=["H", "K", "V", "BT"],
     **autotune_cache_kwargs,
 )
@@ -154,12 +156,14 @@ def chunk_fwd_kernel_o(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["H", "K", "V", "BT", "BK", "BV", "USE_G", "USE_G_GAMMA", "USE_DW"],
     **autotune_cache_kwargs,
 )
@@ -361,12 +365,14 @@ def chunk_bwd_kernel_dqkwg(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["H", "K", "V", "BT", "BK", "BV", "USE_G", "USE_G_GAMMA"],
     **autotune_cache_kwargs,
 )
@@ -475,12 +481,14 @@ def chunk_bwd_kernel_dv(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["H", "K", "V", "BT", "BK", "BV", "USE_G"],
     **autotune_cache_kwargs,
 )
@@ -629,14 +637,18 @@ def chunk_fwd_o(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config(
+                {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
+            )
+            for BK in BKV_LIST
+            for BV in BKV_LIST
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -811,15 +823,19 @@ def chunk_fwd_o_opt(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@maybe_autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT"],
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        [
+            triton.Config(
+                {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
+            )
+            for BK in BKV_LIST
+            for BV in BKV_LIST
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
@@ -844,6 +860,7 @@ def chunk_fwd_kernel_o_opt_vk(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -875,6 +892,12 @@ def chunk_fwd_kernel_o_opt_vk(
         o += ((i_b * T * H + i_h) * V).to(tl.int64)
     h += (i_tg * H + i_h).to(tl.int64) * V * K
 
+    if USE_G:
+        if IS_VARLEN:
+            g += (i_h * T_flat + bos).to(tl.int64)
+        else:
+            g += (((i_b * H + i_h) * T_flat)).to(tl.int64)
+
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
@@ -896,11 +919,14 @@ def chunk_fwd_kernel_o_opt_vk(
         b_A = tl.dot(b_q, b_k, acc=b_A)
 
     if USE_G:
-        g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        p_g = tl.make_block_ptr(g, (T,), (1,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        if USE_EXP2:
+            b_o = b_o * tl.math.exp2(b_g)[:, None]
+            b_A = b_A * tl.math.exp2(b_g[:, None] - b_g[None, :])
+        else:
+            b_o = b_o * exp(b_g)[:, None]
+            b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
@@ -921,11 +947,15 @@ def chunk_fwd_o_opt_vk(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    o: torch.Tensor,
     h: torch.Tensor,
     g: torch.Tensor | None = None,
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
 ) -> torch.Tensor:
     """
     Optimized output forward with h layout [V, K].
@@ -933,12 +963,13 @@ def chunk_fwd_o_opt_vk(
     Args:
         q: [B, T, Hg, K]
         k: [B, T, Hg, K]
-        v: [B, H, T, V]  (token-major from K5 opt_vk)
+        v: [B, H, T, V]  (token-major from opt_vk)
         h: [B, NT, H, V, K]  (h layout [V, K])
-        g: [B*T, H] FP32
+        g: [B, H, T] FP32 cumulative gate tensor
         scale: float
         cu_seqlens: [N+1]
         chunk_size: int
+        use_exp2: when True, interpret g in log2 space
 
     Returns:
         o: [B, T, H, V]
@@ -948,14 +979,24 @@ def chunk_fwd_o_opt_vk(
     T_flat = v.shape[2]
     V = v.shape[-1]
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    # Chunk indices from the ORIGINAL (cache-stable) cu_seqlens + decode ints
+    # (cached, no per-forward D2H); the kernel walks pre-sliced prefill data
+    # via the rebased cu_seqlens.
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+            cu_seqlens, num_decodes, num_decode_tokens
+        )
+    else:
+        chunk_indices = None
+        kernel_cu_seqlens = None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = v.new_empty(B, T, H, V)
+    # o = v.new_empty(B, T, H, V)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
@@ -967,7 +1008,7 @@ def chunk_fwd_o_opt_vk(
         h=h,
         g=g,
         o=o,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=kernel_cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
         T=T,
@@ -977,6 +1018,7 @@ def chunk_fwd_o_opt_vk(
         K=K,
         V=V,
         BT=BT,
+        USE_EXP2=use_exp2,
     )
     return o
 
@@ -1000,7 +1042,7 @@ def chunk_bwd_dv(
     # H100 can have larger block size
     if check_shared_mem("hopper", k.device.index):
         CONST_TILING = 128
-    elif check_shared_mem:
+    elif check_shared_mem():
         CONST_TILING = 64
     else:
         CONST_TILING = 32
@@ -1054,7 +1096,7 @@ def chunk_bwd_dv_local(
     # H100 can have larger block size
     if check_shared_mem("hopper", k.device.index):
         CONST_TILING = 128
-    elif check_shared_mem:
+    elif check_shared_mem():
         CONST_TILING = 64
     else:
         CONST_TILING = 32

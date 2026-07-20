@@ -88,6 +88,7 @@ jobs:
             --network=host \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
+            -e AITER_USE_SYSTEM_TRITON=1 \
             ${{ env.BASE_IMAGE }} \
             bash -lc '
               set -euo pipefail
@@ -97,7 +98,6 @@ jobs:
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
-              pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
               pip install -r requirements.txt
               pip install --upgrade pandas pyzmq einops numpy==1.26.2
               pip install --upgrade "pybind11>=3.0.1"
@@ -116,7 +116,7 @@ jobs:
           retention-days: 14
 
   vllm_benchmark:
-    name: vLLM Benchmark (8 GPU)
+    name: vLLM Benchmark
     timeout-minutes: 60
     if: >-
       github.event_name != 'pull_request' ||
@@ -124,26 +124,42 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: build_aiter_wheel
-    runs-on: aiter-8gpu-runner
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
-          - model: openai/gpt-oss-120b
+          - model: deepseek-ai/DeepSeek-V4-Pro
+            runner: linux-aiter-do-mi350x-8
             kv_cache_dtype: fp8_kvcache
             tp: 8
-            extra_args: --gpu-memory-utilization 0.3
+            extra_args: >-
+              --quantization deepseek_v4_fp8
+              --moe-backend aiter
+              --tokenizer-mode deepseek_v4
+              --reasoning-parser deepseek_v4
             extra_env_args: ""
-          - model: deepseek-ai/DeepSeek-R1-0528
+          - model: amd/MiniMax-M3-MXFP4
+            runner: linux-aiter-do-mi350x-8
+            kv_cache_dtype: default_kvcache
+            tp: 4
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
+          - model: amd/MiniMax-M3-MXFP4
+            runner: linux-aiter-do-mi350x-8
             kv_cache_dtype: default_kvcache
             tp: 8
-            extra_args: --block-size 1
-            extra_env_args: ""
-          - model: moonshotai/Kimi-K2.5
-            kv_cache_dtype: default_kvcache
-            tp: 8
-            extra_args: --block-size 1 --trust-remote-code
-            extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
         
     steps:
       - name: Checkout Docker pull retry helper
@@ -156,6 +172,7 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
@@ -209,6 +226,7 @@ jobs:
               $MODEL_MOUNT \
               -v "${{ github.workspace }}:/workspace" -w /workspace \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
+              -e AITER_USE_SYSTEM_TRITON=1 \
               ${{ matrix.extra_env_args }} \
               ${{ env.BASE_IMAGE }} bash -lc "
                 set -euo pipefail
@@ -219,8 +237,12 @@ jobs:
                   exit 1
                 fi
                 ls -lh /workspace/aiter_wheels
+                echo \"AITER_USE_SYSTEM_TRITON=1; keeping system Triton\"
+                pip show triton
                 pip uninstall -y aiter amd-aiter || true
-                pip install --no-deps \"\${wheels[0]}\"
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
+                pip install \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
                 if [ -d \"/models/${{ matrix.model }}\" ]; then
                   model_path=\"/models/${{ matrix.model }}\"

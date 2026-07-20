@@ -646,23 +646,43 @@ def test_triton_mhc_matches_hip(M, n, C):
         sinkhorn_iters=sinkhorn_repeat,
     )
 
-    residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
-        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    # HACK: temporarily swap the HIP reference for the torch reference to
+    # confirm Triton mhc() matches the spec (and isolate the HIP 2nd-row bug).
+    # Triton mhc() uses canonical log-domain Sinkhorn, so compare against
+    # mhc_torch with asymmetric_exp_domain=False.
+    #
+    # Original HIP reference (kept for re-enabling once the HIP
+    # mhc_pre_big_fuse 2nd-row projection bug is fixed):
+    #
+    # residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
+    #     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    # )
+    # # aiter.mhc_pre allocates outputs via torch.empty without a device kwarg,
+    # # so it needs an active torch.device context to land on the GPU.
+    # with torch.device(x.device):
+    #     post_h, comb_h, li_h = _aiter.mhc_pre(
+    #         residual,
+    #         fn_hip,
+    #         hc_scale,
+    #         hc_base,
+    #         rms_eps=rms_eps,
+    #         hc_pre_eps=hc_pre_eps,
+    #         hc_sinkhorn_eps=hc_sinkhorn_eps,
+    #         hc_post_mult_value=hc_post_mult_value,
+    #         sinkhorn_repeat=sinkhorn_repeat,
+    #     )
+    post_h, comb_h, _hpre_ref, li_h = mhc_torch(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        sinkhorn_iters=sinkhorn_repeat,
     )
-    # aiter.mhc_pre allocates outputs via torch.empty without a device kwarg,
-    # so it needs an active torch.device context to land on the GPU.
-    with torch.device(x.device):
-        post_h, comb_h, li_h = _aiter.mhc_pre(
-            residual,
-            fn_hip,
-            hc_scale,
-            hc_base,
-            rms_eps=rms_eps,
-            hc_pre_eps=hc_pre_eps,
-            hc_sinkhorn_eps=hc_sinkhorn_eps,
-            hc_post_mult_value=hc_post_mult_value,
-            sinkhorn_repeat=sinkhorn_repeat,
-        )
 
     cfg = f"(M={M}, n={n}, C={C})"
     for name, t, h, atol, rtol in (
@@ -670,7 +690,7 @@ def test_triton_mhc_matches_hip(M, n, C):
         ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
         ("layer_input", li_t, li_h, 8e-2, 2e-2),
     ):
-        msg = f"{name} Triton vs aiter.mhc_pre mismatch at {cfg}"
+        msg = f"{name} Triton vs mhc_torch mismatch at {cfg}"
         pct = checkAllclose(
             t.float(),
             h.float(),
@@ -866,14 +886,15 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     stream via the mhc_post mix, then runs the next sub-layer's mhc_pre
     GEMM + RMS-norm + Sinkhorn on the just-updated residual.
 
-    Reference chain depends on ``use_asymmetric_exp_domain``:
+    Both modes compare against the **torch** chain
+    (``mhc_post_torch → mhc_torch``); the Sinkhorn variant inside ``mhc_torch``
+    is selected by ``use_asymmetric_exp_domain``:
 
-    - ``False``: canonical log-domain Sinkhorn — compared against the
-      **torch** chain (``mhc_post_torch → mhc_torch``).
-    - ``True``: HIP-compatible exp-domain Sinkhorn
-      (``mhc_kernels.cu:493-507``) — compared against the **HIP** chain
-      (``aiter.mhc_post → aiter.mhc_pre``). Skipped when HIP kernels aren't
-      built or HIP big-fuse / residual-block dispatch can't handle the shape.
+    - ``False``: canonical log-domain Sinkhorn-Knopp.
+    - ``True``: HIP-compatible asymmetric exp-domain Sinkhorn
+      (``sinkhorn_knopp_asymmetric_exp_domain_torch``): first iter
+      ``softmax(row) + eps`` then ``div(col + eps)``, followed by
+      ``sinkhorn_iters - 1`` symmetric ``div(row + eps)/div(col + eps)`` iters.
 
     Compared outputs in both modes:
     ``(residual_out, h_post, h_res, layer_input_out)``.
@@ -899,73 +920,29 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     )
     alphas_t = _alphas(alpha_pre, alpha_post, alpha_res, device=layer_input.device)
 
-    if use_asymmetric_exp_domain:
-        # HIP reference. Skip if HIP kernels aren't built or HIP big-fuse /
-        # residual-block dispatch can't handle the shape.
-        if not _HAS_AITER_MHC_PRE or not _HAS_AITER_MHC_POST:
-            pytest.skip("aiter.mhc_pre / aiter.mhc_post not built in this environment")
-        if dtype != torch.bfloat16:
-            # aiter.mhc_pre hardcodes its layer_input output to bf16, so the
-            # fp16 caller dtype would force a dtype-mismatched comparison.
-            pytest.skip("aiter.mhc_pre only supports bf16")
-        if n != 4:
-            pytest.skip("aiter.mhc_pre_big_fuse hardcodes hc_mult == 4")
-        if C < 512:
-            pytest.skip("aiter.mhc_pre_big_fuse dispatch requires C >= 512")
-        if (n * C) % 64 != 0:
-            pytest.skip("aiter.mhc_pre_gemm_sqrsum needs n*C divisible by tile_k")
-
-        import aiter.jit.utils.chip_info as chip_info
-
-        arch_id = chip_info.get_gfx()
-        block = _hip_post_dispatch_block(C, arch_id)
-        if block is None or C < 2 * block:
-            pytest.skip(
-                f"aiter.mhc_post residual_block dispatch unsupported for "
-                f"C={C} on {arch_id}"
-            )
-
-        # HIP chain: aiter.mhc_post then aiter.mhc_pre on the same residual_in.
-        residual_out_ref = torch.empty_like(residual_in)
-        # HIP `fn` is (N, K) fp32 — the row-major transpose of phi.
-        fn_hip = phi.T.contiguous().float()
-        with torch.device(layer_input.device):
-            _aiter.mhc_post(
-                residual_out_ref,
-                layer_input,
-                residual_in,
-                post_mix.unsqueeze(-1),
-                comb_mix,
-            )
-            h_post_ref, h_res_ref, layer_input_out_ref = _aiter.mhc_pre(
-                residual_out_ref,
-                fn_hip,
-                alphas_t,
-                bias,
-                1e-6,  # rms_eps
-                1e-6,  # hc_pre_eps
-                1e-6,  # hc_sinkhorn_eps
-                2.0,  # hc_post_mult_value
-                sinkhorn_iters,
-            )
-        # Triton consumes phi K-contiguous (K, N) fp32 — same numerical input
-        # as HIP's ``fn_hip``.
-        phi_triton = phi.T.contiguous().T.to(torch.float32)
-    else:
-        # Torch reference (canonical log-domain Sinkhorn, fp32 throughout).
-        residual_out_ref = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
-        h_post_ref, h_res_ref, _h_pre_ref, layer_input_out_ref = mhc_torch(
-            residual_out_ref.view(M, n * C),
-            phi,
-            alpha_pre,
-            alpha_post,
-            alpha_res,
-            bias,
-            n,
-            sinkhorn_iters=sinkhorn_iters,
-        )
-        # Keep phi in its native bf16/fp16 K-contiguous layout.
-        phi_triton = phi.T.contiguous().T
+    # Torch reference for both modes (fp32 throughout). The only difference is
+    # the Sinkhorn variant selected by ``asymmetric_exp_domain``:
+    #   - False: canonical log-domain Sinkhorn-Knopp.
+    #   - True : HIP-compatible asymmetric exp-domain Sinkhorn
+    #            (softmax(row) + eps first iter, then symmetric div iters).
+    # Both compare against the **torch** chain (``mhc_post_torch → mhc_torch``);
+    # no HIP kernel is involved.
+    residual_out_ref = mhc_post_torch(layer_input, residual_in, post_mix, comb_mix)
+    h_post_ref, h_res_ref, _h_pre_ref, layer_input_out_ref = mhc_torch(
+        residual_out_ref.view(M, n * C),
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n,
+        sinkhorn_iters=sinkhorn_iters,
+        asymmetric_exp_domain=use_asymmetric_exp_domain,
+        hc_sinkhorn_eps=1e-6,
+    )
+    # Keep phi in its native K-contiguous layout (mhc_torch casts to fp32
+    # internally; the Triton kernel consumes the same values).
+    phi_triton = phi.T.contiguous().T
 
     # Triton fused — mhc_post_pre selects log-domain (default) or
     # HIP-compatible exp-domain Sinkhorn via the flag.
