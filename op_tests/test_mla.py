@@ -138,6 +138,7 @@ def test_mla(
     decode_qlen,
     split_per_batch=None,
     return_lse=False,
+    is_causal=True,
     sequential_page_indices=False,
 ):
     ret = {}
@@ -230,6 +231,7 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
+    prefill_ref_token_cap = 512 * 1024
     # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
     # (1M+) never trigger the O(N^2) ref.
@@ -237,6 +239,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
@@ -332,6 +335,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
@@ -359,7 +363,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=True,
+        is_causal=is_causal,
         dtype=out_dtype,
     )
 
@@ -481,7 +485,7 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_gluon():
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -504,7 +508,7 @@ def test_mla(
             use_2d_view = False
 
         (attn_logits, attn_lse), us_gluon_decode = run_perftest(
-            mla_decode_gluon,
+            mla_gluon,
             q_nope,
             q_pe,
             kv_c,
@@ -534,7 +538,7 @@ def test_mla(
         # Shared bh16bn{64,128} runner. The wrapper dispatches on
         # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
         # name='bh16bn64' -> keep bf16. -lse also validates the returned lse.
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
@@ -554,7 +558,7 @@ def test_mla(
             use_2d_view = False
 
         (_, lse), us_decode = run_perftest(
-            mla_decode_gluon,
+            mla_gluon,
             q_nope,
             q_pe,
             kv_c,
@@ -588,6 +592,7 @@ def test_mla(
     if return_lse:
         pass
     elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+        8,
         16,
         32,
         64,
@@ -778,6 +783,7 @@ parser.add_argument(
     choices=[
         (4, 1),
         (8, 1),
+        (8, 2),
         (12, 1),
         (16, 1),
         (16, 2),
@@ -824,6 +830,13 @@ parser.add_argument(
     help="""Use kv_indices[i]=i (sequential physical page id) instead of random pages.
     Expands KV pool to cover ctx length (tests 64-bit page_idx * stride).""",
 )
+parser.add_argument(
+    "--causal",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="""Enable/disable causal masking. Default: True.
+    --causal / --no-causal""",
+)
 
 
 args = parser.parse_args()
@@ -849,6 +862,7 @@ for nhead, decode_qlen in args.nhead:
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
                 return_lse=args.return_lse,
+                is_causal=args.causal,
                 sequential_page_indices=args.sequential_page_indices,
             )
             df.append(ret)

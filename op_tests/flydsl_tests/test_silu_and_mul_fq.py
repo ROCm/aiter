@@ -72,6 +72,7 @@ def test_flydsl_swiglu_fused_fp4_quant_matches_reference(
             torch.empty(0, dtype=torch.float32, device=device),
             token_num,
             sorted_ids.numel(),
+            7.0,
             torch.cuda.current_stream(),
         ),
     )

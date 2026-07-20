@@ -289,8 +289,12 @@ torch::Tensor
             # generate code for default kernels
             self.gen_code(candidate_kernels_cktile_dict)
         else:
-            # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict(self.tune_file))
+            # Runtime dispatch is keyed by kernelName from Python-selected tuned
+            # rows. Build the full CKTile candidate registry so a newly tuned CSV
+            # cannot reference a valid candidate that is absent from the .so.
+            runtime_kernels = self.get_tune_dict(self.tune_file)
+            runtime_kernels.update(candidate_kernels_cktile_dict)
+            self.gen_code(runtime_kernels)
 
 
 if __name__ == "__main__":
