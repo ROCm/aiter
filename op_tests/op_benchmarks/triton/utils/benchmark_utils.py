@@ -163,11 +163,11 @@ def batched_model_benchmark_shapes(args):
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
-            N = config["intermediate_size"]
-            K = config["hidden_size"]
+            hidden_size = config["hidden_size"]
+            intermediate_size = config["intermediate_size"]
 
             shapes.append(
-                (M, N, K, batch_size, model_name)
+                (M, hidden_size, intermediate_size, batch_size, model_name)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes

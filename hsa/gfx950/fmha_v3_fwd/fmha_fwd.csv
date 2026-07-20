@@ -7,3 +7,7 @@ bf16,192,128,0,0,0,128,128,_ZN5aiter25fmha_fwd_hd192_hd128_bf16E,fwd_hd192_hd128
 bf16,192,128,2,0,0,128,128,_ZN5aiter32fmha_fwd_hd192_hd128_bf16_causalE,fwd_hd192_hd128_bf16_causal.co
 bf16,192,128,0,1,0,128,128,_ZN5aiter31fmha_fwd_hd192_hd128_bf16_groupE,fwd_hd192_hd128_bf16_group.co
 bf16,192,128,2,1,0,128,128,_ZN5aiter38fmha_fwd_hd192_hd128_bf16_causal_groupE,fwd_hd192_hd128_bf16_causal_group.co
+fp8bf16,128,128,0,0,0,256,128,_ZN5aiter24fmha_fwd_hd128_fp8_gfx950E,fwd_hd128_fp8.co
+fp8bf16,128,128,2,0,0,256,128,_ZN5aiter31fmha_fwd_hd128_fp8_causal_gfx950E,fwd_hd128_fp8_causal.co
+fp8bf16,128,128,0,1,0,256,128,_ZN5aiter30fmha_fwd_hd128_fp8_group_gfx950E,fwd_hd128_fp8_group.co
+fp8bf16,128,128,2,1,0,256,128,_ZN5aiter37fmha_fwd_hd128_fp8_causal_group_gfx950E,fwd_hd128_fp8_causal_group.co

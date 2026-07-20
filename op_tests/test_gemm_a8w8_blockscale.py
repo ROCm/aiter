@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
+from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from einops import rearrange
@@ -59,6 +60,26 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     )
 
 
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=None):
+    # Direct call into the triton preshuffle kernel, mirroring the dispatch in
+    # gemm_a8w8_blockscale_bpreshuffle: reshape the (n, k) preshuffled weight to
+    # (n // 16, k * 16) and pass the transposed x_scale.
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale_preshuffle,
+    )
+
+    n, k = weightshuffle.shape
+    return gemm_a8w8_blockscale_preshuffle(
+        x,
+        weightshuffle.reshape(n // 16, k * 16),
+        x_scale,
+        w_scale,
+        dtype=dtype,
+        backend=backend,
+    )
+
+
 @benchmark()
 def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret = {}
@@ -79,7 +100,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
-    err_ck = checkAllclose(a, b, msg="ck")
+    err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
@@ -89,12 +110,23 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight_asm = shuffle_weight(weight, layout=(16, 16))
     c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}")
+    err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
     ret[f"{tag} us"] = avg_c
     ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
     ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
     ret[f"{tag} err"] = err_asm
     ret["asm/ck"] = avg_c / avg_b
+
+    # Triton path requires a preshuffled weight. When not preshuffled we simply omit
+    # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
+    if ck_preshuffle:
+        d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
+        err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
+        ret["triton us"] = avg_d
+        ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
+        ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
+        ret["triton err"] = err_triton
+        ret["triton/ck"] = avg_d / avg_b
 
     return ret
 
@@ -127,6 +159,60 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
 
 
+def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
+    """Verify that splitK > 0 produces the same output as splitK=0 (within fp tolerance).
+
+    split-K accumulates partial tiles via atomic_add, which changes the floating-point
+    reduction order.  We therefore use a relaxed tolerance that matches the cumulative
+    rounding error introduced by K-splitting.
+    """
+    block_shape_n, block_shape_k = block_shape
+    scale_n = (n + block_shape_n - 1) // block_shape_n
+    scale_k = (k + block_shape_k - 1) // block_shape_k
+
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+
+    # CK path (no preshuffle): compare splitK=0 vs splitK>0
+    Y_base = torch.empty((m, n), dtype=dtype, device="cuda")
+    Y_split = torch.empty((m, n), dtype=dtype, device="cuda")
+    gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_base, splitK=0)
+    gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_split, splitK=splitK)
+    ck_err = checkAllclose(
+        Y_base,
+        Y_split,
+        msg=f"ck splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
+
+    # CKTile path (no preshuffle): compare splitK=0 vs splitK>0
+    Y_base_tile = torch.empty((m, n), dtype=dtype, device="cuda")
+    Y_split_tile = torch.empty((m, n), dtype=dtype, device="cuda")
+    gemm_a8w8_blockscale_cktile(
+        x, weight, x_scale, w_scale, Y_base_tile, False, splitK=0
+    )
+    gemm_a8w8_blockscale_cktile(
+        x, weight, x_scale, w_scale, Y_split_tile, False, splitK=splitK
+    )
+    cktile_err = checkAllclose(
+        Y_base_tile,
+        Y_split_tile,
+        msg=f"cktile splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
+
+    print(
+        f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
+        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
+    )
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -146,35 +232,6 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    choices=[
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
-    ],
     default=[
         1,
         2,
@@ -301,6 +358,12 @@ print("=" * 150)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
 
+# Correctness check: verify split-K produces matching results
+print("\nRunning split-K correctness checks ...")
+for splitK in [1, 2]:
+    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+
+# Save results from benchmarks
 if args.output:
     os.makedirs(args.output, exist_ok=True)
     if args.csv:

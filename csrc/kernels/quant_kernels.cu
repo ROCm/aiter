@@ -5,55 +5,69 @@
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
+#include "gemm_dispatch_utils.h"
 #include "quant.h"
+#include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <hipcub/hipcub.hpp>
+
 
 const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32>
-__global__ void
+// emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
+// byte scale, fp8 / i8 output a continuous fp32 per-group scale.
+//
+// emit_e8m0_scale = true (opt-in for fp8): compute a power-of-2 per-group
+// scale via f32_to_e8m0_scale and write a single E8M0 byte per group,
+// matching the fp4 byte layout. Used by the MXFP8 "split" path
+// `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the
+// produced byte scale is directly consumable by `mxfp4_moe_sort_hip` /
+// MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false>
+__global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
                                       DTYPE_I const* __restrict__ input,
                                       float const* __restrict__ scale_ub,
-                                      const int32_t group_size,
                                       int64_t ori_rows,
                                       int32_t ori_cols,
                                       int32_t ori_row_stride,
-                                      bool shuffle_scale                   = true,
+                                      int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
                                       const int32_t num_cols_factor        = 1)
 {
-    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad, int32_t x, int32_t y) {
-        return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
-               (y % 8) / 4 * 2 + (x % 32) / 16;
-    };
+    static_assert(!emit_e8m0_scale
+                      || std::is_same_v<DTYPE_O, opus::fp4_t>
+                      || std::is_same_v<DTYPE_O, opus::fp8_t>,
+                  "emit_e8m0_scale is only valid for fp4 / fp8 outputs");
+
+    // fp4 always emits e8m0 byte scale (no fp32-scale variant exists today);
+    // fp8 emits e8m0 byte scale iff caller opted in via emit_e8m0_scale.
+    static constexpr bool use_e8m0_scale =
+        std::is_same_v<DTYPE_O, opus::fp4_t> || emit_e8m0_scale;
+
     if(num_rows != nullptr)
     {
-        ori_rows = *num_rows * num_cols_factor;
+        ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
     }
-    int num_thread_per_group = group_size / thread_data_size;
-    int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
+    static constexpr int num_thread_per_group = group_size / thread_data_size;
+    int64_t row_offset       = static_cast<int64_t>(blockIdx.x) * block_size;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
-    int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, opus::fp4_t> && shuffle_scale)
+    // Shuffle tiles e8m0 bytes 8-wide along scaleN regardless of element
+    // dtype, so the padding applies to any e8m0-scale path (fp4 always,
+    // fp8 only when emit_e8m0_scale).
+    int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
     int64_t x                = groupId / scaleN_pad;
-    int32_t y                = groupId % scaleN_pad;
-    if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
+    int32_t y                = static_cast<int32_t>(groupId % scaleN_pad);
+    if constexpr(use_e8m0_scale)
     {
         if(x >= ori_rows || y >= scaleN)
         {
-            // if (shuffle_scale && threadIdx.x % num_thread_per_group == 0)
-            // {
-            //   auto *tmp = reinterpret_cast<uint8_t *>(scale);
-            //   groupId = fp4_scale_shuffle_id(scaleN_pad, x, y);
-            //   tmp[groupId] = 0x7f;
-            // }
             return;
         }
     }
@@ -67,13 +81,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
+    // The non-e8m0 (continuous fp32-scale) path uses the exact 1/DTYPE_MAX
+    // divisor. The e8m0 path instead derives a power-of-2 scale via
+    // fp_f32_to_e8m0_scale<> below (which folds in / max_pos), so it does not
+    // use this divisor.
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
-
-    static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
-    const int64_t oob_o = (ori_rows * ori_cols + ooba_o - 1) / ooba_o * ooba_o;
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
     vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
@@ -84,50 +97,69 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
-    float inverted_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? fp4_scale(absMax) * inverted_DTYPE_MAX
-                               : absMax * inverted_DTYPE_MAX;
+    // MX e8m0 path: use the project-wide default round mode
+    // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
+    // The helper returns the dequant scale (e.g. ceil_pow2(amax/max_pos))
+    // directly, so the (>>23)&0xFF extraction yields the e8m0 byte. fp4
+    // always e8m0; fp8 only when emit_e8m0_scale (use_e8m0_scale gates this).
+    // rmode is shared across fp4/fp8; only the dtype constant differs.
+    float inverted_scale;
+    if constexpr (use_e8m0_scale)
+    {
+        constexpr aiter::MxDtype kMxDtype =
+            std::is_same_v<DTYPE_O, opus::fp4_t>
+                ? aiter::MxDtype::FP4_E2M1
+#if defined(__gfx942__)
+                : aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+                : aiter::MxDtype::FP8_E4M3;
+#endif
+        inverted_scale =
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
+    }
+    else
+    {
+        inverted_scale = absMax * inverted_DTYPE_MAX;
+    }
     row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
                                ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
                                : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
     if(threadIdx.x % num_thread_per_group == 0)
     {
-        if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
+        if constexpr(use_e8m0_scale)
         {
             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
             uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
-            if(shuffle_scale)
+            if constexpr(shuffle_scale)
             {
-                groupId = fp4_scale_shuffle_id(scaleN_pad, x, y);
+                groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
             }
             tmp[groupId] = exponent;
         }
         else
         {
-            if(shuffle_scale)
+            if constexpr(shuffle_scale)
             {
                 groupId = y * ori_rows + x;
             }
             scale[groupId] = inverted_scale;
         }
     }
+    // The reciprocal is required by the store path, not by the scale-derivation
+    // mode: fp4 store uses the hardware `cvt_scalef32_pk_fp4_f32` intrinsic
+    // which consumes the e8m0 byte directly (so `inverted_scale` stays as the
+    // scale factor `pow2_amax / max_pow2`); fp8/i8 store does software
+    // `input * inv_scale` and therefore needs `inv_scale = 1 / row_scale`
+    // regardless of whether `row_scale` was derived via e8m0 (power-of-2)
+    // or the continuous `absMax * inv_DTYPE_MAX` formula. Earlier this gate
+    // was on `use_e8m0_scale` which silently skipped the reciprocal for the
+    // fp8 + e8m0 path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
     inverted_scale =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? inverted_scale : 1.0f / inverted_scale;
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_o * sizeof(DTYPE_STORE));
+    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
 
     store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, row_offset, inverted_scale);
 }
@@ -152,9 +184,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4);
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     const int64_t row_offset        = blockIdx.x * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
@@ -205,19 +235,8 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     // absMax = BlockReduce(temp_storage).Reduce(absMax, hipcub::Max());
     absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                          ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                          ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
 }
@@ -409,9 +428,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
     using vec_s = opus::vector_t<float, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     auto const* ptr_smscale = reinterpret_cast<float const*>(smooth_scale + smscale_map_idx * cols);
     auto const* smscale_vecs = reinterpret_cast<vec_s const*>(ptr_smscale);
@@ -430,19 +447,8 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
 
     absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                          ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                          ? aiter::fp4_f32_to_e8m0_scale(absMax)
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
 }
@@ -661,6 +667,11 @@ void static_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
         DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 0)        \
     }
 
+#define DISPATCH_GROUP_SIZE(gs, ...) \
+    if((gs) == 32)        { constexpr int32_t _GS = 32;  __VA_ARGS__ } \
+    else if((gs) == 64)   { constexpr int32_t _GS = 64;  __VA_ARGS__ } \
+    else                  { constexpr int32_t _GS = 128; __VA_ARGS__ }
+
 void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
                               const aiter_tensor_t& input,  // [..., d]
                               aiter_tensor_t& scale)        // [1]
@@ -727,93 +738,70 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
-        int group_size           = cols;
-        int thread_data_size     = 32;
-        int num_thread_per_group = group_size / thread_data_size;
-        int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
-        if(out.dtype() == AITER_DTYPE_fp8)
-        {
-            int ori_cols  = out.size(-1);
-            int scaleN    = ori_cols / cols;
-            int ori_rows  = rows / scaleN;
-            int num_group = rows;
-            dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-            dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-                        reinterpret_cast<float*>(scales.data_ptr()),
-                        reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
-                        group_size,
-                        ori_rows,
-                        ori_cols,
-                        ori_cols,
-                        shuffle_scale,
-                        num_rows_ptr,
-                        num_rows_factor);
-                });
-        }
-        else if(out.dtype() == AITER_DTYPE_i8)
-        {
-            int ori_cols  = cols;
-            int scaleN    = ori_cols / cols;
-            int ori_rows  = rows / scaleN;
-            int num_group = rows;
-            dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-            dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<opus::i8_t*>(out.data_ptr()),
-                        reinterpret_cast<float*>(scales.data_ptr()),
-                        reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
-                        group_size,
-                        ori_rows,
-                        ori_cols,
-                        ori_cols,
-                        shuffle_scale,
-                        num_rows_ptr,
-                        num_rows_factor);
-                });
-        }
+        DISPATCH_GROUP_SIZE(cols,
+            static constexpr int thread_data_size     = 32;
+            static constexpr int num_thread_per_group = _GS / thread_data_size;
+            static constexpr int32_t dynGroupQuantBlockSize = 64;
+            const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
+            auto launch_group_quant = [&](auto out_type_tag, int ori_cols, int ori_rows, int num_group, auto shuffle_tag) {
+                using out_t = decltype(out_type_tag);
+                constexpr bool ss = decltype(shuffle_tag)::value;
+                static constexpr int32_t ooba = 4 / sizeof(out_t);
+                const int64_t oob_elems =
+                    (static_cast<int64_t>(ori_rows) * ori_cols + ooba - 1) / ooba * ooba;
+                const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
+                dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
+                dim3 const block(dynGroupQuantBlockSize);
+                AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+                    input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+                        using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize>
+                            <<<grid, block, 0, stream>>>(
+                            reinterpret_cast<out_t*>(out.data_ptr()),
+                            reinterpret_cast<float*>(scales.data_ptr()),
+                            reinterpret_cast<input_dtype*>(input.data_ptr()),
+                            scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
+                            ori_rows,
+                            ori_cols,
+                            ori_cols,
+                            oob_size,
+                            num_rows_ptr,
+                            num_rows_factor);
+                    });
+            };
+            auto do_launch = [&](auto shuffle_tag) {
+                if(out.dtype() == AITER_DTYPE_fp8)
+                {
+                    int ori_cols  = out.size(-1);
+                    int ori_rows  = rows / (ori_cols / _GS);
+                    launch_group_quant(opus::fp8_t{}, ori_cols, ori_rows, rows, shuffle_tag);
+                }
+                else if(out.dtype() == AITER_DTYPE_i8)
+                {
+                    int ori_cols  = _GS;
+                    int ori_rows  = rows;
+                    launch_group_quant(opus::i8_t{}, ori_cols, ori_rows, rows, shuffle_tag);
+                }
 #if defined(__Float4_e2m1fn_x2)
-        else if(out.dtype() == AITER_DTYPE_fp4x2)
-        {
-            int ori_cols  = out.size(-1) * 2;
-            int scaleN    = ori_cols / cols;
-            int ori_rows  = rows / scaleN;
-            int num_group = shuffle_scale ? ori_rows * ((scaleN + 7) / 8 * 8) : rows;
-            // int num_group = shuffle_scale ? ((ori_rows + 255) / 256 * 256) * ((scaleN + 7) / 8 *
-            // 8) : rows;
-            dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-            dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
-                        reinterpret_cast<float*>(scales.data_ptr()),
-                        reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
-                        group_size,
-                        ori_rows,
-                        ori_cols,
-                        ori_cols,
-                        shuffle_scale,
-                        num_rows_ptr,
-                        num_rows_factor);
-                });
-        }
+                else if(out.dtype() == AITER_DTYPE_fp4x2)
+                {
+                    int ori_cols  = out.size(-1) * 2;
+                    int ori_rows  = rows / (ori_cols / _GS);
+                    constexpr bool ss = decltype(shuffle_tag)::value;
+                    int num_group = ss ? ori_rows * (((ori_cols / _GS) + 7) / 8 * 8) : rows;
+                    launch_group_quant(opus::fp4_t{}, ori_cols, ori_rows, num_group, shuffle_tag);
+                }
 #endif
-        else
-        {
-            AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
-        }
+                else
+                {
+                    AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
+                }
+            };
+            if(shuffle_scale)
+                do_launch(std::true_type{});
+            else
+                do_launch(std::false_type{});
+        )
     }
     else
     {
@@ -843,13 +831,22 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
     }
 }
 
-void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
-                                        const aiter_tensor_t& input, // [..., d]
-                                        aiter_tensor_t& scales,
-                                        int group_size,
-                                        bool shuffle_scale,
-                                        std::optional<aiter_tensor_t> num_rows,
-                                        int num_rows_factor)
+// Canonical dynamic per-group scaled quant. Accepts fp8 / i8 / fp4x2 output;
+// the per-group scale layout is selected by ``scales.dtype()``:
+//   * AITER_DTYPE_fp8_e8m0 / u8 -> e8m0 byte scale (one byte per group of
+//     ``group_size`` elements). Required for MXFP4/MXFP8 GEMM consumers.
+//   * AITER_DTYPE_fp32          -> continuous fp32 per-group scale.
+// fp4 outputs always emit e8m0 (there is no fp32-scale fp4 path); fp8 picks
+// the path by scale dtype; i8 only supports fp32. The legacy entry point
+// `dynamic_per_group_scaled_quant_fp4` (kept as a forwarder below) hard-coded
+// fp4 only, which made the MXFP8 1xG byte-scale path unreachable here.
+void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
+                                    const aiter_tensor_t& input, // [..., d]
+                                    aiter_tensor_t& scales,
+                                    int group_size,
+                                    bool shuffle_scale,
+                                    std::optional<aiter_tensor_t> num_rows,
+                                    int num_rows_factor)
 {
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
@@ -863,40 +860,121 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
 
     AITER_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
+    // Decide e8m0 vs fp32 scale path from scales.dtype(). Note u8 alias is
+    // accepted for callers that build the scale tensor as raw uint8.
+    const bool use_e8m0_scale =
+        scales.dtype() == AITER_DTYPE_fp8_e8m0 || scales.dtype() == AITER_DTYPE_u8;
+    AITER_CHECK(use_e8m0_scale || scales.dtype() == AITER_DTYPE_fp32,
+                __func__,
+                " expects scales.dtype in {fp8_e8m0, u8, fp32}, got ",
+                AiterDtype_to_str(scales.dtype()));
+
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    int thread_data_size     = 32;
-    int num_thread_per_group = group_size / thread_data_size;
-    int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
+    DISPATCH_GROUP_SIZE(group_size,
+        static constexpr int thread_data_size     = 32;
+        static constexpr int num_thread_per_group = _GS / thread_data_size;
+        static constexpr int32_t dynGroupQuantBlockSize = 64;
+        const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
 
-    int scaleN    = cols / group_size;
-    int num_group = shuffle_scale ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
-    // int num_group = shuffle_scale ? ((rows + 255) / 256 * 256) * ((scaleN + 7) / 8 * 8) : rows *
-    // scaleN;
-    dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-    dim3 const block(groupQuantBlockSize);
+        int scaleN    = cols / _GS;
+        dim3 const block(dynGroupQuantBlockSize);
 
+        auto launch = [&](auto out_type_tag, auto shuffle_tag, auto e8m0_tag) {
+            using out_t = decltype(out_type_tag);
+            constexpr bool ss = decltype(shuffle_tag)::value;
+            constexpr bool ee = decltype(e8m0_tag)::value;
+            // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
+            // regardless of element dtype; non-shuffle / fp32-scale paths
+            // use exactly `rows * scaleN` slots.
+            int num_group;
+            if constexpr(ee)
+            {
+                num_group = ss ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
+            }
+            else
+            {
+                num_group = rows * scaleN;
+            }
+            static constexpr int32_t ooba = 4 / sizeof(out_t);
+            const int64_t oob_elems =
+                (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
+            const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
+            dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize, ee>
+                        <<<grid, block, 0, stream>>>(
+                        reinterpret_cast<out_t*>(out.data_ptr()),
+                        reinterpret_cast<float*>(scales.data_ptr()),
+                        reinterpret_cast<input_dtype*>(input.data_ptr()),
+                        nullptr,
+                        rows,
+                        cols,
+                        row_stride,
+                        oob_size,
+                        num_rows_ptr,
+                        num_rows_factor);
+                });
+        };
+
+        auto do_launch = [&](auto shuffle_tag, auto e8m0_tag) {
+            constexpr bool ee = decltype(e8m0_tag)::value;
+            if(out.dtype() == AITER_DTYPE_fp8)
+            {
+                launch(opus::fp8_t{}, shuffle_tag, e8m0_tag);
+            }
+            else if(out.dtype() == AITER_DTYPE_i8)
+            {
+                static_assert(true, "i8 path does not support e8m0 scale");
+                AITER_CHECK(!ee, __func__, " i8 output does not support e8m0 scale");
+                launch(opus::i8_t{}, shuffle_tag, std::false_type{});
+            }
 #if defined(__Float4_e2m1fn_x2)
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
-        input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
-            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-            aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
-                reinterpret_cast<float*>(scales.data_ptr()),
-                reinterpret_cast<input_dtype*>(input.data_ptr()),
-                nullptr,
-                group_size,
-                rows,
-                cols,
-                row_stride,
-                shuffle_scale,
-                num_rows_ptr,
-                num_rows_factor);
-        });
-#else
-    AITER_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
+            else if(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8)
+            {
+                // fp4 always uses e8m0 scale regardless of `use_e8m0_scale`.
+                launch(opus::fp4_t{}, shuffle_tag, std::true_type{});
+            }
 #endif
+            else
+            {
+                AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
+            }
+        };
+
+        auto with_e8m0 = [&](auto shuffle_tag) {
+            if(use_e8m0_scale)
+                do_launch(shuffle_tag, std::true_type{});
+            else
+                do_launch(shuffle_tag, std::false_type{});
+        };
+        if(shuffle_scale)
+            with_e8m0(std::true_type{});
+        else
+            with_e8m0(std::false_type{});
+    )
+}
+
+// Backward-compat thin forwarder. Asserts fp4x2/u8 output and delegates to
+// the dtype-aware canonical entry. Existing callers (Python compile_ops
+// binding `dynamic_per_group_scaled_quant_fp4`, downstream tests, etc.)
+// continue to work unchanged.
+void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
+                                        const aiter_tensor_t& input, // [..., d]
+                                        aiter_tensor_t& scales,
+                                        int group_size,
+                                        bool shuffle_scale,
+                                        std::optional<aiter_tensor_t> num_rows,
+                                        int num_rows_factor)
+{
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8,
+                __func__,
+                " expects fp4x2 / uint8 output; use dynamic_per_group_scaled_quant for fp8/i8");
+    dynamic_per_group_scaled_quant(
+        out, input, scales, group_size, shuffle_scale, num_rows, num_rows_factor);
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \
@@ -1429,9 +1507,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
         using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
         using vec_f = opus::vector_t<float, vec_size_i>;
         const float inverted_DTYPE_MAX =
-            std::is_same_v<DTYPE_O, opus::fp4_t>
-                ? 0.25
-                : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+            (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
         auto buffer_smscale = opus::make_gmem<float>(smooth_scale + expert_id * cols, cols * sizeof(float));
         vec_f smscale = load_vector_nbytes<float, thread_data_size, 16>(buffer_smscale, threadIdx.x * vec_size_i);
         int token_id_list = token_id_info_list & 0xFFFFFF;
@@ -1462,19 +1538,8 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             }
             absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
-            auto fp4_scale = [](float tmp) {
-                uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-                uint32_t exponent = (u32 >> 23) & 0b11111111;
-                if(exponent == 0b11111111)
-                {
-                    return __builtin_bit_cast(float, exponent << 23);
-                }
-                if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-                    exponent += 1;
-                return __builtin_bit_cast(float, exponent << 23);
-            };
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                                ? aiter::fp4_f32_to_e8m0_scale(absMax)
                                 : absMax * inverted_DTYPE_MAX;
             
             int out_token_idx;
@@ -1614,13 +1679,62 @@ void moe_smooth_per_token_scaled_quant_v2(
 }
 
 
+// Fused dynamic MX (fp4 / fp8) quantization + MoE-sort writeback.
+// Template parameter DTYPE_O selects the element format (opus::fp4_t for MXFP4,
+// opus::fp8_t for MXFP8); both paths emit the same E8M0 scale byte layout via
+// `aiter::mx_scale_shuffle_idx`. The legacy kernel name
+// `mxfp4_quant_moe_sort_kernel` was misleading because it implied fp4-only
+// — the implementation has always been dtype-templated.
+template <typename DTYPE_O, int thread_data_size>
+__device__ void store_zero_mx_quant_moe_sort_row(
+    DTYPE_O* __restrict__ out,
+    uint8_t* __restrict__ scale,
+    const int sorted_row,
+    const int32_t scaleN_pad,
+    const int32_t scaleN_valid,
+    const int scale_k,
+    const int num_thread_per_group,
+    const int topk_id,
+    const int topk,
+    const int64_t offset_base,
+    const int cols)
+{
+    if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+    {
+        int addr    = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
+        scale[addr] = 0;
+    }
+    if(topk_id < topk || topk == 1)
+    {
+        const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
+        uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
+        const int64_t row_offset = offset_base * row_bytes;
+        auto buffer_o = opus::make_gmem<uint8_t>(out_u8 + row_offset, row_bytes);
+
+        static constexpr int32_t zero_vec_bytes = 16;
+        opus::vector_t<uint8_t, zero_vec_bytes> zero_vec;
+#pragma unroll
+        for(int j = 0; j < zero_vec_bytes; j++)
+        {
+            zero_vec[j] = 0;
+        }
+
+        const int32_t num_vecs = (row_bytes + zero_vec_bytes - 1) / zero_vec_bytes;
+        for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x)
+        {
+            buffer_o.template store<zero_vec_bytes>(zero_vec, vec_idx * zero_vec_bytes);
+        }
+    }
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
-__global__ void mxfp4_quant_moe_sort_kernel(
+__global__ void fused_mx_quant_moe_sort_kernel(
     DTYPE_O* __restrict__ out,
     uint8_t* __restrict__ scale,
     DTYPE_I const* __restrict__ input,
     int32_t const* __restrict__ sorted_ids,
     int32_t const* __restrict__ num_valid_ids,
+    float const* __restrict__ sorted_weights,
     const int32_t num_tokens,
     const int32_t cols,
     const int32_t group_size,
@@ -1643,28 +1757,27 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                                                 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     using vec_f = opus::vector_t<float, vec_size_i>;
+    // Continuous fp32 scale divisor for non-MX dtypes (e.g. int8). MX dtypes
+    // (fp4 / fp8) take the e8m0 path via fp_f32_to_e8m0_scale<RoundUp, dtype>
+    // below, which returns a pure pow-2 dequant scale directly.
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, opus::fp4_t>
-            ? 0.25
-            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+        1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max());
+
+    // HW-native FP8 element dtype: gfx942 ships e4m3fnuz (max_pos=240),
+    // gfx950+ ships OCP e4m3fn (max_pos=448). The legacy
+    // ``fp_f32_to_e8m0_scale<RoundUp, FP4>(absMax) * 1/floor_pow2(MAX)`` formula here used
+    // to over-scale the FP8 working value by ~2x (factor*amax > max_pos),
+    // saturating the high tail; emit_mx_e8m0_scale<RoundUp, dtype> picks the
+    // correct ``ceil_pow2(amax / max_pos)`` per arch instead.
+    constexpr aiter::MxDtype kHwFp8Dtype =
+#if defined(__gfx942__)
+        aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+        aiter::MxDtype::FP8_E4M3;
+#endif
+
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
-
-    auto fp4_scale = [](float tmp) {
-        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
-        uint32_t exponent = (u32 >> 23) & 0b11111111;
-        if(exponent == 0b11111111)
-        {
-            return __builtin_bit_cast(float, exponent << 23);
-        }
-        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
-    };
-    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
-        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
-               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
-    };
 
     for(; block_idx < num_blocks; block_idx += num_tg)
     {
@@ -1695,6 +1808,23 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             }
 
             int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
+            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
+            if(sorted_weights != nullptr && sorted_weights[sorted_row] == 0.0f)
+            {
+                store_zero_mx_quant_moe_sort_row<DTYPE_O, thread_data_size>(
+                    out,
+                    scale,
+                    sorted_row,
+                    scaleN_pad,
+                    scaleN_valid,
+                    scale_k,
+                    num_thread_per_group,
+                    topk_id,
+                    topk,
+                    offset_base,
+                    cols);
+                continue;
+            }
             auto buffer_input =
                 opus::make_gmem<DTYPE_I>(input + offset_base * input_stride, cols * sizeof(DTYPE_I));
             vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
@@ -1710,15 +1840,31 @@ __global__ void mxfp4_quant_moe_sort_kernel(
             }
             absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-            float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
-                                  ? fp4_scale(absMax) * inverted_DTYPE_MAX
-                                  : absMax * inverted_DTYPE_MAX;
+            // MXFP4 / MXFP8 use the project-wide default round mode
+            // (kDefaultMxScaleRoundMode, currently NV ROUND_UP =
+            // ceil_pow2(amax / max_pos)). The helper returns the dequant
+            // scale as a pow-2 fp32, so the ``(>> 23) & 0xFF`` extraction
+            // below yields the stored e8m0 byte directly. Other dtypes fall
+            // back to a continuous fp32 scale.
+            float row_scale;
+            if constexpr (std::is_same_v<DTYPE_O, opus::fp4_t>)
+            {
+                row_scale = aiter::fp4_f32_to_e8m0_scale(absMax);
+            }
+            else if constexpr (std::is_same_v<DTYPE_O, opus::fp8_t>)
+            {
+                row_scale = aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode,
+                                                       kHwFp8Dtype>(absMax);
+            }
+            else
+            {
+                row_scale = absMax * inverted_DTYPE_MAX;
+            }
 
-            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
             if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
             {
                 uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
-                int addr        = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k);
+                int addr        = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
                 scale[addr]     = bs_e8m0;
             }
 
@@ -1732,20 +1878,21 @@ __global__ void mxfp4_quant_moe_sort_kernel(
 }
 
 
-#define MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                    \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "mxfp4_quant_moe_sort_kernel", [&] { \
-        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                            \
+#define FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                       \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "fused_mx_quant_moe_sort_kernel", [&] {  \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                               \
         AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
-        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                  \
-        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                     \
-        dim3 const grid(num_tg);                                                               \
-        mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                       \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                         \
+        dim3 const grid(num_tg);                                                                    \
+        fused_mx_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>               \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                           \
                 reinterpret_cast<DTYPE_O*>(output.data_ptr()),                                  \
                 reinterpret_cast<uint8_t*>(scale.data_ptr()),                                   \
                 reinterpret_cast<input_dtype const*>(input.data_ptr()),                         \
                 reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                              \
                 reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                           \
+                sorted_weights_ptr,                                                            \
                 token_num,                                                                      \
                 cols,                                                                           \
                 group_size,                                                                     \
@@ -1758,33 +1905,33 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     });
 
 
-#define MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(DTYPE_O, cols_)                                   \
+#define FUSED_MX_QUANT_MOE_SORT_KERNEL_DISPATCH(DTYPE_O, cols_)                                \
     if(cols_ <= 2 * BlockSize)                                                                 \
     {                                                                                          \
-        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 4)                           \
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 4)                         \
     }                                                                                          \
     else if(cols_ <= 4 * BlockSize)                                                            \
     {                                                                                          \
-        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 2)                           \
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 2)                         \
     }                                                                                          \
     else if(cols_ <= 8 * BlockSize)                                                            \
     {                                                                                          \
-        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize)                               \
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize)                             \
     }                                                                                          \
     else if(cols_ <= 16 * BlockSize)                                                           \
     {                                                                                          \
-        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 16, BlockSize)                              \
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 16, BlockSize)                            \
     }                                                                                          \
     else if(cols_ <= 16 * BlockSize * 2)                                                       \
     {                                                                                          \
-        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize)                              \
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize)                            \
     }                                                                                          \
     else                                                                                       \
     {                                                                                          \
         AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
     }
 
-void fused_dynamic_mxfp4_quant_moe_sort_hip(
+void fused_dynamic_mx_quant_moe_sort_hip(
     aiter_tensor_t& output,
     aiter_tensor_t& scale,
     const aiter_tensor_t& input,
@@ -1792,12 +1939,24 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
     const aiter_tensor_t& num_valid_ids,
     int token_num,
     int block_m,
-    int group_size
+    int group_size,
+    std::optional<aiter_tensor_t> sorted_weights
 )
 {
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
     int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
+    if(sorted_weights.has_value())
+    {
+        AITER_CHECK(sorted_weights->dtype() == AITER_DTYPE_fp32,
+                    __func__,
+                    " sorted_weights must be fp32 when provided");
+        AITER_CHECK(sorted_weights->numel() >= sorted_ids.size(0),
+                    __func__,
+                    " sorted_weights must have at least sorted_ids.size(0) elements");
+    }
+    float const* sorted_weights_ptr =
+        sorted_weights.has_value() ? reinterpret_cast<float const*>(sorted_weights->data_ptr()) : nullptr;
 
     const int num_cu = get_num_cu_func();
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
@@ -1810,19 +1969,34 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-#if defined(__Float4_e2m1fn_x2)
-    if(output.dtype() == AITER_DTYPE_fp4x2 || output.dtype() == AITER_DTYPE_u8)
+    if(output.dtype() == AITER_DTYPE_fp8)
     {
-        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp8_t, cols);
     }
+#if defined(__Float4_e2m1fn_x2)
+    else if(output.dtype() == AITER_DTYPE_fp4x2 || output.dtype() == AITER_DTYPE_u8)
+    {
+        FUSED_MX_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
+    }
+#endif
     else
     {
         AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
     }
-#else
-    AITER_CHECK(false, __func__, ": not support fp4x2 on this device");
-#endif
 }
+
+// Perf gate threshold for the coalesced LDS-staged store path in
+// mxfp4_moe_sort_kernel (see below). The LDS staging + double __syncthreads
+// cost scales with the LDS footprint per row (scaleN_pad bytes) times the
+// number of grid tiles (num_blocks). On MI355X/gfx950 uncoalesced byte stores
+// are already cheap, so the coalesced path is a net win for small/mid
+// (scaleN_pad x num_blocks) but loses once that product is large (empirically
+// the only regressor is dim=7168 @ M=16384: 224*4352=974,848; the largest
+// winner is dim=7168 @ M=8192: 224*2304=516,096). The threshold sits between
+// them with ~35% margin. This is a PURE PERFORMANCE knob: both the coalesced
+// and the scatter paths are byte-exact, so the value only affects speed, never
+// correctness.
+constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
 template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
 __global__ void mxfp4_moe_sort_kernel(
@@ -1850,12 +2024,124 @@ __global__ void mxfp4_moe_sort_kernel(
     using vec_i = opus::vector_t<uint8_t, vec_size_i>;
     const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
     const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
-    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
-        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
-               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
-    };
     auto buffer_scale =
                 opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
+
+    // Optimized store path: when one threadblock maps to exactly one 32-row
+    // swizzle tile (num_rows == 32), we stage this block's scale bytes into
+    // LDS in natural [row][col] order, then emit the swizzled out_scale layout
+    // with fully-coalesced 4-byte (dword) stores instead of 32 strided 1-byte
+    // scatters. The swizzle address for a fixed 32-row tile decomposes so that
+    // each contiguous 256-byte region == (one tile) x (8 columns), and one
+    // aligned dword at offset (y_blk*256 + c*64 + xl_lo*4) packs exactly:
+    //   byte0 = data[xl_lo   ][col_a]   byte1 = data[xl_lo+16][col_a]
+    //   byte2 = data[xl_lo   ][col_a+4] byte3 = data[xl_lo+16][col_a+4]
+    // with col_a = y_blk*8 + c. So 64 consecutive dwords fill a 256B block.
+    //
+    // The coalesced path is gated by a pure perf heuristic computed here from
+    // values already in scope (scaleN_pad = LDS footprint per row, num_blocks =
+    // grid tiles); see MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX above. When the
+    // gate is off we fall through to the original per-byte scatter path below.
+    // Both paths are byte-exact; the gate only selects the faster one. The
+    // (long) casts avoid int32 overflow of the product.
+    if constexpr (num_rows == 32)
+    {
+      if(((long)scaleN_pad * (long)num_blocks) <= MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX)
+      {
+        // LDS holds 32 rows x scaleN_pad bytes (upper bound is compile-time:
+        // threads_per_row * thread_data_size columns). Zero-staged so invalid
+        // rows and padding columns store 0 (byte-exact with the reference,
+        // whose buffer is zero-initialised).
+        //
+        // The LDS row stride is PADDED (LDS_STRIDE = lds_cols + LDS_PAD), kept
+        // separate from the output stride scaleN_pad. Without padding, a
+        // scaleN_pad that is a multiple of 32 dwords (e.g. dim=4096 ->
+        // scaleN_pad=128 = 32 LDS banks) makes all 32 rows of a tile alias onto
+        // the same LDS bank, causing a ~32-way bank conflict in the packed
+        // read-out (s_scale[xl_lo*..] and s_scale[(xl_lo+16)*..]). Padding the
+        // stride by 4 bytes (one dword) breaks that aliasing while preserving
+        // dword alignment of the staged reads. This is invisible to the output:
+        // out_scale addressing still uses scaleN_pad, so the result is
+        // byte-identical; only the in-LDS layout changes.
+        constexpr int lds_cols   = threads_per_row * thread_data_size;
+        constexpr int LDS_PAD    = 4;
+        constexpr int LDS_STRIDE = lds_cols + LDS_PAD;
+        __shared__ uint8_t s_scale[num_rows * LDS_STRIDE];
+
+        for(; block_idx < num_blocks; block_idx += num_tg)
+        {
+            // Skip tiles whose 32 rows are entirely in the padding region
+            // (all rows >= num_valid_ids -> all invalid). The output buffer is
+            // pre-zeroed, so leaving such tiles untouched is byte-exact with the
+            // reference, and matches the original kernel's per-row guard. This
+            // avoids streaming zeros to the large E*block_m padding region.
+            // block_idx is uniform across the block, so no __syncthreads hazard.
+            if(block_idx * num_rows >= num_valid_ids_value)
+            {
+                continue;
+            }
+            int sorted_row = block_idx * num_rows + row_i;
+            int token_id_info = num_tokens;
+            if (sorted_row < num_valid_ids_value)
+            {
+                token_id_info = sorted_ids[sorted_row];
+            }
+            int token_idx = token_id_info & 0xFFFFFF;
+            int topk_id   = token_id_info >> 24;
+            bool valid = (token_idx < num_tokens && (topk == 1 || topk_id < topk));
+
+            vec_i vec_scale;
+            if(valid)
+            {
+                int64_t scale_offset;
+                if (topk == 1)
+                {
+                    scale_offset = (int64_t)(token_idx) * scale_per_row;
+                }
+                else
+                {
+                    scale_offset = (int64_t)(token_idx * topk + topk_id) * scale_per_row;
+                }
+                vec_scale = load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(
+                    buffer_scale, scale_offset + scale_k);
+            }
+
+            __syncthreads();
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                int col = scale_k + j;
+                if(col < scaleN_pad)
+                {
+                    s_scale[row_i * LDS_STRIDE + col] =
+                        (valid && col < scaleN_valid) ? vec_scale[j] : (uint8_t)0;
+                }
+            }
+            __syncthreads();
+
+            const int ngroups   = scaleN_pad / 8;
+            const int total_dw  = ngroups * 64;
+            const int64_t tile_base = (int64_t)block_idx * scaleN_pad * 32;
+            for(int d = threadIdx.x; d < total_dw; d += block_size)
+            {
+                int y_blk  = d >> 6;
+                int t      = d & 63;
+                int xl_lo  = t & 15;
+                int c      = t >> 4;
+                int col_a  = y_blk * 8 + c;
+                int col_b  = col_a + 4;
+                uint32_t b0 = s_scale[xl_lo * LDS_STRIDE + col_a];
+                uint32_t b1 = s_scale[(xl_lo + 16) * LDS_STRIDE + col_a];
+                uint32_t b2 = s_scale[xl_lo * LDS_STRIDE + col_b];
+                uint32_t b3 = s_scale[(xl_lo + 16) * LDS_STRIDE + col_b];
+                uint32_t packed = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                int64_t addr = tile_base + (int64_t)y_blk * 256 + (int64_t)c * 64 + xl_lo * 4;
+                *reinterpret_cast<uint32_t*>(out_scale + addr) = packed;
+            }
+        }
+        return;
+      }
+    }
+
     for(; block_idx < num_blocks; block_idx += num_tg)
     {
         int sorted_row = block_idx * num_rows + row_i;
@@ -1884,7 +2170,7 @@ __global__ void mxfp4_moe_sort_kernel(
             {
                 if((scale_k + j) < scaleN_valid)
                 {
-                    int addr = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k + j);
+                    int addr = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k + j);
                     out_scale[addr] = vec_scale[j];
                 }
             }
@@ -1901,6 +2187,8 @@ __global__ void mxfp4_moe_sort_kernel(
     int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
     int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
     dim3 const grid(num_tg);                                                            \
+    /* The coalesced-store perf gate is computed inside the kernel from        */       \
+    /* num_blocks + scaleN_pad (no extra launch arg / signature change).       */       \
     mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
         <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
             reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \

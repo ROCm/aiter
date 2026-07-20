@@ -1,97 +1,93 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+#include <torch/extension.h>
 
 #include "gemm_a4w4_blockscale_common.cuh"
-#include "gemm_a4w4_blockscale_manifest.h"
 #include "gemm_a4w4_blockscale_lookup.h"
-#include "gemm_common.h"
-#include "gemm_dispatch_utils.h"
-#include <cmath>
+#include "gemm_a4w4_blockscale_manifest.h"
 
-using BlockwiseKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, int)>;
+using BlockwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
+// Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
+// behind std::string_view keys + raw fn-ptr values (constant-init into
+// .data.rel.ro, matching PR #3255's GemmDispatchMap style).
+//
+// Note: the a4w4 tuned CSV mixes CK and ASM kernels; the ASM rows are
+// filtered out at codegen (see csrc/ck_gemm_a4w4_blockscale/gen_instances.py)
+// and dispatched separately by aiter/ops/gemm_op_a4w4.py based on the
+// kernelName prefix (_ZN... = mangled ASM symbol).  This map only contains
+// CK kernels.
+using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
+// Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the
+// rationale).  Empty kernelName -> default heuristic; non-empty but unknown
+// kernelName -> hard error.
 template <typename CDataType>
-BlockwiseKernel blockscale_dispatch(int M, int N, int K)
+BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 {
-    // For a given shape, either find the best kernel via lookup or heuristic.
-    // For many small M shapes, we bucket them to the next largest kernel.
-    // This is fine since kernels are padded anyway.
+    static const auto lookup = [] {
+        if constexpr(std::is_same_v<CDataType, F16>)
+        {
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(F16)};
+        }
+        else if constexpr(std::is_same_v<CDataType, B16>)
+        {
+            return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(B16)};
+        }
+        else
+        {
+            static_assert(false, "blockscale_dispatch used with unsupported dtype!");
+        }
+    }();
 
-    static const auto lookup = []
+    if(!kernelName.empty())
     {
-      if constexpr (std::is_same_v<CDataType, F16>) {
-          return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(F16)};
-      } else if constexpr (std::is_same_v<CDataType, B16>) {
-          return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(B16)};
-      } else {
-          static_assert(false, "blockscale_dispatch used with unsupported dtype!");
-      } }();
-
-    const int cu_num         = get_device_cu_num();
-    const std::string& gfx   = get_device_gfx();
-
-    // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({gfx, cu_num, M, N, K});
-    // If we found an optimal kernel, use it.
-    if (it != lookup.end())
-    {
-      return it->second;
+        auto it = lookup.find(std::string_view{kernelName});
+        if(it != lookup.end())
+        {
+            return it->second;
+        }
+        TORCH_CHECK(false,
+                    "gemm_a4w4_blockscale kernel '",
+                    kernelName,
+                    "' is not present in the compiled registry. The tuned CSV references a "
+                    "kernel that was not built into aiter. Rebuild aiter (or remove this row "
+                    "from aiter/configs/a4w4_blockscale_tuned_gemm.csv) and try again.");
     }
 
-    int padded_m = M;
-    // Fine-grained search
-    padded_m = getPaddedM(M, N, K, 0);
-
-    // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({gfx, cu_num, padded_m, N, K});
-    // If we found an optimal kernel, use it.
-    if (it != lookup.end())
-    {
-      return it->second;
-    }
-    // Coarse-grained search
-    padded_m = getPaddedM(M, N, K, 1);
-    it = lookup.find({gfx, cu_num, padded_m, N, K});
-    if (it != lookup.end())
-    {
-      return it->second;
-    }
-    // Otherwise, use heuristics.
-    return a4w4_blockscale_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x2_intrawave_v3<CDataType>;
+    // Default heuristic kernel (used when Python had no tuned row).
+    return a4w4_blockscale_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x2_intrawave_v3<
+        CDataType>;
 }
 
-torch::Tensor gemm_a4w4_blockscale(
-    torch::Tensor& XQ,
-    torch::Tensor& WQ,
-    torch::Tensor& x_scale,
-    torch::Tensor& w_scale,
-    torch::Tensor& Y,
-    int splitK)
+torch::Tensor gemm_a4w4_blockscale(torch::Tensor& XQ,
+                                   torch::Tensor& WQ,
+                                   torch::Tensor& x_scale,
+                                   torch::Tensor& w_scale,
+                                   torch::Tensor& Y,
+                                   int splitK,
+                                   std::string kernelName)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
-                "Scales should have the same dtype!");
+    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  int K = XQ.size(1) * 2; // always fp4_x2
-
-  if (Y.dtype() == at::ScalarType::Half)
-  {
-    blockscale_dispatch<F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, splitK);
-  }
-  else if (Y.dtype() == at::ScalarType::BFloat16)
-  {
-    blockscale_dispatch<B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, splitK);
-  }
-  else
-  {
-    TORCH_CHECK(false, "Unsupported scales/output dtype!");
-  }
-  return Y;
+    if(Y.dtype() == at::ScalarType::Half)
+    {
+        blockscale_dispatch<F16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
+    }
+    else if(Y.dtype() == at::ScalarType::BFloat16)
+    {
+        blockscale_dispatch<B16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported scales/output dtype!");
+    }
+    return Y;
 }
