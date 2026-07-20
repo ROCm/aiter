@@ -208,9 +208,22 @@ jobs:
           # CMD of /bin/bash, which exits immediately for `docker run -d`.
           # Force a long-lived `sleep infinity` so subsequent `docker exec`
           # invocations succeed for both legacy and manylinux images.
+          # Pass GPU devices into the build container when the runner has them:
+          # setup.py start_aot() JIT-loads HIP modules and fails with
+          # hipErrorNoDevice if the container cannot reach a GPU. On GPU-less
+          # runners (build-only-aiter) /dev/kfd is absent, so the flags are
+          # omitted and the container starts as before.
+          GPU_FLAGS=""
+          if [ -e /dev/kfd ]; then
+            GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video"
+            echo "GPU devices detected; passing ${GPU_FLAGS} to build container"
+          else
+            echo "No /dev/kfd on runner; starting build container without GPU access"
+          fi
           docker run -dt \
           --shm-size=16G \
           --network=host \
+          ${GPU_FLAGS} \
           --entrypoint="" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
