@@ -466,6 +466,16 @@ def fused_moe(
     splitk=0,
     swiglu_limit=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    # EP gemm2-fused scatter (combine_mode="scatter_fused"): route gemm2 output
+    # straight into peers' comb_inp instead of gather-reduce; see grouped path.
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: Optional[torch.Tensor] = None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -493,6 +503,14 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        ep_scatter=ep_scatter,
+        ep_arena_handle=ep_arena_handle,
+        ep_comb_inp_off=ep_comb_inp_off,
+        ep_wire_nbytes=ep_wire_nbytes,
+        ep_rank=ep_rank,
+        ep_max_tok=ep_max_tok,
+        ep_topk=ep_topk,
+        ep_tis=ep_tis,
     )
 
 
@@ -522,6 +540,14 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -558,6 +584,14 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -655,6 +689,14 @@ def fused_moe_(
                 gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
                 num_local_tokens=num_local_tokens,
+                ep_scatter=ep_scatter,
+                ep_arena_handle=ep_arena_handle,
+                ep_comb_inp_off=ep_comb_inp_off,
+                ep_wire_nbytes=ep_wire_nbytes,
+                ep_rank=ep_rank,
+                ep_max_tok=ep_max_tok,
+                ep_topk=ep_topk,
+                ep_tis=ep_tis,
             )
 
     if grouped_a8w4_out is not None:

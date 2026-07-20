@@ -71,6 +71,12 @@ class _GroupedA8W4Config:
     stage1_weight_layout: str = "gguu"
     stage1_quant_out: str | None = None
     stage1_quant_wmma_rep: int = 1
+    # EP gemm2-fused scatter (compile-time; see compile_mxscale_gemm.ep_p2p_write).
+    ep_p2p_write: bool = False
+    ep_off_comb_inp: int = 0
+    ep_wire_nbytes: int = 0
+    ep_slot_stride: int = 0
+    ep_arena_handle: int = 0
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -1031,6 +1037,11 @@ def _compile_base_a8w4_gemm(
         stage1_quant_out=stage1_quant_out,
         stage1_quant_wmma_rep=stage1_quant_wmma_rep,
         kernel_tag=kernel_tag,
+        ep_p2p_write=cfg.ep_p2p_write,
+        ep_off_comb_inp=cfg.ep_off_comb_inp,
+        ep_wire_nbytes=cfg.ep_wire_nbytes,
+        ep_slot_stride=cfg.ep_slot_stride,
+        ep_arena_handle=cfg.ep_arena_handle,
     )
 
 
@@ -1611,6 +1622,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     persistent_workers: int | None = None,
     persistent_stride: bool = True,
     data_format: str = "a8w4",
+    ep_p2p_write: bool = False,
+    ep_off_comb_inp: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_slot_stride: int = 0,
+    ep_arena_handle: int = 0,
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim),
@@ -1639,6 +1655,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         persistent_workers=persistent_workers,
         persistent_stride=bool(persistent_stride),
         data_format=str(data_format),
+        ep_p2p_write=bool(ep_p2p_write),
+        ep_off_comb_inp=int(ep_off_comb_inp),
+        ep_wire_nbytes=int(ep_wire_nbytes),
+        ep_slot_stride=int(ep_slot_stride),
+        ep_arena_handle=int(ep_arena_handle),
     )
     _validate_common(cfg)
 
@@ -1682,9 +1703,26 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _m_tile_prefix=None,
         _m_tile_map=None,
         bias=None,
+        ep_rowmap=None,
     ):
         """If `_gemm_events=(start, end)` is given, record around the GEMM
-        kernel launch only -- excludes prefix-sum prep work."""
+        kernel launch only -- excludes prefix-sum prep work.
+
+        ep_rowmap (EP gemm2-fused scatter, cfg.ep_p2p_write): a (cap_rows, 2) i32
+        tensor [dst_packed, f32_weight_bits] indexed by the flat gemm output row,
+        smuggled to the kernel through the otherwise-unused m_tile_prefix arg slot
+        (free in both the contiguous and dense-masked schedulers; the persistent
+        scheduler reads it, so ep_p2p_write forbids persistent)."""
+        if cfg.ep_p2p_write:
+            if ep_rowmap is None:
+                raise ValueError("ep_p2p_write stage2 requires ep_rowmap")
+            if cfg.grouped_persistent_m:
+                raise ValueError(
+                    "ep_p2p_write stage2 requires a non-persistent scheduler "
+                    "(grouped_persistent_m=False); contiguous or dense masked is ok"
+                )
+            if bias is not None:
+                raise ValueError("ep_p2p_write stage2 does not support bias")
         if (
             int(max_m_arg) != cfg.max_m
             or int(model_dim_arg) != cfg.model_dim
@@ -1758,6 +1796,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 _gemm_events[1].record(stream)
         elif cfg.grouped_contiguous_m:
             _unused_m_tile_prefix = masked_m
+            if cfg.ep_p2p_write:
+                # Smuggle the row->dest/weight map through the free prefix slot;
+                # grouped_layout (psum) stays in the m_tile_map slot for the
+                # DeepGEMM contiguous scheduler bisect.
+                _unused_m_tile_prefix = ep_rowmap
             grouped_layout = _m_tile_map
             if grouped_layout is None:
                 grouped_layout = masked_m
@@ -1804,8 +1847,12 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 _gemm_events[1].record(stream)
         else:
             # Dense mode: prefix/map unused, pass placeholders for ABI compat.
+            # EP gemm2-fused scatter repurposes the prefix slot for the per-row
+            # dest/weight map that the P2P epilogue reads.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
+            if cfg.ep_p2p_write:
+                _unused_m_tile_prefix = ep_rowmap
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:

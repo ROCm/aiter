@@ -33,6 +33,7 @@ from .intranode_kernels import (
     make_dispatch,
     make_combine,
     make_combine_scatter,
+    make_combine_fused_reduce,
     make_convert_dispatch_output,
     make_convert_combine_input,
     make_local_expert_count,
@@ -150,9 +151,10 @@ class EpDispatchCombineConfig:
                 f"combine_quant_type must be one of {_COMBINE_QUANT_TYPES}, "
                 f"got {self.combine_quant_type!r}"
             )
-        if self.combine_mode not in ("gather", "scatter"):
+        if self.combine_mode not in ("gather", "scatter", "scatter_fused"):
             raise ValueError(
-                f"combine_mode must be gather|scatter, got {self.combine_mode!r}"
+                "combine_mode must be gather|scatter|scatter_fused, "
+                f"got {self.combine_mode!r}"
             )
         if self.combine_quant_type != "none":
             self.combine_mode = "scatter"
@@ -232,7 +234,13 @@ class EpDispatchCombineConfig:
 
     @property
     def is_scatter(self):
-        return self.combine_mode == "scatter"
+        return self.combine_mode in ("scatter", "scatter_fused")
+
+    @property
+    def is_fused(self):
+        """gemm2-fused scatter: gemm2 P2P-writes weighted per-(token,k) results into
+        comb_inp; combine only barriers + sums. No Stage-1 write, no gather_reduce."""
+        return self.combine_mode == "scatter_fused"
 
     @property
     def fp8_direct_cast(self):
@@ -458,20 +466,34 @@ class EpDispatchCombineOp:
         # scatter combine needs its own staging regions
         if cfg.is_scatter:
             wire_elem_size = cfg.wire_elem_size
-            regions.append(
-                (
-                    "comb_inp",
-                    cfg.world_size * max_tok_per_rank * hidden_dim * wire_elem_size,
+            if cfg.is_fused:
+                # per-(origin_token, k): this rank's own M tokens x topk slots; each
+                # (token,k) is written exactly once by the owner rank's gemm2 (the
+                # expert k of that token lives on one rank) -> no cross-rank collision.
+                # Weights are pre-multiplied in gemm2, so no comb_wts region.
+                regions.append(
+                    ("comb_inp", max_tok_per_rank * topk * hidden_dim * wire_elem_size)
                 )
-            )
-            regions.append(("comb_wts", cfg.world_size * max_tok_per_rank * topk * 4))  # delete
-            if cfg.fp8_blockwise:
+            else:
                 regions.append(
                     (
-                        "comb_scales",
-                        cfg.world_size * max_tok_per_rank * cfg.combine_scale_dim * 4,
+                        "comb_inp",
+                        cfg.world_size * max_tok_per_rank * hidden_dim * wire_elem_size,
                     )
                 )
+                regions.append(
+                    ("comb_wts", cfg.world_size * max_tok_per_rank * topk * 4)
+                )
+                if cfg.fp8_blockwise:
+                    regions.append(
+                        (
+                            "comb_scales",
+                            cfg.world_size
+                            * max_tok_per_rank
+                            * cfg.combine_scale_dim
+                            * 4,
+                        )
+                    )
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
 
@@ -562,7 +584,25 @@ class EpDispatchCombineOp:
             for (b, w) in dispatch_specs
         }
         self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
-        if cfg.is_scatter:
+        if cfg.is_fused:
+            # gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp;
+            # combine only barriers (wait for peers' writes) + sums the topk slots.
+            self._combine_variants = {
+                (b, w): make_combine_fused_reduce(
+                    rank=cfg.rank,
+                    npes=cfg.world_size,
+                    experts_per_token=topk,
+                    hidden_dim=hidden_dim,
+                    hidden_elem_size=elem_size,
+                    max_tok_per_rank=max_tok_per_rank,
+                    block_num=b,
+                    warp_num_per_block=w,
+                    off_comb_inp=arena.offset("comb_inp"),
+                    off_xdb_mem=arena.offset("cross_device_barrier"),
+                )
+                for (b, w) in combine_specs
+            }
+        elif cfg.is_scatter:
             self._combine_variants = {
                 (b, w): make_combine_scatter(
                     rank=cfg.rank,
@@ -893,6 +933,8 @@ class EpDispatchCombineOp:
         accepted for API parity but unused (weights come from forwarded out_wts,
         routing carries the mapping). Returns (out [ct,hidden], out_weights [ct,topk]).
         """
+        if self.cfg.is_fused:
+            return self._combine_fused(routing)
         comb_stg_ptr = self.arena.local_ptr("comb_stg")
         if self.cfg.is_scatter:
             # Scatter Stage 1 only LOCAL-reads its source, so read the post-expert
@@ -943,6 +985,51 @@ class EpDispatchCombineOp:
         cols = (
             hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else hidden_dim
         )  # fp4 out is hidden/2 float4 elems
+        out = self.combine_out[: count * cols].view(cdt).view(count, cols)
+        return out, self.combine_out_weights[: count * topk].view(count, topk)
+
+    # ---- gemm2-fused scatter (combine_mode="scatter_fused") ---- #
+    def zero_fused_staging(self):
+        """Zero the per-(token,k) comb_inp before the gemm2 P2P writes of a layer.
+        Needed because gemm2 writes only the (token,k) slots whose expert survived
+        dispatch/capacity; dropped slots must read 0 in the combine topk sum."""
+        assert self.cfg.is_fused, "zero_fused_staging is scatter_fused-only"
+        self.arena.zero("comb_inp")
+
+    def ep_scatter_params(self):
+        """Handles the moe gemm2 epilogue needs to P2P-write its weighted per-(token,k)
+        results straight into peers' comb_inp (combine_mode='scatter_fused')."""
+        assert self.cfg.is_fused, "ep_scatter_params is scatter_fused-only"
+        return dict(
+            ep_arena_handle=self.arena.handle,
+            ep_comb_inp_off=self.arena.offset("comb_inp"),
+            ep_tis_off=self.arena.offset("recv_to_src_token"),
+            ep_wire_nbytes=self.cfg.hidden_dim * self.cfg.wire_elem_size,
+            ep_rank=self.cfg.rank,
+            ep_max_tok=self.cfg.max_num_inp_token_per_rank,
+            ep_topk=self.cfg.num_experts_per_token,
+        )
+
+    def _combine_fused(self, routing):
+        """gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp; just
+        barrier (wait for peers' writes) + sum the topk slots per origin token."""
+        stream = fx.Stream(torch.cuda.current_stream())
+        count = routing.cur_rank_num_token
+        _, comb_spec = self._pick(count)
+        self.combine_out.zero_()
+        self._combine_variants[comb_spec](
+            self.arena.handle,
+            self.combine_barrier.data_ptr(),
+            self.cross_device_flag.data_ptr(),
+            self.combine_out.data_ptr(),
+            self.cfg.rank,
+            count,
+            stream,
+        )
+        hidden_dim = self.cfg.hidden_dim
+        topk = self.cfg.num_experts_per_token
+        cdt = self.cfg.combine_dtype
+        cols = hidden_dim // 2 if cdt == torch.float4_e2m1fn_x2 else hidden_dim
         out = self.combine_out[: count * cols].view(cdt).view(count, cols)
         return out, self.combine_out_weights[: count * topk].view(count, topk)
 

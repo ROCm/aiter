@@ -228,7 +228,8 @@ def quant_tokens_fp8(tokens, spec):
 
 
 def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
-                expert_mask, spec, a1_scale=None, num_local_tokens=None):
+                expert_mask, spec, a1_scale=None, num_local_tokens=None,
+                ep_kwargs=None):
     """Single fused_moe call (device path). ``num_local_tokens`` (device int32
     scalar == total_recv) lets the caller feed the FULL, un-truncated dispatch
     buffer: routes past total_recv*topk are dropped in the grouped route kernel,
@@ -237,7 +238,10 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
         num_local_tokens = torch.tensor(
             [hidden.shape[0]], dtype=dtypes.i32, device=hidden.device
         )
+    ep_kwargs = ep_kwargs or {}
     if spec["is_mxfp4"]:
+        if ep_kwargs:
+            raise NotImplementedError("scatter_fused is a8w4-only (not mxfp4)")
         return fused_moe(
             hidden, w1_a, w2_a, topk_weights, topk_ids,
             expert_mask=expert_mask,
@@ -255,6 +259,7 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
         quant_type=spec["aiter_qtype"],
         a1_scale=a1_scale,
         dtype=dtypes.bf16,
+        **ep_kwargs,
     )
 
 
@@ -488,10 +493,29 @@ class DeviceMoEPipeline:
         recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
             xn, wts, None, ids, return_routing=True
         )
+        ep_kwargs = None
+        if self.op.cfg.is_fused:
+            # gemm2-fused scatter: zero the per-(token,k) comb_inp before gemm2's
+            # P2P writes (dropped/unwritten slots must read 0 in the combine sum),
+            # then hand gemm2 the arena handles + this rank's tis (recv->origin).
+            self.op.zero_fused_staging()
+            ep_kwargs = dict(self.op.ep_scatter_params())
+            ep_tis = handle.disp_tok_id_to_src_tok_id_local
+            ep_kwargs = dict(
+                ep_scatter=True,
+                ep_arena_handle=ep_kwargs["ep_arena_handle"],
+                ep_comb_inp_off=ep_kwargs["ep_comb_inp_off"],
+                ep_wire_nbytes=ep_kwargs["ep_wire_nbytes"],
+                ep_rank=ep_kwargs["ep_rank"],
+                ep_max_tok=ep_kwargs["ep_max_tok"],
+                ep_topk=ep_kwargs["ep_topk"],
+                ep_tis=ep_tis,
+            )
         out = moe_forward(
             recv_x, self.w1_a, self.w2_a, self.w1_s, self.w2_s,
             recv_w, recv_idx.to(dtypes.i32), self.expert_mask, self.spec,
             num_local_tokens=total_recv_t,
+            ep_kwargs=ep_kwargs,
         )
         combine_out, _ = self.op.combine(out.to(self.transport_dtype), routing=handle)
         y = combine_out[: self.ct].to(dtypes.bf16)
