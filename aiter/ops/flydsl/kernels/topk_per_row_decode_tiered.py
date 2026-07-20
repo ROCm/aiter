@@ -65,6 +65,10 @@ from flydsl.expr.typing import T
 BLOCK_THREADS = 1024
 WARP_SIZE = 64
 LOAD_VEC = 4
+# log2(LOAD_VEC); LOAD_VEC must be a power of two (vec_blocks = ceil(row_len/LOAD_VEC)
+# is computed as a right shift, so the shift amount must track LOAD_VEC rather than
+# assuming a fixed width).
+LOAD_VEC_LOG2 = LOAD_VEC.bit_length() - 1
 # Default histogram-scan staging (one of 1/2/4/8)
 SCAN_STAGES = 2
 
@@ -125,6 +129,8 @@ def create_topk_per_row_decode_tiered_kernel(
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
     mask_non_finite: bool = True,
+    row_proportional_parts: bool = False,
+    early_stop: bool = False,
 ) -> Any:
     short_max = tiered_short_max
     mid_cap = tiered_mid_cap
@@ -136,8 +142,17 @@ def create_topk_per_row_decode_tiered_kernel(
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
     if scan_stages not in (1, 2, 4, 8):
         raise ValueError(f"scan_stages must be one of (1, 2, 4, 8), got {scan_stages}")
-    if not 2 <= blocks_per_row <= 32:
-        raise ValueError(f"blocks_per_row must be in [2, 32], got {blocks_per_row}")
+    # blocks_per_row == 1 collapses the launch to grid=(1, num_rows): every row runs
+    # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
+    # blocks hogging co-resident slots). This is only well-defined when the short tier
+    # exists (bpp==11); with bpp==10 a length>short_max row would need >1 cooperating
+    # part, so keep the >=2 floor there. gfx942 never produces 1 (batch cap off), so
+    # this only relaxes the gfx950 large-batch path.
+    _min_blocks_per_row = 1 if (tiered and bits_per_pass == 11) else 2
+    if not _min_blocks_per_row <= blocks_per_row <= 32:
+        raise ValueError(
+            f"blocks_per_row must be in [{_min_blocks_per_row}, 32], got {blocks_per_row}"
+        )
     if mid_cap < 2 or long_cap < 2:
         raise ValueError(f"mid_cap/long_cap must be >= 2, got {mid_cap}/{long_cap}")
     if mid_max < short_max:
@@ -160,6 +175,8 @@ def create_topk_per_row_decode_tiered_kernel(
         f"{f'_mm{tiered_mid_max}_lc{tiered_long_cap}' if tiered else ''}"
         f"{'_1wg' if short_tier else ''}"
         f"{'_mf' if mask_non_finite else ''}"
+        f"{'_rpp' if row_proportional_parts else ''}"
+        f"{'_es' if early_stop else ''}"
     )
 
     @fx.struct
@@ -257,6 +274,29 @@ def create_topk_per_row_decode_tiered_kernel(
             long_parts = (ArithValue(c_parts) < ArithValue(c_long_cap)).select(
                 c_parts, c_long_cap
             )
+            if const_expr(row_proportional_parts):
+                # gfx950: the launch grid (c_parts) is sized for the padded buffer
+                # width, so a short row would otherwise spin up far more cooperating
+                # workgroups than it needs -- each extra part only adds cross-CU
+                # barrier/merge latency (the mid/long floor). Cap the participating
+                # workgroups by the row's actual coverage need: one part per
+                # items_per_block (LOAD_VEC*BLOCK_THREADS) elements, floored at 2 so
+                # the persistent tier still has >1 workgroup. Fewer parts is always
+                # correct (the scan stride covers all vec-blocks regardless).
+                items_per_block = LOAD_VEC * block_threads
+                cover_shift = (items_per_block).bit_length() - 1
+                row_cover = ArithValue(
+                    ArithValue(row_len) + ArithValue(fx.Int32(items_per_block - 1))
+                ).shrui(fx.Int32(cover_shift))
+                row_cover = (ArithValue(row_cover) < ArithValue(c_two)).select(
+                    c_two, row_cover
+                )
+                mid_parts = (ArithValue(mid_parts) < ArithValue(row_cover)).select(
+                    mid_parts, row_cover
+                )
+                long_parts = (ArithValue(long_parts) < ArithValue(row_cover)).select(
+                    long_parts, row_cover
+                )
             active_parts = (ArithValue(row_len) <= ArithValue(c_short)).select(
                 c_one,
                 (ArithValue(row_len) <= ArithValue(c_mid)).select(
@@ -651,11 +691,74 @@ def create_topk_per_row_decode_tiered_kernel(
                 col_base, load_row_vec(col_base), local_k, kth_bits
             )
 
+        def process_loaded_early_vec(col_base, vec, previous_start_bit: int, kth_bits):
+            # Early-stop write: the boundary bucket after the previous pass is taken
+            # whole (remaining_len == remaining_k), so every element whose prefix at
+            # the previous resolution is <= the boundary prefix is in the top-k. No
+            # tie-break needed. Mirrors HIP mb `previous_bits <= kth_value_bits`.
+            for j in range_constexpr(LOAD_VEC):
+                col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
+                if ArithValue(col_i32) < ArithValue(row_len):
+                    val = vector.extract(vec, static_position=[j], dynamic_position=[])
+                    key = radix_twiddle_key(val)
+                    prefix = prefix_for_key(key, previous_start_bit)
+                    if arith.cmpi(arith.CmpIPredicate.ule, prefix, kth_bits):
+                        pos = global_atomic_add_i32(
+                            counter_slot(COUNTER_OUT_FRONT), c_one
+                        )
+                        if ArithValue(pos) < ArithValue(c_top_k):
+                            buffer_ops.buffer_store(
+                                col_i32, indices_rsrc, row_out + ArithValue(pos)
+                            )
+
+        def early_write_vec_block(vblk, previous_start_bit: int, kth_bits):
+            col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
+            process_loaded_early_vec(
+                col_base, load_row_vec(col_base), previous_start_bit, kth_bits
+            )
+
+        def early_write_all(previous_start_bit: int, kth_bits):
+            # Same 4x-staged unroll as the normal last-pass write so the early-stop
+            # row re-scan is not slower than the pass it replaces.
+            unroll_limit_idx = ArithValue(vec_blocks_idx) - ArithValue(
+                active_stride3_idx
+            )
+            for vblk, write_state in range(
+                ArithValue(global_vec_tid_idx),
+                unroll_limit_idx,
+                ArithValue(active_stride4_idx),
+                init=[global_vec_tid_idx],
+            ):
+                for unroll_id in range_constexpr(4):
+                    early_write_vec_block(
+                        ArithValue(vblk)
+                        + ArithValue(
+                            arith.index_cast(
+                                T.index,
+                                ArithValue(active_threads)
+                                * ArithValue(fx.Int32(unroll_id)),
+                            )
+                        ),
+                        previous_start_bit,
+                        kth_bits,
+                    )
+                write_results = yield [
+                    ArithValue(vblk) + ArithValue(active_stride4_idx)
+                ]
+            for vblk, write_state in range(
+                write_results,
+                ArithValue(vec_blocks_idx),
+                ArithValue(active_stride_idx),
+                init=[c_zero],
+            ):
+                early_write_vec_block(vblk, previous_start_bit, kth_bits)
+                write_results = yield [write_state[0]]
+
         global_vec_tid = part * ArithValue(c_block_i32) + tid
         global_vec_tid_idx = arith.index_cast(T.index, global_vec_tid)
         vec_blocks_i32 = ArithValue(
             ArithValue(row_len) + ArithValue(c_vec) - ArithValue(c_one)
-        ).shrui(fx.Int32(2))
+        ).shrui(fx.Int32(LOAD_VEC_LOG2))
         vec_blocks_idx = arith.index_cast(T.index, vec_blocks_i32)
 
         def scan_pass(pass_id: int, current_k, current_bits, barrier_token: int):
@@ -1074,11 +1177,33 @@ def create_topk_per_row_decode_tiered_kernel(
 
         if persistent_active:
             local_k = c_top_k
+            local_len = row_len
             kth_bits = c_zero
-            for pass_id in range_constexpr(num_passes):
-                local_k, _local_len, kth_bits = scan_pass(
-                    pass_id, local_k, kth_bits, pass_id + 1
-                )
+            if early_stop:
+                # HIP-mb-style early termination: run every pass but the last (none of
+                # these write), then skip the final radix pass when the boundary bucket
+                # is taken whole (remaining_len == remaining_k) and write those elements
+                # directly. `early` is computed from the globally merged histogram, so it
+                # is identical across every block of the row -> the last pass's row_barrier
+                # is entered (or skipped) by all blocks together, no deadlock.
+                for pass_id in range_constexpr(num_passes - 1):
+                    local_k, local_len, kth_bits = scan_pass(
+                        pass_id, local_k, kth_bits, pass_id + 1
+                    )
+                last_pass = num_passes - 1
+                prev_start_bit = max(32 - last_pass * bits_per_pass, 0)
+                early = ArithValue(local_len) == ArithValue(local_k)
+                if early:
+                    early_write_all(prev_start_bit, kth_bits)
+                if ~early:
+                    local_k, local_len, kth_bits = scan_pass(
+                        last_pass, local_k, kth_bits, last_pass + 1
+                    )
+            else:
+                for pass_id in range_constexpr(num_passes):
+                    local_k, local_len, kth_bits = scan_pass(
+                        pass_id, local_k, kth_bits, pass_id + 1
+                    )
 
     @flyc.jit
     def launcher(
