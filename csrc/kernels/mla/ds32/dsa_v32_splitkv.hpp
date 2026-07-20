@@ -9,6 +9,30 @@ using opus::operator""_I;
 
 namespace dsa_v32_16mx8_32nx1_fp8 {
 
+// [sched exp] instruction-group masks for __builtin_amdgcn_sched_group_barrier
+namespace sched_masks {
+constexpr int MFMA    = 0x08;
+constexpr int VALU    = 0x02;
+constexpr int SALU    = 0x04;
+constexpr int DS_READ = 0x100;
+constexpr int EXP     = 0x400;
+} // namespace sched_masks
+
+// Manually interleave the QK compute region so the long-latency fp8 128-K scale
+// MFMAs hide the K/rope/scale DS_READs and the softmax/dequant VALU/EXP.
+// sched_group_barrier only reorders within data-dependency constraints -> correctness-safe.
+template <int G>
+__device__ inline void sched_compute_qk_dsa()
+{
+    using namespace sched_masks;
+    opus::static_for<10>([&](auto) {
+        __builtin_amdgcn_sched_group_barrier(MFMA, 1, G);
+        __builtin_amdgcn_sched_group_barrier(DS_READ, 2, G);
+        __builtin_amdgcn_sched_group_barrier(VALU, 2, G);
+        __builtin_amdgcn_sched_group_barrier(EXP, 1, G);
+    });
+}
+
 template <class T>
 __device__ inline auto make_layout_q_nope(int warp_id, int lane_id)
 {
@@ -519,8 +543,12 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
 }
 
 template <typename T, typename V>
-__device__ inline void
-attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg_inf_v)
+__device__ inline void attn_mask_causal_kv_tile(V& v_s,
+                                                int valid_kv_len,
+                                                int kv_tile_idx,
+                                                int causal_diagonal,
+                                                int nhead,
+                                                opus::u32_t neg_inf_v)
 {
     using D_ACC    = typename T::D_ACC;
     using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
@@ -531,7 +559,11 @@ attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg
     constexpr int c_rept              = elems_per_wave_tile / c_pack;
     constexpr int c_rept_stride       = (T::WARP_SIZE / T::W_M) * c_pack;
 
-    const int last_valid_kv_pos = valid_kv_len - 1;
+    const int warp_id     = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / T::WARP_SIZE);
+    const int q_pos       = (warp_id * T::W_M) / nhead;
+    const int oob_last    = valid_kv_len - 1;
+    const int causal_last = q_pos + causal_diagonal;
+    const int last_valid_kv_pos = causal_last < oob_last ? causal_last : oob_last;
     const int k_start_pos       = kv_tile_idx * T::KV_TILE_SIZE;
     int lane_id                 = opus::thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
@@ -580,7 +612,10 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
                                          VO& v_o,
                                          typename Traits::D_ACC& m_row,
                                          typename Traits::D_ACC& l_row,
-                                         float temperature_scale)
+                                         float temperature_scale,
+                                         int causal_diagonal,
+                                         int nhead,
+                                         bool causal_multi)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -714,9 +749,12 @@ __device__ void dsa_v32_decode_le2_tiles(dsa_kargs kargs,
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
     auto mask_oob_scores  = [&](auto& s, int tile_idx) {
-        if((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len)
+        const bool partial = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
+        const bool is_last = (tile_idx == tile_end - 1);
+        if(partial || (causal_multi && is_last))
         {
-            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v);
+            attn_mask_causal_kv_tile<T>(
+                s, valid_kv_len, tile_idx, causal_diagonal, nhead, neg_inf_v);
         }
     };
 
@@ -808,7 +846,10 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
                                          VO& v_o,
                                          typename Traits::D_ACC& m_row,
                                          typename Traits::D_ACC& l_row,
-                                         float temperature_scale)
+                                         float temperature_scale,
+                                         int causal_diagonal,
+                                         int nhead,
+                                         bool causal_multi)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -1006,10 +1047,15 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
     };
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
-    auto mask_oob_scores  = [&](auto& s, int tile_idx) {
-        if((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len)
+    // Only ever invoked on the last KV tile of the work (tile_end - 1) in the
+    // epilogue, so causal masking (needed for multi-position tiles even when the
+    // last tile is full) fires here alongside the partial-tile OOB masking.
+    auto mask_oob_scores = [&](auto& s, int tile_idx) {
+        const bool partial = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
+        if(partial || causal_multi)
         {
-            attn_mask_oob_kv_tile<T>(s, valid_kv_len, tile_idx, neg_inf_v);
+            attn_mask_causal_kv_tile<T>(
+                s, valid_kv_len, tile_idx, causal_diagonal, nhead, neg_inf_v);
         }
     };
 
@@ -1081,6 +1127,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1144,6 +1191,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1215,6 +1263,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1269,6 +1318,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1351,6 +1401,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1408,6 +1459,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1464,6 +1516,7 @@ __device__ void dsa_v32_decode_pipelined(dsa_kargs kargs,
         v_v_nope_fp8 = load<T::VEC_KV_NOPE>(s_k_nope, u_rv_dequant + k_nope_slot_off);
         s_waitcnt_lgkmcnt(0_I);
         v_v_nope_bf16 = dequant_v(v_v_nope_fp8);
+        sched_compute_qk_dsa<0>();
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1550,6 +1603,12 @@ __device__ void dsa_v32_decode_one_req(
     if(num_kv_tiles == 0)
         return;
 
+    const int nhead           = kargs.H;
+    const int causal_diagonal = q_len_ptr_s - kv_ind_ptr_s +
+                                __builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx + 1]) -
+                                __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
+    const bool causal_multi = (q_len > 1);
+
     const int q_nope_gmem_offset  = q_len_ptr_s * kargs.stride_q_nope_b;
     const int q_rope_gmem_offset  = q_len_ptr_s * kargs.stride_q_rope_b;
     const int q_scale_gmem_offset = q_len_ptr_s * kargs.stride_q_scale_b;
@@ -1594,7 +1653,10 @@ __device__ void dsa_v32_decode_one_req(
                                          v_o,
                                          m_row,
                                          l_row,
-                                         temperature_scale);
+                                         temperature_scale,
+                                         causal_diagonal,
+                                         nhead,
+                                         causal_multi);
     }
     else if(num_kv_tiles & 1)
     {
@@ -1611,7 +1673,10 @@ __device__ void dsa_v32_decode_one_req(
                                                v_o,
                                                m_row,
                                                l_row,
-                                               temperature_scale);
+                                               temperature_scale,
+                                               causal_diagonal,
+                                               nhead,
+                                               causal_multi);
     }
     else
     {
@@ -1628,7 +1693,10 @@ __device__ void dsa_v32_decode_one_req(
                                                 v_o,
                                                 m_row,
                                                 l_row,
-                                                temperature_scale);
+                                                temperature_scale,
+                                                causal_diagonal,
+                                                nhead,
+                                                causal_multi);
     }
 
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
@@ -1652,7 +1720,7 @@ __device__ void dsa_v32_decode_one_req(
     {
         const int oa_offset = slot * kargs.stride_o_b;
         auto g_oa           = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
-                              q_len * kargs.stride_o_b * sizeof(D_OUT));
+                              q_len * kargs.stride_o_b * sizeof(D_ACC));
         auto u_oa           = make_layout_o<T>(warp_id_o, lane_id_o, T::D_NOPE_SIZE);
         store<T::VEC_O>(g_oa, v_o, u_oa);
 
@@ -1660,9 +1728,10 @@ __device__ void dsa_v32_decode_one_req(
         {
             const int lse_offset = slot * kargs.H;
             auto g_lse           = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_accum) + lse_offset,
-                                   kargs.H * sizeof(D_ACC));
-            const D_ACC lse      = (l_row > D_ACC(0.0f)) ? (m_row + log2f(l_row))
-                                                         : opus::numeric_limits<D_ACC>::lowest();
+                                   q_len * kargs.H * sizeof(D_ACC));
+            constexpr float INV_LOG2_E = 0.69314718055994531f; // 1 / LOG2_E == ln(2)
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
+                                                    : opus::numeric_limits<D_ACC>::lowest();
             g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
         }
     }
@@ -1693,9 +1762,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
 
     for(int w = work_idx_start; w < work_idx_end; ++w)
     {
-        // Barrier between work items: a block may process multiple splits that
-        // reuse smem_kv; ensure the previous item's smem reads finished before
-        // the next item overwrites it (matches hk's per-work-item barrier).
         __builtin_amdgcn_s_barrier();
         dsa_v32_decode_one_req<Traits>(kargs, w, smem_kv, smem_kv_scale, temperature_scale);
     }

@@ -1143,8 +1143,16 @@ def test_mla(
             kv_last_page_lens.fill_(ctx_lens % page_size)
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(kv_block_nums, dim=0)
-    num_page = kv_indptr[-1].item()
-    kv_indices = torch.randperm(num_page, dtype=torch.int)
+    if os.environ.get("DS32_DENSE_KV"):
+        assert not varlen, "DS32_DENSE_KV requires uniform seqlen (drop --varlen)"
+        pages_per_batch = int(kv_block_nums[0].item())
+        num_page = pages_per_batch
+        kv_indices = (
+            torch.arange(num_page, dtype=torch.int).repeat(batch_size).contiguous()
+        )
+    else:
+        num_page = kv_indptr[-1].item()
+        kv_indices = torch.randperm(num_page, dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     # max_seqlen_kv = seq_lens_kv.max().item()
@@ -1213,7 +1221,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=False,
+        is_causal=True,
         dtype=out_dtype,
     )
 
@@ -1781,7 +1789,7 @@ def test_mla(
             kv_lora_rank,
             qk_rope_head_dim,
             dtype=out_dtype,
-            is_causal=False,
+            is_causal=True,
             scale_dim=scale_dim,
             q_scale=q_scale_e8m0,
             kv_scale=kv_scale_e8m0,
