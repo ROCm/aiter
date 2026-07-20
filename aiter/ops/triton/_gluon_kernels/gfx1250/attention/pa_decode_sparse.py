@@ -309,7 +309,7 @@ def _pa_decode_sparse(
         safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
     else:
         safe_slot_cur = slot_reg
-    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, 0, kv_bufs.index(0))
+    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
     if QUANT_KV:
         cur_safe_slot = safe_slot_cur
         _safe_sl = gl.convert_layout(cur_safe_slot, gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
@@ -350,7 +350,7 @@ def _pa_decode_sparse(
         else:
             safe_next_slot = slot_reg
         gl.amd.gfx1250.tdm.async_gather(
-            kv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
+            kv_desc, safe_next_slot, kv_bufs.index(async_idx)
         )
 
         # Wait for KV[i] (the FIFO ordering guarantees it is older than the

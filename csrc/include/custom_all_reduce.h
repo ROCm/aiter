@@ -97,7 +97,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    int64_t reg_ptr,
                                    int64_t reg_bytes,
                                    bool use_1stage,
-                                   bool gemma_norm = false);
+                                   bool gemma_norm    = false,
+                                   int64_t bf16_out_ptr = 0);
 void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              const aiter_tensor_t& inp,
                                              const aiter_tensor_t& res_inp,
