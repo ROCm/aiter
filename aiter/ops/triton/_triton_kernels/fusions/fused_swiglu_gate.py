@@ -76,7 +76,7 @@ def _fused_swiglu_gate_kernel(
     col_stride_in,
     row_stride_out,
     col_stride_out,
-    swiglu_alpha,
+    neg_log2e_alpha,
     swiglu_limit,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -98,17 +98,25 @@ def _fused_swiglu_gate_kernel(
     out_ptrs = out_ptr + row_out[:, None] + col_idx[None, :] * col_stride_out
 
     mask = (row_idx < n_rows)[:, None] & (col_idx < n_cols)[None, :]
-    gate = tl.load(gate_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(tl.float32)
-    up = tl.load(up_ptrs, mask=mask, other=0.0, cache_modifier=".cg").to(tl.float32)
+    # Default (cached) loads outperform ".cg" here: this is a pure streaming op
+    # with no data reuse, and bypassing L1 via ".cg" adds coherence traffic that
+    # regresses large-M bandwidth. The output is write-once, so ".wt"
+    # (write-through) avoids polluting the cache with lines nobody reads back.
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if HAVE_SWIGLU_CLAMP:
         gate = tl.minimum(gate, swiglu_limit)
         up = tl.clamp(up, -swiglu_limit, swiglu_limit)
 
-    s = gate / (1 + tl.exp2(-1.44269504089 * swiglu_alpha * gate))
+    # sigmoid(alpha*g) = 1 / (1 + exp2(-log2(e) * alpha * g)); the -log2(e)*alpha
+    # scalar is folded into neg_log2e_alpha by the caller.
+    s = gate / (1 + tl.exp2(neg_log2e_alpha * gate))
     if ADD_RESIDUAL:
         out = tl.fma(s, up, s)
     else:
         out = s * up
 
-    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        out_ptrs, out.to(out_ptr.dtype.element_ty), mask=mask, cache_modifier=".wt"
+    )

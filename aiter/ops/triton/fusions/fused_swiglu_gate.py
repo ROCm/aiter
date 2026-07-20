@@ -20,6 +20,9 @@ _LOGGER = AiterTritonLogger()
 _DEFAULT_SWIGLU_ALPHA = 1.702
 _DEFAULT_SWIGLU_LIMIT = 7.0
 
+# log2(e); used to evaluate sigmoid via exp2 (faster than exp on the hardware).
+_LOG2E = 1.4426950408889634
+
 
 def fused_swiglu_gate(
     inp: torch.Tensor,
@@ -92,6 +95,8 @@ def fused_swiglu_gate(
     grid_n = triton.cdiv(n_cols, block_n)
 
     HAVE_SWIGLU_CLAMP = swiglu_limit > 0
+    # Fold the constant sigmoid scaling into a single scalar passed to the kernel.
+    neg_log2e_alpha = -_LOG2E * swiglu_alpha
 
     _fused_swiglu_gate_kernel[(grid_m, grid_n)](
         inp,
@@ -102,7 +107,7 @@ def fused_swiglu_gate(
         col_stride_in,
         row_stride_out,
         col_stride_out,
-        swiglu_alpha,
+        neg_log2e_alpha,
         swiglu_limit,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
