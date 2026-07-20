@@ -818,7 +818,6 @@ def compile_wd_moe_gate_up_splitk(
         f32 = T.f32
         i32 = T.i32
         i64 = T.i64
-        bf16 = T.bf16
 
         B_i32 = i32_B.ir_value()
         TOPK_i32 = i32_TOPK.ir_value()
