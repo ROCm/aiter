@@ -12,7 +12,6 @@ import argparse
 import sys
 
 import torch
-import triton
 
 from aiter.ops.triton.fusions.fused_swiglu_gate import fused_swiglu_gate
 
@@ -39,7 +38,37 @@ def _make_inputs(n_rows: int, dtype: torch.dtype):
 
 
 def bench_fn(fn, warmup: int = 25, rep: int = 100) -> float:
-    return triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    """Per-call GPU time under a CUDA graph.
+
+    Wall-time benchmarking (``do_bench``) includes per-launch dispatch overhead.
+    In production, decode runs under a CUDA graph where that overhead is captured
+    once and elided on replay — so a launch-heavy path (e.g. one torch.compile
+    activation = several Inductor launches) looks artificially slow under wall
+    time but not in reality. Capturing ``rep`` iterations into a graph and timing
+    one replay isolates pure GPU time, which is what the serving perf report
+    reflects, so this benchmark always uses it.
+
+    ``warmup`` = pre-capture warmup calls (also lets torch.compile finish
+    compiling before capture); ``rep`` = number of captured iterations.
+    """
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(rep):
+            fn()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    g.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / rep
 
 
 def run_point_bench(args):
@@ -79,7 +108,7 @@ def run_point_bench(args):
 
     print(f"Shape: ({n_rows}, {_MINIMAX_LAST_DIM}) -> ({n_rows}, {_MINIMAX_LOCAL_D})")
     print(f"dtype={dtype}, alpha={_MINIMAX_ALPHA}, limit={_MINIMAX_LIMIT}")
-    print(f"warmup={args.warmup}, rep={args.rep}")
+    print(f"warmup={args.warmup}, rep={args.rep}, timing=cudagraph GPU time")
     print()
     print(f"  eager torch:     {us_eager:7.2f} µs/call  ({ms_eager:8.4f} ms)")
     print(f"  torch.compile:   {us_compile:7.2f} µs/call  ({ms_compile:8.4f} ms)")
@@ -105,6 +134,7 @@ def run_sweep(args):
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     m_list = [int(x) for x in args.M_list.split(",")]
 
+    print("timing=cudagraph GPU time")
     print(
         f"{'M':>8} {'rows':>10} {'eager_us':>10} {'compile_us':>12} "
         f"{'fused_us':>10} {'vs_compile':>12}"
@@ -155,8 +185,12 @@ def parse_args():
         choices=["bf16", "fp16"],
         default="bf16",
     )
-    p.add_argument("--warmup", type=int, default=25)
-    p.add_argument("--rep", type=int, default=100)
+    p.add_argument(
+        "--warmup", type=int, default=25, help="Pre-capture warmup call count"
+    )
+    p.add_argument(
+        "--rep", type=int, default=100, help="Iterations captured into the CUDA graph"
+    )
     p.add_argument(
         "--layers",
         type=int,

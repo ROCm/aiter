@@ -12,6 +12,49 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
+
+def _fallback_config(n_rows: int, n_cols: int) -> dict:
+    """Heuristic config used when no tuned JSON exists for this arch.
+
+    Mirrors the tuned tables: small BLOCK_M at low concurrency so the grid
+    spreads across CUs, growing BLOCK_M as the op becomes bandwidth-bound.
+    """
+    block_n = min(128, triton.next_power_of_2(max(n_cols, 1)))
+    if n_rows <= 16:
+        block_m, num_warps = 8, 2
+    elif n_rows <= 512:
+        block_m, num_warps = 8, 4
+    elif n_rows <= 8192:
+        block_m, num_warps = 16, 4
+    else:
+        block_m, num_warps = 32, 4
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "num_warps": num_warps,
+        "waves_per_eu": 0,
+    }
+
+
+def _get_config(n_rows: int, n_cols: int) -> dict:
+    """Select a launch config, mirroring the GEMM config-selection logic.
+
+    Uses ``get_gemm_config`` (per-arch JSON, ``M_LEQ_x``/``M_GEQ_x`` buckets)
+    with a per-``n_cols`` specialized file ``{arch}-FUSED-SWIGLU-GATE-D={n_cols}
+    .json`` and a shared ``{arch}-FUSED-SWIGLU-GATE.json`` default. Falls back to
+    a heuristic on arches with no tuned tables.
+    """
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    try:
+        config, _ = get_gemm_config(
+            "FUSED-SWIGLU-GATE", M=n_rows, specialized_filename=f"D={n_cols}"
+        )
+    except (AssertionError, KeyError):
+        config = _fallback_config(n_rows, n_cols)
+    return config
+
+
 _fused_swiglu_gate_repr = make_kernel_repr(
     "_fused_swiglu_gate_kernel",
     [

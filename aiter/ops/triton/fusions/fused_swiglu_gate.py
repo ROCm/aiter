@@ -10,6 +10,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_swiglu_gate import (
     _fused_swiglu_gate_kernel,
+    _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -20,48 +21,13 @@ _DEFAULT_SWIGLU_ALPHA = 1.702
 _DEFAULT_SWIGLU_LIMIT = 7.0
 
 
-def _pick_block_n(d: int, n_rows: int) -> int:
-    """Tile size along the reduced last dim (cap 1024); at least 32 for vectorization."""
-    n = max(d, 1)
-    if n == 512:
-        return 512 if n_rows > 4096 else 256
-    if n == 384:
-        return 256 if n_rows <= 128 else 128
-    upper = min(n, 1024)
-    p = 1
-    while p * 2 <= upper:
-        p *= 2
-    return max(32, p)
-
-
-def _pick_block_m(n_rows: int, block_n: int, d: int) -> int:
-    if n_rows <= 64:
-        return min(32, max(4, triton.next_power_of_2(n_rows)))
-    if d == 384 and n_rows > 128:
-        return 32 if n_rows > 8192 else 8
-    if d == 512 and n_rows > 4096:
-        return 8
-    if d == 512 and 128 < n_rows <= 4096:
-        return 8
-    if block_n >= 1024:
-        return 8
-    if block_n >= 512:
-        return 8
-    return 16
-
-
-def _pick_num_warps(n_rows: int, block_m: int, block_n: int) -> int:
-    if n_rows <= 128 and block_m >= 16 and block_n >= 128:
-        return 8
-    return 2
-
-
 def fused_swiglu_gate(
     inp: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     swiglu_alpha: float = _DEFAULT_SWIGLU_ALPHA,
     swiglu_limit: float = _DEFAULT_SWIGLU_LIMIT,
     add_residual: bool = True,
+    config: Optional[dict] = None,
 ):
     """
     Fused MiniMax / GPT-OSS gate activation on separated gate|up GEMM output.
@@ -80,6 +46,9 @@ def fused_swiglu_gate(
         swiglu_alpha: sigmoid scale on the gate half (default 1.702).
         swiglu_limit: clamp limit; pass ``<= 0`` to skip clamping.
         add_residual: when True, multiply by ``(up + 1)``; else ``up`` only.
+        config: optional launch config override (``BLOCK_M``, ``BLOCK_N``,
+            ``num_warps``, ``waves_per_eu``). When None, a tuned config is
+            selected per (n_rows, n_cols) via ``_get_config``.
     """
     assert inp.is_cuda, "fused_swiglu_gate requires a CUDA tensor"
     assert inp.is_contiguous(), "inp must be contiguous"
@@ -111,11 +80,16 @@ def fused_swiglu_gate(
     row_stride_out = n_cols
     col_stride_out = 1
 
-    block_n = _pick_block_n(n_cols, n_rows)
-    block_m = _pick_block_m(n_rows, block_n, n_cols)
+    if config is None:
+        config = _get_config(n_rows, n_cols)
+    block_m = config["BLOCK_M"]
+    # Clamp the column tile to the reduced dim (keeps it a power of 2 and avoids
+    # launching mostly-masked column blocks when n_cols < BLOCK_N).
+    block_n = min(config["BLOCK_N"], triton.next_power_of_2(n_cols))
+    num_warps = config.get("num_warps", 4)
+    waves_per_eu = config.get("waves_per_eu", 0)
     grid_m = triton.cdiv(n_rows, block_m)
     grid_n = triton.cdiv(n_cols, block_n)
-    num_warps = _pick_num_warps(n_rows, block_m, block_n)
 
     HAVE_SWIGLU_CLAMP = swiglu_limit > 0
 
@@ -135,6 +109,6 @@ def fused_swiglu_gate(
         HAVE_SWIGLU_CLAMP=HAVE_SWIGLU_CLAMP,
         ADD_RESIDUAL=add_residual,
         num_warps=num_warps,
-        waves_per_eu=0,
+        waves_per_eu=waves_per_eu,
     )
     return out
