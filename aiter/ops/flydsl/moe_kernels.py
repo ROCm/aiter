@@ -2306,9 +2306,9 @@ def flydsl_moe_fused_quant_preshuffle(
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
     Ws = feat_dim // 32
     if out_payload is None:
-        out_payload = torch.zeros((E, max_m, Pb), dtype=torch.uint8, device=device)
+        out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
     if out_scale is None:
-        out_scale = torch.zeros(
+        out_scale = torch.empty(
             (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
         )
 

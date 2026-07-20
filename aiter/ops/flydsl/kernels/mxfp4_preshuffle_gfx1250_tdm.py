@@ -181,7 +181,12 @@ def launch_gemm_a8w4_tdm(
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
-        mn_oob = i32_m - blk_m
+        # Per-expert A-data OOB: bound to the owning expert's valid-row end
+        # (arg_m_tile_map[e], resolved by the bisect above) so the TDM HW zero-fills
+        # each expert's un-written padding rows; otherwise garbage fp8 bytes in those
+        # rows poison valid rows (intermittent NaN at small token counts). Also bounds
+        # the row-masked epilogue store.
+        mn_oob = _mmap[(_e_i32 < n_experts).select(_e_i32, n_experts - 1)] - blk_m
 
         base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
 
