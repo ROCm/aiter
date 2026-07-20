@@ -70,6 +70,12 @@ class _GroupedA8W4Config:
     stage1_weight_layout: str = "gguu"
     stage1_quant_out: str | None = None
     stage1_quant_wmma_rep: int = 1
+    # EP gemm2-fused scatter (compile-time; see compile_mxscale_gemm.ep_p2p_write).
+    ep_p2p_write: bool = False
+    ep_off_comb_inp: int = 0
+    ep_wire_nbytes: int = 0
+    ep_slot_stride: int = 0
+    ep_arena_handle: int = 0
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -1029,6 +1035,11 @@ def _compile_base_a8w4_gemm(
         stage1_quant_out=stage1_quant_out,
         stage1_quant_wmma_rep=stage1_quant_wmma_rep,
         kernel_tag=kernel_tag,
+        ep_p2p_write=cfg.ep_p2p_write,
+        ep_off_comb_inp=cfg.ep_off_comb_inp,
+        ep_wire_nbytes=cfg.ep_wire_nbytes,
+        ep_slot_stride=cfg.ep_slot_stride,
+        ep_arena_handle=cfg.ep_arena_handle,
     )
 
 
@@ -1606,6 +1617,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     data_format: str = "a8w4",
+    ep_p2p_write: bool = False,
+    ep_off_comb_inp: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_slot_stride: int = 0,
+    ep_arena_handle: int = 0,
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim),
@@ -1633,6 +1649,11 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
+        ep_p2p_write=bool(ep_p2p_write),
+        ep_off_comb_inp=int(ep_off_comb_inp),
+        ep_wire_nbytes=int(ep_wire_nbytes),
+        ep_slot_stride=int(ep_slot_stride),
+        ep_arena_handle=int(ep_arena_handle),
     )
     _validate_common(cfg)
 
@@ -1676,9 +1697,28 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _m_tile_prefix=None,
         _m_tile_map=None,
         bias=None,
+        ep_row2dst=None,
+        ep_row2weight=None,
     ):
         """If `_gemm_events=(start, end)` is given, record around the GEMM
-        kernel launch only -- excludes prefix-sum prep work."""
+        kernel launch only -- excludes prefix-sum prep work.
+
+        ep_row2dst / ep_row2weight (EP gemm2-fused scatter, cfg.ep_p2p_write):
+        i32 row->packed-dest and f32 row->weight maps, passed to the kernel via
+        the otherwise-unused m_tile_prefix / m_tile_map arg slots. Requires the
+        dense masked path (no persistent / contiguous scheduler)."""
+        if cfg.ep_p2p_write:
+            if ep_row2dst is None or ep_row2weight is None:
+                raise ValueError(
+                    "ep_p2p_write stage2 requires ep_row2dst and ep_row2weight"
+                )
+            if cfg.grouped_persistent_m or cfg.grouped_contiguous_m:
+                raise ValueError(
+                    "ep_p2p_write stage2 requires the dense masked scheduler "
+                    "(grouped_persistent_m=grouped_contiguous_m=False)"
+                )
+            if bias is not None:
+                raise ValueError("ep_p2p_write stage2 does not support bias")
         if (
             int(max_m_arg) != cfg.max_m
             or int(model_dim_arg) != cfg.model_dim
@@ -1798,8 +1838,13 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 _gemm_events[1].record(stream)
         else:
             # Dense mode: prefix/map unused, pass placeholders for ABI compat.
+            # EP gemm2-fused scatter repurposes those two tensor slots for the
+            # per-row dest / weight maps that the P2P epilogue reads.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
+            if cfg.ep_p2p_write:
+                _unused_m_tile_prefix = ep_row2dst
+                _unused_m_tile_map = ep_row2weight
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
