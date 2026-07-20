@@ -52,7 +52,7 @@ from aiter.ops.flydsl.gemm_kernels import (
     get_flydsl_splitk_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -71,8 +71,7 @@ _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x"
-    r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)_"
+    r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
     r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
 )
 _SHORT_DTYPE = {
@@ -118,12 +117,11 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
         "tile_k": int(m.group("tile_k")),
         "in_dtype": qa,
         "out_dtype": out,
-        "lds_stage": int(m.group("lds_stage")),
-        "use_cshuffle_epilog": int(m.group("cshuffle")),
         "use_async_copy": int(m.group("async_copy")),
         "waves_per_eu": int(m.group("waves_per_eu")),
+        "xcd_swizzle": int(m.group("xcd_swizzle")) if m.group("xcd_swizzle") else 0,
+        "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
-        "xcd_swizzle": int(m.group("xcd_swizzle")),
     }
 
 
@@ -199,9 +197,9 @@ def _compile_executable_to_cache(exe, *args) -> None:
 
 
 def _ptr_view_safe(t):
-    from aiter.ops.flydsl.gemm_kernels import _ptr_view_safe as _wrap
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-    return _wrap(t)
+    return ptr_arg(t)
 
 
 def _compile_hgemm_to_cache(
@@ -304,14 +302,15 @@ def _compile_preshuffle_to_cache(
     tile_m: int,
     tile_n: int,
     tile_k: int,
-    lds_stage: int,
-    use_cshuffle_epilog: int,
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    scheduler: str = "Default",
     **kwargs,
 ):
     del kwargs
+    enable_scheduler = str(scheduler).lower() != "off"
 
     import torch
 
@@ -327,7 +326,7 @@ def _compile_preshuffle_to_cache(
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
     stream = fx.Stream(0)
 
-    exe = compile_preshuffle_gemm_a8(
+    exe = compile_preshuffle_gemm(
         N=n,
         K=k,
         tile_m=tile_m,
@@ -335,20 +334,23 @@ def _compile_preshuffle_to_cache(
         tile_k=tile_k,
         in_dtype=in_dtype,
         out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
-        lds_stage=lds_stage,
-        use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        enable_scheduler=enable_scheduler,
         xcd_swizzle=xcd_swizzle,
+        lds_stage=lds_stage,
     )
+    # The layout-API launcher uses fx.Tensor args (it builds views via
+    # fx.get_iter/make_view), so pass flat torch tensors directly rather
+    # than raw pointers (pointer args would fail GetIterOp type checks).
     _compile_executable_to_cache(
         exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(scale_a),
-        _ptr_view_safe(scale_b),
-        _ptr_view_safe(bias),
+        out,
+        a,
+        b,
+        scale_a,
+        scale_b,
+        bias,
         m,
         n,
         stream,

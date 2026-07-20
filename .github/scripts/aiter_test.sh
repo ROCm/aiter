@@ -78,9 +78,20 @@ for file in "${sharded_files[@]}"; do
         } | tee -a latest_test.log
         continue
     fi
+    # Persistent MLA op-tests always pass work_meta_data; disable the decode
+    # batch gate so they exercise the persistent kernel at every batch size.
+    test_cmd=(timeout 60m python3 "$file")
+    case "$file" in
+        op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
+            {
+                echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
+            } | tee -a latest_test.log
+            test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
+            ;;
+    esac
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)
-    if ! timeout 60m python3 "$file" 2>&1 | tee -a latest_test.log; then
+    if ! "${test_cmd[@]}" 2>&1 | tee -a latest_test.log; then
         status="❌ Test failed"
         testFailed=true
         failedFiles+=("$file")

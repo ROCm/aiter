@@ -64,6 +64,17 @@ def lds_store_b128(memref, elem_off, data):
     vector.store(typed_vec, memref, [elem_off])
 
 
+def lds_store_b64(memref, elem_off, data):
+    """Store 8 bytes to LDS (``ds_store_b64``).
+
+    Bitcasts *data* (any 64-bit vector, e.g. ``vec<4×bf16>`` / ``vec<2×i32>``)
+    to match the memref element type, then ``vector.store``.
+    """
+    vec_ty = _lds_vec_type(memref, 64)
+    typed_vec = vector.bitcast(vec_ty, data)
+    vector.store(typed_vec, memref, [elem_off])
+
+
 def extract_lds_base_idx(smem_ptr):
     """Extract the absolute LDS byte-base address as an index value."""
     from flydsl._mlir.dialects import memref as _memref

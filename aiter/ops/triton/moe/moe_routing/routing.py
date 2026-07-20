@@ -350,6 +350,20 @@ def routing(
     # fused path: fused routing math + sort (score_mode given)
     # ------------------------------------------------------------------
 
+    # HERD: env-gated fused min-unique routing for decode-sized batches.
+    # Only for non-grouped-topk (DSv4 flat topk with sqrtsoftplus).
+    if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M and not use_grouped_topk:
+        from .minunique import routing_minunique_fused
+
+        return routing_minunique_fused(
+            logits,
+            n_expts_act,
+            score_mode=score_mode,
+            bias=bias,
+            renorm=renorm,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
     if use_grouped_topk and num_expert_group != 1:
         assert (
             num_expert_group is not None and topk_group is not None

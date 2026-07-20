@@ -24,9 +24,19 @@ try:
 except:  # noqa: E722
     _unified_attention_gluon_kernel_2d = None
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
+        reduce_segments_gluon as _reduce_segments_gluon,
+    )
+except:  # noqa: E722
+    _reduce_segments_gluon = None
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
+# Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
+_GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -159,7 +169,7 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        if SLIDING_WINDOW is not None:
+        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
             num_segments = 1
         else:
             occ = waves_per_eu * 4 // attn_warps
@@ -219,6 +229,13 @@ def select_3d_config(
             TILE_SIZE % block_size == 0
         ), "TILE_SIZE needs to be divisible by block_size"
         NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
+
+    # gfx1151 (RDNA3.5) decode is memory-latency-bound at bs=1: the default 2
+    # warps/workgroup leave unified_attention at only ~31% of the LPDDR5X
+    # bandwidth roofline. 8 warps/workgroup reach ~59% (1.5-1.9x on bf16 decode)
+    # with bitwise-identical output. Mirrors the waves_per_eu=8 gfx1151 tuning above.
+    if DEVICE_ARCH == "gfx1151":
+        attn_warps = 8
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -646,6 +663,41 @@ def unified_attention(
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
+        head_size_padded = triton.next_power_of_2(head_size)
+        # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
+        use_gluon_reduce = (
+            IS_DEVICE_ARCH_GFX12
+            and _reduce_segments_gluon is not None
+            and ALL_DECODE
+            and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
+            and head_size_padded % 32 == 0
+            and num_query_heads % gluon_num_warps == 0
+        )
+        if use_gluon_reduce:
+            _reduce_segments_gluon[(q.shape[0],)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_query_heads=num_query_heads,
+                out_scale_ptr=output_scale,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                H=num_query_heads,
+                S=NUM_SEGMENTS,
+                D=head_size,
+                D_PAD=head_size_padded,
+                TILE_SIZE=reduce_config["TILE_SIZE"],
+                NUM_WARPS=gluon_num_warps,
+                IS_FP8_OUT=(out.dtype == e4m3_dtype),
+                FP8_MIN=torch.finfo(e4m3_dtype).min,
+                FP8_MAX=torch.finfo(e4m3_dtype).max,
+                num_warps=gluon_num_warps,
+            )
+            return out
+
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
@@ -659,7 +711,7 @@ def unified_attention(
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             **reduce_config,
@@ -754,6 +806,12 @@ def _gfx1250_unified_attention_2d(
         waves_per_eu = 2
         TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
         num_buffers = 2
+
+        if max_seqlen_k < 2048:
+            BLOCK_M = 64
+            num_warps = 2 if (Q_FP8 and KV_FP8) else 1
+            sel_loop_variant = 0
+            num_buffers = 2
 
     loop_variant = sel_loop_variant if loop_variant is None else loop_variant
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page

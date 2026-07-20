@@ -9,6 +9,7 @@ import, so we toggle them by monkeypatching the module globals.
 
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 
 import aiter.ops.triton.moe.moe_routing.routing as routing_mod
@@ -329,6 +330,225 @@ def test_topk_pop_out(n_tokens, n_expts_tot, n_expts_act):
     ]
 
     # popularity == bincount of the emitted selection.
+    ref_pop = torch.bincount(expt_indx.reshape(-1).long(), minlength=n_expts_tot).to(
+        torch.int32
+    )
+    _assert_int_equal(ref_pop, pop, "popularity")
+    assert int(pop.sum()) == n_tokens * kp1
+
+
+# ==========================================================================
+# sqrtsoftplus HERD (DSv4 fused scoring path)
+# ==========================================================================
+
+
+def _minunique_select_sqrtsoftplus_torch(
+    logits, k, bias, renorm, routed_scaling_factor
+):
+    """top-(k+1) with sqrtsoftplus scoring -> drop least-batch-popular -> keep k.
+    Returns (weights[M,k] float32, ids[M,k] int64), experts ascending per row."""
+    M, E = logits.shape
+    kp1 = k + 1
+    f32 = logits.float()
+
+    transformed = torch.sqrt(F.softplus(f32))
+
+    biased = transformed + bias.float() if bias is not None else transformed
+
+    _, cand_idx = torch.topk(biased, kp1, dim=1)
+    cand_idx, order = torch.sort(cand_idx, dim=1)
+
+    cand_val = torch.gather(transformed, 1, cand_idx)
+
+    pop = torch.zeros(E, dtype=torch.int64, device=logits.device)
+    pop.scatter_add_(
+        0,
+        cand_idx.reshape(-1),
+        torch.ones(M * kp1, dtype=torch.int64, device=logits.device),
+    )
+    cand_pop = pop[cand_idx]
+
+    BIG = float("inf")
+    is_mp = cand_pop == cand_pop.min(dim=1, keepdim=True).values
+    val_m = torch.where(is_mp, cand_val, torch.full_like(cand_val, BIG))
+    is_mv = is_mp & (val_m == val_m.min(dim=1, keepdim=True).values)
+    cols = torch.arange(kp1, device=logits.device).expand(M, kp1)
+    col_m = torch.where(is_mv, cols, torch.full_like(cols, 1 << 30))
+    drop_col = col_m.argmin(dim=1)
+
+    keep = torch.ones(M, kp1, dtype=torch.bool, device=logits.device)
+    keep.scatter_(1, drop_col.unsqueeze(1), False)
+    kept_val = cand_val[keep].reshape(M, k)
+    kept_idx = cand_idx[keep].reshape(M, k)
+
+    if renorm:
+        s = kept_val.sum(dim=1, keepdim=True)
+        w = kept_val / (s + 1e-20) * routed_scaling_factor
+    elif routed_scaling_factor != 1.0:
+        w = kept_val * routed_scaling_factor
+    else:
+        w = kept_val
+
+    return w.float(), kept_idx.to(torch.int64)
+
+
+def _init_bias(n_expts_tot, device="cuda", seed=7):
+    torch.manual_seed(seed)
+    return torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.1
+
+
+DSV4_SHAPES = [(128, 4), (256, 8)]
+DSV4_N_TOKENS = [16, 32, 64, 128]
+
+
+# ==========================================================================
+# 6. HERD + sqrtsoftplus: end-to-end routing() == torch reference
+# ==========================================================================
+@pytest.mark.parametrize("n_tokens", DSV4_N_TOKENS)
+@pytest.mark.parametrize("n_expts_tot, n_expts_act", DSV4_SHAPES)
+@pytest.mark.parametrize("renorm", [True, False])
+@pytest.mark.parametrize("routed_scaling_factor", [1.0, 2.5])
+def test_routing_herd_sqrtsoftplus(
+    monkeypatch, n_tokens, n_expts_tot, n_expts_act, renorm, routed_scaling_factor
+):
+    _skip_if_unsupported()
+    logits = _init_logits(n_tokens, n_expts_tot)
+    bias = _init_bias(n_expts_tot)
+    block_m = _block_m(n_tokens, n_expts_act, n_expts_tot)
+
+    ref_w, ref_ids = _minunique_select_sqrtsoftplus_torch(
+        logits.clone(), n_expts_act, bias, renorm, routed_scaling_factor
+    )
+
+    _enable_herd(monkeypatch)
+    rd, gather, scatter = routing(
+        logits,
+        n_expts_act,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=renorm,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    _check_minunique(
+        ref_w, ref_ids, rd, gather, scatter, n_expts_tot, n_expts_act, block_m
+    )
+    assert rd.n_expts_tot == n_expts_tot
+    assert rd.n_expts_act == n_expts_act
+    assert rd.block_m == block_m
+
+
+# ==========================================================================
+# 7. HERD + sqrtsoftplus: expert union shrinks
+# ==========================================================================
+@pytest.mark.parametrize("n_tokens", [32, 64, 128])
+def test_herd_sqrtsoftplus_shrinks_expert_union(monkeypatch, n_tokens):
+    _skip_if_unsupported()
+    n_expts_tot, k = 128, 4
+    logits = _init_logits(n_tokens, n_expts_tot)
+    bias = _init_bias(n_expts_tot)
+
+    _disable_herd(monkeypatch)
+    rd_off, _, _ = routing(
+        logits,
+        k,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=True,
+        routed_scaling_factor=2.5,
+    )
+
+    _enable_herd(monkeypatch)
+    rd_on, _, _ = routing(
+        logits,
+        k,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=True,
+        routed_scaling_factor=2.5,
+    )
+
+    n_gates = n_tokens * k
+    assert int(rd_off.expt_hist.sum()) == n_gates
+    assert int(rd_on.expt_hist.sum()) == n_gates
+
+    uniq_off = int((rd_off.expt_hist > 0).sum())
+    uniq_on = int((rd_on.expt_hist > 0).sum())
+    assert uniq_on <= uniq_off, f"HERD did not shrink the union: {uniq_on} > {uniq_off}"
+    assert not torch.equal(rd_off.expt_hist, rd_on.expt_hist), "HERD did not engage"
+
+
+# ==========================================================================
+# 8. HERD + sqrtsoftplus: gating window
+# ==========================================================================
+@pytest.mark.parametrize("n_tokens, engaged", [(8, False), (64, True), (256, False)])
+def test_herd_sqrtsoftplus_gating_window(monkeypatch, n_tokens, engaged):
+    _skip_if_unsupported()
+    n_expts_tot, k = 128, 4
+    logits = _init_logits(n_tokens, n_expts_tot)
+    bias = _init_bias(n_expts_tot)
+    block_m = _block_m(n_tokens, k, n_expts_tot)
+
+    _enable_herd(monkeypatch, min_m=16, max_m=128)
+    tri_rd, tri_g, tri_s = routing(
+        logits,
+        k,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=True,
+        routed_scaling_factor=2.5,
+    )
+    assert int(tri_rd.expt_hist.sum()) == n_tokens * k
+
+    if engaged:
+        ref_w, ref_ids = _minunique_select_sqrtsoftplus_torch(
+            logits.clone(), k, bias, True, 2.5
+        )
+        _check_minunique(ref_w, ref_ids, tri_rd, tri_g, tri_s, n_expts_tot, k, block_m)
+    else:
+        _disable_herd(monkeypatch)
+        st_rd, st_g, st_s = routing(
+            logits,
+            k,
+            score_mode="sqrtsoftplus",
+            bias=bias,
+            renorm=True,
+            routed_scaling_factor=2.5,
+        )
+        _routing_fields_equal(tri_rd, tri_g, tri_s, st_rd, st_g, st_s)
+
+
+# ==========================================================================
+# 9. sqrtsoftplus topk(k+1) with pop_out
+# ==========================================================================
+@pytest.mark.parametrize("n_tokens", [16, 64, 128])
+@pytest.mark.parametrize("n_expts_tot, n_expts_act", [(128, 4), (256, 8)])
+def test_topk_pop_out_sqrtsoftplus(n_tokens, n_expts_tot, n_expts_act):
+    _skip_if_unsupported()
+    logits = _init_logits(n_tokens, n_expts_tot)
+    bias = _init_bias(n_expts_tot)
+    kp1 = n_expts_act + 1
+
+    pop = torch.zeros(n_expts_tot, dtype=torch.int32, device=logits.device)
+    expt_scal, expt_indx, _ = topk(
+        logits,
+        kp1,
+        apply_softmax=False,
+        score_mode="sqrtsoftplus",
+        bias=bias,
+        renorm=False,
+        HIST_BLOCK_M=32,
+        pop_out=pop,
+    )
+    assert expt_indx.shape == (n_tokens, kp1)
+
+    transformed = torch.sqrt(F.softplus(logits.float()))
+    biased = transformed + bias.float()
+    _, ref_idx = torch.topk(biased, kp1, dim=1)
+    assert [set(r.tolist()) for r in expt_indx.long()] == [
+        set(r.tolist()) for r in ref_idx
+    ]
+
     ref_pop = torch.bincount(expt_indx.reshape(-1).long(), minlength=n_expts_tot).to(
         torch.int32
     )

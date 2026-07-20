@@ -364,8 +364,8 @@ def aiter_cp_rank_decode(
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=False,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
         is_cp_round_robin=True,
     )
 

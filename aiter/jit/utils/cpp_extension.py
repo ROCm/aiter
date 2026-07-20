@@ -177,6 +177,28 @@ def _find_rocm_home() -> Optional[str]:
     return rocm_home
 
 
+def _find_rocm_devel_include() -> Optional[str]:
+    """Locate the header tree shipped by the rocm-sdk-devel pip package.
+
+    The rocm-sdk split-package layout puts runtime bits in `_rocm_sdk_core`
+    (what ROCM_HOME/ROCM_PATH usually point at) but the full dev headers —
+    thrust, hipcub, hipblas, half, ... — live in `_rocm_sdk_devel/include`.
+    torch's own headers (e.g. torch/headeronly/util/complex.h -> thrust/complex.h)
+    need those, so when ROCM_HOME resolves to the core tree we must add the
+    devel include dir explicitly or the build fails with "'thrust/complex.h'
+    file not found". Returns None if the devel package isn't installed.
+    """
+    try:
+        spec = importlib.util.find_spec("_rocm_sdk_devel")
+    except (ImportError, ValueError):
+        return None
+    if spec is not None and spec.submodule_search_locations:
+        inc = os.path.join(spec.submodule_search_locations[0], "include")
+        if os.path.isdir(inc):
+            return inc
+    return None
+
+
 def _join_rocm_home(*paths) -> str:
     """
     Join paths with ROCM_HOME, or raises an error if it ROCM_HOME is not set.
@@ -988,7 +1010,14 @@ def include_paths(cuda: bool = False) -> List[str]:
     ]
     if cuda and IS_HIP_EXTENSION:
         paths.append(os.path.join(lib_include, "THH"))
-        paths.append(_join_rocm_home("include"))
+        rocm_include = _join_rocm_home("include")
+        paths.append(rocm_include)
+        # ROCM_HOME may point at the runtime-only `_rocm_sdk_core` tree, which
+        # lacks the dev headers (thrust, hipcub, ...) that torch's headers pull
+        # in. Add the `_rocm_sdk_devel` include tree so they resolve.
+        devel_include = _find_rocm_devel_include()
+        if devel_include is not None and devel_include != rocm_include:
+            paths.append(devel_include)
     return paths
 
 
@@ -1241,7 +1270,18 @@ def _jit_compile(
         name = f"{name}_v{version}"
 
     baton = FileBaton(os.path.join(build_directory, "lock"))
-    if baton.try_acquire():
+    need_build = True
+    while True:
+        if baton.try_acquire():
+            break  # we own the lock; fall through and build below
+        # Another process holds the lock. wait() returns True if that holder
+        # finished normally (module is built — just import it), or False if we
+        # broke a stale lock left by a dead holder, in which case we loop and
+        # re-acquire so we build it ourselves instead of importing nothing.
+        if baton.wait():
+            need_build = False
+            break
+    if need_build:
         try:
             if version != old_version:
                 with GeneratedFileCleaner(
@@ -1309,8 +1349,6 @@ def _jit_compile(
                 )
         finally:
             baton.release()
-    else:
-        baton.wait()
 
     if verbose:
         print(f"Loading extension module {name}...", file=sys.stderr)

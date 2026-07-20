@@ -3,16 +3,23 @@
 
 """Tests for flydsl ``fused_compress_attn`` kernels (V4-Pro / V4-Flash).
 
+Single test for every arch: the ``flydsl_fused_compress_attn`` /
+``flydsl_hca_compress_attn`` wrappers dispatch internally by ``get_gfx()`` —
+wave64 on the gfx9 family (gfx942/gfx950) and wave32 on gfx1250 — so we drive
+the public wrapper and never import an arch-specific kernel directly. gfx1250
+uses the linear FP8 layout, so ``preshuffle`` is forced off there.
+
 Three shape configs cover both models (they share compressor geometry; the
 model_dim difference 7168 vs 4096 is invisible to the kernel):
 
     CSA Main    : D=512, RD=64, ratio=4,   overlap=True,  BF16
-    CSA Indexer : D=128, RD=64, ratio=4,   overlap=True,  FP8 + ue8m0 + preshuffle
+    CSA Indexer : D=128, RD=64, ratio=4,   overlap=True,  FP8 + ue8m0 + preshuffle*
     HCA Main    : D=512, RD=64, ratio=128, overlap=False, BF16
+    (*preshuffle only on wave64; gfx1250 forces it off.)
 
-Each shape is swept across batch sizes {1,2,4,8,16,32,65,128,256,512} and
-speculative-decode step counts {0,3} (MTP3). The HCA Main shape is
-additionally cross-checked against the 2-kernel split launcher.
+Each shape is swept across batch sizes and speculative-decode step counts {0,3}
+(MTP3). The HCA Main shape is additionally cross-checked against the 2-kernel
+split launcher. The fp8 nm-asm cross-checks run on wave64 only.
 """
 
 import argparse
@@ -29,8 +36,13 @@ from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
+
+# The flydsl wrappers dispatch by arch internally, so one test covers wave64
+# (gfx9 family) and wave32 (gfx1250). The fp8 nm-asm cross-checks are wave64-only.
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
 # (label, head_dim, rope_head_dim, ratio, overlap, quant, use_ue8m0, preshuffle)
 SHAPES = [
@@ -86,6 +98,8 @@ def _build_inputs(shape, bs, mtp, mode):
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
     label, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    if get_gfx() == "gfx1250":
+        preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
     dim_full = (2 if overlap else 1) * D
     K_pool = (2 if overlap else 1) * ratio
 
@@ -176,7 +190,17 @@ def _build_inputs(shape, bs, mtp, mode):
         for j in range(blocks_per_seq):
             block_tables[b, j] = b * blocks_per_seq + j
 
+    # Dominant memory traffic (this kernel is bandwidth-bound): per compressed
+    # boundary it pools K_pool source tokens from kv_in + score_in (each dim_full
+    # wide, bf16) and writes D compressed elements to kv_cache. state-cache reads
+    # vary with window_len and are treated as a secondary term.
+    nbytes = num_compress * (
+        K_pool * dim_full * 2 * kv_in.element_size()  # kv_in + score_in pooled reads
+        + D * kv_cache.element_size()  # compressed cache write (fp8=1B / bf16=2B)
+    )
+
     return dict(
+        nbytes=nbytes,
         kv_in=kv_in,
         score_in=score_in,
         kv_state=kv_state,
@@ -275,7 +299,7 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
         quant=quant,
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
-        preshuffle=preshuffle,
+        preshuffle=inp["preshuffle"],  # arch-adjusted (False on gfx1250)
     )
 
     msg = f"{shape_label}/{mode}/{path} bs={bs} mtp={mtp}"
@@ -314,7 +338,12 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
             tol_err_ratio=0.02,
             msg=f"{msg} kv_cache(bf16)",
         )
-    return {"us_kernel": us_kernel, "err_pct": err}
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": inp["nbytes"] / us_kernel / 1e6,
+        "err_pct": err,
+    }
 
 
 def _hca_cos_sin(max_pos, rope_dim):
@@ -357,10 +386,6 @@ def test_flydsl_hca_fp8(bs, ratio=128, D=512, RD=64, G=64):
     reference path). Exercises the flydsl fp8 Kernel B incl. the k_waves wave-packing
     path (plan_capacity=bs+1: bs<=31 -> kw4, 32..1022 -> kw1, >=1023 -> kw4).
     """
-    from aiter.ops.flydsl.kernels.fused_compress_attn_hca import (
-        flydsl_hca_compress_attn,
-    )
-
     torch.manual_seed(0)
     head_dim, rot_dim, group_size = D, RD, G
     nope_dim = head_dim - rot_dim
@@ -478,7 +503,19 @@ def test_flydsl_hca_fp8(bs, ratio=128, D=512, RD=64, G=64):
     checkAllclose(
         fly_pe.float(), ref_pe.float(), atol=0.02, rtol=0.02, msg=f"{msg} rope(bf16)"
     )
-    return {"us_kernel": us_kernel, "err_pct": e_nope}
+    # Dominant traffic: per boundary pool `ratio` tokens from kv + score (bf16),
+    # write the fp8 nope+scale entry + bf16 rope.
+    nbytes = bs * (
+        ratio * head_dim * 2 * kv_in_bf.element_size()
+        + entry * fly_nope_scale.element_size()
+        + rot_dim * fly_rope.element_size()
+    )
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": nbytes / us_kernel / 1e6,
+        "err_pct": e_nope,
+    }
 
 
 @benchmark()
@@ -488,8 +525,6 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
     inline dup e8m0 + separate bf16 rope) -- byte-compatible with HCA Main. Validated
     against the shared pure-torch ``fused_compress_attn_reference(group_quant=True)``.
     """
-    from aiter.ops.flydsl.kernels.fused_compress_attn import flydsl_fused_compress_attn
-
     shape = _shape_by_label("csa_main")
     _, D, RD, ratio, overlap, *_ = shape
     G = 64
@@ -583,102 +618,134 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
     checkAllclose(
         fly_pe.float(), ref_pe.float(), atol=0.02, rtol=0.02, msg=f"{msg} rope(bf16)"
     )
-    return {"us_kernel": us_kernel, "err_pct": e_nope}
+    return {
+        "gfx": get_gfx(),
+        "us_kernel": us_kernel,
+        "TB/s": inp["nbytes"] / us_kernel / 1e6,
+        "err_pct": e_nope,
+    }
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-s",
-    "--shapes",
-    type=str,
-    nargs="*",
-    default=[s[0] for s in SHAPES],
-    choices=[s[0] for s in SHAPES],
-    help="""Shape labels to run.
-    e.g.: -s csa_main hca_main""",
-)
-parser.add_argument(
-    "-b",
-    "--bs",
-    type=int,
-    nargs="*",
-    default=[1, 2, 4, 8, 16, 32, 65, 128, 256, 512],
-    help="""Batch sizes.
-    e.g.: -b 1 32 512""",
-)
-parser.add_argument(
-    "-m",
-    "--mtp",
-    type=int,
-    nargs="*",
-    default=[0, 3],
-    help="""Speculative-decode step counts (decode mode: num_per_seq = mtp+1).
-    Ignored in prefill mode.
-    e.g.: -m 0 3""",
-)
-parser.add_argument(
-    "--prefill-bs",
-    type=int,
-    nargs="*",
-    default=[1, 4, 32],
-    help="""Batch sizes for prefill mode (prefill ragged tokens = bs*context_len
-    grows fast; trimmed list by default).
-    e.g.: --prefill-bs 1 4 32""",
-)
-parser.add_argument(
-    "--modes",
-    type=str,
-    nargs="*",
-    default=["decode", "prefill"],
-    choices=["decode", "prefill"],
-    help="""Which modes to sweep.""",
-)
-parser.add_argument(
-    "--fp8-bs",
-    type=int,
-    nargs="*",
-    default=[1, 16, 32, 64, 256, 1024],
-    help="""Batch sizes for the HCA fp8 cross-check (flydsl 2-kernel fp8 vs C++).
-    plan_capacity=bs+1 -> spans the k_waves packing policy (bs<=31 kw4,
-    32..1022 kw1, >=1023 kw4). Set to empty to skip the fp8 sweep.
-    e.g.: --fp8-bs 1 64 1024""",
-)
-parser.add_argument(
-    "--csa-fp8-bs",
-    type=int,
-    nargs="*",
-    default=[1, 16, 64, 256],
-    help="""Batch sizes for the CSA Main nm-asm fp8 group-quant check (flydsl
-    single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
-)
+def main():
+    # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
+    # outside the validated set.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl compress_attn unsupported on %s; skipping", get_gfx()
+        )
+        return
 
-args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-s",
+        "--shapes",
+        type=str,
+        nargs="*",
+        default=[s[0] for s in SHAPES],
+        choices=[s[0] for s in SHAPES],
+        help="""Shape labels to run.
+        e.g.: -s csa_main hca_main""",
+    )
+    parser.add_argument(
+        "-b",
+        "--bs",
+        type=int,
+        nargs="*",
+        default=[1, 2, 4, 8, 16, 32, 65, 128, 256, 512],
+        help="""Batch sizes.
+        e.g.: -b 1 32 512""",
+    )
+    parser.add_argument(
+        "-m",
+        "--mtp",
+        type=int,
+        nargs="*",
+        default=[0, 3],
+        help="""Speculative-decode step counts (decode mode: num_per_seq = mtp+1).
+        Ignored in prefill mode.
+        e.g.: -m 0 3""",
+    )
+    parser.add_argument(
+        "--prefill-bs",
+        type=int,
+        nargs="*",
+        default=[1, 4, 32],
+        help="""Batch sizes for prefill mode (prefill ragged tokens = bs*context_len
+        grows fast; trimmed list by default).
+        e.g.: --prefill-bs 1 4 32""",
+    )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        nargs="*",
+        default=["decode", "prefill"],
+        choices=["decode", "prefill"],
+        help="""Which modes to sweep.""",
+    )
+    parser.add_argument(
+        "--fp8-bs",
+        type=int,
+        nargs="*",
+        default=[1, 16, 32, 64, 256, 1024],
+        help="""Batch sizes for the HCA fp8 cross-check (flydsl 2-kernel fp8 vs C++).
+        plan_capacity=bs+1 -> spans the k_waves packing policy (bs<=31 kw4,
+        32..1022 kw1, >=1023 kw4). Set to empty to skip the fp8 sweep.
+        e.g.: --fp8-bs 1 64 1024""",
+    )
+    parser.add_argument(
+        "--csa-fp8-bs",
+        type=int,
+        nargs="*",
+        default=[1, 16, 64, 256],
+        help="""Batch sizes for the CSA Main nm-asm fp8 group-quant check (flydsl
+        single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
+    )
 
-df = []
-for mode in args.modes:
-    bs_list = args.bs if mode == "decode" else args.prefill_bs
-    mtp_list = args.mtp if mode == "decode" else [0]  # prefill: mtp irrelevant
-    # Sweep order (slowest -> fastest changing): shape -> mtp -> bs.
-    # Within each shape, all bs cases for mtp=0 print first, then mtp=3,
-    # which makes the perf-vs-bs trend easy to read off the summary table.
-    for shape_label, mtp, bs in itertools.product(args.shapes, mtp_list, bs_list):
-        df.append(test_flydsl_compress_attn(shape_label, bs, mtp, mode, "single"))
-        if shape_label == "hca_main":
-            df.append(test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel"))
+    args = parser.parse_args()
 
-# HCA fp8 check (flydsl 2-kernel fp8 vs pure-torch fused_compress_attn_reference).
-fp8_df = []
-for bs in args.fp8_bs:
-    fp8_df.append(test_flydsl_hca_fp8(bs))
-if fp8_df:
-    df.extend(fp8_df)
-# CSA Main nm-asm fp8 check (flydsl single-kernel group-quant vs torch reference).
-for bs in args.csa_fp8_bs:
-    df.append(test_flydsl_csa_nm_asm_fp8(bs))
-df = pd.DataFrame(df)
-aiter.logger.info(
-    "flydsl_compress_attn summary (markdown):\n%s", df.to_markdown(index=False)
-)
+    def summarize(name, rows):
+        if rows:
+            aiter.logger.info(
+                "%s summary (markdown):\n%s",
+                name,
+                pd.DataFrame(rows).to_markdown(index=False),
+            )
+
+    # --- Table 1: bf16/fp8 compress_attn sweep (decode + prefill) ---
+    main_rows = []
+    for mode in args.modes:
+        bs_list = args.bs if mode == "decode" else args.prefill_bs
+        mtp_list = args.mtp if mode == "decode" else [0]  # prefill: mtp irrelevant
+        # Sweep order (slowest -> fastest changing): shape -> mtp -> bs.
+        for shape_label, mtp, bs in itertools.product(args.shapes, mtp_list, bs_list):
+            main_rows.append(
+                test_flydsl_compress_attn(shape_label, bs, mtp, mode, "single")
+            )
+            if shape_label == "hca_main":
+                main_rows.append(
+                    test_flydsl_compress_attn(shape_label, bs, mtp, mode, "2kernel")
+                )
+    summarize("flydsl_compress_attn", main_rows)
+
+    # The fp8 nm-asm cross-checks have their own arg shape, so each gets its own
+    # table (forcing them into the main table would just scatter NaN columns).
+    # They are wave64-only (never validated on gfx1250/wave32).
+    if get_gfx() == "gfx1250":
+        aiter.logger.warning("gfx1250: skipping wave64-only fp8 nm-asm cross-checks")
+        return
+
+    # --- Table 2: HCA fp8 (flydsl 2-kernel fp8 vs pure-torch reference) ---
+    summarize("flydsl_hca_fp8", [test_flydsl_hca_fp8(bs) for bs in args.fp8_bs])
+
+    # --- Table 3: CSA Main nm-asm fp8 (flydsl single-kernel group-quant vs torch) ---
+    summarize(
+        "flydsl_csa_nm_asm_fp8",
+        [test_flydsl_csa_nm_asm_fp8(bs) for bs in args.csa_fp8_bs],
+    )
+
+
+if __name__ == "__main__":
+    main()

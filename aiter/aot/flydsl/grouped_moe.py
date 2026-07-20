@@ -21,6 +21,7 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
@@ -214,17 +215,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     numel = token_num * topk
     grid = max(1, (numel + 255) // 256)
 
-    def _payload_cols(feat_dim):
-        return feat_dim if quant_mode == "fp8" else feat_dim // 2
-
-    def _payload_numel(rows, feat_dim):
-        return rows * _payload_cols(feat_dim)
-
-    def _scale_pre_numel(out_e, out_m, feat_dim):
-        # (out_e, out_m // wmma_rep, (feat_dim // 32) * wmma_rep) flattened
-        return out_e * (out_m // wmma_rep) * ((feat_dim // 32) * wmma_rep)
-
-    def _route_ksplit(feat_dim, source_topk, out_e, out_m, grouped_in_numel):
+    def _route_ksplit(feat_dim, source_topk, out_e, out_m):
         # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
         # sets remap_rows on the grouped MoE fast path (row_starts stays None).
         launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
@@ -235,15 +226,11 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             remap_rows=False,
         )
         launch(
-            torch.empty((grouped_in_numel,), dtype=bf16, device=dev),
-            torch.empty(
-                (_payload_numel(out_e * out_m, feat_dim),), dtype=u8, device=dev
-            ),
-            torch.empty(
-                (_scale_pre_numel(out_e, out_m, feat_dim),), dtype=u8, device=dev
-            ),
-            torch.empty((numel,), dtype=i32, device=dev),
-            torch.empty((max(E, 1),), dtype=i32, device=dev),  # dummy row_starts
+            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             1,
             numel,
             grid,
@@ -259,12 +246,10 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         )
         n_rows = out_e * out_m
         launch(
-            torch.empty((n_rows * feat_dim,), dtype=bf16, device=dev),
-            torch.empty((_payload_numel(n_rows, feat_dim),), dtype=u8, device=dev),
-            torch.empty(
-                (_scale_pre_numel(out_e, out_m, feat_dim),), dtype=u8, device=dev
-            ),
-            torch.empty((max(E, 1),), dtype=i32, device=dev),
+            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             n_rows,
             out_m,
             grid,
@@ -274,9 +259,9 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     def _topids_to_rows():
         launch = build_moe_topids_to_rows_module()
         launch(
-            torch.empty((numel,), dtype=i32, device=dev),
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((numel,), dtype=i32, device=dev),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             numel,
             max_m,
             grid,
@@ -294,11 +279,11 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
 
         psum_remap = build_moe_contiguous_psum_remap_module()
         psum_remap(
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((numel,), dtype=i32, device=dev),
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((1,), dtype=i32, device=dev),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             numel,
             E,
             max_m,
@@ -311,7 +296,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             source_topk=topk,
             out_e=1,
             out_m=contiguous_m,
-            grouped_in_numel=token_num * model_dim,
         )
         a2_out_e, a2_out_m = 1, contiguous_m
     else:
@@ -325,7 +309,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 source_topk=topk,
                 out_e=E,
                 out_m=max_m,
-                grouped_in_numel=token_num * model_dim,
             )
         else:
             build_route = (
@@ -342,17 +325,13 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 max_m=max_m,
             )
             launch(
-                torch.empty((numel,), dtype=i32, device=dev),
-                torch.empty((E,), dtype=i32, device=dev),
-                torch.empty((numel,), dtype=i32, device=dev),
-                torch.empty((token_num * model_dim,), dtype=bf16, device=dev),
-                torch.empty(
-                    (_payload_numel(E * max_m, model_dim),), dtype=u8, device=dev
-                ),
-                torch.empty(
-                    (_scale_pre_numel(E, max_m, model_dim),), dtype=u8, device=dev
-                ),
-                torch.empty((E,), dtype=i32, device=dev),  # expert_row_base (dummy)
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 numel,
                 grid,
                 stream=0,
@@ -370,7 +349,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             source_topk=0,
             out_e=a2_out_e,
             out_m=a2_out_m,
-            grouped_in_numel=a2_out_e * a2_out_m * inter_dim,
         )
     else:
         # masked_m is None on the contiguous path -> skip_padding=False;
@@ -395,12 +373,10 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             model_dim, topk, out_dtype, split_k, vec
         )
         gather_reduce(
-            torch.empty(
-                (split_k * a2_out_e * a2_out_m, model_dim), dtype=dtype, device=dev
-            ),
-            torch.empty((token_num, topk), dtype=i32, device=dev),
-            torch.empty((token_num, topk), dtype=dtype, device=dev),
-            torch.empty((token_num, model_dim), dtype=dtype, device=dev),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
+            ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
             token_num,
             a2_out_e * a2_out_m * (model_dim // 2),
             stream=0,

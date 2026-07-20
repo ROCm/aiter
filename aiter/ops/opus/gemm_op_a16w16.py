@@ -128,24 +128,39 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
             f"Y.shape={tuple(Y.shape)}, expected ({batch}, {M}, {N}))"
         )
 
-    # Strides must match the launcher's hardcoded assumptions.
-    expected = {
-        "XQ": (XQ, (M * K, K, 1)),
-        "WQ": (WQ, (N * K, K, 1)),
-        "Y": (Y, (M * N, N, 1)),
-    }
-    for name, (t, want) in expected.items():
-        got = tuple(t.stride())
-        if got != want:
+    # XQ / WQ: the K (innermost / contraction) dimension may be padded -- the
+    # launcher passes the tensor's real leading stride as kargs.stride_a/stride_b
+    # and the kernels use it as the lda for BOTH addressing and the gmem buffer
+    # bound, so a row pitch > K (e.g. a 2880-wide tensor stored at lda 3072) is
+    # served correctly. We only require:
+    #   * innermost stride == 1   (the kernel layout hardcodes the K stride to 1)
+    #   * row pitch (stride[1]) >= K
+    #   * batch stride == rows * row pitch (or batch == 1) -- rejects broadcast
+    #     (stride 0) and transposed / overlapping views.
+    for name, t, rows in (("XQ", XQ, M), ("WQ", WQ, N)):
+        s0, s1, s2 = t.stride()
+        k_inner = t.shape[2]
+        ok = s2 == 1 and s1 >= k_inner and (batch == 1 or s0 == rows * s1)
+        if not ok:
             raise NotImplementedError(
-                f"opus_gemm_a16w16_tune: {name} must have contiguous "
-                f"strides {want} (got {name}.stride()={got}, "
-                f"{name}.shape={tuple(t.shape)}). The launcher hardcodes "
-                f"stride_*_batch and stride_* values; any broadcast / "
-                f"transpose / slice produces wrong results or a memory "
-                f"access fault. Materialize with `{name} = {name}."
-                f"contiguous()` before calling."
+                f"opus_gemm_a16w16_tune: {name} must be K-contiguous with an "
+                f"optional padded leading dim -- need stride[2]==1, "
+                f"stride[1]>={k_inner}, and stride[0]==size(1)*stride[1] (or "
+                f"batch==1). Got {name}.stride()={tuple(t.stride())}, "
+                f"{name}.shape={tuple(t.shape)}. Broadcast / transpose / "
+                f"non-K-contiguous slices are not supported; materialize with "
+                f"`{name} = {name}.contiguous()` before calling."
             )
+    # Y is the output: the launcher hardcodes stride_c == N and
+    # stride_c_batch == M*N, so it must be fully contiguous.
+    y_want = (M * N, N, 1)
+    if tuple(Y.stride()) != y_want:
+        raise NotImplementedError(
+            f"opus_gemm_a16w16_tune: Y must have contiguous strides {y_want} "
+            f"(got Y.stride()={tuple(Y.stride())}, Y.shape={tuple(Y.shape)}). "
+            f"The launcher hardcodes stride_c == N and stride_c_batch == M*N; "
+            f"materialize with `Y = Y.contiguous()` before calling."
+        )
 
 
 def opus_gemm_a16w16_tune(
@@ -265,12 +280,35 @@ def _opus_gemm_bf16_dispatch(
 
 # ---- High-level shape-driven API -----------------------------------------
 
-# splitk kids (200..299) main kernel only has the <fp32_t> instantiation
-# (traits static_assert D_C==float, fp32 workspace). The reduce kernel
+# splitk kids main kernel only has the <fp32_t> instantiation (traits
+# static_assert D_C==float, fp32 workspace). The reduce kernel
 # (splitk_reduce_kernel) is templated on D_OUT and dispatches to either
 # __bf16 or float at launch time based on Y.dtype(), so both bf16 and fp32
-# outputs are valid. Kept here only as a documentation anchor; the dispatch
-# code below no longer needs to special-case Y.dtype against splitk kids.
+# outputs are valid. The dispatch code below no longer needs to special-case
+# Y.dtype against splitk kids.
+#
+# splitk kid ranges, one half-open [lo, hi) interval per device family. Kept
+# in exact lockstep with the C++ authority `opus_kid_is_splitk` in
+# csrc/opus_gemm/opus_gemm.cu -- adding a new device's splitk band means
+# appending one row HERE and there. Consumed by is_splitk_kid() below, which
+# gates the split-K workspace prewarm in aiter/tuned_gemm.py (non-splitk kids
+# never touch the workspace, so warming it for them is pure waste).
+_SPLITK_KID_RANGES = (
+    (200, 300),  # gfx950 base
+    (1200, 1300),  # gfx950 non-OOB mirror (+1000)
+    (10200, 10300),  # gfx942 (+10000)
+    (20000, 21000),  # gfx1250 cluster/TDM split-K
+)
+
+
+def is_splitk_kid(kid: int) -> bool:
+    """True iff `kid` selects a split-K opus a16w16 kernel (fp32 workspace +
+    reduce). Mirrors C++ `opus_kid_is_splitk`; keep the two in sync."""
+    kid = int(kid)
+    return any(lo <= kid < hi for lo, hi in _SPLITK_KID_RANGES)
+
+
+# Back-compat: the old gfx950-only single-band constants some callers imported.
 _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
@@ -364,16 +402,19 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     else:
         Y = torch.empty(batch, M, N, dtype=dtype, device=A.device)
 
-    # Bias validation. dtype must match Y dtype (match_d_out convention).
-    # Bias is per-output-feature [N] (F.linear convention). Shape protocol:
+    # Bias validation. Bias may be fp32 OR match the output dtype: the gfx1250
+    # splitk main kernel always writes an fp32 workspace and the reduce kernel
+    # folds bias in fp32 before the final cast to Y, so an fp32 bias is exact
+    # and free regardless of Y dtype (the common accuracy-friendly case for a
+    # bf16 output). Bias is per-output-feature [N] (F.linear convention):
     #   * [N]          -> stride_bias_batch = 0 (broadcast across batch)
     #   * [batch, N]   -> stride_bias_batch = N
-    # Matches the C++-side BIAS_HOST_VALIDATE in gen_instances.py.
+    # Matches the C++-side gfx1250 bias validation in gen_instances_gfx1250.py.
     if bias is not None:
-        if bias.dtype != dtype:
+        if bias.dtype not in (dtype, torch.float32):
             raise ValueError(
-                f"gemm_a16w16_opus: bias dtype must match output dtype "
-                f"(got bias.dtype={bias.dtype}, dtype={dtype})"
+                f"gemm_a16w16_opus: bias dtype must be fp32 or match output "
+                f"dtype (got bias.dtype={bias.dtype}, dtype={dtype})"
             )
         if not bias.is_contiguous():
             raise ValueError(
@@ -515,4 +556,5 @@ __all__ = [
     "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
+    "is_splitk_kid",
 ]

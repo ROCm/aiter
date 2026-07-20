@@ -39,13 +39,25 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
-DEFAULT_GPU_ARCH = (
-    subprocess.run(
-        "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
+
+
+def get_amdgpu_arch():
+    """Find amdgpu-arch and return the detected GPU architecture."""
+    result = subprocess.run(
+        "which amdgpu-arch", shell=True, capture_output=True, text=True
     )
-    .stdout.strip()
-    .split("\n")[0]
-)
+    amdgpu_arch_path = (
+        result.stdout.strip()
+        if result.returncode == 0
+        else "/opt/rocm/llvm/bin/amdgpu-arch"
+    )
+    result = subprocess.run(
+        amdgpu_arch_path, shell=True, capture_output=True, text=True
+    )
+    return result.stdout.strip().split("\n")[0]
+
+
+DEFAULT_GPU_ARCH = get_amdgpu_arch()
 GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
 
@@ -58,7 +70,9 @@ AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
 if AITER_REBUILD >= 1:
-    subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
+    # Wipe the build dir without a shell: BUILD_DIR is recreated just below.
+    # Avoids shell interpolation of BUILD_DIR (derived from AITER_ROOT_DIR env).
+    shutil.rmtree(BUILD_DIR, ignore_errors=True)
 
 if not os.path.exists(BUILD_DIR):
     os.makedirs(BUILD_DIR, exist_ok=True)
@@ -139,6 +153,7 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx950",
+        "gfx1151",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -236,8 +251,9 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}",
-            shell=True,
+            ["make", "build", f"-j{len(sources)}"],
+            cwd=sub_build_dir,
+            shell=False,
             capture_output=AITER_LOG_MORE < 2,
             check=True,
         )

@@ -20,12 +20,16 @@ from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.opus.gemm_op_a8w8 import (
+    opus_gemm_a8w8_blockscale_bpreshuffle_tune,
+)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
     kernels_list as candidate_kernels_bpreshuffle_dict,
 )
 from gemm_a8w8_blockscale_instance import candidate_kernels_dict
+from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 
 # cktile
 from gemm_a8w8_blockscale_cktile_instance import (
@@ -148,6 +152,22 @@ def run_gemm_a8w8_blockscale_asm(
     )
 
 
+def run_gemm_a8w8_blockscale_opus(
+    x,
+    weight,
+    x_scale,
+    w_scale,
+    out,
+    kernel_id,
+):
+    """
+    Run gfx942 Opus a8w8 blockscale bpreshuffle tuned kernel.
+    """
+    return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
+        x, weight, x_scale, w_scale, out, kernelId=kernel_id
+    )
+
+
 def generate_data(m, n, k, seed, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
@@ -221,9 +241,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="all",
-            choices=["ck", "cktile", "asm", "all", "both"],
+            choices=["ck", "cktile", "asm", "opus", "all", "both"],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, both or all (covers all supported backends across standard/preshuffleB modes)",
+            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, both or all (covers all supported backends across standard/preshuffleB modes)",
         )
 
         self.parser.add_argument(
@@ -438,6 +458,49 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 )
         return tasks_ck
 
+    def get_gemm_a8w8_blockscale_opus_tune_task(
+        self,
+        info_keys,
+        seed,
+        preshuffleB,
+        run_kwargs,
+    ):
+        gfx, _, M, N, K = info_keys
+        if not preshuffleB or gfx != "gfx942":
+            return []
+
+        gemm_keys = ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale"]
+        ref_args = (ref_keys, None, dtypes.bf16)
+        tasks_opus = []
+        for kernel_id, kernel in gfx942_a8w8_kernels_list.items():
+            if N % kernel.B_N != 0 or K % kernel.B_K != 0:
+                continue
+            if not kernel.has_oob and M % kernel.B_M != 0:
+                continue
+            info = (info_keys, kernel_id, 0, kernel.name, "opus", preshuffleB)
+            gemm_args = (gemm_keys, kernel_id)
+            tasks_opus.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed),
+                    run_gemm_a8w8_blockscale_opus,
+                    gemm_args,
+                    dict(run_kwargs),
+                    run_torch,
+                    ref_args,
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks_opus
+
     def run_config(self, args):
         from aiter.ops.gemm_op_a8w8 import (
             gemm_a8w8_blockscale,
@@ -634,6 +697,15 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     self.get_gemm_a8w8_blockscale_asm_tune_task(
                         info_keys,
                         useSplitK,
+                        seed,
+                        isPreshuffleB,
+                        run_kwargs,
+                    )
+                )
+            if lib in ("opus", "all"):
+                task.extend(
+                    self.get_gemm_a8w8_blockscale_opus_tune_task(
+                        info_keys,
                         seed,
                         isPreshuffleB,
                         run_kwargs,

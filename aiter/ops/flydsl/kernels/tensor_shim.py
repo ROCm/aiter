@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import numpy as np
 import flydsl.compiler as flyc
@@ -13,6 +15,34 @@ from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
+
+# Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
+# kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
+# globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
+# number of kernel arguments to preload.
+AITER_FLYDSL_KERNARG_PRELOAD = bool(
+    int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1"))
+)
+AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
+    os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
+)
+
+
+def ptr_rsrc(ptr):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
+    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
+    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+
+
+def ptr_arg(t: torch.Tensor):
+    """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
+    import flydsl.expr as fx
+
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
 def _run_compiled(exe, *args):
