@@ -53,6 +53,16 @@ on:
         description: 'Use pytorch/manylinux2_28-builder ROCm image (AlmaLinux 8 + devtoolset, glibc 2.28). Produces wheels ABI-compatible with vLLM/Ubuntu 22 containers.'
         type: boolean
         default: false
+      torch_pin:
+        description: 'Optional torch version pin for the manylinux build (e.g. 2.11.0 or 2.10.0+rocm7.1). Empty = default constraint (torch<2.13).'
+        type: string
+        required: false
+        default: ''
+      torch_index_url:
+        description: 'Optional override for the torch wheel index URL. Empty = auto-derive from the builder image ROCm tag.'
+        type: string
+        required: false
+        default: ''
   workflow_call:
     inputs:
       release_type:
@@ -309,11 +319,16 @@ jobs:
           else
             TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_NUM}"
           fi
-          # Optional torch version pin (e.g. 2.10.0+rocm7.1). Empty = latest.
+          # Optional torch version pin (e.g. 2.10.0+rocm7.1). Empty = default
+          # constraint torch<2.13. torch 2.13.0 breaks the build: its
+          # torch.library._clear_torch_ops_cache() does qualname.split("::")
+          # expecting exactly one "::", which raises on aiter custom-op names
+          # during interpreter teardown of setup.py start_aot(). Pin below 2.13
+          # until the op-name incompatibility is resolved.
           if [ -n "${TORCH_PIN}" ]; then
             TORCH_SPEC="torch==${TORCH_PIN}"
           else
-            TORCH_SPEC="torch"
+            TORCH_SPEC="torch<2.13"
           fi
           echo "Torch index: ${TORCH_INDEX}"
           echo "Torch spec:  ${TORCH_SPEC}"
