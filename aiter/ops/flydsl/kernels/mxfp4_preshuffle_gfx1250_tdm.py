@@ -57,12 +57,21 @@ def launch_gemm_a8w4_tdm(
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
 ):
-    cache_tag = (
-        tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
-        a_is_fp4, n_experts, stage1_act, has_bias, _TDM_DESCRIPTOR_VERSION,
-        stage1_quant_out, quant_wmma_rep,
+    # Distinct AOT module name per constexpr specialization so different tile /
+    # buffer / epilogue configs don't collide in the kernel cache. Mirrors the
+    # name= convention in the sibling gfx1250 mxscale GEMM kernels.
+    _out_dt = "f16" if out_is_f16 else "bf16"
+    _a_dt = "fp4" if a_is_fp4 else "fp8"
+    _act_tag = {0: "noact", 1: "silu", 2: "swiglu"}.get(stage1_act, f"act{stage1_act}")
+    module_name = (
+        "gemm_a8w4_tdm"
+        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
+        f"_b{num_buffers}_e{n_experts}"
+        f"_a{_a_dt}_out{_out_dt}"
+        f"_{_act_tag}_bias{has_bias}"
+        f"_qout{stage1_quant_out}_qrep{quant_wmma_rep}"
+        f"_v{_TDM_DESCRIPTOR_VERSION}"
     )
-    _ = cache_tag
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -106,13 +115,27 @@ def launch_gemm_a8w4_tdm(
     # to global memory (no LDS staging), so no C_STORE_B LDS is needed.
     ARENA_B = max(num_buffers * PITCH, 0 if stage1_quant_out else C_STORE_B)
 
+    # LDS occupancy report (compile-time). The arena is allocated dynamically
+    # (SharedAllocator(static=False)) so the size does not surface in the kernel
+    # signature; print the per-stage byte breakdown so LDS usage is visible.
+    _per_buf = STAGE_A + STAGE_B + STAGE_SA + STAGE_SB
+    print(
+        f"[lds] {module_name}: "
+        f"A={STAGE_A} B={STAGE_B} SA={STAGE_SA} SB={STAGE_SB} "
+        f"per_buf(unpadded)={_per_buf} PITCH(512-aligned)={PITCH} "
+        f"x num_buffers={num_buffers}"
+        + ("" if stage1_quant_out else f" | C_STORE={C_STORE_B}")
+        + f" -> ARENA={ARENA_B} B ({ARENA_B / 1024:.2f} KiB)",
+        flush=True,
+    )
+
     # Quant epilogue compile-time constants.
     _Q_ROWS_PER_TILE = quant_wmma_rep * 16
     # Each wn subtile produces 8 output cols (4 per kgrp) after silu/swiglu;
     # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
     _Q_WN_PER_MX = 4
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    @flyc.kernel(name=module_name, known_block_size=[block, 1, 1])
     def kernel(
         arg_c: fx.Tensor,
         arg_a: fx.Pointer,
