@@ -45,14 +45,20 @@ try:
         flydsl_wd_moe_down_reduce,
     )
     _HAS_WRAPPERS = True
-except ImportError:
+except (ImportError, AttributeError):
+    # ImportError: aiter package not installed.
+    # AttributeError: stale module_aiter_core.so (e.g. MlaVersion missing after
+    # a source-only pull without rebuilding the C extension).  Both cases fall
+    # back to loading the FlyDSL kernel and wrapper directly from source so that
+    # the warp-decode tests can still run without a full aiter build.
     import importlib.util
     import pathlib
 
+    _flydsl_dir = pathlib.Path(__file__).parents[2] / "aiter/ops/flydsl"
+
     _spec = importlib.util.spec_from_file_location(
         "moe_warp_decode",
-        pathlib.Path(__file__).parents[2]
-        / "aiter/ops/flydsl/kernels/moe_warp_decode.py",
+        _flydsl_dir / "kernels/moe_warp_decode.py",
     )
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
@@ -60,10 +66,18 @@ except ImportError:
     compile_wd_moe_gate_up_splitk = _mod.compile_wd_moe_gate_up_splitk
     compile_wd_moe_gate_finalize = _mod.compile_wd_moe_gate_finalize
     compile_wd_moe_down_reduce = _mod.compile_wd_moe_down_reduce
-    # Wrappers may not be importable in fallback path; mark unavailable.
-    flydsl_wd_moe_gate_up = None
-    flydsl_wd_moe_down_reduce = None
-    _HAS_WRAPPERS = False
+
+    # Load the high-level wrapper by path too (it imports flydsl directly,
+    # not the full aiter package, so it works even with a stale .so).
+    _wspec = importlib.util.spec_from_file_location(
+        "warp_decode_moe",
+        _flydsl_dir / "warp_decode_moe.py",
+    )
+    _wmod = importlib.util.module_from_spec(_wspec)
+    _wspec.loader.exec_module(_wmod)
+    flydsl_wd_moe_gate_up = _wmod.flydsl_wd_moe_gate_up
+    flydsl_wd_moe_down_reduce = _wmod.flydsl_wd_moe_down_reduce
+    _HAS_WRAPPERS = True
 
 
 # ---------------------------------------------------------------------------

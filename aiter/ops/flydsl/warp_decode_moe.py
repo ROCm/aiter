@@ -75,12 +75,30 @@ def _ptr(t: torch.Tensor):
 
 
 def _get_compile_fns():
-    """Lazy-import the kernel builders (avoids top-level FlyDSL import)."""
-    from .kernels.moe_warp_decode import (
-        compile_wd_moe_gate_up,
-        compile_wd_moe_down_reduce,
-    )
-    return compile_wd_moe_gate_up, compile_wd_moe_down_reduce
+    """Lazy-import the kernel builders.
+
+    Tries the package-relative import first (normal installed path).
+    Falls back to loading by file path when the module is loaded
+    standalone via importlib (e.g. when aiter's C extension is stale).
+    """
+    try:
+        from aiter.ops.flydsl.kernels.moe_warp_decode import (
+            compile_wd_moe_gate_up,
+            compile_wd_moe_down_reduce,
+        )
+        return compile_wd_moe_gate_up, compile_wd_moe_down_reduce
+    except (ImportError, AttributeError):
+        pass
+
+    # Fallback: load directly from the source file next to this module.
+    import importlib.util
+    import pathlib
+
+    _kernel_path = pathlib.Path(__file__).parent / "kernels" / "moe_warp_decode.py"
+    _spec = importlib.util.spec_from_file_location("moe_warp_decode", _kernel_path)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod.compile_wd_moe_gate_up, _mod.compile_wd_moe_down_reduce
 
 
 # ---------------------------------------------------------------------------
