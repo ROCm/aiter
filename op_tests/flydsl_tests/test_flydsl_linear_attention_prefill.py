@@ -118,6 +118,11 @@ class PrefillArgs:
     # shapes share the same ``(T, num_seqs)``. Typical values are a log
     # count or a hex digest of cu_seqlens.
     trace_tag: str = ""
+    # Appended to the display id when a group sweeps multiple
+    # ``max_num_batched_tokens`` values, so a fixed (tp, full_prompt_len) stays
+    # unique across the batched-token sweep. Empty for single-value groups, so
+    # their ids are unchanged.
+    bt_tag: str = ""
 
     @property
     def Hg(self):
@@ -153,6 +158,8 @@ class PrefillArgs:
         tag = self.model_name + "_" if self.model_name else ""
         tag += f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
         tag += f"_TP{self.tp}_T{self.full_prompt_len}"
+        if self.bt_tag:
+            tag += f"_{self.bt_tag}"
         if not self.is_varlen:
             tag += "_novarlen"
         if not self.output_final_state:
@@ -197,7 +204,13 @@ class PrefillGroup:
     is_varlen: bool = True
     output_final_state: bool = True
     ssm_state_dtype: torch.dtype = torch.float32
-    # Three semantics for ``max_num_batched_tokens``:
+    # Semantics for ``max_num_batched_tokens``:
+    #   - list/tuple : sweep -- materialise one case per element (Cartesian with
+    #           tps x full_prompt_lens). Each element is itself one of the specs
+    #           below (int / "full_prompt_len" / None). For the varlen path this
+    #           sweeps the batch size N = mnbt // full_prompt_len. ids get an
+    #           ``mnbt{value}`` suffix so a fixed (tp, full_prompt_len) stays
+    #           unique. Example: ``max_num_batched_tokens=[16384, 32768, 65536]``.
     #   - int : use this exact value for every expanded case (e.g. you want
     #           a fixed scheduler budget across a sweep of full_prompt_len).
     #   - "full_prompt_len" : tie it to each case's full_prompt_len. The
@@ -240,70 +253,34 @@ class PrefillGroup:
 def expand_groups(groups):
     out = []
     for g in groups:
+        # ``max_num_batched_tokens`` may be a single spec (int / "full_prompt_len"
+        # / None) OR a list/tuple of such specs. A list materialises one case per
+        # value (Cartesian with tps x full_prompt_lens) -- e.g. to sweep the
+        # scheduler token budget, which for the varlen path sweeps the batch size
+        # (N = mnbt // full_prompt_len). When more than one value is present, ids
+        # gain an ``mnbt{value}`` suffix so a fixed (tp, full_prompt_len) stays
+        # unique; a single value keeps the original ids unchanged.
+        mnbt_specs = g.max_num_batched_tokens
+        if not isinstance(mnbt_specs, (list, tuple)):
+            mnbt_specs = [mnbt_specs]
+        _sweep_mnbt = len(mnbt_specs) > 1
         for tp in g.tps:
             for full_len in g.full_prompt_lens:
-                if g.max_num_batched_tokens == "full_prompt_len":
-                    mnbt = full_len
-                elif g.max_num_batched_tokens is None:
-                    mnbt = 32768  # PrefillArgs dataclass default
-                else:
-                    mnbt = g.max_num_batched_tokens
+                for mnbt_spec in mnbt_specs:
+                    if mnbt_spec == "full_prompt_len":
+                        mnbt = full_len
+                    elif mnbt_spec is None:
+                        mnbt = 32768  # PrefillArgs dataclass default
+                    else:
+                        mnbt = mnbt_spec
+                    bt_tag = f"mnbt{mnbt}" if _sweep_mnbt else ""
 
-                # head_seqlens=None : preserve the original "equal split via
-                # _build_context_lens" behavior. Otherwise materialise one
-                # PrefillArgs per (tp, full_len, head) triple with an
-                # explicit 3-segment cu_seqlens layout
-                # [head, mid_seqlen, full_len - head - mid_seqlen].
-                if g.head_seqlens is None:
-                    out.append(
-                        PrefillArgs(
-                            K=g.K,
-                            V=g.V,
-                            Hk=g.Hk,
-                            Hv=g.Hv,
-                            tp=tp,
-                            full_prompt_len=full_len,
-                            model_name=g.model_name,
-                            BT=g.BT,
-                            max_num_batched_tokens=mnbt,
-                            dtype=g.dtype,
-                            is_varlen=g.is_varlen,
-                            output_final_state=g.output_final_state,
-                            ssm_state_dtype=g.ssm_state_dtype,
-                        )
-                    )
-                else:
-                    for head in g.head_seqlens:
-                        if g.num_segments == 2:
-                            tail = full_len - head
-                            if tail <= 0:
-                                raise ValueError(
-                                    f"head_seqlens (num_segments=2) produced "
-                                    f"non-positive tail ({tail}) for "
-                                    f"group={g.model_name!r} "
-                                    f"full_prompt_len={full_len} head={head}."
-                                )
-                            context_lens = [head, tail]
-                            tag = f"head{head}_tail{tail}"
-                        elif g.num_segments == 3:
-                            tail = full_len - head - g.mid_seqlen
-                            if tail <= 0:
-                                raise ValueError(
-                                    f"head_seqlens (num_segments=3) produced "
-                                    f"non-positive tail ({tail}) for "
-                                    f"group={g.model_name!r} "
-                                    f"full_prompt_len={full_len} head={head} "
-                                    f"mid_seqlen={g.mid_seqlen}. Drop this "
-                                    f"(full_len, head) combo or raise "
-                                    f"full_prompt_len."
-                                )
-                            context_lens = [head, g.mid_seqlen, tail]
-                            tag = f"head{head}_mid{g.mid_seqlen}"
-                        else:
-                            raise ValueError(
-                                f"num_segments={g.num_segments} unsupported; "
-                                f"only 2 or 3 are implemented."
-                            )
+                    # head_seqlens=None : preserve the original "equal split via
+                    # _build_context_lens" behavior. Otherwise materialise one
+                    # PrefillArgs per (tp, full_len, head) triple with an
+                    # explicit 3-segment cu_seqlens layout
+                    # [head, mid_seqlen, full_len - head - mid_seqlen].
+                    if g.head_seqlens is None:
                         out.append(
                             PrefillArgs(
                                 K=g.K,
@@ -319,10 +296,62 @@ def expand_groups(groups):
                                 is_varlen=g.is_varlen,
                                 output_final_state=g.output_final_state,
                                 ssm_state_dtype=g.ssm_state_dtype,
-                                context_lens=context_lens,
-                                trace_tag=tag,
+                                bt_tag=bt_tag,
                             )
                         )
+                    else:
+                        for head in g.head_seqlens:
+                            if g.num_segments == 2:
+                                tail = full_len - head
+                                if tail <= 0:
+                                    raise ValueError(
+                                        f"head_seqlens (num_segments=2) produced "
+                                        f"non-positive tail ({tail}) for "
+                                        f"group={g.model_name!r} "
+                                        f"full_prompt_len={full_len} head={head}."
+                                    )
+                                context_lens = [head, tail]
+                                tag = f"head{head}_tail{tail}"
+                            elif g.num_segments == 3:
+                                tail = full_len - head - g.mid_seqlen
+                                if tail <= 0:
+                                    raise ValueError(
+                                        f"head_seqlens (num_segments=3) produced "
+                                        f"non-positive tail ({tail}) for "
+                                        f"group={g.model_name!r} "
+                                        f"full_prompt_len={full_len} head={head} "
+                                        f"mid_seqlen={g.mid_seqlen}. Drop this "
+                                        f"(full_len, head) combo or raise "
+                                        f"full_prompt_len."
+                                    )
+                                context_lens = [head, g.mid_seqlen, tail]
+                                tag = f"head{head}_mid{g.mid_seqlen}"
+                            else:
+                                raise ValueError(
+                                    f"num_segments={g.num_segments} unsupported; "
+                                    f"only 2 or 3 are implemented."
+                                )
+                            if _sweep_mnbt:
+                                tag = f"{tag}_mnbt{mnbt}"
+                            out.append(
+                                PrefillArgs(
+                                    K=g.K,
+                                    V=g.V,
+                                    Hk=g.Hk,
+                                    Hv=g.Hv,
+                                    tp=tp,
+                                    full_prompt_len=full_len,
+                                    model_name=g.model_name,
+                                    BT=g.BT,
+                                    max_num_batched_tokens=mnbt,
+                                    dtype=g.dtype,
+                                    is_varlen=g.is_varlen,
+                                    output_final_state=g.output_final_state,
+                                    ssm_state_dtype=g.ssm_state_dtype,
+                                    context_lens=context_lens,
+                                    trace_tag=tag,
+                                )
+                            )
     return out
 
 
@@ -375,7 +404,7 @@ _PREFILL_GROUPS = [
         Hv=64,
         tps=[8],
         full_prompt_lens=[1024, 2048, 4096, 8192],
-        max_num_batched_tokens=32768,
+        max_num_batched_tokens=65536,
     ),
     PrefillGroup(
         model_name="varlen-16k-aws",
@@ -994,6 +1023,19 @@ class TestCorrectness:
             cu_seqlens=cu,
         )
 
+        # HIP K5 accumulates the h-state in f32 (only the stored h / v_new /
+        # final_state are bf16), so it tracks the f32 reference far more
+        # tightly than the shared 5e-2 / 5e-3 band -- even at 128k context the
+        # error does not accumulate. Measured worst case over the full
+        # PREFILL_PARAMS HIP-supported sweep (gfx942, truncf f32->bf16, the
+        # least accurate path; gfx950 RNE is tighter still):
+        #   h            max 2.2e-3  mean 6.7e-5
+        #   v_new        max 3.9e-3  mean 2.5e-4
+        #   final_state  max 9.7e-4  mean 4.8e-5
+        # The bounds below leave ~2.5x margin on the worst element and ~4x on
+        # the mean, so they stay green under seed / arch jitter while being 5x
+        # tighter than the shared default -- a real HIP regression that the
+        # loose band waved through now trips here.
         _assert_k5_outputs_match_ref(
             h_hip,
             vn_hip,
@@ -1003,6 +1045,9 @@ class TestCorrectness:
             fs_ref,
             output_final_state=args.output_final_state,
             label="hip",
+            atol=1e-2,
+            rtol=1e-2,
+            mean_atol=1e-3,
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
