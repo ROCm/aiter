@@ -69,6 +69,9 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 | AMD Instinct MI325X | gfx942 (CDNA3) | Fully supported |
 | AMD Instinct MI350 | gfx950 (CDNA4) | Supported |
 | AMD Instinct MI355X | gfx950 (CDNA4) | Supported |
+| AMD Radeon AI PRO R9700 | gfx1201 (RDNA4) | Partially supported<sup>1</sup> |
+
+<sup>1</sup> On gfx1201, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). Most CK and ASM kernels are CDNA-only.
 
 ## Operators
 
