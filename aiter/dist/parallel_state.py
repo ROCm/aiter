@@ -33,7 +33,11 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
+try:
+    from torch.distributed import Backend, ProcessGroup
+except (ImportError, AttributeError):
+    Backend = None  # type: ignore[assignment]
+    ProcessGroup = None  # type: ignore[assignment]
 
 import os
 from aiter import logger

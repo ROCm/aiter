@@ -62,7 +62,7 @@ AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
 # JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
 # env var, e.g. Triton-backend users with no C++ toolchain or CK.
 AITER_TRITON_ONLY = (
-    os.getenv("AITER_TRITON_ONLY", "0") == "1" or sys.platform == "win32"
+    os.getenv("AITER_TRITON_ONLY", "0") == "1"
 )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.

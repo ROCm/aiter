@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
@@ -19,24 +20,40 @@ from build_targets import (  # noqa: F401 -- re-exported for callers
 logger = logging.getLogger("aiter")
 
 
+def _resolve_gpu_info_tool() -> tuple:
+    """Return (executable, gfx_regex) for the current platform.
+
+    On Linux:   rocminfo,     matches any "gfxNNNN" token per line.
+    On Windows: hipInfo.exe,  matches the "gcnArchName: gfxNNNN" field.
+    """
+    if sys.platform == "win32":
+        import sysconfig
+        platlib = sysconfig.get_paths()["platlib"]
+        hipinfo = os.path.join(platlib, "_rocm_sdk_core", "bin", "hipInfo.exe")
+        if not os.path.isfile(hipinfo):
+            raise RuntimeError(f"hipInfo.exe not found at {hipinfo}")
+        return hipinfo, r"gcnArchName\s*:\s*(gfx\w+)"
+    return executable_path("rocminfo"), r"\b(gfx\w+)\b"
+
+
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
+    gpu_info_tool, pattern = _resolve_gpu_info_tool()
     try:
-        rocminfo = executable_path("rocminfo")
         result = subprocess.run(
-            [rocminfo],
+            [gpu_info_tool],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=True,
         )
         for line in result.stdout.splitlines():
-            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+            match = re.search(pattern, line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
     except Exception as e:
-        raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
-    raise RuntimeError("No gfx arch found in rocminfo output.")
+        raise RuntimeError(f"Get GPU arch from {os.path.basename(gpu_info_tool)} failed: {e}") from e
+    raise RuntimeError(f"No gfx arch found in {os.path.basename(gpu_info_tool)} output.")
 
 
 @torch_compile_guard()
@@ -142,20 +159,27 @@ def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
-            rocminfo = executable_path("rocminfo")
+            rocminfo, _ = _resolve_gpu_info_tool()  # regex not needed here; each branch uses its own pattern
             result = subprocess.run(
                 [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
             output = result.stdout
             devices = re.split(r"Agent\s*\d+", output)
             gpu_compute_units = []
-            for device in devices:
-                for line in device.split("\n"):
-                    if "Device Type" in line and line.find("GPU") != -1:
-                        match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
-                        if match:
-                            gpu_compute_units.append(int(match.group(1)))
+            if sys.platform == "win32":
+                for line in output.splitlines():
+                    match = re.search(r"multiProcessorCount\s*:\s*(\d+)", line)
+                    if match:
+                        gpu_compute_units.append(int(match.group(1)))
                         break
+            else:
+                for device in devices:
+                    for line in device.split("\n"):
+                        if "Device Type" in line and line.find("GPU") != -1:
+                            match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
+                            if match:
+                                gpu_compute_units.append(int(match.group(1)))
+                            break
         except Exception as e:
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
         assert len(set(gpu_compute_units)) == 1
