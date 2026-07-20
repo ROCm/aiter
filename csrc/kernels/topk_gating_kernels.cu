@@ -19,6 +19,7 @@
 #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
 #include <hip/hip_runtime.h>
+#include <cfloat>
 #include <type_traits>
 
 namespace aiter {
@@ -36,6 +37,19 @@ inline bool topk_gating_prefer_optn_e128()
 // ---------------------------------------------------------------------------
 
 enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
+
+// Finite sentinel that +Inf logits are clamped to before sqrt(softplus) (see
+// compute_score). FLT_MAX is the largest finite float, so the clamp fires only
+// for +Inf (no finite logit exceeds it) and leaves every finite logit untouched.
+// After sqrt(softplus) the score is sqrt(FLT_MAX) ~= 1.84e19, so even summing it
+// across all experts stays well within fp32 range and cannot overflow the renorm.
+constexpr float SOFTPLUS_LOGIT_CLAMP = FLT_MAX;
+
+// Lower floor for the normalization denominator. This is only a degeneracy
+// guard for zero/subnormal sums (e.g. every expert masked out / NaN), not a
+// regular damping epsilon: top-k routing should preserve tiny-but-valid sums.
+// Keep it far below any real routing sum while still preventing division by 0.
+constexpr float RENORM_SUM_FLOOR = 1e-20f;
 
 // Fused DPP warp argmax: 6× v_max_f32+DPP + ballot + ctzll + readlane ≈ 9 instr.
 // NaN-safe: if all lanes have NaN (val_o == max_val is always false), ballot is 0
@@ -70,16 +84,16 @@ __device__ __forceinline__ float compute_score(float x)
     else
     {
         // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
-        // Clamp +Inf (and absurd) logits to a large finite value: softplus is
-        // unbounded, so an Inf logit would make sqrt(softplus) = Inf and then
-        // overflow the renorm sum to NaN. 1e30 keeps the expert the top-ranked
-        // one while staying finite; realistic logits (<< 1e30) are unchanged.
-        // NOTE: an explicit compare, not fminf -- fminf(NaN, 1e30) returns 1e30,
-        // which would turn a NaN logit into a huge finite score and defeat the
-        // NaN guard. `NaN > 1e30` is false, so NaN falls through unchanged and is
-        // rejected downstream.
-        if(x > 1.0e30f)
-            x = 1.0e30f;
+        // Clamp +Inf logits to SOFTPLUS_LOGIT_CLAMP: softplus is unbounded, so an
+        // Inf logit would make sqrt(softplus) = Inf and then overflow the renorm
+        // sum to NaN. The clamp keeps the expert top-ranked while staying finite
+        // (see the constant for the magnitude rationale).
+        // NOTE: an explicit compare, not fminf -- fminf(NaN, clamp) returns the
+        // clamp, which would turn a NaN logit into a huge finite score and defeat
+        // the NaN guard. `NaN > clamp` is false, so NaN falls through unchanged
+        // and is rejected downstream.
+        if(x > SOFTPLUS_LOGIT_CLAMP)
+            x = SOFTPLUS_LOGIT_CLAMP;
         // Highest-precision path: pure libm (expf + log1pf), ≤1 ULP.
         // Faster alternatives (commented out, ~0.5-1 ULP extra error):
         //   float sp = x > 20.0f ? x : log1pf(exp2f(x * 1.4426950408889634f));   // exp2f HW
@@ -271,7 +285,7 @@ __global__ void topk_softplus_kernel_opt(
 
     // Step 4: renorm + scale + write
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -409,7 +423,7 @@ __global__ void topk_softplus_kernel_opt_multiwave(
         }
 
         if constexpr(need_renorm)
-            out_scale = routed_scaling_factor / fmaxf(sum, 1e-20f);
+            out_scale = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
         else
             out_scale = routed_scaling_factor;
     }
@@ -544,7 +558,7 @@ __global__ void topk_softplus_kernel_opt_n(
     }
 
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -700,7 +714,7 @@ void topk_softplus_kernel_prefill(
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, 1e-20f));
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
 #pragma unroll
         for(int i = 0; i < VPT; i++)
         {
@@ -756,7 +770,7 @@ void topk_softplus_kernel_prefill(
     }
 
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -853,7 +867,7 @@ __global__ void topk_softplus_kernel(
         }
         local_sum = wave_reduce(local_sum, [](float a, float b) { return a + b; });
 
-        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, 1e-20f));
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
             scores[e] *= inv_sum;
@@ -897,7 +911,7 @@ __global__ void topk_softplus_kernel(
     }
 
     if(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -1028,7 +1042,7 @@ __global__ void topk_softplus_kernel_smem_n(
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, 1e-20f));
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
         for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
         {
             scores[e] *= inv_sum;
@@ -1087,7 +1101,7 @@ __global__ void topk_softplus_kernel_smem_n(
     }
 
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
