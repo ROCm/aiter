@@ -96,6 +96,13 @@ def unswizzle_mx_scale_cdna4(
     x = x.reshape(BLOCK_N // N_PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // 8, 4, 16, 2, 2, 1)
     x = x.permute(0, 5, 3, 1, 4, 2, 6)
     x = x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
+    x = x.trans(1, 0)
+    x = x.reshape(MX_SCALE_BLOCK_K, 1, BLOCK_N)
+    x = x.broadcast_to((MX_SCALE_BLOCK_K, 32, BLOCK_N))
+    x = x.reshape((MX_SCALE_BLOCK_K * 32, BLOCK_N))
+    #x = x.reshape(BLOCK_N, MX_SCALE_BLOCK_K, 1)
+    #x = x.broadcast_to(BLOCK_N, MX_SCALE_BLOCK_K, 32)
+    #x = x.reshape(BLOCK_N, MX_SCALE_BLOCK_K*32)
     return x
 
 @gluon.jit(launch_metadata=matmul_launch_metadata)
@@ -222,7 +229,7 @@ def _moe_gemm_a16w4(
     )
 
     LOAD_LAYOUT_W: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],
+        size_per_thread=[8, 1],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, num_warps],
         order=[0, 1],
@@ -239,7 +246,8 @@ def _moe_gemm_a16w4(
     )
 
     MFMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, num_warps // 2]
+        #version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, num_warps // 2]
+        version=4, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, num_warps], tiles_per_warp=[2,2]
     )
 
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
@@ -326,12 +334,17 @@ def _moe_gemm_a16w4(
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
-        w_scales = w_scales.trans(1, 0)
-        w_scales = (
-            w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
-            .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
-            .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
-        )
+        #w_scales = (
+        #    w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
+        #    .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
+        #   .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
+        #)
+        #w_scales = (
+        #    w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
+        #    .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
+        #    .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR ))
+        #)
+        #w_scales = w_scales.trans(1, 0)
         w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
 
         #Scaled upcast to bf16
@@ -359,12 +372,12 @@ def _moe_gemm_a16w4(
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
-        w_scales = w_scales.trans(1, 0)
-        w_scales = (
-            w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
-            .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
-            .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
-        )
+        #w_scales = (
+        #    w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
+        #    .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
+        #    .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR ))
+        #)
+        #w_scales = w_scales.trans(1, 0)
         w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
 
         #Scaled Upcast 

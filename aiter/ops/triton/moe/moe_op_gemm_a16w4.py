@@ -12,9 +12,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_triton,
 )
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1,
-)
+#from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1 import (
+#    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1,
+#)
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1_swizzle_only import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1_swizzle,
 )
@@ -130,9 +130,11 @@ def get_kernel_config(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
+    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
-def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
+'''
+def get_gluon_kernel_config_v1(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -161,14 +163,14 @@ def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
             num_warps = 4
         elif n <= 4096:
             block_n = 256
-            num_warps = 4
+            num_warps = 8
         else:
             block_n = 256
             num_warps = 4
 
     else:
-        block_n =  256
-        num_warps = 4
+        block_n =  512
+        num_warps = 8
 
     ret = {
         "block_m": block_m,
@@ -186,7 +188,8 @@ def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
     }
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
-
+'''
+    
 def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -196,10 +199,13 @@ def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
     num_stages = 2
     split_k = 1
     block_k = 256
+    matrix_instr_nonkdim = 32
 
     if block_m == 16:
         block_n = 128
         num_warps = 4
+        tile_per_warp = [1,1]
+        matrix_instr_nonkdim = 16
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -212,16 +218,20 @@ def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
 
     elif block_m == 32:
         if n <= 1024:
+            tile_per_warp = [1,2]
             block_n = 128
             num_warps = 4
         elif n <= 4096:
-            block_n = 128
-            num_warps = 4
-        else:
+            tile_per_warp = [1,2]
             block_n = 256
-            num_warps = 4
+            num_warps = 8
+        else:
+            tile_per_warp = [1,2]
+            block_n = 256
+            num_warps = 8
 
     else:
+        tile_per_warp = [2,2]
         block_n =  64
         num_warps = 4
 
@@ -238,11 +248,13 @@ def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
+        "tile_per_warp0" : tile_per_warp[0],
+        "tile_per_warp1" : tile_per_warp[1]
     }
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
-def get_gluon_kernel_config_v1(m, n, k, routing_data):
+def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -251,10 +263,13 @@ def get_gluon_kernel_config_v1(m, n, k, routing_data):
     num_stages = 1
     split_k = 1
     block_k = 256
+    matrix_instr_nonkdim = 32
 
     if block_m == 16:
-        block_n = 128 
+        block_n = 128
         num_warps = 4
+        tile_per_warp = [1,2]
+        matrix_instr_nonkdim = 16
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -267,16 +282,20 @@ def get_gluon_kernel_config_v1(m, n, k, routing_data):
 
     elif block_m == 32:
         if n <= 1024:
+            tile_per_warp = [2,2]
             block_n = 128
             num_warps = 4
         elif n <= 4096:
+            tile_per_warp = [1,2]
             block_n = 256
             num_warps = 4
         else:
+            tile_per_warp = [1,2]
             block_n = 256
-            num_warps = 4
+            num_warps =4
 
     else:
+        tile_per_warp = [2,2]
         block_n =  256
         num_warps = 4
 
@@ -291,70 +310,14 @@ def get_gluon_kernel_config_v1(m, n, k, routing_data):
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
+        "matrix_instr_nonkdim": matrix_instr_nonkdim,
         "kpack": 1,
+        "tile_per_warp0" : tile_per_warp[0],
+        "tile_per_warp1" : tile_per_warp[1]
     }
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
-
-    block_m = routing_data.block_m
-    group_m = 4
-    num_xcds = 8
-    xcd_swizzle = num_xcds
-    w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
-    split_k = 1
-    block_k = 256
-
-    if block_m == 16:
-        block_n = 128 
-        num_warps = 4
-
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
-            block_n = block_n // 2
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-
-    elif block_m == 32:
-        num_stages = 2
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            num_warps = 4
-        else:
-            # block_n=512 here overflows LDS once X, W and the (swizzled) scale
-            # tile are all staged through shared memory; 256 leaves headroom.
-            block_n = 512 
-            num_warps = 4
-
-    else:
-        num_stages = 1
-        block_n =  256
-        num_warps = 4
-
-    ret = {
-        "block_m": block_m,
-        "block_n": block_n,
-        "block_k": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "group_m": group_m,
-        "xcd_swizzle": xcd_swizzle,
-        "w_cache_modifier": w_cache_modifier,
-        "split_k": split_k,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1,
-    }
-    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
-    return ret 
 
 def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
@@ -410,6 +373,7 @@ def moe_gemm_a16w4(
     assert quant_static_scale is None, "quant_static_scale must be none"
 
     # determine shapes
+
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
     block_m = routing_data.block_m
@@ -421,14 +385,14 @@ def moe_gemm_a16w4(
     # compute optimization flags
     if use_gluon:
         mask_k_limit =K % 256
-        #use_v2  = True
-        use_v2  = False 
+        use_v2  = True
+        #use_v2  = False 
         if use_v2 and mask_k_limit == 0 and swizzle_mx_scale is not None:
             #print(f"v2 swizzle kernel")
             config = get_gluon_kernel_config_v2_swizzle(M, N, K, routing_data)       
         else:
           #print(f"v1 kernel")
-          config = get_gluon_kernel_config_v1(M, N, K, routing_data)
+          config = get_gluon_kernel_config_v1_swizzle(M, N, K, routing_data)
     else:
         #print(f"triton kernel")
         config = get_kernel_config(M, N, K, routing_data)
@@ -475,6 +439,7 @@ def moe_gemm_a16w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
 
+    #print(f"M={M}, grid={grid}, grid_m={grid_m}, grid_n={grid_n}")
     # launch kernel
     
     if use_gluon:
@@ -527,6 +492,8 @@ def moe_gemm_a16w4(
               W_CACHE_MODIFIER=config["w_cache_modifier"],
               num_warps=config["num_warps"],
               num_stages=config["num_stages"],
+              TILE_PER_WARP_0=config["tile_per_warp0"],
+              TILE_PER_WARP_1=config["tile_per_warp1"],
               UPCAST_INDICES=should_upcast_indices(x, w, y),
               waves_per_eu=config["waves_per_eu"],
               matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
@@ -535,7 +502,9 @@ def moe_gemm_a16w4(
             )
            
         else:
-            _moe_gemm_a16w4_gluon_gfx950_v1[(grid,)](
+            #print(f"w_shape={w.shape} w_stride()= {w.stride()} {w.is_contiguous()}") 
+            #print(f"w_scales_shape={w_scales.shape} w_scales_stride()= {w_scales.stride()} {w_scales.is_contiguous()}") 
+            _moe_gemm_a16w4_gluon_gfx950_v1_swizzle[(grid,)](
             y,
             y.stride(0),
             y.stride(1),
@@ -583,13 +552,17 @@ def moe_gemm_a16w4(
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
+            TILE_PER_WARP_0=config["tile_per_warp0"],
+            TILE_PER_WARP_1=config["tile_per_warp1"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
         )
    
-    else: 
+    else:
+        #print(f"w_shape={w.shape} w_stride()= {w.stride()} {w.is_contiguous()}") 
+        #print(f"w_scales_shape={w_scales.shape} w_scales_stride()= {w_scales.stride()} {w_scales.is_contiguous()}") 
         _moe_gemm_a16w4_triton[(grid,)](
             y,
             y.stride(0),

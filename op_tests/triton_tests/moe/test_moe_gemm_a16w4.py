@@ -12,6 +12,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
+    swizzle_scales_gfx950
 )
 from aiter.ops.shuffle import shuffle_scale_moe
 
@@ -70,8 +71,8 @@ def init_compute_data(
     torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
-    x = alloc_rand(shape_x, device=device, dtype=act_dtype)
-    w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype)
+    x = alloc_rand(shape_x, device=device, dtype=act_dtype) #row-major
+    w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype) #row-major
     bias = alloc_rand((n_expts_tot, n), device=device, dtype=torch.float32)
     bias = torch.zeros((n_expts_tot, n), device=device,dtype=torch.float32)
     if has_y_gammas:
@@ -271,14 +272,15 @@ def test_op(
     )
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
 
+    print(f"Before downcast w_tri.shape={w_tri.shape} w_tri.stride={w_tri.stride()} {w_tri.is_contiguous}")
     # downcast to mxfp
-    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
+    w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1) #w, w_scale are returned as column-major
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
         swizzle_mx_scale = "CDNA4_SCALE"
         w_scale_tri = shuffle_scale_moe(
             w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        )
+        ) #
     else:
         swizzle_mx_scale = None
 
@@ -322,6 +324,7 @@ def test_op(
         for case in [
             Case(4, 32, 256, 4, 1, hbm_swizzling=True),
             Case(1024, 4096, 4096, 256, 6, hbm_swizzling=True),
+            Case(1, 4096, 256, 1, 1, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
@@ -406,13 +409,21 @@ def test_swizzling(
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
 
     # downcast to mxfp
+    print(f"Before downcast w_tri.shape={w_tri.shape} w_tri.stride={w_tri.stride()} {w_tri.is_contiguous()}")
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    print(f"After downcast w_tri.shape={w_tri.shape} w_tri.stride={w_tri.stride()} {w_tri.is_contiguous()}")
+    print(f"After downcast w_scale_tri.shape={w_scale_tri.shape} w_scale_tri.stride={w_scale_tri.stride()} {w_scale_tri.is_contiguous()}")
+    #print(f"After downcast w_scale_tri={w_scale_tri}")
     if hbm_swizzling:
         swizzle_mx_scale = "CDNA4_SCALE"
+        w_scale_tri_swizzle = swizzle_scales_gfx950(w_scale_tri)
+        print(f"Post swizzle w_scale_tri_swizzle.shape={w_scale_tri_swizzle.shape} w_scale_tri_swizzle.stride={w_scale_tri_swizzle.stride()} {w_scale_tri_swizzle.is_contiguous()}")
         w_scale_tri = shuffle_scale_moe(
             w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
         )
+        print(f"Post swizzle w_scale_tri.shape={w_scale_tri.shape} w_scale_tri.stride={w_scale_tri.stride()} {w_scale_tri.is_contiguous()}")
+        #print(f"Post swizzle w_scale_tri={w_scale_tri}")
     else:
         swizzle_mx_scale = None
 

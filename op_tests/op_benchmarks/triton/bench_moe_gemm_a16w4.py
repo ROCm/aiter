@@ -98,6 +98,9 @@ def compute_roofline(
             f"{intensity_proxy_name}: {val:5d} | "
             f"Total latency (us): {total_latency_us:.2f} | "
             f"Kernel latency (us): {kernel_latency_us:.2f} | "
+            f"FLOPS: {perf["flops"]:.2f} | "
+            f"Bytes: {perf["bytes"]:.2f} | "
+            f"AI: {perf["flops"] / perf["bytes"]:.2f} | "
             f"TFLOPS: {tflops:#.4g} | "
             f"TBPS: {tbps:.2f}"
         )
@@ -183,22 +186,28 @@ def bench_mlp_single_weight_init(
     bg = torch.randn((n_expts_tot,), device=dev)
     b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
     b2 = torch.randn((n_expts_tot, dim1), device=dev)
-
+    #print(f"w1.shape={w1.shape}, w2.shape={w2.shape} ")
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
+    #print(f"After quantize w1.shape={w1.shape}, w2.shape={w2.shape} ")
+    #print(f"After quantize w1_scale.shape={w1_scale.shape}, w2_scale.shape={w2_scale.shape} ")
     w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
     w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
+    #print(f"After swizzle w1_scale.shape={w1_scale.shape}, w2_scale.shape={w2_scale.shape} ")
 
     # -- benchmark --
     x_dtype_torch = torch.bfloat16 if x_dtype == "bf16" else torch.float16
 
     reps = 100
+    #reps = 1
     x = torch.randn((batch, dim1), dtype=x_dtype_torch, device=dev)
     xg = x
+
+    #print(f"x.shape={x.shape}")
 
     # run layer
     fpath = Path(tempfile.mktemp())
@@ -221,6 +230,7 @@ def bench_mlp_single_weight_init(
             apply_swiglu=True,
             backend=backend
         )
+        #print(f"Loop Post First MoE x.shape={x.shape}")
         x = moe_gemm_a16w4(
             x,
             w2,
@@ -233,9 +243,10 @@ def bench_mlp_single_weight_init(
             gather_indx=gather_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             out_dtype=x_dtype_torch,
-            apply_swiglu=True,
+            apply_swiglu=False,
             backend=backend
         )
+        #print(f"Loop Post 2nd MoE x.shape={x.shape}")
 
     proton.finalize()
     return parse_profile(
@@ -295,6 +306,7 @@ def roofline_mlp(
 
     out_csv = out_dir / f"{x_dtype}x-{w_dtype}w-TP{TP}.csv"
 
+    print(f"batch_sizes={batch_sizes}")
     compute_roofline(
         dim1,
         dim2,
@@ -381,6 +393,7 @@ def main(args: list[str] | None = None) -> None:
 
     quantized_dtypes = ["bf16", "mx4"]
 
+    print(f"batch_sizes_moe={batch_sizes_moe}")
     roofline_mlp(
         batch_sizes_moe,
         dim1,
@@ -389,9 +402,11 @@ def main(args: list[str] | None = None) -> None:
         active_experts,
         quantized_dtypes[0],
         quantized_dtypes[1],
-        TP=1,
+        #TP=1,
+        TP=8,
         op_regex=parsed_args.op_regex,
-        name="gpt-oss-x2",
+        #name="gpt-oss-x2",
+        name="DSV4-Flash",
         num_weight_inits=parsed_args.num_weight_inits,
         backend=parsed_args.backend
     )
