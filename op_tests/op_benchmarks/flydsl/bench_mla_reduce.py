@@ -21,6 +21,8 @@ Pass ``--include-hip`` to also benchmark the production HIP kernel
 
 import argparse
 import itertools
+import os
+import sys
 
 import aiter
 import pandas as pd
@@ -33,6 +35,13 @@ from aiter.test_common import (
     run_perftest,
 )
 from aiter.jit.utils.chip_info import get_gfx
+
+# Make the sibling `op_tests/flydsl_mla_reduce_common` module importable when run
+# directly (e.g. `python3 op_tests/op_benchmarks/flydsl/bench_mla_reduce.py`)
+# without PYTHONPATH set to the repo root.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 from op_tests.flydsl_mla_reduce_common import (
     MLA_REDUCE_SUPPORTED_GFX,

@@ -10,12 +10,22 @@ split-KV decode, where every tile can need a different split count and the
 partial buffer is a sparsely-indexed pool.
 """
 
+import os
+import sys
+
 import pytest
 import torch
 
+# Make the sibling `flydsl_mla_reduce_common` module importable regardless of
+# invocation style: CI runs this file as `python3 op_tests/test_flydsl_mla_reduce.py`
+# (no PYTHONPATH), where `op_tests` itself isn't a resolvable package, while
+# `pytest` invocations in this repo don't reliably put this file's own directory
+# on sys.path either. Inserting it explicitly makes both paths work.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from aiter.test_common import checkAllclose
 from aiter.jit.utils.chip_info import get_gfx
-from op_tests.flydsl_mla_reduce_common import (
+from flydsl_mla_reduce_common import (
     MLA_REDUCE_SUPPORTED_GFX,
     build_degenerate_inputs,
     build_inputs,
