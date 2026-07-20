@@ -1218,6 +1218,7 @@ class FmoeTuner(TunerCommon):
         doweight_stage1,
         blockM,
         stage=1,
+        use_real_mxfp8=False,
         device="cuda",
     ):
         _data = FmoeTuner.generate_data(
@@ -1443,6 +1444,17 @@ class FmoeTuner(TunerCommon):
                 a2_scale_mxfp4_sort = torch.ones(
                     [M, scaleN_pad], dtype=dtypes.fp8_e8m0, device=a2_qt.device
                 )
+
+                if use_real_mxfp8:
+                    a2_opus_bytes, a2_opus_scale = torch_dynamic_mxfp8_quant(ref1)
+                    a2_qt = a2_opus_bytes.view(dtypes.fp8)
+                    a2_scale_mxfp4_sort = moe_mxfp4_sort(
+                        a2_opus_scale[: token * topk, :].view(token, topk, -1),
+                        sorted_ids=sorted_ids,
+                        num_valid_ids=num_valid_ids,
+                        token_num=token,
+                        block_size=max(32, blockM),
+                    )
             else:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
@@ -3279,6 +3291,7 @@ class FmoeTuner(TunerCommon):
                     doweight_stage1,
                     blockM,
                     2,
+                    True,
                 )
                 run_args = (run_keys, dtype, topk, kparams, blockM, q_type, act_type)
                 tasks_opus.append(

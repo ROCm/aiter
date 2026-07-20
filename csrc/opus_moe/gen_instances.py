@@ -188,6 +188,7 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
     block_ms = sorted({inst.block_m for inst in a8w4_kernels})
+    sort_block_ms = sorted({inst.sort_block_m for inst in a8w4_kernels})
     block_ns = sorted({inst.block_n for inst in a8w4_kernels})
 
     lines.extend(
@@ -299,6 +300,13 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines.append("    default: return -1;\n    }\n}\n\n")
 
     lines.append(
+        "constexpr int stage2_a8w4_kid_sort_block_m(int kid)\n{\n    switch(kid)\n    {\n"
+    )
+    for inst in a8w4_kernels:
+        lines.append(f"    case {inst.kid}: return {inst.sort_block_m};\n")
+    lines.append("    default: return -1;\n    }\n}\n\n")
+
+    lines.append(
         "constexpr int stage2_a8w4_kid_block_n(int kid)\n{\n    switch(kid)\n    {\n"
     )
     for inst in a8w4_kernels:
@@ -342,7 +350,7 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
         "    switch(block_m)\n"
         "    {\n"
     )
-    for block_m in block_ms:
+    for block_m in sort_block_ms:
         try:
             kid = opus_a8w4_decode_kid(
                 OPUS_A8W4_OUT_MODE_ATOMIC,
