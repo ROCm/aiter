@@ -611,6 +611,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
     }
+    else if((input->dtype() == AITER_DTYPE_bf16 || input->dtype() == AITER_DTYPE_fp16) &&
+            gate->dtype() == AITER_DTYPE_fp4x2) // bf16/fp16 X + MXFP4 weights (in-kernel X quant)
+    {
+        // X stays bf16/fp16; the asm kernel dynamic-quantizes X to MXFP4 internally
+        // (xbf16 path), so no activation scale is consumed. Weights are still fp4
+        // (set_4bit), and we reuse the pertokenMXfp4 config map keyed by out dtype.
+        if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_silu;
+        else if(out->dtype() == AITER_DTYPE_fp16 && act == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else
+            AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
+        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr->set_4bit(true);
+    }
     else if(input->dtype() == AITER_DTYPE_i8 || input->dtype() == AITER_DTYPE_u8) // int8
     {
         if(fc2_smooth_scale)

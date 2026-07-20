@@ -13,52 +13,13 @@ from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight, shuffle_weight_gfx1250
+from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_gemm
 
 DEVICE_ARCH = arch_info.get_arch()
 
 pytestmark = pytest.mark.skipif(
     not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
 )
-
-
-def shuffle_scales(scales: torch.Tensor):
-    scales_shuffled = scales.clone()
-    sm, sn = scales_shuffled.shape
-    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
-    return scales_shuffled
-
-
-def un_shuffle_scales(scales_shuffled: torch.Tensor):
-    scales = scales_shuffled.clone()
-    sm, sn = scales.shape
-    scales = scales.view(sm * 32, sn // 32)
-    sm, sn = scales.shape
-    scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
-    scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
-    scales = scales.view(sm, sn)
-    return scales
-
-
-def shuffle_scales_gfx1250(scales: torch.Tensor):
-    # PRESHUFFLE_FACTOR = 16        rows packed per stripe
-    # SCALE_KWIDTH      = 4         scale-groups contiguous per row
-    # (4 scale-groups × 32 K-per-group = 128 K elems contiguous per row)
-    PRESHUFFLE_FACTOR = 16
-    SCALE_KWIDTH = 4
-    M, K_groups = scales.shape
-
-    out = scales.view(
-        M // PRESHUFFLE_FACTOR,
-        PRESHUFFLE_FACTOR,  # rows  →  (m_tile, lane)
-        K_groups // SCALE_KWIDTH,
-        SCALE_KWIDTH,  # cols  →  (k_tile, kg_in_lane)
-    )
-    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.view(M // PRESHUFFLE_FACTOR, K_groups * PRESHUFFLE_FACTOR)
-    return out
 
 
 # Note this is specified by the HW and cannot be changed.
@@ -118,33 +79,32 @@ def generate_gemm_afp4wfp4_inputs(
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
             if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales)
+                x_scales_shuffled = shuffle_scale_gemm(
+                    x_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
+                )
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales)
+            w_scales_shuffled = shuffle_scale_gemm(
+                w_scales, arch="gfx1250", preshuffle_factor=16, scale_kwidth=4
+            )
         else:
             if M >= 32:
-                x_scales_shuffled = shuffle_scales(x_scales)
+                x_scales_shuffled = shuffle_scale_gemm(
+                    x_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+                )
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales(w_scales)
+            w_scales_shuffled = shuffle_scale_gemm(
+                w_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
     else:
         x_scales_shuffled = x_scales
         w_scales_shuffled = w_scales
 
     if shuffle_weight_fg:
-        if DEVICE_ARCH == "gfx1250":
-            # gfx1250: simple reshape for TDM coalescing (no tile permutation)
-            w_shuffed = shuffle_weight_gfx1250(w)
-        else:
-            use_int4 = False
-            weight_shuffle_layout = (16, 16)
-            w_shuffed = shuffle_weight(
-                w, layout=weight_shuffle_layout, use_int4=use_int4
-            ).reshape(
-                w.shape[0] // weight_shuffle_layout[0],
-                w.shape[1] * weight_shuffle_layout[0],
-            )
+        # shuffle_weight returns the (N, K) shuffled weight on both arches; reshape
+        # to the (N//16, K*16) layout the kernel consumes
+        w_shuffed = shuffle_weight(w).reshape(w.shape[0] // 16, w.shape[1] * 16)
     else:
         w_shuffed = w
 

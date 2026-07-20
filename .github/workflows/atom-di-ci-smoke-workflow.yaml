@@ -1,0 +1,606 @@
+name: ATOM DI CI smoke workflow
+
+on:
+  schedule:
+    - cron: "0 16 * * *"  # 12:00 AM Beijing Time (UTC+8)
+  workflow_dispatch:
+    inputs:
+      atom_ref:
+        description: "ROCm/ATOM ref with ATOMesh Spur support"
+        required: false
+        type: string
+        default: "main"
+      atomesh_image:
+        description: "ATOM image used by the ATOMesh benchmark"
+        required: false
+        type: string
+        default: "rocm/atom-dev:latest"
+      model_path:
+        description: "DeepSeek-V4-Pro model path visible on Spur nodes"
+        required: false
+        type: string
+        default: "/data/models2/DeepSeek-V4-Pro"
+      glm_5_2_fp8_model_path:
+        description: "GLM-5.2-FP8 model path visible on Spur nodes"
+        required: false
+        type: string
+        default: "/data/models2/GLM-5.2-FP8"
+      run_glm_5_2_fp8:
+        description: "Run GLM-5.2-FP8 1P1D TP-only case (needs an image with the aiter MLA-metadata JIT op; crashes otherwise)"
+        required: false
+        default: false
+        type: boolean
+      log_root:
+        description: "Root directory for ATOMesh logs"
+        required: false
+        type: string
+        default: "/data/xinhuang/spur_dsv4_logs"
+      shared_workspace_root:
+        description: "Shared workspace root visible on Spur nodes"
+        required: false
+        type: string
+        default: "/data/xinhuang/atomesh-ci"
+      spur_nodelist:
+        description: "Optional comma-separated Spur nodes; empty lets Spur allocate"
+        required: false
+        type: string
+        default: ""
+      conc_list:
+        description: "Concurrency list for the smoke benchmark"
+        required: false
+        type: string
+        default: "16"
+      eval_conc_list:
+        description: "Concurrency list for GSM8K eval; empty uses benchmark concurrency"
+        required: false
+        type: string
+        default: "16"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ATOM_REF_DEFAULT: 22577adb3ac909c3d0d8fe2209e64afe67b5c7bc
+  ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
+  ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
+  ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
+  ATOMESH_LOG_ROOT_DEFAULT: /data/xinhuang/spur_dsv4_logs
+  ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT: /data/xinhuang/atomesh-ci
+  ATOMESH_2P1D_NODES_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+  ISL_LIST_DEFAULT: "1024"
+  OSL_DEFAULT: "1024"
+  CONC_LIST_DEFAULT: "16"
+  DEEPSEEK_EVAL_CONC_LIST_DEFAULT: "16"
+  GLM_OSL_DEFAULT: "1024"
+  GLM_CONC_LIST_DEFAULT: "16"
+  GLM_EVAL_CONC_LIST_DEFAULT: "16"
+  ATOMESH_SLURM_SUBMIT_RUNNER: aiter-di-ci-spur-login
+  ATOMESH_SLURM_ACCOUNT: ""
+  ATOMESH_SLURM_PARTITION: ""
+  ATOMESH_MODEL_ROOT: /data/models2
+  ATOMESH_1P1D_NODES: ""
+  ATOMESH_PD_RANK_MAPPING_POLICY: idx2idx
+
+jobs:
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      cell_id: ${{ steps.cell.outputs.cell_id }}
+    steps:
+      - name: Apply ATOM DI smoke inputs
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              event = json.load(f)
+
+          inputs = event.get("inputs") or {}
+
+          def value(name: str, default_env: str) -> str:
+              raw = inputs.get(name, "")
+              default = os.environ[default_env]
+              return raw if raw not in ("", None) else default
+
+          def bool_input(name: str, default: bool = False) -> bool:
+              raw = inputs.get(name, "")
+              if raw in ("", None):
+                  return default
+              if isinstance(raw, bool):
+                  return raw
+              return str(raw).lower() == "true"
+
+          # GLM-5.2-FP8 disabled by default: the aiter build baked into
+          # rocm/atom-dev:latest crashes at init with
+          # "NameError: name 'module_mla_metadata' is not defined"
+          # (aiter/jit/core.py check_args, MLA-metadata JIT op) on the
+          # glm_moe_dsa MLA path -- independent of ATOM_REF (main crashes too).
+          # Re-enable once the image ships an aiter with that JIT op registered.
+          run_glm = bool_input("run_glm_5_2_fp8", False)
+
+          print(f"ATOM_REF={value('atom_ref', 'ATOM_REF_DEFAULT')}")
+          print(f"ATOMESH_IMAGE={value('atomesh_image', 'ATOMESH_IMAGE_DEFAULT')}")
+          print(
+              "ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO="
+              + value("model_path", "ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT")
+          )
+          print(
+              "ATOMESH_MODEL_PATH_GLM_5_2_FP8="
+              + value("glm_5_2_fp8_model_path", "ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT")
+          )
+          print(f"RUN_GLM_5_2_FP8={str(run_glm).lower()}")
+          print(f"ATOMESH_LOG_ROOT={value('log_root', 'ATOMESH_LOG_ROOT_DEFAULT')}")
+          print(
+              "ATOMESH_SHARED_WORKSPACE_ROOT="
+              + value("shared_workspace_root", "ATOMESH_SHARED_WORKSPACE_ROOT_DEFAULT")
+          )
+          node_list = value("spur_nodelist", "ATOMESH_2P1D_NODES_DEFAULT")
+          nodes = [node.strip() for node in node_list.split(",") if node.strip()]
+          print(f"ATOMESH_2P1D_NODES={node_list}")
+          print(f"ATOMESH_1P1D_NODES={','.join(nodes[:2])}")
+          print("ISL_LIST=" + os.environ["ISL_LIST_DEFAULT"])
+          print("OSL=" + os.environ["OSL_DEFAULT"])
+          print("CONC_LIST=" + value("conc_list", "CONC_LIST_DEFAULT"))
+          eval_conc = inputs.get("eval_conc_list", "")
+          if eval_conc in ("", None):
+              eval_conc = os.environ["DEEPSEEK_EVAL_CONC_LIST_DEFAULT"]
+          print(f"EVAL_CONC_LIST={eval_conc}")
+          print(f"GLM_OSL={os.environ['GLM_OSL_DEFAULT']}")
+          print(f"GLM_CONC_LIST={os.environ['GLM_CONC_LIST_DEFAULT']}")
+          print(f"GLM_EVAL_CONC_LIST={os.environ['GLM_EVAL_CONC_LIST_DEFAULT']}")
+          PY
+
+      - name: Checkout ATOM source
+        uses: actions/checkout@v4
+        with:
+          repository: ROCm/ATOM
+          ref: main
+          path: ATOM
+
+      - name: Select ATOM ref
+        run: |
+          set -euo pipefail
+          cd ATOM
+          if [[ "${ATOM_REF}" != "main" ]]; then
+            git fetch --depth=1 origin "${ATOM_REF}"
+            git checkout FETCH_HEAD
+          fi
+          git rev-parse HEAD
+
+      - name: Patch ATOMesh smoke config
+        run: |
+          set -euo pipefail
+          cd ATOM
+          python3 - <<'PY'
+          from pathlib import Path
+
+          old = "atomesh-cicd-mi350"
+          new = "aiter-di-ci-spur-login"
+          paths = [
+              Path(".github/scripts/atomesh/pd_matrix.py"),
+              Path(".github/scripts/atomesh/pd_submit.sh"),
+              Path(".github/workflows/atomesh-benchmark.yaml"),
+          ]
+
+          for path in paths:
+              text = path.read_text(encoding="utf-8")
+              count = text.count(old)
+              path.write_text(text.replace(old, new), encoding="utf-8")
+              print(f"{path}: replaced {count} occurrence(s)")
+
+          remaining = []
+          for path in paths:
+              if old in path.read_text(encoding="utf-8"):
+                  remaining.append(str(path))
+
+          if remaining:
+              raise SystemExit(
+                  "Failed to replace all ATOMesh Spur runner labels in: "
+                  + ", ".join(remaining)
+              )
+
+          submit_path = Path(".github/scripts/atomesh/pd_submit.sh")
+          text = submit_path.read_text(encoding="utf-8")
+          nodes_line = "#SBATCH --nodes=${NUM_NODES}\n"
+          ntasks_line = "#SBATCH --ntasks=${NUM_NODES}\n"
+          if ntasks_line not in text:
+              if nodes_line not in text:
+                  raise SystemExit("Failed to find Spur submit SBATCH nodes directive")
+              text = text.replace(nodes_line, nodes_line + ntasks_line, 1)
+              submit_path.write_text(text, encoding="utf-8")
+          print(f"{submit_path}: patched explicit Spur Slurm task count")
+          models_path = Path(".github/benchmark/models_atomesh.yaml")
+          text = models_path.read_text(encoding="utf-8")
+          if "  GLM-5.2-FP8:" not in text:
+              marker = "\n  Kimi-K2.5-MXFP4:"
+              if marker not in text:
+                  raise SystemExit("Could not find insertion point before Kimi-K2.5-MXFP4")
+              fragment = r'''
+            GLM-5.2-FP8:
+              backend: atom
+              model_path: "${ATOMESH_MODEL_ROOT}/GLM-5.2-FP8/"
+              precision: FP8
+              env:
+                common: {}
+                prefill: {}
+                decode: {}
+              server:
+                common_args:
+                  trust_remote_code: true
+                  kv_cache_dtype: fp8
+                  block_size: 16
+                  gpu_memory_utilization: 0.8
+                  max_model_len: 32768
+                  max_num_seqs: 256
+                  max_num_batched_tokens: 32768
+                  extra_args: ""
+              suites:
+                nightly:
+                  - name: glm-5-2-fp8-1p1d-tp8
+                    topology: 1p1d
+                    pd_worker_layout: multi_node
+                    nodes: "${ATOMESH_1P1D_NODES}"
+                    isl: [1024]
+                    osl: 1024
+                    concurrency: [16]
+                    prefill:
+                      workers: 1
+                      tp: 8
+                    decode:
+                      workers: 1
+                      tp: 8
+                    benchmark:
+                      wait_server_timeout: 4200
+                    runner:
+                      time_limit: "08:00:00"
+                    run_eval: true
+                    eval_concurrency: [16]
+
+              accuracy:
+                task: gsm8k
+                fewshot: 3
+                limit: null
+              '''
+              text = text.replace(marker, "\n" + fragment + marker, 1)
+              models_path.write_text(text, encoding="utf-8")
+              print(f"{models_path}: inserted GLM-5.2-FP8 config")
+          else:
+              print(f"{models_path}: GLM-5.2-FP8 already exists")
+
+          PY
+
+      - name: Install matrix dependencies
+        run: python3 -m pip install pyyaml
+
+      - name: Build ATOMesh benchmark cell
+        id: cell
+        run: |
+          set -euo pipefail
+          cd ATOM
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def parse_int_list(value: str):
+              return [int(item) for item in value.replace(",", " ").split() if item]
+
+          def build_matrix(model: str, conc: str, eval_conc: str, output: Path):
+              subprocess.run(
+                  [
+                      "python3",
+                      ".github/scripts/atomesh/pd_matrix.py",
+                      "--suite",
+                      "nightly",
+                      "--model",
+                      model,
+                      "--image",
+                      os.environ["ATOMESH_IMAGE"],
+                      "--benchmark-concurrency",
+                      conc,
+                      "--eval-concurrency",
+                      eval_conc,
+                      "--output",
+                      str(output),
+                  ],
+                  check=True,
+              )
+              return json.loads(output.read_text(encoding="utf-8"))
+
+          requested = [
+              {
+                  "model": "DeepSeek-V4-Pro",
+                  "topology": "1p1d",
+                  "osl": os.environ["OSL"],
+                  "conc": os.environ["CONC_LIST"],
+                  "eval_conc": os.environ["EVAL_CONC_LIST"],
+                  "run_eval": True,
+              }
+          ]
+          if os.environ.get("RUN_GLM_5_2_FP8", "false") == "true":
+              requested.append(
+                  {
+                      "model": "GLM-5.2-FP8",
+                      "topology": "1p1d",
+                      "osl": os.environ["GLM_OSL"],
+                      "conc": os.environ["GLM_CONC_LIST"],
+                      "eval_conc": os.environ["GLM_EVAL_CONC_LIST"],
+                      "run_eval": True,
+                  }
+              )
+
+          node_list = [
+              node.strip()
+              for node in os.environ.get("ATOMESH_2P1D_NODES", "").split(",")
+              if node.strip()
+          ]
+          isl = parse_int_list(os.environ["ISL_LIST"])
+          all_cells = []
+          combined_matrix = {"include": []}
+          cells_dir = Path("../atomesh-cells")
+          cells_dir.mkdir(exist_ok=True)
+
+          for index, cfg in enumerate(requested):
+              matrix_path = Path(f"../atomesh-matrix-{index}.json")
+              matrix = build_matrix(cfg["model"], cfg["conc"], cfg["eval_conc"], matrix_path)
+              combined_matrix["include"].extend(matrix.get("include", []))
+              matches = [
+                  cell
+                  for cell in matrix.get("include", [])
+                  if cell.get("model") == cfg["model"]
+                  and cell.get("topology") == cfg["topology"]
+              ]
+              if not matches:
+                  raise SystemExit(f"No {cfg['model']} {cfg['topology']} cell was generated")
+
+              cell = matches[0]
+              conc = parse_int_list(cfg["conc"])
+              cell["isl"] = isl
+              cell["osl"] = int(cfg["osl"])
+              cell["concurrency"] = conc
+              cell["concurrency_x"] = "x".join(str(value) for value in conc)
+              cell["run_eval"] = bool(cfg["run_eval"])
+              cell["accuracy"]["concurrency"] = parse_int_list(cfg["eval_conc"])
+              cell["runner"]["slurm_submit_runner"] = "aiter-di-ci-spur-login"
+              cell["runner"]["slurm_account"] = ""
+              cell["runner"]["slurm_partition"] = ""
+              cell["runner"]["log_root"] = os.environ["ATOMESH_LOG_ROOT"]
+              if cfg["model"] == "DeepSeek-V4-Pro":
+                  for role in ("prefill", "decode"):
+                      service_role = cell.setdefault("service", {}).setdefault(role, {})
+                      extra_args = service_role.get("extra_args", "")
+                      service_role["extra_args"] = " ".join(
+                          arg for arg in extra_args.split() if arg != "--enable-tbo"
+                      )
+
+              required_nodes = int(cell["num_nodes"])
+              if node_list:
+                  if len(node_list) < required_nodes:
+                      raise SystemExit(
+                          f"Need {required_nodes} nodes, got {len(node_list)}: {node_list}"
+                      )
+                  cell["nodes"] = node_list[:required_nodes]
+
+              cell_env = cell.setdefault("env", {})
+              for scope in ("common", "prefill", "decode"):
+                  scope_env = cell_env.setdefault(scope, {})
+                  scope_env["ATOM_PD_RANK_MAPPING_POLICY"] = "idx2idx"
+                  # Pin Mooncake KV-transfer RoCE to the RoCE v2 IPv4 GID (index 1)
+                  # and the same lossless traffic class NCCL uses (NCCL_IB_TC=104).
+                  # The Mooncake engine reads MC_GID_INDEX / MC_IB_TC; without them it
+                  # falls back to a link-local GID (cross-node QP handshake times out,
+                  # "modify QP to RTR ... check gid") and traffic class 0 (the
+                  # PFC-congested class, so bulk KV writes stall and hit the 30s
+                  # transfer timeout). ATOM sets neither today.
+                  scope_env["MC_GID_INDEX"] = "1"
+                  scope_env["MC_IB_TC"] = "104"
+
+              cell_path = cells_dir / f"{cell['id']}.json"
+              cell_path.write_text(json.dumps(cell, indent=2), encoding="utf-8")
+              all_cells.append(cell)
+              print(json.dumps(cell, indent=2))
+
+          Path("../atomesh-cell.json").write_text(
+              json.dumps(all_cells[0], indent=2),
+              encoding="utf-8",
+          )
+          Path("../atomesh-cells.json").write_text(
+              json.dumps(all_cells, indent=2),
+              encoding="utf-8",
+          )
+          Path("../atomesh-matrix.json").write_text(
+              json.dumps(combined_matrix, indent=2),
+              encoding="utf-8",
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("cell_id=" + ",".join(cell["id"] for cell in all_cells) + "\n")
+          PY
+      - name: Package patched ATOM source
+        run: tar -C ATOM -czf atom-source.tar.gz .
+
+      - name: Upload ATOMesh smoke config
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-di-ci-smoke-config
+          path: |
+            atomesh-cell.json
+            atomesh-cells.json
+            atomesh-cells/
+            atomesh-matrix.json
+            atom-source.tar.gz
+
+  atom-di-ci-smoke:
+    needs: [load-config]
+    runs-on: [self-hosted, aiter-di-ci-spur-login]
+    timeout-minutes: 420
+    env:
+      ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
+    steps:
+      - name: Show runner and Spur-compatible Slurm state
+        run: |
+          set -euo pipefail
+          hostname
+          whoami
+          pwd
+          command -v sbatch
+          sbatch --help | head -80 || true
+          command -v squeue
+          squeue --help | head -80 || true
+          command -v scancel
+          command -v spur && spur --help | head -120 || true
+
+      - name: Clean stale ATOMesh config from prior runs
+        run: |
+          set -euo pipefail
+          # Self-hosted runner reuses the workspace; download-artifact only adds
+          # files, so stale per-cell JSONs from a previous run (e.g. a 2p1d_dpa
+          # cell) linger in atomesh-cells/ and get picked up by the benchmark
+          # loop. Clear them so only the freshly-downloaded config runs.
+          rm -rf atomesh-cells atomesh-cells.json atomesh-cell.json \
+                 atomesh-matrix.json atomesh-matrix-*.json
+
+      - name: Download ATOMesh smoke config
+        uses: actions/download-artifact@v4
+        with:
+          name: atom-di-ci-smoke-config
+
+      - name: Unpack patched ATOM source
+        run: |
+          set -euo pipefail
+          rm -rf ATOM
+          mkdir -p ATOM
+          tar -C ATOM -xzf atom-source.tar.gz
+
+      - name: Run ATOMesh benchmark cell
+        run: |
+          set -euo pipefail
+          original_workspace="${GITHUB_WORKSPACE}"
+          result_dir="${original_workspace}/atomesh-results"
+          rm -rf "${result_dir}"
+          mkdir -p "${result_dir}"
+
+          cancel_helper=""
+          cancel_slurm_from_wrapper() {
+            local rc=$?
+            if [[ "${rc}" -ne 0 && -n "${cancel_helper}" && -x "${cancel_helper}" ]]; then
+              echo "=== cancelling ATOMesh job from workflow wrapper rc=${rc} ==="
+              bash "${cancel_helper}" || true
+            fi
+            exit "${rc}"
+          }
+          trap cancel_slurm_from_wrapper EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          # The self-hosted runner can retain Spur per-rank variables. Slurm
+          # inherits the environment by default, and those variables make the
+          # ATOMesh Slurm script take its single-rank Spur path.
+          unset SPUR_TASK_OFFSET SPUR_PEER_NODES SPUR_NODELIST
+
+          mapfile -t cell_files < <(find "${original_workspace}/atomesh-cells" -maxdepth 1 -name '*.json' | sort)
+          if [[ "${#cell_files[@]}" -eq 0 ]]; then
+            cell_files=("${original_workspace}/atomesh-cell.json")
+          fi
+
+          for cell_json in "${cell_files[@]}"; do
+            cell_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${cell_json}")"
+            shared_workspace="${ATOMESH_SHARED_WORKSPACE_ROOT%/}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${cell_id}"
+            rm -rf "${shared_workspace}"
+            mkdir -p "${shared_workspace}"
+
+            tar -C "${original_workspace}/ATOM" -cf - . | tar \
+              --no-same-owner \
+              --no-same-permissions \
+              -C "${shared_workspace}" \
+              -xf -
+
+            cd "${shared_workspace}"
+            chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+            # Spur sacct compatibility: ATOM pd_submit.sh reads the Slurm exit
+            # code with flags Spur's sacct rejects (--accounting on the primary
+            # branch, -X/-P on the fallback) and without --controller, so the
+            # query returns empty and the job RC defaults to 1 -- marking runs
+            # that actually succeeded (gsm8k + benchmark) as failed. The "Patch
+            # ATOMesh smoke config" step rewrites the runner label so the FIRST
+            # (--accounting) branch is the one that runs here. Rewrite both
+            # branches to a Spur-compatible query: --controller + -j/-n/-o,
+            # awk-filtered by JobID to State|ExitCode.
+            patched=0
+            if grep -q -- '--accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader' .github/scripts/atomesh/pd_submit.sh; then
+              sed -i "s@sacct --accounting \"\${SPUR_ACCOUNTING_ADDR}\" --brief --noheader@sacct --controller \"\${SPUR_CONTROLLER_ADDR}\" -j \"\${job_id}\" -n -o JobID,State,ExitCode@" .github/scripts/atomesh/pd_submit.sh
+              patched=1
+            fi
+            if grep -q -- '-X -n -P -o State,ExitCode' .github/scripts/atomesh/pd_submit.sh; then
+              sed -i "/-X -n -P -o State,ExitCode/c\\sacct_line=\"\$(sacct --controller \"\${SPUR_CONTROLLER_ADDR}\" -j \"\${job_id}\" -n -o JobID,State,ExitCode 2>/dev/null | awk -v job_id=\"\${job_id}\" '\$1==job_id { print \$2 \"|\" \$3; exit }' || true)\"" .github/scripts/atomesh/pd_submit.sh
+              patched=1
+            fi
+            if [ "$patched" = 1 ]; then
+              echo "[patch] pd_submit.sh sacct exit-code read made Spur-compatible"
+            else
+              echo "[patch] WARNING: no sacct anchor found in pd_submit.sh (ATOM_REF changed?); exit-code may be misread" >&2
+            fi
+            cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
+            rm -rf "${result_dir}/${cell_id}" \
+                   "${result_dir}/${cell_id}-summary.md" \
+                   "${result_dir}/${cell_id}-benchmark-action.json" \
+                   "${result_dir}/${cell_id}.slurm-job-id" \
+                   "${result_dir}/${cell_id}.slurm-cancel.sh"
+
+            bash .github/scripts/atomesh/pd_submit.sh \
+              --cell-json "$(cat "${cell_json}")" \
+              --result-dir "${result_dir}"
+          done
+      - name: Summarize ATOMesh smoke result
+        if: always()
+        run: |
+          set -euo pipefail
+          cd ATOM
+          mkdir -p ../atomesh-results
+          if [ -f ../atomesh-cells.json ]; then
+            mapfile -t cell_ids < <(python3 - <<'PY'
+          import json
+          for cell in json.load(open("../atomesh-cells.json")):
+              print(cell["id"])
+          PY
+            )
+          elif [ -f ../atomesh-cell.json ]; then
+            mapfile -t cell_ids < <(python3 -c 'import json; print(json.load(open("../atomesh-cell.json"))["id"])')
+          else
+            cell_ids=()
+          fi
+
+          for cell_id in "${cell_ids[@]}"; do
+            summary="../atomesh-results/${cell_id}-summary.md"
+            output="../atomesh-results/${cell_id}-benchmark-action.json"
+            python3 .github/scripts/atomesh/process_result.py \
+              "../atomesh-results/${cell_id}" \
+              --output "${output}" \
+              --summary "${summary}" \
+              --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+            if [ -f "${summary}" ]; then
+              cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+              cat "${summary}"
+            fi
+          done
+      - name: Upload ATOMesh smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-di-ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            atomesh-cell.json
+            atomesh-cells.json
+            atomesh-cells/
+            atomesh-matrix.json
+            atomesh-results/
