@@ -148,6 +148,20 @@ def compile_mxscale_gemm(
     stage1_quant_out: str | None = None,
     stage1_quant_wmma_rep: int = 1,
     kernel_tag: str = "gemm",
+    # EP gemm2-fused scatter: when True the epilogue does NOT write arg_c; instead
+    # each output tile row (= grouped_row) is P2P-written (pre-multiplied by its
+    # route weight) into a peer's cco symmetric comb_inp[origin_lid*topk + k]. The
+    # per-row (origin_pe, slot) + f32 weight map is a single (cap_rows, 2) i32
+    # tensor [dst_packed, f32_weight_bits] passed at runtime through the otherwise-
+    # unused arg_m_tile_prefix slot (contiguous/masked-dense do not read it; only
+    # the persistent scheduler does, hence ep_p2p_write forbids persistent).
+    # off/wire/slot_stride/arena_handle are compile-time constants (the dispatch
+    # op's arena is stable for the kernel's lifetime).
+    ep_p2p_write: bool = False,
+    ep_off_comb_inp: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_slot_stride: int = 0,
+    ep_arena_handle: int = 0,
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
 
@@ -176,6 +190,23 @@ def compile_mxscale_gemm(
             f"out_dtype must be 'f32', 'bf16', or 'f16', got {out_dtype!r}"
         )
     elem_bytes_d = 2 if out_dtype in ("bf16", "f16") else 4
+
+    ep_p2p_write = bool(ep_p2p_write)
+    if ep_p2p_write:
+        # The fused P2P scatter epilogue is a per-row buffer_store into peers'
+        # symmetric memory; it cannot ride the contiguous 2D TDM tensor-store, so
+        # force the per-address buffer-store epilogue path.
+        use_tdm_store = False
+        if out_dtype not in ("bf16", "f16"):
+            raise ValueError("ep_p2p_write requires a bf16/f16 output dtype")
+        if split_k != 1:
+            raise ValueError("ep_p2p_write requires split_k == 1")
+        if epilogue_bias:
+            raise ValueError("ep_p2p_write is not supported together with bias")
+        if grouped_persistent_m:
+            # The persistent scheduler consumes arg_m_tile_prefix (the slot the
+            # fused row->dest/weight map is smuggled through), so it is unavailable.
+            raise ValueError("ep_p2p_write requires the non-persistent scheduler")
 
     if num_buffers not in (2, 3, 4):
         raise ValueError(f"num_buffers must be 2, 3, or 4, got {num_buffers}")
@@ -712,6 +743,7 @@ def compile_mxscale_gemm(
         f"_masked{int(grouped_masked_m)}"
         f"_pers{int(grouped_persistent_m)}"
         f"_contig{int(grouped_contiguous_m)}"
+        f"_ep{int(ep_p2p_write)}"
         f"{_quant_tag}"
     ).replace("-", "_")
 
@@ -1825,6 +1857,92 @@ def compile_mxscale_gemm(
                 return biased
 
             def epilogue_stores(final_accs, addrs):
+                if const_expr(ep_p2p_write):
+                    # gemm2-fused EP scatter: no local arg_c store. Each output tile
+                    # row is grouped_row = flat_m_base + warp_m_base + m_off + lane16
+                    # -- the flat gemm output row, which equals topids_to_rows[t,k]
+                    # in BOTH the masked (batch*max_m+local) and contiguous
+                    # (layout_row) layouts. The per-row map is a (cap_rows, 2) i32
+                    # tensor in arg_m_tile_prefix: col0 = origin_pe*slot_stride +
+                    # (origin_lid*topk + k) (sentinel <0 -> skip), col1 = the f32
+                    # route weight bits (loaded directly as f32, same 4B stride).
+                    # The weight is applied here (combine does an unweighted topk
+                    # sum). The lane's 8-wide bf16 column slice is P2P-stored into
+                    # the origin peer's comb_inp slot; a release fence publishes it
+                    # before the combine kernel's cross-device acquire barrier.
+                    import mori.cco.device.flydsl as _cco
+                    from aiter.ops.flydsl.dispatch_combine_v2 import (
+                        flydsl_prims as _P,
+                    )
+
+                    _win = _cco.Window(fx.Int64(ep_arena_handle))
+                    _map_rsrc = buffer_ops.create_buffer_resource(
+                        arg_m_tile_prefix, max_size=True
+                    )
+                    for acc_idx, vec_base, m_off, wn in _sub_tiles:
+                        sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
+                        grouped_row = (
+                            flat_m_base + warp_m_base + arith.index(m_off) + lane16
+                        )
+                        _map_base = grouped_row * arith.index(2)
+                        _dst_idx = arith.index_cast(T.i32, _map_base)
+                        _w_idx = arith.index_cast(
+                            T.i32, _map_base + arith.index(1)
+                        )
+                        row_local = (
+                            blk_m + warp_m_base + arith.index(m_off) + lane16
+                        )
+                        row_valid = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            arith.index_cast(T.i32, row_local),
+                            valid_m_i32,
+                        )
+                        dst_packed = buffer_ops.buffer_load(
+                            _map_rsrc, _dst_idx, vec_width=1, dtype=T.i32,
+                        )
+                        dst_valid = arith.cmpi(
+                            arith.CmpIPredicate.sge,
+                            dst_packed,
+                            arith.constant(0, type=T.i32),
+                        )
+                        store_valid = arith.andi(
+                            arith.andi(tile_valid, row_valid), dst_valid
+                        )
+                        w = buffer_ops.buffer_load(
+                            _map_rsrc, _w_idx, vec_width=1, dtype=T.f32,
+                        )
+                        w_vec8 = vector.from_elements(
+                            T.vec(8, T.f32),
+                            [w for _ in range_constexpr(8)],
+                        )
+                        weighted = sub8 * w_vec8
+                        h_vec = arith.trunc_f(T.vec(8, _out_elem_local), weighted)
+                        i32x4 = vector.bitcast(T.vec(4, T.i32), h_vec)
+                        origin_pe = dst_packed // ep_slot_stride
+                        slot = dst_packed % ep_slot_stride
+                        col_base = (
+                            blk_n
+                            + warp_n_base
+                            + arith.index(wn * WMMA_N)
+                            + lane_kgrp * arith.index(8)
+                        )
+                        remote = (
+                            fx.Int64(_win.lsa_ptr(origin_pe, ep_off_comb_inp))
+                            + fx.Int64(slot) * fx.Int64(ep_wire_nbytes)
+                            + fx.Int64(arith.index_cast(T.i64, col_base))
+                            * fx.Int64(elem_bytes_d)
+                        )
+                        store_if = scf.IfOp(
+                            store_valid, results_=[], has_else=False
+                        )
+                        with ir.InsertionPoint(store_if.then_block):
+                            _dst_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                                remote
+                            )
+                            buffer_ops.buffer_store(i32x4, _dst_rsrc, 0)
+                            scf.YieldOp([])
+                    _P.fence_system_release()
+                    return
                 addr_idx = 0
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
                     sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
@@ -3837,6 +3955,11 @@ def compile_mxscale_gemm(
         int(stage1_quant_wmma_rep),
         kernel_tag_mode,
         tdm_store_descriptor_version,
+        ep_p2p_write,
+        ep_off_comb_inp,
+        ep_wire_nbytes,
+        ep_slot_stride,
+        ep_arena_handle,
     )
 
     @flyc.jit

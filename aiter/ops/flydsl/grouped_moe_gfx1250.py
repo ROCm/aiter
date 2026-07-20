@@ -546,6 +546,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     gate_mode: GateMode = GateMode.SEPARATED,
     swiglu_limit: Optional[float] = None,
     num_local_tokens: Optional[torch.Tensor] = None,
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: Optional[torch.Tensor] = None,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -881,6 +889,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if _grouped_persistent_req:
         grouped_contiguous_m = False
         _grouped_dbg("persistent grouped GEMM requested; contiguous disabled")
+    if ep_scatter:
+        # gemm2-fused EP scatter rides the gemm2 epilogue's per-row P2P store,
+        # whose row->dest/weight map is smuggled through the (free) m_tile_prefix
+        # arg slot. The persistent scheduler consumes that slot, so force it off.
+        # Both the contiguous and dense-masked schedulers are supported: row2dst is
+        # indexed by the flat gemm output row, which equals topids_to_rows[t,k] in
+        # either layout (contiguous rows after contiguous_psum_remap, else
+        # batch*max_m+local).
+        if not _is_ep:
+            raise ValueError("ep_scatter requires an EP config (expert_mask set)")
+        _grouped_persistent_req = False
+        _grouped_dbg("ep_scatter on; force non-persistent scheduler")
 
     n_route_buckets = E
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
@@ -1400,6 +1420,81 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_out = torch.empty(
         (route_E, route_max_m, model_dim), dtype=dtype, device=device
     )
+    # ── EP gemm2-fused scatter: build the per-flat-row dest/weight map the gemm2
+    # P2P epilogue consumes. row = topids_to_rows[t,k] is the flat gemm output row
+    # in the ACTIVE layout (contiguous rows after contiguous_psum_remap, else
+    # batch*max_m+local). Only VALID routes (expert local to this rank AND
+    # recv_slot < total_recv) are scattered; each such row is unique, so no index
+    # collisions. Remote experts are owned by another rank (sentinel -1 -> epilogue
+    # skip). Invalid entries dump into a trash slot so the scatter stays
+    # capture-safe (no boolean-mask host sync). dst_packed and the f32 route weight
+    # are packed into one (cap_rows, 2) i32 tensor so a single free m_tile_prefix
+    # slot carries both (contiguous keeps psum in m_tile_map).
+    ep_rowmap = None
+    if ep_scatter:
+        if _use_naive:
+            raise NotImplementedError("ep_scatter is not supported on the naive path")
+        if data_format == "fp4":
+            raise NotImplementedError("ep_scatter (gemm2-fused) is a8w4-only for now")
+        if split_k2 != 1:
+            raise ValueError("ep_scatter requires stage2 split_k == 1")
+        if ep_tis is None:
+            raise ValueError("ep_scatter requires ep_tis (recv_to_src_token)")
+        if _g2l_lut is None:
+            raise ValueError(
+                "ep_scatter requires the split route-g2l path (_g2l_lut built); "
+                "unset AITER_FLYDSL_FUSED_ROUTE_G2L"
+            )
+        _cap_rows = int(route_E) * int(route_max_m)
+        _slot_stride = int(ep_max_tok) * int(ep_topk)
+        _g2l_full = _g2l_lut[topk_ids.reshape(-1).long()].view(token_num, topk)
+        _ep_drop_k = _g2l_full >= n_route_buckets
+        _rs = torch.arange(token_num, device=device, dtype=torch.int32).view(
+            token_num, 1
+        )
+        _kk = torch.arange(topk, device=device, dtype=torch.int32).view(1, topk)
+        _origin_enc = ep_tis[:token_num].view(token_num, 1).to(torch.int32)
+        _origin_pe = _origin_enc // int(ep_max_tok)
+        _origin_lid = _origin_enc % int(ep_max_tok)
+        _slot = _origin_lid * int(topk) + _kk
+        _packed = (_origin_pe * _slot_stride + _slot).to(torch.int32)
+        _valid = (~_ep_drop_k) & (_rs < _ep_nvt.view(1, 1))
+        _gr = topids_to_rows.view(token_num, topk).long()
+        _gr_idx = torch.where(
+            _valid, _gr, torch.full_like(_gr, _cap_rows)
+        ).view(-1)
+        _w = (
+            _gather_w_buf.view(token_num, topk).float()
+            if _gather_w_buf is not None
+            else gather_weight.view(token_num, topk).float()
+        )
+        _row2dst_full = torch.full(
+            (_cap_rows + 1,), -1, dtype=torch.int32, device=device
+        )
+        _row2w_full = torch.zeros(
+            (_cap_rows + 1,), dtype=torch.float32, device=device
+        )
+        _row2dst_full[_gr_idx] = _packed.view(-1)
+        _row2w_full[_gr_idx] = _w.view(-1)
+        ep_rowmap = torch.stack(
+            [
+                _row2dst_full[:_cap_rows],
+                _row2w_full[:_cap_rows].view(torch.int32),
+            ],
+            dim=1,
+        ).contiguous()
+    _ep_stage2_kwargs = (
+        dict(
+            ep_p2p_write=True,
+            ep_off_comb_inp=int(ep_comb_inp_off),
+            ep_wire_nbytes=int(ep_wire_nbytes),
+            ep_slot_stride=int(ep_max_tok) * int(ep_topk),
+            ep_arena_handle=int(ep_arena_handle),
+        )
+        if ep_scatter
+        else {}
+    )
+    _ep_launch_kwargs = dict(ep_rowmap=ep_rowmap) if ep_scatter else {}
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
@@ -1455,6 +1550,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         persistent_stride=_persistent_stride,
         wave_specialized_tdm=((m_warp * n_warp) == 4 and wave_specialized_tdm_req),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
+        **_ep_stage2_kwargs,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
@@ -1479,6 +1575,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
+        **_ep_launch_kwargs,
     )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
@@ -1500,6 +1597,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                     _m_tile_prefix=m_tile_prefix,
                     _m_tile_map=m_tile_map,
                     bias=_bias2_arg,
+                    **_ep_launch_kwargs,
                 ),
             )
         )
@@ -1528,6 +1626,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+    if ep_scatter:
+        # gemm2 already P2P-wrote each (token,k) result (pre-multiplied by its route
+        # weight) into peers' comb_inp; the gather-reduce is replaced by the fused
+        # combine kernel. Return a shape-only placeholder (the caller's combine()
+        # ignores this and reads comb_inp).
+        _grouped_dbg("ep_scatter on; skip gather-reduce (fused combine reads comb_inp)")
+        return moe_out
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
         _grouped_dbg("start gather-reduce output")
         # Feed route weights to the epilogue in their native dtype: the kernel
