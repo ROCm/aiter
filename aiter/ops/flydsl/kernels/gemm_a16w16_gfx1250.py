@@ -33,6 +33,8 @@ LDS_PAD_B = 8
 
 _STAGE_NAMES = ("ping", "pong", "pang", "pung")
 
+_SCHED_ALLOW_SALU = 1 << 2
+
 
 def _disable_unroll_on_enclosing_loop():
     """Tag the enclosing scf.for with llvm.loop metadata so it stays rolled at ASM level."""
@@ -116,12 +118,25 @@ def compile_gemm_a16w16(
     sched_strategy: Optional[str] = None,
     barrier_signal_wait_latency: Optional[int] = None,
     main_loop_unroll: bool = False,
+    variant: str = "bandwidth_bound",
 ):
-    """Compile the A16W16 GEMM kernel; returns launch_fn(y, x, w, bias, M, N, stream=stream)."""
+    """Compile the A16W16 GEMM kernel; returns launch_fn(y, x, w, bias, M, N, stream=stream).
+
+    variant:
+        "bandwidth_bound" (default) — steady-state loads the whole next fragment
+            bank up front, then runs all WMMAs (burst load, ~2 banks live).
+        "compute_bound" — in-place fragment rotation: each fragment's next-tile
+            ds_load is hoisted to right after its last WMMA use so the load
+            co-executes with the remaining WMMAs (~1 bank live + trickle).
+    """
     _ = (M, N)
 
     if not (2 <= num_buffers <= 8):
         raise ValueError(f"num_buffers must be between 2 and 8, got {num_buffers}")
+    if variant not in ("bandwidth_bound", "compute_bound"):
+        raise ValueError(
+            "variant must be 'bandwidth_bound' or 'compute_bound', " f"got {variant!r}"
+        )
     if in_dtype not in ("fp16", "bf16"):
         raise ValueError(f"in_dtype must be 'fp16' or 'bf16', got {in_dtype!r}")
     # Experimental LLVM scheduling levers (injected via llvm_options below).
@@ -601,6 +616,53 @@ def compile_gemm_a16w16(
                         ).result
             return current_accs
 
+        def _load_one_a_frag(buf_i32, ks, wm):
+            """ds_load a single A fragment (ks, wm) from LDS ring slot buf_i32 (i32 SSA)."""
+            slot_off_a = arith.index_cast(
+                T.index, arith.muli(buf_i32, slot_stride_a_elems_i32)
+            )
+            return _load_a_frag(big_a_mem, a_lane_bases[wm] + slot_off_a, ks)
+
+        def _load_one_b_frag(buf_i32, ks, wn):
+            """ds_load a single B fragment (ks, wn) from LDS ring slot buf_i32 (i32 SSA)."""
+            slot_off_b = arith.index_cast(
+                T.index, arith.muli(buf_i32, slot_stride_b_elems_i32)
+            )
+            return _load_b_frag(big_b_mem, b_lane_bases[wn] + slot_off_b, ks)
+
+        def _wmma_rotate(accs_in, a_frags, b_frags, next_buf_i32):
+            """compute_bound steady-state: run this tile's WMMAs, and the instant a
+            fragment reaches its last use, issue its next-tile ds_load so the load
+            co-executes with the remaining WMMAs. Returns (accs, next_a, next_b) where
+            next_* are the freshly rotated-in fragments for the next K-tile."""
+            current_accs = list(accs_in)
+            next_a = [None] * N_A_FRAGS
+            next_b = [None] * N_B_FRAGS
+            for ks in range_constexpr(k_wmma_steps):
+                for wm in range_constexpr(wmma_m_rep):
+                    a_f = a_frags[ks * wmma_m_rep + wm]
+                    for wn in range_constexpr(wmma_n_rep):
+                        idx = wm * wmma_n_rep + wn
+                        current_accs[idx] = wmma_op(
+                            T.vec(8, T.f32),
+                            b_frags[ks * wmma_n_rep + wn],
+                            a_f,
+                            current_accs[idx],
+                            modC=0,
+                            reuseA=False,
+                            reuseB=(wn > 0),
+                        ).result
+                    rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+                    next_a[ks * wmma_m_rep + wm] = _load_one_a_frag(
+                        next_buf_i32, ks, wm
+                    )
+                rocdl.sched_barrier(_SCHED_ALLOW_SALU)
+                for wn in range_constexpr(wmma_n_rep):
+                    next_b[ks * wmma_n_rep + wn] = _load_one_b_frag(
+                        next_buf_i32, ks, wn
+                    )
+            return current_accs, next_a, next_b
+
         _half_out = out_dtype in ("f16", "bf16")
         _out_elem = (
             T.f16 if out_dtype == "f16" else (T.bf16 if out_dtype == "bf16" else None)
@@ -823,7 +885,48 @@ def compile_gemm_a16w16(
                 nbank = None
             return accs_, nbank, lo_a_, lo_w_
 
-        if const_expr(main_loop_iters > 0):
+        if const_expr(variant == "compute_bound"):
+            if const_expr(main_loop_iters > 0):
+                init_state = _pack_state(accs, cur_a, cur_b) + [
+                    lo_a,
+                    lo_w,
+                    load_idx_init,
+                    compute_idx_init,
+                ]
+                results = init_state
+                for step, state in range(0, main_loop_iters, 1, init=init_state):
+                    _disable_unroll_on_enclosing_loop()
+                    cidx = state[-1]
+                    lidx = state[-2]
+                    lw = state[-3]
+                    lx = state[-4]
+                    p_accs, ca, cb = _unpack_state(state[:-4])
+
+                    load_buf_i32 = arith.remui(lidx, nb_const_i32)
+                    lx, lw = issue_tdm_loads(load_buf_i32, lx, lw)
+                    if const_expr(num_buffers == 2):
+                        tdm_ops.tensor_wait(0)
+                    else:
+                        tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
+                    _wg_barrier()
+
+                    next_buf_i32 = arith.remui(arith.addi(cidx, one_i32), nb_const_i32)
+                    p_accs, next_a, next_b = _wmma_rotate(p_accs, ca, cb, next_buf_i32)
+                    cidx1 = arith.addi(cidx, one_i32)
+                    lidx1 = arith.addi(lidx, one_i32)
+
+                    new_state = _pack_state(p_accs, next_a, next_b) + [
+                        lx,
+                        lw,
+                        lidx1,
+                        cidx1,
+                    ]
+                    results = yield new_state
+
+                accs, cur_a, cur_b = _unpack_state(results[:-4])
+            else:
+                accs = list(accs)
+        elif const_expr(main_loop_iters > 0):
             if const_expr(main_loop_unroll):
                 # Unroll-by-2: 2 tiles/trip, ping-pong 2 register banks + odd leftover.
                 lo_a_s = lo_a
@@ -992,6 +1095,7 @@ def compile_gemm_a16w16(
         sched_strategy,
         barrier_signal_wait_latency,
         main_loop_unroll,
+        variant,
     )
 
     @flyc.jit
@@ -1112,6 +1216,7 @@ def gemm_a16w16(
     sched_strategy: Optional[str] = None,
     barrier_signal_wait_latency: Optional[int] = None,
     main_loop_unroll: bool = False,
+    variant: str = "bandwidth_bound",
 ):
     """Compute Y = X @ W^T + bias. Auto-detects physical layout from strides."""
     assert x.dtype in (
@@ -1220,6 +1325,7 @@ def gemm_a16w16(
         sched_strategy=sched_strategy,
         barrier_signal_wait_latency=barrier_signal_wait_latency,
         main_loop_unroll=main_loop_unroll,
+        variant=variant,
     )
 
     launch_fn(y_buf, x, w, bias, M, N_stride, stream=torch.cuda.current_stream())

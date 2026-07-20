@@ -111,6 +111,20 @@ def test_gemm_a16_w16(M, N, K):
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("num_buffers", [2, 3])
+def test_gemm_a16_w16_compute_bound(M, N, K, num_buffers):
+    torch.cuda.empty_cache()
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+
+    torch_out = F.linear(x, w, bias=None)
+    kernel_out = gemm_a16w16(
+        x, w, dtype=torch.bfloat16, num_buffers=num_buffers, variant="compute_bound"
+    )
+
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu", "silu_exp2"])
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
