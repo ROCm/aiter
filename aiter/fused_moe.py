@@ -716,7 +716,13 @@ def fused_moe_(
                 "(expert_mask is dropped by the output_aux sort path)."
             )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
-        _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
+        # Path B: kernelName2 may be a flydsl_moe2_layout v2 gemm2 name.
+        _v2_kn2 = parse_flydsl_v2_gemm2_kernel(_kn2)
+        _atomic = (
+            _v2_kn2["epilog"] == "atomic"
+            if _v2_kn2 is not None
+            else _parse_mxfp4_g2_kname(_kn2)["atomic"]
+        )
         (
             sorted_ids,
             sorted_weights,
@@ -1419,6 +1425,31 @@ def _mxfp4_a4w4_stage2(
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
+    # Path B: mxmoe sort+gemm1 (native-BM) intermediate consumed by the
+    # flydsl_moe2_layout gemm2 (gemm2_body_v2) at SBM=BM. Selected purely by
+    # kernelName2 being a flydsl_moe2_layout name (verified correct for
+    # BM in {16,32,64,128} x epilog {atomic,reduce}). The mxmoe intermediate
+    # (inter_sorted_quant + inter_sorted_shuffled_scale) is byte-compatible with
+    # gemm2_body_v2's native-BM scale-chunk layout.
+    if parse_flydsl_v2_gemm2_kernel(kernelName2) is not None:
+        return _flydsl_v2_stage2_wrapper(
+            inter_states=inter_sorted_quant,
+            w1=None,
+            w2=w2,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=cumsum_tensor,
+            out=out_dst,
+            topk=topk,
+            kernelName=kernelName2,
+            model_dim=D_HIDDEN,
+            inter_dim=D_INTER,
+            num_experts=NE,
+            w2_scale=w2_scale,
+            a2_scale=inter_sorted_shuffled_scale,
+            sorted_weights=sorted_weights,
+            block_m=BM,
+        )
     _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
     if atomic:
         out_buf = out_dst
@@ -1617,10 +1648,22 @@ def _mxfp4_a4w4_stage2_fw(
 ):
 
     device = inter_states.device
-    p2 = _parse_mxfp4_g2_kname(kernelName2)
-    BM = p2["BM"]
-    atomic = p2["atomic"]
-    mxfp4out = p2.get("mxfp4out", False)
+    # Path B: kernelName2 may be a flydsl_moe2_layout v2 gemm2 (mxmoe front-end +
+    # v2 gemm2). Parse BM/atomic from whichever name format applies.
+    _v2 = parse_flydsl_v2_gemm2_kernel(kernelName2)
+    if _v2 is not None:
+        BM = _v2["tile_m"]
+        atomic = _v2["epilog"] == "atomic"
+        mxfp4out = False
+        use_nt = _v2["use_nt"]
+        cshuffle = False
+    else:
+        p2 = _parse_mxfp4_g2_kname(kernelName2)
+        BM = p2["BM"]
+        atomic = p2["atomic"]
+        mxfp4out = p2.get("mxfp4out", False)
+        use_nt = p2["use_nt"]
+        cshuffle = p2.get("cshuffle", False)
     # Read inter_real BEFORE any w2.view() drops the attr. The flydsl port reads
     # D_INTER directly (D_INTER_REAL handles the unpadded shard); no K-pad needed.
     inter_real = getattr(w2, "inter_real", None)
@@ -1652,8 +1695,8 @@ def _mxfp4_a4w4_stage2_fw(
         D_INTER=D_INTER,
         BM=BM,
         device=device,
-        use_nt=p2["use_nt"],
-        cshuffle=p2.get("cshuffle", False),
+        use_nt=use_nt,
+        cshuffle=cshuffle,
         inter_real=inter_real,
     )
 

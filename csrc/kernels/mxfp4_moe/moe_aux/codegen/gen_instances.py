@@ -20,6 +20,7 @@ SHAPES = [
     (385, 7168, 1024, 9),  # Kimi-K2.5 TP=2 (kimik2_c)
     (257, 7168, 512, 9),  # DSR (dsv3_b)
     (257, 7168, 256, 9),  # DSR D_INTER=256 (dsv3_c)
+    (257, 6144, 512, 9),  # glm5 (H=6144) a4w4 path-B
     (384, 7168, 512, 8),  # Kimi-K2 TP=4, TOPK=8 (kimik2_a)
     (385, 7168, 256, 9),  # Kimi-K2.5 D_INTER=256 (kimik2_b)
     (32, 7168, 2048, 8),  # dsv3_a
