@@ -112,13 +112,10 @@ def _resolve_single_barrier(hidden_dim: int, param) -> bool:
 
 
 def _waitcnt_vm_n(n: int):
-    """Emit s_waitcnt vmcnt(n) only (lgkmcnt=63, expcnt=7)."""
-    vmcnt_lo_mask = 0xF
-    lgkmcnt_expcnt_base = 0x3F70
-    vmcnt_hi_shift = 14
-    vmcnt_hi_mask = 0x3
-    val = (n & vmcnt_lo_mask) | lgkmcnt_expcnt_base | (((n >> 4) & vmcnt_hi_mask) << vmcnt_hi_shift)
-    rocdl.s_waitcnt(val)
+    """Emit `s_waitcnt vmcnt(n)` only (lgkmcnt/expcnt left unconstrained, so
+    outstanding LDS/export traffic isn't serialized).
+    """
+    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({n})", "", has_side_effects=True)
 
 
 def validate_hstu_attention_bwd(
