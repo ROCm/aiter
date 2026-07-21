@@ -72,23 +72,25 @@ def flydsl_grouped_gemm_a8w4_masked(
     controlling the scale preshuffle tile geometry.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    from .kernels.tensor_shim import _run_compiled
 
     if stream is None:
         stream = torch.cuda.current_stream()
     nb = min(num_buffers, max(1, K // tile_k))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
-    # When quant is off, pass a dummy tensor for arg_quant_scale (unused).
+    # When quant is off, pass a dummy pointer for arg_quant_scale (unused).
     if quant_scale is None:
-        quant_scale_tensor = out  # dummy, never written
+        quant_scale_ptr = ptr_arg(out)  # dummy, never written
     else:
-        quant_scale_tensor = quant_scale.view(torch.uint8)
-    launch_gemm_a8w4_tdm(
-        out,
+        quant_scale_ptr = ptr_arg(quant_scale.view(torch.uint8))
+    _run_compiled(
+        launch_gemm_a8w4_tdm,
+        ptr_arg(out),
         ptr_arg(a),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
+        ptr_arg(a_scales.view(torch.int32)),
+        ptr_arg(w_scales.view(torch.int32)),
         contiguous_m,
         stream,
         N,
@@ -109,7 +111,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(swiglu_limit),
         stage1_quant_out,
         quant_wmma_rep,
-        quant_scale_tensor,
+        quant_scale_ptr,
     )
     return out
 
@@ -225,6 +227,7 @@ def _run_gfx1250(
     weight/activation DMA with WMMA compute.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
+    from .kernels.tensor_shim import _run_compiled
 
     if a_dtype not in ("fp8", "fp4"):
         raise NotImplementedError(
@@ -304,22 +307,27 @@ def _run_gfx1250(
         )
 
     out_is_f16 = 1 if dtype == torch.float16 else 0
-    layout_mbn = 1 if layout == "mbn" else 0
     shape = (M, B, N) if layout == "mbn" else (B, M, N)
     out_phys = (
         out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
     )
 
+    # Build a trivial m_tile_map for single-batch (n_experts=1): the one "expert"
+    # owns all M rows, so the exclusive-end psum is just [contiguous_m].
+    contiguous_m = B * M
+    m_tile_map = torch.tensor([contiguous_m], dtype=torch.int32, device=a.device)
+
     # A/B only need the base address (views built in-kernel) -> pass as pointers;
     # bind the contiguous A to a local so its storage outlives the async launch.
     a_c = a.contiguous()
-    launch_gemm_a8w4_tdm(
-        out_phys,
+    _run_compiled(
+        launch_gemm_a8w4_tdm,
+        ptr_arg(out_phys),
         ptr_arg(a_c),
         ptr_arg(w),
-        a_scales.view(torch.int32),
-        w_scales.view(torch.int32),
-        M,
+        ptr_arg(a_scales.view(torch.int32)),
+        ptr_arg(w_scales.view(torch.int32)),
+        contiguous_m,
         torch.cuda.current_stream(),
         N,
         K,
@@ -329,11 +337,16 @@ def _run_gfx1250(
         m_warp,
         n_warp,
         out_is_f16,
-        B,
-        layout_mbn,
         num_buffers,
         a_is_fp4,
-        ptr_arg(a_c),  # masked_m unused when grouped_masked=0
-        0,
+        ptr_arg(m_tile_map),
+        1,            # n_experts
+        0,            # stage1_act (no activation)
+        0,            # has_bias
+        ptr_arg(a_c), # arg_bias (dummy, unused)
+        float("inf"), # f32_swiglu_limit (unused)
+        0,            # stage1_quant_out
+        1,            # quant_wmma_rep
+        ptr_arg(out_phys),  # arg_quant_scale (dummy, unused)
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys

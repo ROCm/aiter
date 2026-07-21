@@ -29,11 +29,11 @@ TDM_DESCRIPTOR_VERSION = 1
 
 @flyc.jit
 def launch_gemm_a8w4_tdm(
-    arg_c: fx.Tensor,
+    arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
-    arg_scale_a: fx.Tensor,
-    arg_scale_b: fx.Tensor,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
@@ -54,7 +54,7 @@ def launch_gemm_a8w4_tdm(
     f32_swiglu_limit: fx.Float32,
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
-    arg_quant_scale: fx.Tensor = None,
+    arg_quant_scale: fx.Pointer = None,
 ):
     cache_tag = (
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
@@ -111,14 +111,14 @@ def launch_gemm_a8w4_tdm(
 
     @flyc.kernel(known_block_size=[block, 1, 1])
     def kernel(
-        arg_c: fx.Tensor,
+        arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
         arg_m_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
-        arg_quant_scale: fx.Tensor,
+        arg_quant_scale: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -199,7 +199,7 @@ def launch_gemm_a8w4_tdm(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
-        gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
+        gSA_base, gSB_base = fx.recast_iter(fx.Int32, arg_scale_a), fx.recast_iter(fx.Int32, arg_scale_b)
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
         a_off0 = blk_m64 * A_KROW
         b_off0 = b_outer_row * Kp16
@@ -390,7 +390,7 @@ def launch_gemm_a8w4_tdm(
             if const_expr(stage1_quant_out and stage1_act):
                 # Fused silu/swiglu -> fp8 quant; stage fp8 payload to LDS, scatter scale to global.
                 i32_ptr_g = fx.PointerType.get(elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1)
-                scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
+                scale_ptr = fx.recast_iter(i32_ptr_g, arg_quant_scale)
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                 q_dst_scale_dwpr = (i32_n // 256) * quant_wmma_rep
 
@@ -460,10 +460,10 @@ def launch_gemm_a8w4_tdm(
                 out_col_off = c_inner_off
             if const_expr(stage1_quant_out and stage1_act):
                 oc_store = fx.Int8
-                c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
+                c_iter = fx.recast_iter(fx.Int8, arg_c)
             else:
                 oc_store = oc
-                c_iter = fx.get_iter(arg_c)
+                c_iter = fx.recast_iter(oc, arg_c)
             c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
             gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
             atomC = make_tdm_store(gtC, mn_oob, out_stride)
