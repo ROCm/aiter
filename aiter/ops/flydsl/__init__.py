@@ -13,7 +13,7 @@ from packaging.version import Version
 from .utils import is_flydsl_available
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.1.8")
+_MIN_FLYDSL_VERSION = Version("0.2.4")
 
 __all__ = [
     "is_flydsl_available",
@@ -41,6 +41,17 @@ if is_flydsl_available():
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .kernels.pa_mqa_logits_fp4 import (
+        flydsl_pa_mqa_logits_fp4,
+    )
+    from .kernels.pa_mqa_logits_fp4_prefill import (
+        flydsl_pa_mqa_logits_fp4_prefill,
+    )
+    from .kernels.fp8_mqa_logits import (
+        flydsl_fp8_mqa_logits,
+        KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
+        DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -51,5 +62,10 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         "flydsl_qk_norm_rope_quant",
+        "flydsl_pa_mqa_logits_fp4",
+        "flydsl_pa_mqa_logits_fp4_prefill",
+        "flydsl_fp8_mqa_logits",
+        "FP8_MQA_LOGITS_VARIANTS",
+        "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         # "flydsl_gdr_decode",
     ]

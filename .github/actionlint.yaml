@@ -2,6 +2,8 @@ self-hosted-runner:
   labels:
     - aiter-1gpu-runner
     - aiter-8gpu-runner
+    - aiter-di-ci-spur-login
+    - aiter-di-ci-spur-login-vllm
     - aiter-gfx1100
     - build-only-aiter
     - linux-aiter-do-mi350x-1
@@ -19,3 +21,8 @@ self-hosted-runner:
     - linux-aiter-mi355-8
 
 config-variables: null
+
+paths:
+  .github/workflows/flash_attention_integration.yaml:
+    ignore:
+      - 'constant expression "false" in condition'
