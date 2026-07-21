@@ -10,21 +10,10 @@
 #pragma once
 #include "aiter_tensor.h"
 
-// Public API: dense GQA scaled-dot-product attention, head dim D=128, bf16.
-//
-// Tensor expectations (row-major, last dim contiguous):
-//   q   : [B, N, H,    D]   bf16
-//   k   : [B, N, H_KV, D]   bf16
-//   v   : [B, N, H_KV, D]   bf16
-//   out : [B, N, H,    D]   bf16 (caller-allocated)
-// `causal` selects the causal mask; `softmax_scale` is applied to QK^T (pass a
-// value <= 0 to use the default 1/sqrt(D)).
-void fmha_fwd_hd128_bf16_opus_fwd(aiter_tensor_t& q,
-                  aiter_tensor_t& k,
-                  aiter_tensor_t& v,
-                  aiter_tensor_t& out,
-                  bool causal,
-                  float softmax_scale);
+// Kernel-only header for the symmetric D=128 OPUS forward kernel. The public torch
+// API now lives in the shared `fmha_fwd_bf16_opus.h` (`fmha_fwd_bf16_opus_fwd`), which
+// dispatches to this kernel by head dim. This header just exposes the device kernel
+// template (IMPL-guarded) so the shared host translation unit can launch it.
 
 #ifdef FMHA_FWD_HD128_BF16_OPUS_IMPL
 // Implementation section - only compiled in the .cu translation unit.

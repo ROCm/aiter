@@ -19,6 +19,7 @@
 #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
 #include <hip/hip_runtime.h>
+#include <cfloat>
 #include <type_traits>
 
 namespace aiter {
@@ -36,6 +37,19 @@ inline bool topk_gating_prefer_optn_e128()
 // ---------------------------------------------------------------------------
 
 enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
+
+// Finite sentinel that +Inf logits are clamped to before sqrt(softplus) (see
+// compute_score). FLT_MAX is the largest finite float, so the clamp fires only
+// for +Inf (no finite logit exceeds it) and leaves every finite logit untouched.
+// After sqrt(softplus) the score is sqrt(FLT_MAX) ~= 1.84e19, so even summing it
+// across all experts stays well within fp32 range and cannot overflow the renorm.
+constexpr float SOFTPLUS_LOGIT_CLAMP = FLT_MAX;
+
+// Lower floor for the normalization denominator. This is only a degeneracy
+// guard for zero/subnormal sums (e.g. every expert masked out / NaN), not a
+// regular damping epsilon: top-k routing should preserve tiny-but-valid sums.
+// Keep it far below any real routing sum while still preventing division by 0.
+constexpr float RENORM_SUM_FLOOR = 1e-20f;
 
 // Fused DPP warp argmax: 6× v_max_f32+DPP + ballot + ctzll + readlane ≈ 9 instr.
 // NaN-safe: if all lanes have NaN (val_o == max_val is always false), ballot is 0
@@ -70,6 +84,16 @@ __device__ __forceinline__ float compute_score(float x)
     else
     {
         // sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
+        // Clamp +Inf logits to SOFTPLUS_LOGIT_CLAMP: softplus is unbounded, so an
+        // Inf logit would make sqrt(softplus) = Inf and then overflow the renorm
+        // sum to NaN. The clamp keeps the expert top-ranked while staying finite
+        // (see the constant for the magnitude rationale).
+        // NOTE: an explicit compare, not fminf -- fminf(NaN, clamp) returns the
+        // clamp, which would turn a NaN logit into a huge finite score and defeat
+        // the NaN guard. `NaN > clamp` is false, so NaN falls through unchanged
+        // and is rejected downstream.
+        if(x > SOFTPLUS_LOGIT_CLAMP)
+            x = SOFTPLUS_LOGIT_CLAMP;
         // Highest-precision path: pure libm (expf + log1pf), ≤1 ULP.
         // Faster alternatives (commented out, ~0.5-1 ULP extra error):
         //   float sp = x > 20.0f ? x : log1pf(exp2f(x * 1.4426950408889634f));   // exp2f HW
@@ -215,6 +239,14 @@ __global__ void topk_softplus_kernel_opt(
         idxs[i]     = e;
         if(correction_bias != nullptr)
             vals[i] += static_cast<float>(correction_bias[e]);
+        // A NaN selection score never wins the argmax and would stall this
+        // lane's cursor in the k-way merge (blocking its remaining experts);
+        // push NaN to the bottom so it is simply excluded.
+        // NOTE: ::isnan() is compiled away under -ffast-math (-ffinite-math-only).
+        // aiter does not use -ffast-math; if that ever changes, replace with a
+        // bit-pattern check: (bit_cast<uint32_t>(v) & 0x7F800000) == 0x7F800000
+        //                 && (bit_cast<uint32_t>(v) & 0x007FFFFF) != 0
+        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
     }
 
     // Step 2: sort thread-local partition descending
@@ -253,7 +285,7 @@ __global__ void topk_softplus_kernel_opt(
 
     // Step 4: renorm + scale + write
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -327,6 +359,11 @@ __global__ void topk_softplus_kernel_opt_multiwave(
         idxs[i]     = e;
         if(correction_bias != nullptr)
             vals[i] += static_cast<float>(correction_bias[e]);
+        // A NaN selection score never wins the argmax and would stall this
+        // lane's cursor in the k-way merge (blocking its remaining experts);
+        // push NaN to the bottom so it is simply excluded.
+        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
+        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -386,7 +423,7 @@ __global__ void topk_softplus_kernel_opt_multiwave(
         }
 
         if constexpr(need_renorm)
-            out_scale = routed_scaling_factor / fmaxf(sum, 1e-20f);
+            out_scale = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
         else
             out_scale = routed_scaling_factor;
     }
@@ -484,6 +521,11 @@ __global__ void topk_softplus_kernel_opt_n(
         idxs[i]     = e;
         if(correction_bias != nullptr)
             vals[i] += static_cast<float>(correction_bias[e]);
+        // A NaN selection score never wins the argmax and would stall this
+        // lane's cursor in the k-way merge (blocking its remaining experts);
+        // push NaN to the bottom so it is simply excluded.
+        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
+        vals[i] = ::isnan(vals[i]) ? -INFINITY : vals[i];
     }
 
     sort_network_desc<EPT>(vals, orig, idxs);
@@ -516,7 +558,7 @@ __global__ void topk_softplus_kernel_opt_n(
     }
 
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -607,9 +649,15 @@ void topk_softplus_kernel_prefill(
             float score         = compute_score<SCORE_FUNC>(static_cast<float>(vec[j]));
             row_orig[elt]       = score;
             row_chunk[elt]      = score;
-            if(correction_bias != nullptr) {
-                int global_e    = lane_in_group * VPT + elt;
-                row_chunk[elt] += static_cast<float>(correction_bias[global_e]);
+            // Softmax adds bias AFTER normalization (see block below), matching
+            // the smem kernels. Adding it here would make softmax normalize over
+            // (logit+bias) and double-count bias in the selection score.
+            if constexpr(SCORE_FUNC != SCORE_SOFTMAX)
+            {
+                if(correction_bias != nullptr) {
+                    int global_e    = lane_in_group * VPT + elt;
+                    row_chunk[elt] += static_cast<float>(correction_bias[global_e]);
+                }
             }
         }
     }
@@ -618,6 +666,27 @@ void topk_softplus_kernel_prefill(
     // then add bias for topk selection.  row_orig[] holds unbiased softmax weights.
     if constexpr(SCORE_FUNC == SCORE_SOFTMAX)
     {
+        // Exclude NaN logits before the max: a NaN in the max would make every
+        // exp(x - NaN) = NaN, poisoning the entire row.  +Inf logits are kept
+        // so that softmax(+Inf) = 1.0, the limit as one logit dominates.  (NOTE:
+        // this diverges from torch.softmax, whose max-subtraction still hits
+        // exp(+inf - +inf) = exp(nan) = nan, so torch.softmax(row_with_inf) is
+        // all-NaN -- see the diff-is-NaN check below for how this kernel avoids
+        // that.)
+        // is_nan[] is remembered (not re-derived from the probability) because
+        // a NaN expert's probability normalizes to the same 0.0 a genuinely
+        // low-but-finite expert can reach -- without the flag, adding bias
+        // below would let a NaN logit win a slot purely on a favorable bias,
+        // the same bug being fixed here for the -Inf/argmax paths.
+        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
+        bool is_nan[VPT];
+#pragma unroll
+        for(int i = 0; i < VPT; i++)
+        {
+            is_nan[i]    = ::isnan(row_chunk[i]);
+            row_chunk[i] = is_nan[i] ? -INFINITY : row_chunk[i];
+        }
+
         float local_max = row_chunk[0];
 #pragma unroll
         for(int i = 1; i < VPT; i++)
@@ -630,14 +699,22 @@ void topk_softplus_kernel_prefill(
 #pragma unroll
         for(int i = 0; i < VPT; i++)
         {
-            row_chunk[i] = exp2f((row_chunk[i] - local_max) * 1.4426950408889634f);
-            local_sum += row_chunk[i];
+            // When local_max == +Inf (row has a +Inf logit):
+            //   +Inf expert: +Inf - +Inf = NaN → exp = NaN, but we know this
+            //     logit equals local_max, so the correct softmax exp is 1.0.
+            //   finite expert: finite - +Inf = -Inf → exp = 0 (correct).
+            // When local_max is finite, no special case needed.
+            float diff   = row_chunk[i] - local_max;
+            float ex     = ::isnan(diff) ? 1.0f
+                         : exp2f(diff * 1.4426950408889634f);
+            row_chunk[i] = ex;
+            local_sum += ex;
         }
 #pragma unroll
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
 #pragma unroll
         for(int i = 0; i < VPT; i++)
         {
@@ -645,6 +722,10 @@ void topk_softplus_kernel_prefill(
             row_orig[i]   = row_chunk[i];
             if(correction_bias != nullptr)
                 row_chunk[i] += static_cast<float>(correction_bias[lane_in_group * VPT + i]);
+            // A NaN expert's probability is 0.0, same as a genuinely low
+            // finite expert's -- bias alone could otherwise win it a slot.
+            // Force it back below any real selection score.
+            if(is_nan[i]) row_chunk[i] = -INFINITY;
         }
     }
 
@@ -689,7 +770,7 @@ void topk_softplus_kernel_prefill(
     }
 
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -763,6 +844,13 @@ __global__ void topk_softplus_kernel(
     // The topk loop subtracts bias back to get unbiased softmax weights.
     if constexpr(SCORE_FUNC == SCORE_SOFTMAX)
     {
+        // Exclude NaN logits before the max so they don't poison the row.
+        // +Inf logits are kept: softmax(+Inf) should be 1.0.
+        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
+        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+            scores[e] = ::isnan(scores[e]) ? -INFINITY : scores[e];
+        __syncthreads();
+
         float local_max = -INFINITY;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
             local_max = fmaxf(local_max, scores[e]);
@@ -771,17 +859,25 @@ __global__ void topk_softplus_kernel(
         float local_sum = 0.0f;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
-            scores[e] = exp2f((scores[e] - local_max) * 1.4426950408889634f);
-            local_sum += scores[e];
+            float diff = scores[e] - local_max;
+            float ex   = ::isnan(diff) ? 1.0f
+                       : exp2f(diff * 1.4426950408889634f);
+            scores[e]  = ex;
+            local_sum += ex;
         }
         local_sum = wave_reduce(local_sum, [](float a, float b) { return a + b; });
 
-        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
             scores[e] *= inv_sum;
             if(correction_bias != nullptr)
                 scores[e] += static_cast<float>(correction_bias[e]);
+            // A NaN expert's probability is 0.0, same as a genuinely low
+            // finite expert's -- bias alone could otherwise win it a slot.
+            // Force it back below any real selection score.
+            if(::isnan(static_cast<float>(input_ptr[e])))
+                scores[e] = -INFINITY;
         }
         __syncthreads();
     }
@@ -815,7 +911,7 @@ __global__ void topk_softplus_kernel(
     }
 
     if(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
@@ -920,6 +1016,12 @@ __global__ void topk_softplus_kernel_smem_n(
     // -----------------------------------------------------------------------
     if constexpr(SCORE_FUNC == SCORE_SOFTMAX)
     {
+        // Exclude NaN logits before the max so they don't poison the row.
+        // +Inf logits are kept: softmax(+Inf) should be 1.0.
+        // NOTE: ::isnan() is compiled away under -ffast-math; see opt kernel.
+        for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
+            scores[e] = ::isnan(scores[e]) ? -INFINITY : scores[e];
+
         float local_max = -INFINITY;
         for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
             local_max = fmaxf(local_max, scores[e]);
@@ -930,19 +1032,27 @@ __global__ void topk_softplus_kernel_smem_n(
         float local_sum = 0.0f;
         for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
         {
-            scores[e] = exp2f((scores[e] - local_max) * 1.4426950408889634f);
-            local_sum += scores[e];
+            float diff = scores[e] - local_max;
+            float ex   = ::isnan(diff) ? 1.0f
+                       : exp2f(diff * 1.4426950408889634f);
+            scores[e]  = ex;
+            local_sum += ex;
         }
 #pragma unroll
         for(int off = THREADS_PER_ROW >> 1; off >= 1; off >>= 1)
             local_sum += __shfl_xor(local_sum, off);
 
-        float inv_sum = __builtin_amdgcn_rcpf(local_sum);
+        float inv_sum = __builtin_amdgcn_rcpf(fmaxf(local_sum, RENORM_SUM_FLOOR));
         for(int e = lane_in_row; e < num_experts; e += THREADS_PER_ROW)
         {
             scores[e] *= inv_sum;
             if(correction_bias != nullptr)
                 scores[e] += static_cast<float>(correction_bias[e]);
+            // A NaN expert's probability is 0.0, same as a genuinely low
+            // finite expert's -- bias alone could otherwise win it a slot.
+            // Force it back below any real selection score.
+            if(::isnan(static_cast<float>(input_ptr[e])))
+                scores[e] = -INFINITY;
         }
         __syncthreads();
     }
@@ -991,7 +1101,7 @@ __global__ void topk_softplus_kernel_smem_n(
     }
 
     if constexpr(need_renorm)
-        sum = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        sum = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
     else
         sum = routed_scaling_factor;
 
