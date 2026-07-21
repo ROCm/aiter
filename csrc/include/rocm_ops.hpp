@@ -1446,15 +1446,21 @@ namespace py = pybind11;
           py::arg("out"),                              \
           py::arg("softmax_scale"));
 
-#define FMHA_FWD_HD128_BF16_OPUS_PYBIND                             \
-    m.def("fmha_fwd_hd128_bf16_opus_fwd",                          \
-          &fmha_fwd_hd128_bf16_opus_fwd,                           \
-          py::arg("q"),                            \
-          py::arg("k"),                            \
-          py::arg("v"),                            \
-          py::arg("out"),                          \
-          py::arg("causal"),                       \
-          py::arg("softmax_scale"));
+#define FMHA_FWD_BF16_OPUS_PYBIND                                  \
+    m.def("fmha_fwd_bf16_opus_fwd",                                \
+          &fmha_fwd_bf16_opus_fwd,                                 \
+          py::arg("q"),                                            \
+          py::arg("k"),                                            \
+          py::arg("v"),                                            \
+          py::arg("out"),                                          \
+          py::arg("causal"),                                       \
+          py::arg("softmax_scale"),                                \
+          py::arg("seqstart_q")     = std::nullopt,                \
+          py::arg("seqstart_k")     = std::nullopt,                \
+          py::arg("seqstart_q_pad") = std::nullopt,                \
+          py::arg("seqstart_k_pad") = std::nullopt,                \
+          py::arg("max_seqlen_q")   = 0,                           \
+          py::arg("max_seqlen_k")   = 0);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
@@ -2237,18 +2243,27 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND               \
-    m.def("gated_rmsnorm_fp8_group_quant",       \
-          &aiter::gated_rmsnorm_fp8_group_quant, \
-          py::arg("out"),                        \
-          py::arg("scale"),                      \
-          py::arg("x"),                          \
-          py::arg("z"),                          \
-          py::arg("weight"),                     \
-          py::arg("epsilon"),                    \
-          py::arg("group_size"),                 \
-          py::arg("transpose_scale") = false,    \
-          "Fused Gated RMSNorm + FP8 Group Quantization");
+#define GATED_RMSNORM_QUANT_PYBIND                   \
+    m.def("gated_rmsnorm_fp8_group_quant",           \
+          &aiter::gated_rmsnorm_fp8_group_quant,     \
+          py::arg("out"),                            \
+          py::arg("scale"),                          \
+          py::arg("x"),                              \
+          py::arg("z"),                              \
+          py::arg("weight"),                         \
+          py::arg("epsilon"),                        \
+          py::arg("group_size"),                     \
+          py::arg("transpose_scale") = false,        \
+          "Fused Gated RMSNorm + FP8 Group Quantization"); \
+    m.def("gated_rmsnorm_fp8_per_token_quant",       \
+          &aiter::gated_rmsnorm_fp8_per_token_quant, \
+          py::arg("out"),                            \
+          py::arg("scale"),                          \
+          py::arg("x"),                              \
+          py::arg("z"),                              \
+          py::arg("weight"),                         \
+          py::arg("epsilon"),                        \
+          "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                              \
     m.def("mhc_pre_gemm_sqrsum",                \
@@ -2342,6 +2357,7 @@ namespace py = pybind11;
           py::arg("g"),                             \
           py::arg("gk"),                            \
           py::arg("initial_state"),                 \
+          py::arg("initial_state_indices"),         \
           py::arg("cu_seqlens"),                    \
           py::arg("chunk_offsets"),                 \
           py::arg("h"),                             \
