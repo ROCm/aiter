@@ -202,10 +202,12 @@ def _moe_gemm_a8w4_decode_persistent(
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
         SCALE_KWIDTH: gl.constexpr = 8
+        K_MX = K // MX_PACK_DIVISOR
     else:
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
+        K_MX = tl.cdiv(K, MX_PACK_DIVISOR)
     SCALE_BLOCK_N_PERSISTENT: gl.constexpr = SCALE_BLOCK_N * N_ITERS
 
     # -- WMMA layouts (decode uses warp_bases [[0,1],[0,2]]) --
@@ -364,7 +366,7 @@ def _moe_gemm_a8w4_decode_persistent(
         base=WMxScale,
         shape=(
             N // PRESHUFFLE_FACTOR - pid_n * SCALE_BLOCK_N_PERSISTENT,
-            (K // MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR,
+            K_MX * PRESHUFFLE_FACTOR,
         ),
         strides=(stride_w_mx_n, stride_w_mx_k),
         block_shape=(SCALE_BLOCK_N, PACKED_MX_BLOCK),
@@ -376,7 +378,7 @@ def _moe_gemm_a8w4_decode_persistent(
             XMxScale += start_m.to(index_type) * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
-                shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
+                shape=(M, K_MX),
                 strides=(stride_x_mx_m, stride_x_mx_k),
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
@@ -384,7 +386,7 @@ def _moe_gemm_a8w4_decode_persistent(
         else:
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
-                shape=(num_tokens, tl.cdiv(K, MX_PACK_DIVISOR)),
+                shape=(num_tokens, K_MX),
                 strides=(stride_x_mx_m, stride_x_mx_k),
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
@@ -702,7 +704,7 @@ def _moe_gemm_a8w4_decode_persistent(
                 w_desc,
                 add_offsets=[PACKED_BLOCK_N_W, -num_k_iter * PACKED_BLOCK_K_W],
                 set_bounds=[
-                    N // W_PRESHUFFLE_FACTOR - pid_n * PACKED_BLOCK_N_W_PERSISTENT,
+                    N // W_PRESHUFFLE_FACTOR - (block_id_n + 1) * PACKED_BLOCK_N_W,
                     (K // W_K_DIVISOR) * W_PRESHUFFLE_FACTOR,
                 ],
             )
@@ -711,7 +713,7 @@ def _moe_gemm_a8w4_decode_persistent(
                 w_desc,
                 add_offsets=[PACKED_BLOCK_N_W, -num_k_iter * PACKED_BLOCK_K_W],
                 set_bounds=[
-                    N - pid_n * PACKED_BLOCK_N_W_PERSISTENT,
+                    N - (block_id_n + 1) * PACKED_BLOCK_N_W,
                     K // W_K_DIVISOR,
                 ],
             )
@@ -729,8 +731,8 @@ def _moe_gemm_a8w4_decode_persistent(
             w_scales_desc,
             add_offsets=[SCALE_BLOCK_N, -num_k_iter * PACKED_MX_BLOCK],
             set_bounds=[
-                N // PRESHUFFLE_FACTOR - pid_n * SCALE_BLOCK_N_PERSISTENT,
-                (K // MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR,
+                N // PRESHUFFLE_FACTOR - (block_id_n + 1) * SCALE_BLOCK_N,
+                K_MX * PRESHUFFLE_FACTOR,
             ],
         )
         if is_x_microscaled:
@@ -738,13 +740,13 @@ def _moe_gemm_a8w4_decode_persistent(
                 x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
                     add_offsets=[0, -num_k_iter * MX_SCALE_BLOCK_K],
-                    set_bounds=[M, K // MX_PACK_DIVISOR],
+                    set_bounds=[M, K_MX],
                 )
             else:
                 x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
                     add_offsets=[0, -num_k_iter * MX_SCALE_BLOCK_K],
-                    set_bounds=[num_tokens, K // MX_PACK_DIVISOR],
+                    set_bounds=[num_tokens, K_MX],
                 )
         if B is not None:
             bias_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
