@@ -750,6 +750,7 @@ def _get_or_compile_mfma16_hip(
     state_bf16=False,
     g_log2_scaled=False,
     use_state_indices=False,
+    sched_gfx942=False,
 ):
     """Compile (and cache) the mfma16 / HIP-aligned K5 kernel (formerly the "vk"
     fork): 16x16x16 bf16 MFMA + HIP-matching warp partition, writing the public
@@ -777,6 +778,7 @@ def _get_or_compile_mfma16_hip(
         STATE_DTYPE_BF16=state_bf16,
         G_IS_LOG2_SCALED=g_log2_scaled,
         USE_STATE_INDICES=use_state_indices,
+        SCHED_GFX942=sched_gfx942,
     )
 
 
@@ -1356,7 +1358,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # ``use_state_indices`` is an mfma16_hip-only compile knob; every other
     # fork's ``_get_or_compile*`` shares the common signature without it.
     _extra_compile_kwargs = (
-        {"use_state_indices": use_state_indices} if _mfma16_hip_active else {}
+        # SCHED_GFX942 仅在 gfx942 上开启（_IS_GFX942）；其它 arch（含 gfx950）传
+        # False，emit 与改动前逐字节一致，且并入 lru_cache key 成为独立编译产物。
+        {"use_state_indices": use_state_indices, "sched_gfx942": _IS_GFX942}
+        if _mfma16_hip_active
+        else {}
     )
     launch_fn = _compile_fn(
         K,

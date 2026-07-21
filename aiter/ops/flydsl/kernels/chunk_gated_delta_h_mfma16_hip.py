@@ -175,6 +175,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     STATE_DTYPE_BF16: bool = False,
     G_IS_LOG2_SCALED: bool = False,
     USE_STATE_INDICES: bool = False,
+    SCHED_GFX942: bool = False,
 ):
     """Compile the GDN K5 kernel.
 
@@ -266,9 +267,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = (
-        119  # +state_indices slot (indexed state-pool gather / in-place write-back)
-    )
+    _K5_KERNEL_REVISION = 120  # +SCHED_GFX942 编译期变体（gfx942 GEMM1 ds 拆簇调度）
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -787,6 +786,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         bv_accs[nr] = _mfma_bf16_16x16x16(
                             a_frag_hi, b_frag_hi, bv_accs[nr]
                         )
+                    # gfx942 调度：在每个 ks 边界插 sched_barrier(0)，阻止 LLVM 把
+                    # 各 ks 的 b_frag ds_read 跨迭代 hoist 聚成一大簇（LDS 端口背压
+                    # 主因）。sched_barrier 只约束指令排布、不改地址/数值，正确性安全。
+                    if const_expr(SCHED_GFX942):
+                        rocdl.sched_barrier(0)
 
             # >>> PREFETCH w_next: HBM loads for next chunk (HIP .cu:670-672).
             next_i_t = i_t_i32 + fx.Int32(1)
@@ -847,6 +851,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         bv_accs[nr] = _mfma_bf16_16x16x16(
                             a_frag_hi, b_frag_hi, bv_accs[nr]
                         )
+                    # gfx942 调度：同上，切断 remaining K-block 里跨 ks 的 ds_read 聚簇。
+                    if const_expr(SCHED_GFX942):
+                        rocdl.sched_barrier(0)
 
             # WAR barrier (.cu:692).
             gpu.barrier()
