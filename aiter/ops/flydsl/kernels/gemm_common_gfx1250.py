@@ -317,15 +317,21 @@ LOG2E = _math.log2(_math.e)
 
 
 def fmin_f32(a, b):
-    """Scalar f32 min (select-based, no NaN handling)."""
+    """Scalar f32 min (maps to v_min_num_f32)."""
     import flydsl.expr as _fx
-    return _fx.Float32((a < b).select(a, b))
+    return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
 
 
 def fmax_f32(a, b):
-    """Scalar f32 max (select-based, no NaN handling)."""
+    """Scalar f32 max (maps to v_max_num_f32)."""
     import flydsl.expr as _fx
-    return _fx.Float32((a > b).select(a, b))
+    return _fx.Float32(arith.maxnumf(_raw(a), _raw(b)))
+
+
+def fclamp_f32(x, lo, hi):
+    """Scalar f32 clamp via v_med3_num_f32."""
+    import flydsl.expr as _fx
+    return _fx.Float32(rocdl.fmed3(T.f32, _raw(x), _raw(lo), _raw(hi)))
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
@@ -333,14 +339,59 @@ def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     import flydsl.expr as _fx
     _one = _fx.Float32(1.0)
     g = fmin_f32(g, limit_f32)
-    u = fmin_f32(fmax_f32(u, neg_limit_f32), limit_f32)
+    u = fclamp_f32(u, neg_limit_f32, limit_f32)
     if swiglu:
         nlog2e = _fx.Float32(-1.702 * LOG2E)
-        sig = _fx.Float32(rocdl.rcp(T.f32, _one + (g * nlog2e).exp2()))
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
         return g * sig * (u + _one)
     nlog2e = _fx.Float32(-LOG2E)
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + (g * nlog2e).exp2()))
+    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
     return g * sig * u
+
+
+def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
+
+    Args:
+        pairs: list of (gate, up) f32 value pairs.
+        swiglu: True for swiglu, False for silu.
+        limit_f32, neg_limit_f32: clamp bounds.
+        range_constexpr: the FlyDSL ``range_constexpr`` helper.
+
+    Returns:
+        list of activated f32 values, same length as *pairs*.
+    """
+    import flydsl.expr as _fx
+    _one = _fx.Float32(1.0)
+    nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    N = len(pairs)
+    # Stage 1: clamp + exp2
+    gs, us, exp_vals = [], [], []
+    for i in range_constexpr(N):
+        g = fmin_f32(pairs[i][0], limit_f32)
+        u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+        gs.append(g)
+        us.append(u)
+        exp_vals.append(exp_val)
+    # Stage 2a: add 1+exp
+    sum_vals = []
+    for i in range_constexpr(N):
+        sum_vals.append(_one + exp_vals[i])
+    # Stage 2b: rcp
+    rcp_vals = []
+    for i in range_constexpr(N):
+        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
+    # Stage 3: final mul
+    results = []
+    for i in range_constexpr(N):
+        if swiglu:
+            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+        else:
+            results.append(gs[i] * rcp_vals[i] * us[i])
+    return results
 
 
 __all__ = [
@@ -364,4 +415,5 @@ __all__ = [
     "fmin_f32",
     "fmax_f32",
     "fused_silu_swiglu_elem",
+    "batched_silu_swiglu",
 ]

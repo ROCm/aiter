@@ -377,6 +377,35 @@ def emit_amax_e8m0_recip(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     return recip, e8m0_byte
 
 
+def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
+    """Like :func:`emit_amax_e8m0_recip` but returns the *forward* scale
+    ``2^(e8m0-127)`` needed by native gfx1250 ``v_cvt_scalef32_pk8_*``
+    instructions (HW divides by the scale internally).
+
+    Returns:
+        ``(scale_f32, e8m0_byte)`` — f32 forward scale and i8 E8M0 byte.
+    """
+    c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
+    c16 = arith.constant(16, type=T.i32)
+    c23 = arith.constant(23, type=T.i32)
+    c_wave = arith.constant(wave_size, type=T.i32)
+
+    block_amax = arith.constant(0.0, type=T.f32)
+    for v in all_vals:
+        abs_v = llvm.call_intrinsic(
+            T.f32, "llvm.fabs.f32", [_raw(v)], [], []
+        )
+        block_amax = arith.maxnumf(block_amax, abs_v)
+    block_amax = arith.minnumf(block_amax, c_flt_max)
+    peer = block_amax.shuffle_xor(c16, c_wave)
+    block_amax = arith.maxnumf(block_amax, peer)
+
+    e8m0 = emit_mx_e8m0_scale(block_amax, dtype=dtype)
+    scale_f32 = (e8m0 << c23).bitcast(T.f32)
+    e8m0_byte = arith.trunci(T.i8, e8m0)
+    return scale_f32, e8m0_byte
+
+
 def _raw(value):
     """Unwrap a DSL Numeric to a raw ir.Value (rocdl/inline_asm need raw operands)."""
     return value.ir_value() if hasattr(value, "ir_value") else value
@@ -395,6 +424,19 @@ def emit_cvt_scalef32_pk8_fp8_bf16(src_v8bf16, scale_f32, *, v2i32_ty):
         "v_cvt_scalef32_pk8_fp8_bf16 $0, $1, $2",
         "=v,v,v",
         has_side_effects=False,
+    )
+
+
+def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp8_f32``: 8 f32 -> 8 fp8 e4m3.
+
+    ``src_v8f32`` is a ``vector<8, f32>`` ir.Value, ``scale_f32`` an f32 whose
+    exponent is the e8m0 block scale (2^(e8m0-127)); the HW divides each input
+    by it and RNE-packs 8 fp8 e4m3 bytes into a ``vector<2, i32>``.
+    No bf16 round-trip — full f32 precision into the scaled conversion.
+    """
+    return rocdl.cvt_scalef32_pk8_fp8_f32(
+        v2i32_ty, _raw(src_v8f32), _raw(scale_f32),
     )
 
 
