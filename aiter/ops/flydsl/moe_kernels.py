@@ -82,7 +82,7 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [256]
-    tile_ms = [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if a_dtype == "fp8" and is_fp4_b else [32, 64, 128]
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
