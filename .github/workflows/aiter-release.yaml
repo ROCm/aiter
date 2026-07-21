@@ -53,16 +53,6 @@ on:
         description: 'Use pytorch/manylinux2_28-builder ROCm image (AlmaLinux 8 + devtoolset, glibc 2.28). Produces wheels ABI-compatible with vLLM/Ubuntu 22 containers.'
         type: boolean
         default: false
-      torch_pin:
-        description: 'Optional torch version pin for the manylinux build (e.g. 2.11.0 or 2.10.0+rocm7.1). Empty = default constraint (torch<2.13).'
-        type: string
-        required: false
-        default: ''
-      torch_index_url:
-        description: 'Optional override for the torch wheel index URL. Empty = auto-derive from the builder image ROCm tag.'
-        type: string
-        required: false
-        default: ''
   workflow_call:
     inputs:
       release_type:
