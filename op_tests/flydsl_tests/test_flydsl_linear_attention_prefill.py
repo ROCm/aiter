@@ -400,11 +400,12 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
-        model_name="varlen-32k-qwen-ptpc-ali",
+        model_name="varlen-64k-qwen-ptpc-ali",
         Hv=64,
         tps=[8],
-        full_prompt_lens=[1024, 2048, 4096, 8192],
-        max_num_batched_tokens=65536,
+        full_prompt_lens=[8192],
+        # max_num_batched_tokens=[8192,16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
         model_name="varlen-16k-aws",
