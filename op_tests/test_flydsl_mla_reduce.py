@@ -85,6 +85,7 @@ def _env(**kwargs):
             else:
                 os.environ[k] = v
 
+
 # DeepSeek shape: HIP MLA_REDUCE_ROUTER has a Dv=512 template, so these compare
 # against the HIP kernel directly.
 _HIP_SHAPE = (128, 512)
@@ -1151,9 +1152,7 @@ def test_dispatch_does_not_thread_actual_max_splits():
             captured["kwargs"] = kwargs
 
         with mock.patch.object(flydsl, "flydsl_mla_reduce_v1", _capture):
-            mla._mla_reduce_v1_dispatch(
-                None, None, None, None, None, 1, 0, None, None
-            )
+            mla._mla_reduce_v1_dispatch(None, None, None, None, None, 1, 0, None, None)
         assert "actual_max_splits" not in captured["kwargs"]
         assert captured["kwargs"].get("num_kv_splits") == 0
 
@@ -1307,13 +1306,19 @@ def run_checks():
         )
     for case in _GRAPH_CASES:
         _run(
-            f"cudagraph_replay[{case[0]}]", test_flydsl_mla_reduce_cudagraph_replay, case
+            f"cudagraph_replay[{case[0]}]",
+            test_flydsl_mla_reduce_cudagraph_replay,
+            case,
         )
     _run(
-        "small_split_cudagraph_replay", test_flydsl_mla_reduce_small_split_cudagraph_replay
+        "small_split_cudagraph_replay",
+        test_flydsl_mla_reduce_small_split_cudagraph_replay,
     )
     _run("serving_sparse_grid_vs_hip", test_serving_sparse_grid_vs_hip)
-    _run("serving_sparse_grid_cudagraph_replay", test_serving_sparse_grid_cudagraph_replay)
+    _run(
+        "serving_sparse_grid_cudagraph_replay",
+        test_serving_sparse_grid_cudagraph_replay,
+    )
     for K in [4, 8, 16]:
         _run(f"splitk_b1_s128_vs_torch_ref[K={K}]", test_splitk_b1_s128_vs_torch_ref, K)
     _run("splitk_b1_s128_vs_hip", test_splitk_b1_s128_vs_hip)
@@ -1323,9 +1328,12 @@ def run_checks():
     _run("da_splitk_no_engage_low_splits", test_da_splitk_no_engage_low_splits)
     _run("da_splitk_wrapper_vs_hip", test_da_splitk_wrapper_vs_hip)
     _run(
-        "da_splitk_capture_safe_varying_splits", test_da_splitk_capture_safe_varying_splits
+        "da_splitk_capture_safe_varying_splits",
+        test_da_splitk_capture_safe_varying_splits,
     )
-    _run("actual_max_splits_gate_loose_budget", test_actual_max_splits_gate_loose_budget)
+    _run(
+        "actual_max_splits_gate_loose_budget", test_actual_max_splits_gate_loose_budget
+    )
     _run("derive_actual_max_splits", test_derive_actual_max_splits)
     _run(
         "actual_max_splits_wrapper_loose_budget_correct",
@@ -1335,7 +1343,10 @@ def run_checks():
         "actual_max_splits_wrapper_cudagraph_replay",
         test_actual_max_splits_wrapper_cudagraph_replay,
     )
-    _run("serving_stale_indptr_cudagraph_replay", test_serving_stale_indptr_cudagraph_replay)
+    _run(
+        "serving_stale_indptr_cudagraph_replay",
+        test_serving_stale_indptr_cudagraph_replay,
+    )
     _run("serving_gather_guard_differential", test_serving_gather_guard_differential)
     _run("serving_store_guard_differential", test_serving_store_guard_differential)
     _run(
@@ -1630,7 +1641,8 @@ def main():
         return
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter, description="config input of test"
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
     parser.add_argument(
         "-d",
