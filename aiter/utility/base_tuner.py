@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 
 from aiter import dtypes, logger
+from aiter.jit.utils.chip_info import get_cu_num as _chip_get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
 INVALID_TIME = -1
@@ -460,10 +461,12 @@ class TunerCommon:
         tunedf.to_csv(tune_file, index=False)
 
     def get_cu_num(self):
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
-        return cu_num
+        # Use chip_info.get_cu_num() (rocminfo "Compute Unit", CU_NUM-aware) as the
+        # single source of truth: it is the same value the runtime dispatch keys
+        # (gfx, cu_num, M, N, K) are looked up with. torch's multi_processor_count
+        # reports WGPs (= CU/2) on RDNA (gfx11/gfx12), so tuning with it would key
+        # rows at half the CU count and the runtime would never find them.
+        return _chip_get_cu_num()
 
     def get_gfx(self):
         return _chip_get_gfx()
