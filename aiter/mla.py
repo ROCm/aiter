@@ -1293,7 +1293,7 @@ def mla_decode_fwd_v4_nm(
     sink,  # REQUIRED [num_heads] FP32 -- attention sink logit
     split_indptr=None,  # [num_seqs+1] int32; auto-built by get_meta_param if None
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
-    out_16_nosplit=0,
+    out_16_nosplit=0,  # DEPRECATED/IGNORED: derived internally from num_kv_splits (V3-style)
     num_kv_splits=None,  # None -> auto-pick via V3 get_meta_param heuristic
     logits=None,
     attn_lse=None,
@@ -1310,9 +1310,12 @@ def mla_decode_fwd_v4_nm(
     convention).
 
     Single-pass mode (`num_kv_splits == 1`):
-      Returned `logits[:, 0]` already holds the per-token output (no merge
-      needed). `output[total_q, num_heads, v_head_dim]` BF16 is only written
-      by the kernel when `out_16_nosplit == 1`.
+      V3-style: the kernel ALWAYS writes the final packed-BF16 result straight
+      into `output` (zero-copy). `out_16_nosplit` is derived internally (=1
+      here) and the caller-facing arg is ignored. The returned `logits` is a
+      BF16 view aliased onto `output` (shape [total_q, 1, num_heads,
+      v_head_dim]); read the per-token result from `output` (or `logits[:, 0]`,
+      same bytes). There is no separate FP32 partial to reduce.
 
     Split-count selection (`num_kv_splits`):
       `None` (default) auto-picks the split count via V3's `get_meta_param`
@@ -1403,13 +1406,7 @@ def mla_decode_fwd_v4_nm(
         if split_indptr is None:
             split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
 
-    # ---- Multi-pass requires the FP32 split-output path ----
-    if num_kv_splits > 1 and out_16_nosplit != 0:
-        raise ValueError(
-            f"mla_decode_fwd_v4_nm: num_kv_splits={num_kv_splits} requires "
-            f"out_16_nosplit=0 (the kernel's bf16-direct-write path only "
-            f"supports passes==1). Got out_16_nosplit={out_16_nosplit}."
-        )
+    out_16_nosplit = 1 if num_kv_splits == 1 else 0
 
     # ---- Allocate splitData / splitLse in KERNEL-NATIVE layout --------------
     # kernel-native layout:   [num_seqs, max_seqlen_q, num_kv_splits, num_heads, v_head_dim]
@@ -1433,7 +1430,12 @@ def mla_decode_fwd_v4_nm(
 
     expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
-    if logits is None:
+    if out_16_nosplit != 0:
+        # V3-style zero-copy final output. When out_16_nosplit=1 (single-pass),
+        # the kernel writes the final DENSELY-PACKED BF16 result into ptr_R
+        # (= the `logits`/splitData buffer).
+        logits = output.view(expected_logits_shape)
+    elif logits is None:
         logits = torch.empty(
             expected_logits_shape,
             dtype=dtypes.fp32,
@@ -1547,23 +1549,5 @@ def mla_decode_fwd_v4_nm(
             num_stages=2,
             waves_per_eu=4,
         )
-
-    # ---- out_16_nosplit=1: resolve the kernel's packed-BF16 output ----------
-    # When out_16_nosplit=1 (single-pass only), the kernel does NOT write the
-    # `output` buffer. Instead it writes the final result as DENSELY-PACKED
-    # BF16 into the `logits` allocation. Global layout is identical to the
-    # fp32 path -- [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
-    # num_heads -- but each element is 2 bytes (R16_BPP=2), so the per-head
-    # stride is v_head_dim*2 bytes = v_head_dim BF16 slots, occupying only the
-    # FIRST half of the fp32 `logits` byte range. Reinterpret those bytes as a
-    # tight [total_q, num_heads, v_head_dim] BF16 tensor and copy into the
-    # caller's `output` so `output` is the single authoritative result buffer
-    # (mirrors the multi-split stage2 path, which also lands in `output`).
-    if out_16_nosplit != 0:
-        n_bf16 = total_q * num_heads * v_head_dim
-        packed_bf16 = (
-            logits.contiguous().view(torch.bfloat16).flatten()[:n_bf16]
-        ).view(total_q, num_heads, v_head_dim)
-        output.copy_(packed_bf16)
 
     return logits, attn_lse

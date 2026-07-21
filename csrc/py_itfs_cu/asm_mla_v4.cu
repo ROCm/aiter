@@ -244,6 +244,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      stream))
 {
     (void)softmax_scale;
+    (void)out_16_nosplit;
+    const unsigned int out_16_nosplit_derived =
+        (num_kv_splits == 1) ? 1u : 0u;
     AITER_CHECK(sink != nullptr, __func__, ": `sink` must not be NULL");
     AITER_CHECK(sink->data_ptr() != nullptr,
                 __func__,
@@ -286,7 +289,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a.s_kv_split  = static_cast<unsigned int>(num_kv_splits);
         // a.s_total_kv     left as 0 here — set per-arch in fill_gfx1250_kargs below.
         a.ptr_QTP        = qo_indptr->data_ptr();
-        a.out_16_nosplit = static_cast<unsigned int>(out_16_nosplit);
+        a.out_16_nosplit = out_16_nosplit_derived;
         a.ptr_QROPE      = qrope->data_ptr();
         a.ptr_KVROPE     = kvrope->data_ptr();
         a.ptr_sink       = sink->data_ptr();
