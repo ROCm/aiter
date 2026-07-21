@@ -3887,9 +3887,11 @@ class FmoeTuner(TunerCommon):
                         }
                     )
             except Exception as e:
-                print(f"\n=== Exception in run_config for {shape_str} {config_string=} ===")
+                print(
+                    f"\n=== Exception in run_config for {shape_str} {config_string=} ==="
+                )
                 traceback.print_exc()
-                print(f"=== End of traceback ===")
+                print("=== End of traceback ===")
                 results.append(
                     {
                         "shape": shape_str,
@@ -4796,7 +4798,7 @@ class FmoeTuner(TunerCommon):
                     target_fused_moe=partial(
                         target_fused_moe, config_string=config_string
                     ),
-                    config_string = config_string,
+                    config_string=config_string,
                 )
             except Exception as e:
                 print(f"{RED}Error with config {config_string}: {e}{END}")

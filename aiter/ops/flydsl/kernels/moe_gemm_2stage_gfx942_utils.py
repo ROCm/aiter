@@ -4,7 +4,7 @@
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl._mlir.dialects import fly, llvm, vector, gpu, scf, rocdl
+from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir import ir
 
 import functools
@@ -33,8 +33,9 @@ def fly_ast_rewrite(member):
         return classmethod(ASTRewriter.transform(member.__func__))
     return ASTRewriter.transform(member)
 
+
 @fly_ast_rewrite
-def split_works(num_works, num_workers, worker_id, align = 1):
+def split_works(num_works, num_workers, worker_id, align=1):
     num_work_items = num_works // align
     num_items_per_worker = num_work_items // num_workers
     num_items_remains = num_work_items % num_workers
@@ -47,7 +48,8 @@ def split_works(num_works, num_workers, worker_id, align = 1):
     )
     work_item1 = work_item0 + num_items
 
-    return work_item0*align, work_item1*align, num_items*align
+    return work_item0 * align, work_item1 * align, num_items * align
+
 
 def load_fragment(thr_view: fx.Tensor):
     """
@@ -82,7 +84,6 @@ def load_fragment(thr_view: fx.Tensor):
         return frag_stride
 
     frag_stride = collect_nz_modes(tview_shape, tview_stride)
-    nz_cnt = fstride
     # print(" thr_view shape: ", nz_shape, " stride: ", nz_stride, " frag_stride: ", frag_stride, " nz_cnt: ", nz_cnt)
 
     if len(nz_shape) == 0:
@@ -538,7 +539,10 @@ class FlyObjCache:
         thread_m = num_threads // thread_n
         tile_mn = (thread_m, thread_n * num_vals)
         assert (num_rows % tile_mn[0]) == 0, f"expect {num_rows} % {tile_mn[0]} == 0"
-        stride = lambda m, n: m + n * tile_mn[0]
+
+        def stride(m, n):
+            return m + n * tile_mn[0]
+
         tiled_copy = fx.make_tiled_copy(
             copy_atom,
             fx.make_layout(
