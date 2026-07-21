@@ -25,7 +25,9 @@ _SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
 # a/b operand combos the kernel supports (a4w4 / a6w4 / a8w8).
 _COMBOS = [("fp4", "fp4"), ("fp6", "fp4"), ("fp8", "fp8")]
 _TILE_M = (32, 64, 96, 128, 256)
-_TILE_N = (64, 128, 256, 512)
+# tile_n=16/32 use fewer N-waves (block 64/128) so wide-N small-M shapes launch more
+# workgroups (WG=N/tile_n) and fill the CUs; tile_n>=64 keeps 4 waves / block 256.
+_TILE_N = (16, 32, 64, 128, 256, 512)
 _TILE_K = (128, 256)
 _WAVES_PER_EU = (0, 1, 2, 3, 4)
 _XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
@@ -112,7 +114,10 @@ def instance_valid(ki: kernelInstance) -> bool:
         return False
     if ki.tile_m % 32 != 0:  # microscale packs M by 2 -> m_chunks = tile_m//16 even
         return False
-    if ki.tile_n % 64 != 0:  # 16-col n-subblocks per wave: tile_n multiple of 64
+    if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
+        return False
+    _nw = min(4, ki.tile_n // 16)  # N-waves; each handles tile_n//_nw cols
+    if (ki.tile_n // _nw) % 16 != 0:  # per-wave N span must be a whole 16-col count
         return False
     arb = _a_row_bytes(ki.a_dtype, ki.tile_k)
     if (

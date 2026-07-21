@@ -151,10 +151,12 @@ def launch_gemm(
     # e8m0 scales are 256-K granular, B 128-K: tiles_per_chunk K-tiles share a word (hi/lo 16b = 128-K half).
     tiles_per_chunk = 256 // BK  # 1 for tile_k=256, 2 for tile_k=128
     m_chunks = BM // 16
-    num_acc_n = (BN // 4) // 16  # 16-col n-subblocks per wave
+    num_waves = min(4, BN // 16)
+    num_threads = num_waves * 64
+    num_acc_n = (BN // num_waves) // 16  # 16-col n-subblocks per wave
     _scale_chunk_dw = ((K + 255) // 256) * 64  # e8m0 stride in dwords
     _scale_k0_dw = 64
-    n_coop = A_LDS_B // 256 // 16  # 16B cooperative loads per thread
+    n_coop = A_LDS_B // num_threads // 16  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
 
@@ -291,8 +293,8 @@ def launch_gemm(
             base_k_byte = kt * A_ROW_B
             for i in range_constexpr(n_coop):
                 if const_expr(i > 0):
-                    lds_ptr = fx.add_offset(lds_ptr, fx.Int32(256 * 16))
-                lin = (i * 256 + tid) * 16
+                    lds_ptr = fx.add_offset(lds_ptr, fx.Int32(num_threads * 16))
+                lin = (i * num_threads + tid) * 16
                 row = lin // A_ROW_B
                 col = lin % A_ROW_B
                 if const_expr(swz_lds):
@@ -338,7 +340,7 @@ def launch_gemm(
                         av.append(t)
             return av
 
-        n_col_base = by_n + wave * (BN // 4)
+        n_col_base = by_n + wave * (BN // num_waves)
         bq_views = [
             _bq_view(arg_b, n_col_base + ni * 16, KH4, K_TILES, k_halves, B_BLK_PER_MMA)
             for ni in range_constexpr(num_acc_n)
@@ -377,7 +379,7 @@ def launch_gemm(
             fx.make_layout(1, 1),
         )
         a_sc_base = [(bx_m // 32 + mp) * sca_rstride for mp in range_constexpr(m_pairs)]
-        nsb = (by_n + wave * (BN // 4)) // 32
+        nsb = (by_n + wave * (BN // num_waves)) // 32
         b_sc_base = [(nsb + np) * _scale_chunk_dw for np in range_constexpr(n_pairs)]
         sc_lane = lane_div_16 * 16 + lane_mod_16
 
@@ -450,7 +452,7 @@ def launch_gemm(
                 sa_v = [v.shrui(scale_shift) for v in sa_v]
                 sb_v = [v.shrui(scale_shift) for v in sb_v]
             if const_expr(BN < 128):
-                _bnsh = ((wave * (BN // 4)) % 32) // 16 * 8
+                _bnsh = ((by_n + wave * (BN // num_waves)) % 32) // 16 * 8
                 sb_v = [v.shrui(_bnsh) for v in sb_v]
             # kh OUTERMOST: consecutive MFMAs hit distinct accumulators (dense issue). Each
             # scaled MFMA = fx.gemm over rank-1 i32[4] A/B frags, e8m0 word on scale_a=/scale_b=.
@@ -570,7 +572,7 @@ def launch_gemm(
         else:
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
         c_rstride = fx.Int32(c_stride)
-        col_w = by_n + wave * (BN // 4) + lane_mod_16
+        col_w = by_n + wave * (BN // num_waves) + lane_mod_16
         for mi in range_constexpr(m_chunks):
             row_local = (
                 mi * 16 + lane_div_16 * 4
@@ -605,7 +607,7 @@ def launch_gemm(
         i32_m,
         i32_n,
         value_attrs={"rocdl.waves_per_eu": wpe},
-    ).launch(grid=(gx, gy, gz), block=(256, 1, 1), stream=stream)
+    ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
 
 
 # ── split-K reduce ────────────────────────────────────────────────────────────
