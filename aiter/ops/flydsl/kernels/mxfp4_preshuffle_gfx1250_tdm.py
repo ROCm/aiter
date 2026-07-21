@@ -37,7 +37,7 @@ def launch_gemm_a8w4_tdm(
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
-    K: fx.Int32,
+    K: Constexpr[int],
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -57,7 +57,7 @@ def launch_gemm_a8w4_tdm(
     arg_quant_scale: fx.Tensor = None,
 ):
     cache_tag = (
-        tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
+        K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
         a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
         stage1_quant_out, quant_wmma_rep,
     )
@@ -121,16 +121,14 @@ def launch_gemm_a8w4_tdm(
         arg_quant_scale: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
-        i32_k: fx.Int32,
         f32_swiglu_limit: fx.Float32,
     ):
         rocdl.disable_xdl_arb_stall()
 
-        K_TILES = i32_k // tile_k
-        k64 = fx.Int64(i32_k)
-        A_KROW = k64 // A_PACK
-        Kp16 = (k64 // 2) * 16
-        K4 = k64 // 4
+        K_TILES = K // tile_k
+        A_KROW = K // A_PACK
+        Kp16 = (K // 2) * 16
+        K4 = K // 4
 
         tid = fx.thread_idx.x
         bid_x = fx.block_idx.x
@@ -172,7 +170,7 @@ def launch_gemm_a8w4_tdm(
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
-        AS_ROW = (k64 // 128) * wmma_m_rep
+        AS_ROW = (K // 128) * wmma_m_rep
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -474,7 +472,7 @@ def launch_gemm_a8w4_tdm(
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, i32_m, N, K, f32_swiglu_limit).launch(
+    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, i32_m, N, f32_swiglu_limit).launch(
         grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
     )
 
