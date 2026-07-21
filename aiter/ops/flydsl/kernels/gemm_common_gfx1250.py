@@ -150,6 +150,12 @@ def lds_store_b64_raw(lds_base_idx, byte_offset, data):
     llvm_dialect.store(_raw(data), ptr_val)
 
 
+def lds_store_b32_raw(lds_base_idx, byte_offset, data):
+    """Store 4 bytes to LDS using a pre-extracted base index (i32)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
+
+
 def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
     """Transpose-load 16 bytes from LDS using a pre-extracted base index."""
     from flydsl._mlir.dialects import rocdl as _rocdl

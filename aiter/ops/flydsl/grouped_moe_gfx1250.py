@@ -470,7 +470,7 @@ def _grouped_a8w4_tdm_moe(
             masked_m=None, topids_to_rows=None,
         )
 
-    grouped_out = torch.zeros((1, contiguous_m, model_dim), dtype=dtype, device=device)
+    grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     flydsl_grouped_gemm_a8w4_masked(

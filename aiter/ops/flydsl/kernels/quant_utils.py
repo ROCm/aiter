@@ -335,6 +335,48 @@ def emit_cvt_pk4_fp8_f32(vals, recip, *, rocdl, vector, T):
     return word
 
 
+def emit_amax_e8m0_recip(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
+    """Per-lane amax over *all_vals*, shuffle-xor across kgrp halves, E8M0 scale.
+
+    Computes:
+      1. ``amax = max(|v| for v in all_vals)``  (per-lane)
+      2. Combine both kgrp halves via ``shuffle_xor(16, wave_size)``
+      3. Clamp to ``FLT_MAX`` to avoid inf in the scale
+      4. E8M0 biased exponent via :func:`emit_mx_e8m0_scale`
+      5. Reciprocal ``2^(254-e8m0) << 23`` bitcast to f32
+      6. Truncate E8M0 to i8 for storage
+
+    Args:
+        all_vals: list of f32 DSL values (activated GEMM output columns
+            for one MX block, typically 16 values = 4 sub-tiles x 4 cols).
+        wave_size: compile-time integer, wavefront width (e.g. 32).
+        dtype: MxDtype for the target format (default FP8_E4M3).
+
+    Returns:
+        ``(recip, e8m0_byte)`` — f32 reciprocal scale and i8 E8M0 byte.
+    """
+    c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
+    c16 = arith.constant(16, type=T.i32)
+    c23 = arith.constant(23, type=T.i32)
+    c254 = arith.constant(254, type=T.i32)
+    c_wave = arith.constant(wave_size, type=T.i32)
+
+    block_amax = arith.constant(0.0, type=T.f32)
+    for v in all_vals:
+        abs_v = llvm.call_intrinsic(
+            T.f32, "llvm.fabs.f32", [_raw(v)], [], []
+        )
+        block_amax = arith.maxnumf(block_amax, abs_v)
+    block_amax = arith.minnumf(block_amax, c_flt_max)
+    peer = block_amax.shuffle_xor(c16, c_wave)
+    block_amax = arith.maxnumf(block_amax, peer)
+
+    e8m0 = emit_mx_e8m0_scale(block_amax, dtype=dtype)
+    recip = ((c254 - e8m0) << c23).bitcast(T.f32)
+    e8m0_byte = arith.trunci(T.i8, e8m0)
+    return recip, e8m0_byte
+
+
 def _raw(value):
     """Unwrap a DSL Numeric to a raw ir.Value (rocdl/inline_asm need raw operands)."""
     return value.ir_value() if hasattr(value, "ir_value") else value
