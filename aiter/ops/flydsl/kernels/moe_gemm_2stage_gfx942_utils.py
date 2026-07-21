@@ -33,6 +33,21 @@ def fly_ast_rewrite(member):
         return classmethod(ASTRewriter.transform(member.__func__))
     return ASTRewriter.transform(member)
 
+@fly_ast_rewrite
+def split_works(num_works, num_workers, worker_id, align = 1):
+    num_work_items = num_works // align
+    num_items_per_worker = num_work_items // num_workers
+    num_items_remains = num_work_items % num_workers
+    has_extra = worker_id < num_items_remains
+
+    num_items = has_extra.select(num_items_per_worker + 1, num_items_per_worker)
+    work_item0 = has_extra.select(
+        worker_id * (num_items_per_worker + 1),
+        worker_id * num_items_per_worker + num_items_remains,
+    )
+    work_item1 = work_item0 + num_items
+
+    return work_item0*align, work_item1*align, num_items*align
 
 def load_fragment(thr_view: fx.Tensor):
     """
@@ -269,7 +284,10 @@ def all_copy_atoms(*tensors, atom_bits, num_threads: int):
             else:
                 coord = [(None, i0 + i), *[None] * rk]
             atom_list.append(t[coord])
-        yield atom_list
+        if len(atom_list) == 1:
+            yield atom_list[0]
+        else:
+            yield atom_list
     return
 
 
