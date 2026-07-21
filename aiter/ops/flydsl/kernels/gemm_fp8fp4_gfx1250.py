@@ -1526,6 +1526,7 @@ def compile_fp8fp4_gemm(
                 nb_buf, nb_bases, nas_buf, nas_bases, nbs_buf, nbs_bases, n_ks = (
                     next_bs_info
                 )
+                rocdl.sched_barrier(0)
                 next_result = _load_b_and_scales(
                     nb_buf, nb_bases, nas_buf, nas_bases, nbs_buf, nbs_bases, n_ks
                 )
