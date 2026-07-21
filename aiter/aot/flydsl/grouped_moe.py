@@ -185,7 +185,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     import torch
 
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
-        build_moe_contiguous_psum_module,
         build_moe_contiguous_psum_remap_module,
     )
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -205,6 +204,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     i32 = torch.int32
     u8 = torch.uint8
     bf16 = torch.bfloat16
+    f32 = torch.float32
     E = job["experts"]
     topk = job["topk"]
     model_dim = job["model_dim"]
@@ -216,26 +216,30 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     numel = token_num * topk
     grid = max(1, (numel + 255) // 256)
 
-    def _route_ksplit(feat_dim, source_topk, out_e, out_m, remap_rows=False):
-        launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
-            feat_dim=feat_dim,
-            wmma_rep=wmma_rep,
-            quant_mode=quant_mode,
-            source_topk=source_topk,
-            remap_rows=remap_rows,
-            route_max_m_const=max_m if remap_rows else None,
-        )
-        launch(
-            ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
-            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
-            ptr_arg(torch.empty(0, dtype=u8, device=dev)),
-            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-            1,
-            numel,
-            grid,
-            stream=0,
-        )
+    def _route_ksplit(feat_dim, source_topk, out_e, out_m):
+        # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
+        # sets remap_rows on the grouped MoE fast path (row_starts stays None).
+        # Precompile both ksplit=True (small token) and ksplit=False (large token).
+        for ks in (True, False):
+            launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                source_topk=source_topk,
+                remap_rows=False,
+                ksplit=ks,
+            )
+            launch(
+                ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=u8, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+                1,
+                numel,
+                grid,
+                stream=0,
+            )
 
     def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding):
         launch = build_moe_fused_quant_preshuffle_module(
@@ -270,20 +274,23 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
 
     # --- Stage1 activation prep (a1): fused route + MX-quant + scatter ---
     if contiguous:
-        # DeepGEMM contiguous-M: topids_to_rows -> psum starts, then routeks
-        # remaps rows while quantizing into a single contiguous (E=1) buffer.
+        # DeepGEMM contiguous-M: topids_to_rows -> contiguous psum+remap ->
+        # route-indexed quant+preshuffle into a single contiguous (E=1) buffer.
         ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
         contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
 
         _topids_to_rows()
 
-        psum = build_moe_contiguous_psum_module()
-        psum(
+        psum_remap = build_moe_contiguous_psum_remap_module()
+        psum_remap(
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            numel,
             E,
+            max_m,
             tile_m,
             stream=0,
         )
@@ -293,7 +300,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             source_topk=topk,
             out_e=1,
             out_m=contiguous_m,
-            remap_rows=True,
         )
         a2_out_e, a2_out_m = 1, contiguous_m
     else:
@@ -322,7 +328,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 use_expert_row_base=False,
                 max_m=max_m,
             )
-            launch(
+            launch_args = [
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
@@ -331,9 +337,16 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 ptr_arg(torch.empty(0, dtype=u8, device=dev)),
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 numel,
-                grid,
-                stream=0,
-            )
+            ]
+            if not use_st_ksplit:
+                # Generic path carries the (unused-by-default) EP g2l fusion ABI.
+                launch_args += [
+                    ptr_arg(torch.empty(0, dtype=i32, device=dev)),  # g2l_lut
+                    ptr_arg(torch.empty(0, dtype=f32, device=dev)),  # weight_in
+                    ptr_arg(torch.empty(0, dtype=bf16, device=dev)),  # gather_w
+                    0,  # n_buckets
+                ]
+            launch(*launch_args, grid, stream=0)
         a2_out_e, a2_out_m = E, max_m
 
     # --- Stage2 activation prep (a2): fused grouped quant + preshuffle ---
@@ -377,7 +390,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
             token_num,
             a2_out_e * a2_out_m * (model_dim // 2),
-            a2_out_e * a2_out_m,
             stream=0,
         )
 

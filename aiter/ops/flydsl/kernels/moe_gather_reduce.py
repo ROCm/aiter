@@ -42,9 +42,9 @@ nothing and need no branch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr, vector
+from flydsl.expr import arith, range_constexpr, vector
 from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
+from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
@@ -138,15 +138,13 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: Int32,
         slice_stride_dw: Int32,
-        num_grouped_rows: Int32,
+        num_valid_tokens: fx.Pointer,  # (1,) int32: tokens >= this are dead-tail (EP); skip (their route map is unwritten/garbage)
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
 
         f32 = T.f32
         i32 = T.i32
-        c0_i32 = arith.constant(0, type=i32)
-        c0_f32 = arith.constant(0.0, type=f32)
         vec_i32_ty = T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route
         # weights straight through (no pre-cast); bf16/f16 get extended below.
@@ -156,32 +154,32 @@ def build_moe_gather_reduce_module(
 
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
+        row_dwords_i32 = arith.constant(row_dwords, type=i32)
         vec_i32 = arith.constant(VEC, type=i32)
         num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
         slice_stride_dw_i32 = ArithValue(slice_stride_dw)
-        num_grouped_rows_i32 = ArithValue(num_grouped_rows)
 
-        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
+        # Guard on the dynamic valid-token count (EP dead-tail skip): the grid is
+        # launched over the static num_tokens, but tokens >= num_valid_tokens are
+        # padding whose route map (topids_to_rows) was left unwritten by the route
+        # kernel -> reading it would OOB-index grouped_out. When truncation is
+        # disabled the caller passes num_tokens, so nothing is skipped.
+        nvt = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_tokens),
+                arith.constant(0, type=i32),
+                vec_width=1,
+                dtype=i32,
+            )
+        )
+        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, nvt)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
+            in_rsrc = ptr_rsrc(grouped_out_flat)
             rows_rsrc = ptr_rsrc(topids_to_rows)
             w_rsrc = ptr_rsrc(gather_w)
             out_rsrc = ptr_rsrc(out)
-            in_base_i64 = arith.index_cast(T.i64, ptrtoint(grouped_out_flat))
-            row_bytes_i64 = arith.constant(model_dim * 2, type=T.i64)
-            slice_stride_by_i64 = arith.extui(
-                T.i64, slice_stride_dw_i32
-            ) * arith.constant(4, type=T.i64)
-
-            def src_row_rsrc(row_i32, sk):
-                base = in_base_i64 + arith.extui(T.i64, row_i32) * row_bytes_i64
-                if sk != 0:
-                    base = base + arith.constant(sk, type=T.i64) * slice_stride_by_i64
-                return buffer_ops.create_buffer_resource_from_addr(
-                    base, num_records_bytes=model_dim * 2
-                )
-
             thread_id = ArithValue(tid)
             iter_idx_i32 = ArithValue(fx.block_idx.y)
 
@@ -193,7 +191,7 @@ def build_moe_gather_reduce_module(
             def _load_row_weight(k):
                 """Load (source grouped row, route weight as f32) for slot k."""
                 map_off = map_base + arith.constant(k, type=i32)
-                row_raw = ArithValue(
+                row_i32 = ArithValue(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
                 # weight loaded in its native dtype; extend to f32 unless it is
@@ -206,12 +204,6 @@ def build_moe_gather_reduce_module(
                     if w_dtype == "f32"
                     else ArithValue(arith.extf(f32, w_loaded))
                 )
-                # Unsigned compare treats negative route rows as invalid too.
-                row_valid = arith.cmpi(
-                    CmpIPredicate.ult, row_raw, num_grouped_rows_i32
-                )
-                row_i32 = ArithValue(arith.select(row_valid, _raw(row_raw), c0_i32))
-                w_f32 = ArithValue(arith.select(row_valid, _raw(w_f32), c0_f32))
                 return row_i32, w_f32
 
             dw_base = thread_id * vec_i32 + iter_idx_i32 * arith.constant(
@@ -232,14 +224,16 @@ def build_moe_gather_reduce_module(
 
                     for k in range_constexpr(topk):
                         row_i32, w_f32 = _load_row_weight(k)
+                        src_dw_base = row_i32 * row_dwords_i32 + dw_base
                         red = [
                             ArithValue(arith.constant(0.0, type=f32))
                             for _ in range(2 * VEC)
                         ]
                         for sk in range_constexpr(split_k):
+                            sk_off = arith.constant(sk, type=i32) * slice_stride_dw_i32
                             raw_vec = buffer_ops.buffer_load(
-                                src_row_rsrc(row_i32, sk),
-                                dw_base,
+                                in_rsrc,
+                                src_dw_base + sk_off,
                                 vec_width=VEC,
                                 dtype=i32,
                             )
@@ -285,13 +279,18 @@ def build_moe_gather_reduce_module(
                             acc_hi = ArithValue(arith.constant(0.0, type=f32))
                             for k in range_constexpr(topk):
                                 row_i32, w_f32 = _load_row_weight(k)
+                                src_dw_base = row_i32 * row_dwords_i32 + dw_idx
                                 red_lo = ArithValue(arith.constant(0.0, type=f32))
                                 red_hi = ArithValue(arith.constant(0.0, type=f32))
                                 for sk in range_constexpr(split_k):
+                                    sk_off = (
+                                        arith.constant(sk, type=i32)
+                                        * slice_stride_dw_i32
+                                    )
                                     raw_dw = ArithValue(
                                         buffer_ops.buffer_load(
-                                            src_row_rsrc(row_i32, sk),
-                                            dw_idx,
+                                            in_rsrc,
+                                            src_dw_base + sk_off,
                                             vec_width=1,
                                             dtype=i32,
                                         )
@@ -323,7 +322,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
-        num_grouped_rows: fx.Int32,
+        num_valid_tokens: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -338,7 +337,7 @@ def build_moe_gather_reduce_module(
             out,
             num_tokens,
             slice_stride_dw,
-            num_grouped_rows,
+            num_valid_tokens,
         )
         launcher.launch(
             grid=(idx_tokens, n_iters, 1),

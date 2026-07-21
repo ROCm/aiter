@@ -262,34 +262,6 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     mx_group_base = getattr(c, "mx_group_base", None)
     if mx_group_base is None:
         mx_group_base = arith.constant(0, type=i32)
-
-    payload_base_i64 = getattr(c, "payload_base_i64", None)
-    payload_bytes_per_row = getattr(c, "payload_bytes_per_row", None)
-    dst_payload = []
-    for dst in c.dests:
-        if payload_base_i64 is not None:
-            row_addr = payload_base_i64 + arith.extui(
-                T.i64, dst.payload_row_i32
-            ) * arith.constant(payload_bytes_per_row, type=T.i64)
-            rsrc = buffer_ops.create_buffer_resource_from_addr(
-                row_addr, num_records_bytes=payload_bytes_per_row
-            )
-            dst_payload.append((rsrc, arith.constant(0, type=i32)))
-        else:
-            dst_payload.append((c.payload_rsrc, dst.payload_row_byte_base))
-
-    hidden_base_i64 = getattr(c, "hidden_base_i64", None)
-    if hidden_base_i64 is not None:
-        hidden_row_addr = hidden_base_i64 + arith.extui(
-            T.i64, c.feat_row_i32
-        ) * arith.constant(c.feat_bytes_per_row, type=T.i64)
-        hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            hidden_row_addr, num_records_bytes=c.feat_bytes_per_row
-        )
-        feat_elem_base = arith.constant(0, type=i32)
-    else:
-        hidden_rsrc = c.hidden_rsrc
-        feat_elem_base = c.feat_elem_base
     for it in range_constexpr(c.block_iters):
         # MX block (along K) this lane works on this iteration.
         mx_block = (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
@@ -310,9 +282,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     + c.lane_in_block * c.c_elems_per_lane
                 )
                 # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
-                hidden_dword = (feat_elem_base + col_base) >> c.c1_i32
+                hidden_dword = (c.feat_elem_base + col_base) >> c.c1_i32
                 dwords4 = buffer_ops.buffer_load(
-                    hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
+                    c.hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
                 )
                 vec8_bf16_ty = T.vec(8, T.bf16)
                 vec8_f32_ty = T.vec(8, f32)
@@ -352,10 +324,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     mx_block * arith.constant(32, type=i32)
                     + c.lane_in_block * c.c_elems_per_lane
                 )
-                hidden_dword = (feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
+                hidden_dword = (c.feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
 
                 dword_raw = buffer_ops.buffer_load(
-                    hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
+                    c.hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
                 )
                 vec1_i32_ty = T.vec(1, i32)
                 vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
@@ -439,40 +411,28 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             scale_dword = arith.divui(mx_block, c.c4_i32)
             byte_in_dword = mx_block - scale_dword * c.c4_i32
             e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-            for di, dst in enumerate(c.dests):
-                payload_rsrc, payload_row_base = dst_payload[di]
-                dst_valid = getattr(dst, "valid", None)
+            for dst in c.dests:
+                # payload byte offset within grouped_payload. offset_is_bytes=True
+                # so the i8 (fp4) / i16 (fp8) / i32 (pk8) store does not rescale
+                # this already-byte offset by the data element size.
+                payload_byte_off = (
+                    dst.payload_row_byte_base
+                    + mx_block * c.c_payload_bytes_per_block
+                    + c.lane_in_block * c.c_payload_bytes_per_lane
+                )
+                buffer_ops.buffer_store(
+                    payload_val, c.payload_rsrc, payload_byte_off, offset_is_bytes=True
+                )
 
-                def _emit_dst_store():
-                    # payload byte offset within grouped_payload. offset_is_bytes=True
-                    # so the i8 (fp4) / i16 (fp8) / i32 (pk8) store does not rescale
-                    # this already-byte offset by the data element size.
-                    payload_byte_off = (
-                        payload_row_base
-                        + mx_block * c.c_payload_bytes_per_block
-                        + c.lane_in_block * c.c_payload_bytes_per_lane
+                # one e8m0 byte per block, written by the block's lead lane.
+                _if_lead = scf.IfOp(c.is_block_lead)
+                with ir.InsertionPoint(_if_lead.then_block):
+                    dst_scale_dword = (
+                        dst.scale_row_dword_base + scale_dword * c.c_wmma_rep
                     )
-                    buffer_ops.buffer_store(
-                        payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
-                    )
-
-                    # one e8m0 byte per block, written by the block's lead lane.
-                    _if_lead = scf.IfOp(c.is_block_lead)
-                    with ir.InsertionPoint(_if_lead.then_block):
-                        dst_scale_dword = (
-                            dst.scale_row_dword_base + scale_dword * c.c_wmma_rep
-                        )
-                        dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
-                        buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
-                        scf.YieldOp([])
-
-                if dst_valid is None:
-                    _emit_dst_store()
-                else:
-                    _if_dst = scf.IfOp(dst_valid)
-                    with ir.InsertionPoint(_if_dst.then_block):
-                        _emit_dst_store()
-                        scf.YieldOp([])
+                    dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
+                    buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
+                    scf.YieldOp([])
             scf.YieldOp([])
 
 
@@ -497,6 +457,8 @@ def build_moe_fused_route_quant_scatter_module(
     *,
     use_expert_row_base: bool = True,
     max_m: int = 0,
+    use_g2l: bool = False,
+    weight_dtype: str = "bf16",
 ):
     """Return a JIT launcher for the fused route+quant+scatter+preshuffle kernel.
 
@@ -566,14 +528,15 @@ def build_moe_fused_route_quant_scatter_module(
     topk_shift = topk.bit_length() - 1 if topk_is_pow2 else 0
 
     base_tag = "baseptr" if use_expert_row_base else f"basem{max_m}"
+    g2l_tag = f"_g2l_{weight_dtype}" if use_g2l else ""
     module_name = (
         f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{base_tag}"
+        f"_{quant_mode}_{L.native_tag}_{base_tag}{g2l_tag}"
     )
 
     @flyc.kernel(name=module_name)
     def fused_kernel(
-        topk_ids: fx.Pointer,  # (numel,) int32
+        topk_ids: fx.Pointer,  # (numel,) int32 (GLOBAL expert ids when use_g2l)
         counter: fx.Pointer,  # (E,) int32, init 0
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         hidden: fx.Pointer,  # (token_num*model_dim,) bf16
@@ -581,10 +544,14 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,  # preshuffled e8m0 out
         expert_row_base: fx.Pointer,  # (E,) int32 per-expert dst row base
         numel: Int32,
-        experts: Int32,
+        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local, sentinel=n_buckets
+        weight_in: fx.Pointer,  # (numel,) f32 route weights in (used iff use_g2l)
+        gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
+        n_buckets: Int32,  # sentinel value (== dropped) / local expert count
     ):
         i32 = T.i32
         f32 = T.f32
+        wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
 
         c0_i32 = arith.constant(0, type=i32)
         c1_i32 = arith.constant(1, type=i32)
@@ -623,142 +590,148 @@ def build_moe_fused_route_quant_scatter_module(
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
-            ge0 = arith.cmpi(CmpIPredicate.sge, expert, c0_i32)
-            ltE = arith.cmpi(CmpIPredicate.slt, expert, ArithValue(experts))
-            valid_e = arith.andi(ge0, ltE)
 
-            _if_valid = scf.IfOp(valid_e, has_else=True)
-            with ir.InsertionPoint(_if_valid.then_block):
-                # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
-                # it to the warp. Single-token pow2 cases use the dedicated st_ksplit
-                # kernel, so the generic path does not need a runtime numel==topk
-                # branch here.
-                slot_on_lane0 = arith.constant(0, type=i32)
-                if lane == 0:
-                    counter_base = arith.index_cast(T.index, ptrtoint(counter))
-                    expert_idx = arith.index_cast(T.index, expert)
-                    counter_addr = fx.Index(counter_base) + fx.Index(
-                        expert_idx
-                    ) * fx.Index(4)
-                    counter_ptr = buffer_ops.create_llvm_ptr(
-                        counter_addr, address_space=1
-                    )
-                    counter_ptr = (
-                        counter_ptr._value
-                        if hasattr(counter_ptr, "_value")
-                        else counter_ptr
-                    )
-                    slot_on_lane0 = ArithValue(
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.add,
-                            counter_ptr,
-                            arith.constant(1, type=i32),
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="agent",
-                            alignment=4,
-                        ).result
-                    )
-                # readlane needs raw ir.Value operands in this FlyDSL build (the
-                # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
-                slot = ArithValue(
-                    rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32))
+            # EP global->local remap (warp-uniform). Dropped (non-local) routes
+            # fold into bucket 0 -- matching the prior host behaviour, so they
+            # still take a unique atomic slot and never collide with a real row --
+            # and their gather weight is zeroed so the final reduce ignores them.
+            # Replaces the host cumsum/index/eq/where/masked_fill chain.
+            if const_expr(use_g2l):
+                g2l_rsrc = ptr_rsrc(g2l_lut)
+                le = buffer_ops.buffer_load(
+                    g2l_rsrc, expert, vec_width=1, dtype=i32
                 )
-                slot = ArithValue(slot)
-
-                # Destination row = per-expert base + within-expert slot. Masked
-                # layout fuses the former Python-side arange(E)*max_m into this
-                # kernel; contiguous-M still loads starts[e] from expert_row_base.
-                if const_expr(use_expert_row_base):
-                    erb_rsrc = ptr_rsrc(expert_row_base)
-                    row_base = ArithValue(
-                        buffer_ops.buffer_load(
-                            erb_rsrc, expert, vec_width=1, dtype=i32
-                        )
-                    )
-                else:
-                    row_base = expert * c_max_m
-                grouped_row = slot + row_base
-                if const_expr(topk_is_pow2):
-                    token = route >> c_topk_shift
-                else:
-                    token = arith.divui(route, c_topk)
-
-                # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
-                if lane == 0:
-                    topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
-                    buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
-
-                # --- per-row scale-preshuffle geometry (uniform; from the *global*
-                #     grouped_row so the same math serves both output layouts). Since
-                #     every expert base is a multiple of rows_per_tile, tiling by the
-                #     global row reproduces the per-expert byte layout exactly. ---
-                scale_tile = arith.divui(grouped_row, c_rows_per_tile)
-                row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-                wmma_row = arith.divui(row_in_tile, c16_i32)
-                row_lane16 = row_in_tile - wmma_row * c16_i32
-                out_row = scale_tile * c16_i32 + row_lane16
-                # dst dword base for out_row; scale_dword*wmma_rep added per block.
-                scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
-
-                payload_row_byte_base = grouped_row * c_payload_bytes_per_row
-                hidden_elem_base = (
-                    token * c_model_dim
-                )  # bf16 element base for this token
-
-                hidden_rsrc = ptr_rsrc(hidden)
-                payload_rsrc = ptr_rsrc(grouped_payload)
-                scale_rsrc = ptr_rsrc(grouped_scale)
-
-                # this lane's position inside its MX block group
-                block_in_wave = arith.divui(lane, c_lanes_per_block)
-                lane_in_block = lane - block_in_wave * c_lanes_per_block
-                is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
-
-                c = SimpleNamespace(
-                    i32=i32,
-                    f32=f32,
-                    block_iters=block_iters,
-                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                    mx_blocks_per_row=mx_blocks_per_row,
-                    amax_shuffle_dists=amax_shuffle_dists,
-                    is_fp8=is_fp8,
-                    use_native=use_native,
-                    use_pk8=use_pk8,
-                    mx_dtype=mx_dtype,
-                    c0_i32=c0_i32,
-                    c1_i32=c1_i32,
-                    c4_i32=c4_i32,
-                    c23_i32=c23_i32,
-                    c254_i32=c254_i32,
-                    c0_f32=c0_f32,
-                    c_wave=c_wave,
-                    c_elems_per_lane=c_elems_per_lane,
-                    c_payload_bytes_per_block=c_payload_bytes_per_block,
-                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                    c_wmma_rep=c_wmma_rep,
-                    block_in_wave=block_in_wave,
-                    lane_in_block=lane_in_block,
-                    is_block_lead=is_block_lead,
-                    dests=[
-                        SimpleNamespace(
-                            payload_row_byte_base=payload_row_byte_base,
-                            scale_row_dword_base=scale_row_dword_base,
-                        )
-                    ],
-                    feat_elem_base=hidden_elem_base,
-                    hidden_rsrc=hidden_rsrc,
-                    payload_rsrc=payload_rsrc,
-                    scale_rsrc=scale_rsrc,
+                is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
+                expert = ArithValue(arith.select(is_drop, c0_i32, le))
+                # Fused weight cast+mask (warp-uniform: every lane writes the same
+                # value to gather_w[route], redundant but race-free). Reads f32
+                # weight_in and writes weight_dtype (kept -> cast, dropped -> 0),
+                # folding the host topk_weight.to(bf16) copy + masked_fill.
+                wi_rsrc = ptr_rsrc(weight_in)
+                gather_w_rsrc = ptr_rsrc(gather_w)
+                w_f32 = buffer_ops.buffer_load(
+                    wi_rsrc, route, vec_width=1, dtype=f32
                 )
-                _emit_quant_block_loop(c)
-                scf.YieldOp([])
-            with ir.InsertionPoint(_if_valid.else_block):
-                if lane == 0:
-                    topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
-                    buffer_ops.buffer_store(
-                        arith.constant(-1, type=i32), topids_to_rows_rsrc, route
+                w_cast = arith.trunc_f(wdt, w_f32)
+                w_out = arith.select(
+                    is_drop, arith.constant(0.0, type=wdt), w_cast
+                )
+                buffer_ops.buffer_store(w_out, gather_w_rsrc, route)
+
+            # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
+            # it to the warp. Single-token pow2 cases use the dedicated st_ksplit
+            # kernel, so the generic path does not need a runtime numel==topk
+            # branch here.
+            slot_on_lane0 = arith.constant(0, type=i32)
+            if lane == 0:
+                counter_base = arith.index_cast(T.index, ptrtoint(counter))
+                expert_idx = arith.index_cast(T.index, expert)
+                counter_addr = fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(
+                    4
+                )
+                counter_ptr = buffer_ops.create_llvm_ptr(counter_addr, address_space=1)
+                counter_ptr = (
+                    counter_ptr._value
+                    if hasattr(counter_ptr, "_value")
+                    else counter_ptr
+                )
+                slot_on_lane0 = ArithValue(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        counter_ptr,
+                        arith.constant(1, type=i32),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                )
+            # readlane needs raw ir.Value operands in this FlyDSL build (the
+            # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
+            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
+            slot = ArithValue(slot)
+
+            # Destination row = per-expert base + within-expert slot. Masked
+            # layout fuses the former Python-side arange(E)*max_m into this
+            # kernel; contiguous-M still loads starts[e] from expert_row_base.
+            if const_expr(use_expert_row_base):
+                erb_rsrc = ptr_rsrc(expert_row_base)
+                row_base = ArithValue(
+                    buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
+                )
+            else:
+                row_base = expert * c_max_m
+            grouped_row = slot + row_base
+            if const_expr(topk_is_pow2):
+                token = route >> c_topk_shift
+            else:
+                token = arith.divui(route, c_topk)
+
+            # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
+            if lane == 0:
+                topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
+                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
+
+            # --- per-row scale-preshuffle geometry (uniform; from the *global*
+            #     grouped_row so the same math serves both output layouts). Since
+            #     every expert base is a multiple of rows_per_tile, tiling by the
+            #     global row reproduces the per-expert byte layout exactly. ---
+            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            # dst dword base for out_row; scale_dword*wmma_rep added per block.
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+
+            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
+            hidden_elem_base = token * c_model_dim  # bf16 element base for this token
+
+            hidden_rsrc = ptr_rsrc(hidden)
+            payload_rsrc = ptr_rsrc(grouped_payload)
+            scale_rsrc = ptr_rsrc(grouped_scale)
+
+            # this lane's position inside its MX block group
+            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+
+            c = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=block_iters,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=is_block_lead,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
                     )
-                scf.YieldOp([])
+                ],
+                feat_elem_base=hidden_elem_base,
+                hidden_rsrc=hidden_rsrc,
+                payload_rsrc=payload_rsrc,
+                scale_rsrc=scale_rsrc,
+            )
+            _emit_quant_block_loop(c)
             scf.YieldOp([])
 
     @flyc.jit
@@ -771,7 +744,10 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
-        experts: fx.Int32,
+        g2l_lut: fx.Pointer,
+        weight_in: fx.Pointer,
+        gather_w: fx.Pointer,
+        n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -789,7 +765,10 @@ def build_moe_fused_route_quant_scatter_module(
             grouped_scale,
             expert_row_base,
             numel,
-            experts,
+            g2l_lut,
+            weight_in,
+            gather_w,
+            n_buckets,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -876,7 +855,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         grouped_scale: fx.Pointer,  # out
         expert_row_base: fx.Pointer,  # (E,) int32
         numel: Int32,  # == topk for this specialization
-        experts: Int32,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -915,9 +893,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
-            ge0 = arith.cmpi(CmpIPredicate.sge, expert, c0_i32)
-            ltE = arith.cmpi(CmpIPredicate.slt, expert, ArithValue(experts))
-            valid_e = arith.andi(ge0, ltE)
 
             # torch.topk over experts returns distinct expert indices for one
             # token. Therefore each selected expert receives exactly one route:
@@ -928,88 +903,76 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
             is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
             is_lane0_k0 = arith.andi(is_lane0, is_k0)
-            _if_valid = scf.IfOp(valid_e, has_else=True)
-            with ir.InsertionPoint(_if_valid.then_block):
-                if is_lane0_k0:
-                    counter_rsrc = ptr_rsrc(counter)
-                    buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
+            if is_lane0_k0:
+                counter_rsrc = ptr_rsrc(counter)
+                buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
 
-                if const_expr(use_expert_row_base):
-                    erb_rsrc = ptr_rsrc(expert_row_base)
-                    row_base = ArithValue(
-                        buffer_ops.buffer_load(
-                            erb_rsrc, expert, vec_width=1, dtype=i32
-                        )
-                    )
-                else:
-                    row_base = expert * c_max_m
-                grouped_row = slot + row_base
-
-                if is_lane0_k0:
-                    topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
-                    buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
-
-                scale_tile = arith.divui(grouped_row, c_rows_per_tile)
-                row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-                wmma_row = arith.divui(row_in_tile, c16_i32)
-                row_lane16 = row_in_tile - wmma_row * c16_i32
-                out_row = scale_tile * c16_i32 + row_lane16
-                scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
-                payload_row_byte_base = grouped_row * c_payload_bytes_per_row
-
-                hidden_rsrc = ptr_rsrc(hidden)
-                payload_rsrc = ptr_rsrc(grouped_payload)
-                scale_rsrc = ptr_rsrc(grouped_scale)
-
-                block_in_wave = arith.divui(lane, c_lanes_per_block)
-                lane_in_block = lane - block_in_wave * c_lanes_per_block
-                is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
-
-                c = SimpleNamespace(
-                    i32=i32,
-                    f32=f32,
-                    block_iters=1,
-                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                    mx_blocks_per_row=mx_blocks_per_row,
-                    amax_shuffle_dists=amax_shuffle_dists,
-                    is_fp8=is_fp8,
-                    use_native=use_native,
-                    use_pk8=use_pk8,
-                    mx_dtype=mx_dtype,
-                    c0_i32=c0_i32,
-                    c1_i32=c1_i32,
-                    c4_i32=c4_i32,
-                    c23_i32=c23_i32,
-                    c254_i32=c254_i32,
-                    c0_f32=c0_f32,
-                    c_wave=c_wave,
-                    c_elems_per_lane=c_elems_per_lane,
-                    c_payload_bytes_per_block=c_payload_bytes_per_block,
-                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                    c_wmma_rep=c_wmma_rep,
-                    block_in_wave=block_in_wave,
-                    lane_in_block=lane_in_block,
-                    is_block_lead=is_block_lead,
-                    dests=[
-                        SimpleNamespace(
-                            payload_row_byte_base=payload_row_byte_base,
-                            scale_row_dword_base=scale_row_dword_base,
-                        )
-                    ],
-                    feat_elem_base=c0_i32,
-                    hidden_rsrc=hidden_rsrc,
-                    payload_rsrc=payload_rsrc,
-                    scale_rsrc=scale_rsrc,
+            if const_expr(use_expert_row_base):
+                erb_rsrc = ptr_rsrc(expert_row_base)
+                row_base = ArithValue(
+                    buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
                 )
-                _emit_quant_one_k_group(c, k_group)
-                scf.YieldOp([])
-            with ir.InsertionPoint(_if_valid.else_block):
-                if is_lane0_k0:
-                    topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
-                    buffer_ops.buffer_store(
-                        arith.constant(-1, type=i32), topids_to_rows_rsrc, route
+            else:
+                row_base = expert * c_max_m
+            grouped_row = slot + row_base
+
+            if is_lane0_k0:
+                topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
+                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
+
+            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
+
+            hidden_rsrc = ptr_rsrc(hidden)
+            payload_rsrc = ptr_rsrc(grouped_payload)
+            scale_rsrc = ptr_rsrc(grouped_scale)
+
+            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+
+            c = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=1,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=is_block_lead,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
                     )
-                scf.YieldOp([])
+                ],
+                feat_elem_base=c0_i32,
+                hidden_rsrc=hidden_rsrc,
+                payload_rsrc=payload_rsrc,
+                scale_rsrc=scale_rsrc,
+            )
+            _emit_quant_one_k_group(c, k_group)
             scf.YieldOp([])
 
     @flyc.jit
@@ -1022,7 +985,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         grouped_scale: fx.Pointer,
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
-        experts: fx.Int32,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -1037,7 +999,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             grouped_scale,
             expert_row_base,
             numel,
-            experts,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(block_threads, 1, 1),
@@ -1297,15 +1258,17 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
-    route_max_m_const: int | None = None,
+    ksplit: bool = True,
 ):
-    """Route-indexed K-split grouped quant+preshuffle for small token counts.
+    """Route-indexed grouped quant+preshuffle.
 
     Instead of launching over every row in the (E, max_m) capacity buffer and
     skipping padding, this kernel launches only over routed rows
-    (``topids_to_rows``) and K groups. It works for both masked and contiguous-M
-    layouts because ``topids_to_rows`` already contains the global row index in
-    the actual output/input buffer.
+    (``topids_to_rows``). When ``ksplit=True`` (designed for small token counts
+    where grid.x is too small to saturate the GPU), the K-dimension is split
+    across ``grid.y = block_iters`` so each workgroup handles one K-group.
+    When ``ksplit=False`` (large token counts where grid.x already saturates),
+    ``grid.y = 1`` and each warp loops over all K-groups internally.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -1333,17 +1296,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows else ""
-    route_max_m_static = (
-        int(route_max_m_const) if route_max_m_const is not None else None
-    )
-    max_m_tag = f"_m{route_max_m_static}" if route_max_m_static is not None else ""
+    ksplit_tag = "" if ksplit else "_noKS"
     source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
     source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
-    token_multi_dest = source_topk > 1
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{max_m_tag}"
+        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
     )
 
     @flyc.kernel(name=module_name)
@@ -1355,6 +1314,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_starts: fx.Pointer,  # (E,) int32, read iff remap_rows
         route_max_m: Int32,  # masked route stride, read iff remap_rows
         numel: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
     ):
         i32 = T.i32
         f32 = T.f32
@@ -1382,124 +1342,67 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
         tid = ArithValue(fx.thread_idx.x)
         bid = ArithValue(fx.block_idx.x)
-        k_group = ArithValue(fx.block_idx.y)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave
-        route_or_token = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        if const_expr(token_multi_dest):
-            route_base = route_or_token * c_source_topk
-            route_in_range = arith.cmpi(
-                CmpIPredicate.ult, route_base, ArithValue(numel)
+        # Dynamic EP token count (capture-safe, no host sync): grid is launched over
+        # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
+        # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
+        # When truncation is disabled the caller passes numel, so nothing is skipped.
+        nvr = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
             )
-        else:
-            route = route_or_token
-            route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        )
+        route_in_range = arith.cmpi(CmpIPredicate.ult, route, nvr)
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
             rows_rsrc = ptr_rsrc(topids_to_rows)
-
-            def _load_route_row_uniform(route_idx):
-                row_on_lane0 = arith.constant(0, type=i32)
-                valid_on_lane0 = arith.constant(0, type=i32)
-                if lane == 0:
-                    route_ok = arith.cmpi(
-                        CmpIPredicate.ult, route_idx, ArithValue(numel)
-                    )
-                    load_if = scf.IfOp(route_ok, results_=[i32, i32], has_else=True)
-                    with ir.InsertionPoint(load_if.then_block):
-                        row_raw = ArithValue(
-                            buffer_ops.buffer_load(
-                                rows_rsrc, route_idx, vec_width=1, dtype=i32
-                            )
-                        )
-                        row_ge0 = arith.cmpi(CmpIPredicate.sge, row_raw, c0_i32)
-                        row_safe = arith.select(row_ge0, _raw(row_raw), c0_i32)
-                        row_valid_i32 = arith.select(row_ge0, c1_i32, c0_i32)
-                        scf.YieldOp([row_safe, row_valid_i32])
-                    with ir.InsertionPoint(load_if.else_block):
-                        scf.YieldOp([c0_i32, c0_i32])
-                    row_on_lane0 = ArithValue(load_if.results[0])
-                    valid_on_lane0 = ArithValue(load_if.results[1])
-                row = ArithValue(
-                    rocdl.readlane(i32, _raw(row_on_lane0), _raw(c0_i32))
-                )
-                valid_i32 = ArithValue(
-                    rocdl.readlane(i32, _raw(valid_on_lane0), _raw(c0_i32))
-                )
-                row_valid = arith.cmpi(CmpIPredicate.ne, valid_i32, c0_i32)
-                return row, row_valid
-
-            def _remap_row_uniform(row, row_valid, route_idx):
-                remapped_on_lane0 = arith.constant(0, type=i32)
-                if lane == 0:
-                    m = (
-                        arith.constant(route_max_m_static, type=i32)
-                        if const_expr(route_max_m_static is not None)
-                        else ArithValue(route_max_m)
-                    )
-                    expert = ArithValue(arith.divui(row, m))
-                    slot = row - expert * m
-                    starts_rsrc = ptr_rsrc(row_starts)
-                    remapped_on_lane0 = (
-                        ArithValue(
-                            buffer_ops.buffer_load(
-                                starts_rsrc, expert, vec_width=1, dtype=i32
-                            )
-                        )
-                        + slot
-                    )
-                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
-                    store_valid = arith.andi(row_valid, is_k0)
-                    _if_store = scf.IfOp(store_valid)
-                    with ir.InsertionPoint(_if_store.then_block):
-                        buffer_ops.buffer_store(remapped_on_lane0, rows_rsrc, route_idx)
-                        scf.YieldOp([])
-                return (
+            row = ArithValue(
+                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
+            )
+            if const_expr(remap_rows):
+                m = ArithValue(route_max_m)
+                expert = ArithValue(arith.divui(row, m))
+                slot = row - expert * m
+                starts_rsrc = ptr_rsrc(row_starts)
+                row = (
                     ArithValue(
-                        rocdl.readlane(i32, _raw(remapped_on_lane0), _raw(c0_i32))
-                    ),
-                    row_valid,
-                )
-
-            def _make_dest_uniform(row, row_valid):
-                payload_base_lane0 = arith.constant(0, type=i32)
-                scale_base_lane0 = arith.constant(0, type=i32)
-                if lane == 0:
-                    payload_base_lane0 = row * c_payload_bytes_per_row
-                    if const_expr(wmma_rep == 1):
-                        scale_base_lane0 = row * c_dst_scale_dwords_per_row
-                    else:
-                        scale_tile = arith.divui(row, c_rows_per_tile)
-                        row_in_tile = row - scale_tile * c_rows_per_tile
-                        wmma_row = arith.divui(row_in_tile, c16_i32)
-                        row_lane16 = row_in_tile - wmma_row * c16_i32
-                        out_row = scale_tile * c16_i32 + row_lane16
-                        scale_base_lane0 = (
-                            out_row * c_dst_scale_dwords_per_row + wmma_row
+                        buffer_ops.buffer_load(
+                            starts_rsrc, expert, vec_width=1, dtype=i32
                         )
-                return SimpleNamespace(
-                    payload_row_byte_base=ArithValue(
-                        rocdl.readlane(i32, _raw(payload_base_lane0), _raw(c0_i32))
-                    ),
-                    scale_row_dword_base=ArithValue(
-                        rocdl.readlane(i32, _raw(scale_base_lane0), _raw(c0_i32))
-                    ),
-                    valid=row_valid,
+                    )
+                    + slot
                 )
-
-            if const_expr(source_topk > 0):
-                if const_expr(token_multi_dest):
-                    source_row = route_or_token
+                is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
+                if const_expr(ksplit):
+                    k_group = ArithValue(fx.block_idx.y)
+                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
+                    store_cond = arith.andi(is_lane0, is_k0)
                 else:
-                    if const_expr(source_topk_is_pow2):
-                        source_row = route >> c_source_topk_shift
-                    else:
-                        source_row = arith.divui(route, c_source_topk)
+                    store_cond = is_lane0
+                _if_store = scf.IfOp(store_cond)
+                with ir.InsertionPoint(_if_store.then_block):
+                    buffer_ops.buffer_store(row, rows_rsrc, route)
+                    scf.YieldOp([])
+
+            scale_tile = arith.divui(row, c_rows_per_tile)
+            row_in_tile = row - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+
+            payload_row_byte_base = row * c_payload_bytes_per_row
+            if const_expr(source_topk > 0):
+                if const_expr(source_topk_is_pow2):
+                    source_row = route >> c_source_topk_shift
+                else:
+                    source_row = arith.divui(route, c_source_topk)
                 feat_elem_base = source_row * c_feat_dim
             else:
-                row, row_valid = _load_route_row_uniform(route)
                 feat_elem_base = row * c_feat_dim
 
             hidden_rsrc = ptr_rsrc(grouped_in)
@@ -1510,10 +1413,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
 
-            c = SimpleNamespace(
+            qc = SimpleNamespace(
                 i32=i32,
                 f32=f32,
-                block_iters=1,
+                block_iters=1 if ksplit else block_iters,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
                 mx_blocks_per_row=mx_blocks_per_row,
                 amax_shuffle_dists=amax_shuffle_dists,
@@ -1535,29 +1438,25 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=is_block_lead,
-                dests=[],
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
+                    )
+                ],
                 feat_elem_base=feat_elem_base,
                 hidden_rsrc=hidden_rsrc,
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
             )
-            if const_expr(token_multi_dest):
-                for k in range_constexpr(source_topk):
-                    dst_route = route_base + arith.constant(k, type=i32)
-                    dst_row, dst_valid = _load_route_row_uniform(dst_route)
-                    if const_expr(remap_rows):
-                        dst_row, dst_valid = _remap_row_uniform(
-                            dst_row, dst_valid, dst_route
-                        )
-                    c.dests.append(_make_dest_uniform(dst_row, dst_valid))
+            if const_expr(ksplit):
+                k_group_val = ArithValue(fx.block_idx.y)
+                _emit_quant_one_k_group(qc, k_group_val)
             else:
-                if const_expr(source_topk > 0):
-                    row, row_valid = _load_route_row_uniform(route)
-                if const_expr(remap_rows):
-                    row, row_valid = _remap_row_uniform(row, row_valid, route)
-                c.dests.append(_make_dest_uniform(row, row_valid))
-            _emit_quant_one_k_group(c, k_group)
+                _emit_quant_block_loop(qc)
             scf.YieldOp([])
+
+    _grid_y_dim = block_iters if ksplit else 1
 
     @flyc.jit
     def launch_fused(
@@ -1568,22 +1467,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_starts: fx.Pointer,
         route_max_m: fx.Int32,
         numel: fx.Int32,
+        num_valid_routes: fx.Pointer,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        if const_expr(token_multi_dest):
-            token_count = arith.divui(
-                ArithValue(numel) + arith.constant(source_topk - 1, type=T.i32),
-                arith.constant(source_topk, type=T.i32),
-            )
-            grid_x_i32 = arith.divui(
-                token_count + arith.constant(warps_per_block - 1, type=T.i32),
-                arith.constant(warps_per_block, type=T.i32),
-            )
-            grid_x = arith.index_cast(T.index, grid_x_i32)
-        else:
-            grid_x = arith.index_cast(T.index, grid_route_blocks)
-        grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
+        grid_x = arith.index_cast(T.index, grid_route_blocks)
+        grid_y = arith.index_cast(
+            T.index, arith.constant(_grid_y_dim, type=T.i32)
+        )
         fused_kernel(
             grouped_in,
             grouped_payload,
@@ -1592,6 +1483,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             row_starts,
             route_max_m,
             numel,
+            num_valid_routes,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -1799,14 +1691,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            ge0 = arith.cmpi(CmpIPredicate.sge, expert, c0_i32)
-            ltE = arith.cmpi(CmpIPredicate.slt, expert, ArithValue(experts))
-            valid_e = arith.andi(ge0, ltE)
-            _if_valid = scf.IfOp(valid_e)
-            with ir.InsertionPoint(_if_valid.then_block):
-                if lane == 0:
-                    _atomic_add(count, expert, c1_i32)
-                scf.YieldOp([])
+            if lane == 0:
+                _atomic_add(count, expert, c1_i32)
             scf.YieldOp([])
 
         # ===================== Barrier A + Phase 2: prefix sum ==================
@@ -1918,90 +1804,78 @@ def build_moe_fused_route_psum_quant_scatter_module(
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            ge0 = arith.cmpi(CmpIPredicate.sge, expert, c0_i32)
-            ltE = arith.cmpi(CmpIPredicate.slt, expert, ArithValue(experts))
-            valid_e = arith.andi(ge0, ltE)
 
-            _if_valid = scf.IfOp(valid_e, has_else=True)
-            with ir.InsertionPoint(_if_valid.then_block):
-                # lane 0 claims the within-expert slot and reads the (published) per-
-                # expert row base; both are warp-uniform, broadcast via readlane.
-                slot_on_lane0 = arith.constant(0, type=i32)
-                rowbase_on_lane0 = arith.constant(0, type=i32)
-                if lane == 0:
-                    slot_on_lane0 = _atomic_add(slot_counter, expert, c1_i32)
-                    rowbase_on_lane0 = buffer_ops.buffer_load(
-                        starts_rd_rsrc, _raw(expert), vec_width=1, dtype=i32
-                    )
-                slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
-                row_base = ArithValue(
-                    rocdl.readlane(i32, _raw(rowbase_on_lane0), _raw(c0_i32))
+            # lane 0 claims the within-expert slot and reads the (published) per-
+            # expert row base; both are warp-uniform, broadcast via readlane.
+            slot_on_lane0 = arith.constant(0, type=i32)
+            rowbase_on_lane0 = arith.constant(0, type=i32)
+            if lane == 0:
+                slot_on_lane0 = _atomic_add(slot_counter, expert, c1_i32)
+                rowbase_on_lane0 = buffer_ops.buffer_load(
+                    starts_rd_rsrc, _raw(expert), vec_width=1, dtype=i32
                 )
-                grouped_row = slot + row_base
-                token = arith.divui(route_i32, c_topk)
+            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
+            row_base = ArithValue(
+                rocdl.readlane(i32, _raw(rowbase_on_lane0), _raw(c0_i32))
+            )
+            grouped_row = slot + row_base
+            token = arith.divui(route_i32, c_topk)
 
-                if lane == 0:
-                    buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route_i32)
+            if lane == 0:
+                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route_i32)
 
-                # per-row scale-preshuffle geometry from the global grouped_row.
-                scale_tile = arith.divui(grouped_row, c_rows_per_tile)
-                row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-                wmma_row = arith.divui(row_in_tile, c16_i32)
-                row_lane16 = row_in_tile - wmma_row * c16_i32
-                out_row = scale_tile * c16_i32 + row_lane16
-                scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            # per-row scale-preshuffle geometry from the global grouped_row.
+            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-                payload_row_byte_base = grouped_row * c_payload_bytes_per_row
-                hidden_elem_base = token * c_model_dim
+            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
+            hidden_elem_base = token * c_model_dim
 
-                block_in_wave = arith.divui(lane, c_lanes_per_block)
-                lane_in_block = lane - block_in_wave * c_lanes_per_block
-                is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
 
-                c = SimpleNamespace(
-                    i32=i32,
-                    f32=f32,
-                    block_iters=block_iters,
-                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                    mx_blocks_per_row=mx_blocks_per_row,
-                    amax_shuffle_dists=amax_shuffle_dists,
-                    is_fp8=is_fp8,
-                    use_native=use_native,
-                    use_pk8=use_pk8,
-                    mx_dtype=mx_dtype,
-                    c0_i32=c0_i32,
-                    c1_i32=c1_i32,
-                    c4_i32=c4_i32,
-                    c23_i32=c23_i32,
-                    c254_i32=c254_i32,
-                    c0_f32=c0_f32,
-                    c_wave=c_wave,
-                    c_elems_per_lane=c_elems_per_lane,
-                    c_payload_bytes_per_block=c_payload_bytes_per_block,
-                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                    c_wmma_rep=c_wmma_rep,
-                    block_in_wave=block_in_wave,
-                    lane_in_block=lane_in_block,
-                    is_block_lead=is_block_lead,
-                    dests=[
-                        SimpleNamespace(
-                            payload_row_byte_base=payload_row_byte_base,
-                            scale_row_dword_base=scale_row_dword_base,
-                        )
-                    ],
-                    feat_elem_base=hidden_elem_base,
-                    hidden_rsrc=hidden_rsrc,
-                    payload_rsrc=payload_rsrc,
-                    scale_rsrc=scale_rsrc,
-                )
-                _emit_quant_block_loop(c)
-                scf.YieldOp([])
-            with ir.InsertionPoint(_if_valid.else_block):
-                if lane == 0:
-                    buffer_ops.buffer_store(
-                        arith.constant(-1, type=i32), topids_to_rows_rsrc, route_i32
+            c = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=block_iters,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=is_block_lead,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
                     )
-                scf.YieldOp([])
+                ],
+                feat_elem_base=hidden_elem_base,
+                hidden_rsrc=hidden_rsrc,
+                payload_rsrc=payload_rsrc,
+                scale_rsrc=scale_rsrc,
+            )
+            _emit_quant_block_loop(c)
             scf.YieldOp([])
 
     @flyc.jit

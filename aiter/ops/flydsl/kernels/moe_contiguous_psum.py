@@ -193,6 +193,7 @@ def build_moe_contiguous_psum_remap_module():
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
     ):
         i32 = T.i32
         tid = ArithValue(fx.thread_idx.x)
@@ -279,26 +280,32 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
+        # Only remap valid routes ([0, nvr)); dead-tail routes (>= num_valid_routes)
+        # hold unwritten/garbage rows from the route kernel and must NOT be used as
+        # a row index (would OOB-read starts[expert]). They are never read
+        # downstream. When truncation is disabled the caller passes numel == nvr.
+        nvr = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes),
+                arith.constant(0, type=i32),
+                vec_width=1,
+                dtype=i32,
+            )
+        )
         tid_idx = arith.index_cast(T.index, tid)
-        numel_idx = arith.index_cast(T.index, ArithValue(numel))
+        nvr_idx = arith.index_cast(T.index, ArithValue(nvr))
         stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
-        remap_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
+        remap_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
         with ir.InsertionPoint(remap_loop.body):
             route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            row_valid = arith.cmpi(
-                CmpIPredicate.sge, row, arith.constant(0, type=i32)
-            )
-            _if_row = scf.IfOp(row_valid)
-            with ir.InsertionPoint(_if_row.then_block):
-                m = ArithValue(route_max_m)
-                expert = ArithValue(arith.divui(row, m))
-                slot = row - expert * m
-                start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-                buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
-                scf.YieldOp([])
+            m = ArithValue(route_max_m)
+            expert = ArithValue(arith.divui(row, m))
+            slot = row - expert * m
+            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
             scf.YieldOp([])
 
     @flyc.jit
@@ -312,6 +319,7 @@ def build_moe_contiguous_psum_remap_module():
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
+        num_valid_routes: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -328,6 +336,7 @@ def build_moe_contiguous_psum_remap_module():
             experts,
             route_max_m,
             tile_m,
+            num_valid_routes,
         ).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
@@ -429,33 +438,24 @@ def build_moe_route_psum_fused_module():
         with ir.InsertionPoint(route_loop.body):
             route_i32 = arith.index_cast(i32, route_loop.induction_variable)
             e = buffer_ops.buffer_load(topk_rsrc, route_i32, vec_width=1, dtype=i32)
-            ge0 = arith.cmpi(CmpIPredicate.sge, e, arith.constant(0, type=i32))
-            ltE = arith.cmpi(CmpIPredicate.slt, e, ArithValue(experts))
-            valid_e = arith.andi(ge0, ltE)
-            _if_valid = scf.IfOp(valid_e, has_else=True)
-            with ir.InsertionPoint(_if_valid.then_block):
-                e_idx = arith.index_cast(T.index, e)
-                addr = (
-                    fx.Index(cnt_base_idx)
-                    + fx.Index(cnt_off)
-                    + fx.Index(e_idx) * fx.Index(4)
-                )
-                ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
-                ptr = ptr._value if hasattr(ptr, "_value") else ptr
-                slot = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    ptr,
-                    arith.constant(1, type=i32),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="workgroup",
-                    alignment=4,
-                ).result
-                row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
-                buffer_ops.buffer_store(row, rows_rsrc, route_i32)
-                scf.YieldOp([])
-            with ir.InsertionPoint(_if_valid.else_block):
-                buffer_ops.buffer_store(arith.constant(-1, type=i32), rows_rsrc, route_i32)
-                scf.YieldOp([])
+            e_idx = arith.index_cast(T.index, e)
+            addr = (
+                fx.Index(cnt_base_idx)
+                + fx.Index(cnt_off)
+                + fx.Index(e_idx) * fx.Index(4)
+            )
+            ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
+            ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            slot = llvm.AtomicRMWOp(
+                llvm.AtomicBinOp.add,
+                ptr,
+                arith.constant(1, type=i32),
+                llvm.AtomicOrdering.monotonic,
+                syncscope="workgroup",
+                alignment=4,
+            ).result
+            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+            buffer_ops.buffer_store(row, rows_rsrc, route_i32)
             scf.YieldOp([])
         gpu.barrier()
 
@@ -515,17 +515,11 @@ def build_moe_route_psum_fused_module():
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            row_valid = arith.cmpi(
-                CmpIPredicate.sge, row, arith.constant(0, type=i32)
-            )
-            _if_row = scf.IfOp(row_valid)
-            with ir.InsertionPoint(_if_row.then_block):
-                m = ArithValue(max_m)
-                expert = ArithValue(arith.divui(row, m))
-                slot = row - expert * m
-                start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-                buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
-                scf.YieldOp([])
+            m = ArithValue(max_m)
+            expert = ArithValue(arith.divui(row, m))
+            slot = row - expert * m
+            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
             scf.YieldOp([])
 
     @flyc.jit
