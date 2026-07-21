@@ -33,6 +33,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
+    lds_load_b128,
     lds_load_b128_raw,
     lds_load_b32_raw,
     lds_store_b64,
@@ -207,6 +208,17 @@ def compile_mxscale_gemm(
             # The persistent scheduler consumes arg_m_tile_prefix (the slot the
             # fused row->dest/weight map is smuggled through), so it is unavailable.
             raise ValueError("ep_p2p_write requires the non-persistent scheduler")
+
+    # Direction D (AITER_EP_P2P_LDS=1): de-interleave the tile into the LDS store
+    # tile, then per-row coalesced P2P. Measured net perf-neutral-to-slightly-worse
+    # vs the per-lane register->remote scatter (gemm2 P2P gets faster but the
+    # coupled combine cross-device barrier absorbs it), so it defaults OFF. The
+    # per-lane epilogue (default) stays the production path; set AITER_EP_P2P_LDS=1
+    # to A/B the LDS-coalesced variant.
+    _ep_lds = ep_p2p_write and (
+        os.environ.get("AITER_EP_P2P_LDS", "0")
+        in ("1", "true", "True", "yes", "on")
+    )
 
     if num_buffers not in (2, 3, 4):
         raise ValueError(f"num_buffers must be 2, 3, or 4, got {num_buffers}")
@@ -642,12 +654,16 @@ def compile_mxscale_gemm(
         stage_base_off[i] + stage_b_up_scale_rel_off for i in range(num_buffers)
     ]
 
-    if use_tdm_store:
+    if use_tdm_store or _ep_lds:
         # TDM store copies the LDS tile as described; it does not de-pad rows.
         # Keep the output LDS tile tightly packed so the store extent is exactly
         # the per-warp column count. gugu (stage1_act_interleave) writes the
         # de-interleaved swiglu output (C_N = N/2), so each warp stores
         # warp_tile_n/2 columns; otherwise the raw warp_tile_n columns.
+        # ep_p2p_write (Direction D) reuses this same LDS store tile to
+        # de-interleave the tile row-major, then does a per-row coalesced P2P
+        # write from LDS (no TDM descriptor). The LDS overlays the mainloop
+        # arena (d_output_off=0), so peak LDS = max(mainloop, store tile).
         _tdm_store_warp_n = warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
         lds_d_row_stride = _tdm_store_warp_n * elem_bytes_d
         warp_d_bytes = warp_tile_m * lds_d_row_stride
@@ -744,6 +760,7 @@ def compile_mxscale_gemm(
         f"_pers{int(grouped_persistent_m)}"
         f"_contig{int(grouped_contiguous_m)}"
         f"_ep{int(ep_p2p_write)}"
+        f"_eplds{int(_ep_lds)}"
         f"{_quant_tag}"
     ).replace("-", "_")
 
@@ -2456,6 +2473,37 @@ def compile_mxscale_gemm(
                         d_buf, d_base, imm, sub8, out_elem=_out_elem_local
                     )
 
+            def epilogue_lds_stores_ep(final_accs, d_buf, d_base):
+                # Direction D: like epilogue_lds_stores, but pre-multiplies each
+                # output row by its route weight (ep_rowmap[grouped_row].col1, f32)
+                # BEFORE truncating to bf16 into the LDS store tile. The combine
+                # kernel then does an unweighted topk sum. Row layout matches the
+                # normal path (lane16 = row, so the per-lane weight aligns with the
+                # row this lane's acc holds), so Phase-3 can read each LDS row
+                # contiguously and P2P it to the row's dest slot.
+                _map_rsrc = buffer_ops.create_buffer_resource(
+                    arg_m_tile_prefix, max_size=True
+                )
+                for acc_idx, vec_base, m_off, wn in _sub_tiles:
+                    sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
+                    grouped_row = (
+                        flat_m_base + warp_m_base + arith.index(m_off) + lane16
+                    )
+                    _w_idx = arith.index_cast(
+                        T.i32, grouped_row * arith.index(2) + arith.index(1)
+                    )
+                    w = buffer_ops.buffer_load(
+                        _map_rsrc, _w_idx, vec_width=1, dtype=T.f32
+                    )
+                    w_vec8 = vector.from_elements(
+                        T.vec(8, T.f32), [w for _ in range_constexpr(8)]
+                    )
+                    sub8w = sub8 * w_vec8
+                    imm = m_off * _lds_d_stride_elems + wn * _n_col_d_elems
+                    store_acc_vec8_to_lds(
+                        d_buf, d_base, imm, sub8w, out_elem=_out_elem_local
+                    )
+
             def epilogue_lds_stores_act_dual_b(gate_accs, up_accs, d_buf, d_base):
                 # Fused stage1 activation for the TDM store path: mirrors
                 # `epilogue_lds_stores` but writes silu/swiglu(gate) * up into the
@@ -2697,7 +2745,9 @@ def compile_mxscale_gemm(
                 as_full_mem = as_full.get()
                 as_full_idx = extract_lds_base_idx(as_full)
 
-            if const_expr(use_tdm_store and not needs_grouped_row_masked_store):
+            if const_expr(
+                (use_tdm_store or _ep_lds) and not needs_grouped_row_masked_store
+            ):
                 d_lds_base_ptr = arena_base_ptr
                 d_lds_f16_count = total_d_bytes // 2
                 d_smem = SmemPtr(
@@ -2731,6 +2781,11 @@ def compile_mxscale_gemm(
                 _store_blk_n = (
                     blk_n / arith.index(2) if stage1_act_interleave else blk_n
                 )
+            # ep_p2p_write reuses the LDS store tile but writes per-row P2P (no
+            # TDM), so it does not need the tensor-store descriptor.
+            if const_expr(
+                use_tdm_store and not needs_grouped_row_masked_store
+            ):
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_c,
                     lds_memref=d_lds_base_ptr,
@@ -3635,7 +3690,89 @@ def compile_mxscale_gemm(
             if const_expr(stage1_dual_b):
                 accs_up = finalize_acc_layout(accs_up)
 
-            if const_expr(use_tdm_store and not needs_grouped_row_masked_store):
+            if const_expr(_ep_lds and not needs_grouped_row_masked_store):
+                # Direction D: de-interleave the (route-weighted) tile into the LDS
+                # store tile, then P2P each output row as ONE contiguous coalesced
+                # write to its origin peer's comb_inp slot (replaces the per-lane
+                # scatter). Each LDS row is _store_warp_n contiguous bf16; the warp's
+                # WAVE_SIZE lanes cooperatively write 8-bf16 (b128) chunks of one row
+                # to consecutive remote addresses -> coalesced. Rows past valid_m or
+                # with sentinel dst (remote/dropped/padding) are skipped.
+                import mori.cco.device.flydsl as _cco
+                from aiter.ops.flydsl.dispatch_combine_v2 import flydsl_prims as _P
+
+                rocdl.sched_barrier(0)
+                epilogue_lds_stores_ep(accs, d_lds_buffer, d_lane_base)
+                rocdl.s_wait_dscnt(0)
+                _win = _cco.Window(fx.Int64(ep_arena_handle))
+                _map_rsrc = buffer_ops.create_buffer_resource(
+                    arg_m_tile_prefix, max_size=True
+                )
+                # Flatten (row, chunk) over ALL WAVE_SIZE lanes so every lane issues
+                # a remote store each pass (max stores-in-flight for latency hiding).
+                # A "chunk" = 8 bf16 (b128). Consecutive lanes in the same row hit
+                # consecutive remote columns -> coalesced within the row.
+                _nchunks = _store_warp_n // 8  # 8 bf16 (b128) per chunk
+                _nchunks_idx = arith.index(_nchunks)
+                _total = warp_tile_m * _nchunks
+                _lane_id = lane_kgrp * arith.index(16) + lane16
+                _col0 = blk_n + warp_n_base
+                for _base in range_constexpr(0, _total, WAVE_SIZE):
+                    _remaining = _total - _base
+                    _f = arith.index(_base) + _lane_id
+                    _row = _f // _nchunks_idx
+                    _chunk = _f - _row * _nchunks_idx
+                    grouped_row = flat_m_base + warp_m_base + _row
+                    row_local = blk_m + warp_m_base + _row
+                    _dst_idx = arith.index_cast(T.i32, grouped_row * arith.index(2))
+                    dst_packed = buffer_ops.buffer_load(
+                        _map_rsrc, _dst_idx, vec_width=1, dtype=T.i32
+                    )
+                    row_valid = arith.cmpi(
+                        arith.CmpIPredicate.slt,
+                        arith.index_cast(T.i32, row_local),
+                        valid_m_i32,
+                    )
+                    dst_valid = arith.cmpi(
+                        arith.CmpIPredicate.sge,
+                        dst_packed,
+                        arith.constant(0, type=T.i32),
+                    )
+                    store_valid = arith.andi(
+                        arith.andi(tile_valid, row_valid), dst_valid
+                    )
+                    if _remaining < WAVE_SIZE:
+                        _lane_ok = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            arith.index_cast(T.i32, _lane_id),
+                            arith.constant(_remaining, type=T.i32),
+                        )
+                        store_valid = arith.andi(store_valid, _lane_ok)
+                    origin_pe = dst_packed // ep_slot_stride
+                    slot = dst_packed % ep_slot_stride
+                    _col = _col0 + _chunk * arith.index(8)
+                    dest = (
+                        fx.Int64(_win.lsa_ptr(origin_pe, ep_off_comb_inp))
+                        + fx.Int64(slot) * fx.Int64(ep_wire_nbytes)
+                        + fx.Int64(arith.index_cast(T.i64, _col))
+                        * fx.Int64(elem_bytes_d)
+                    )
+                    _elem_off = (
+                        warp_lds_off
+                        + _row * arith.index(_lds_d_stride_elems)
+                        + _chunk * arith.index(8)
+                    )
+                    _if = scf.IfOp(store_valid, results_=[], has_else=False)
+                    with ir.InsertionPoint(_if.then_block):
+                        _v = lds_load_b128(d_lds_buffer, _elem_off)
+                        buffer_ops.buffer_store(
+                            _v,
+                            buffer_ops.create_buffer_resource_from_addr(dest),
+                            0,
+                        )
+                        scf.YieldOp([])
+                _P.fence_system_release()
+            elif const_expr(use_tdm_store and not needs_grouped_row_masked_store):
                 if const_expr(d_need_epilogue_fence):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 rocdl.sched_barrier(0)
