@@ -8,8 +8,8 @@ per-token e8m0 (GROUP_M=1), weight scale is 128x128-block e8m0. Candidates are
 the curated flatmm kernel IDs; the reference is a dequantized fp32 einsum.
 
 Usage:
-    python3 op_tests/test_opus_mxscale_bmm.py
-    python3 op_tests/test_opus_mxscale_bmm.py -s 512,1024,4096 -g 2 -d bf16
+    python3 op_tests/test_opus_a8w8_bmm.py
+    python3 op_tests/test_opus_a8w8_bmm.py -s 512,1024,4096 -g 2 -d bf16
 """
 
 import argparse
