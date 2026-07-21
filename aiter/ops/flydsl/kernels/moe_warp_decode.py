@@ -202,6 +202,36 @@ def _dot2_batched(acc_f32, a_i32, b_i32):
     )
 
 
+def _dot2_acc_nonop(acc_f32, a_i32, b_i32):
+    """v_dot2_f32_bf16 with TIED accumulation — no s_nop.
+
+    Uses the "0" constraint to tie the accumulator and output to the SAME
+    physical register: output ≡ accumulator ≡ vdst.  LLVM cannot alias the
+    output with any OTHER live operand (a_i32, b_i32) because the output
+    register is already committed to the accumulator.
+
+    This mirrors CK's ``dot2_bf16_packed_raw_nonop`` pattern. The caller must
+    emit one ``rocdl.s_nop(2)`` drain after issuing the full batch of dot2s
+    (covering the write→read hazard for all accumulators at once).
+
+    Constraint layout:
+      =v   → $0  output (written, also used as accumulator via "0" tie)
+      v    → $1  a_i32  (read)
+      v    → $2  b_i32  (read)
+      0    → $3  acc_f32 (tied to $0, i.e. same register as output)
+    Asm: v_dot2_f32_bf16 vdst, src0, src1, vdst   (in-place: vdst += dot)
+    """
+    return llvm.inline_asm(
+        T.f32,
+        [a_i32, b_i32, acc_f32],
+        "v_dot2_f32_bf16 $0, $1, $2, $0",
+        "=v,v,v,0",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def _dot2_dep(acc_f32, a_i32, b_i32):
     """v_dot2_f32_bf16 in legacy dependent-chain form.
 
@@ -483,16 +513,15 @@ def compile_wd_moe_gate_up(
             u_final = for_op.results[1]
 
         elif w_dtype == "fp8":
-            # ── FP8: batched load/compute ─────────────────────────────────────
-            # A software-pipelined prefetch variant was investigated but produces
-            # incorrect results for various n_k_steps values.  Root cause: the
-            # FP8 compute kernel re-uses the same g_fp8/u_fp8 SSA values for two
-            # different sel conversions; LLVM's register allocator aliases the
-            # first dot2 output with that shared VGPR, corrupting the second
-            # conversion.  Issuing separate loads per (wi,sel) doesn't help
-            # because LLVM CSEs the duplicate loads (same address, no side effect).
-            # The batched pattern (issue all loads → vmcnt0 → compute) is reliable
-            # and already recovered HBM utilisation from 44% → 65%.
+            # ── FP8: batched load/compute (independent accumulators) ──────────
+            # A prefetch pipeline with tied-accumulator dot2 was tested and found
+            # to be SLOWER (e.g. deepseek B=1: 0.092 ms vs 0.077 ms batched).
+            # Root cause: FP8 weights are already small enough that 8 loads per
+            # k-step complete before the compute finishes; the 8 extra ForOp
+            # iter_args from the prefetch add register pressure that outweighs
+            # any latency-hiding benefit.  The batched approach (issue all loads →
+            # vmcnt0 → 4 independent dot2s → 1 s_nop drain → sum) already reaches
+            # near the HBM roofline and is the right path for FP8.
             for_op = scf.ForOp(
                 arith.constant(0, index=True),
                 arith.constant(_n_k_steps, index=True),
@@ -1114,8 +1143,8 @@ def compile_wd_moe_down_reduce(
         raise ValueError(f"n_waves must be >= 1, got {n_waves}")
     if n_waves > 1 and k_batch > 1:
         raise ValueError("LDS mode (n_waves>1) is incompatible with split-K (k_batch>1)")
-    if n_waves > 1 and w_dtype == "fp8":
-        raise ValueError("LDS mode (n_waves>1) not yet implemented for FP8 weights")
+    # n_waves > 1 is compatible with FP8 weights: LDS caches inter_states
+    # (BF16 activations), not the weights. Weight loading is unaffected.
     _block_threads = n_waves * _WAVE_SIZE
     if n_waves > 1 and inter % (_block_threads * 2) != 0:
         raise ValueError(
@@ -1124,7 +1153,13 @@ def compile_wd_moe_down_reduce(
 
     _use_fp8_w = w_dtype == "fp8"
     _k_fp8_words = k_vector // 4  # FP8: 4 elements per i32
-    _use_lds = n_waves > 1        # cooperative inter_states caching in LDS
+    # LDS inter_states caching only applies to the f32 scalar path.
+    # In the dot2 path, x_word reads come from the inner scf.ForOp which
+    # currently sources from global memory; adding LDS reads there requires
+    # careful lgkmcnt management and is deferred.  For the dot2 path,
+    # n_waves > 1 still uses a wider block for better occupancy but skips
+    # the cooperative LDS fill (which would otherwise be a no-op overhead).
+    _use_lds = n_waves > 1 and not use_dot2
     _lds_bytes = inter * 2 if _use_lds else 0  # BF16 row in LDS
 
     # Elements of inter each thread loads in the cooperative LDS-fill pass.
