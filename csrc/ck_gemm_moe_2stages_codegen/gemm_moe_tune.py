@@ -5310,12 +5310,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
         g2_bms = {v[0] for v in G2}
+        # TEMP: PATHB_V2_ONLY=1 restricts gemm2 candidates to path-B
+        # (flydsl_moe2_layout) only, skipping the native mxmoe g2 family. For
+        # inspecting the best v2-only config; remove/unset for normal tuning.
+        _v2_only = os.environ.get("PATHB_V2_ONLY") == "1"
         cands = []
         for bm in sorted({v[0] for v in G1}):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms:
+                if bm in g2_bms and not _v2_only:
                     for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
                         cands.append(
                             self._candidate_row(

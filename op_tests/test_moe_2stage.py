@@ -487,7 +487,7 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=5,
+        num_iters=10,
         num_warmup=2,
         **_fused_moe_kwargs,
     )
