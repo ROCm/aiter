@@ -34,7 +34,6 @@ def run(m, n, k, n_expts_tot, n_expts_act, apply_swiglu, arch, label, device="cu
 
     x_ref, w_ref, bias_ref = x.clone(), w.clone(), bias.clone()
 
-    weight_dtype = torch.uint8  # mxfp4_e2m1 packed
     from aiter.ops.triton.utils.types import str_to_torch_dtype
 
     w_tri, w_scale_tri = downcast_to_mxfp(w, str_to_torch_dtype["mxfp4_e2m1"], axis=1)

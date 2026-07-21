@@ -142,7 +142,9 @@ def _tdm_load_tile(
     else:
         gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
     gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
-    gl.amd.gfx1250.tdm.async_load(ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot)
+    gl.amd.gfx1250.tdm.async_load(
+        ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot
+    )
 
 
 @gluon.jit
@@ -257,7 +259,6 @@ def _moe_gemm_a16w4(
 
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
-    CLAMP_BOUNDS: gl.constexpr = False if EVEN_K else True
 
     pid = gl.program_id(0)
 
@@ -367,16 +368,14 @@ def _moe_gemm_a16w4(
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
     )
-    DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=8
-    )
     # scaled_upcast operand-aligned layouts (fp4 B in K-major (K/2,N), axis=0):
     #   fp4 input  -> DotOperandLayout(op=1, k_width=4)  [packed]
     #   scale      -> DotOperandLayout(op=1, k_width=8)  [op output layout]
-    # k_width doubles on unpack, so the bf16 output is k_width=8 == DOT_LAYOUT_W
-    # directly -> the WMMA B operand needs NO convert_layout (a k_width 16->8
-    # convert was 128 cross-lane v_permlanes/tile). The scale sits on the exact
-    # WMMA-fragment lanes the HW scale broadcast reads (BlockedLayout aliases them).
+    # k_width doubles on unpack, so the bf16 output is k_width=8 == the WMMA B
+    # dot-operand layout directly -> the WMMA B operand needs NO convert_layout
+    # (a k_width 16->8 convert was 128 cross-lane v_permlanes/tile). The scale
+    # sits on the exact WMMA-fragment lanes the HW scale broadcast reads
+    # (BlockedLayout aliases them).
     L_IN_W: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=WMMA_LAYOUT, k_width=4
     )
@@ -384,60 +383,12 @@ def _moe_gemm_a16w4(
         operand_index=1, parent=WMMA_LAYOUT, k_width=8
     )
 
-    # Blocked layouts for fp4-packed W (BLOCK_N, BLOCK_K // 2) and its expanded e8m0
-    # scale (BLOCK_N, BLOCK_K). size_per_thread along K doubles for the scale layout
-    # so the unpack along K lines up element-for-element with the scale.
-    # threads_per_warp = [8, 4] = 32 (wave32 on gfx1250).
-
-    PACKED_LOAD_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 32],
-            [0, 64],
-            [0, 128],
-            [64, 0],
-        ],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 16]],
-        warp_bases=[[16, 0], [32, 0]],
-        block_bases=[],
-        shape=[128, 256],
-    )
-    PACKED_DOT_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[
-            [0, 1],
-            [0, 2],
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [0, 64],
-            [0, 128],
-            [64, 0],
-        ],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]],
-        warp_bases=[[16, 0], [32, 0]],
-        block_bases=[],
-        shape=[128, 256],
-    )
     # Parametric blocked layout for the compact (BLOCK_N, MX_SCALE_BLOCK_K) scale
     # tile (shape-agnostic, so BLOCK_K is tunable). _expand_mx_scale_k operates
     # on the logical values and the result is convert_layout'd to the upcast
     # output layout, so the exact blocked layout here only needs to tile the shape.
     COMPACT_SCALE_LAYOUT: gl.constexpr = gl.BlockedLayout(
         [1, 1], [8, 4], [num_warps, 1], [1, 0]
-    )
-    # Local Triton's fp4 scaled_upcast requires the (expanded) scale to be in the
-    # op's *output* layout: the packed input's blocked layout with sizePerThread
-    # doubled along the unpack axis (see triton test_amd_scaled_upcast_fp4_cdna).
-    # Route the upcast through matched blocked layouts, then convert_layout the
-    # bf16 result to the WMMA dot-operand layout.
-    W_PACKED_BLOCKED: gl.constexpr = gl.BlockedLayout(
-        [1, 4], [8, 4], [num_warps, 1], [1, 0]
-    )
-    W_UNPACKED_BLOCKED: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [8, 4], [num_warps, 1], [1, 0]
     )
 
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
