@@ -238,8 +238,10 @@ def get_GEMM_A16W16_config(
         if config is not None:
             if config["libtype"] == "flydsl":
                 if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                        config["kernelName"]
+                    flydsl_config = (
+                        aiter.ops.flydsl.gemm_kernels.get_flydsl_hgemm_kernel_params(
+                            config["kernelName"]
+                        )
                     )
                     if flydsl_config is None:
                         logger.warning(
@@ -548,10 +550,9 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]
     )
-    stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -563,23 +564,16 @@ def flydsl_gemm(
         inp,
         weights,
         bias=fused_bias,
-        kernel_family=flydsl_config.get("kernel_family"),
-        tile_m=flydsl_config["tile_m"],
-        tile_n=flydsl_config["tile_n"],
-        tile_k=flydsl_config["tile_k"],
-        split_k=flydsl_config["split_k"],
-        block_m_warps=flydsl_config["block_m_warps"],
-        block_n_warps=flydsl_config["block_n_warps"],
-        block_k_warps=flydsl_config.get("block_k_warps", 1),
-        n_tile_repeat=flydsl_config.get("n_tile_repeat", 1),
-        persistent_n_tiles=flydsl_config.get("persistent_n_tiles", 1),
-        waves_per_eu=flydsl_config.get("waves_per_eu", 0),
-        b_to_lds_unroll=flydsl_config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=flydsl_config.get("async_copy", False),
-        b_to_lds=flydsl_config["b_to_lds"],
-        b_preshuffle=flydsl_config.get("b_preshuffle", False),
-        c_to_lds=flydsl_config.get("c_to_lds", False),
+        tile_m=flydsl_config["TILE_M"],
+        tile_n=flydsl_config["TILE_N"],
+        tile_k=flydsl_config["TILE_K"],
+        stages=flydsl_config["STAGES"],
+        split_k=flydsl_config["SPLIT_K"],
+        block_m_warps=flydsl_config["BLOCK_M_WARPS"],
+        block_n_warps=flydsl_config["BLOCK_N_WARPS"],
+        block_k_warps=flydsl_config["BLOCK_K_WARPS"],
+        group_m=flydsl_config["GROUP_M"],
+        policy="ht" if flydsl_config["USE_HALF_TILE_INTERLEAVED"] else "ft",
     )
 
     if bias is not None and fused_bias is None:
