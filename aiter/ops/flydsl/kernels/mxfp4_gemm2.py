@@ -3,19 +3,15 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .mxfp4_gemm_common import (
     kStages,
     kBS_stride_k0_dw,
     _raw,
     _lds_ptr3,
-    _lds_base_ptr3,
     _gep3,
     _global_base_ptr1,
     _gep1,
@@ -66,14 +62,13 @@ def _umod(a, c):
 
 
 def _issue_a_load_lds(
-    aq_rsrc, saq, slot, kt, car, lane, slot_bytes, lds_row, KH_TILE, k_half
+    aq_rsrc, saq_base_i32, slot, kt, car, lane, slot_bytes, lds_row, KH_TILE, k_half
 ):
     lane_mod_8 = lane % fx.Int32(8)
     mask = _lds_swizzle_mask(lds_row + (lane // fx.Int32(8)))
     voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + car * fx.Int32(k_half)
-    base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(saq.get()))
     off_i32 = fx.Int32(slot * slot_bytes) + lds_row * fx.Int32(KH_TILE)
-    lds_ptr = _lds_ptr3(base_i32, off_i32)
+    lds_ptr = _lds_ptr3(saq_base_i32, off_i32)
     rocdl.raw_ptr_buffer_load_lds(
         aq_rsrc,
         lds_ptr,
@@ -135,11 +130,9 @@ def compile_gemm2_a4w4_port(
         _tag += f"_xcd{xcd_swizzle}"
     _name = f"gemm2_a4w4_port_{_tag}"
 
-    allocator = SmemAllocator(
-        None, arch="gfx950", global_sym_name=f"gemm2port_smem_{_tag}"
-    )
-    lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_off + _lds_bytes
+    @fx.struct
+    class SharedStorage:
+        raw: fx.Array[fx.Uint8, _lds_bytes, 16]
 
     @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
     def gemm2_kernel(
@@ -168,9 +161,8 @@ def compile_gemm2_a4w4_port(
             BM * _K_HALF
         )
         aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
-        saq = SmemPtr(
-            allocator.get_base(), lds_off, T.i8, shape=(_aStages * _slot_bytes,)
-        )
+        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
 
         def _issue_all_a_loads(m_row0):
             for slot in range_constexpr(kStages):
@@ -179,7 +171,7 @@ def compile_gemm2_a4w4_port(
                     car = m_row0 + lds_row + (lane // fx.Int32(8))
                     _issue_a_load_lds(
                         aq_rsrc,
-                        saq,
+                        saq_base_i32,
                         slot,
                         slot,
                         car,
@@ -192,8 +184,7 @@ def compile_gemm2_a4w4_port(
 
         def _run_tile(tile_i32):
             _gemm2_body(
-                allocator,
-                lds_off,
+                lds_raw_ptr,
                 arg_ascale,
                 arg_bq,
                 arg_bscale,
@@ -259,11 +250,9 @@ def compile_gemm2_a4w4_port(
                 rocdl.sched_barrier(0)
                 _run_tile(tile)
 
-            saq._view_cache = None
             for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
                 wu = fx.Int32(iv)
                 gpu.barrier()
-                setattr(saq, "_view_cache", None)
                 tile = _xcd(wu)
                 _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 _run_tile(tile)
@@ -299,12 +288,6 @@ def compile_gemm2_a4w4_port(
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
     ):
-        from flydsl.compiler.kernel_function import CompilationContext
-
-        ctx = CompilationContext.get_current()
-        allocator.finalized = False
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
             persist = _raw(tw > fx.Int32(NUM_CU * 4))
@@ -337,8 +320,7 @@ def compile_gemm2_a4w4_port(
 
 @flyc.jit
 def _gemm2_body(
-    allocator,
-    lds_off,
+    lds_raw_ptr,
     arg_ascale,
     arg_bq,
     arg_bscale,
@@ -369,7 +351,6 @@ def _gemm2_body(
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
-    _lds_acc_floats = (min(BM, 64) if epilog == "nonatomic_cshuffle" else BM) * BN
     _K = D_INTER
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
@@ -398,18 +379,9 @@ def _gemm2_body(
     bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
     bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
 
-    lds_base = allocator.get_base()
-    saq = SmemPtr(lds_base, lds_off, T.i8, shape=(_aStages * _slot_bytes,))
-    lds_acc = (
-        SmemPtr(
-            lds_base,
-            lds_off + _aStages * _slot_bytes,
-            T.f32,
-            shape=(_lds_acc_floats,),
-        )
-        if epilog != "nonatomic"
-        else None
-    )
+    # Sequential LDS layout: saq bytes at offset 0, f32 accumulator after them.
+    saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+    lds_acc_base_i32 = saq_base_i32 + fx.Int32(_aStages * _slot_bytes)
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -497,7 +469,7 @@ def _gemm2_body(
             car = m_row + lds_row + (lane // fx.Int32(8))
             _issue_a_load_lds(
                 aq_rsrc,
-                saq,
+                saq_base_i32,
                 slot,
                 kt,
                 car,
@@ -512,7 +484,7 @@ def _gemm2_body(
         lane_row = lane_mod_16
         lane_col = lane_div_16 * fx.Int32(16)
         mask = _lds_swizzle_mask(lane_row)
-        base_ptr = _lds_base_ptr3(saq.get())
+        base_ptr = _lds_ptr3(saq_base_i32, fx.Int32(0))
         a = [[None, None] for _ in range(_kMChunks)]
         for k in range_constexpr(2):
             lds_col = (lane_col + fx.Int32(k * 64)) ^ mask
@@ -608,16 +580,23 @@ def _gemm2_body(
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
             mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=False)
 
-    saq._view_cache = None
     if epilog == "nonatomic":
         out_base = _global_base_ptr1(arg_out)
         _flat_bf16_epilog(
             accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, BN, _kMChunks
         )
     elif epilog == "nonatomic_cshuffle":
-        lds_acc._view_cache = None
         _cshuffle_flat_bf16_epilog(
-            lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT, BN
+            lds_acc_base_i32,
+            accm,
+            arg_out,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            BM,
+            N_OUT,
+            BN,
         )
     elif epilog == "nonatomic_mxfp4":
         out_q_base = _global_base_ptr1(arg_out)
@@ -634,13 +613,12 @@ def _gemm2_body(
             tid_i32,
             N_OUT,
             BN,
-            lds_acc,
+            lds_acc_base_i32,
             _kMChunks,
         )
     else:
-        lds_acc._view_cache = None
         _atomic_bf16_epilog(
-            lds_acc,
+            lds_acc_base_i32,
             accm,
             arg_out,
             arg_stids,
@@ -674,13 +652,13 @@ def _flat_bf16_epilog(
 
 
 def _cshuffle_flat_bf16_epilog(
-    lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT, BN
+    lds_acc_base_i32, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT, BN
 ):
     _iC = BM // 16
     _REPS = BM // 8
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
-    lds_base = _lds_base_ptr3(lds_acc.get())
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // fx.Int32(32)
     n_lane = tx_i32 % fx.Int32(32)
@@ -719,10 +697,10 @@ def _flat_mxfp4_epilog(
     tid_i32,
     N_OUT,
     BN,
-    lds_acc,
+    lds_acc_base_i32,
     kMChunks,
 ):
-    lds_base = _lds_base_ptr3(lds_acc.get())
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     for i in range_constexpr(kMChunks):
@@ -804,7 +782,7 @@ def _flat_mxfp4_epilog(
 
 @flyc.jit
 def _atomic_bf16_epilog(
-    lds_acc,
+    lds_acc_base_i32,
     accm,
     arg_out,
     arg_stids,
@@ -822,7 +800,7 @@ def _atomic_bf16_epilog(
     M_REPS = BM // 8
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
-    lds_base = _lds_base_ptr3(lds_acc.get())
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // fx.Int32(32)
