@@ -429,7 +429,7 @@ def mp_tuner(
     remaining_tasks = list(enumerate(rets))
 
     # Track start time for each task
-    task_start_times = {k: time.time() for k, _ in remaining_tasks}
+    task_start_times = {k: None for k, _ in remaining_tasks}
     check_interval = 10  # Check every 10 seconds for responsive polling
 
     timeout_msg = (
@@ -463,8 +463,12 @@ def mp_tuner(
         consecutive_timeouts = 0
         half_gpu = max(1, (mp_num + 1) // 2)
 
-        for k, async_result in remaining_tasks:
+        active_tasks = remaining_tasks[:parallel_num]
+        for k, async_result in active_tasks:
             try:
+                if task_start_times[k] is None:
+                    task_start_times[k] = time.time()
+
                 # Calculate appropriate timeout based on task's remaining time
                 if timeout is not None:
                     elapsed = time.time() - task_start_times[k]
@@ -602,7 +606,7 @@ def mp_tuner(
             remaining_tasks = [(k, new_rets_dict[k]) for k in remaining_task_indices]
             # Reset start times for resubmitted tasks
             for k in remaining_task_indices:
-                task_start_times[k] = time.time()
+                task_start_times[k] = None
 
             # Reset pool restart flag
             pool_restart_needed = False
@@ -612,7 +616,7 @@ def mp_tuner(
             )
 
         # Small sleep to avoid busy waiting
-        if remaining_tasks:
+        if remaining_tasks and not completed_this_round:
             time.sleep(1)
 
     # Reconstruct results in original task order
