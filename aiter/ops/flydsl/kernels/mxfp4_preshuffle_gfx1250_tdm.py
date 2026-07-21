@@ -66,7 +66,7 @@ def launch_gemm_a8w4_tdm(
         f"_a{_a_dt}_out{_out_dt}"
         f"_{_act_tag}_bias{has_bias}"
         f"_qout{stage1_quant_out}_qrep{quant_wmma_rep}"
-        f"_v{_TDM_DESCRIPTOR_VERSION}"
+        f"_v{TDM_DESCRIPTOR_VERSION}"
     )
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
