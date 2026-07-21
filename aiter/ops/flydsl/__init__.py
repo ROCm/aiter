@@ -62,6 +62,10 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
         "flydsl_fp8_paged_mqa_logits_gfx950",
     ),
+    "flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle": (
+        ".kernels.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",
+        "flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",
+    ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -126,6 +130,7 @@ __all__ = [
     "flydsl_fp8_mqa_logits",
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",
+    "flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
