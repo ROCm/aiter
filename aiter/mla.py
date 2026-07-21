@@ -1296,10 +1296,6 @@ def mla_decode_fwd_v4_nm(
     num_kv_splits=None,  # None -> auto-pick via V3 get_meta_param heuristic
     logits=None,
     attn_lse=None,
-    kv_last_page_lens=None,  # [num_seqs] int32; OPTIONAL, defaults None. Unused on
-    # the nm path (page_size=1 -> kv_seq_len comes from the token-level kv_indptr).
-    # None flows through to a nullptr kernarg; the host guards the deref and the
-    # kernel never loads through it, so no buffer is allocated.
 ):
     """v4 MLA decode forward.
 
@@ -1499,7 +1495,6 @@ def mla_decode_fwd_v4_nm(
         output,
         valid_split_count,
         use_valid_split_count_reduce,
-        kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
     )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
@@ -1527,7 +1522,7 @@ def mla_decode_fwd_v4_nm(
             final_lse_buf,
             qo_indptr,
             kv_indptr,
-            kv_last_page_lens,
+            None,  # kv_last_page_lens: unused on nm path (KV_INDPTR_IS_PAGE_LEVEL=False)
             split_indptr,  # num_kv_splits_indptr
             valid_split_count,  # [num_seqs] i32; written by the asm kernel
             attn_lse.stride(0),  # stride_mid_ob = num_kv_splits * num_heads
