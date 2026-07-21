@@ -11,7 +11,7 @@
 # against a dequant einsum reference (and a8w8_scale_mmajor where applicable).
 #
 # v1 kernel constraints: N % 128 == 0, K % 128 == 0, M % B_M == 0 (no store OOB
-# masking). DSV4 N=1024/K=4096 satisfy N/K; M is swept as multiples of 256.
+# masking). DSV4-Pro TP=8 wo_a maps to G=2, M=512, N=1024, K=4096.
 
 import argparse
 import itertools
@@ -23,6 +23,7 @@ from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus.bmm_op import (
+    _opus_bmm_a8w8_mxscale_flatmm_splitk_mmajor_raw,
     _opus_bmm_a8w8_mxscale_mmajor_raw,
     _opus_bmm_a8w8_mxscale_splitk_mmajor_raw,
     _opus_bmm_a8w8_uniform_scale_raw,
@@ -170,9 +171,136 @@ def test_uniform_scale(m, n, k, g, layout, out_dtype):
             )
             return Y
 
-        candidates["a8w8_mxscale_sk4"] = (lambda: _a8w8_mx_sk(4), ref_mx)
-        candidates["a8w8_mxscale_sk8"] = (lambda: _a8w8_mx_sk(8), ref_mx)
-        candidates["a8w8_mxscale_sk16"] = (lambda: _a8w8_mx_sk(16), ref_mx)
+        # The 8-wave splitK pipeline requires at least 2 128-K tiles per split.
+        for split_k in (2, 4, 6, 8, 16):
+            if k // GROUP >= 2 * split_k:
+                candidates[f"a8w8_mxscale_sk{split_k}"] = (
+                    lambda split_k=split_k: _a8w8_mx_sk(split_k),
+                    ref_mx,
+                )
+
+        def _a8w8_mx_flatmm_sk(split_k, kernel_id=0):
+            Y = torch.empty(y_shape, dtype=ydt)
+            _opus_bmm_a8w8_mxscale_flatmm_splitk_mmajor_raw(
+                O_mx_in, W_mx, Y, xs_mx_in, ws_mx, split_k, kernel_id
+            )
+            return Y
+
+        # Direct-store K256 variants bypass the split-K workspace and reduce
+        # kernel.
+        if k % (2 * GROUP) == 0:
+            total_tiles_k256 = k // (2 * GROUP)
+            if total_tiles_k256 >= 3:
+                if m % 64 == 0 and n % 32 == 0:
+                    candidates["a8w8_mxscale_flatmm_m64n32k256_sk1"] = (
+                        lambda: _a8w8_mx_flatmm_sk(1, 320),
+                        ref_mx,
+                    )
+                    candidates["a8w8_mxscale_flatmm_m64n32k256_wg1_sk1"] = (
+                        lambda: _a8w8_mx_flatmm_sk(1, 322),
+                        ref_mx,
+                    )
+                if m % 32 == 0 and n % 64 == 0:
+                    candidates["a8w8_mxscale_flatmm_m32n64k256_sk1"] = (
+                        lambda: _a8w8_mx_flatmm_sk(1, 640),
+                        ref_mx,
+                    )
+                    candidates["a8w8_mxscale_flatmm_m32n64k256_selfload_sk1"] = (
+                        lambda: _a8w8_mx_flatmm_sk(1, 646),
+                        ref_mx,
+                    )
+                    candidates["a8w8_mxscale_flatmm_m32n64k256_wg1_sk1"] = (
+                        lambda: _a8w8_mx_flatmm_sk(1, 642),
+                        ref_mx,
+                    )
+                total_tiles_k128 = k // GROUP
+                if total_tiles_k128 >= 3:
+                    if m % 64 == 0 and n % 64 == 0:
+                        candidates["a8w8_mxscale_flatmm_m64n64k128_sk1"] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 650),
+                            ref_mx,
+                        )
+                    if m % 64 == 0 and n % 128 == 0:
+                        candidates["a8w8_mxscale_flatmm64_sk1"] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 64),
+                            ref_mx,
+                        )
+                    if m % 128 == 0 and n % 128 == 0:
+                        candidates["a8w8_mxscale_flatmm_m128n128k128_wg1_sk1"] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 128),
+                            ref_mx,
+                        )
+                        candidates[
+                            "a8w8_mxscale_flatmm_m128n128k128_persistent_mouter_wg1_sk1"
+                        ] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 131),
+                            ref_mx,
+                        )
+                    if m % 128 == 0 and n % 256 == 0:
+                        candidates["a8w8_mxscale_flatmm_m128n256k128_wave8n2_sk1"] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 132),
+                            ref_mx,
+                        )
+                        candidates[
+                            "a8w8_mxscale_flatmm_m128n256k128_wave4n2_selfload_sk1"
+                        ] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 133),
+                            ref_mx,
+                        )
+                    if m % 256 == 0 and n % 128 == 0:
+                        candidates[
+                            "a8w8_mxscale_flatmm_m256n128k128_wave4m2_selfload_sk1"
+                        ] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 134),
+                            ref_mx,
+                        )
+                    if m % 64 == 0 and n % 256 == 0:
+                        candidates["a8w8_mxscale_flatmm_m64n256k128_nphase_sk1"] = (
+                            lambda: _a8w8_mx_flatmm_sk(1, 129),
+                            ref_mx,
+                        )
+
+        # Base flatmm uses B_K=128 with a 3-slot prefetch pipeline; keep at
+        # least 3 K tiles per split.
+        for split_k in (2, 3, 4, 5, 8):
+            total_tiles = k // GROUP
+            iters_full = (total_tiles + split_k - 1) // split_k
+            last_loops = total_tiles - (split_k - 1) * iters_full
+            if last_loops >= 3:
+                candidates[f"a8w8_mxscale_flatmm_sk{split_k}"] = (
+                    lambda split_k=split_k: _a8w8_mx_flatmm_sk(split_k),
+                    ref_mx,
+                )
+                if split_k == 2:
+                    candidates["a8w8_mxscale_flatmm_fused_sk2"] = (
+                        lambda: _a8w8_mx_flatmm_sk(2, 100),
+                        ref_mx,
+                    )
+                if m % 64 == 0:
+                    candidates[f"a8w8_mxscale_flatmm64_sk{split_k}"] = (
+                        lambda split_k=split_k: _a8w8_mx_flatmm_sk(split_k, 64),
+                        ref_mx,
+                    )
+                if n % 256 == 0:
+                    candidates[f"a8w8_mxscale_flatmm256_sk{split_k}"] = (
+                        lambda split_k=split_k: _a8w8_mx_flatmm_sk(split_k, 256),
+                        ref_mx,
+                    )
+            if k % (2 * GROUP) == 0:
+                total_tiles_k256 = k // (2 * GROUP)
+                iters_full_k256 = (total_tiles_k256 + split_k - 1) // split_k
+                last_loops_k256 = total_tiles_k256 - (split_k - 1) * iters_full_k256
+                if last_loops_k256 >= 3:
+                    if m % 64 == 0 and n % 32 == 0:
+                        candidates[f"a8w8_mxscale_flatmm_m64n32k256_sk{split_k}"] = (
+                            lambda split_k=split_k: _a8w8_mx_flatmm_sk(split_k, 320),
+                            ref_mx,
+                        )
+                    if m % 32 == 0 and n % 64 == 0:
+                        candidates[f"a8w8_mxscale_flatmm_m32n64k256_sk{split_k}"] = (
+                            lambda split_k=split_k: _a8w8_mx_flatmm_sk(split_k, 640),
+                            ref_mx,
+                        )
 
     def _bf16_einsum():
         if layout == "mmajor":
@@ -215,8 +343,8 @@ def main():
         "--batch",
         type=int,
         nargs="*",
-        default=[8],
-        help="G = n_local_groups (DSV4 wo_a batch)",
+        default=[2],
+        help="G = n_local_groups (DSV4 wo_a batch); DSV4-Pro TP=8 -> G=2",
     )
     parser.add_argument(
         "-s",
@@ -224,20 +352,16 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         default=[
-            (256, 1024, 4096),
             (512, 1024, 4096),
-            (1024, 1024, 4096),
-            (2048, 1024, 4096),
-            (4096, 1024, 4096),
         ],
-        help="(M=num_tokens, N=o_lora_rank, K); M must be a multiple of 256",
+        help="(M=num_tokens, N=head_dim, K=o_lora_rank); DSV4-Pro TP=8 wo_a uses (512,1024,4096)",
     )
     parser.add_argument(
         "-l",
         "--layout",
         type=str,
         nargs="*",
-        default=["mmajor", "bmajor"],
+        default=["mmajor"],
         help="tensor layout: mmajor (DSV4 zero-copy) or bmajor (batch-major)",
     )
     parser.add_argument(

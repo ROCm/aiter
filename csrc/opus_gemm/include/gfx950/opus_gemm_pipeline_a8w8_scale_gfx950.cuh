@@ -185,11 +185,47 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
         // E8M0 scale bytes; replicate one checkpoint byte across all four
         // subblocks in the packed scale word to preserve 128-block semantics.
         static_assert(T::B_K == T::GROUP_K, "e8m0 path assumes one K scale block per B_K");
-        static_assert(T::E_M == 1, "e8m0 path assumes one A scale per half-tile");
         static_assert(T::HALF_B_N == T::GROUP_N, "e8m0 path assumes one B scale per half-tile");
-        const int scale_a = pack_e8m0x4(v_sfa[0]);
-        const int scale_b = pack_e8m0x4(v_sfb[0]);
-        v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
+        if constexpr (T::E_M == 1) {
+            const int scale_a = pack_e8m0x4(v_sfa[0]);
+            const int scale_b = pack_e8m0x4(v_sfb[0]);
+            v_c = mma(v_a, v_b, v_c, scale_a, scale_b, 0_I, 0_I);
+        } else {
+            using MMA = typename Mma::MMA;
+            constexpr int a_len = Mma::mma_a_len;
+            constexpr int b_len = Mma::mma_b_len;
+            constexpr int c_len = Mma::mma_c_len;
+            constexpr int rep_n_per_scale = T::GROUP_N / (T::W_N * T::T_N);
+            static_assert(T::GROUP_N % (T::W_N * T::T_N) == 0);
+            opus::static_for<T::E_M>([&](auto im_c) {
+                constexpr int im = decltype(im_c)::value;
+                opus::static_for<T::E_N>([&](auto in_c) {
+                    constexpr int in = decltype(in_c)::value;
+                    opus::static_for<T::E_K>([&](auto ik_c) {
+                        constexpr int ik = decltype(ik_c)::value;
+                        const int scale_a = pack_e8m0x4(v_sfa[im * T::E_K + ik]);
+                        const int scale_b =
+                            pack_e8m0x4(v_sfb[(in / rep_n_per_scale) * T::E_K + ik]);
+                        constexpr int i_tile_a = im * T::E_K + ik;
+                        constexpr int i_tile_b = in * T::E_K + ik;
+                        constexpr int i_tile_c = im * T::E_N + in;
+                        auto s_a = opus::slice(v_a,
+                            opus::number<i_tile_a * a_len>{},
+                            opus::number<i_tile_a * a_len + a_len>{});
+                        auto s_b = opus::slice(v_b,
+                            opus::number<i_tile_b * b_len>{},
+                            opus::number<i_tile_b * b_len + b_len>{});
+                        auto s_c = opus::slice(v_c,
+                            opus::number<i_tile_c * c_len>{},
+                            opus::number<i_tile_c * c_len + c_len>{});
+                        s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b, 0_I, 0_I);
+                        opus::set_slice(v_c, s_c,
+                            opus::number<i_tile_c * c_len>{},
+                            opus::number<i_tile_c * c_len + c_len>{});
+                    });
+                });
+            });
+        }
     } else {
         typename Mma::vtype_c v_mma = mma(v_a, v_b, 0, 0);
         scale_c_tile<T::E_M, T::E_N, ELEM_C, D_ACC, D_SF>(v_mma, v_sfa, v_sfb, v_c);
@@ -203,8 +239,8 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
 // Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
 
-template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
+template<typename Traits, bool K1024_ONLY>
+__device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
     using namespace opus;
@@ -295,7 +331,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
         return half_tile_n * (T::HALF_B_N / T::GROUP_N) * kargs.stride_sfb + tile_k * (T::B_K / T::GROUP_K);
     };
 
-    const int loops = ceil_div(kargs.k, T::B_K);
+    if constexpr (K1024_ONLY) {
+        static_assert(T::B_K == 128, "K1024_ONLY expects eight 128-wide K tiles");
+        if (kargs.k != 1024) return;
+    }
+    const int loops = K1024_ONLY ? 8 : ceil_div(kargs.k, T::B_K);
     int tic = 0, toc = 1;
 
     // Prologue
@@ -557,6 +597,39 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
     // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host
     // launcher symbol must still exist for the unconditional dispatcher
     // reference, but the body uses gfx950-only intrinsics.
+#endif // __gfx950__
+#endif // __HIP_DEVICE_COMPILE__
+}
+
+template<typename Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    gemm_a8w8_scale_kernel_impl<Traits, false>(kargs);
+#else
+    // Non-gfx950 device pass: empty stub.
+#endif // __gfx950__
+#endif // __HIP_DEVICE_COMPILE__
+}
+
+template<typename Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_k1024_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    gemm_a8w8_scale_kernel_impl<Traits, true>(kargs);
+#else
+    // Non-gfx950 device pass: empty stub.
+#endif // __gfx950__
+#endif // __HIP_DEVICE_COMPILE__
+}
+
+template<typename Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a8w8_scale_k1024_lb1_kernel(opus_gemm_scale_kargs_gfx950 kargs) {
+#ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    gemm_a8w8_scale_kernel_impl<Traits, true>(kargs);
+#else
+    // Non-gfx950 device pass: empty stub.
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }
