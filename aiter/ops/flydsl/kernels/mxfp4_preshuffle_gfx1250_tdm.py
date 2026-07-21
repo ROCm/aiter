@@ -344,7 +344,9 @@ def launch_gemm_a8w4_tdm(
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
-            if const_expr(tile_m <= 64):
+            # Post-compute issue: better for decode (small tile_m).
+            # if const_expr(tile_m <= 64):
+            if const_expr(True):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
