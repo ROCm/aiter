@@ -1305,8 +1305,17 @@ def make_kernel_runner(
         _is_f6f4 = args.kernel in ("aiter_f6f4", "aiter_f6f4_pv")
         if args.kernel == "aiter_f6f4_pv":
             os.environ["AITER_FMHA_F6F4_PV"] = "1"  # redirect f6f4 slot -> fwd_hd128_f6f4_pv.co
+            # fp4-P kernel reads V via a plain ds_read_b128 (no tr_b4), so its V packer must emit the
+            # DIRECT operand image, and V's kv order must match P's fp4 B-operand kv layout. The
+            # aligning permutation (learned via the V=identity kv-layout probe: bit0<->bit3 swap of
+            # the group-of-4 index applied to meas) is 'measmu'. Defaults here; explicit env overrides.
+            os.environ.setdefault("AITER_VFP4_LAYOUT", "direct")
+            os.environ.setdefault("AITER_VFP4_KPERM", "measmu")
         else:
             os.environ.pop("AITER_FMHA_F6F4_PV", None)  # don't leak into f6f4/mxfp6 (e.g. --kernel all)
+            os.environ.pop("AITER_VFP4_LAYOUT", None)  # direct layout is pv-only
+            if os.environ.get("AITER_VFP4_KPERM") == "measmu":
+                os.environ.pop("AITER_VFP4_KPERM")  # measmu is pv-only
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
@@ -1422,9 +1431,15 @@ def check_output_against_reference(
     current: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
+    print(current.flatten()[:20], reference.flatten()[:20])
     # Guard against NaN/Inf in the kernel output before any accuracy stats are
     # computed (a non-finite output silently wrecks cosine/MAE and is the usual
     # symptom of softmax tail overflow -- see the "latesink" input distribution).
+    import os as _os
+    if _os.environ.get("DUMP_PROBE"):
+        torch.save({"current": current.detach().float().cpu(),
+                    "reference": reference.detach().float().cpu()}, _os.environ["DUMP_PROBE"])
+        print(f"[DUMP_PROBE] saved to {_os.environ['DUMP_PROBE']}")
     n_nan = int(torch.isnan(current).sum().item())
     n_inf = int(torch.isinf(current).sum().item())
     if n_nan or n_inf:
@@ -1531,6 +1546,21 @@ def benchmark_single_case(
     loaded_single_mask: Optional[LoadedMask],
     explicit_block_attn_mask: Optional[torch.Tensor] = None,
 ) -> float:
+    if os.environ.get("AITER_PROBE_VIDENTITY"):
+        # LAYOUT PROBE (not accuracy): V := identity so O[q,d] = sum_kv P[q,kv] d(kv==d) = P[q,d].
+        # The output's d-axis then IS the kv axis, so any kv scramble in the PV contraction shows up
+        # as a column permutation of O vs the reference (both use this same V). Use sq=sk=d=dv=128.
+        _b, _d0 = v.shape[0], v.shape[-1]
+        _sk = v.shape[1] if args.layout == "bshd" else v.shape[2]
+        _h = v.shape[2] if args.layout == "bshd" else v.shape[1]
+        _n = min(_sk, _d0)
+        eye = torch.zeros(_sk, _d0, device=v.device, dtype=v.dtype)
+        eye[:_n, :_n] = torch.eye(_n, device=v.device, dtype=v.dtype) * 6.0
+        if args.layout == "bshd":  # [b, s, h, d]
+            v = eye[None, :, None, :].expand(_b, _sk, _h, _d0).contiguous()
+        else:                      # [b, h, s, d]
+            v = eye[None, None, :, :].expand(_b, _h, _sk, _d0).contiguous()
+
     shape = infer_shape_spec(q, v, args.layout)
     block_attn_mask = (
         explicit_block_attn_mask
