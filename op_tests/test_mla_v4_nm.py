@@ -904,7 +904,6 @@ def _run_one_point(
         inputs["qo_indptr"],
         inputs["kv_indptr"],
         inputs["kv_page_indices"],
-        inputs["kv_last_page_lens"],
         split_indptr,
         inputs["sink"],  # per-head [num_heads] sink; req'd positional
         inputs["max_seqlen_q"],

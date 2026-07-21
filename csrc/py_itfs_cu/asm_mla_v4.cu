@@ -206,7 +206,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* qo_indptr,       // [num_seqs+1]
      aiter_tensor_t* kv_indptr,       // [num_seqs+1]
      aiter_tensor_t* kv_page_indices, // [num_page_used]
-     aiter_tensor_t* kv_last_page_lens, // [num_seqs]
      aiter_tensor_t* split_indptr,      // [num_seqs+1]
      aiter_tensor_t* sink,              // [num_heads] FP32 — see "ptr_sink" note above
      int max_seqlen_q,
@@ -221,6 +220,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
          output, // [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
      aiter_tensor_t* valid_split_count, // [num_seqs] int32 scratch (slot 19), nullable
      int use_valid_split_count_reduce,  // slot 20 flag; gates the kernel's valid_split write
+     // Moved to the tail: UNUSED on the nm path (page_size=1 -> kv_seq_len comes
+     // from the token-level kv_indptr). Nullable; the host guards the deref below
+     // and the kernel never loads through the pointer.
+     aiter_tensor_t* kv_last_page_lens, // [num_seqs] int32, nullable
      hipStream_t stream),
     (Q,
      qrope,
@@ -229,7 +232,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      qo_indptr,
      kv_indptr,
      kv_page_indices,
-     kv_last_page_lens,
      split_indptr,
      sink,
      max_seqlen_q,
@@ -241,6 +243,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      output,
      valid_split_count,
      use_valid_split_count_reduce,
+     kv_last_page_lens,
      stream))
 {
     (void)softmax_scale;
@@ -283,7 +286,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a.ptr_KV      = KV->data_ptr();
         a.ptr_LTP     = kv_indptr->data_ptr();
         a.ptr_LTD     = kv_page_indices->data_ptr();
-        a.ptr_LTL     = kv_last_page_lens->data_ptr();
+        a.ptr_LTL     = kv_last_page_lens ? kv_last_page_lens->data_ptr() : nullptr;
         a.scalar_f    = scalar_f;
         a.s_gqa_ratio = static_cast<unsigned int>(gqa_ratio);
         a.s_kv_split  = static_cast<unsigned int>(num_kv_splits);
