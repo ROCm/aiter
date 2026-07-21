@@ -109,7 +109,19 @@ def launch_gemm_a8w4_tdm(
     # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
     WN_PER_MX_BLOCK = 4
 
-    @flyc.kernel(known_block_size=[block, 1, 1])
+    _afp = "fp4" if a_is_fp4 else "fp8"
+    _act = f"_act{stage1_act}" if stage1_act else ""
+    _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
+    _bias = "_bias" if has_bias else ""
+    _grouped = f"_e{n_experts}" if n_experts > 0 else ""
+    _kname = (
+        f"a8w4_tdm_{_afp}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
+        f"_b{num_buffers}_K{K}"
+        f"{_grouped}{_act}{_bias}{_qout}"
+    )
+
+    @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
         arg_c: fx.Tensor,
         arg_a: fx.Pointer,
