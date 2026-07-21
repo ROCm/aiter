@@ -11,7 +11,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.mha import fmha_fwd_hd128_bf16_opus_fwd
+from aiter.ops.mha import fmha_fwd_bf16_opus_fwd, fmha_fwd_bf16_opus_varlen_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
@@ -1166,9 +1166,148 @@ def test_flash_attn_func_opus(
     assert (out - out_ref).abs().max().item() <= out_tol
 
     with torch.no_grad():
-        out_opus = fmha_fwd_hd128_bf16_opus_fwd(
-            q, k, v, softmax_scale=d**-0.5, causal=causal
-        )
+        out_opus = fmha_fwd_bf16_opus_fwd(q, k, v, softmax_scale=d**-0.5, causal=causal)
     assert torch.equal(
         out, out_opus
     ), "flash_attn_func did not route to the opus kernel (env/gate not engaged)"
+
+
+# OPUS gfx950 asymmetric D_QK=192 / D_V=128. Batch cases span partial/odd/large seqlen
+# and MHA/GQA/MQA. This kernel is enabled by DEFAULT (no env), so flash_attn_func should
+# route here for (192,128) bf16 on gfx950 without any monkeypatch.
+_OPUS_D192_CASES = [
+    (2, 64, 8, 2),  # tiny, GQA
+    (2, 100, 8, 2),  # partial last tile, GQA
+    (2, 127, 8, 8),  # partial last tile, MHA
+    (2, 129, 32, 8),  # pipelined odd, GQA
+    (1, 256, 16, 16),  # MHA
+    (2, 512, 8, 1),  # MQA
+    (1, 1023, 16, 4),  # partial odd, GQA
+    (1, 4096, 8, 2),  # large, GQA
+    (4, 256, 8, 8),  # larger batch, MHA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen,nheads,nheads_k",
+    _OPUS_D192_CASES,
+    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_D192_CASES],
+)
+def test_flash_attn_func_opus_d192_v128(batch_size, seqlen, nheads, nheads_k, causal):
+    """Validate the OPUS D_QK=192/D_V=128 kernel THROUGH flash_attn_func (default-on)."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+
+    torch.manual_seed(0)
+    d_qk, d_v = 192, 128
+    q = torch.randn(batch_size, seqlen, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(
+        batch_size, seqlen, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16
+    )
+    v = torch.randn(batch_size, seqlen, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+
+    with torch.no_grad():
+        out = aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=None,  # -> default 1/sqrt(d_qk), matches attention_ref
+            causal=causal,
+            window_size=(-1, -1),
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    out_ref, _, _ = attention_ref(q, k, v, causal=causal)
+    out_pt, _, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    print(
+        f"[opus-d192] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}"
+    )
+    assert (out - out_ref).abs().max().item() <= out_tol
+
+    with torch.no_grad():
+        out_opus = fmha_fwd_bf16_opus_fwd(
+            q, k, v, softmax_scale=d_qk**-0.5, causal=causal
+        )
+    assert torch.equal(
+        out, out_opus
+    ), "flash_attn_func did not route to the opus D=192 kernel"
+
+
+# OPUS gfx950 group/varlen D_QK=192 / D_V=128. Validated through the direct wrapper
+# (packed THD; exercises the group-mode host launch + kernel via the shared pybind).
+_OPUS_D192_GROUP_CASES = [
+    (3, [64, 200, 500], 8, 2),  # varlen, GQA
+    (2, [128, 1000], 16, 16),  # varlen, MHA
+    (4, [300, 300, 300, 300], 8, 8),  # uniform, MHA
+    (2, [1023, 65], 16, 4),  # odd/partial, GQA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "num_groups,seqlens,nheads,nheads_k",
+    _OPUS_D192_GROUP_CASES,
+    ids=[f"g{g}_h{h}_hkv{hk}" for (g, _sl, h, hk) in _OPUS_D192_GROUP_CASES],
+)
+def test_fmha_fwd_bf16_opus_d192_v128_group(
+    num_groups, seqlens, nheads, nheads_k, causal
+):
+    """Validate the OPUS D=192 group/varlen path via the direct shared wrapper.
+
+    Self-attention per group (seqlen_q == seqlen_kv); packed [total, H, D]; no KV
+    padding (physical == real cu_seqlens). Compares each group against attention_ref.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=192 kernel requires gfx950")
+    assert len(seqlens) == num_groups
+
+    torch.manual_seed(0)
+    d_qk, d_v = 192, 128
+    total = sum(seqlens)
+    q = torch.randn(total, nheads, d_qk, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(total, nheads_k, d_qk, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(total, nheads_k, d_v, device="cuda", dtype=dtypes.bf16)
+
+    cu = torch.tensor(
+        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    max_s = max(seqlens)
+
+    with torch.no_grad():
+        out = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=d_qk**-0.5,
+            causal=causal,
+            seqstart_q=cu,
+            seqstart_k=cu,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+        )
+
+    # Per-group fp32 reference.
+    max_diff = 0.0
+    starts = [0]
+    for s in seqlens:
+        starts.append(starts[-1] + s)
+    for g in range(num_groups):
+        lo, hi = starts[g], starts[g + 1]
+        qg = q[lo:hi].unsqueeze(0)
+        kg = k[lo:hi].unsqueeze(0)
+        vg = v[lo:hi].unsqueeze(0)
+        out_ref, _, _ = attention_ref(qg, kg, vg, causal=causal)
+        out_pt, _, _ = attention_ref(
+            qg, kg, vg, causal=causal, upcast=False, reorder_ops=True
+        )
+        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+        diff = (out[lo:hi].unsqueeze(0) - out_ref).abs().max().item()
+        max_diff = max(max_diff, diff)
+        assert diff <= tol, f"group {g} diff {diff} > tol {tol}"
+    print(f"[opus-d192-group] max diff across groups: {max_diff}")

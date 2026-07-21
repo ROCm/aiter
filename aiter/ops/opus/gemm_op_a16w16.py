@@ -280,12 +280,35 @@ def _opus_gemm_bf16_dispatch(
 
 # ---- High-level shape-driven API -----------------------------------------
 
-# splitk kids (200..299) main kernel only has the <fp32_t> instantiation
-# (traits static_assert D_C==float, fp32 workspace). The reduce kernel
+# splitk kids main kernel only has the <fp32_t> instantiation (traits
+# static_assert D_C==float, fp32 workspace). The reduce kernel
 # (splitk_reduce_kernel) is templated on D_OUT and dispatches to either
 # __bf16 or float at launch time based on Y.dtype(), so both bf16 and fp32
-# outputs are valid. Kept here only as a documentation anchor; the dispatch
-# code below no longer needs to special-case Y.dtype against splitk kids.
+# outputs are valid. The dispatch code below no longer needs to special-case
+# Y.dtype against splitk kids.
+#
+# splitk kid ranges, one half-open [lo, hi) interval per device family. Kept
+# in exact lockstep with the C++ authority `opus_kid_is_splitk` in
+# csrc/opus_gemm/opus_gemm.cu -- adding a new device's splitk band means
+# appending one row HERE and there. Consumed by is_splitk_kid() below, which
+# gates the split-K workspace prewarm in aiter/tuned_gemm.py (non-splitk kids
+# never touch the workspace, so warming it for them is pure waste).
+_SPLITK_KID_RANGES = (
+    (200, 300),  # gfx950 base
+    (1200, 1300),  # gfx950 non-OOB mirror (+1000)
+    (10200, 10300),  # gfx942 (+10000)
+    (20000, 21000),  # gfx1250 cluster/TDM split-K
+)
+
+
+def is_splitk_kid(kid: int) -> bool:
+    """True iff `kid` selects a split-K opus a16w16 kernel (fp32 workspace +
+    reduce). Mirrors C++ `opus_kid_is_splitk`; keep the two in sync."""
+    kid = int(kid)
+    return any(lo <= kid < hi for lo, hi in _SPLITK_KID_RANGES)
+
+
+# Back-compat: the old gfx950-only single-band constants some callers imported.
 _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
@@ -533,4 +556,5 @@ __all__ = [
     "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
+    "is_splitk_kid",
 ]
