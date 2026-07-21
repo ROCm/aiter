@@ -8,7 +8,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import _to_raw as _raw
 from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Float4E2M1FN, T
+from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
 
 from .mxfp4_gemm_common import (
@@ -105,12 +105,13 @@ def bscale_frag_tmpl(view):
     return view[0, 0, 0, None]
 
 
-def scale_mma_atoms():
-    """16 (opselA,opselB) scaled-MFMA atoms; cbsz/blgp=4 for fp4 from Float4E2M1FN."""
+def scale_mma_atoms(a_dtype):
+    """16 (opselA,opselB) scaled-MFMA atoms; A elem is fp8/fp4, B is fp4."""
+    elem_a = Float8E4M3FN if a_dtype == "fp8" else Float4E2M1FN
     return {
         (osa, osb): fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(
-                16, 16, 128, Float4E2M1FN, opsel_a=osa, opsel_b=osb
+                16, 16, 128, elem_a, Float4E2M1FN, opsel_a=osa, opsel_b=osb
             )
         )
         for osa in range(4)
@@ -127,11 +128,10 @@ def issue_a_ds_read_dt(
     lane_div_16,
     lane_mod_16,
     is_f8,
-    a_vals,
     a_frags,
     kMChunks,
 ):
-    """A ds-read for one slot: fp4 -> Vec4 i32 into a_frags; fp8 -> Vec8 i32 into a_vals."""
+    """A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>."""
     for k in range_constexpr(2):
         for i in range_constexpr(kMChunks):
             lds_row = lane_mod_16 + i * 16
@@ -160,7 +160,7 @@ def issue_a_ds_read_dt(
                     )
                 )
                 a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
-                a_vals[i][k] = _raw(a64.bitcast(fx.Int32))
+                a_frags[i][k].store(a64.bitcast(fx.Int32))
             else:
                 mask = lds_swizzle_mask(lane_mod_16)
                 lds_col = (lane_div_16 * 16 + k * 64) ^ mask
@@ -180,105 +180,29 @@ def mma_one_j(
     sa,
     sb,
     bq_frags_kt,
-    is_f8,
-    cbsz_a,
-    a_vals,
     a_frags,
-    accm,
     c_frags,
     atoms,
     i0=0,
     single_rg=False,
     rg_off=0,
 ):
-    """One J-cluster (4 scaled MFMAs) for a 32-row A-scale group (row-groups i0, i0+1); fp4 fx.gemm / fp8 raw mfma_scale. sa: 32-row A-scale reg. single_rg (BM16): single 16-row group, rg_off picks its byte, 2 MFMAs."""
+    """One J-cluster of scaled MFMAs over a 32-row A-scale group (row-groups i0, i0+1); each is
+    an fx.gemm on i32 A/B frags (fp8 A = i32<8:1>, fp4 A = i32<4:1>), e8m0 words on scale_a/scale_b.
+    sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte, 2 MFMAs."""
+    bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
     if const_expr(single_rg):
-        if const_expr(is_f8):
-            bJ0 = Vec(bq_frags_kt[J][0].load())
-            bJ1 = Vec(bq_frags_kt[J][1].load())
-            for osa_base, k in ((0, 0), (2, 1)):
-                bJ = bJ0 if k == 0 else bJ1
-                osb = (0 if k == 0 else 2) + in_b
-                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    T.f32x4,
-                    [
-                        a_vals[i0][k],
-                        bJ,
-                        accm[i0][J],
-                        cbsz_a,
-                        4,
-                        osa_base + rg_off,
-                        sa,
-                        osb,
-                        sb,
-                    ],
-                )
-        else:
-            bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
-            fx.gemm(
-                atoms[(0 + rg_off, 0 + in_b)],
-                c_frags[i0][J],
-                a_frags[i0][0],
-                bJ0,
-                c_frags[i0][J],
-                scale_a=sa,
-                scale_b=sb,
-            )
-            fx.gemm(
-                atoms[(2 + rg_off, 2 + in_b)],
-                c_frags[i0][J],
-                a_frags[i0][1],
-                bJ1,
-                c_frags[i0][J],
-                scale_a=sa,
-                scale_b=sb,
-            )
-        return
-    if const_expr(is_f8):
-        bJ0 = Vec(bq_frags_kt[J][0].load())
-        bJ1 = Vec(bq_frags_kt[J][1].load())
-        for osa, k, di in ((0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1)):
-            i = i0 + di
-            bJ = bJ0 if k == 0 else bJ1
-            osb = (0 if k == 0 else 2) + in_b
-            accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                T.f32x4, [a_vals[i][k], bJ, accm[i][J], cbsz_a, 4, osa, sa, osb, sb]
-            )
+        steps = ((0 + rg_off, 0, i0, bJ0), (2 + rg_off, 1, i0, bJ1))
     else:
-        bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
+        steps = ((0, 0, i0, bJ0), (1, 0, i0 + 1, bJ0), (2, 1, i0, bJ1), (3, 1, i0 + 1, bJ1))
+    for osa, k, i, bJ in steps:
+        osb = (0 if k == 0 else 2) + in_b
         fx.gemm(
-            atoms[(0, 0 + in_b)],
-            c_frags[i0 + 0][J],
-            a_frags[i0 + 0][0],
-            bJ0,
-            c_frags[i0 + 0][J],
-            scale_a=sa,
-            scale_b=sb,
-        )
-        fx.gemm(
-            atoms[(1, 0 + in_b)],
-            c_frags[i0 + 1][J],
-            a_frags[i0 + 1][0],
-            bJ0,
-            c_frags[i0 + 1][J],
-            scale_a=sa,
-            scale_b=sb,
-        )
-        fx.gemm(
-            atoms[(2, 2 + in_b)],
-            c_frags[i0 + 0][J],
-            a_frags[i0 + 0][1],
-            bJ1,
-            c_frags[i0 + 0][J],
-            scale_a=sa,
-            scale_b=sb,
-        )
-        fx.gemm(
-            atoms[(3, 2 + in_b)],
-            c_frags[i0 + 1][J],
-            a_frags[i0 + 1][1],
-            bJ1,
-            c_frags[i0 + 1][J],
+            atoms[(osa, osb)],
+            c_frags[i][J],
+            a_frags[i][k],
+            bJ,
+            c_frags[i][J],
             scale_a=sa,
             scale_b=sb,
         )
@@ -394,7 +318,6 @@ def gemm2_body_v2(
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
-    cbsz_a = 0 if is_f8_a else 4
     # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = K_rt // fx.Int32(a_pack)  # A row stride bytes (runtime)
@@ -492,24 +415,17 @@ def gemm2_body_v2(
     # B / B-scale fragments are streamed PER-ITER (one K-tile worth); A refilled per K via LDS.
     frag_tmpl = bq_frag_tmpl(bq_views[0])  # i32<4:1>
     bs_frag_tmpl = bscale_frag_tmpl(bscale_views[0])  # i32<1:1>
-    # fp4: A in fx.gemm fragments. fp8: A a per-iter Vec8 i32, C a raw f32x4 (accm).
-    zero4 = Vec.filled(4, 0.0, fx.Float32)
-    a_vals = a_frags = c_frags = accm = None
-    if const_expr(is_f8_a):
-        a_vals = [[None, None] for _ in range(kMChunks)]
-        accm = [[zero4 for _ in range(4)] for _ in range(kMChunks)]
-    else:
-        a_frags = [
-            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
-            for _ in range_constexpr(kMChunks)
-        ]
-        c_frags = [
-            [
-                fx.make_fragment_like(frag_tmpl, dtype=fx.Float32.ir_type)
-                for _ in range_constexpr(4)
-            ]
-            for _ in range_constexpr(kMChunks)
-        ]
+    # A/C both live in fx.gemm fragments (dtype-generic path). fp8 A packs two 128-K halves -> i32<8:1>.
+    zero4 = Vec.filled(4, 0.0, Float32)
+    A_NDW = 8 if is_f8_a else 4
+    a_frags = [
+        [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(2)]
+        for _ in range_constexpr(kMChunks)
+    ]
+    c_frags = [
+        [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(4)]
+        for _ in range_constexpr(kMChunks)
+    ]
 
     def issue_b_load_into(bqf, bsf, kt_rt):
         # Issue B-weight + B-scale vmem loads for K-tile kt_rt into the given (per-stage) fragments.
@@ -546,7 +462,6 @@ def gemm2_body_v2(
             lane_div_16,
             lane_mod_16,
             is_f8_a,
-            a_vals,
             a_frags,
             kMChunks,
         )
@@ -569,7 +484,7 @@ def gemm2_body_v2(
             BM=BM,
         )
 
-    mma_atoms = scale_mma_atoms() if const_expr(not is_f8_a) else None
+    mma_atoms = scale_mma_atoms(a_dtype)
 
     def mfma_cluster(bqf, bsf, sa):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
@@ -583,11 +498,7 @@ def gemm2_body_v2(
                     sa[0],
                     sb,
                     bqf,
-                    is_f8_a,
-                    cbsz_a,
-                    a_vals,
                     a_frags,
-                    accm,
                     c_frags,
                     mma_atoms,
                     i0=0,
@@ -602,11 +513,7 @@ def gemm2_body_v2(
                     sa[sub],
                     sb,
                     bqf,
-                    is_f8_a,
-                    cbsz_a,
-                    a_vals,
                     a_frags,
-                    accm,
                     c_frags,
                     mma_atoms,
                     i0=2 * sub,
@@ -641,36 +548,26 @@ def gemm2_body_v2(
                     sa[sub],
                     sb,
                     bqf,
-                    is_f8_a,
-                    cbsz_a,
-                    a_vals,
                     a_frags,
-                    accm,
                     c_frags,
                     mma_atoms,
                     i0=2 * sub,
                 )
 
-    # zero C (fp4 fragments accumulate in place; fp8 accm pre-init above).
-    if const_expr(not is_f8_a):
-        for i in range_constexpr(kMChunks):
-            for J in range_constexpr(4):
-                c_frags[i][J].store(zero4)
+    # zero C (fragments accumulate in place).
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(4):
+            c_frags[i][J].store(zero4)
 
-    # Runtime-trip scf.for K-loop: stream A->LDS (triple-buffered) + B per tile; carry C / accm.
+    # Runtime-trip scf.for K-loop: stream A->LDS (triple-buffered) + B per tile; carry C fragments.
     def load_c_carry():
-        if const_expr(is_f8_a):
-            return [accm[i][J] for i in range(kMChunks) for J in range(4)]
         return [c_frags[i][J].load() for i in range(kMChunks) for J in range(4)]
 
     def store_c_carry(state):
         n = 0
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(4):
-                if const_expr(is_f8_a):
-                    accm[i][J] = state[n]
-                else:
-                    c_frags[i][J].store(state[n])
+                c_frags[i][J].store(state[n])
                 n += 1
         return n
 
@@ -853,11 +750,8 @@ def gemm2_body_v2(
             results = yield yield_carry()
         store_carry(results)
 
-    # epilog: atomic bf16. fp8 reads accm; fp4 loads the C fragments.
-    if const_expr(is_f8_a):
-        accm_vecs = accm
-    else:
-        accm_vecs = [[c_frags[i][J].load() for J in range(4)] for i in range(kMChunks)]
+    # epilog: atomic bf16. Load the C fragments (fp8/fp4 unified onto the same fx.gemm path).
+    accm_vecs = [[c_frags[i][J].load() for J in range(4)] for i in range(kMChunks)]
     atomic_bf16_epilog(
         lds_acc_base,
         accm_vecs,
