@@ -1,32 +1,49 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Pytest correctness coverage for the FlyDSL MLA reduce kernel.
+"""Correctness + perf coverage for the FlyDSL MLA reduce kernel (aiter op_test
+standard: a pytest-free script run as ``python3 test_flydsl_mla_reduce.py``,
+gated on process exit code by aiter CI).
 
-Irregular-first: most cases use production-shaped metadata (variable per-tile
-``n_splits``, gapped ``reduce_partial_map``, MLDS tier boundary, empty tiles).
-Uniform/dense layouts are kept only as a small smoke layer. This mirrors real
-split-KV decode, where every tile can need a different split count and the
-partial buffer is a sparsely-indexed pool.
+Irregular-first: most correctness cases use production-shaped metadata
+(variable per-tile ``n_splits``, gapped ``reduce_partial_map``, MLDS tier
+boundary, empty tiles). Uniform/dense layouts are kept only as a small smoke
+layer. This mirrors real split-KV decode, where every tile can need a
+different split count and the partial buffer is a sparsely-indexed pool.
+
+Running this file (``main()``) does two things in order:
+  1. ``run_checks()`` -- every invariant/correctness check below (guards,
+     cudagraph capture/replay, split-K planning, dispatch-seam introspection,
+     empty-tile/OOB regressions). Any failure aborts with a non-zero exit
+     before the perf sweep runs.
+  2. ``run_bench()`` -- the GLM-5.2 serving / uniform / irregular perf
+     scoreboard (``wrapper`` vs ``hip``), one markdown table each.
 """
 
+import argparse
+import itertools
 import os
 import sys
+from contextlib import contextmanager
+from unittest import mock
 
-import pytest
+import aiter
+import pandas as pd
 import torch
 
-# Make the sibling `flydsl_mla_reduce_common` module importable regardless of
-# invocation style: CI runs this file as `python3 op_tests/test_flydsl_mla_reduce.py`
-# (no PYTHONPATH), where `op_tests` itself isn't a resolvable package, while
-# `pytest` invocations in this repo don't reliably put this file's own directory
-# on sys.path either. Inserting it explicitly makes both paths work.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from aiter.test_common import checkAllclose
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+# `python3 op_tests/test_flydsl_mla_reduce.py` (the file's only supported
+# invocation, now that pytest support is dropped) always resolves
+# `sys.path[0]` to this file's own directory, so the sibling
+# `flydsl_mla_reduce_common` module is importable with no manual sys.path
+# manipulation.
 from flydsl_mla_reduce_common import (
     MLA_REDUCE_SUPPORTED_GFX,
+    bench_cudagraph,
     build_degenerate_inputs,
     build_inputs,
     build_irregular_inputs,
@@ -45,6 +62,28 @@ from flydsl_mla_reduce_common import (
     torch_ref_gather,
 )
 from aiter.ops.flydsl.kernels.mla_reduce import select_tier
+
+
+@contextmanager
+def _env(**kwargs):
+    """Set/unset environment variables for the duration of the block,
+    restoring the prior state on exit (a pytest-free ``monkeypatch.setenv``/
+    ``delenv``). Pass ``None`` for a var that should be unset."""
+    sentinel = object()
+    old = {k: os.environ.get(k, sentinel) for k in kwargs}
+    try:
+        for k, v in kwargs.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is sentinel:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 # DeepSeek shape: HIP MLA_REDUCE_ROUTER has a Dv=512 template, so these compare
 # against the HIP kernel directly.
@@ -115,10 +154,13 @@ _DEGEN_TILES = [2, 4]
 
 
 def _require_cuda():
+    """``main()`` already gates on this before calling `run_checks()`; this is
+    a defensive re-check for anyone importing/calling a check function
+    directly (rule 7: functions stay independently importable)."""
     if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+        raise RuntimeError("mla_reduce check requires CUDA")
     if get_gfx() not in MLA_REDUCE_SUPPORTED_GFX:
-        pytest.skip(f"mla_reduce unsupported on {get_gfx()}")
+        raise RuntimeError(f"mla_reduce unsupported on {get_gfx()}")
 
 
 def _assert_close(fout, flse, ref_out, ref_lse, dt):
@@ -274,7 +316,6 @@ def _run_irregular(spt, gap, M, H, Dv, dt):
     return po, pl, indptr, fmap, pmap, fout, flse
 
 
-@pytest.mark.parametrize("case", _HIP_CASES, ids=_HIP_IDS)
 def test_flydsl_mla_reduce_irregular_vs_hip(case):
     """Irregular metadata matches HIP kn_mla_reduce_v1 (DeepSeek shape, Dv=512)."""
     _require_cuda()
@@ -287,7 +328,6 @@ def test_flydsl_mla_reduce_irregular_vs_hip(case):
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.parametrize("case", _TORCH_CASES, ids=_TORCH_IDS)
 def test_flydsl_mla_reduce_irregular_vs_torch_ref(case):
     """Irregular metadata matches the gather-based torch ref (GLM-5.2, Dv=256)."""
     _require_cuda()
@@ -300,7 +340,6 @@ def test_flydsl_mla_reduce_irregular_vs_torch_ref(case):
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.parametrize("case", _SMOKE_CASES, ids=_SMOKE_IDS)
 def test_flydsl_mla_reduce_uniform_smoke(case):
     """Dense/uniform smoke: each compile tier on both reference paths."""
     _require_cuda()
@@ -337,7 +376,6 @@ def test_flydsl_mla_reduce_uniform_smoke(case):
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.parametrize("case", _GRAPH_CASES, ids=_GRAPH_IDS)
 def test_flydsl_mla_reduce_cudagraph_replay(case):
     """Irregular metadata stays correct under CUDA-graph capture + replay (the
     serving failure mode); no GPU fault and output matches the reference."""
@@ -386,7 +424,6 @@ def test_flydsl_mla_reduce_small_split_cudagraph_replay():
 _SERVING_SHAPE = (16, 512)
 
 
-@pytest.mark.slow
 def test_serving_sparse_grid_vs_hip():
     """batch=8 layout: 16384-tile grid, 8 active tiles, garbage tail."""
     _require_cuda()
@@ -404,7 +441,6 @@ def test_serving_sparse_grid_vs_hip():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
 def test_serving_sparse_grid_cudagraph_replay():
     """16384-tile serving grid under CUDA-graph replay (prod failure mode)."""
     _require_cuda()
@@ -454,117 +490,111 @@ def _assert_splitk_engages(indptr):
     return K, num_slots
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize("K", [4, 8, 16])
-def test_splitk_b1_s128_vs_torch_ref(monkeypatch, K):
+def test_splitk_b1_s128_vs_torch_ref(K):
     """Split-K partial+combine matches the gather-based torch reference for the
     low-tile/high-split decode case, across split factors K."""
     _require_cuda()
-    monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
-    monkeypatch.setenv("MLA_SPLITK_FACTOR", str(K))
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr)
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
-        _SPLITK_H,
-        _SPLITK_DV,
-        dt,
-        True,
-        tier=None,
-    )
-    run()
-    torch.cuda.synchronize()
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    with _env(AITER_MLA_REDUCE_SPLITK="1", MLA_SPLITK_FACTOR=str(K)):
+        dt = "bf16"
+        out_dtype = _out_dtype(dt)
+        po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+        _assert_splitk_engages(indptr)
+        fout.zero_()
+        flse.zero_()
+        run = make_runner(
+            po,
+            pl,
+            indptr,
+            pmap,
+            fmap,
+            fout,
+            flse,
+            _SPLITK_H,
+            _SPLITK_DV,
+            dt,
+            True,
+            tier=None,
+        )
+        run()
+        torch.cuda.synchronize()
+        ref_out, ref_lse = torch_ref_gather(
+            po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+        )
+        _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
-def test_splitk_b1_s128_vs_hip(monkeypatch):
+def test_splitk_b1_s128_vs_hip():
     """Split-K matches the production HIP kn_mla_reduce_v1 (Dv=512 template)."""
     _require_cuda()
-    monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr)
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
-        _SPLITK_H,
-        _SPLITK_DV,
-        dt,
-        True,
-        tier=None,
-    )
-    run()
-    torch.cuda.synchronize()
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    with _env(AITER_MLA_REDUCE_SPLITK="1"):
+        dt = "bf16"
+        out_dtype = _out_dtype(dt)
+        po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+        _assert_splitk_engages(indptr)
+        fout.zero_()
+        flse.zero_()
+        run = make_runner(
+            po,
+            pl,
+            indptr,
+            pmap,
+            fmap,
+            fout,
+            flse,
+            _SPLITK_H,
+            _SPLITK_DV,
+            dt,
+            True,
+            tier=None,
+        )
+        run()
+        torch.cuda.synchronize()
+        ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+        _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
-def test_splitk_b1_s128_cudagraph_replay(monkeypatch):
+def test_splitk_b1_s128_cudagraph_replay():
     """Split-K (2-kernel) stays correct under CUDA-graph capture + replay, with
     a pre-allocated scratch buffer."""
     _require_cuda()
-    monkeypatch.setenv("AITER_MLA_REDUCE_SPLITK", "1")
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr)
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
-        _SPLITK_H,
-        _SPLITK_DV,
-        dt,
-        True,
-        tier=None,
-    )
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    with _env(AITER_MLA_REDUCE_SPLITK="1"):
+        dt = "bf16"
+        out_dtype = _out_dtype(dt)
+        po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+        _assert_splitk_engages(indptr)
+        fout.zero_()
+        flse.zero_()
+        run = make_runner(
+            po,
+            pl,
+            indptr,
+            pmap,
+            fmap,
+            fout,
+            flse,
+            _SPLITK_H,
+            _SPLITK_DV,
+            dt,
+            True,
+            tier=None,
+        )
+        run_cudagraph_replay(run)
+        ref_out, ref_lse = torch_ref_gather(
+            po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+        )
+        _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
-def test_splitk_disabled_by_default(monkeypatch):
+def test_splitk_disabled_by_default():
     """Without the env flag, plan_splitk never engages (default path untouched)."""
     from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk, splitk_enabled
 
-    monkeypatch.delenv("AITER_MLA_REDUCE_SPLITK", raising=False)
-    assert not splitk_enabled()
-    engage, _, _ = plan_splitk(
-        active_tiles=1, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
-    )
-    assert not engage
+    with _env(AITER_MLA_REDUCE_SPLITK=None):
+        assert not splitk_enabled()
+        engage, _, _ = plan_splitk(
+            active_tiles=1, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
+        )
+        assert not engage
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +644,6 @@ def test_da_splitk_no_engage_low_splits():
     assert not engage
 
 
-@pytest.mark.slow
 def test_da_splitk_wrapper_vs_hip():
     """The default-able wrapper path (DA split-K on) matches HIP for b1_s128."""
     _require_cuda()
@@ -638,7 +667,6 @@ def test_da_splitk_wrapper_vs_hip():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
 def test_da_splitk_capture_safe_varying_splits():
     """One CUDA-graph capture (bs=1, grid/K/scratch baked from host num_kv_splits)
     stays correct across replays whose per-tile split count changes on-device."""
@@ -734,7 +762,6 @@ def test_derive_actual_max_splits():
     assert derive_actual_max_splits(indptr) == 8
 
 
-@pytest.mark.slow
 def test_actual_max_splits_wrapper_loose_budget_correct():
     """Loose budget (304) + small actual splits stays on single-kernel path and
     matches the torch reference."""
@@ -787,7 +814,6 @@ def test_actual_max_splits_wrapper_loose_budget_correct():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
 def test_actual_max_splits_wrapper_cudagraph_replay():
     """Loose budget + actual_max_splits gate stays correct under graph replay."""
     _require_cuda()
@@ -827,7 +853,6 @@ def test_actual_max_splits_wrapper_cudagraph_replay():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
 def test_serving_stale_indptr_cudagraph_replay():
     """Cudagraph replay after batch-8→batch-1 layout (guards-ON/OFF differential)."""
     _require_cuda()
@@ -1082,9 +1107,6 @@ def test_serving_true_oob_no_fault():
     _assert_close(fout, flse, ref_out[: fout.size(0)], ref_lse[: fout.size(0)], dt)
 
 
-@pytest.mark.parametrize(
-    "num_tiles", _DEGEN_TILES, ids=[f"tiles{t}" for t in _DEGEN_TILES]
-)
 def test_flydsl_mla_reduce_degenerate_empty_tile(num_tiles):
     """Empty-tile guard: all-empty (n_splits=0) metadata never stores through the
     garbage q-ranges, leaving the output untouched."""
@@ -1105,7 +1127,7 @@ def test_flydsl_mla_reduce_degenerate_empty_tile(num_tiles):
     assert torch.equal(flse, expected_lse)
 
 
-def test_dispatch_does_not_thread_actual_max_splits(monkeypatch):
+def test_dispatch_does_not_thread_actual_max_splits():
     """mla_decode_fwd and _mla_reduce_v1_dispatch do not accept or forward
     actual_max_splits; the FlyDSL wrapper auto-resolves it from reduce_indptr
     (capture-safe warmup cache)."""
@@ -1121,18 +1143,19 @@ def test_dispatch_does_not_thread_actual_max_splits(monkeypatch):
     assert "actual_max_splits" not in inspect.signature(mla.mla_decode_fwd).parameters
 
     # _flydsl_mla_reduce_enabled() re-reads the env var on every call (no
-    # lru_cache on the gate itself), so monkeypatch.setenv takes effect
-    # immediately -- no cache_clear() needed.
-    monkeypatch.setenv("AITER_MLA_REDUCE_FLYDSL", "1")
-    captured = {}
+    # lru_cache on the gate itself), so _env() takes effect immediately.
+    with _env(AITER_MLA_REDUCE_FLYDSL="1"):
+        captured = {}
 
-    def _capture(*args, **kwargs):
-        captured["kwargs"] = kwargs
+        def _capture(*args, **kwargs):
+            captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(flydsl, "flydsl_mla_reduce_v1", _capture)
-    mla._mla_reduce_v1_dispatch(None, None, None, None, None, 1, 0, None, None)
-    assert "actual_max_splits" not in captured["kwargs"]
-    assert captured["kwargs"].get("num_kv_splits") == 0
+        with mock.patch.object(flydsl, "flydsl_mla_reduce_v1", _capture):
+            mla._mla_reduce_v1_dispatch(
+                None, None, None, None, None, 1, 0, None, None
+            )
+        assert "actual_max_splits" not in captured["kwargs"]
+        assert captured["kwargs"].get("num_kv_splits") == 0
 
 
 def test_resolve_actual_max_splits_eager_and_capture():
@@ -1182,9 +1205,6 @@ _ADAPTIVE_SCENARIOS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "label,active,splits", _ADAPTIVE_SCENARIOS, ids=[s[0] for s in _ADAPTIVE_SCENARIOS]
-)
 def test_adaptive_launch_wrapper_vs_hip(label, active, splits):
     """Adaptive launch (split-K off) matches HIP on the serving decode shapes."""
     _require_cuda()
@@ -1208,7 +1228,6 @@ def test_adaptive_launch_wrapper_vs_hip(label, active, splits):
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-@pytest.mark.slow
 def test_adaptive_launch_cudagraph_replay():
     """Adaptive launch stays correct under CUDA-graph capture/replay (b8_s32)."""
     _require_cuda()
@@ -1252,3 +1271,442 @@ def test_adaptive_launch_single_tile_uses_persistent():
     torch.cuda.synchronize()
     ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
     _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+def run_checks():
+    """Run every invariant/correctness check. Returns a list of ``(name, exc)``
+    for any that failed; an empty list means everything passed. Aggregates
+    failures instead of stopping at the first one, mirroring a full pytest
+    report without depending on pytest."""
+    failures = []
+
+    def _run(name, fn, *args):
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001 - collect every failure, keep going
+            failures.append((name, exc))
+
+    for case in _HIP_CASES:
+        _run(
+            f"irregular_vs_hip[{case[0]}_{case[4]}]",
+            test_flydsl_mla_reduce_irregular_vs_hip,
+            case,
+        )
+    for case in _TORCH_CASES:
+        _run(
+            f"irregular_vs_torch_ref[{case[0]}_{case[4]}]",
+            test_flydsl_mla_reduce_irregular_vs_torch_ref,
+            case,
+        )
+    for case in _SMOKE_CASES:
+        (H, Dv), ref, S = case
+        _run(
+            f"uniform_smoke[H{H}_Dv{Dv}_{ref}_s{S}]",
+            test_flydsl_mla_reduce_uniform_smoke,
+            case,
+        )
+    for case in _GRAPH_CASES:
+        _run(
+            f"cudagraph_replay[{case[0]}]", test_flydsl_mla_reduce_cudagraph_replay, case
+        )
+    _run(
+        "small_split_cudagraph_replay", test_flydsl_mla_reduce_small_split_cudagraph_replay
+    )
+    _run("serving_sparse_grid_vs_hip", test_serving_sparse_grid_vs_hip)
+    _run("serving_sparse_grid_cudagraph_replay", test_serving_sparse_grid_cudagraph_replay)
+    for K in [4, 8, 16]:
+        _run(f"splitk_b1_s128_vs_torch_ref[K={K}]", test_splitk_b1_s128_vs_torch_ref, K)
+    _run("splitk_b1_s128_vs_hip", test_splitk_b1_s128_vs_hip)
+    _run("splitk_b1_s128_cudagraph_replay", test_splitk_b1_s128_cudagraph_replay)
+    _run("splitk_disabled_by_default", test_splitk_disabled_by_default)
+    _run("da_splitk_no_engage_large_batch", test_da_splitk_no_engage_large_batch)
+    _run("da_splitk_no_engage_low_splits", test_da_splitk_no_engage_low_splits)
+    _run("da_splitk_wrapper_vs_hip", test_da_splitk_wrapper_vs_hip)
+    _run(
+        "da_splitk_capture_safe_varying_splits", test_da_splitk_capture_safe_varying_splits
+    )
+    _run("actual_max_splits_gate_loose_budget", test_actual_max_splits_gate_loose_budget)
+    _run("derive_actual_max_splits", test_derive_actual_max_splits)
+    _run(
+        "actual_max_splits_wrapper_loose_budget_correct",
+        test_actual_max_splits_wrapper_loose_budget_correct,
+    )
+    _run(
+        "actual_max_splits_wrapper_cudagraph_replay",
+        test_actual_max_splits_wrapper_cudagraph_replay,
+    )
+    _run("serving_stale_indptr_cudagraph_replay", test_serving_stale_indptr_cudagraph_replay)
+    _run("serving_gather_guard_differential", test_serving_gather_guard_differential)
+    _run("serving_store_guard_differential", test_serving_store_guard_differential)
+    _run(
+        "serving_gather_guard_differential_cudagraph_replay",
+        test_serving_gather_guard_differential_cudagraph_replay,
+    )
+    _run(
+        "serving_store_guard_differential_cudagraph_replay",
+        test_serving_store_guard_differential_cudagraph_replay,
+    )
+    _run("serving_true_oob_no_fault", test_serving_true_oob_no_fault)
+    for num_tiles in _DEGEN_TILES:
+        _run(
+            f"degenerate_empty_tile[tiles{num_tiles}]",
+            test_flydsl_mla_reduce_degenerate_empty_tile,
+            num_tiles,
+        )
+    _run(
+        "dispatch_does_not_thread_actual_max_splits",
+        test_dispatch_does_not_thread_actual_max_splits,
+    )
+    _run(
+        "resolve_actual_max_splits_eager_and_capture",
+        test_resolve_actual_max_splits_eager_and_capture,
+    )
+    for label, active, splits in _ADAPTIVE_SCENARIOS:
+        _run(
+            f"adaptive_launch_wrapper_vs_hip[{label}]",
+            test_adaptive_launch_wrapper_vs_hip,
+            label,
+            active,
+            splits,
+        )
+    _run("adaptive_launch_cudagraph_replay", test_adaptive_launch_cudagraph_replay)
+    _run(
+        "adaptive_launch_single_tile_uses_persistent",
+        test_adaptive_launch_single_tile_uses_persistent,
+    )
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Perf scoreboard: GLM-5.2 serving decode grid, dense/uniform occupancy
+# control, and irregular per-tile cost factors. Each candidate (``wrapper`` =
+# FlyDSL, ``hip`` = production baseline where a Dv=512 HIP template exists) is
+# timed with `run_perftest`/`bench_cudagraph` and checked with `checkAllclose`
+# against a torch online-softmax reference (untimed, not tabled).
+# ---------------------------------------------------------------------------
+
+# (active_tiles, splits) serving decode buckets: 1 tile x 128 splits exercises
+# the split-K path; 8 tiles x N splits exercises the sparse adaptive launch.
+_SERVING_SCENARIOS = [
+    (1, 128),
+    (8, 32),
+    (8, 26),
+    (8, 13),
+    (8, 6),
+    (8, 5),
+    (8, 3),
+    (8, 2),
+]
+
+
+def _roofline(active, splits, H, Dv, out_dtype):
+    """FLOPs (online-softmax weighted-sum FMA) and byte traffic for the reduce."""
+    total_splits = active * splits
+    out_bytes = torch.finfo(out_dtype).bits // 8
+    flops = 2 * total_splits * H * Dv
+    nbytes = (
+        total_splits * H * Dv * 4  # partial_output fp32 read
+        + total_splits * H * 4  # partial_lse   fp32 read
+        + active * H * Dv * out_bytes  # final_output  write
+        + active * H * 4  # final_lse     fp32 write
+    )
+    return flops, nbytes
+
+
+@benchmark()
+def test_mla_reduce(active, splits, H, Dv, dtype):
+    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
+        active, splits, dtype, H=H, Dv=Dv
+    )
+
+    # torch online-softmax reference over the active prefix only (tail tiles are
+    # empty and skipped by both the kernels and the ref).
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr[: active + 1], fmap[:active], pmap, H, Dv, dtype, M=1
+    )
+
+    candidates = {
+        "wrapper": lambda: flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
+        )
+    }
+    if Dv == 512:
+        # mla_reduce_v1 signature: (..., max_seqlen_q, num_kv_splits, out, lse)
+        # HIP MLA_REDUCE_ROUTER only has a Dv=512 template; skip it elsewhere.
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, 0, fout, flse
+        )
+
+    flops, nbytes = _roofline(active, splits, H, Dv, dtype)
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        fout.zero_()
+        flse.zero_()
+        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
+        out = fout.clone()
+        lse = flse.clone()
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=_out_atol(dtype),
+            msg=f"{name}: mla_reduce out",
+            printLog=False,
+        )
+        checkAllclose(
+            ref_lse.to(dtypes.fp32),
+            lse.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-3,
+            msg=f"{name}: mla_reduce lse",
+            printLog=False,
+        )
+        # CUDA-graph replay µs (serving path): host dispatch captured once and
+        # amortized away. TFLOPS/TB/s are derived from this, not eager us.
+        graph_us = bench_cudagraph(fn) * 1e3
+        ret[f"{name} us"] = us
+        ret[f"{name} graph us"] = graph_us
+        ret[f"{name} TFLOPS"] = flops / graph_us / 1e6
+        ret[f"{name} TB/s"] = nbytes / graph_us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_mla_reduce_uniform(tiles, splits, H, Dv, M, dtype):
+    """Dense/uniform occupancy control: every tile has ``splits`` splits."""
+    po, pl, indptr, fmap, pmap, fout, flse = build_inputs(
+        tiles, splits, H, Dv, dtype, M=M
+    )
+    ref_out, ref_lse = torch_ref(po, pl, tiles, splits, H, Dv, dtype, M=M)
+
+    candidates = {
+        "wrapper": lambda: flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, M, fout, flse, num_kv_splits=splits
+        )
+    }
+    if Dv == 512:
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, M, 0, fout, flse
+        )
+
+    out_bytes = torch.finfo(dtype).bits // 8
+    flops = 2 * tiles * splits * H * Dv
+    nbytes = (
+        tiles * splits * H * Dv * 4
+        + tiles * splits * H * 4
+        + tiles * M * H * Dv * out_bytes
+        + tiles * M * H * 4
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        fout.zero_()
+        flse.zero_()
+        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            fout.clone().to(dtypes.fp32),
+            rtol=1e-2,
+            atol=_out_atol(dtype),
+            msg=f"{name}: mla_reduce_uniform out",
+            printLog=False,
+        )
+        graph_us = bench_cudagraph(fn) * 1e3
+        ret[f"{name} us"] = us
+        ret[f"{name} graph us"] = graph_us
+        ret[f"{name} TFLOPS"] = flops / graph_us / 1e6
+        ret[f"{name} TB/s"] = nbytes / graph_us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_mla_reduce_irregular(splits_per_tile, gap_stride, pool_slack, H, Dv, dtype):
+    """Irregular per-tile split cost factors: tier mismatch, gaps, pool slack."""
+    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+        list(splits_per_tile),
+        H,
+        Dv,
+        dtype,
+        gap_stride=gap_stride,
+        pool_slack=pool_slack,
+    )
+    ref_out, ref_lse = torch_ref_gather(po, pl, indptr, fmap, pmap, H, Dv, dtype)
+
+    candidates = {
+        "wrapper": lambda: flydsl_mla_reduce_v1(
+            po,
+            pl,
+            indptr,
+            fmap,
+            pmap,
+            1,
+            fout,
+            flse,
+            num_kv_splits=max(splits_per_tile),
+        )
+    }
+    if Dv == 512:
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, 0, fout, flse
+        )
+
+    total_splits = sum(splits_per_tile)
+    active = sum(1 for s in splits_per_tile if s > 1)
+    out_bytes = torch.finfo(dtype).bits // 8
+    flops = 2 * total_splits * H * Dv
+    nbytes = (
+        total_splits * H * Dv * 4
+        + total_splits * H * 4
+        + active * H * Dv * out_bytes
+        + active * H * 4
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        fout.zero_()
+        flse.zero_()
+        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
+        err = checkAllclose(
+            ref_out.to(dtypes.fp32),
+            fout.clone().to(dtypes.fp32),
+            rtol=1e-2,
+            atol=_out_atol(dtype),
+            msg=f"{name}: mla_reduce_irregular out",
+            printLog=False,
+        )
+        graph_us = bench_cudagraph(fn) * 1e3
+        ret[f"{name} us"] = us
+        ret[f"{name} graph us"] = graph_us
+        ret[f"{name} TFLOPS"] = flops / graph_us / 1e6
+        ret[f"{name} TB/s"] = nbytes / graph_us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def run_bench(args):
+    """Run the three perf sweeps and print one markdown table each."""
+    for dtype in args.dtype:
+        df = []
+        for (H, Dv), (active, splits) in itertools.product(args.hdv, args.scenario):
+            df.append(test_mla_reduce(active, splits, H, Dv, dtype))
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "mla_reduce GLM-5.2 serving summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+        df = []
+        for (H, Dv), tiles, splits in itertools.product(
+            args.hdv, args.tiles, args.uniform_splits
+        ):
+            df.append(test_mla_reduce_uniform(tiles, splits, H, Dv, 1, dtype))
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "mla_reduce uniform (occupancy) summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+        df = []
+        for (H, Dv), spt, gap_stride, pool_slack in itertools.product(
+            args.hdv, args.splits_per_tile, args.gap_stride, args.pool_slack
+        ):
+            df.append(
+                test_mla_reduce_irregular(spt, gap_stride, pool_slack, H, Dv, dtype)
+            )
+        df = pd.DataFrame(df)
+        aiter.logger.info(
+            "mla_reduce irregular (cost-factor) summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+
+def main():
+    if not torch.cuda.is_available() or get_gfx() not in MLA_REDUCE_SUPPORTED_GFX:
+        aiter.logger.warning("mla_reduce unsupported on %s; skipping", get_gfx())
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter, description="config input of test"
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default="bf16,",
+        metavar="{bf16,fp16}",
+        help="Output data type, e.g. -d bf16",
+    )
+    parser.add_argument(
+        "--hdv",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(16, 512)],
+        help="(H, Dv) shape, e.g. --hdv 16,512 128,512",
+    )
+    parser.add_argument(
+        "-s",
+        "--scenario",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=_SERVING_SCENARIOS,
+        help="(active_tiles, splits) decode buckets, e.g. -s 1,128 8,32",
+    )
+    parser.add_argument(
+        "--tiles",
+        type=int,
+        nargs="*",
+        default=[256],
+        help="uniform sweep: dense reduce-tile counts, e.g. --tiles 128 256",
+    )
+    parser.add_argument(
+        "--uniform-splits",
+        type=int,
+        nargs="*",
+        default=[8],
+        help="uniform sweep: splits per tile (dense), e.g. --uniform-splits 8 128",
+    )
+    parser.add_argument(
+        "--splits-per-tile",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(8, 304), (4, 32, 8, 64)],
+        help='irregular sweep: per-tile n_splits, e.g. --splits-per-tile "8,304" "4,32,8,64"',
+    )
+    parser.add_argument(
+        "--gap-stride",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="irregular sweep: partial-pool row stride, e.g. --gap-stride 1 4",
+    )
+    parser.add_argument(
+        "--pool-slack",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="irregular sweep: extra unused partial-pool rows",
+    )
+    args = parser.parse_args()
+
+    aiter.logger.info("mla_reduce: running invariant/correctness checks...")
+    failures = run_checks()
+    if failures:
+        for name, exc in failures:
+            aiter.logger.error("FAILED %s: %r", name, exc)
+        aiter.logger.error(
+            "mla_reduce: %d invariant check(s) failed; skipping perf sweep",
+            len(failures),
+        )
+        sys.exit(1)
+    aiter.logger.info("mla_reduce: all invariant checks passed")
+
+    run_bench(args)
+
+
+if __name__ == "__main__":
+    main()
