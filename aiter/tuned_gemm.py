@@ -285,8 +285,21 @@ def get_GEMM_A16W16_config(
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
         if not default_config:
-            default_config["libtype"] = "torch"
-            default_config["solidx"] = 0
+            # gfx1250 has no tuned ASM/skinny/hipblaslt bf16 kernels, so the
+            # torch fallback lands on hipBLASLt, which is markedly slower than
+            # the Triton (gluon) a16w16 kernel for these shapes. Prefer Triton
+            # for unscaled bf16/fp16 GEMMs; explicit tuned CSV entries still win
+            # since they are matched before this fallback is reached.
+            if (
+                gfx == "gfx1250"
+                and not scaleAB
+                and eval(dtype) in (dtypes.bf16, dtypes.fp16)
+            ):
+                default_config["libtype"] = "triton"
+                default_config["solidx"] = 0
+            else:
+                default_config["libtype"] = "torch"
+                default_config["solidx"] = 0
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
