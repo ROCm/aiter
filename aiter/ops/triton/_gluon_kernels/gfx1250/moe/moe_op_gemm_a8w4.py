@@ -321,6 +321,13 @@ def _moe_gemm_a8w4_decode_persistent(
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
+    if Gammas is not None:
+        offs_gm = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_gm = offs_gm < M
+        gammas = gl.amd.gfx1250.buffer_load(
+            Gammas + start_m, offs_gm, mask=mask_gm, other=0.0
+        )
+
     WMxScale += expt_id.to(index_type) * stride_w_mx_e
     W += expt_id.to(index_type) * stride_w_e
 
@@ -682,11 +689,6 @@ def _moe_gemm_a8w4_decode_persistent(
             out = acc
 
         if Gammas is not None:
-            offs_gm = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
-            mask_gm = offs_gm < M
-            gammas = gl.amd.gfx1250.buffer_load(
-                Gammas + start_m, offs_gm, mask=mask_gm, other=0.0
-            )
             out *= gammas[:, None]
 
         # quant
