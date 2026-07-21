@@ -1259,19 +1259,36 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         )
         is_varlen = True
 
-    BV = _heuristic_bv(
-        H=H,
-        Hg=Hg,
-        V=V,
-        T_flat=T_flat,
-        N=N,
-        is_varlen=is_varlen,
-        min_seqlen=min_seqlen,
-        device_index=k.device.index if k.device.type == "cuda" else -1,
-        dtype_str=str(k.dtype),
-        K=K,
-        BT=BT,
-    )
+    if _IS_GFX942:
+        # gfx942：BV 选择与 hip K5（chunk_gated_delta_rule_fwd_h_hip_fn）逐函数对齐，
+        # 直接复用 hip 的解析式选择（_compute_bv），绕过 csv-best 与 rule carve-out，
+        # 保证同 shape 下 flydsl 与 hip 选出**完全相同**的 BV。gfx950 仍走下面的
+        # csv-best + heuristic 路径。lazy import 避免与 hip 模块潜在的循环导入。
+        # 两侧 chunk_offsets 同源（prepare_chunk_offsets），dense 的 T_flat/H/device
+        # 口径也一致，故直接把 flydsl 现有变量喂给 hip 的选择函数即可。
+        from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+            _select_bv_for_dense as _hip_select_bv_for_dense,
+            _select_bv_for_varlen as _hip_select_bv_for_varlen,
+        )
+
+        if is_varlen:
+            BV = _hip_select_bv_for_varlen(chunk_offsets, H)
+        else:
+            BV = _hip_select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
+    else:
+        BV = _heuristic_bv(
+            H=H,
+            Hg=Hg,
+            V=V,
+            T_flat=T_flat,
+            N=N,
+            is_varlen=is_varlen,
+            min_seqlen=min_seqlen,
+            device_index=k.device.index if k.device.type == "cuda" else -1,
+            dtype_str=str(k.dtype),
+            K=K,
+            BT=BT,
+        )
 
     if _fork is not None and _fork not in _K5_FORKS:
         raise ValueError(
