@@ -3,10 +3,10 @@
 """A8W8 FP8 blockscale GEMM for gfx1250.
 
 Computes Y = X @ W^T with per-K-block f32 scales.
-Supports the `reg_preload` variant and optional TDM-store output.
+Supports the `compute_bound` variant and optional TDM-store output.
 
 Variant:
-  - reg_preload : default. Operand frags loop-carried across K-tiles via
+  - compute_bound : default. Operand frags loop-carried across K-tiles via
                   `_pack_state_experimental` / `_unpack_state_experimental`.
                     * W-scales: bulk-load K-tiles' W-scales into VGPRs
                       (each buffer_load_b32 covers up to 32 K-blocks).
@@ -180,15 +180,18 @@ def compile_gemm_a8w8_blockscale(
     waves_per_eu: int = None,
     l2_prefetch_distance: int = 0,
     out_dtype: str = "bf16",
-    variant: str = "reg_preload",
+    variant: str = "compute_bound",
     N: int = 0,
     use_tdm_store: bool = False,
     loop_carried_load_percent: Optional[int] = None,
     kernarg_preload: bool = False,
+    split_k: int = 1,
 ):
-    if variant not in ("reg_preload", "memb"):
-        raise ValueError(f"variant must be 'reg_preload' or 'memb', got {variant!r}")
-    if const_expr(variant in ("reg_preload", "memb")):
+    if variant not in ("compute_bound", "memory_bound"):
+        raise ValueError(
+            f"variant must be 'compute_bound' or 'memory_bound', got {variant!r}"
+        )
+    if const_expr(variant in ("compute_bound", "memory_bound")):
         _w_is_wave_uniform = (tile_n // n_warp) <= scale_block_n
         if not _w_is_wave_uniform:
             raise ValueError(
@@ -200,8 +203,8 @@ def compile_gemm_a8w8_blockscale(
         raise ValueError(
             f"out_dtype must be 'bf16', 'fp16', or 'f32', got {out_dtype!r}"
         )
-    if num_buffers not in (2, 3, 4):
-        raise ValueError(f"num_buffers must be 2, 3, or 4, got {num_buffers}")
+    if not (2 <= num_buffers <= 8):
+        raise ValueError(f"num_buffers must be between 2 and 8, got {num_buffers}")
     if tile_m % WMMA_M != 0:
         raise ValueError(f"tile_m must be a multiple of {WMMA_M}, got {tile_m}")
     if tile_n % WMMA_N != 0:
@@ -231,6 +234,30 @@ def compile_gemm_a8w8_blockscale(
             raise ValueError(
                 f"use_tdm_store=True requires N ({N}) to be a multiple of tile_n ({tile_n})"
             )
+    if split_k < 1:
+        raise ValueError(f"split_k must be >= 1, got {split_k}")
+    if split_k > 1:
+        if variant != "memory_bound":
+            raise ValueError(
+                f"split_k > 1 is only supported for variant='memory_bound', got {variant!r}"
+            )
+        if use_tdm_store:
+            raise ValueError("split_k > 1 is incompatible with use_tdm_store")
+        if out_dtype != "f32":
+            raise ValueError(
+                "split_k > 1 requires out_dtype='f32' (partials accumulate via f32 "
+                "atomic-fadd; the gemm_a8w8_blockscale wrapper sets this automatically)"
+            )
+        if K % split_k != 0:
+            raise ValueError(f"K ({K}) must be divisible by split_k ({split_k})")
+        if (K // split_k) % tile_k != 0:
+            raise ValueError(
+                f"K/split_k ({K // split_k}) must be a multiple of tile_k ({tile_k})"
+            )
+        if (K // split_k) % scale_block_k != 0:
+            raise ValueError(
+                f"K/split_k ({K // split_k}) must be a multiple of scale_block_k ({scale_block_k})"
+            )
 
     num_warps = m_warp * n_warp
     block_threads = num_warps * WAVE_SIZE
@@ -253,12 +280,14 @@ def compile_gemm_a8w8_blockscale(
         for wn in range(wmma_n_rep)
     ]
 
-    num_k_tiles = K // tile_k
+    split_k_chunk = K // split_k
+    num_k_tiles = split_k_chunk // tile_k
     scale_k = K // scale_block_k
+    scale_k_per_split = split_k_chunk // scale_block_k
 
     # W-scale chunking: 1 buffer_load_b32 covers 32 K-blocks; lazy chain when scale_k > 32 (both variants bulk-load).
     _USES_REG_W = True
-    NUM_W_CHUNKS = (scale_k + 31) // 32
+    NUM_W_CHUNKS = (scale_k_per_split + 31) // 32
     USES_W_CHUNK_PREFETCH = NUM_W_CHUNKS > 1
 
     if num_k_tiles < num_buffers - 1:
@@ -331,9 +360,9 @@ def compile_gemm_a8w8_blockscale(
     # NB-1 tiles in flight across the barrier instead of dipping to NB-2). The wait now
     # sees the just-issued tile -> target is (NB-1)*3, matching the prologue. This
     # re-exposes the WAR (the TDM refill precedes the barrier) -- see the main-loop note.
-    if variant == "memb":
-        # MEMORY-BOUND (memb): prologue fills NB-1 buffers (not NB), so the waits
-        # are one tile shorter than reg_preload -- prologue retires tile-0 leaving
+    if variant == "memory_bound":
+        # MEMORY-BOUND (memory_bound): prologue fills NB-1 buffers (not NB), so the waits
+        # are one tile shorter than compute_bound -- prologue retires tile-0 leaving
         # NB-1 pending, and the main-loop wait sits ABOVE its own refill.
         MAIN_TDM_OUTSTANDING_EXPERIMENTAL = max(0, num_buffers - 3) * _TDMS_PER_TILE_EXP
         REG_PROLOGUE_WAIT = (num_buffers - 2) * _TDMS_PER_TILE_EXP
@@ -356,6 +385,13 @@ def compile_gemm_a8w8_blockscale(
         by = gpu.block_id("y")
         blk_m = bx * arith.index(tile_m)
         blk_n = by * arith.index(tile_n)
+        if const_expr(split_k > 1):
+            bz = gpu.block_id("z")
+            split_k_base = bz * arith.index(split_k_chunk)
+            split_kb_base = bz * arith.index(scale_k_per_split)
+        else:
+            split_k_base = arith.index(0)
+            split_kb_base = arith.index(0)
 
         layout_thr = fx.make_layout(
             (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
@@ -460,8 +496,8 @@ def compile_gemm_a8w8_blockscale(
                 num_warps=num_warps,
             )
 
-        _desc_x_init = _make_desc_x(stages_a_mem[0], arith.index(0))
-        _desc_w_init = _make_desc_w(stages_b_mem[0], arith.index(0))
+        _desc_x_init = _make_desc_x(stages_a_mem[0], split_k_base)
+        _desc_w_init = _make_desc_w(stages_b_mem[0], split_k_base)
 
         dgroup1_x = _desc_x_init.dgroup1
         dgroup1_w = _desc_w_init.dgroup1
@@ -558,7 +594,7 @@ def compile_gemm_a8w8_blockscale(
                 )
 
             _desc_x_scale_init = _make_desc_x_scale(
-                stages_x_scale_mem[0], arith.index(0)
+                stages_x_scale_mem[0], split_kb_base
             )
             dgroup1_x_scale = _desc_x_scale_init.dgroup1
             addr_hi_x_scale = vector.extract(
@@ -632,6 +668,8 @@ def compile_gemm_a8w8_blockscale(
                 """Issue one bulk W-scale load for compile-time chunk_i."""
                 offset = arith.index(chunk_i * 32)
                 idx = wave_n_block * arith.index(scale_k) + lane_id_full + offset
+                if const_expr(split_k > 1):
+                    idx = idx + split_kb_base
                 return buffer_ops.buffer_load(
                     w_scale_buf, idx, vec_width=1, dtype=T.f32
                 )
@@ -647,6 +685,8 @@ def compile_gemm_a8w8_blockscale(
                 offset_i32 = arith.muli(clamped_i32, arith.constant(32, type=T.i32))
                 offset = arith.index_cast(T.index, offset_i32)
                 idx = wave_n_block * arith.index(scale_k) + lane_id_full + offset
+                if const_expr(split_k > 1):
+                    idx = idx + split_kb_base
                 return buffer_ops.buffer_load(
                     w_scale_buf, idx, vec_width=1, dtype=T.f32
                 )
@@ -791,7 +831,7 @@ def compile_gemm_a8w8_blockscale(
             scale_vec = vector.broadcast(T.vec(8, T.f32), scale)
             return math_dialect.fma(temp, scale_vec, acc)
 
-        # State layout: N_ACCS accs | N_A_FRAGS cur_a | N_B_FRAGS cur_b | N_CUR_X_RAW | N_CUR_W_RAW | N_PREFETCH_X | N_PREFETCH_W (frags reg_preload only).
+        # State layout: N_ACCS accs | N_A_FRAGS cur_a | N_B_FRAGS cur_b | N_CUR_X_RAW | N_CUR_W_RAW | N_PREFETCH_X | N_PREFETCH_W (frags compute_bound only).
         N_ACCS = n_accs
         N_A_FRAGS = wmma_m_rep * k_wmma_steps
         N_B_FRAGS = wmma_n_rep * k_wmma_steps
@@ -802,8 +842,8 @@ def compile_gemm_a8w8_blockscale(
         zero_w_raw = [scale_zero] * N_CUR_W_RAW
 
         # Prologue + accs init live inside each variant branch.
-        if const_expr(variant == "reg_preload"):
-            # ───── reg_preload-only helpers ─────
+        if const_expr(variant == "compute_bound"):
+            # ───── compute_bound-only helpers ─────
             def _pack_state_experimental(accs_, a_, b_, cur_x_, cur_w_, pw):
                 return (
                     list(accs_)
@@ -1005,12 +1045,12 @@ def compile_gemm_a8w8_blockscale(
                 """Flat WMMA/FMA (fold-lag removed): issue each WMMA then fold immediately.
 
                 Non-transposed WMMA: ISA operand order (B, A, C). Same WMMA
-                output layout as reg_preload — each lane's vec<8> shares one row,
+                output layout as compute_bound — each lane's vec<8> shares one row,
                 so the per-row x_scale broadcasts as a scalar at FMA time.
 
-                Pattern per scale block matches the reg_preload version. Kept as
+                Pattern per scale block matches the compute_bound version. Kept as
                 a separate function so the experimental path can diverge from
-                reg_preload independently (e.g., scale-apply rewrites or
+                compute_bound independently (e.g., scale-apply rewrites or
                 instruction scheduling experiments).
 
                 Now built on top of the split-out helpers (issue_wmma_step,
@@ -1277,8 +1317,8 @@ def compile_gemm_a8w8_blockscale(
                 dresults = yield list(accs_d) + [arith.addi(cur_dci_d, one_i32_d)]
             accs = list(dresults[:N_ACCS])
 
-        elif const_expr(variant == "memb"):
-            # ───── reg_preload-only helpers ─────
+        elif const_expr(variant == "memory_bound"):
+            # ───── compute_bound-only helpers ─────
 
             def _pack_state_experimental(accs_, a_, b_, cur_x_, cur_w_, pw):
                 return (
@@ -1800,6 +1840,8 @@ def compile_gemm_a8w8_blockscale(
             tdm_ops.tensor_store_2d(d_desc)
             tdm_ops.tensor_wait(0)
         else:
+            if const_expr(split_k > 1):
+                zero_i32_s = arith.constant(0, type=T.i32)
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -1811,7 +1853,24 @@ def compile_gemm_a8w8_blockscale(
                         + lane_kgrp * arith.index(8)
                     )
 
-                    if is_half_out:
+                    if const_expr(split_k > 1):
+                        for half in range_constexpr(2):
+                            col_h = col_base + arith.index(half * 4)
+                            for vi in range_constexpr(4):
+                                val = vector.extract(
+                                    accs[idx],
+                                    static_position=[half * 4 + vi],
+                                    dynamic_position=[],
+                                )
+                                byte_off = arith.index_cast(
+                                    T.i32,
+                                    (row * n_stride + col_h + arith.index(vi))
+                                    * arith.index(4),
+                                )
+                                rocdl.raw_ptr_buffer_atomic_fadd(
+                                    val, y_buf, byte_off, zero_i32_s, zero_i32_s
+                                )
+                    elif is_half_out:
                         c_off_bytes = (row * n_stride + col_base) * arith.index(
                             elem_bytes_d
                         )
@@ -1847,6 +1906,7 @@ def compile_gemm_a8w8_blockscale(
         use_tdm_store,
         loop_carried_load_percent,
         kernarg_preload,
+        split_k,
     )
 
     @flyc.jit
@@ -1924,26 +1984,20 @@ def compile_gemm_a8w8_blockscale(
                     op.attributes["arg_attrs"] = ir.ArrayAttr.get(per_arg)
 
         launcher.launch(
-            grid=(gx, gy, 1),
+            grid=(gx, gy, split_k),
             block=(block_threads, 1, 1),
             stream=stream,
         )
 
-    # LLVM backend scheduling flags — mirrors FlyDSL kernels/gemm_a8w8_blockscale.py.
-    # coexec scheduler + expert-scheduling-mode + static simulator. Flag names take
-    # NO leading dashes; bool/str auto-dispatch. `amdgpu-block-carried-latency` is an
-    # ENUM opt (needs `EnumOpt` + the set_llvm_option_enum C++ binding) — left
-    # commented out to avoid that dependency. To enable it, add
-    #     from flydsl.compiler.llvm_options import EnumOpt
-    # and uncomment the line below (requires a FlyDSL build with the enum patch).
-    launch_gemm_a8w8_blockscale.compile_hints["llvm_options"] = {
-        "amdgpu-expert-scheduling-mode": True,
-        "amdgpu-anti-hints-for-va-vdst": True,
-        "amdgpu-enable-static-simulator": True,
-        "amdgpu-static-sim-inline": True,
-        "amdgpu-sched-strategy": "coexec",
-        # "amdgpu-block-carried-latency": EnumOpt("all"),  # enable per the note above
-    }
+    # Commented out until coexec branch is merged.
+    # launch_gemm_a8w8_blockscale.compile_hints["llvm_options"] = {
+    #     "amdgpu-expert-scheduling-mode": True,
+    #     "amdgpu-anti-hints-for-va-vdst": True,
+    #     "amdgpu-enable-static-simulator": True,
+    #     "amdgpu-static-sim-inline": True,
+    #     "amdgpu-sched-strategy": "coexec",
+    #     # "amdgpu-block-carried-latency": EnumOpt("all"),  # enable per the note above
+    # }
 
     return launch_gemm_a8w8_blockscale
 
@@ -1963,15 +2017,18 @@ def gemm_a8w8_blockscale(
     num_buffers: int = 2,
     waves_per_eu: int = None,
     l2_prefetch_distance: int = 0,
-    variant: str = "reg_preload",
+    variant: str = "compute_bound",
     use_tdm_store: bool = False,
     loop_carried_load_percent: Optional[int] = None,
     kernarg_preload: bool = False,
+    split_k: int = 1,
 ):
     """Compute Y = (X @ W^T) with per-block f32 scales (A8W8 blockscale).
 
-    variant: "reg_preload" (default; the only supported value).
-      - "reg_preload" : loop-carry cur_a/cur_b operand frags across iters.
+    variant: "compute_bound" (default) or "memory_bound".
+      - "compute_bound" : prologue fills all NB buffers; loop-carries
+                        operand frags, 2 barriers/iter.
+      - "memory_bound"  : prologue fills NB-1 buffers, 1 barrier/iter.
                         W-scales bulk-loaded via buffer_load_b32 + readlane,
                         X-scales TDM-staged into LDS. Requires
                         w_is_wave_uniform.
@@ -2009,13 +2066,22 @@ def gemm_a8w8_blockscale(
     assert dtype in torch_to_str, f"Unsupported output dtype {dtype}"
     out_dtype_str = torch_to_str[dtype]
 
+    _splitk_f32_accum = split_k > 1 and dtype in (torch.bfloat16, torch.float16)
+    buf_dtype = torch.float32 if _splitk_f32_accum else dtype
+    if _splitk_f32_accum:
+        out_dtype_str = "f32"
+
     K_padded = ((K + tile_k - 1) // tile_k) * tile_k
     if K_padded != K:
-        # W is always preshuffled; a preshuffled buffer can't be K-padded here (pad before the shuffle).
-        raise ValueError(
-            "K padding is not supported for preshuffled W; pass K that is a "
-            "multiple of tile_k or shuffle the padded W."
-        )
+        pad_size = K_padded - K
+        x = torch.nn.functional.pad(x, (0, pad_size))
+        w = torch.nn.functional.pad(w, (0, pad_size * 16))
+        new_scale_k = K_padded // scale_block_k_derived
+        scale_pad = new_scale_k - scale_k
+        if scale_pad > 0:
+            x_scale = torch.nn.functional.pad(x_scale, (0, scale_pad))
+            w_scale = torch.nn.functional.pad(w_scale, (0, scale_pad))
+        K = K_padded
 
     # Pad N up to tile_n so the kernel's WMMAs and stores land inside the allocated output.
     N_stride = ((N + tile_n - 1) // tile_n) * tile_n
@@ -2024,12 +2090,17 @@ def gemm_a8w8_blockscale(
         assert y.shape == (M, N), f"y shape {y.shape} != ({M}, {N})"
         assert y.dtype == dtype, f"y dtype {y.dtype} != {dtype}"
 
-    if N_stride != N:
-        y_buf = torch.empty((M, N_stride), dtype=dtype, device=x.device)
+    _alloc = torch.zeros if split_k > 1 else torch.empty
+    if _splitk_f32_accum:
+        y_buf = _alloc((M, N_stride), dtype=buf_dtype, device=x.device)
+    elif N_stride != N:
+        y_buf = _alloc((M, N_stride), dtype=dtype, device=x.device)
     elif y is not None:
         y_buf = y
+        if split_k > 1:
+            y_buf.zero_()
     else:
-        y_buf = torch.empty((M, N), dtype=dtype, device=x.device)
+        y_buf = _alloc((M, N), dtype=dtype, device=x.device)
 
     launcher = compile_gemm_a8w8_blockscale(
         K=K,
@@ -2049,11 +2120,18 @@ def gemm_a8w8_blockscale(
         use_tdm_store=use_tdm_store,
         loop_carried_load_percent=loop_carried_load_percent,
         kernarg_preload=kernarg_preload,
+        split_k=split_k,
     )
 
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
     launcher(y_buf, x, w, x_scale, w_scale, M, N_stride, stream=stream)
 
+    if _splitk_f32_accum:
+        result = (y_buf[:, :N] if N_stride != N else y_buf).to(dtype)
+        if y is not None:
+            y.copy_(result)
+            return y
+        return result
     if N_stride != N:
         result = y_buf[:, :N]
         if y is not None:

@@ -216,6 +216,98 @@ def test_gemm_a8w8_blockscale_num_buffers(M, N, K, num_buffers):
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "M, N, K", [(128, 256, 256), (256, 512, 512), (128, 128, 1024)]
+)
+@pytest.mark.parametrize("variant", ["compute_bound", "memory_bound"])
+def test_gemm_a8w8_blockscale_variant(M, N, K, variant):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x, w, x_scale, w_scale, dtype=torch.bfloat16, variant=variant
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+_M_SWEEP = [1, 32, 64, 128]
+_NK_SWEEP = [
+    (8192, 1024),
+    (4096, 8192),
+    (4096, 4096),
+    (4096, 2048),
+    (1536, 4096),
+    (32768, 1024),
+]
+
+
+@pytest.mark.parametrize("N, K", _NK_SWEEP)
+@pytest.mark.parametrize("M", _M_SWEEP)
+@pytest.mark.parametrize("variant", ["compute_bound", "memory_bound"])
+def test_gemm_a8w8_blockscale_m_sweep(variant, M, N, K):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x, w, x_scale, w_scale, dtype=torch.bfloat16, variant=variant
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "M, N, K", [(128, 256, 1024), (256, 512, 2048), (128, 128, 4096)]
+)
+@pytest.mark.parametrize("split_k", [2, 4, 8])
+def test_gemm_a8w8_blockscale_split_k(M, N, K, split_k):
+    _check_gfx1250()
+    tile_k = 128
+    num_buffers = 3
+    if K % (split_k * tile_k) != 0:
+        pytest.skip(f"K={K} not divisible by split_k*tile_k ({split_k}*{tile_k})")
+    if (K // split_k) // tile_k < num_buffers - 1:
+        pytest.skip(f"per-split num_k_tiles < num_buffers-1 (split_k={split_k}, K={K})")
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        variant="memory_bound",
+        split_k=split_k,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_gemm_a8w8_blockscale_split_k_requires_memory_bound():
+    _check_gfx1250()
+    M, N, K = 128, 256, 1024
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    w = shuffle_weight_gfx1250(w)
+    with pytest.raises(ValueError):
+        gemm_a8w8_blockscale(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            dtype=torch.bfloat16,
+            variant="compute_bound",
+            split_k=2,
+        )
+
+
 @pytest.mark.parametrize("M, N, K", [(128, 256, 256)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_gemm_a8w8_blockscale_dtype(M, N, K, dtype):
@@ -393,7 +485,9 @@ if __name__ == "__main__":
         default="bf16",
         choices=["bf16", "fp16", "f32"],
     )
-    parser.add_argument("--num-buffers", type=int, default=2, choices=[2, 3, 4])
+    parser.add_argument(
+        "--num-buffers", type=int, default=2, choices=[2, 3, 4, 5, 6, 7, 8]
+    )
     parser.add_argument(
         "--tdm-store",
         action="store_true",
@@ -402,9 +496,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--variant",
         type=str,
-        default="reg_preload",
-        choices=["reg_preload"],
+        default="compute_bound",
+        choices=["compute_bound", "memory_bound"],
     )
+    parser.add_argument("--tile-m", type=int, default=None)
+    parser.add_argument("--tile-n", type=int, default=None)
+    parser.add_argument("--tile-k", type=int, default=None)
+    parser.add_argument("--m-warp", type=int, default=None)
+    parser.add_argument("--n-warp", type=int, default=None)
+    parser.add_argument("--split-k", type=int, default=None)
     args = parser.parse_args()
 
     dtype_map = {
@@ -415,7 +515,22 @@ if __name__ == "__main__":
     dtype = dtype_map[args.dtype]
 
     _check_gfx1250()
-    _check_shape_compat(args.M, args.N, args.K, num_buffers=args.num_buffers)
+    tile_k_compat = args.tile_k if args.tile_k is not None else 128
+    _check_shape_compat(
+        args.M, args.N, args.K, tile_k=tile_k_compat, num_buffers=args.num_buffers
+    )
+
+    tuned = {}
+    for name, val in (
+        ("tile_m", args.tile_m),
+        ("tile_n", args.tile_n),
+        ("tile_k", args.tile_k),
+        ("m_warp", args.m_warp),
+        ("n_warp", args.n_warp),
+        ("split_k", args.split_k),
+    ):
+        if val is not None:
+            tuned[name] = val
 
     x, w, x_scale, w_scale = _generate_inputs(args.M, args.N, args.K)
     ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
@@ -429,6 +544,7 @@ if __name__ == "__main__":
         num_buffers=args.num_buffers,
         use_tdm_store=args.tdm_store,
         variant=args.variant,
+        **tuned,
     )
 
     torch.cuda.synchronize()
@@ -438,5 +554,5 @@ if __name__ == "__main__":
     print(
         f"PASSED M={args.M} N={args.N} K={args.K} dtype={args.dtype} "
         f"num_buffers={args.num_buffers} tdm_store={args.tdm_store} "
-        f"variant={args.variant}"
+        f"variant={args.variant} " + " ".join(f"{k}={v}" for k, v in tuned.items())
     )
