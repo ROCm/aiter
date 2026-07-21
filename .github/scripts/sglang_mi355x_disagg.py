@@ -244,6 +244,18 @@ model_runtime_path() {
   local original="${1:-}"
   local fallback="${2:-}"
   local resolved=""
+  local prepared_file="${MODEL_RUNTIME_PATH_FILE:-/ci_workdir/prepared_model_path}"
+
+  if [[ -f "$prepared_file" ]]; then
+    local prepared=""
+    prepared="$(head -n 1 "$prepared_file" 2>/dev/null || true)"
+    if resolved="$(resolve_local_model_path "$prepared")"; then
+      echo "[model] using prepared local model path: ${prepared} -> ${resolved}" >&2
+      printf "%s\\n" "$resolved"
+      return 0
+    fi
+    echo "WARN: prepared model path is not complete: ${prepared:-<empty>}" >&2
+  fi
 
   if resolved="$(resolve_local_model_path "$original")"; then
     echo "[model] resolved local model path: ${original} -> ${resolved}" >&2
@@ -276,6 +288,7 @@ MODEL_ID="$MODEL"
 IMAGE="$IMAGE"
 WORKDIR="$WORKDIR"
 DOCKER_DOWNLOAD_COMMON="$DOCKER_DOWNLOAD_COMMON"
+PREPARED_MODEL_PATH_FILE="$WORKDIR/prepared_model_path"
 
 source "\$WORKDIR/model_path_helpers.sh"
 
@@ -286,11 +299,29 @@ fi
 
 if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
   echo "[model] local model already prepared: \$MODEL_PATH -> \$resolved"
+  printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
   exit 0
 fi
 
-mkdir -p "\$(dirname "\$MODEL_PATH")"
-LOCK="\${MODEL_PATH}.download.lock"
+MODEL_TARGET="\$MODEL_PATH"
+MODEL_TARGET_PARENT="\$(dirname "\$MODEL_TARGET")"
+if ! mkdir -p "\$MODEL_TARGET_PARENT" 2>/dev/null || ! touch "\$MODEL_TARGET_PARENT/.aiter-ci-write-test-\$\$" 2>/dev/null; then
+  FALLBACK_ROOT="\${MODEL_CACHE_FALLBACK_ROOT:-/data/\$(id -un)/models2}"
+  MODEL_TARGET="\$FALLBACK_ROOT/\$(basename "\$MODEL_PATH")"
+  MODEL_TARGET_PARENT="\$(dirname "\$MODEL_TARGET")"
+  echo "WARN: MODEL_PATH parent is not writable, using fallback cache: \$MODEL_PATH -> \$MODEL_TARGET"
+  mkdir -p "\$MODEL_TARGET_PARENT"
+else
+  rm -f "\$MODEL_TARGET_PARENT/.aiter-ci-write-test-\$\$" 2>/dev/null || true
+fi
+
+if resolved="\$(resolve_local_model_path "\$MODEL_TARGET")"; then
+  echo "[model] fallback/local model already prepared: \$MODEL_TARGET -> \$resolved"
+  printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
+  exit 0
+fi
+
+LOCK="\${MODEL_TARGET}.download.lock"
 
 lock_is_stale() {
   [[ -d "\$LOCK" ]] || return 1
@@ -311,15 +342,32 @@ sys.exit(0 if age > limit else 1)
 PY
 }
 
+remove_foreign_lock() {
+  [[ -d "\$LOCK" ]] || return 0
+  local owner=""
+  owner="\$(cat "\$LOCK/owner" 2>/dev/null || true)"
+  if [[ "\$owner" != *"workdir=\$WORKDIR"* ]]; then
+    echo "WARN: removing foreign model download lock: \$LOCK"
+    [[ -n "\$owner" ]] && echo "WARN: foreign lock owner: \$owner"
+    rm -rf "\$LOCK"
+  fi
+}
+
+remove_foreign_lock
+
 if lock_is_stale; then
   echo "WARN: removing stale model download lock: \$LOCK"
   rm -rf "\$LOCK"
 fi
 
-if mkdir "\$LOCK" 2>/dev/null; then
+mkdir_error="\$(mktemp)"
+if mkdir "\$LOCK" 2>"\$mkdir_error"; then
+  rm -f "\$mkdir_error" 2>/dev/null || true
   {
     echo "host=\$(hostname)"
     echo "pid=\$\$"
+    echo "workdir=\$WORKDIR"
+    echo "target=\$MODEL_TARGET"
     date -u "+start=%Y-%m-%dT%H:%M:%SZ"
   } > "\$LOCK/owner" 2>/dev/null || true
   touch "\$LOCK/heartbeat" 2>/dev/null || true
@@ -331,11 +379,11 @@ if mkdir "\$LOCK" 2>/dev/null; then
   ) &
   HEARTBEAT_PID=\$!
   trap 'kill "\$HEARTBEAT_PID" 2>/dev/null || true; rm -rf "\$LOCK" 2>/dev/null || true' EXIT
-  echo "[model] downloading \$MODEL_ID to \$MODEL_PATH"
-  mkdir -p "\$MODEL_PATH"
+  echo "[model] downloading \$MODEL_ID to \$MODEL_TARGET"
+  mkdir -p "\$MODEL_TARGET"
   docker run \$DOCKER_DOWNLOAD_COMMON \
     -e MODEL="\$MODEL_ID" \
-    -e MODEL_PATH="\$MODEL_PATH" \
+    -e MODEL_PATH="\$MODEL_TARGET" \
     "\$IMAGE" bash -lc '
       set -euo pipefail
       python3 - <<'"'"'PY'"'"'
@@ -366,10 +414,20 @@ else:
 PY
     '
 else
-  echo "[model] another rank is preparing \$MODEL_PATH; waiting for it"
-  for _ in \$(seq 1 180); do
-    if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
-      echo "[model] local model prepared by another rank: \$MODEL_PATH -> \$resolved"
+  mkdir_status="\$(cat "\$mkdir_error" 2>/dev/null || true)"
+  rm -f "\$mkdir_error" 2>/dev/null || true
+  if [[ ! -d "\$LOCK" ]]; then
+    echo "WARN: failed to create model lock and no active lock exists: \$LOCK"
+    [[ -n "\$mkdir_status" ]] && echo "WARN: mkdir error: \$mkdir_status"
+    exit 1
+  fi
+  echo "[model] another rank is preparing \$MODEL_TARGET; waiting for it"
+  lock_owner="\$(cat "\$LOCK/owner" 2>/dev/null || true)"
+  [[ -n "\$lock_owner" ]] && echo "[model] lock owner: \$lock_owner"
+  for i in \$(seq 1 \${MODEL_DOWNLOAD_WAIT_POLLS:-720}); do
+    if resolved="\$(resolve_local_model_path "\$MODEL_TARGET")"; then
+      echo "[model] local model prepared by another rank: \$MODEL_TARGET -> \$resolved"
+      printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
       exit 0
     fi
     if lock_is_stale; then
@@ -378,16 +436,20 @@ else
       exec "\$0"
     fi
     [[ -d "\$LOCK" ]] || exec "\$0"
+    if (( i % 15 == 0 )); then
+      echo "[model] still waiting for \$MODEL_TARGET after \$((i * 20))s"
+    fi
     sleep 20
   done
 fi
 
-if resolved="\$(resolve_local_model_path "\$MODEL_PATH")"; then
-  echo "[model] local model prepared: \$MODEL_PATH -> \$resolved"
+if resolved="\$(resolve_local_model_path "\$MODEL_TARGET")"; then
+  echo "[model] local model prepared: \$MODEL_TARGET -> \$resolved"
+  printf "%s\\n" "\$resolved" > "\$PREPARED_MODEL_PATH_FILE"
   exit 0
 fi
 
-echo "WARN: unable to prepare local model cache at \$MODEL_PATH; runtime will fall back to \$MODEL_ID"
+echo "WARN: unable to prepare local model cache at \$MODEL_TARGET; runtime will fall back to \$MODEL_ID"
 exit 1
 EOF
 
