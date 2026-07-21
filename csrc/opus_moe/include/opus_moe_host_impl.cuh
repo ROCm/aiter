@@ -9,6 +9,7 @@
 
 #include "opus_moe_arch.cuh"
 #include "gfx950/opus_moe_arch_gfx950.cuh"
+#include "gfx950/a8w4/stage1/opus_moe_stage1_a8w4_dispatch_gfx950.cuh"
 #include "gfx950/a8w4/opus_moe_stage2_a8w4_decode_dispatch_gfx950.cuh"
 #include "opus_moe_common.cuh"
 
@@ -553,5 +554,169 @@ void opus_moe_stage2_reduce_token_slot_route_output_fwd(aiter_tensor_t& route_ou
     const hipStream_t stream = aiter::getCurrentHIPStream();
     opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
         kargs, stream, block_n);
+    HIP_CALL_LAUNCH(hipGetLastError());
+}
+
+void opus_moe_stage1_a8w4_fwd(
+    aiter_tensor_t& hidden_states,
+    aiter_tensor_t& w1,
+    aiter_tensor_t& hidden_scale,
+    aiter_tensor_t& w1_scale,
+    std::optional<aiter_tensor_t> bias,
+    aiter_tensor_t& sorted_token_ids,
+    aiter_tensor_t& sorted_expert_ids,
+    aiter_tensor_t& num_valid_ids,
+    aiter_tensor_t& out,
+    aiter_tensor_t& out_scale,
+    int block_m,
+    const std::string& kernelName,
+    int inter_dim_pad)
+{
+    check_tensor(hidden_states,
+                 "hidden_states",
+                 2,
+                 "[token, model_dim]",
+                 AITER_DTYPE_fp8,
+                 "fp8");
+    check_tensor(
+        w1, "w1", 3, "[expert, 2 * inter_dim, packed_model_dim]", AITER_DTYPE_fp4x2, "fp4x2");
+    check_tensor(hidden_scale,
+                 "hidden_scale",
+                 2,
+                 "[route, hidden_scale_cols]",
+                 AITER_DTYPE_fp8_e8m0,
+                 "fp8_e8m0");
+    check_tensor(w1_scale,
+                 "w1_scale",
+                 2,
+                 "[expert * 2 * inter_dim, hidden_scale_cols]",
+                 AITER_DTYPE_fp8_e8m0,
+                 "fp8_e8m0");
+    if(bias.has_value())
+        check_tensor(*bias, "bias", 2, "[expert, 2 * inter_dim]", AITER_DTYPE_fp32, "fp32");
+    check_tensor(out, "out", 3, "[token, topk, inter_dim]", AITER_DTYPE_fp8, "fp8");
+    check_tensor(out_scale,
+                 "out_scale",
+                 2,
+                 "[sorted_route_rows_padded, output_scale_cols_padded]",
+                 AITER_DTYPE_fp8_e8m0,
+                 "fp8_e8m0");
+    check_i32_metadata(sorted_token_ids, "sorted_token_ids", false);
+    check_i32_metadata(sorted_expert_ids, "sorted_expert_ids", true);
+    check_i32_metadata(num_valid_ids, "num_valid_ids", true);
+    if(bias.has_value())
+        check_same_device(hidden_states, "hidden_states", *bias, "bias");
+
+    const int token_num = static_cast<int>(hidden_states.size(0));
+    const int model_dim = static_cast<int>(hidden_states.size(1));
+    const int num_experts = static_cast<int>(w1.size(0));
+    const int gate_up_dim = static_cast<int>(w1.size(1));
+    const int packed_model_dim = static_cast<int>(w1.size(2));
+    const int topk = static_cast<int>(out.size(1));
+    const int inter_dim = static_cast<int>(out.size(2));
+    const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
+    const int effective_inter_dim = inter_dim - inter_dim_pad;
+    const int kernel_id = opus_moe::stage1_a8w4_kid_from_name(kernelName.c_str());
+    AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
+                "Invalid Opus A8W4 stage1 kernel name: ",
+                kernelName);
+
+    const int expected_block_m = opus_moe::stage1_a8w4_kid_sort_block_m(kernel_id);
+    AITER_CHECK(block_m == expected_block_m,
+                "Opus A8W4 stage1 kernel_id=",
+                kernel_id,
+                " (",
+                opus_moe::stage1_a8w4_kid_name(kernel_id),
+                ") expects sorted block_m=",
+                expected_block_m,
+                ", got ",
+                block_m);
+    constexpr int scale_group = opus_moe::stage1_a8w4::kScaleGroupLogicalK;
+    constexpr int mfma_k = opus_moe::stage1_a8w4::kMfmaK;
+    AITER_CHECK(opus_moe::stage1_a8w4_kid_supports_shape(
+                    kernel_id, model_dim, inter_dim, inter_dim_pad),
+                "Opus A8W4 stage1 kernel_id=",
+                kernel_id,
+                " (",
+                opus_moe::stage1_a8w4_kid_name(kernel_id),
+                ") does not support shape model_dim=",
+                model_dim,
+                " inter_dim=",
+                inter_dim,
+                " inter_dim_pad=",
+                inter_dim_pad,
+                " effective_inter_dim=",
+                effective_inter_dim);
+    AITER_CHECK(!opus_moe::stage1_a8w4_kid_requires_bias(kernel_id) ||
+                    bias.has_value(),
+                "Opus A8W4 stage1 kernel_id=",
+                kernel_id,
+                " (",
+                opus_moe::stage1_a8w4_kid_name(kernel_id),
+                ") requires bias");
+    const int hidden_scale_cols = model_dim / scale_group;
+    const int out_scale_cols = inter_dim / scale_group;
+    const int k_steps = model_dim / mfma_k;
+    AITER_CHECK(gate_up_dim == 2 * inter_dim,
+                "w1.size(1) must equal 2 * inter_dim, got ",
+                gate_up_dim,
+                " vs ",
+                2 * inter_dim);
+    AITER_CHECK(packed_model_dim == model_dim / opus_moe::stage1_a8w4::kFp4ValuesPerByte,
+                "w1 packed model dim mismatch, expected ",
+                model_dim / opus_moe::stage1_a8w4::kFp4ValuesPerByte,
+                ", got ",
+                packed_model_dim);
+    AITER_CHECK(out.size(0) == token_num,
+                "out token dimension must match hidden_states token dimension");
+    AITER_CHECK(hidden_scale.size(1) >= hidden_scale_cols,
+                "hidden_scale second dimension must cover model_dim / ",
+                scale_group);
+    AITER_CHECK(w1_scale.size(0) >= num_experts * gate_up_dim &&
+                    w1_scale.size(1) >= hidden_scale_cols,
+                "w1_scale shape must be at least [expert * 2 * inter_dim, model_dim / ",
+                scale_group,
+                "]");
+    if(bias.has_value())
+    {
+        AITER_CHECK(bias->size(0) >= num_experts && bias->size(1) >= gate_up_dim,
+                    "bias shape must be at least [expert, 2 * inter_dim]");
+    }
+    AITER_CHECK(out_scale.size(0) >= sorted_blocks * block_m &&
+                    out_scale.size(1) >= out_scale_cols,
+                "out_scale shape must cover sorted_blocks * block_m rows and inter_dim / ",
+                scale_group,
+                " columns");
+
+    opus_moe::stage1_a8w4::OpusMoeStage1A8W4Kargs kargs{};
+    kargs.hidden_fp8 = reinterpret_cast<const uint8_t*>(hidden_states.data_ptr());
+    kargs.w1_fp4 = reinterpret_cast<const uint8_t*>(w1.data_ptr());
+    kargs.hidden_scale_e8m0 = reinterpret_cast<const uint8_t*>(hidden_scale.data_ptr());
+    kargs.w1_scale_e8m0 = reinterpret_cast<const uint8_t*>(w1_scale.data_ptr());
+    kargs.w1_bias =
+        bias.has_value() ? reinterpret_cast<const float*>(bias->data_ptr()) : nullptr;
+    kargs.sorted_token_ids = reinterpret_cast<const int32_t*>(sorted_token_ids.data_ptr());
+    kargs.sorted_expert_ids =
+        reinterpret_cast<const int32_t*>(sorted_expert_ids.data_ptr());
+    kargs.num_valid_ids = reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
+    kargs.inter_states_fp8 = reinterpret_cast<uint8_t*>(out.data_ptr());
+    kargs.inter_states_scale_e8m0 = reinterpret_cast<uint8_t*>(out_scale.data_ptr());
+    kargs.stride_hidden_t = hidden_states.stride(0);
+    kargs.stride_w1_e = w1.stride(0);
+    kargs.stride_w1_bias_e = bias.has_value() ? bias->stride(0) : 0;
+    kargs.stride_out_t = out.stride(0);
+    kargs.stride_out_k = out.stride(1);
+    kargs.stride_out_scale_route = out_scale.stride(0);
+    kargs.token_num = token_num;
+    kargs.topk = topk;
+    kargs.num_experts = num_experts;
+    kargs.inter_dim = inter_dim;
+    kargs.hidden_scale_cols = hidden_scale_cols;
+    kargs.k_steps = k_steps;
+
+    HipDeviceGuard guard(hidden_states.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    opus_moe::stage1_a8w4::dispatch(
+        kernel_id, effective_inter_dim, sorted_blocks, kargs, stream);
     HIP_CALL_LAUNCH(hipGetLastError());
 }

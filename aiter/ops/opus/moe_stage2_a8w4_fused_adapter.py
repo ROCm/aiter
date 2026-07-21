@@ -246,7 +246,9 @@ def opus_a8w4_stage2_wrapper(
     if not is_opus_a8w4_stage2_kernel(kernelName):
         raise ValueError(f"Invalid Opus A8W4 stage2 kernel name: {kernelName}")
     route_out_mode = bool(route_out)
-    sort_block_m = int(stage2_sort_block_m if stage2_sort_block_m is not None else block_m)
+    sort_block_m = int(
+        stage2_sort_block_m if stage2_sort_block_m is not None else block_m
+    )
     if bias2 is not None:
         raise ValueError("Opus A8W4 stage2 does not support bias2")
     if expert_mask is not None or topk_ids is not None:

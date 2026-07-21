@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Generate Opus MoE stage2 dispatch headers.
+"""Generate Opus MoE dispatch headers.
 
 This is intentionally smaller than ``csrc/opus_gemm/gen_instances.py`` today:
-the stage2 kernels still live in one header, but the generated manifest is the
-single source of truth for kid -> launcher mapping.
+several kernels still live in hand-written headers, but the generated
+manifests are the single source of truth for kid -> launcher mapping.
 """
 
 from __future__ import annotations
@@ -25,9 +25,14 @@ from opus_moe_common import (  # noqa: E402
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_ATOMIC,
     OPUS_A8W4_ROUTE_REDUCE_INSTANCES,
+    OPUS_A8W4_STAGE1_MFMA_K,
+    OPUS_A8W4_STAGE1_SCALE_GROUP_LOGICAL_K,
+    STAGE1_A8W4_KERNELS,
     STAGE2_A8W4_KERNELS,
     STAGE2_BF16_KERNELS,
     opus_a8w4_decode_kid,
+    opus_a8w4_stage1_instance_requires_bias,
+    opus_a8w4_stage1_shape_requirements,
 )
 
 MANIFEST_HEADER = """#pragma once
@@ -69,6 +74,31 @@ namespace opus_moe
 
 A8W4_META_FOOTER = """
 } // namespace opus_moe
+"""
+
+STAGE1_A8W4_META_HEADER = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See csrc/opus_moe/gen_instances.py.
+//
+// A8W4 stage1 metadata generated from
+// csrc/opus_moe/opus_moe_common.py.
+
+namespace opus_moe
+{
+
+"""
+
+STAGE1_A8W4_MANIFEST_HEADER = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See csrc/opus_moe/gen_instances.py.
+//
+// A8W4 stage1 kid -> launcher cases. Generated from structured metadata so
+// csrc metadata and C++ dispatch cases do not drift.
+
 """
 
 
@@ -180,10 +210,10 @@ def _collect_a8w4_effective_inter_dims(tune_files: str | None) -> tuple[int, ...
     return _validate_effective_inter_dims(effective_inter_dims)
 
 
-# ---- A8W4 metadata and dispatch manifests ---------------------------------
+# ---- A8W4 stage2 metadata and dispatch manifests ---------------------------
 
 
-def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
+def _emit_stage2_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines = [A8W4_META_HEADER]
     k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
@@ -364,7 +394,7 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
     return "".join(lines)
 
 
-def _emit_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> str:
+def _emit_stage2_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> str:
     lines = [A8W4_MANIFEST_HEADER]
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
 
@@ -406,10 +436,160 @@ def _emit_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> str:
     return "".join(lines)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate Opus MoE stage2 dispatch headers"
+def _stage1_cpp_activation(activation: str) -> str:
+    act = str(activation).strip().lower()
+    if act == "silu":
+        return "Stage1Activation::Silu"
+    if act == "swiglu":
+        return "Stage1Activation::Swiglu"
+    raise ValueError(f"unsupported Opus A8W4 stage1 activation: {activation}")
+
+
+def _stage1_cpp_shape(inst) -> str:
+    policy_args = (
+        inst.gate_up_group_split,
+        inst.k_wave,
+        inst.min_blocks_per_cu_override,
+        inst.skip_invalid_a_scale_guard,
+        inst.quant_group_blocks,
+        _stage1_cpp_activation(inst.activation),
+        inst.block_threads,
     )
+    policy = (
+        "OpusMoeStage1A8W4Policy<"
+        + ", ".join(
+            _cpp_bool(arg) if isinstance(arg, bool) else str(arg) for arg in policy_args
+        )
+        + ">"
+    )
+    return f"OpusMoeStage1A8W4Shape<" f"{inst.block_m}, {inst.block_n}, {policy}>"
+
+
+def _emit_stage1_a8w4_meta_header() -> str:
+    lines = [STAGE1_A8W4_META_HEADER]
+    kernels = [STAGE1_A8W4_KERNELS[kid] for kid in sorted(STAGE1_A8W4_KERNELS)]
+    scale_group = OPUS_A8W4_STAGE1_SCALE_GROUP_LOGICAL_K
+
+    lines.extend(
+        [
+            "constexpr int kOpusMoeStage1A8W4ScaleGroupLogicalK = "
+            f"{scale_group};\n\n",
+            "constexpr int kStage1A8W4KidInvalid = -1;\n\n",
+        ]
+    )
+
+    lines.append(
+        "inline bool stage1_a8w4_name_eq(const char* lhs, const char* rhs)\n"
+        "{\n"
+        "    if(lhs == nullptr || rhs == nullptr)\n"
+        "        return false;\n"
+        "    while(*lhs != '\\0' && *rhs != '\\0' && *lhs == *rhs)\n"
+        "    {\n"
+        "        ++lhs;\n"
+        "        ++rhs;\n"
+        "    }\n"
+        "    return *lhs == *rhs;\n"
+        "}\n\n"
+        "inline int stage1_a8w4_kid_from_name(const char* name)\n"
+        "{\n"
+    )
+    for inst in kernels:
+        names = [inst.name]
+        if inst.profile_name != inst.name:
+            names.append(inst.profile_name)
+        condition = " || ".join(
+            f'stage1_a8w4_name_eq(name, "{_cpp_string(name)}")' for name in names
+        )
+        lines.append(f"    if({condition})\n        return {inst.kid};\n")
+    lines.append("    return kStage1A8W4KidInvalid;\n}\n")
+    lines.append("\n")
+
+    lines.append(
+        "constexpr int stage1_a8w4_kid_sort_block_m(int kid)\n"
+        "{\n    switch(kid)\n    {\n"
+    )
+    for inst in kernels:
+        lines.append(f"    case {inst.kid}: " f"return {inst.block_m};\n")
+    lines.append("    default: return -1;\n    }\n}\n\n")
+
+    lines.extend(
+        [
+            "constexpr bool stage1_a8w4_kid_supports_shape(\n",
+            "    int kid,\n",
+            "    int model_dim,\n",
+            "    int logical_inter_dim,\n",
+            "    int inter_dim_pad)\n",
+            "{\n",
+            f"    constexpr int kMfmaK = {OPUS_A8W4_STAGE1_MFMA_K};\n",
+            f"    constexpr int kScaleGroup = {scale_group};\n",
+            "    const int effective_inter_dim = logical_inter_dim - inter_dim_pad;\n",
+            "    if(inter_dim_pad < 0 || effective_inter_dim <= 0)\n",
+            "        return false;\n",
+            "    if(model_dim % kMfmaK != 0 ||\n",
+            "       logical_inter_dim % kScaleGroup != 0)\n",
+            "        return false;\n",
+            "    const int k_steps = model_dim / kMfmaK;\n",
+            "    switch(kid)\n",
+            "    {\n",
+        ]
+    )
+    for inst in kernels:
+        requirements = opus_a8w4_stage1_shape_requirements(inst)
+        if requirements is None:
+            raise ValueError(
+                f"Opus A8W4 stage1 kid {inst.kid} has invalid shape requirements"
+            )
+        k_step_multiple, output_cols = requirements
+        lines.append(
+            f"    case {inst.kid}: "
+            f"return k_steps % {k_step_multiple} == 0 && "
+            f"effective_inter_dim % {output_cols} == 0;\n"
+        )
+    lines.append("    default: return false;\n    }\n")
+    lines.append("}\n\n")
+
+    lines.append(
+        "constexpr bool stage1_a8w4_kid_requires_bias(int kid)\n"
+        "{\n    switch(kid)\n    {\n"
+    )
+    for inst in kernels:
+        if opus_a8w4_stage1_instance_requires_bias(inst):
+            lines.append(f"    case {inst.kid}: return true;\n")
+    lines.append("    default: return false;\n    }\n}\n\n")
+
+    lines.append(
+        "constexpr const char* stage1_a8w4_kid_name(int kid)\n"
+        "{\n    switch(kid)\n    {\n"
+    )
+    for inst in kernels:
+        lines.append(f"    case {inst.kid}: " f'return "{_cpp_string(inst.name)}";\n')
+    lines.append('    default: return "unknown";\n    }\n}\n')
+    lines.append(A8W4_META_FOOTER)
+    return "".join(lines)
+
+
+def _emit_stage1_a8w4_manifest_header() -> str:
+    lines = [STAGE1_A8W4_MANIFEST_HEADER]
+    kernels = [STAGE1_A8W4_KERNELS[kid] for kid in sorted(STAGE1_A8W4_KERNELS)]
+
+    if not kernels:
+        lines.append("#define GENERATE_OPUS_MOE_STAGE1_A8W4_DISPATCH_CASES\n")
+        return "".join(lines)
+
+    lines.append("#define GENERATE_OPUS_MOE_STAGE1_A8W4_DISPATCH_CASES \\\n")
+    for idx, inst in enumerate(kernels):
+        suffix = " \\\n" if idx != len(kernels) - 1 else "\n"
+        lines.append(
+            f"    case {inst.kid}: "
+            f"return launch<{_stage1_cpp_shape(inst)}>("
+            "effective_inter_dim, sorted_blocks, kargs, stream);" + suffix
+        )
+    lines.append("\n")
+    return "".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate Opus MoE dispatch headers")
     parser.add_argument("--working_path", required=True)
     parser.add_argument(
         "--tune_files", default="", help="Accepted for JIT compatibility."
@@ -433,13 +613,19 @@ def main() -> None:
 
     bf16_manifest_path = out_dir / "opus_moe_stage2_manifest.h"
     bf16_manifest_path.write_text(_emit_bf16_manifest_header(), encoding="utf-8")
-    a8w4_meta_path = out_dir / "opus_moe_stage2_a8w4_meta.h"
-    a8w4_meta_path.write_text(
-        _emit_a8w4_meta_header(effective_inter_dims), encoding="utf-8"
+    stage2_a8w4_meta_path = out_dir / "opus_moe_stage2_a8w4_meta.h"
+    stage2_a8w4_meta_path.write_text(
+        _emit_stage2_a8w4_meta_header(effective_inter_dims), encoding="utf-8"
     )
-    a8w4_manifest_path = out_dir / "opus_moe_stage2_a8w4_manifest.h"
-    a8w4_manifest_path.write_text(
-        _emit_a8w4_manifest_header(effective_inter_dims), encoding="utf-8"
+    stage2_a8w4_manifest_path = out_dir / "opus_moe_stage2_a8w4_manifest.h"
+    stage2_a8w4_manifest_path.write_text(
+        _emit_stage2_a8w4_manifest_header(effective_inter_dims), encoding="utf-8"
+    )
+    stage1_a8w4_meta_path = out_dir / "opus_moe_stage1_a8w4_meta.h"
+    stage1_a8w4_meta_path.write_text(_emit_stage1_a8w4_meta_header(), encoding="utf-8")
+    stage1_a8w4_manifest_path = out_dir / "opus_moe_stage1_a8w4_manifest.h"
+    stage1_a8w4_manifest_path.write_text(
+        _emit_stage1_a8w4_manifest_header(), encoding="utf-8"
     )
 
     print(
@@ -447,11 +633,16 @@ def main() -> None:
         f"{len(STAGE2_BF16_KERNELS)} BF16 stage2 kid(s)"
     )
     print(
-        f"[opus_moe gen_instances] wrote {a8w4_manifest_path} with "
+        f"[opus_moe gen_instances] wrote {stage2_a8w4_manifest_path} with "
         f"{len(STAGE2_A8W4_KERNELS)} A8W4 stage2 kid(s), "
         f"effective_inter_dims={effective_inter_dims}"
     )
-    print(f"[opus_moe gen_instances] wrote {a8w4_meta_path}")
+    print(f"[opus_moe gen_instances] wrote {stage2_a8w4_meta_path}")
+    print(
+        f"[opus_moe gen_instances] wrote {stage1_a8w4_manifest_path} with "
+        f"{len(STAGE1_A8W4_KERNELS)} A8W4 stage1 kid(s)"
+    )
+    print(f"[opus_moe gen_instances] wrote {stage1_a8w4_meta_path}")
 
 
 if __name__ == "__main__":

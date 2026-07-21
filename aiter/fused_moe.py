@@ -1132,6 +1132,47 @@ def _normalize_bias_for_kernel(
     return bias
 
 
+def _opus_a8w4_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    block_m: int = 0,
+    w1_scale=None,
+    a1_scale=None,
+    sorted_weights=None,
+    bias1=None,
+    inter_dim_pad: int = 0,
+    **_kwargs,
+):
+    if sorted_weights is not None:
+        raise NotImplementedError(
+            "Opus A8W4 stage1 does not support routed-weight multiplication"
+        )
+    from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
+
+    return opus_moe_stage1_a8w4_fwd(
+        hidden_states,
+        w1,
+        a1_scale,
+        w1_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk=int(topk),
+        inter_dim_pad=int(inter_dim_pad),
+        bias=_normalize_bias_for_kernel(bias1),
+        out=out,
+        block_m=int(block_m),
+        kernelName=str(kernelName),
+    )
+
+
 # TODO: remove this function once kernel handles padding in the runtime
 def _get_padding_for_flydsl(
     inter_dim_pad,
@@ -2011,14 +2052,24 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
+    is_opus1 = isinstance(kernelName1, str) and kernelName1.startswith(
+        "opus_moe1_a8w4_"
+    )
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
-    if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+    if is_opus1 or ((is_flydsl1 or is_flydsl2) and is_flydsl_available()):
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
-        if is_flydsl1:
+        if is_opus1:
+            stage1_func = functools.partial(
+                _opus_a8w4_stage1_wrapper,
+                kernelName=kernelName1,
+                block_m=block_m,
+                inter_dim_pad=intermediate_pad,
+            )
+        elif is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
@@ -2067,7 +2118,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
+        _s1_fp8q = is_opus1 or (is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1])
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
         return MOEMetadata(
             stage1_func,
@@ -2075,9 +2126,9 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            has_bias=enable_bias and is_flydsl1,
+            has_bias=enable_bias and (is_opus1 or is_flydsl1),
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias and is_flydsl2,
+            stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             **route_bucket_metadata,
         )
     if (
