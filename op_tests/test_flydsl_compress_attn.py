@@ -30,7 +30,10 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.ops.flydsl.kernels.fused_compress_attn import flydsl_fused_compress_attn
+from aiter.ops.flydsl.kernels.fused_compress_attn import (
+    csa_ksplit_num_waves,
+    flydsl_fused_compress_attn,
+)
 from aiter.ops.flydsl.kernels.fused_compress_attn_hca import flydsl_hca_compress_attn
 from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
@@ -44,11 +47,13 @@ torch.set_default_device("cuda")
 # (gfx9 family) and wave32 (gfx1250). The fp8 nm-asm cross-checks are wave64-only.
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 
-# (label, head_dim, rope_head_dim, ratio, overlap, quant, use_ue8m0, preshuffle)
+# (label, head_dim, rope_head_dim, ratio, overlap, quant_mode, use_ue8m0, preshuffle)
+# quant_mode ∈ {"none","fp8","group_fp8","fp4"}.
 SHAPES = [
-    ("csa_main", 512, 64, 4, True, False, False, False),
-    ("csa_indexer", 128, 64, 4, True, True, True, True),
-    ("hca_main", 512, 64, 128, False, False, False, False),
+    ("csa_main", 512, 64, 4, True, "none", False, False),
+    ("csa_indexer", 128, 64, 4, True, "fp8", True, True),
+    ("csa_indexer_fp4", 128, 64, 4, True, "fp4", True, True),
+    ("hca_main", 512, 64, 128, False, "none", False, False),
 ]
 K_PER_BLOCK = (
     64  # paged-cache compressed-slot block size (multiple of 16 for preshuffle)
@@ -97,7 +102,8 @@ def _build_inputs(shape, bs, mtp, mode):
     Both modes append SENTINEL_PAD trailing rows with position=-1 so the
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
-    label, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    label, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
+    quant = quant_mode in ("fp8", "group_fp8", "fp4")
     if get_gfx() == "gfx1250":
         preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
     dim_full = (2 if overlap else 1) * D
@@ -179,9 +185,19 @@ def _build_inputs(shape, bs, mtp, mode):
     # paged cache: one block per seq is enough (num_per_seq <= K_PER_BLOCK).
     blocks_per_seq = (num_per_seq + K_PER_BLOCK - 1) // K_PER_BLOCK
     total_blocks = bs * blocks_per_seq + 4
-    if quant:
+    if quant_mode == "fp8":
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=dtypes.fp8)
         cache_scale = torch.zeros(total_blocks, K_PER_BLOCK, dtype=torch.float32)
+    elif quant_mode == "fp4":
+        # FP4 preshuffle: data [NB, k_tiles, 4, K_PER_BLOCK, 16] u8,
+        # scale [NB, k_tiles, 4, K_PER_BLOCK] u8 (e8m0). 16 bytes = 32 fp4.
+        k_tiles = D // 128
+        kv_cache = torch.zeros(
+            total_blocks, k_tiles, 4, K_PER_BLOCK, 16, dtype=torch.uint8
+        )
+        cache_scale = torch.zeros(
+            total_blocks, k_tiles, 4, K_PER_BLOCK, dtype=torch.uint8
+        )
     else:
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=torch.bfloat16)
         cache_scale = None
@@ -220,6 +236,7 @@ def _build_inputs(shape, bs, mtp, mode):
         ratio=ratio,
         overlap=overlap,
         quant=quant,
+        quant_mode=quant_mode,
         use_ue8m0=ue8m0,
         preshuffle=preshuffle,
         rms_eps=RMS_EPS,
@@ -254,17 +271,76 @@ def _run_kernel(inp, *, use_2kernel):
             **common,
             overlap=inp["overlap"],
             quant=inp["quant"],
+            quant_mode=inp["quant_mode"],
             cache_scale=inp["cache_scale"],
             use_ue8m0=inp["use_ue8m0"],
             preshuffle=inp["preshuffle"],
         )
 
 
+def _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
+    """Compare an FP4 (E2M1 data + e8m0 scale) paged cache against the reference:
+    dequantize both (scale * E2M1 value) and allclose within tol; e8m0 scale
+    bytes bit-exact. Returns the dequant err %. Shared by the shape sweep and the
+    dedicated K-split coverage test."""
+    from aiter.utility.fp4_utils import mxfp4_to_f32
+
+    k_dq = mxfp4_to_f32(out_cache.reshape(-1, 16)) * (
+        2.0 ** (out_scale.reshape(-1).to(torch.int32)[:, None].float() - 127.0)
+    )
+    r_dq = mxfp4_to_f32(ref_cache.reshape(-1, 16)) * (
+        2.0 ** (ref_scale.reshape(-1).to(torch.int32)[:, None].float() - 127.0)
+    )
+    err = checkAllclose(
+        k_dq,
+        r_dq,
+        rtol=1e-2,
+        atol=1e-2,
+        tol_err_ratio=0.05,
+        msg=f"{msg} kv_cache(fp4 dequant)",
+    )
+    checkAllclose(
+        out_scale.to(torch.int32),
+        ref_scale.to(torch.int32),
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0.0,
+        msg=f"{msg} cache_scale(e8m0 bit-exact)",
+    )
+    return err
+
+
+def _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
+    """Compare an FP8 (e4m3 + fp32 per-row scale) paged cache against the
+    reference: kv_cache allclose within tol; cache_scale bit-exact (the reference
+    mirrors the kernel's exact fp32 ops — am_safe * inv_fp8_max + ue8m0 ceil-pow2
+    — so the scale per row must match to the bit). Returns the kv_cache err %.
+    Shared by the shape sweep and the dedicated K-split coverage test."""
+    err = checkAllclose(
+        out_cache.to(dtypes.fp32),
+        ref_cache.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        tol_err_ratio=0.05,
+        msg=f"{msg} kv_cache(fp8)",
+    )
+    checkAllclose(
+        out_scale,
+        ref_scale,
+        rtol=0,
+        atol=0,
+        tol_err_ratio=0.0,
+        msg=f"{msg} cache_scale(bit-exact)",
+    )
+    return err
+
+
 @benchmark()
 def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
-    _, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    _, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
+    quant = quant_mode in ("fp8", "fp4")
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
 
@@ -297,31 +373,28 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
         head_dim=D,
         rope_head_dim=RD,
         quant=quant,
+        quant_mode=quant_mode,
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
         preshuffle=inp["preshuffle"],  # arch-adjusted (False on gfx1250)
     )
 
     msg = f"{shape_label}/{mode}/{path} bs={bs} mtp={mtp}"
-    if quant:
-        err = checkAllclose(
-            inp["kv_cache"].to(dtypes.fp32),
-            ref_inp["kv_cache"].to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            tol_err_ratio=0.05,
-            msg=f"{msg} kv_cache(fp8)",
-        )
-        # cache_scale: bit-exact. Reference mirrors the kernel's exact fp32
-        # ops (am_safe * inv_fp8_max constant + ue8m0 ceil-pow2), so the
-        # scale per row must match to the bit.
-        checkAllclose(
+    if quant_mode == "fp4":
+        err = _check_fp4_cache(
+            inp["kv_cache"],
             inp["cache_scale"],
+            ref_inp["kv_cache"],
             ref_inp["cache_scale"],
-            rtol=0,
-            atol=0,
-            tol_err_ratio=0.0,
-            msg=f"{msg} cache_scale(bit-exact)",
+            msg,
+        )
+    elif quant:
+        err = _check_fp8_cache(
+            inp["kv_cache"],
+            inp["cache_scale"],
+            ref_inp["kv_cache"],
+            ref_inp["cache_scale"],
+            msg,
         )
     else:
         # BF16 kv_cache: rare rounding-boundary flips at <=1 ulp because online
@@ -626,6 +699,139 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
     }
 
 
+@benchmark()
+def test_flydsl_csa_indexer_ksplit(shape_label, bs=2, mtp=0):
+    """CSA-indexer AUTO K-split coverage for the FP8 and FP4 scatter paths.
+
+    The K-split scatter (amax/e8m0/pack) in ``_build_kernel_ksplit`` mirrors the
+    single-wave ``_build_kernel`` emitter but runs on a different wave layout
+    (K-split lid 0-63 with a different group-reduce span), so each quantized
+    scatter (``csa_indexer`` fp8, ``csa_indexer_fp4`` fp4) needs its own
+    coverage. This drives ``flydsl_fused_compress_attn`` on ``shape_label``
+    WITHOUT an explicit ``k_split_num_waves`` and:
+
+      1. asserts the auto-pick actually engages the multi-wave kernel (NW>1) for
+         this plan_capacity — i.e. the auto path is the K-split path, not legacy;
+      2. validates that the auto (K-split) cache matches the pure-torch reference;
+      3. validates the forced-legacy (NW=1) cache matches the reference too, so
+         the two wave layouts are cross-checked against a common oracle.
+    """
+    if get_gfx() == "gfx942":
+        aiter.logger.info("gfx942 unsupported for fp8/fp4 indexer scatter")
+        return {}
+    shape = _shape_by_label(shape_label)
+    _, D, RD, ratio, overlap, quant_mode, ue8m0, _ = shape
+    assert quant_mode in (
+        "fp8",
+        "fp4",
+    ), f"{shape_label} quant_mode={quant_mode!r} is not a quantized indexer shape"
+
+    def _check(out_cache, out_scale, ref_cache, ref_scale, m):
+        if quant_mode == "fp4":
+            return _check_fp4_cache(out_cache, out_scale, ref_cache, ref_scale, m)
+        return _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, m)
+
+    inp = _build_inputs(shape, bs, mtp, "decode")
+    plan_capacity = inp["plan_gpu"].shape[0]
+    # The kernel's auto-pick is `use_ksplit = csa_ksplit_num_waves(plan_capacity)
+    # > 1` for these shapes (has_block_table, non-nm_asm fp8/fp4). Assert it here
+    # so the run below is GUARANTEED to exercise the K-split kernel, not single-wave.
+    nw = csa_ksplit_num_waves(plan_capacity)
+    assert nw > 1, (
+        f"{shape_label} bs={bs} mtp={mtp} plan_capacity={plan_capacity} did NOT "
+        f"auto-engage K-split (NW={nw}); test would silently only cover single-wave"
+    )
+
+    def _run(inp_, **extra):
+        flydsl_fused_compress_attn(
+            kv_in=inp_["kv_in"],
+            score_in=inp_["score_in"],
+            kv_state=inp_["kv_state"],
+            score_state=inp_["score_state"],
+            state_slot_mapping=inp_["state_slot_mapping"],
+            plan_gpu=inp_["plan_gpu"],
+            ape=inp_["ape"],
+            rms_weight=inp_["rms_weight"],
+            rms_eps=inp_["rms_eps"],
+            cos_cache=inp_["cos_cache"],
+            sin_cache=inp_["sin_cache"],
+            kv_cache=inp_["kv_cache"],
+            block_tables=inp_["block_tables"],
+            k_per_block=inp_["k_per_block"],
+            ratio=inp_["ratio"],
+            head_dim=inp_["head_dim"],
+            rope_head_dim=inp_["rope_head_dim"],
+            overlap=inp_["overlap"],
+            quant=inp_["quant"],
+            quant_mode=inp_["quant_mode"],
+            cache_scale=inp_["cache_scale"],
+            use_ue8m0=inp_["use_ue8m0"],
+            preshuffle=inp_["preshuffle"],
+            **extra,
+        )
+
+    # Reference (pure torch) into a separate cache clone.
+    ref_inp = dict(inp)
+    ref_inp["kv_cache"] = inp["kv_cache"].clone()
+    ref_inp["cache_scale"] = inp["cache_scale"].clone()
+    fused_compress_attn_reference(
+        kv_in=ref_inp["kv_in"],
+        score_in=ref_inp["score_in"],
+        kv_state=ref_inp["kv_state"],
+        score_state=ref_inp["score_state"],
+        plan_gpu=ref_inp["plan_gpu"],
+        state_slot_mapping=ref_inp["state_slot_mapping"],
+        ape=ref_inp["ape"],
+        rms_weight=ref_inp["rms_weight"],
+        rms_eps=ref_inp["rms_eps"],
+        cos_cache=ref_inp["cos_cache"],
+        sin_cache=ref_inp["sin_cache"],
+        kv_cache=ref_inp["kv_cache"],
+        block_tables=ref_inp["block_tables"],
+        k_per_block=ref_inp["k_per_block"],
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=D,
+        rope_head_dim=RD,
+        quant=True,
+        quant_mode=quant_mode,
+        cache_scale=ref_inp["cache_scale"],
+        use_ue8m0=ue8m0,
+        preshuffle=inp["preshuffle"],
+    )
+
+    # (1)+(2) AUTO path (no k_split_num_waves) -> K-split (asserted above) vs ref.
+    _, us_kernel = run_perftest(_run, inp)
+    err = _check(
+        inp["kv_cache"],
+        inp["cache_scale"],
+        ref_inp["kv_cache"],
+        ref_inp["cache_scale"],
+        f"{shape_label}/ksplit(auto NW={nw}) bs={bs} mtp={mtp}",
+    )
+
+    # (3) Forced-legacy (NW=1, single-wave) on fresh inputs vs the same ref.
+    leg_inp = dict(inp)
+    leg_inp["kv_cache"] = torch.zeros_like(inp["kv_cache"])
+    leg_inp["cache_scale"] = torch.zeros_like(inp["cache_scale"])
+    _run(leg_inp, k_split_num_waves=1)
+    _check(
+        leg_inp["kv_cache"],
+        leg_inp["cache_scale"],
+        ref_inp["kv_cache"],
+        ref_inp["cache_scale"],
+        f"{shape_label}/legacy(NW=1) bs={bs} mtp={mtp}",
+    )
+
+    return {
+        "gfx": get_gfx(),
+        "plan_capacity": plan_capacity,
+        "auto_nw": nw,
+        "us_kernel": us_kernel,
+        "err_pct": err,
+    }
+
+
 def main():
     # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
     # outside the validated set.
@@ -703,6 +909,16 @@ def main():
         help="""Batch sizes for the CSA Main nm-asm fp8 group-quant check (flydsl
         single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
     )
+    parser.add_argument(
+        "--ksplit-bs",
+        type=int,
+        nargs="*",
+        default=[2, 8],
+        help="""Batch sizes for the CSA-indexer AUTO K-split coverage check (fp8 +
+        fp4): asserts auto-pick engages NW>1 without an explicit k_split_num_waves,
+        then validates the K-split scatter vs the torch ref + forced-legacy. These
+        small bs keep plan_capacity in the K-split regime. Empty to skip.""",
+    )
 
     args = parser.parse_args()
 
@@ -744,6 +960,17 @@ def main():
     summarize(
         "flydsl_csa_nm_asm_fp8",
         [test_flydsl_csa_nm_asm_fp8(bs) for bs in args.csa_fp8_bs],
+    )
+
+    # --- Table 4: CSA-indexer AUTO K-split coverage (fp8 + fp4): auto NW>1 + vs
+    # torch ref + forced-legacy cross-check. ---
+    summarize(
+        "flydsl_csa_indexer_ksplit",
+        [
+            test_flydsl_csa_indexer_ksplit(shape_label, bs)
+            for shape_label in ("csa_indexer", "csa_indexer_fp4")
+            for bs in args.ksplit_bs
+        ],
     )
 
 
