@@ -7,7 +7,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import _to_raw as _raw
-from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -25,23 +25,11 @@ from .mxfp4_gemm_common import (
 from .mxfp4_gemm_common import _global_base_ptr1 as global_base_ptr1
 from .mxfp4_gemm_common import _gep1 as gep1
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
-from .mxfp4_gemm_common import _buffer_rsrc
 
 # Compile-time caps for the runtime inter_dim / model_dim (gemm2 B-view + LDS bounds).
 # Imported and applied by mxmoe_dispatcher.
 INTER_MAX_DEFAULT = 8192
 HIDDEN_MAX_DEFAULT = 8192
-
-
-# ---- Shared layout-API primitives (B / B-scale data movement + scaled MFMA) ----
-def b_copy_atom(nontemporal):
-    """Copy one 128-bit B-weight chunk as four i32 lanes (cache modifier 2=nontemporal, 0=default)."""
-    return fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if nontemporal else 0), 32)
-
-
-def bscale_copy_atom():
-    """Copy one cached i32 e8m0 B-scale word."""
-    return fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), 32)
 
 
 def bq_view(arg_bq, row_elems, KH4, K_TILES_TOTAL, num_records_bytes=None):
@@ -62,16 +50,16 @@ def bq_view(arg_bq, row_elems, KH4, K_TILES_TOTAL, num_records_bytes=None):
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
-def bscale_view(
-    arg_bscale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
+def scale_view(
+    arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
 ):
-    """Layout view over e8m0 B-scale for one n-pack word; slice -> i32<1:1> scale word. num_records_bytes (has_pad pad-skip) sizes to real extent; None -> max_size=False byte-identical default."""
+    """Layout view over an e8m0 scale buffer (A-scale per 32-row chunk / B-scale per n-pack); slice -> i32<1:1> scale word. num_records_bytes (has_pad pad-skip) sizes to real extent; None -> max_size=False byte-identical default."""
     base_dw = rocdl.readfirstlane(T.i32, _raw(base_dw))
     i32_ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
     )
     off_i64 = fx.Int64(base_dw)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bscale) + off_i64 * fx.Int64(4))
+    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * fx.Int64(4))
     shape = (4, 16, K_TILES_TOTAL, 1)
     stride = (16, 1, k0_stride_dw, 1)
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, stride)))
@@ -92,61 +80,6 @@ def scale_mma_atoms(a_dtype):
         for osa in range(4)
         for osb in range(4)
     }
-
-
-# ---- Shared A ds-read + per-J MMA cluster (used by both gemm bodies) ----
-def issue_a_ds_read_dt(
-    s_aq_base,
-    slot,
-    slot_bytes,
-    KH_TILE_A,
-    lane_div_16,
-    lane_mod_16,
-    is_f8,
-    a_frags,
-    kMChunks,
-):
-    """A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>."""
-    for k in range_constexpr(2):
-        for i in range_constexpr(kMChunks):
-            lds_row = lane_mod_16 + i * 16
-            row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
-            if const_expr(is_f8):
-                mask = lds_swizzle_mask_f8(lane_mod_16)
-                col0 = lane_div_16 * 16 + k * 128
-                col_lo = col0 ^ mask
-                col_hi = (col0 + 64) ^ mask
-                lo = Vec(
-                    lds_vec_load(
-                        s_aq_base,
-                        row_off + col_lo,
-                        Vec.make_type(2, fx.Int64),
-                        fx.Int64,
-                        align=16,
-                    )
-                )
-                hi = Vec(
-                    lds_vec_load(
-                        s_aq_base,
-                        row_off + col_hi,
-                        Vec.make_type(2, fx.Int64),
-                        fx.Int64,
-                        align=16,
-                    )
-                )
-                a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
-                a_frags[i][k].store(a64.bitcast(fx.Int32))
-            else:
-                mask = lds_swizzle_mask(lane_mod_16)
-                lds_col = (lane_div_16 * 16 + k * 64) ^ mask
-                vec = lds_vec_load(
-                    s_aq_base,
-                    row_off + lds_col,
-                    Vec.make_type(4, fx.Int32),
-                    fx.Int32,
-                    align=16,
-                )
-                a_frags[i][k].store(Vec(vec))
 
 
 def mma_one_j(
@@ -189,7 +122,6 @@ def mma_one_j(
         )
 
 
-# ---- gemm2 (down-proj) ----
 def issue_a_load_lds_dt(
     arg_aq,
     aq_num_records,
@@ -278,14 +210,11 @@ def gemm2_body_v2(
     topk=1,
     has_pad=False,
     SBM=None,
-    g2_kstages=2,
     g2_bhoist=True,
     g2_ascale_pf=True,
     g2_bf16_lds=False,
 ):
-    # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
-    if g2_kstages not in (1, 2):
-        raise AssertionError(f"g2_kstages must be 1 or 2, got {g2_kstages}")
+    # gemm2 K-loop perf knobs (default ON): 2-stage B pipeline double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     # SBM (sort padding unit) >= BM (compute tile); SBM==BM default byte-identical.
     if SBM is None:
         SBM = BM
@@ -340,116 +269,17 @@ def gemm2_body_v2(
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
 
-    # A-scale buffer resource + uniform base (raw load); chunk = m_block_idx (BM16) else m_row//32.
-    asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
-    asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
-    ascale_rsrc = _buffer_rsrc(arg_ascale, asc_num)
-    scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
-    a_scale_s_base = rocdl.readfirstlane(
-        T.i32, scale_chunk0 * kAS_per_chunk_dw * fx.Int32(4)
-    )
-    v_voff_scale = ((lane_div_16 * 16) + lane_mod_16) * 4
-
-    def load_a_scale_tile(kt):
-        # One i32 A-scale register per 32-row chunk (kScaleSubBlocks); chunk sub at sub*kAS_per_chunk_dw dwords.
-        out = []
-        for sub in range_constexpr(kScaleSubBlocks):
-            out.append(
-                buffer_ops.buffer_load(
-                    ascale_rsrc,
-                    (v_voff_scale + kt * 256) // 4 + sub * kAS_per_chunk_dw,
-                    vec_width=1,
-                    dtype=T.i32,
-                    soffset_bytes=a_scale_s_base,
-                )
-            )
-        return out
-
     s_aq_base = lds_base_i32
-    lds_acc_base = lds_base_i32  # f32 acc unions the A-tile region
+    lds_acc_base = lds_base_i32  # f32 acc unions the A-tile LDS region (shared union)
+    mma_atoms = scale_mma_atoms(a_dtype)
 
-    # -- B / B-scale layout-API views (shared primitives) ---------------------
-    b_catom = b_copy_atom(use_nt)
-    bs_copy_atom = bscale_copy_atom()
-
-    def make_bq_view(j):
-        col = n_block_idx * BN + wave * (BN // 4) + j * 16
-        nrec = bq_num_records
-        if const_expr(has_pad):
-            # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
-            nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
-        return bq_view(
-            arg_bq, e * N_OUT_rt + col, KH4, K_TILES_MAX, num_records_bytes=nrec
-        )
-
-    bq_views = [make_bq_view(j) for j in range_constexpr(4)]
-
-    mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
-    bscale_views = [
-        bscale_view(
-            arg_bscale,
-            e * kbs_per_expert_dw + (mni_base + mw) * kBS_stride_n0_dw,
-            K_TILES_MAX,
-            k0_stride_dw=kBS_stride_k0_dw,
-        )
-        for mw in range_constexpr(2)
-    ]
-
-    # B / B-scale fragments are streamed PER-ITER (one K-tile worth); A refilled per K via LDS.
-    frag_tmpl = bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
-    bs_frag_tmpl = bscale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
-    # A/C both live in fx.gemm fragments (dtype-generic path). fp8 A packs two 128-K halves -> i32<8:1>.
-    zero4 = Vec.filled(4, 0.0, Float32)
-    A_NDW = 8 if is_f8_a else 4
+    # A activation: global->LDS DMA (issue_a_load_lds), then LDS->reg ds-read (issue_a_ds_read).
+    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * K_BYTES)
+    A_NDW = 8 if is_f8_a else 4  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
     a_frags = [
         [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(2)]
         for _ in range_constexpr(kMChunks)
     ]
-    c_frags = [
-        [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(4)]
-        for _ in range_constexpr(kMChunks)
-    ]
-
-    def issue_b_load_into(bqf, bsf, kt_rt):
-        # Issue B-weight + B-scale vmem loads for K-tile kt_rt into the given (per-stage) fragments.
-        for j in range_constexpr(4):
-            for half in range_constexpr(2):
-                fx.copy(
-                    b_catom,
-                    bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
-                    bqf[j][half],
-                )
-        for mw in range_constexpr(2):
-            fx.copy(
-                bs_copy_atom,
-                bscale_views[mw][lane_div_16, lane_mod_16, kt_rt, None],
-                bsf[mw],
-            )
-
-    def stream_b_tile(kt_rt):
-        # Fresh per-iter fragments (B streamed, not register-resident) then issue_b_load_into.
-        bqf = [
-            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
-            for _ in range_constexpr(4)
-        ]
-        bsf = [fx.make_fragment_like(bs_frag_tmpl) for _ in range_constexpr(2)]
-        issue_b_load_into(bqf, bsf, kt_rt)
-        return bqf, bsf
-
-    def issue_a_ds_read(slot):
-        issue_a_ds_read_dt(
-            s_aq_base,
-            slot,
-            slot_bytes,
-            KH_TILE_A,
-            lane_div_16,
-            lane_mod_16,
-            is_f8_a,
-            a_frags,
-            kMChunks,
-        )
-
-    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * K_BYTES)
 
     def issue_a_load_lds(slot, kt):
         issue_a_load_lds_dt(
@@ -467,8 +297,146 @@ def gemm2_body_v2(
             BM=BM,
         )
 
-    mma_atoms = scale_mma_atoms(a_dtype)
+    def issue_a_ds_read(slot):
+        # A ds-read for one slot into a_frags: fp8 -> i32<8:1> (two 128-K halves), fp4 -> i32<4:1>.
+        for k in range_constexpr(2):
+            for i in range_constexpr(kMChunks):
+                lds_row = lane_mod_16 + i * 16
+                row_off = fx.Int32(slot * slot_bytes) + lds_row * KH_TILE_A
+                if const_expr(is_f8_a):
+                    mask = lds_swizzle_mask_f8(lane_mod_16)
+                    col0 = lane_div_16 * 16 + k * 128
+                    col_lo = col0 ^ mask
+                    col_hi = (col0 + 64) ^ mask
+                    lo = Vec(
+                        lds_vec_load(
+                            s_aq_base,
+                            row_off + col_lo,
+                            Vec.make_type(2, fx.Int64),
+                            fx.Int64,
+                            align=16,
+                        )
+                    )
+                    hi = Vec(
+                        lds_vec_load(
+                            s_aq_base,
+                            row_off + col_hi,
+                            Vec.make_type(2, fx.Int64),
+                            fx.Int64,
+                            align=16,
+                        )
+                    )
+                    a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
+                    a_frags[i][k].store(a64.bitcast(fx.Int32))
+                else:
+                    mask = lds_swizzle_mask(lane_mod_16)
+                    lds_col = (lane_div_16 * 16 + k * 64) ^ mask
+                    vec = lds_vec_load(
+                        s_aq_base,
+                        row_off + lds_col,
+                        Vec.make_type(4, fx.Int32),
+                        fx.Int32,
+                        align=16,
+                    )
+                    a_frags[i][k].store(Vec(vec))
 
+    # Scale words (e8m0): shared scale_view / copy atom for both A and B. A-scale is one
+    # word per 32-row chunk, each view bounded to bytes remaining after its baked base.
+    sc_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), 32)
+
+    asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
+    asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
+    scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
+
+    def make_ascale_view(sub):
+        base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
+        nrec = asc_num - fx.Int64(base_dw) * fx.Int64(4)
+        return scale_view(
+            arg_ascale, base_dw, K_TILES_MAX, k0_stride_dw=64, num_records_bytes=nrec
+        )
+
+    ascale_views = [make_ascale_view(sub) for sub in range_constexpr(kScaleSubBlocks)]
+    sc_frag_tmpl = ascale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
+
+    def load_a_scale_tile(kt):
+        # One i32 A-scale register per 32-row chunk (kScaleSubBlocks).
+        out = []
+        for sub in range_constexpr(kScaleSubBlocks):
+            saf = fx.make_fragment_like(sc_frag_tmpl)
+            fx.copy(
+                sc_copy_atom,
+                ascale_views[sub][lane_div_16, lane_mod_16, kt, None],
+                saf,
+            )
+            out.append(_raw(Vec(saf.load())[0]))
+        return out
+
+    # B-weight + B-scale: global->register, streamed per K-tile (not LDS-staged).
+    # b128 weight copy atom; cache modifier 2=nontemporal, 0=default.
+    b_catom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if use_nt else 0), 32)
+
+    def make_bq_view(j):
+        col = n_block_idx * BN + wave * (BN // 4) + j * 16
+        nrec = bq_num_records
+        if const_expr(has_pad):
+            # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
+            nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
+        return bq_view(
+            arg_bq, e * N_OUT_rt + col, KH4, K_TILES_MAX, num_records_bytes=nrec
+        )
+
+    bq_views = [make_bq_view(j) for j in range_constexpr(4)]
+
+    mni_base = n_block_idx * (BN // 16 // 2) + wave * (BN // 64 // 2)
+    bscale_views = [
+        scale_view(
+            arg_bscale,
+            e * kbs_per_expert_dw + (mni_base + mw) * kBS_stride_n0_dw,
+            K_TILES_MAX,
+            k0_stride_dw=kBS_stride_k0_dw,
+        )
+        for mw in range_constexpr(2)
+    ]
+
+    frag_tmpl = bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
+    # B-scale word template shares the A-scale layout (sc_frag_tmpl).
+
+    def issue_b_load_into(bqf, bsf, kt_rt):
+        # Issue B-weight + B-scale vmem loads for K-tile kt_rt into the given (per-stage) fragments.
+        for j in range_constexpr(4):
+            for half in range_constexpr(2):
+                fx.copy(
+                    b_catom,
+                    bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
+                    bqf[j][half],
+                )
+        for mw in range_constexpr(2):
+            fx.copy(
+                sc_copy_atom,
+                bscale_views[mw][lane_div_16, lane_mod_16, kt_rt, None],
+                bsf[mw],
+            )
+
+    def stream_b_half(kt_rt, half_n):
+        # Half-N B stream (straight_line_k2): only the two N-row groups of half_n.
+        bqf = [None, None, None, None]
+        for j in (2 * half_n, 2 * half_n + 1):
+            bqf[j] = [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
+            for half in range_constexpr(2):
+                fx.copy(
+                    b_catom,
+                    bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
+                    bqf[j][half],
+                )
+        bsf = fx.make_fragment_like(sc_frag_tmpl)
+        fx.copy(
+            sc_copy_atom,
+            bscale_views[half_n][lane_div_16, lane_mod_16, kt_rt, None],
+            bsf,
+        )
+        return bqf, bsf
+
+    # Scaled-MFMA clusters over the loaded A / B / scale fragments.
     def mfma_cluster(bqf, bsf, sa):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
         for J in range_constexpr(4):
@@ -502,24 +470,6 @@ def gemm2_body_v2(
                     i0=2 * sub,
                 )
 
-    def stream_b_half(kt_rt, half_n):
-        bqf = [None, None, None, None]
-        for j in (2 * half_n, 2 * half_n + 1):
-            bqf[j] = [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
-            for half in range_constexpr(2):
-                fx.copy(
-                    b_catom,
-                    bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
-                    bqf[j][half],
-                )
-        bsf = fx.make_fragment_like(bs_frag_tmpl)
-        fx.copy(
-            bs_copy_atom,
-            bscale_views[half_n][lane_div_16, lane_mod_16, kt_rt, None],
-            bsf,
-        )
-        return bqf, bsf
-
     def mfma_cluster_half(bqf, bsf, sa, half_n):
         sb = _raw(Vec(bsf.load())[0])
         for j in (2 * half_n, 2 * half_n + 1):
@@ -537,12 +487,16 @@ def gemm2_body_v2(
                     i0=2 * sub,
                 )
 
-    # zero C (fragments accumulate in place).
+    # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
+    zero4 = Vec.filled(4, 0.0, Float32)
+    c_frags = [
+        [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(4)]
+        for _ in range_constexpr(kMChunks)
+    ]
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(4):
             c_frags[i][J].store(zero4)
 
-    # Runtime-trip scf.for K-loop: stream A->LDS (triple-buffered) + B per tile; carry C fragments.
     def load_c_carry():
         return [c_frags[i][J].load() for i in range(kMChunks) for J in range(4)]
 
@@ -575,47 +529,27 @@ def gemm2_body_v2(
                 mfma_cluster_half(bqf, bsf, sa, half_n)
                 rocdl.s_setprio(0)
                 rocdl.sched_barrier(0)
-    elif const_expr(g2_kstages == 1):
-        # 1-deep pipe: synchronous B load per K-tile.
-        for kt_iv, state in range(
-            fx.Int32(0),
-            K_TILES_RT,
-            fx.Int32(1),
-            init=load_c_carry(),
-        ):
-            store_c_carry(state)
-            kt_rt = fx.Int32(kt_iv)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
-            nxt = kt_rt + fx.Int32(kStages)
-            if nxt < K_TILES_RT:
-                issue_a_load_lds(nxt % fx.Int32(aStages), nxt)
-            bqf, bsf = stream_b_tile(kt_rt)
-            sa = load_a_scale_tile(kt_rt)
-            mfma_cluster(bqf, bsf, sa)
-            results = yield load_c_carry()
-        store_c_carry(results)
     else:
         # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
         cur_bqf = [
             [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
             for _ in range_constexpr(4)
         ]
-        cur_bsf = [fx.make_fragment_like(bs_frag_tmpl) for _ in range_constexpr(2)]
+        cur_bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(2)]
         nxt_bqf = [
             [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
             for _ in range_constexpr(4)
         ]
-        nxt_bsf = [fx.make_fragment_like(bs_frag_tmpl) for _ in range_constexpr(2)]
+        nxt_bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(2)]
         # g2_ascale_pf: carry the A-scale through scf.for state, same rotating-buffer model as B.
         cur_saf = nxt_saf = None
         if const_expr(g2_ascale_pf):
             cur_saf = [
-                fx.make_fragment_like(bs_frag_tmpl)
+                fx.make_fragment_like(sc_frag_tmpl)
                 for _ in range_constexpr(kScaleSubBlocks)
             ]
             nxt_saf = [
-                fx.make_fragment_like(bs_frag_tmpl)
+                fx.make_fragment_like(sc_frag_tmpl)
                 for _ in range_constexpr(kScaleSubBlocks)
             ]
 

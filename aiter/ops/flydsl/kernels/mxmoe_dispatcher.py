@@ -86,7 +86,6 @@ def compile_gemm2_a4w4_port(
     persist=False,
     cu_num=0,
     has_pad=False,
-    g2_kstages=None,
     g2_bhoist=None,
     g2_ascale_pf=None,
     g2_spart=None,
@@ -102,11 +101,7 @@ def compile_gemm2_a4w4_port(
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
     use_reduce = epilog == "reduce"
-    # gemm2 perf knobs (default ON; env override, explicit arg wins): kstages=2 double-buffers B one tile ahead; bhoist hoists that prefetch above the LDS barrier; ascale_pf prefetches A-scale; spart = SpatiallyLocalTilePartitioner remap GroupNum*100+M01 (402; 0=naive).
-    if g2_kstages is None:
-        g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
-    if g2_kstages not in (1, 2):
-        raise AssertionError(f"g2_kstages must be 1 or 2, got {g2_kstages}")
+    # gemm2 perf knobs (default ON; env override, explicit arg wins): 2-stage B pipeline double-buffers B one tile ahead; bhoist hoists that prefetch above the LDS barrier; ascale_pf prefetches A-scale; spart = SpatiallyLocalTilePartitioner remap GroupNum*100+M01 (402; 0=naive).
     if g2_bhoist is None:
         g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_bhoist = bool(g2_bhoist)
@@ -155,12 +150,11 @@ def compile_gemm2_a4w4_port(
     pad_tag = (
         "_pad" if has_pad else ""
     )  # has_pad adds the runtime pad kernarg + weight-OOB pad-skip
-    ks_tag = "" if g2_kstages == 1 else f"_g2ks{g2_kstages}"
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -249,7 +243,6 @@ def compile_gemm2_a4w4_port(
                 topk=topk,
                 has_pad=has_pad,
                 SBM=SBM,
-                g2_kstages=g2_kstages,
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
                 g2_bf16_lds=g2_bf16_lds,
@@ -419,7 +412,6 @@ def get_g2(
     topk_key = topk if epilog == "reduce" else 1
     cu_key = cu_num if persist else 0
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
-    g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
@@ -436,7 +428,6 @@ def get_g2(
         persist,
         cu_key,
         has_pad,
-        g2_kstages,
         g2_bhoist,
         g2_ascale_pf,
         g2_spart,
@@ -456,7 +447,6 @@ def get_g2(
             persist=persist,
             cu_num=cu_key,
             has_pad=has_pad,
-            g2_kstages=g2_kstages,
             g2_bhoist=g2_bhoist,
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
