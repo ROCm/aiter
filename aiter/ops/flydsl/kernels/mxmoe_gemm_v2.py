@@ -27,36 +27,21 @@ from .mxfp4_gemm_common import _gep1 as gep1
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from .mxfp4_gemm_common import _buffer_rsrc
 
-# shape constants (per-shape values come from the compile args)
-INTER_MAX_DEFAULT = (
-    8192  # compile-time cap for runtime inter_dim (gemm2 B-view / LDS bounds)
-)
-HIDDEN_MAX_DEFAULT = 8192  # compile-time cap for runtime model_dim/hidden
-BN = BK = 256
-
-
-# BM per-launch (default 32): bodies derive kMChunks=BM//16 (MFMA row-groups), kSubBlocks=BM//32.
-BM = 32
-kAStages = 3
-_I32_COPY_BITS = 32
-_CACHE_MODIFIER_DEFAULT = 0
-_CACHE_MODIFIER_NONTEMPORAL = 2
+# Compile-time caps for the runtime inter_dim / model_dim (gemm2 B-view + LDS bounds).
+# Imported and applied by mxmoe_dispatcher.
+INTER_MAX_DEFAULT = 8192
+HIDDEN_MAX_DEFAULT = 8192
 
 
 # ---- Shared layout-API primitives (B / B-scale data movement + scaled MFMA) ----
 def b_copy_atom(nontemporal):
-    """Copy one 128-bit B-weight chunk as four i32 lanes."""
-    cache_modifier = (
-        _CACHE_MODIFIER_NONTEMPORAL if nontemporal else _CACHE_MODIFIER_DEFAULT
-    )
-    return fx.make_copy_atom(fx.rocdl.BufferCopy128b(cache_modifier), _I32_COPY_BITS)
+    """Copy one 128-bit B-weight chunk as four i32 lanes (cache modifier 2=nontemporal, 0=default)."""
+    return fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if nontemporal else 0), 32)
 
 
 def bscale_copy_atom():
     """Copy one cached i32 e8m0 B-scale word."""
-    return fx.make_copy_atom(
-        fx.rocdl.BufferCopy32b(_CACHE_MODIFIER_DEFAULT), _I32_COPY_BITS
-    )
+    return fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), 32)
 
 
 def bq_view(arg_bq, row_elems, KH4, K_TILES_TOTAL, num_records_bytes=None):
@@ -189,12 +174,18 @@ def mma_one_j(
 ):
     """One J-cluster of scaled MFMAs over a 32-row A-scale group (row-groups i0, i0+1); each is
     an fx.gemm on i32 A/B frags (fp8 A = i32<8:1>, fp4 A = i32<4:1>), e8m0 words on scale_a/scale_b.
-    sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte, 2 MFMAs."""
+    sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte, 2 MFMAs.
+    """
     bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
     if const_expr(single_rg):
         steps = ((0 + rg_off, 0, i0, bJ0), (2 + rg_off, 1, i0, bJ1))
     else:
-        steps = ((0, 0, i0, bJ0), (1, 0, i0 + 1, bJ0), (2, 1, i0, bJ1), (3, 1, i0 + 1, bJ1))
+        steps = (
+            (0, 0, i0, bJ0),
+            (1, 0, i0 + 1, bJ0),
+            (2, 1, i0, bJ1),
+            (3, 1, i0 + 1, bJ1),
+        )
     for osa, k, i, bJ in steps:
         osb = (0 if k == 0 else 2) + in_b
         fx.gemm(
@@ -221,7 +212,7 @@ def issue_a_load_lds_dt(
     is_f8,
     KH_TILE_A,
     K_BYTES,
-    BM=BM,
+    BM=32,
 ):
     """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -287,6 +278,8 @@ def gemm2_body_v2(
     i32_npad,
     *,
     BM,
+    BN=256,
+    BK=256,
     use_nt,
     INTER_MAX,
     aStages,
@@ -765,6 +758,7 @@ def gemm2_body_v2(
         i32_M,
         BM,
         N_OUT_rt,
+        BN=BN,
         use_reduce=use_reduce,
         topk=topk,
         SBM=SBM,
@@ -787,6 +781,7 @@ def atomic_bf16_epilog(
     BM,
     N_OUT,
     *,
+    BN=256,
     use_reduce=False,
     topk=1,
     SBM=None,

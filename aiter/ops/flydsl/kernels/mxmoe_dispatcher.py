@@ -12,8 +12,6 @@ from flydsl.expr.typing import Int8, T
 from aiter.jit.utils.chip_info import get_cu_num
 
 from .mxmoe_gemm_v2 import (
-    BK,
-    BN,
     HIDDEN_MAX_DEFAULT,
     INTER_MAX_DEFAULT,
     gemm2_body_v2,
@@ -76,6 +74,8 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
 
 def compile_gemm2_a4w4_port(
     BM=32,
+    BN=256,
+    BK=256,
     use_nt=False,
     HIDDEN_MAX=HIDDEN_MAX_DEFAULT,
     epilog="atomic",
@@ -239,6 +239,8 @@ def compile_gemm2_a4w4_port(
                 i32_kpad,
                 i32_npad,
                 BM=BM,
+                BN=BN,
+                BK=BK,
                 use_nt=use_nt,
                 INTER_MAX=INTER_MAX,
                 aStages=aStages,
