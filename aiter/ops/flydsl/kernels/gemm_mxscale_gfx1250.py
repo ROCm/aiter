@@ -1888,9 +1888,6 @@ def compile_mxscale_gemm(
                     # the origin peer's comb_inp slot; a release fence publishes it
                     # before the combine kernel's cross-device acquire barrier.
                     import mori.cco.device.flydsl as _cco
-                    from aiter.ops.flydsl.dispatch_combine_v2 import (
-                        flydsl_prims as _P,
-                    )
 
                     _win = _cco.Window(fx.Int64(ep_arena_handle))
                     _map_rsrc = buffer_ops.create_buffer_resource(
@@ -1958,7 +1955,11 @@ def compile_mxscale_gemm(
                             )
                             buffer_ops.buffer_store(i32x4, _dst_rsrc, 0)
                             scf.YieldOp([])
-                    _P.fence_system_release()
+                    # No per-CTA release fence: the stores latch their data at
+                    # issue (no LDS/VGPR hazard) and drain in the background;
+                    # cross-device visibility is enforced by the combine kernel's
+                    # cross-device (xdb) barrier. Draining here would serialize the
+                    # P2P stores and expose their full latency.
                     return
                 addr_idx = 0
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
@@ -3699,7 +3700,6 @@ def compile_mxscale_gemm(
                 # to consecutive remote addresses -> coalesced. Rows past valid_m or
                 # with sentinel dst (remote/dropped/padding) are skipped.
                 import mori.cco.device.flydsl as _cco
-                from aiter.ops.flydsl.dispatch_combine_v2 import flydsl_prims as _P
 
                 rocdl.sched_barrier(0)
                 epilogue_lds_stores_ep(accs, d_lds_buffer, d_lane_base)
@@ -3771,7 +3771,9 @@ def compile_mxscale_gemm(
                             0,
                         )
                         scf.YieldOp([])
-                _P.fence_system_release()
+                # No per-CTA release fence (see per-lane branch): stores drain in
+                # the background; the combine kernel's xdb barrier enforces
+                # cross-device visibility.
             elif const_expr(use_tdm_store and not needs_grouped_row_masked_store):
                 if const_expr(d_need_epilogue_fence):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
