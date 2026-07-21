@@ -77,6 +77,8 @@ KernelName = Literal[
     "aiter_mxfp4",
     "aiter_mxfp6",
     "aiter_f6f4",
+    "aiter_f6f4_pv",
+    "aiter_f8f4",
     "aiter_bf16",
 ]
 
@@ -99,6 +101,8 @@ QUANT_KERNELS = {
     "aiter_mxfp4",
     "aiter_mxfp6",
     "aiter_f6f4",
+    "aiter_f6f4_pv",
+    "aiter_f8f4",
 }
 
 
@@ -765,8 +769,9 @@ def _load_fp4_v_pack_mod():
 # ===========================================================================
 # MXFP6 / F6F4 operand packers used by the bench runner
 #   _build_fp6_qk_packer / _build_fp6_k_coalesced_packer: Q/K fp6 packers, resolved via
-#     the host module (hp) so AITER_MXFP6_PACK can swap the packer and AITER_MXFP6_QK_TRITON
-#     can force the numpy path. Passed into sage_quant_mxfp6(q_packer=, k_packer=).
+#     the host module (hp) so AITER_MXFP6_PACK can swap the packer module and
+#     AITER_MXFP6_QK_TRITON=0 selects the pure-torch packer (Triton by default). Passed into
+#     sage_quant_mxfp6(q_packer=, k_packer=).
 #   _build_fp4_v_packer: per-channel fp4 V for aiter_f6f4 (host col-major LDS packer).
 # ===========================================================================
 
@@ -805,13 +810,12 @@ def _load_host_fp6_pack():
 
 
 def _build_fp6_qk_packer(device):
-    """Return a packer: rotated/smoothed float Q|K [...,128] -> (uint8 [...,96]
-    interleaved MXFP6-E2M3 data, uint8 [...,4] E8M0 scale) on `device`.
+    """Return a Q packer: rotated/smoothed float Q [...,128] -> (uint8 [...,96] interleaved
+    MXFP6-E2M3 data, uint8 [...,4] E8M0 scale) on `device`.
 
-    GPU (Triton) pack by default: byte-identical to the host numpy packer for
-    bf16/fp16/fp32 Q/K (v/2^E is an exponent shift, exact in fp32) and runs every
-    do_bench iteration cheaply on the rotated tensors. Set AITER_MXFP6_QK_TRITON=0
-    to fall back to the (memoized) CPU numpy round-trip."""
+    TRITON pack by default (quantize_fp6_lastdim_triton): fused single-kernel pack, best a2a
+    overlap under torch.compile. Set AITER_MXFP6_QK_TRITON=0 for the pure-torch packer (byte-
+    identical for bf16/fp16/fp32 Q/K; v/2^E is an exact fp32 exponent shift)."""
     hp = _load_host_fp6_pack()
     _use_triton = (
         os.environ.get("AITER_MXFP6_QK_TRITON", "1") != "0"
@@ -823,23 +827,10 @@ def _build_fp6_qk_packer(device):
         def _packer(t: torch.Tensor):
             return hp.quantize_fp6_lastdim_triton(t)
 
-        return _packer
+    else:
 
-    _cache: dict = {}
-
-    def _packer(t: torch.Tensor):
-        key = (t.data_ptr(), tuple(t.shape), t.dtype)
-        hit = _cache.get(key)
-        if hit is not None:
-            return hit
-        arr = t.detach().to(torch.float32).cpu().numpy()
-        packed, scale = hp.quantize_fp6_lastdim(arr)
-        out = (
-            torch.from_numpy(packed).to(device),
-            torch.from_numpy(scale).to(device),
-        )
-        _cache[key] = out
-        return out
+        def _packer(t: torch.Tensor):
+            return hp.quantize_fp6_lastdim_torch(t)
 
     return _packer
 
@@ -853,14 +844,26 @@ def _build_fp6_qk_packer(device):
 # this is just a memoizing wrapper (do_bench reuses fixed tensors).
 # ---------------------------------------------------------------------------
 def _build_fp6_k_coalesced_packer(device):
+    """K coalesced LDS-order packer. TRITON pack by default (quantize_fp6_k_lds_order_triton):
+    fused kernels, best a2a overlap. Set AITER_MXFP6_QK_TRITON=0 for the pure-torch packer
+    (byte-identical -- same 17408B/tile layout + index tables). Memoized (do_bench reuses the
+    fixed input tensors)."""
     hp = _load_host_fp6_pack()
+    _use_triton = (
+        os.environ.get("AITER_MXFP6_QK_TRITON", "1") != "0"
+        and getattr(hp, "_HAVE_TRITON", False)
+        and hasattr(hp, "quantize_fp6_k_lds_order_triton")
+    )
     _cache: dict = {}
 
     def _packer(k_thd: torch.Tensor):
         key = (k_thd.data_ptr(), tuple(k_thd.shape), k_thd.dtype)
         hit = _cache.get(key)
         if hit is None:
-            hit = hp.quantize_fp6_k_lds_order_triton(k_thd, tile=128)
+            if _use_triton:
+                hit = hp.quantize_fp6_k_lds_order_triton(k_thd, tile=128)
+            else:
+                hit = hp.quantize_fp6_k_lds_order_torch(k_thd, tile=128)
             _cache[key] = hit
         return hit
 
@@ -873,22 +876,32 @@ def _build_fp4_v_packer(device):
     V [b, sk, h_kv, 128] float -> (uint8 view [b, sk, h_kv, 128] over a [b,h_kv,sk*64]
     buffer with seq stride 64, descale f32 [b, h_kv, 128]).
 
-    On-device TORCH pack by default (quantize_fp4_v_colmajor_lds_torch): CUDA-graph /
-    inductor friendly (no host sync, traceable) and cosine-equivalent to the fused Triton
-    packer. Set AITER_VFP4_TRITON=1 to use the fused Triton packer instead (reads the
-    permuted view through strides -- no copy)."""
+    Fused TRITON pack by default (quantize_fp4_v_colmajor_lds_triton): reads the permuted view
+    through strides (no copy) and gives the best a2a overlap. Set AITER_VFP4_TRITON=0 for the
+    on-device torch pack (CUDA-graph / inductor friendly, cosine-equivalent)."""
     hp = _load_fp4_v_pack_mod()
     _use_triton = (
-        os.environ.get("AITER_VFP4_TRITON", "0") != "0"
+        os.environ.get("AITER_VFP4_TRITON", "1") != "0"
         and getattr(hp, "_HP_HAVE_TRITON", False)
         and hasattr(hp, "quantize_fp4_v_colmajor_lds_triton")
     )
+
+    _mxfp4 = os.environ.get("AITER_MXFP4_V", "1") != "0"
 
     def _packer(v: torch.Tensor):
         b_, sk_, h_kv_, d_ = v.shape
         assert d_ == 128 and sk_ % 128 == 0, (d_, sk_)
         v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, 128], non-contiguous (read via strides)
-        if _use_triton:
+        if _mxfp4:
+            # MXFP4-V: block-scaled codes + per-(dv,32-kv-block) E8M0 image. The kernel reads the
+            # E8M0 from the v_descale buffer TAIL (after the 128-f32 per-channel descale), so return a
+            # combined [b, h_kv, 128 + nT*128] f32 descale = [per-channel descale | E8M0-as-f32]. This
+            # is contiguous, giving a per-(b,h) stride of (512 + nT*512) B = 512 + kv_seq_len*4, which
+            # matches the kernel's MXFP4-V v_descale slice stride.
+            packed, descale, eimg = hp.quantize_fp4_v_mxfp4_colmajor_lds_torch(v_tok)
+            eimg_f32 = eimg.contiguous().view(torch.float32).reshape(b_, h_kv_, -1)  # [.., nT*128]
+            descale = torch.cat([descale.reshape(b_, h_kv_, 128), eimg_f32], dim=-1).contiguous()
+        elif _use_triton:
             packed, descale = hp.quantize_fp4_v_colmajor_lds_triton(v_tok)
         else:
             packed, descale = hp.quantize_fp4_v_colmajor_lds_torch(v_tok)
@@ -1133,6 +1146,40 @@ def make_kernel_runner(
             v_descale=v_descale,
         )
 
+    if args.kernel == "aiter_f8f4":
+        # fp8 Q/K (per-tensor descale, as in aiter_fp8) + packed per-channel fp4 (E2M1) V
+        # (as in aiter_f6f4). The C++ dispatch detects fp8-QK + uint8-V -> "f8f4bf16" ->
+        # fwd_hd128_f8f4.co. flash_attn_mxfp4_func is a thin forwarder to fmha_v3_fwd (no dtype
+        # assert); pass softmax_scale explicitly (its uint8-packed default assumes fp4 QK).
+        _v_fp4_packer = _build_fp4_v_packer(q_bshd.device)
+
+        def _quantize_f8f4():
+            q_fp8, k_fp8, _v_fp8, q_ds, k_ds, _v_ds = fp8_quantize(
+                q_bshd, k_bshd, v_bshd
+            )
+            v_fp4, v_descale = _v_fp4_packer(v_bshd)
+            return q_fp8, k_fp8, v_fp4, q_ds, k_ds, v_descale
+
+        def _kernel_f8f4(q_fp8, k_fp8, v_fp4, q_ds, k_ds, v_ds):
+            return flash_attn_mxfp4_func(
+                q_fp8,
+                k_fp8,
+                v_fp4,
+                q_descale=q_ds,
+                k_descale=k_ds,
+                v_descale=v_ds,
+                softmax_scale=softmax_scale,
+            )
+
+        def _run_aiter_f8f4():
+            return _kernel_f8f4(*_quantize_f8f4())
+
+        if args.e2e:
+            return _run_aiter_f8f4
+
+        packed = _quantize_f8f4()
+        return lambda: _kernel_f8f4(*packed)
+
     if args.kernel == "aiter_i8fp8":
         q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
@@ -1249,13 +1296,17 @@ def make_kernel_runner(
         *packed, _delta_s = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel in ("aiter_mxfp6", "aiter_f6f4"):
+    if args.kernel in ("aiter_mxfp6", "aiter_f6f4", "aiter_f6f4_pv"):
         # fp6 QK path. aiter_mxfp6 = f6f8 (fp6 QK, fp8 V, tail K-scale) -> the mainline upstream
         # kernel. aiter_f6f4 = the ISOLATED v_fp4 kernel (fp6 QK, per-channel fp4 V via
-        # ds_read_b64_tr_b4), based on the pre-tail mxfp6: it uses the NO-TAIL K packer (separate
-        # K-scale stream) and forces the fp4-V feed. Both share the fwd_hd128_mxfp6.co slot/symbol
-        # (deploy the matching .co); the wrappers differ only in the K packer + V dtype.
-        _is_f6f4 = args.kernel == "aiter_f6f4"
+        # ds_read_b64_tr_b4). aiter_f6f4_pv = the MXFP4-PV variant of f6f4 (adds fp4-P): identical
+        # inputs/packing as aiter_f6f4, but the C++ dispatch is redirected to the fwd_hd128_f6f4_pv.co
+        # slot via AITER_FMHA_F6F4_PV=1 so the fp8-P baseline and the fp4-P kernel coexist.
+        _is_f6f4 = args.kernel in ("aiter_f6f4", "aiter_f6f4_pv")
+        if args.kernel == "aiter_f6f4_pv":
+            os.environ["AITER_FMHA_F6F4_PV"] = "1"  # redirect f6f4 slot -> fwd_hd128_f6f4_pv.co
+        else:
+            os.environ.pop("AITER_FMHA_F6F4_PV", None)  # don't leak into f6f4/mxfp6 (e.g. --kernel all)
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
@@ -1270,9 +1321,9 @@ def make_kernel_runner(
         ) / (block_r**0.5)
 
         # Q/K fp6 packers, resolved via the host module (hp) so AITER_MXFP6_PACK can swap the
-        # packer and AITER_MXFP6_QK_TRITON can force the numpy path. Built ONCE (they memoize
-        # per input tensor) and passed into sage_quant_mxfp6 as q_packer/k_packer. Q uses the
-        # base fp6 pack; K uses the coalesced LDS-order (tail-K-scale) pack.
+        # packer module and AITER_MXFP6_QK_TRITON=0 selects the pure-torch packer (Triton by
+        # default). Built ONCE (they memoize per input tensor) and passed into sage_quant_mxfp6
+        # as q_packer/k_packer. Q uses the base fp6 pack; K uses the coalesced LDS-order pack.
         _mxfp6_q_packer = _build_fp6_qk_packer(q_bshd.device)
         _mxfp6_k_packer = _build_fp6_k_coalesced_packer(q_bshd.device)
         # V operand: aiter_f6f4 feeds per-channel fp4 (E2M1) col-major (read via ds_read_b64_tr_b4);
@@ -2058,6 +2109,8 @@ def parse_args() -> argparse.Namespace:
             "aiter_mxfp4",
             "aiter_mxfp6",
             "aiter_f6f4",
+            "aiter_f6f4_pv",
+            "aiter_f8f4",
             "aiter_bf16",
             "all",
         ],
