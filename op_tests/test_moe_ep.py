@@ -772,7 +772,7 @@ def test_fmoe_ep_mxfp4(
         _ku = {}
         for _name, _callable in _cap:
             _, _u = run_perftest(
-                _callable, num_warmup=5, num_iters=101, testGraph=False
+                _callable, num_warmup=50, num_iters=101, testGraph=False
             )
             _ku[_name] = _u
         gemm1_us = _ku.get("gemm1")
