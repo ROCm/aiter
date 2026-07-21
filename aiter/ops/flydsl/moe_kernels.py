@@ -11,6 +11,7 @@ from typing import Dict, Optional
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_common import build_num_valid_token
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
@@ -1806,7 +1807,7 @@ def flydsl_moe_topids_to_rows(
             * int(topk)
         ).contiguous()
     else:
-        num_valid_routes = torch.tensor([numel], dtype=torch.int32, device=device)
+        num_valid_routes = build_num_valid_token(numel, device)
 
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
@@ -2354,9 +2355,7 @@ def flydsl_moe_fused_quant_preshuffle(
         # padding rows of the dispatch buffer and are not gathered/quantized. When
         # not provided, pass numel so every route stays valid (no behavior change).
         if num_valid_routes is None:
-            num_valid_routes_i32 = torch.tensor(
-                [numel], dtype=torch.int32, device=device
-            )
+            num_valid_routes_i32 = build_num_valid_token(numel, device)
         else:
             num_valid_routes_i32 = (
                 num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)

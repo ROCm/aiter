@@ -5,6 +5,32 @@
 
 from enum import Enum
 
+import torch
+
+
+def build_num_valid_token(value: int, device: torch.device) -> torch.Tensor:
+    """Return a 1-element int32 device tensor holding ``value``.
+
+    Non-EP dead-tail bound for the grouped MoE kernels. Built with ``fill_``
+    (a device kernel) instead of ``torch.tensor([value])`` -- the latter
+    allocates on the host and pageable-copies to the device (a Memcpy HtoD on
+    every launch), while ``fill_`` writes on the device with no host->device
+    memcpy.
+
+    EP mode does not use this helper: there the bound is a dynamic device
+    tensor and is sliced/cast in place instead.
+
+    Args:
+        value: The scalar count to store (valid routes or valid tokens).
+        device: Device the returned tensor lives on.
+
+    Returns:
+        A ``(1,)`` int32 tensor holding ``value``.
+    """
+    tensor = torch.empty(1, dtype=torch.int32, device=device)
+    tensor.fill_(int(value))
+    return tensor
+
 
 class GateMode(str, Enum):
     """Gate/Up computation strategy for stage1 GEMM.

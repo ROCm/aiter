@@ -16,7 +16,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import GateMode, build_num_valid_token
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
@@ -1728,9 +1728,7 @@ def contiguous_psum_remap(
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
     if num_valid_routes is None:
-        num_valid_routes_i32 = torch.tensor(
-            [int(topids_flat.numel())], dtype=torch.int32, device=device
-        )
+        num_valid_routes_i32 = build_num_valid_token(topids_flat.numel(), device)
     else:
         num_valid_routes_i32 = num_valid_routes.reshape(-1)[:1].to(
             device=device, dtype=torch.int32
@@ -1828,9 +1826,7 @@ def flydsl_moe_gather_reduce(
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
     # truncation) processes every token.
     if num_valid_tokens is None:
-        num_valid_tokens_i32 = torch.tensor(
-            [token_num], dtype=torch.int32, device=device
-        )
+        num_valid_tokens_i32 = build_num_valid_token(token_num, device)
     else:
         num_valid_tokens_i32 = num_valid_tokens.reshape(-1)[:1].to(
             device=device, dtype=torch.int32
