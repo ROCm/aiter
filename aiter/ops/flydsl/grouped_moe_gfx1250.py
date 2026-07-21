@@ -301,13 +301,22 @@ _G2L_MAX_N = 512
 
 
 def _build_g2l_lut(
-    expert_mask: torch.Tensor, E: int, device
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    expert_mask: torch.Tensor,
+    E: int,
+    device,
+    nvt: Optional[torch.Tensor] = None,
+    topk: Optional[int] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build the EP global->local expert LUT (and zero the route counter).
 
-    Returns ``(g2l_lut, counter)`` where ``counter`` is the zero-inited ``(E,)``
-    per-bucket route counter produced by the fused kernel, or ``None`` on the
-    torch fallback (callers then allocate/zero it themselves).
+    Returns ``(g2l_lut, counter, nvr)`` where ``counter`` is the zero-inited
+    ``(E,)`` per-bucket route counter produced by the fused kernel (or ``None``
+    on the torch fallback, so callers allocate/zero it themselves) and ``nvr`` is
+    the ``(1,)`` int32 ``num_valid_routes = nvt * topk`` scalar the same kernel
+    computes on-device (or ``None`` when ``nvt``/``topk`` are not supplied or the
+    torch fallback is taken, so callers compute it themselves). Folding the
+    ``nvt * topk`` into this pre-route kernel removes the standalone torch
+    elementwise ``* topk`` launch on the EP decode hot path.
 
     ``g2l_lut[global_id]`` gives the local bucket in [0, E) for enabled experts
     or the sentinel ``E`` for dropped (non-local) routes. Result is int32 on
@@ -325,6 +334,8 @@ def _build_g2l_lut(
     the LUT at ``expert_mask`` creation and threading it through the op schema.
     """
     n = expert_mask.numel()
+    # nvr is only folded in when both the dynamic-token scalar and topk are known.
+    _want_nvr = nvt is not None and topk is not None
     if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
         try:
             mask = (
@@ -334,15 +345,28 @@ def _build_g2l_lut(
             # The kernel also zero-inits this per-bucket route counter (folds the
             # separate host torch.zeros(E) that moe_route_g2l increments).
             counter = torch.empty(E, dtype=torch.int32, device=device)
+            # (1,) int32 num_valid_routes = nvt * topk, computed on-device by the
+            # same single-block kernel (folds the standalone torch ``* topk``). A
+            # valid nvt pointer is always passed so the kernel store is uniform;
+            # the result is only surfaced to the caller when nvr was requested.
+            nvt_i32 = (
+                nvt.reshape(-1)[:1].to(device=device, dtype=torch.int32).contiguous()
+                if _want_nvr
+                else torch.zeros(1, dtype=torch.int32, device=device)
+            )
+            nvr = torch.empty(1, dtype=torch.int32, device=device)
             _get_compiled_g2l_lut()(
                 ptr_arg(mask),
                 ptr_arg(lut),
                 ptr_arg(counter),
+                ptr_arg(nvt_i32),
+                ptr_arg(nvr),
                 int(n),
                 int(E),
+                int(topk) if _want_nvr else 0,
                 stream=torch.cuda.current_stream(),
             )
-            return lut, counter
+            return lut, counter, (nvr if _want_nvr else None)
         except Exception as exc:  # pragma: no cover - fallback on any kernel issue
             logger.debug(
                 "[grouped_a8w4] flydsl g2l build unavailable (%s); "
@@ -356,11 +380,20 @@ def _build_g2l_lut(
         .to(torch.int32)
         .contiguous()
     )
-    return lut, None
+    return lut, None, None
 
 
 def _use_a8w4_tdm_path() -> bool:
     return os.environ.get("AITER_GROUPED_A8W4_TDM", "1") in _TRUTHY_ENV
+
+
+def _use_a8w4_tdm_ep() -> bool:
+    """Route the a8w4 EP (expert_mask) path through the felix TDM batched GEMM.
+
+    Default on; set ``AITER_GROUPED_A8W4_TDM_EP=0`` to keep EP on the grouped
+    (mxscale masked/contiguous) GEMM path instead.
+    """
+    return os.environ.get("AITER_GROUPED_A8W4_TDM_EP", "1") in _TRUTHY_ENV
 
 
 def _tdm_align_up(x: int, a: int) -> int:
@@ -375,6 +408,7 @@ def _grouped_a8w4_tdm_moe(
     tile_m=64, tile_n=256, tile_k=256, num_buffers=3,
     tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
     data_format="a8w4",
+    expert_mask=None, num_local_tokens=None,
 ):
     import functools
     import torch
@@ -401,8 +435,58 @@ def _grouped_a8w4_tdm_moe(
     contiguous_m = max(_align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m))
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
 
-    _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    _starts, psum, _ = contiguous_psum_remap(_masked_m, topids_to_rows, E, max_m, tile_m)
+    # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
+    # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
+    # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
+    # (kept -> weight_dtype, dropped -> 0), and skips the EP dead-tail (routes >=
+    # num_valid_routes / tokens >= num_valid_tokens). These are the same fused
+    # route/quant/gather kernels the grouped (non-TDM) EP path uses, so only the
+    # felix TDM batched GEMMs differ; those operate on the already-routed
+    # contiguous layout and are EP-agnostic.
+    _is_ep = expert_mask is not None
+    _g2l_lut = None
+    _g2l_counter = None
+    _gather_w_buf = None
+    _ep_nvr = None
+    _ep_nvt = None
+    if _is_ep:
+        if num_local_tokens is not None:
+            _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
+                device=device, dtype=torch.int32
+            ).contiguous()
+        else:
+            # torch.full builds directly on-device (fill kernel, no H2D copy), so
+            # this stays legal under CUDA graph capture. torch.tensor([...],
+            # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
+            # capture rejects unless pinned.
+            _ep_nvt = torch.full(
+                (1,), int(token_num), dtype=torch.int32, device=device
+            )
+        _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
+            expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
+        )
+        _ep_nvr = (
+            _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
+        )
+        # Route kernel writes every entry (kept -> weight_dtype cast, dropped -> 0),
+        # so the buffer is left uninitialised (fully kernel-written).
+        _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
+        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+            topk_ids,
+            E,
+            max_m,
+            g2l_lut=_g2l_lut,
+            gather_w=_gather_w_buf,
+            weight_in=topk_weight,
+            counter=_g2l_counter,
+            num_local_tokens=num_local_tokens,
+            num_valid_routes=_ep_nvr,
+        )
+    else:
+        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+    _starts, psum, _ = contiguous_psum_remap(
+        _masked_m, topids_to_rows, E, max_m, tile_m, num_valid_routes=_ep_nvr
+    )
     psum = psum.to(torch.int32).contiguous()
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
@@ -422,6 +506,7 @@ def _grouped_a8w4_tdm_moe(
         hidden_states.reshape(1, token_num, model_dim), 1, contiguous_m,
         wmma_rep=wmma_rep, quant_mode=_quant_mode, masked_m=None,
         topids_to_rows=topids_to_rows, source_topk=topk,
+        num_valid_routes=_ep_nvr,
     )
 
     # Fuse gemm1 silu/swiglu + fp8 quantization + scale preshuffle into the
@@ -509,12 +594,20 @@ def _grouped_a8w4_tdm_moe(
             stage1_act=0, bias=_b2, num_buffers=num_buffers2)))
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
-    gather_w = (
-        torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
-        if doweight_stage1
-        else topk_weight.contiguous()
+    if _is_ep:
+        # Route kernel already produced gather weights (dropped routes zeroed);
+        # the dead-tail (tokens >= total_recv) is skipped via num_valid_tokens.
+        gather_w = _gather_w_buf
+    else:
+        gather_w = (
+            torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
+            if doweight_stage1
+            else topk_weight.contiguous()
+        )
+    flydsl_moe_gather_reduce(
+        grouped_out, topids_to_rows, gather_w, out=moe_out,
+        num_valid_tokens=(_ep_nvt if _is_ep else None),
     )
-    flydsl_moe_gather_reduce(grouped_out, topids_to_rows, gather_w, out=moe_out)
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
     return moe_out
 
@@ -708,6 +801,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # path is known (see below).
     _g2l_lut = None
     _g2l_counter = None
+    _g2l_nvr = None
     gather_weight = topk_weight
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
@@ -793,9 +887,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tdm_as_in_prologue_req = (
             os.environ["AITER_GROUPED_GEMM_AS_PROLOGUE"] in _TRUTHY_ENV
         )
-    # TDM batched kernel dispatch (gugu only, non-EP).
+    # TDM batched kernel dispatch (gugu). EP (expert_mask) is routed through the
+    # same TDM GEMM when AITER_GROUPED_A8W4_TDM_EP is on; the EP route/quant/gather
+    # wiring lives in _grouped_a8w4_tdm_moe. doweight_stage1 is not supported with
+    # EP on this path (the route kernel owns the gather weights), so it falls back
+    # to the grouped path.
+    _tdm_ep_ok = (expert_mask is not None) and _use_a8w4_tdm_ep() and (
+        not doweight_stage1
+    )
     if _use_a8w4_tdm_path() and stage1_weight_layout == "gugu" and (
-        expert_mask is None
+        expert_mask is None or _tdm_ep_ok
     ):
         _tdm_kw = {}
         if cfg_row is not None:
@@ -807,6 +908,37 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             _tdm_kw["tile_n2"] = _as_int(cfg_row.get("tile_n2"), _tdm_kw["tile_n"])
             _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
             _tdm_kw["num_buffers2"] = _as_int(cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"])
+        # Env overrides for tuning (present-check so any set value wins over CSV /
+        # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
+        # AITER_TDM_TILE_M / _TILE_N / _TILE_K / _NUM_BUFFERS (+ *_M2/_N2/_K2/
+        # _NUM_BUFFERS2) to sweep the felix TDM batched GEMM tiles.
+        def _tdm_env(name):
+            v = os.environ.get(name)
+            return int(v) if (v is not None and v != "") else None
+        _ov_m = _tdm_env("AITER_TDM_TILE_M")
+        _ov_n = _tdm_env("AITER_TDM_TILE_N")
+        _ov_k = _tdm_env("AITER_TDM_TILE_K")
+        _ov_nb = _tdm_env("AITER_TDM_NUM_BUFFERS")
+        _ov_m2 = _tdm_env("AITER_TDM_TILE_M2")
+        _ov_n2 = _tdm_env("AITER_TDM_TILE_N2")
+        _ov_k2 = _tdm_env("AITER_TDM_TILE_K2")
+        _ov_nb2 = _tdm_env("AITER_TDM_NUM_BUFFERS2")
+        if any(v is not None for v in (_ov_m, _ov_n, _ov_k, _ov_nb, _ov_m2, _ov_n2, _ov_k2, _ov_nb2)):
+            _base_m = _ov_m if _ov_m is not None else _tdm_kw.get("tile_m", tile_m)
+            _base_n = _ov_n if _ov_n is not None else _tdm_kw.get("tile_n", int(n_warp) * 64)
+            _base_k = _ov_k if _ov_k is not None else _tdm_kw.get("tile_k", 256)
+            _base_nb = _ov_nb if _ov_nb is not None else _tdm_kw.get("num_buffers", num_buffers)
+            _tdm_kw["tile_m"] = _base_m
+            _tdm_kw["tile_n"] = _base_n
+            _tdm_kw["tile_k"] = _base_k
+            _tdm_kw["num_buffers"] = _base_nb
+            # Stage2 ties to the (possibly overridden) stage1 base unless its own
+            # *_M2/_N2/_K2/_NUM_BUFFERS2 override is set. This intentionally
+            # discards any CSV stage2 value so an env sweep stays self-consistent.
+            _tdm_kw["tile_m2"] = _ov_m2 if _ov_m2 is not None else _base_m
+            _tdm_kw["tile_n2"] = _ov_n2 if _ov_n2 is not None else _base_n
+            _tdm_kw["tile_k2"] = _ov_k2 if _ov_k2 is not None else _base_k
+            _tdm_kw["num_buffers2"] = _ov_nb2 if _ov_nb2 is not None else _base_nb
         return _grouped_a8w4_tdm_moe(
             hidden_states, w1, w2, topk_weight, topk_ids,
             E=E, model_dim=model_dim, inter_dim=inter_dim, dtype=dtype,
@@ -814,7 +946,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             bias1=bias1, bias2=bias2, swiglu_limit=swiglu_limit,
             stage1_weight_layout=stage1_weight_layout,
             doweight_stage1=doweight_stage1,
-            data_format=data_format, **_tdm_kw,
+            data_format=data_format,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
+            **_tdm_kw,
         )
 
     # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
@@ -903,8 +1038,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and (not _use_naive)
         and expert_mask.numel() <= _G2L_MAX_N
     )
+    # EP dynamic-token scalar (total_recv); (1,) int32, capture-safe (no host sync).
+    if _is_ep and num_local_tokens is not None:
+        _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
+            device=device, dtype=torch.int32
+        ).contiguous()
+    else:
+        _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
     if _is_ep and not _use_fused_route_g2l:
-        _g2l_lut, _g2l_counter = _build_g2l_lut(expert_mask, E, device)
+        # num_valid_routes (= total_recv*topk) is computed on-device inside the
+        # single-block moe_g2l_lut kernel and returned as _g2l_nvr, folding the
+        # standalone torch ``_ep_nvt * topk`` elementwise launch out of the EP
+        # decode hot path.
+        _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
+            expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
+        )
     if _is_ep and _use_naive:
         # Naive fallback keeps the host remap: fold dropped (non-local) routes
         # into bucket 0 (gather weight 0) so it stays numerically identical to
@@ -966,14 +1114,24 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # nvr = total_recv*topk; the token-indexed gather-reduce is bounded by nvt =
     # total_recv. When there is no truncation (non-EP), pass the full extents so
     # every route/token stays valid (no behavior change).
+    # _ep_nvt was materialised above (before the g2l-LUT build). Prefer the
+    # num_valid_routes scalar the moe_g2l_lut kernel already computed on-device
+    # (_g2l_nvr); only fall back to a torch launch on the paths that skip that
+    # kernel (fused-route g2l, torch g2l fallback, or non-EP).
     if _is_ep and num_local_tokens is not None:
-        _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
-            device=device, dtype=torch.int32
-        ).contiguous()
-        _ep_nvr = (_ep_nvt * int(topk)).contiguous()
+        _ep_nvr = (
+            _g2l_nvr
+            if _g2l_nvr is not None
+            else (_ep_nvt * int(topk)).contiguous()
+        )
     else:
-        _ep_nvt = torch.tensor([token_num], dtype=torch.int32, device=device)
-        _ep_nvr = torch.tensor([token_num * topk], dtype=torch.int32, device=device)
+        _ep_nvr = (
+            _g2l_nvr
+            if _g2l_nvr is not None
+            else torch.full(
+                (1,), int(token_num) * int(topk), dtype=torch.int32, device=device
+            )
+        )
 
     # Fast path: fused route+quant+scatter; naive path: torch fallback for debug.
     fused_quant_mode = "fp4" if data_format == "fp4" else "fp8"
@@ -1728,8 +1886,8 @@ def contiguous_psum_remap(
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
     if num_valid_routes is None:
-        num_valid_routes_i32 = torch.tensor(
-            [int(topids_flat.numel())], dtype=torch.int32, device=device
+        num_valid_routes_i32 = torch.full(
+            (1,), int(topids_flat.numel()), dtype=torch.int32, device=device
         )
     else:
         num_valid_routes_i32 = num_valid_routes.reshape(-1)[:1].to(
@@ -1828,8 +1986,8 @@ def flydsl_moe_gather_reduce(
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
     # truncation) processes every token.
     if num_valid_tokens is None:
-        num_valid_tokens_i32 = torch.tensor(
-            [token_num], dtype=torch.int32, device=device
+        num_valid_tokens_i32 = torch.full(
+            (1,), int(token_num), dtype=torch.int32, device=device
         )
     else:
         num_valid_tokens_i32 = num_valid_tokens.reshape(-1)[:1].to(
