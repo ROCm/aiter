@@ -12,6 +12,7 @@ enum class ActivationType : int
     Swiglu = 2,
     Situv2 = 3,
 };
+
 enum class QuantType : int
 {
     No,
@@ -23,6 +24,13 @@ enum class QuantType : int
     per_256x128,
     per_1024x128,
 };
+
+enum class MlaVersion : int
+{
+    V32 = 0,
+    V40 = 1,
+};
+
 typedef enum
 {
     AITER_DTYPE_fp8,

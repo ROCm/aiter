@@ -107,6 +107,9 @@ struct opus_gqa_traits {
     }
 };
 
+#ifndef OPUS_FMHA_FWD_CEIL_DIV
+#define OPUS_FMHA_FWD_CEIL_DIV
 __host__ __device__ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
+#endif

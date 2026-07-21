@@ -74,7 +74,11 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    ptr_rsrc,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtype,
@@ -730,8 +734,8 @@ def build_moe_fused_route_quant_scatter_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -960,8 +964,8 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -1197,8 +1201,8 @@ def build_moe_fused_quant_preshuffle_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -1417,8 +1421,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -1850,8 +1854,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 

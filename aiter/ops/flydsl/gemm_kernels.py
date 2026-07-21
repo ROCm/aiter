@@ -951,7 +951,7 @@ _flydsl_import_done = False
 
 
 def _get_compile_fn():
-    """Lazy-import compile_preshuffle_gemm_a8 so the module loads even without FlyDSL."""
+    """Lazy-import compile_preshuffle_gemm so the module loads even without FlyDSL."""
     global _flydsl_compile_fn, _flydsl_import_done
     if _flydsl_import_done:
         return _flydsl_compile_fn
@@ -960,9 +960,9 @@ def _get_compile_fn():
         logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
         return None
     try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-        _flydsl_compile_fn = compile_preshuffle_gemm_a8
+        _flydsl_compile_fn = compile_preshuffle_gemm
         logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
     except Exception as e:
         logger.info(
@@ -980,11 +980,11 @@ def flydsl_preshuffle_gemm_a8(
     tile_m: int,
     tile_n: int,
     tile_k: int,
-    lds_stage: int = 2,
-    use_cshuffle_epilog: int = 0,
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
     xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    enable_scheduler: bool = True,
 ) -> Tensor:
     """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
     compile_fn = _get_compile_fn()
@@ -1032,11 +1032,11 @@ def flydsl_preshuffle_gemm_a8(
         tile_k=tile_k,
         in_dtype=in_dtype,
         out_dtype=out_dtype,
-        lds_stage=lds_stage,
-        use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=wpe,
+        enable_scheduler=bool(enable_scheduler),
         xcd_swizzle=int(xcd_swizzle),
+        lds_stage=int(lds_stage),
     )
 
     def _as_i8(t):
@@ -1047,14 +1047,17 @@ def flydsl_preshuffle_gemm_a8(
     # epilogue != "none"). Pass an empty tensor as a placeholder for the
     # default epilogue="none" path.
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
+    # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
+    # pointers.
     _run_compiled(
         exe,
-        ptr_arg(out_contig.view(-1)),
-        ptr_arg(_as_i8(XQ.contiguous()).view(-1)),
-        ptr_arg(_as_i8(WQ.contiguous()).view(-1)),
-        ptr_arg(x_scale.contiguous().view(-1)),
-        ptr_arg(w_scale.contiguous().view(-1)),
-        ptr_arg(_dummy_bias),
+        out_contig.view(-1),
+        _as_i8(XQ.contiguous()).view(-1),
+        _as_i8(WQ.contiguous()).view(-1),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        _dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),

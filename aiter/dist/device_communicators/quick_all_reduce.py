@@ -279,6 +279,51 @@ class QuickAllReduce:
         )
         return out
 
+    def should_quick_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        hidden_dim: int,
+    ):
+        if not self.should_quick_allreduce(inp):
+            return False
+        if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
+            return False
+        if not is_weak_contiguous(residual_inp) or not is_weak_contiguous(weight):
+            return False
+        if weight.numel() != hidden_dim or inp.numel() % hidden_dim != 0:
+            return False
+
+        row_size = hidden_dim * inp.element_size()
+        tile_size = 32 * 1024
+        return row_size > 0 and row_size <= tile_size and tile_size % row_size == 0
+
+    def quick_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+    ):
+        """Performs QR allreduce fused with residual add and RMSNorm."""
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual_inp)
+        ops.qr_all_reduce_rmsnorm(
+            self._ptr,
+            inp,
+            residual_inp,
+            residual_out,
+            out,
+            weight,
+            eps,
+            hidden_dim,
+            self.qr_quant_level.value,
+            self.use_fp16_kernels,
+        )
+        return out, residual_out
+
     def close(self):
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:

@@ -244,12 +244,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      stream))
 {
     (void)softmax_scale;
-    // valid_split_count / use_valid_split_count_reduce: ABI parity with V3
-    // stage1 (nullable / passive). The shipped v4 nm .co does not consume them;
-    // accept and ignore so callers can plumb a fixed buffer through for
-    // CUDA-graph capture without a separate codepath.
-    (void)valid_split_count;
-    (void)use_valid_split_count_reduce;
     AITER_CHECK(sink != nullptr, __func__, ": `sink` must not be NULL");
     AITER_CHECK(sink->data_ptr() != nullptr,
                 __func__,
@@ -467,7 +461,27 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         args_legacy.s_log2_page = log2_page;
         args_legacy.ptr_STP     = split_indptr->data_ptr();
         if(is_gfx1250)
+        {
             fill_gfx1250_kargs(args_legacy);
+        }
+        else
+        {
+            if(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr)
+            {
+                AITER_CHECK(valid_split_count->dtype() == AITER_DTYPE_i32,
+                            __func__,
+                            ": valid_split_count must be int32");
+                AITER_CHECK(valid_split_count->size(0) >= num_seqs,
+                            __func__,
+                            ": valid_split_count must have at least num_seqs entries");
+                args_legacy.ptr_valid_split = valid_split_count->data_ptr();
+            }
+            else
+            {
+                args_legacy.ptr_valid_split = nullptr;
+            }
+            args_legacy.s_use_valid_split = (use_valid_split_count_reduce != 0) ? 1u : 0u;
+        }
         arg_buf  = &args_legacy;
         arg_size = sizeof(args_legacy);
     }
