@@ -80,16 +80,6 @@ def bscale_view(
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
-def bq_frag_tmpl(view):
-    """i32<4:1> fragment template sliced from a bq_view (16B = 32 fp4)."""
-    return view[0, 0, 0, 0, None]
-
-
-def bscale_frag_tmpl(view):
-    """i32<1:1> fragment template sliced from a bscale_view (one e8m0 word)."""
-    return view[0, 0, 0, None]
-
-
 def scale_mma_atoms(a_dtype):
     """16 (opselA,opselB) scaled-MFMA atoms; A elem is fp8/fp4, B is fp4."""
     elem_a = Float8E4M3FN if a_dtype == "fp8" else Float4E2M1FN
@@ -406,8 +396,8 @@ def gemm2_body_v2(
     ]
 
     # B / B-scale fragments are streamed PER-ITER (one K-tile worth); A refilled per K via LDS.
-    frag_tmpl = bq_frag_tmpl(bq_views[0])  # i32<4:1>
-    bs_frag_tmpl = bscale_frag_tmpl(bscale_views[0])  # i32<1:1>
+    frag_tmpl = bq_views[0][0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
+    bs_frag_tmpl = bscale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
     # A/C both live in fx.gemm fragments (dtype-generic path). fp8 A packs two 128-K halves -> i32<8:1>.
     zero4 = Vec.filled(4, 0.0, Float32)
     A_NDW = 8 if is_f8_a else 4
