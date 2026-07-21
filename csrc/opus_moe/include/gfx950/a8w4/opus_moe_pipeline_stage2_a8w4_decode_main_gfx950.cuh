@@ -3,7 +3,6 @@
 #pragma once
 
 #include "../opus_moe_stage2_utils_gfx950.cuh"
-#include "opus_moe_pipeline_stage2_a8w4_decode_generic_gfx950.cuh"
 #include "opus_moe_pipeline_stage2_a8w4_decode_policy_gfx950.cuh"
 
 #include "opus/opus.hpp"
@@ -121,8 +120,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     int tid,
     int32_t* __restrict__ smem_a_base,
     int32_t* __restrict__ smem_route_base,
-    float* __restrict__ smem_weight,
-    bool& full_route_tile)
+    float* __restrict__ smem_weight)
 {
     const int token_num = kargs.token_num;
     const int topk = kargs.topk;
@@ -159,7 +157,11 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
     if constexpr(T::DIRECT_ATOMIC_OUT)
     {
-        full_route_tile = false;
+        if(route_base + T::B_M <= sorted_rows)
+        {
+            __syncthreads();
+            return true;
+        }
         return __syncthreads_or(has_route) != 0;
     }
     else
@@ -170,13 +172,307 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
             if(route_base + T::B_M <= sorted_rows)
             {
                 __syncthreads();
-                full_route_tile = true;
                 return true;
             }
         }
         const int route_count = __syncthreads_count(has_route);
-        full_route_tile = route_count == T::B_M;
         return route_count != 0;
+    }
+}
+
+template<typename T,
+         typename V_A,
+         typename V_B,
+         typename IssueAPayload,
+         typename WaitAPayload,
+         typename LoadAPayload,
+         typename LoadBHalf,
+         typename LoadBScale,
+         typename LoadAScale,
+         typename ComputeHalf,
+         typename ComputeTile>
+inline __device__ void opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950(
+    int col_base,
+    int b_payload_row_stride_bytes,
+    IssueAPayload& issue_a_payload,
+    WaitAPayload& wait_a_payload,
+    LoadAPayload& load_a_payload,
+    LoadBHalf& load_b_half,
+    LoadBScale& load_b_scale,
+    LoadAScale& load_a_scale,
+    ComputeHalf& compute_half,
+    ComputeTile& compute_tile)
+{
+    using namespace opus;
+
+    static_assert(T::K_TILES >= 2);
+    using Schedule = OpusMoeStage2A8W4DecodeSchedule<T>;
+    using MainloopSchedule = OpusMoeStage2A8W4DecodeMainloopSchedule;
+
+    constexpr bool HasOddTail = (T::K_TILES & 1) != 0;
+    constexpr int PairCount = T::K_TILES / 2;
+    static_assert(PairCount >= 1);
+
+    constexpr int k0 = 0;
+    constexpr int k1 = T::K_STEP_PACKED;
+    constexpr int k2 = 2 * T::K_STEP_PACKED;
+    const int b_tile_base0 = opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(
+        col_base, k0, b_payload_row_stride_bytes);
+    const int b_tile_base1 = opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(
+        col_base, k1, b_payload_row_stride_bytes);
+    const int b_tile_base2 = opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(
+        col_base, k2, b_payload_row_stride_bytes);
+
+    auto b_tile_base_for = [&](auto stage) {
+        constexpr int Stage = decltype(stage)::value;
+        if constexpr(Stage == 0)
+            return b_tile_base0;
+        else if constexpr(Stage == 1)
+            return b_tile_base1;
+        else if constexpr(Stage == 2)
+            return b_tile_base2;
+        else
+            return static_cast<int>(opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(
+                col_base,
+                Stage * T::K_STEP_PACKED,
+                b_payload_row_stride_bytes));
+    };
+
+    auto load_scale_pair = [&](auto pair,
+                               int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
+                               int (&a_scale)[T::M_MFMA_PER_WAVE]) {
+        constexpr int scale_word_base =
+            decltype(pair)::value * T::SCALE_WORDS_PER_GROUP_PACK;
+        load_b_scale(scale_word_base, b_scale);
+        load_a_scale(scale_word_base, a_scale);
+    };
+
+    auto wait_a_tile_and_pending_b = [&]() {
+        if constexpr(Schedule::Mainloop == MainloopSchedule::SplitALoadByNWave)
+            wait_a_payload(1_I);
+        else
+            wait_a_payload(0_I);
+        s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
+    };
+
+    auto compute_prefetched_even_tile = [&](int tile_base,
+                                            const V_A (&v_a_even)[T::M_MFMA_PER_WAVE],
+                                            const int (&a_scale)[T::M_MFMA_PER_WAVE],
+                                            const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE]) {
+        V_B v_b_half0[T::HALF_N_MFMA_PER_WAVE];
+        V_B v_b_half1[T::HALF_N_MFMA_PER_WAVE];
+        load_b_half(0, tile_base, v_b_half0);
+        load_b_half(1, tile_base, v_b_half1);
+
+        __builtin_amdgcn_s_setprio(1);
+        compute_half(0_I, 0_I, v_a_even, a_scale, b_scale, v_b_half0);
+        s_waitcnt_vmcnt(0_I);
+        compute_half(0_I, 1_I, v_a_even, a_scale, b_scale, v_b_half1);
+        __builtin_amdgcn_s_setprio(0);
+    };
+
+    if constexpr(T::A_LDS_STAGES < T::K_TILES)
+    {
+        static_assert(T::A_LDS_STAGES == T::A_LDS_STREAM_STAGES);
+
+        auto issue_streamed_a_tile = [&](auto stage_slot, int k_tile) {
+            const int k_base = k_tile * T::K_STEP_PACKED;
+            issue_a_payload(stage_slot, k_base);
+        };
+
+        auto compute_streamed_tile = [&](auto scale_pair,
+                                         auto stage_slot,
+                                         int k_tile,
+                                         const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE],
+                                         const int (&a_scale)[T::M_MFMA_PER_WAVE]) {
+            const int k_base = k_tile * T::K_STEP_PACKED;
+            const int b_tile_base =
+                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(
+                    col_base, k_base, b_payload_row_stride_bytes);
+            compute_tile(
+                scale_pair,
+                0_I,
+                stage_slot,
+                b_tile_base,
+                b_scale,
+                a_scale);
+            __builtin_amdgcn_s_barrier();
+        };
+
+        #pragma unroll 1
+        for(int pair = 0; pair < T::K_TILES / 2; ++pair)
+        {
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            const int scale_word_base = pair * T::SCALE_WORDS_PER_GROUP_PACK;
+            issue_streamed_a_tile(0_I, 2 * pair);
+            issue_streamed_a_tile(1_I, 2 * pair + 1);
+            load_b_scale(scale_word_base, b_scale);
+            load_a_scale(scale_word_base, a_scale);
+            wait_a_payload(0_I);
+            compute_streamed_tile(0_I, 0_I, 2 * pair, b_scale, a_scale);
+            compute_streamed_tile(1_I, 1_I, 2 * pair + 1, b_scale, a_scale);
+        }
+
+        if constexpr(HasOddTail)
+        {
+            constexpr int TailTile = T::K_TILES - 1;
+            constexpr int TailPair = TailTile / 2;
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            issue_streamed_a_tile(0_I, TailTile);
+            load_scale_pair(number<TailPair>{}, b_scale, a_scale);
+            wait_a_payload(0_I);
+            compute_streamed_tile(0_I, 0_I, TailTile, b_scale, a_scale);
+        }
+    }
+
+    if constexpr(T::A_LDS_STAGES >= T::K_TILES)
+    {
+        V_A v_a_prefetched_even[T::M_MFMA_PER_WAVE];
+
+        static_for<T::K_TILES>([&](auto kt) {
+            issue_a_payload(kt, kt.value * T::K_STEP_PACKED);
+        });
+
+        auto run_odd_tile = [&](auto stage,
+                                auto prefetch_next,
+                                auto wait_for_pending_b_half0,
+                                int tile_base,
+                                const int (&a_scale)[T::M_MFMA_PER_WAVE],
+                                const int (&b_scale)[T::HALF_N_MFMA_PER_WAVE]) {
+            constexpr int Stage = decltype(stage)::value;
+            constexpr bool PrefetchNext = decltype(prefetch_next)::value != 0;
+            constexpr bool WaitForPendingBHalf0 =
+                decltype(wait_for_pending_b_half0)::value != 0;
+            static_assert((Stage & 1) == 1);
+            static_assert(!PrefetchNext || Stage + 1 < T::K_TILES);
+
+            V_A v_a_odd[T::M_MFMA_PER_WAVE];
+            V_B v_b_half0[T::HALF_N_MFMA_PER_WAVE];
+            V_B v_b_half1[T::HALF_N_MFMA_PER_WAVE];
+            wait_a_tile_and_pending_b();
+
+            load_a_payload(stage, v_a_odd);
+            load_b_half(0, tile_base, v_b_half0);
+            load_b_half(1, tile_base, v_b_half1);
+
+            if constexpr(WaitForPendingBHalf0)
+                s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
+
+            __builtin_amdgcn_s_setprio(1);
+            compute_half(1_I, 0_I, v_a_odd, a_scale, b_scale, v_b_half0);
+            s_waitcnt_vmcnt(0_I);
+            if constexpr(PrefetchNext)
+            {
+                load_a_payload(number<Stage + 1>{}, v_a_prefetched_even);
+                if constexpr(Schedule::Mainloop == MainloopSchedule::SplitALoadByNWave)
+                    __builtin_amdgcn_s_barrier();
+            }
+            compute_half(1_I, 1_I, v_a_odd, a_scale, b_scale, v_b_half1);
+            __builtin_amdgcn_s_setprio(0);
+        };
+
+        auto run_first_pair = [&](auto prefetch_next) {
+            constexpr bool PrefetchNext = decltype(prefetch_next)::value != 0;
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+
+            if constexpr(Schedule::Mainloop == MainloopSchedule::SplitALoadByNWave)
+            {
+                V_B v_b_half0[T::HALF_N_MFMA_PER_WAVE];
+                V_B v_b_half1[T::HALF_N_MFMA_PER_WAVE];
+                load_b_half(0, b_tile_base0, v_b_half0);
+                load_b_half(1, b_tile_base0, v_b_half1);
+
+                load_scale_pair(0_I, b_scale, a_scale);
+                if constexpr(PrefetchNext)
+                    wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS +
+                                          T::HALF_N_MFMA_PER_WAVE +
+                                          T::M_MFMA_PER_WAVE +
+                                          2 * T::HALF_N_MFMA_PER_WAVE>{});
+                else
+                    wait_a_payload(0_I);
+
+                V_A v_a_even[T::M_MFMA_PER_WAVE];
+                load_a_payload(0_I, v_a_even);
+
+                if constexpr(!PrefetchNext)
+                    s_waitcnt_vmcnt(0_I);
+
+                __builtin_amdgcn_s_setprio(1);
+                compute_half(0_I, 0_I, v_a_even, a_scale, b_scale, v_b_half0);
+                compute_half(0_I, 1_I, v_a_even, a_scale, b_scale, v_b_half1);
+                __builtin_amdgcn_s_setprio(0);
+            }
+            else
+            {
+                if constexpr(PrefetchNext)
+                    wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS>{});
+                else
+                    wait_a_payload(0_I);
+                load_scale_pair(0_I, b_scale, a_scale);
+                compute_tile(
+                    0_I,
+                    number<!PrefetchNext>{},
+                    0_I,
+                    b_tile_base0,
+                    b_scale,
+                    a_scale);
+            }
+
+            run_odd_tile(
+                1_I,
+                number<PrefetchNext>{},
+                number<!PrefetchNext>{},
+                b_tile_base1,
+                a_scale,
+                b_scale);
+        };
+
+        auto run_middle_pair = [&](auto pair) {
+            constexpr int Pair = decltype(pair)::value;
+            constexpr int EvenStage = 2 * Pair;
+            constexpr int OddStage = EvenStage + 1;
+            constexpr bool PrefetchNext = OddStage + 1 < T::K_TILES;
+            static_assert(Pair > 0);
+            static_assert(OddStage < T::K_TILES);
+
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            load_scale_pair(pair, b_scale, a_scale);
+            compute_prefetched_even_tile(
+                b_tile_base_for(number<EvenStage>{}),
+                v_a_prefetched_even,
+                a_scale,
+                b_scale);
+            run_odd_tile(
+                number<OddStage>{},
+                number<PrefetchNext>{},
+                0_I,
+                b_tile_base_for(number<OddStage>{}),
+                a_scale,
+                b_scale);
+        };
+
+        constexpr bool HasRemainingAfterFirstPair = T::K_TILES > 2;
+        run_first_pair(number<HasRemainingAfterFirstPair>{});
+        static_for<PairCount - 1>([&](auto local_pair) {
+            run_middle_pair(number<local_pair.value + 1>{});
+        });
+        if constexpr(HasOddTail)
+        {
+            constexpr int TailStage = 2 * PairCount;
+            constexpr int TailPair = PairCount;
+            int b_scale[T::HALF_N_MFMA_PER_WAVE];
+            int a_scale[T::M_MFMA_PER_WAVE];
+            load_scale_pair(number<TailPair>{}, b_scale, a_scale);
+            compute_prefetched_even_tile(
+                b_tile_base_for(number<TailStage>{}),
+                v_a_prefetched_even,
+                a_scale,
+                b_scale);
+        }
     }
 }
 
@@ -248,6 +544,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
     const int32_t* __restrict__ smem_a_base,
     int route_base,
     int col_base,
+    int b_payload_row_stride_bytes,
     int wave_id_m,
     int wave_id_n,
     int scale_row_col_base,
@@ -289,8 +586,9 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
     });
     const int b_scale_base_word =
         opus_moe_stage2_a8w4_b_scale_base_word_offset<T>(scale_row_col_base,
-                                                         gb_offset(0_I));
-    constexpr int b_ni_stride_bytes = T::MMA_N * T::B_PAYLOAD_ROW_STRIDE_BYTES;
+                                                         gb_offset(0_I),
+                                                         wave_id_n);
+    const int b_ni_stride_bytes = T::MMA_N * b_payload_row_stride_bytes;
     constexpr int b_lane_offset_mask = T::B_THREADGROUP_STRIDE_BYTES - 1;
     const int b_lane_offset = gb_offset(0_I) & b_lane_offset_mask;
     const int b_wave_scalar_base =
@@ -509,113 +807,17 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
         __builtin_amdgcn_s_setprio(0);
     };
 
-    if constexpr(T::K_TILES == 3)
-    {
-        auto run_k3_pipeline = [&]() {
-            constexpr int k0 = 0;
-            constexpr int k1 = T::K_STEP_PACKED;
-            constexpr int k2 = 2 * T::K_STEP_PACKED;
-            const int b_tile_base0 =
-                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(col_base, k0);
-            const int b_tile_base1 =
-                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(col_base, k1);
-            const int b_tile_base2 =
-                opus_moe_stage2_a8w4_b_payload_tile_base_byte_offset<T>(col_base, k2);
-            constexpr int scale_group0 = 0;
-            constexpr int scale_group1 = T::SCALE_WORDS_PER_GROUP_PACK;
-
-            int b_scale0[T::HALF_N_MFMA_PER_WAVE];
-            int b_scale1[T::HALF_N_MFMA_PER_WAVE];
-            int a_scale0[T::M_MFMA_PER_WAVE];
-            int a_scale1[T::M_MFMA_PER_WAVE];
-
-            issue_a_payload(0_I, k0);
-            issue_a_payload(1_I, k1);
-            issue_a_payload(2_I, k2);
-
-            if constexpr(Schedule::Mainloop ==
-                         MainloopSchedule::SplitALoadByNWave)
-            {
-                V_B v_b_tile0_half0[T::HALF_N_MFMA_PER_WAVE];
-                V_B v_b_tile0_half1[T::HALF_N_MFMA_PER_WAVE];
-                load_b_half(0, b_tile_base0, v_b_tile0_half0);
-                load_b_half(1, b_tile_base0, v_b_tile0_half1);
-
-                load_b_scale(scale_group0, b_scale0);
-                load_a_scale(scale_group0, a_scale0);
-                wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS +
-                                      T::HALF_N_MFMA_PER_WAVE +
-                                      T::M_MFMA_PER_WAVE +
-                                      2 * T::HALF_N_MFMA_PER_WAVE>{});
-
-                V_A v_a_tile0[T::M_MFMA_PER_WAVE];
-                load_a_payload(0_I, v_a_tile0);
-
-                __builtin_amdgcn_s_setprio(1);
-                compute_half(0_I, 0_I, v_a_tile0, a_scale0, b_scale0, v_b_tile0_half0);
-                compute_half(0_I, 1_I, v_a_tile0, a_scale0, b_scale0, v_b_tile0_half1);
-                __builtin_amdgcn_s_setprio(0);
-            }
-            else
-            {
-                wait_a_payload(number<T::A_LDS_BUFFER_LOAD_INSTS>{});
-                load_b_scale(scale_group0, b_scale0);
-                load_a_scale(scale_group0, a_scale0);
-                compute_tile(0_I, 0_I, 0_I, b_tile_base0, b_scale0, a_scale0);
-            }
-
-            V_A v_a_tile1[T::M_MFMA_PER_WAVE];
-            V_A v_a_tile2[T::M_MFMA_PER_WAVE];
-            V_B v_b_tile1_half0[T::HALF_N_MFMA_PER_WAVE];
-            V_B v_b_tile1_half1[T::HALF_N_MFMA_PER_WAVE];
-            if constexpr(Schedule::Mainloop == MainloopSchedule::SplitALoadByNWave)
-                wait_a_payload(1_I);
-            else
-                wait_a_payload(0_I);
-            s_waitcnt_vmcnt(number<T::HALF_N_MFMA_PER_WAVE>{});
-
-            load_a_payload(1_I, v_a_tile1);
-            load_b_half(0, b_tile_base1, v_b_tile1_half0);
-            load_b_half(1, b_tile_base1, v_b_tile1_half1);
-
-            __builtin_amdgcn_s_setprio(1);
-            compute_half(1_I, 0_I, v_a_tile1, a_scale0, b_scale0, v_b_tile1_half0);
-            s_waitcnt_vmcnt(0_I);
-            load_a_payload(2_I, v_a_tile2);
-            if constexpr(Schedule::Mainloop ==
-                         MainloopSchedule::SplitALoadByNWave)
-            {
-                __builtin_amdgcn_s_barrier();
-            }
-            compute_half(1_I, 1_I, v_a_tile1, a_scale0, b_scale0, v_b_tile1_half1);
-            __builtin_amdgcn_s_setprio(0);
-
-            load_b_scale(scale_group1, b_scale1);
-            load_a_scale(scale_group1, a_scale1);
-
-            V_B v_b_tile2_half0[T::HALF_N_MFMA_PER_WAVE];
-            V_B v_b_tile2_half1[T::HALF_N_MFMA_PER_WAVE];
-            load_b_half(0, b_tile_base2, v_b_tile2_half0);
-            load_b_half(1, b_tile_base2, v_b_tile2_half1);
-
-            __builtin_amdgcn_s_setprio(1);
-            compute_half(0_I, 0_I, v_a_tile2, a_scale1, b_scale1, v_b_tile2_half0);
-            s_waitcnt_vmcnt(0_I);
-            compute_half(0_I, 1_I, v_a_tile2, a_scale1, b_scale1, v_b_tile2_half1);
-            __builtin_amdgcn_s_setprio(0);
-        };
-        run_k3_pipeline();
-    }
-    else
-    {
-        opus_moe_stage2_a8w4_decode_run_generic_pipeline_gfx950<T>(
-            col_base,
-            issue_a_payload,
-            wait_a_payload,
-            load_b_scale,
-            load_a_scale,
-            compute_tile);
-    }
+    opus_moe_stage2_a8w4_decode_run_k_scheduler_gfx950<T, V_A, V_B>(
+        col_base,
+        b_payload_row_stride_bytes,
+        issue_a_payload,
+        wait_a_payload,
+        load_a_payload,
+        load_b_half,
+        load_b_scale,
+        load_a_scale,
+        compute_half,
+        compute_tile);
 }
 
 // Epilogue: direct atomic output or route-out store.
@@ -750,8 +952,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     int col_base,
     hip_bfloat16* __restrict__ out,
-    int64_t output_row_stride,
-    bool full_route_tile)
+    int64_t output_row_stride)
 {
     constexpr int PAIRS_PER_ROW =
         OpusMoeStage2A8W4CShuffleLayout<T>::PAIRS_PER_ROW;
@@ -783,34 +984,20 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
                 row_pair));
     };
 
-    if(full_route_tile)
+    #pragma unroll
+    for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
     {
-        #pragma unroll
-        for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
-        {
-            const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
-            const int route_row = smem_route_base[local_m];
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
-    }
-    else
-    {
-        #pragma unroll
-        for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
-        {
-            const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
-            const int route_row = smem_route_base[local_m];
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
+        const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
+        const int route_row = smem_route_base[local_m];
+        if(route_row >= 0)
+            store_row(local_m, route_row);
     }
 }
 
 // MXFP8 route_out store: fp8 e4m3 + per-8col e8m0 (1-byte) scale. Per-thread
 // scale (each thread owns 8 cols) -> NO cross-lane reduction. Row layout:
 // [model_dim fp8 | model_dim/8 e8m0 scale bytes]. 0.56x of bf16 -> store ~ -44%.
-template<typename T, bool FullRouteTile>
+template<typename T>
 inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     const uint32_t* __restrict__ smem_c_pair,
     const int32_t* __restrict__ smem_route_base,
@@ -878,16 +1065,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     {
         const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
         const int route_row = smem_route_base[local_m];
-        if constexpr(FullRouteTile)
-        {
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
-        else
-        {
-            if(route_row >= 0)
-                store_row(local_m, route_row);
-        }
+        if(route_row >= 0)
+            store_row(local_m, route_row);
     }
 }
 
@@ -934,8 +1113,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
     uint32_t* __restrict__ smem_c_pair,
     int col_base,
     hip_bfloat16* __restrict__ out,
-    int64_t output_row_stride,
-    bool full_route_tile)
+    int64_t output_row_stride)
 {
     using namespace opus;
     using opus::operator""_I;
@@ -956,8 +1134,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
         c_layout,
         col_base,
         out,
-        output_row_stride,
-        full_route_tile);
+        output_row_stride);
 }
 
 #endif // __gfx950__
@@ -1015,7 +1192,6 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         T::A_LDS_STAGE_ELEMS>(smem_scratch,
                               opus::make_index_seq<T::A_LDS_STAGES>{});
 
-    bool full_route_tile = false;
     const bool has_route = opus_moe_stage2_a8w4_decode_load_route_metadata<T>(
         kargs,
         route_base,
@@ -1023,8 +1199,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         tid,
         smem_a_base,
         smem_route_base,
-        smem_weight,
-        full_route_tile);
+        smem_weight);
     if(!has_route)
         return;
 
@@ -1042,7 +1217,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
         static_cast<unsigned int>(static_cast<unsigned long long>(token_num) *
                                   static_cast<unsigned long long>(kargs.stride_a_t));
     const unsigned int a_scale_size_bytes =
-        static_cast<unsigned int>(static_cast<unsigned long long>(sorted_rows) *
+        static_cast<unsigned int>(static_cast<unsigned long long>(kargs.a_scale_rows) *
                                   static_cast<unsigned long long>(kargs.stride_a_scale_route));
     auto g_a = make_gmem(inter_states, a_size_bytes);
     auto g_a_scale = make_gmem(a2_scale, a_scale_size_bytes);
@@ -1054,7 +1229,9 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     auto g_w_scale = make_gmem(w2_scale, w_scale_size_bytes);
     auto u_ga = opus_moe_stage2_a8w4_layout_ga<T>(lane_id, wave_id_m);
     auto u_sa = opus_moe_stage2_a8w4_layout_sa<T>(lane_id, wave_id_m);
-    auto u_gb = opus_moe_stage2_a8w4_layout_gb<T>(lane_id, wave_id_n);
+    const int b_payload_row_stride_bytes = static_cast<int>(kargs.stride_w_h);
+    auto u_gb = opus_moe_stage2_a8w4_layout_gb<T>(
+        lane_id, wave_id_n, b_payload_row_stride_bytes);
     auto u_c = opus_moe_stage2_a8w4_layout_c<T>(wave_id_m, wave_id_n);
 
     typename decltype(mma)::vtype_c v_c[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE];
@@ -1076,6 +1253,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
                                             smem_a_base,
                                             route_base,
                                             col_base,
+                                            b_payload_row_stride_bytes,
                                             wave_id_m,
                                             wave_id_n,
                                             scale_row_col_base,
@@ -1116,20 +1294,10 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             v_c, u_c, smem_weight, smem_c_pair);
         s_waitcnt_lgkmcnt(0_I);
         __syncthreads();
-        if(full_route_tile)
-        {
-            opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T, true>(
-                smem_c_pair, smem_route_base, u_c, col_base,
-                reinterpret_cast<uint8_t*>(kargs.out_bf16),
-                kargs.route_out_row_bytes, kargs.model_dim);
-        }
-        else
-        {
-            opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T, false>(
-                smem_c_pair, smem_route_base, u_c, col_base,
-                reinterpret_cast<uint8_t*>(kargs.out_bf16),
-                kargs.route_out_row_bytes, kargs.model_dim);
-        }
+        opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T>(
+            smem_c_pair, smem_route_base, u_c, col_base,
+            reinterpret_cast<uint8_t*>(kargs.out_bf16),
+            kargs.route_out_row_bytes, kargs.model_dim);
     }
     else
     {
@@ -1141,8 +1309,7 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             smem_c_pair,
             col_base,
             kargs.out_bf16,
-            kargs.stride_o_t,
-            full_route_tile);
+            kargs.stride_o_t);
     }
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__

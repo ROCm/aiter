@@ -128,8 +128,8 @@ def get_meta_param(
 ):
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
-    # a larger logical head count from multiple WGs — e.g. the v4 nm gqa=128
-    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) — the GPU's CU occupancy
+    # a larger logical head count from multiple WGs -- e.g. the v4 nm gqa=128
+    # path runs gdx=ceil(128/64)=2 WGs per (seq, split) -- the GPU's CU occupancy
     # is driven by `bs * tg_factor * num_kv_splits`, not `bs * num_kv_splits`.
     # Only the occupancy term scales; avg_kv, the fp8 block cap, and the indptr
     # all stay keyed on the real `bs`. The auto-search keeps V3's cap of 16.
@@ -467,7 +467,10 @@ def mla_decode_fwd(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            # One (token, head) per CTA, no cross-lane reduction: the merge is
+            # memory-latency bound, so max occupancy (num_warps=1) beats wider
+            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+            num_warps=1,
             num_stages=2,
             **extra_kargs,
         )
@@ -504,7 +507,7 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and (
-                    (nhead == 32 and max_seqlen_q == 4)
+                    (nhead == 32 and max_seqlen_q >= 4)
                     or (nhead == 64)
                     or (nhead == 128)
                 )
@@ -1272,7 +1275,7 @@ def mla_prefill_reduce(
 
 
 # ---------------------------------------------------------------------------
-# DSv4 MLA — additive entry point. Does NOT touch any existing
+# DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
 def mla_decode_fwd_v4_nm(
@@ -1287,7 +1290,7 @@ def mla_decode_fwd_v4_nm(
     kv_last_page_lens,  # [num_seqs]
     max_seqlen_q,
     *,
-    sink,  # REQUIRED [num_heads] FP32 — attention sink logit
+    sink,  # REQUIRED [num_heads] FP32 -- attention sink logit
     split_indptr=None,  # [num_seqs+1] int32; auto-built by get_meta_param if None
     sm_scale=None,  # ignored on v4 nm; kernel hardcodes 1/sqrt(512)
     out_16_nosplit=0,
@@ -1299,7 +1302,7 @@ def mla_decode_fwd_v4_nm(
 
     Routes through the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
-    `(logits, attn_lse)` — both 4D, in **kernel-native layout**:
+    `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
         attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
     where `total_q = num_seqs * max_seqlen_q` and
@@ -1314,7 +1317,7 @@ def mla_decode_fwd_v4_nm(
     Split-count selection (`num_kv_splits`):
       `None` (default) auto-picks the split count via V3's `get_meta_param`
       heuristic (CU-occupancy x HBM-efficiency, capped by the fp8 min block
-      for the kernel tile) — identical to `mla_decode_fwd`'s non-persistent
+      for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
 
@@ -1323,7 +1326,7 @@ def mla_decode_fwd_v4_nm(
          `[0, N, 2N, ..., bs*N]` so every seq uses all N passes. When
          `num_kv_splits` is auto-picked, `get_meta_param` returns this
          indptr directly.
-      2. Force `out_16_nosplit = 0` — the kernel's bf16-direct-write path
+      2. Force `out_16_nosplit = 0` -- the kernel's bf16-direct-write path
          does not support multi-pass.
       3. After the kernel returns FP32 partials, run V3's
          `_fwd_kernel_stage2_asm` triton kernel which performs the
@@ -1537,7 +1540,10 @@ def mla_decode_fwd_v4_nm(
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
             mgc=mgc,
-            num_warps=4,
+            # One (token, head) per CTA, no cross-lane reduction: the merge is
+            # memory-latency bound, so max occupancy (num_warps=1) beats wider
+            # tiles. Measured 1.7-1.9x over num_warps=4 on gfx950 decode shapes.
+            num_warps=1,
             num_stages=2,
             waves_per_eu=4,
         )
@@ -1546,8 +1552,8 @@ def mla_decode_fwd_v4_nm(
     # When out_16_nosplit=1 (single-pass only), the kernel does NOT write the
     # `output` buffer. Instead it writes the final result as DENSELY-PACKED
     # BF16 into the `logits` allocation. Global layout is identical to the
-    # fp32 path — [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
-    # num_heads — but each element is 2 bytes (R16_BPP=2), so the per-head
+    # fp32 path -- [total_q, nsplit=1, num_heads, v_head_dim] contiguous in
+    # num_heads -- but each element is 2 bytes (R16_BPP=2), so the per-head
     # stride is v_head_dim*2 bytes = v_head_dim BF16 slots, occupying only the
     # FIRST half of the fp32 `logits` byte range. Reinterpret those bytes as a
     # tight [total_q, num_heads, v_head_dim] BF16 tensor and copy into the
