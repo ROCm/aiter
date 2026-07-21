@@ -240,8 +240,11 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
         )
     ep_kwargs = ep_kwargs or {}
     if spec["is_mxfp4"]:
-        if ep_kwargs:
-            raise NotImplementedError("scatter_fused is a8w4-only (not mxfp4)")
+        # scatter_fused (gemm2 P2P) rides the a8w4 grouped kernel (data_format
+        # "a8w4"): a8w4_mxfp4 = fp8 act + mxfp4 weight is supported; a4w4_mxfp4
+        # (data_format "fp4") is not.
+        if ep_kwargs and spec["key"] != "a8w4_mxfp4":
+            raise NotImplementedError("scatter_fused is a8w4-only (not a4w4/fp4)")
         return fused_moe(
             hidden, w1_a, w2_a, topk_weights, topk_ids,
             expert_mask=expert_mask,
@@ -251,6 +254,7 @@ def moe_forward(hidden, w1_a, w2_a, w1_s, w2_s, topk_weights, topk_ids,
             w1_scale=w1_s, w2_scale=w2_s,
             dtype=dtypes.bf16,
             num_local_tokens=num_local_tokens,
+            **ep_kwargs,
         )
     return fused_moe(
         hidden, w1_a, w2_a, topk_weights, topk_ids, expert_mask,
@@ -421,7 +425,7 @@ class DeviceMoEPipeline:
     torch.profiler. No fp32-reference logic here."""
 
     def __init__(self, dist_ctx, E, hdim, idim, topk, spec, n_layers,
-                 w1_bf, w2_bf, sw1, sw2, routings, ct):
+                 w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather"):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
         self.spec = spec
@@ -430,6 +434,7 @@ class DeviceMoEPipeline:
         self.sw1, self.sw2 = sw1, sw2
         self.routings = routings
         self.ct = ct
+        self.combine_mode = combine_mode
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
@@ -478,7 +483,7 @@ class DeviceMoEPipeline:
             num_experts_per_rank=self.EPR,
             num_experts_per_token=self.topk,
             data_type=self.transport_dtype,
-            combine_mode=os.environ.get("COMBINE", "gather"),  # gather | scatter
+            combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
         )
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
@@ -645,7 +650,7 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={os.environ.get('COMBINE', 'gather')} "
+            f"combine={args.combine} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
         )
@@ -668,7 +673,8 @@ def main():
 
     # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench.
     pipe = DeviceMoEPipeline(
-        dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct
+        dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct,
+        combine_mode=args.combine,
     )
     pipe.setup(x0)
     pipe.capture(x0)
@@ -730,6 +736,11 @@ def _parse_args():
     p.add_argument("--profile_table", type=int, default=0, help="print per-kernel table")
     p.add_argument("--dispatch_commu_dtype", type=str, choices=["auto", "bf16", "fp8"],
                    default="auto", help="dispatch transport (communication) dtype")
+    p.add_argument("--combine", type=str,
+                   choices=["gather", "scatter", "scatter_fused"],
+                   default=os.environ.get("COMBINE", "gather"),
+                   help="EP combine mode: gather | scatter | scatter_fused "
+                        "(gemm2-fused P2P scatter; a8w4 only). Falls back to $COMBINE.")
     return p.parse_args()
 
 
