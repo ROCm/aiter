@@ -418,7 +418,7 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     """Return True when stage2 writes per-slot route output then reduces it."""
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
-    if func is _flydsl_stage2_wrapper:
+    if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
         parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
         return parsed is not None and parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
@@ -466,7 +466,51 @@ def fused_moe(
     splitk=0,
     swiglu_limit=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    shared_w1: Optional[torch.Tensor] = None,
+    shared_w2: Optional[torch.Tensor] = None,
+    shared_w1_scale: Optional[torch.Tensor] = None,
+    shared_w2_scale: Optional[torch.Tensor] = None,
+    shared_expert_id: int = -1,
 ):
+    if (
+        any(
+            tensor is not None
+            for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
+        )
+        or shared_expert_id != -1
+    ):
+        from aiter.fhmoe import _fhmoe
+
+        return _fhmoe(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            expert_mask=expert_mask,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_M=block_size_M,
+            num_local_tokens=num_local_tokens,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            dtype=dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            gate_mode=gate_mode,
+            shared_w1=shared_w1,
+            shared_w2=shared_w2,
+            shared_w1_scale=shared_w1_scale,
+            shared_w2_scale=shared_w2_scale,
+            shared_expert_id=shared_expert_id,
+        )
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(
@@ -559,6 +603,63 @@ def fused_moe_(
     swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
+    return _fused_moe_impl(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
+    )
+
+
+def _fused_moe_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_size_M: int = -1,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: Optional[torch.dtype] = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+    *,
+    _q_dtype_a: Optional[torch.dtype] = None,
+    _metadata_transform: Optional[Callable] = None,
+    _stage1_extra_args: Optional[dict] = None,
+    _stage2_extra_args: Optional[dict] = None,
+) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
@@ -618,6 +719,9 @@ def fused_moe_(
             q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
+
+    if _q_dtype_a is not None:
+        q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
     if is_flydsl_available():
@@ -679,6 +783,9 @@ def fused_moe_(
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
     )
+
+    if _metadata_transform is not None:
+        metadata = _metadata_transform(metadata)
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -827,6 +934,9 @@ def fused_moe_(
             expert_mask=expert_mask,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
+            _metadata_transform=_metadata_transform,
+            _stage1_extra_args=_stage1_extra_args,
+            _stage2_extra_args=_stage2_extra_args,
         )
 
 
@@ -2452,6 +2562,9 @@ def fused_moe_2stages(
     expert_mask=None,
     m_indices=None,
     reverse_sorted=None,
+    _metadata_transform: Optional[Callable] = None,
+    _stage1_extra_args: Optional[dict] = None,
+    _stage2_extra_args: Optional[dict] = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2483,6 +2596,8 @@ def fused_moe_2stages(
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
     )
+    if _metadata_transform is not None:
+        metadata = _metadata_transform(metadata)
     if not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
@@ -2582,8 +2697,8 @@ def fused_moe_2stages(
             dtype=_a2_dtype,
             device=device,
         )
-    extra_stage1_args = {}
-    extra_stage2_args = {}
+    extra_stage1_args = dict(_stage1_extra_args or {})
+    extra_stage2_args = dict(_stage2_extra_args or {})
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
