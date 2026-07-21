@@ -20,6 +20,43 @@ def _groupnorm_run(
 ) -> None: ...
 
 
+# Grow-only scratch workspace cache, keyed by device. The C++ kernel must not
+# allocate; it reuses whatever buffer we hand it (empty is fine — the kernel
+# overwrites every slot it reads). Reusing across calls avoids a per-call
+# allocation that otherwise dominates small-shape latency.
+#
+# Resident memory is bounded, not unbounded: ws_slots = 2 * gridx * outer, and
+# gridx is capped by the 4096 grid limit in groupnorm.cu, so the cached buffer
+# never exceeds ~8192 float32 (~32 KB) per device regardless of input size.
+# This matches main's C++ mean_accumulator_, which was likewise grow-only and
+# resident; no extra shrink/free logic is warranted.
+_workspace_cache: dict[torch.device, Tensor] = {}
+
+
+def _groupnorm_ws_slots(input: Tensor, num_groups: int) -> int:
+    # Exact float32-slot count the kernel needs: 2 * gridx * outer_size.
+    # gridx derivation mirrors launchGroupNormKernel in groupnorm.cu; keep in sync.
+    THREADS_PER_BLOCK = 1024
+    STEPS_PER_THREAD = 8
+    outer = input.shape[0] * num_groups
+    inner = input.numel() // outer
+    gridx = (inner + STEPS_PER_THREAD * THREADS_PER_BLOCK - 1) // (
+        STEPS_PER_THREAD * THREADS_PER_BLOCK
+    )
+    if inner % 4 == 0 and gridx >= 16:
+        gridx = max(1, gridx // 4)
+    gridx = min((4096 + outer - 1) // outer, gridx)
+    return 2 * gridx * outer
+
+
+def _groupnorm_workspace(ws_slots: int, device: torch.device) -> Tensor:
+    ws = _workspace_cache.get(device)
+    if ws is None or ws.numel() < ws_slots:
+        ws = torch.empty(ws_slots, dtype=torch.float32, device=device)
+        _workspace_cache[device] = ws
+    return ws
+
+
 def groupnorm_run(
     input: Tensor,
     num_groups: int,
@@ -27,20 +64,16 @@ def groupnorm_run(
     bias: Tensor,
     eps: float,
 ) -> Tensor:
-    """Group Normalization. Allocates output and scratch workspace, then calls
-    the HIP kernel. Returns the normalized output tensor."""
+    """Group Normalization. Allocates output and reuses a cached scratch
+    workspace, then calls the HIP kernel. Returns the normalized output."""
     input = input.contiguous()
     weight = weight.contiguous()
     bias = bias.contiguous()
 
     y = torch.empty_like(input)
 
-    # Workspace upper bound that matches the C-side grid cap (see groupnorm.cu):
-    # num_acc_slots = gridx * outer, with gridx <= ceil(4096 / outer);
-    # the kernel needs 2 * num_acc_slots float32 slots.
-    outer = input.shape[0] * num_groups
-    ws_slots = 2 * ((4096 + outer - 1) // outer * outer)
-    workspace = torch.empty(ws_slots, dtype=torch.float32, device=input.device)
+    ws_slots = _groupnorm_ws_slots(input, num_groups)
+    workspace = _groupnorm_workspace(ws_slots, input.device)
 
     _groupnorm_run(y, workspace, input, num_groups, weight, bias, eps)
     return y
