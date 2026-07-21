@@ -374,6 +374,16 @@ def _per_1x32_mxfp4_quant(w):
     return w_qt, w_scale
 
 
+def _randn_or_const(shape, *, const_init, scale=1.0, dtype=dtypes.bf16, device="cuda"):
+    """randn (scaled) by default; a constant VALUE tensor when const_init is set.
+
+    Mirrors test_flydsl_grouped_gemm_gfx1250.py's --const-init: the const path
+    fills with VALUE exactly (the ``scale`` only applies to the random path)."""
+    if const_init is not None:
+        return torch.full(shape, float(const_init), dtype=dtype, device=device)
+    return torch.randn(shape, dtype=dtype, device=device) * scale
+
+
 def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     """1 - cosine-similarity in double; matches test_moe_2stage.calc_diff."""
     x, y = x.double(), y.double()
@@ -400,6 +410,7 @@ def test_fmoe_ep_mxfp4(
     ep=8,
     ep_mode="real",
     fake_ep_rank=0,
+    const_init=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
@@ -502,7 +513,7 @@ def test_fmoe_ep_mxfp4(
         total_recv = M
         trim_M = M
 
-        input_ = torch.randn((M, model_dim), dtype=dtype, device="cuda")
+        input_ = _randn_or_const((M, model_dim), const_init=const_init, dtype=dtype)
 
         # Rolling-window local routing == moe.py:131-135:
         #   local_slot = (t*topk + k) % L ; expert_ids = ep_id*L + local_slot
@@ -557,7 +568,7 @@ def test_fmoe_ep_mxfp4(
         # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold
         #   before dispatch). Each token picks topk experts from ALL E experts via
         #   fused_topk (the router runs *before* dispatch on the source rank).
-        src_input = torch.randn((n_src, model_dim), dtype=dtype, device="cuda")
+        src_input = _randn_or_const((n_src, model_dim), const_init=const_init, dtype=dtype)
         src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
         src_topk_ids = torch.empty(
             (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
@@ -594,7 +605,7 @@ def test_fmoe_ep_mxfp4(
         # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
         #   First total_recv rows = valid received tokens (from step 2).
         #   Rows [total_recv, trim_M) = dead padding (MORI arena tail).
-        input_ = torch.randn((trim_M, model_dim), dtype=dtype, device="cuda")
+        input_ = _randn_or_const((trim_M, model_dim), const_init=const_init, dtype=dtype)
         input_[:total_recv] = recv_input
 
         total_topk_ids = torch.zeros(
@@ -624,13 +635,17 @@ def test_fmoe_ep_mxfp4(
         ref_topk_weights = recv_topk_weights
 
     total_local = local_E + shared_E
-    w1 = (
-        torch.randn((total_local, inter_dim * 2, model_dim), dtype=dtype, device="cuda")
-        / 10
+    w1 = _randn_or_const(
+        (total_local, inter_dim * 2, model_dim),
+        const_init=const_init,
+        scale=0.1,
+        dtype=dtype,
     )
-    w2 = (
-        torch.randn((total_local, model_dim, inter_dim), dtype=dtype, device="cuda")
-        / 10
+    w2 = _randn_or_const(
+        (total_local, model_dim, inter_dim),
+        const_init=const_init,
+        scale=0.1,
+        dtype=dtype,
     )
 
     w1_qt, w1_scale = _per_1x32_mxfp4_quant(w1)
@@ -957,6 +972,18 @@ parser.add_argument(
     default 0). Selects the local expert block [rank*L, (rank+1)*L).
     Ignored in --ep-mode real (which always uses ep-1).""",
 )
+parser.add_argument(
+    "--const-init",
+    type=float,
+    nargs="?",
+    const=0.0,
+    default=None,
+    metavar="VALUE",
+    help="""initialize activations (input) and weights (w1/w2) to the constant
+    VALUE instead of random values (mxfp4 EP tests only). Bare --const-init uses
+    0.0 (zero-init). Routing scores stay random so expert selection is unchanged.
+    Mirrors test_flydsl_grouped_gemm_gfx1250.py --const-init.""",
+)
 
 args = parser.parse_args()
 gpu_arch = get_gfx()
@@ -1095,6 +1122,7 @@ for test in args.test:
                             ep=ep,
                             ep_mode=args.ep_mode,
                             fake_ep_rank=args.fake_ep_rank,
+                            const_init=args.const_init,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:
