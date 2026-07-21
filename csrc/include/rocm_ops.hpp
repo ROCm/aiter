@@ -2357,6 +2357,7 @@ namespace py = pybind11;
           py::arg("g"),                             \
           py::arg("gk"),                            \
           py::arg("initial_state"),                 \
+          py::arg("initial_state_indices"),         \
           py::arg("cu_seqlens"),                    \
           py::arg("chunk_offsets"),                 \
           py::arg("h"),                             \

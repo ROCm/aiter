@@ -246,8 +246,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
         auto kargs = Kernel::MakeKernelArgs(args);
 
         const dim3 grids      = Kernel::GridSize(kargs);
-        // BlockSize() calls runtime is_wave32(), so it cannot be constexpr
-        const dim3 blocks = Kernel::BlockSize();
+        constexpr dim3 blocks = Kernel::BlockSize();
 
         // if(!Kernel::IsSupportedArgument(kargs))
         // {
