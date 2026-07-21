@@ -22,6 +22,7 @@ import triton
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
     chunk_gated_delta_rule_fwd,
+    chunk_gated_delta_rule_fwd_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     l2norm_fwd,
@@ -331,5 +332,88 @@ def chunk_gated_delta_rule(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+    )
+    return o.to(q.dtype), final_state
+
+
+def chunk_gated_delta_rule_opt_vk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor | None = None,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    initial_state_indices: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    use_chunk_hip: bool = False,
+    use_chunk_flydsl: bool = False,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Optimized forward-only GDN prefill with state layout [N, H, V, K].
+
+    This mirrors the aiter main high-level API and also supports SGLang's
+    pool-indexed state contract via initial_state_indices.
+    """
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+            )
+        n_prefill = len(cu_seqlens) - 1 - num_decodes
+        if initial_state_indices is not None and initial_state_indices.shape[0] != n_prefill:
+            raise ValueError(
+                f"The number of initial state indices is expected to be equal to the number of input sequences, "
+                f"i.e., {n_prefill} rather than {initial_state_indices.shape[0]}."
+            )
+        if (
+            initial_state is not None
+            and initial_state_indices is None
+            and initial_state.shape[0] != n_prefill
+        ):
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {n_prefill} rather than {initial_state.shape[0]}."
+            )
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    _LOGGER.info(
+        f"CHUNK_GATED_DELTA_RULE_OPT_VK: q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}, "
+        f"scale={scale}, use_qk_l2norm={use_qk_l2norm_in_kernel}"
+    )
+
+    if use_qk_l2norm_in_kernel:
+        _LOGGER.info("Applying L2 normalization to q and k")
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
+
+    _, o, final_state = chunk_gated_delta_rule_fwd_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        output_final_state=output_final_state,
+        inplace_final_state=inplace_final_state,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=use_chunk_hip,
+        use_chunk_flydsl=use_chunk_flydsl,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        o=o,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
     )
     return o.to(q.dtype), final_state
