@@ -369,7 +369,10 @@ def _default_kernel_config(
         tiered_long_cap=tiered_long_cap_default,
         mask_non_finite=True,
         row_proportional_parts=ac["row_proportional_parts"],
-        early_stop=ac.get("early_stop", False),
+        # early_stop pays off only for the single-sequence long tier (measured gfx950:
+        # rows=1 L=120k -4us). At rows>=2 it is a net loss in the low-batch long tier
+        # (rows=4 L=120k +2.2us) and neutral at large batch, so gate it to num_rows<=1.
+        early_stop=ac.get("early_stop", False) and num_rows <= 1,
     )
 
 
