@@ -1923,15 +1923,11 @@ def _flash_attn_forward(
     def _can_impl_fmha_fwd_hd128_bf16_opus():
         # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
         # supersedes v3/CK when enabled. Kernel handles cross-attention (seqlen_q !=
-        # seqlen_k) and arbitrary seqlen. For causal we still require seqlen_k >=
-        # seqlen_q: sq>sk causal leaves fully-masked rows which attention_ref NaNs but
-        # the kernel writes as 0 -> divergence; let those fall back to ASM/CK.
+        # seqlen_k), arbitrary seqlen, and bottom-right causal (incl. sq>sk, whose
+        # fully-masked leading rows are written as O=0).
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        ret = hdim_q == 128 and hdim_v == 128
-        if causal:
-            ret = ret and (seqlen_k >= seqlen_q)
-        return ret
+        return hdim_q == 128 and hdim_v == 128
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
