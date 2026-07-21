@@ -132,6 +132,16 @@ _IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
 # heuristic BV -- this target is tuned specifically for it.
 _GFX942_MFMA16HIP_TARGET_CTAS = 64
 
+# gfx942 H=8/Hg=2 varlen carve-out（当前 K5 生产 shape：V=128, BT=64,
+# is_varlen, seqlen=8192）。20260721 在卡7（gfx942, GPU 空闲）实测按 T 强扫
+# BV∈{16,32,64} 得到的 best BV 随 batch 内序列数 N 单调递增：
+#   N=1 (T=8192) →16 · N=2 (T=16384) →32 · N>=3 (T>=24576) →64
+# 通用 target(64) 会在 N=3 时把 BV=64 的 grid(=N*H*ceil(V/BV)=48) 误判为
+# "不够一个 wave" 而降到 BV=32（实测 662us vs BV=64 的 498us，慢约 25%）。
+# 把该 shape family 的 grid-fill 目标下调到 48，N>=3 的 BV=64 grid 恰好达标，
+# 与实测 best BV 完全吻合；其它 gfx942 shape 不受影响（仍用 64 / csv 精确命中）。
+_GFX942_MFMA16HIP_H8HG2_TARGET_CTAS = 48
+
 # gfx950 has 256 CUs. Used as the fallback CU count when the live device
 # query is unavailable (e.g. CPU-only meta runs).
 _GFX950_CU_COUNT = 256
@@ -421,6 +431,7 @@ def _target_bv_for_shape(
     *,
     H: int,
     Hg: int,
+    V: int,
     T_flat: int,
     N: int,
     is_varlen: bool,
@@ -458,6 +469,16 @@ def _target_bv_for_shape(
     other arches (``_IS_GFX950`` guard) -- non-gfx950 falls through to the
     generic CU-fill default, preserving the pre-calibration behavior.
     """
+    if _IS_GFX942:
+        # gfx942 mfma16_hip carve-out（当前生产 shape H=8/Hg=2, V=128, BT=64,
+        # is_varlen）。用 N 驱动的 grid-fill（target=48）拟合卡7实测 best BV：
+        #   N=1→16 · N=2→32 · N>=3→64（对变长序列比纯 T_flat 阈值泛化更好）。
+        # 仅限该 shape family，其它 gfx942 shape 保持 return None → 通用默认。
+        if is_varlen and H == 8 and Hg == 2:
+            return _select_bv_for_grid(
+                H=H, V=V, N=N, target_ctas=_GFX942_MFMA16HIP_H8HG2_TARGET_CTAS
+            )
+        return None
     if not _IS_GFX950:
         return None
     if is_varlen and H == 32 and Hg == 16:
@@ -625,6 +646,7 @@ def _heuristic_bv(
     target_bv = _target_bv_for_shape(
         H=H,
         Hg=Hg,
+        V=V,
         T_flat=T_flat,
         N=N,
         is_varlen=is_varlen,

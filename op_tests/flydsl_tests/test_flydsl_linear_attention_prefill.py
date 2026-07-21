@@ -404,8 +404,8 @@ _PREFILL_GROUPS = [
         Hv=64,
         tps=[8],
         full_prompt_lens=[8192],
-        # max_num_batched_tokens=[8192,16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        max_num_batched_tokens=[65536],
+        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
         model_name="varlen-16k-aws",
@@ -1919,6 +1919,16 @@ def _run_perf_comparison(args: PrefillArgs):
         if (us_fly_mfma16_hip > 0 and us_fly_mfma16_hip == us_fly_mfma16_hip)
         else float("nan")
     )
+    # fly_hip speedup vs the hand-tuned HIP kernel (>1 means fly_hip is faster).
+    fly_hip_vs_hip = (
+        us_hip / us_fly_mfma16_hip
+        if (
+            us_fly_mfma16_hip > 0
+            and us_fly_mfma16_hip == us_fly_mfma16_hip
+            and us_hip == us_hip
+        )
+        else float("nan")
+    )
 
     _perf_results.append(
         {
@@ -1947,6 +1957,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "hip_vs_vk": hip_vs_vk,
             "flydsl_opt_vs_vk": fly_opt_vs_vk,
             "fly_hip_vs_vk": fly_hip_vs_vk,
+            "fly_hip_vs_hip": fly_hip_vs_hip,
         }
     )
 
@@ -2069,6 +2080,7 @@ def _print_perf_table():
         ("hip/vk", "hip_vs_vk", 6),
         ("2w/vk", "flydsl_opt_vs_vk", 6),
         ("fly_hip/vk", "fly_hip_vs_vk", 10),
+        ("fly_hip/hip", "fly_hip_vs_hip", 11),
     ]
 
     def _fmt_cell(val, key, width):
