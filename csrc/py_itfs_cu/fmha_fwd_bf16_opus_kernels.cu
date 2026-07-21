@@ -38,14 +38,15 @@ void launch_d128(aiter_tensor_t& q,
     AITER_CHECK(out.dim() == 4, "out must be 4-D [B, N, H, D], got ndim=", out.dim());
 
     const int B    = static_cast<int>(q.size(0));
-    const int N    = static_cast<int>(q.size(1));
+    const int N    = static_cast<int>(q.size(1));      // seqlen_q
     const int H    = static_cast<int>(q.size(2));
     const int D    = static_cast<int>(q.size(3));
     const int H_KV = static_cast<int>(k.size(2));
+    const int N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
 
     AITER_CHECK(D == 128, "launch_d128 only compiles D=128, got D=", D);
     AITER_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
-    AITER_CHECK(k.size(1) == N && v.size(1) == N, "k/v seqlen must equal q seqlen N");
+    AITER_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
     AITER_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
     AITER_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
     AITER_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
@@ -64,6 +65,7 @@ void launch_d128(aiter_tensor_t& q,
     kargs.ptr_o = out.data_ptr();
     kargs.B     = B;
     kargs.N     = N;
+    kargs.N_KV  = N_KV;
     kargs.H     = H;
     kargs.H_KV  = H_KV;
     kargs.D     = D;
