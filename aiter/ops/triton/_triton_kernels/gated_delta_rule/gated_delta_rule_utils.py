@@ -4,6 +4,7 @@ import contextlib
 import functools
 import inspect
 import logging
+import math
 import os
 import sys
 import warnings
@@ -41,6 +42,23 @@ SUPPORTS_AUTOTUNE_CACHE = (
 autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
+
+GATED_DELTA_RULE_TRITON_AUTOTUNE = os.environ.get(
+    "GATED_DELTA_RULE_TRITON_AUTOTUNE", "0"
+).lower() in ("1", "true", "yes", "on")
+
+# log2(e) == 1/ln(2). Converts natural-log gate values to log2 space so kernels
+# can use exp2 instead of exp.
+RCP_LN2: float = math.log2(math.e)
+
+
+def gated_delta_rule_autotune_configs(
+    configs: list[triton.Config], default_config: triton.Config | None = None
+) -> list[triton.Config]:
+    if GATED_DELTA_RULE_TRITON_AUTOTUNE:
+        return configs
+    cfg = default_config if default_config is not None else configs[0]
+    return [cfg]
 
 
 @lru_cache(maxsize=1)

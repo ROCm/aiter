@@ -18,7 +18,11 @@ Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 """
 
 from .decode.fused_recurrent import _fused_recurrent_gated_delta_rule_fwd_kernel
-from .prefill.chunk import chunk_gated_delta_rule_fwd
+from .prefill.chunk import (
+    chunk_gated_delta_rule_fwd,
+    chunk_gated_delta_rule_fwd_opt,
+    chunk_gated_delta_rule_fwd_opt_vk,
+)
 from .prefill.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .prefill.chunk_o import chunk_fwd_o
 from . import gated_delta_rule_utils
@@ -26,6 +30,8 @@ from . import gated_delta_rule_utils
 __all__ = [
     "_fused_recurrent_gated_delta_rule_fwd_kernel",
     "chunk_gated_delta_rule_fwd",
+    "chunk_gated_delta_rule_fwd_opt",
+    "chunk_gated_delta_rule_fwd_opt_vk",
     "chunk_gated_delta_rule_fwd_h",
     "chunk_fwd_o",
     "gated_delta_rule_utils",
