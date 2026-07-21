@@ -11,14 +11,13 @@
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-#include "opus_gemm_asm_mma16x16x16.cuh"
+#include "opus_gemm_mfma16x16x16_gfx942.cuh"
 
 namespace opus_em3en4_gfx942 {
 
 using opus::operator""_I;
 
-// EM3EN4 requires physical 96x128x{64|128}, BLOCK=256, T_M=T_N=2.
-// It runs 16x16x16 BF16 MFMA with single-buffer LDS.
+// EM3EN4 runs physical 96x128x{64|128} 16x16x16 BF16 MFMA with single-buffer LDS.
 template<typename T>
 struct em3en4_traits_requirements {
     static_assert(T::LDS_DEPTH == 1, "EM3EN4 requires single-buffer LDS (LDS_DEPTH=1)");
@@ -60,19 +59,10 @@ OPUS_D inline auto em3en4_acc_to_vgpr(const float4_acc* acc)
 }
 
 template<int OFFSET>
-OPUS_D inline void ds_write_b128_u128_offset_asm(unsigned addr, __uint128_t v)
+OPUS_D inline void lds_write_u128_offset(unsigned addr, __uint128_t v)
 {
-    asm volatile("ds_write_b128 %0, %1 offset:%2\n" ::
-                 "v"(addr), "v"(v), "n"(OFFSET) : "memory");
-}
-
-template<int OFFSET>
-OPUS_D inline i32x4_t ds_read_b128_offset_asm(unsigned addr)
-{
-    i32x4_t rd;
-    asm volatile("ds_read_b128 %0, %1 offset:%2\n" :
-                 "=&v"(rd) : "v"(addr), "n"(OFFSET) : "memory");
-    return rd;
+    using lds_u128_ptr = __uint128_t __attribute__((address_space(3)))*;
+    *reinterpret_cast<lds_u128_ptr>(addr + OFFSET) = v;
 }
 
 // gmem load: A and B share the layout (vecs_per_row, m=vec/vpr, k=rem*VEC).
@@ -98,7 +88,7 @@ OPUS_D inline void em3en4_store_smem_chunk(S& s, const V& v, int tid)
     int k = (tid - m * vecs_per_row) * VEC;
     unsigned addr = static_cast<unsigned>(reinterpret_cast<__UINTPTR_TYPE__>(s.ptr)) +
                     static_cast<unsigned>((m * row_stride + k) * sizeof(typename S::scalar_type));
-    ds_write_b128_u128_offset_asm<I * chunk_bytes>(addr, __builtin_bit_cast(__uint128_t, v));
+    lds_write_u128_offset<I * chunk_bytes>(addr, __builtin_bit_cast(__uint128_t, v));
 }
 
 template<typename V>
@@ -165,8 +155,28 @@ OPUS_D inline void em3en4_store_b_chunks(S& s, const em3en4_b_chunk_pack<V>& p, 
     em3en4_store_smem_chunk<T, 7, S, T::VEC_B>(s, p.c7, tid);
 }
 
-#define EM3EN4_PAIR_LO(v) (reinterpret_cast<const short4_ab*>(&(v))[0])
-#define EM3EN4_PAIR_HI(v) (reinterpret_cast<const short4_ab*>(&(v))[1])
+template<int OFFSET>
+OPUS_D inline i32x4_t lds_read_i32x4_offset(unsigned addr)
+{
+    using lds_u128_ptr = const __uint128_t __attribute__((address_space(3)))*;
+    auto value = *reinterpret_cast<lds_u128_ptr>(addr + OFFSET);
+    return __builtin_bit_cast(i32x4_t, value);
+}
+
+OPUS_D inline short4_ab em3en4_pair_lo(const i32x4_t& v)
+{
+    return reinterpret_cast<const short4_ab*>(&v)[0];
+}
+
+OPUS_D inline short4_ab em3en4_pair_hi(const i32x4_t& v)
+{
+    return reinterpret_cast<const short4_ab*>(&v)[1];
+}
+
+OPUS_D inline void em3en4_mfma(short4_ab b, short4_ab a, float4_acc& acc)
+{
+    acc = opus::mfma_f32_16x16x16_bf16{}(b, a, acc);
+}
 
 template<typename T, typename S, int WAVE_DIM, int VEC>
 OPUS_D inline unsigned em3en4_lds_base_b128(S& s, int wave_id_dim, int lane_id)
@@ -188,7 +198,7 @@ OPUS_D inline i32x4_t em3en4_read_pair_b128_base(unsigned base)
     constexpr int wave_row_stride_bytes = T_DIM * WAVE_DIM * row_stride_bytes;
     constexpr int pair_stride_bytes = 32 * sizeof(D);
     constexpr int row_offset = I_DIM * wave_row_stride_bytes + I_PAIR * pair_stride_bytes;
-    return ds_read_b128_offset_asm<row_offset>(base);
+    return lds_read_i32x4_offset<row_offset>(base);
 }
 
 // Drain 4 mfma (lo head) of the just-loaded next pair while still in the active K-tile.
@@ -198,20 +208,16 @@ OPUS_D inline void em3en4_compute_pair_lo_head_packed_b128(
     const i32x4_t& b0p, const i32x4_t& b1p,
     float4_acc* acc)
 {
-    auto a0 = EM3EN4_PAIR_LO(a0p);
-    auto a1 = EM3EN4_PAIR_LO(a1p);
-    auto b0 = EM3EN4_PAIR_LO(b0p);
-    auto b1 = EM3EN4_PAIR_LO(b1p);
-    asm volatile(
-        "v_mfma_f32_16x16x16_bf16 %[c00], %[b0], %[a0], %[c00]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c10], %[b0], %[a1], %[c10]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c01], %[b1], %[a0], %[c01]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c11], %[b1], %[a1], %[c11]\n"
-        : [c00]"+v"(acc[0]), [c01]"+v"(acc[1]),
-          [c10]"+v"(acc[4]), [c11]"+v"(acc[5])
-        : [b0]"v"(b0), [b1]"v"(b1), [a0]"v"(a0), [a1]"v"(a1)
-        : "memory"
-    );
+    auto a0 = em3en4_pair_lo(a0p);
+    auto a1 = em3en4_pair_lo(a1p);
+    auto b0 = em3en4_pair_lo(b0p);
+    auto b1 = em3en4_pair_lo(b1p);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b0, a0, acc[0]);
+    em3en4_mfma(b0, a1, acc[4]);
+    em3en4_mfma(b1, a0, acc[1]);
+    em3en4_mfma(b1, a1, acc[5]);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // Dense single-pair: lo (12 mfma) + hi (12 mfma), no prefetch, for the last tile.
@@ -221,49 +227,26 @@ OPUS_D inline void em3en4_compute_pair_both_packed_b128(
     const i32x4_t& b0p, const i32x4_t& b1p, const i32x4_t& b2p, const i32x4_t& b3p,
     float4_acc* acc)
 {
-    auto a0lo = EM3EN4_PAIR_LO(a0p); auto a1lo = EM3EN4_PAIR_LO(a1p); auto a2lo = EM3EN4_PAIR_LO(a2p);
-    auto b0lo = EM3EN4_PAIR_LO(b0p); auto b1lo = EM3EN4_PAIR_LO(b1p);
-    auto b2lo = EM3EN4_PAIR_LO(b2p); auto b3lo = EM3EN4_PAIR_LO(b3p);
-    auto a0hi = EM3EN4_PAIR_HI(a0p); auto a1hi = EM3EN4_PAIR_HI(a1p); auto a2hi = EM3EN4_PAIR_HI(a2p);
-    auto b0hi = EM3EN4_PAIR_HI(b0p); auto b1hi = EM3EN4_PAIR_HI(b1p);
-    auto b2hi = EM3EN4_PAIR_HI(b2p); auto b3hi = EM3EN4_PAIR_HI(b3p);
-    asm volatile(
-        "v_mfma_f32_16x16x16_bf16 %[c00], %[b0lo], %[a0lo], %[c00]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c10], %[b0lo], %[a1lo], %[c10]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c01], %[b1lo], %[a0lo], %[c01]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c11], %[b1lo], %[a1lo], %[c11]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c20], %[b0lo], %[a2lo], %[c20]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c21], %[b1lo], %[a2lo], %[c21]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c02], %[b2lo], %[a0lo], %[c02]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c12], %[b2lo], %[a1lo], %[c12]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c22], %[b2lo], %[a2lo], %[c22]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c03], %[b3lo], %[a0lo], %[c03]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c13], %[b3lo], %[a1lo], %[c13]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c23], %[b3lo], %[a2lo], %[c23]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c00], %[b0hi], %[a0hi], %[c00]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c10], %[b0hi], %[a1hi], %[c10]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c20], %[b0hi], %[a2hi], %[c20]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c01], %[b1hi], %[a0hi], %[c01]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c11], %[b1hi], %[a1hi], %[c11]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c21], %[b1hi], %[a2hi], %[c21]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c02], %[b2hi], %[a0hi], %[c02]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c12], %[b2hi], %[a1hi], %[c12]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c22], %[b2hi], %[a2hi], %[c22]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c03], %[b3hi], %[a0hi], %[c03]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c13], %[b3hi], %[a1hi], %[c13]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c23], %[b3hi], %[a2hi], %[c23]\n"
-        : [c00]"+v"(acc[0]),  [c01]"+v"(acc[1]),
-          [c02]"+v"(acc[2]),  [c03]"+v"(acc[3]),
-          [c10]"+v"(acc[4]),  [c11]"+v"(acc[5]),
-          [c12]"+v"(acc[6]),  [c13]"+v"(acc[7]),
-          [c20]"+v"(acc[8]),  [c21]"+v"(acc[9]),
-          [c22]"+v"(acc[10]), [c23]"+v"(acc[11])
-        : [b0lo]"v"(b0lo), [b1lo]"v"(b1lo), [b2lo]"v"(b2lo), [b3lo]"v"(b3lo),
-          [a0lo]"v"(a0lo), [a1lo]"v"(a1lo), [a2lo]"v"(a2lo),
-          [b0hi]"v"(b0hi), [b1hi]"v"(b1hi), [b2hi]"v"(b2hi), [b3hi]"v"(b3hi),
-          [a0hi]"v"(a0hi), [a1hi]"v"(a1hi), [a2hi]"v"(a2hi)
-        : "memory"
-    );
+    auto a0lo = em3en4_pair_lo(a0p); auto a1lo = em3en4_pair_lo(a1p); auto a2lo = em3en4_pair_lo(a2p);
+    auto b0lo = em3en4_pair_lo(b0p); auto b1lo = em3en4_pair_lo(b1p);
+    auto b2lo = em3en4_pair_lo(b2p); auto b3lo = em3en4_pair_lo(b3p);
+    auto a0hi = em3en4_pair_hi(a0p); auto a1hi = em3en4_pair_hi(a1p); auto a2hi = em3en4_pair_hi(a2p);
+    auto b0hi = em3en4_pair_hi(b0p); auto b1hi = em3en4_pair_hi(b1p);
+    auto b2hi = em3en4_pair_hi(b2p); auto b3hi = em3en4_pair_hi(b3p);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b0lo, a0lo, acc[0]);  em3en4_mfma(b0lo, a1lo, acc[4]);
+    em3en4_mfma(b1lo, a0lo, acc[1]);  em3en4_mfma(b1lo, a1lo, acc[5]);
+    em3en4_mfma(b0lo, a2lo, acc[8]);  em3en4_mfma(b1lo, a2lo, acc[9]);
+    em3en4_mfma(b2lo, a0lo, acc[2]);  em3en4_mfma(b2lo, a1lo, acc[6]);
+    em3en4_mfma(b2lo, a2lo, acc[10]); em3en4_mfma(b3lo, a0lo, acc[3]);
+    em3en4_mfma(b3lo, a1lo, acc[7]);  em3en4_mfma(b3lo, a2lo, acc[11]);
+    em3en4_mfma(b0hi, a0hi, acc[0]);  em3en4_mfma(b0hi, a1hi, acc[4]);
+    em3en4_mfma(b0hi, a2hi, acc[8]);  em3en4_mfma(b1hi, a0hi, acc[1]);
+    em3en4_mfma(b1hi, a1hi, acc[5]);  em3en4_mfma(b1hi, a2hi, acc[9]);
+    em3en4_mfma(b2hi, a0hi, acc[2]);  em3en4_mfma(b2hi, a1hi, acc[6]);
+    em3en4_mfma(b2hi, a2hi, acc[10]); em3en4_mfma(b3hi, a0hi, acc[3]);
+    em3en4_mfma(b3hi, a1hi, acc[7]);  em3en4_mfma(b3hi, a2hi, acc[11]);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // Dense pair compute plus NEXT_PAIR LDS prefetch.
@@ -286,69 +269,54 @@ OPUS_D inline void em3en4_compute_pair_and_prefetch_next_packed_b128(
     constexpr int b_wave_row_stride_bytes = T::T_N * T::W_N * row_stride_bytes;
     constexpr int pair_offset = NEXT_PAIR * 32 * sizeof(typename T::D_A);
 
-    auto a0lo = EM3EN4_PAIR_LO(a0p); auto a1lo = EM3EN4_PAIR_LO(a1p); auto a2lo = EM3EN4_PAIR_LO(a2p);
-    auto b0lo = EM3EN4_PAIR_LO(b0p); auto b1lo = EM3EN4_PAIR_LO(b1p);
-    auto b2lo = EM3EN4_PAIR_LO(b2p); auto b3lo = EM3EN4_PAIR_LO(b3p);
-    auto a0hi = EM3EN4_PAIR_HI(a0p); auto a1hi = EM3EN4_PAIR_HI(a1p); auto a2hi = EM3EN4_PAIR_HI(a2p);
-    auto b0hi = EM3EN4_PAIR_HI(b0p); auto b1hi = EM3EN4_PAIR_HI(b1p);
-    auto b2hi = EM3EN4_PAIR_HI(b2p); auto b3hi = EM3EN4_PAIR_HI(b3p);
+    auto a0lo = em3en4_pair_lo(a0p); auto a1lo = em3en4_pair_lo(a1p); auto a2lo = em3en4_pair_lo(a2p);
+    auto b0lo = em3en4_pair_lo(b0p); auto b1lo = em3en4_pair_lo(b1p);
+    auto b2lo = em3en4_pair_lo(b2p); auto b3lo = em3en4_pair_lo(b3p);
+    auto a0hi = em3en4_pair_hi(a0p); auto a1hi = em3en4_pair_hi(a1p); auto a2hi = em3en4_pair_hi(a2p);
+    auto b0hi = em3en4_pair_hi(b0p); auto b1hi = em3en4_pair_hi(b1p);
+    auto b2hi = em3en4_pair_hi(b2p); auto b3hi = em3en4_pair_hi(b3p);
 
-    asm volatile(
-        "s_waitcnt lgkmcnt(3)\n"
-        "v_mfma_f32_16x16x16_bf16 %[c00], %[b0lo], %[a0lo], %[c00]\n"
-        "ds_read_b128 %[na0], %[abase] offset:%[a0_off]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c10], %[b0lo], %[a1lo], %[c10]\n"
-        "ds_read_b128 %[nb0], %[bbase] offset:%[b0_off]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c01], %[b1lo], %[a0lo], %[c01]\n"
-        "ds_read_b128 %[na1], %[abase] offset:%[a1_off]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c11], %[b1lo], %[a1lo], %[c11]\n"
-        "ds_read_b128 %[nb1], %[bbase] offset:%[b1_off]\n"
-        "s_waitcnt lgkmcnt(4)\n"
-        "v_mfma_f32_16x16x16_bf16 %[c20], %[b0lo], %[a2lo], %[c20]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c21], %[b1lo], %[a2lo], %[c21]\n"
-        "ds_read_b128 %[na2], %[abase] offset:%[a2_off]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c02], %[b2lo], %[a0lo], %[c02]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c12], %[b2lo], %[a1lo], %[c12]\n"
-        "ds_read_b128 %[nb2], %[bbase] offset:%[b2_off]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c22], %[b2lo], %[a2lo], %[c22]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c03], %[b3lo], %[a0lo], %[c03]\n"
-        "ds_read_b128 %[nb3], %[bbase] offset:%[b3_off]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c13], %[b3lo], %[a1lo], %[c13]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c23], %[b3lo], %[a2lo], %[c23]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c00], %[b0hi], %[a0hi], %[c00]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c10], %[b0hi], %[a1hi], %[c10]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c20], %[b0hi], %[a2hi], %[c20]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c01], %[b1hi], %[a0hi], %[c01]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c11], %[b1hi], %[a1hi], %[c11]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c21], %[b1hi], %[a2hi], %[c21]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c02], %[b2hi], %[a0hi], %[c02]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c12], %[b2hi], %[a1hi], %[c12]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c22], %[b2hi], %[a2hi], %[c22]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c03], %[b3hi], %[a0hi], %[c03]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c13], %[b3hi], %[a1hi], %[c13]\n"
-        "v_mfma_f32_16x16x16_bf16 %[c23], %[b3hi], %[a2hi], %[c23]\n"
-        : [na0]"=&v"(na0p), [na1]"=&v"(na1p), [na2]"=&v"(na2p),
-          [nb0]"=&v"(nb0p), [nb1]"=&v"(nb1p), [nb2]"=&v"(nb2p), [nb3]"=&v"(nb3p),
-          [c00]"+v"(acc[0]),  [c01]"+v"(acc[1]),
-          [c02]"+v"(acc[2]),  [c03]"+v"(acc[3]),
-          [c10]"+v"(acc[4]),  [c11]"+v"(acc[5]),
-          [c12]"+v"(acc[6]),  [c13]"+v"(acc[7]),
-          [c20]"+v"(acc[8]),  [c21]"+v"(acc[9]),
-          [c22]"+v"(acc[10]), [c23]"+v"(acc[11])
-        : [abase]"v"(abase), [bbase]"v"(bbase),
-          [a0lo]"v"(a0lo), [a1lo]"v"(a1lo), [a2lo]"v"(a2lo),
-          [b0lo]"v"(b0lo), [b1lo]"v"(b1lo), [b2lo]"v"(b2lo), [b3lo]"v"(b3lo),
-          [a0hi]"v"(a0hi), [a1hi]"v"(a1hi), [a2hi]"v"(a2hi),
-          [b0hi]"v"(b0hi), [b1hi]"v"(b1hi), [b2hi]"v"(b2hi), [b3hi]"v"(b3hi),
-          [a0_off]"n"(pair_offset),
-          [a1_off]"n"(a_wave_row_stride_bytes + pair_offset),
-          [a2_off]"n"(2 * a_wave_row_stride_bytes + pair_offset),
-          [b0_off]"n"(pair_offset),
-          [b1_off]"n"(b_wave_row_stride_bytes + pair_offset),
-          [b2_off]"n"(2 * b_wave_row_stride_bytes + pair_offset),
-          [b3_off]"n"(3 * b_wave_row_stride_bytes + pair_offset)
-        : "memory"
-    );
+    opus::s_waitcnt_lgkmcnt(opus::number<3>{});
+    em3en4_mfma(b0lo, a0lo, acc[0]);
+    __builtin_amdgcn_sched_barrier(0);
+    na0p = lds_read_i32x4_offset<pair_offset>(abase);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b0lo, a1lo, acc[4]);
+    __builtin_amdgcn_sched_barrier(0);
+    nb0p = lds_read_i32x4_offset<pair_offset>(bbase);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b1lo, a0lo, acc[1]);
+    __builtin_amdgcn_sched_barrier(0);
+    na1p = lds_read_i32x4_offset<a_wave_row_stride_bytes + pair_offset>(abase);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b1lo, a1lo, acc[5]);
+    __builtin_amdgcn_sched_barrier(0);
+    nb1p = lds_read_i32x4_offset<b_wave_row_stride_bytes + pair_offset>(bbase);
+    __builtin_amdgcn_sched_barrier(0);
+    opus::s_waitcnt_lgkmcnt(opus::number<4>{});
+    em3en4_mfma(b0lo, a2lo, acc[8]);
+    em3en4_mfma(b1lo, a2lo, acc[9]);
+    __builtin_amdgcn_sched_barrier(0);
+    na2p = lds_read_i32x4_offset<2 * a_wave_row_stride_bytes + pair_offset>(abase);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b2lo, a0lo, acc[2]);
+    em3en4_mfma(b2lo, a1lo, acc[6]);
+    __builtin_amdgcn_sched_barrier(0);
+    nb2p = lds_read_i32x4_offset<2 * b_wave_row_stride_bytes + pair_offset>(bbase);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b2lo, a2lo, acc[10]);
+    em3en4_mfma(b3lo, a0lo, acc[3]);
+    __builtin_amdgcn_sched_barrier(0);
+    nb3p = lds_read_i32x4_offset<3 * b_wave_row_stride_bytes + pair_offset>(bbase);
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b3lo, a1lo, acc[7]);  em3en4_mfma(b3lo, a2lo, acc[11]);
+    em3en4_mfma(b0hi, a0hi, acc[0]);  em3en4_mfma(b0hi, a1hi, acc[4]);
+    em3en4_mfma(b0hi, a2hi, acc[8]);  em3en4_mfma(b1hi, a0hi, acc[1]);
+    em3en4_mfma(b1hi, a1hi, acc[5]);  em3en4_mfma(b1hi, a2hi, acc[9]);
+    em3en4_mfma(b2hi, a0hi, acc[2]);  em3en4_mfma(b2hi, a1hi, acc[6]);
+    em3en4_mfma(b2hi, a2hi, acc[10]); em3en4_mfma(b3hi, a0hi, acc[3]);
+    em3en4_mfma(b3hi, a1hi, acc[7]);  em3en4_mfma(b3hi, a2hi, acc[11]);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // Half-pair 2-mfma drain while PGR2 stores run.
@@ -358,17 +326,14 @@ OPUS_D inline void em3en4_half_2mfma(
 {
     short4_ab b0, b1, a0;
     if constexpr (HI) {
-        b0 = EM3EN4_PAIR_HI(bop0); b1 = EM3EN4_PAIR_HI(bop1); a0 = EM3EN4_PAIR_HI(aop);
+        b0 = em3en4_pair_hi(bop0); b1 = em3en4_pair_hi(bop1); a0 = em3en4_pair_hi(aop);
     } else {
-        b0 = EM3EN4_PAIR_LO(bop0); b1 = EM3EN4_PAIR_LO(bop1); a0 = EM3EN4_PAIR_LO(aop);
+        b0 = em3en4_pair_lo(bop0); b1 = em3en4_pair_lo(bop1); a0 = em3en4_pair_lo(aop);
     }
-    asm volatile(
-        "v_mfma_f32_16x16x16_bf16 %[clo], %[b0], %[a0], %[clo]\n"
-        "v_mfma_f32_16x16x16_bf16 %[chi], %[b1], %[a0], %[chi]\n"
-        : [clo]"+v"(acc[AC_LO]), [chi]"+v"(acc[AC_HI])
-        : [b0]"v"(b0), [b1]"v"(b1), [a0]"v"(a0)
-        : "memory"
-    );
+    __builtin_amdgcn_sched_barrier(0);
+    em3en4_mfma(b0, a0, acc[AC_LO]);
+    em3en4_mfma(b1, a0, acc[AC_HI]);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 // pgr2 store + reload chunk: waits vmem with HAS_FUTURE-aware drain count.
@@ -394,7 +359,7 @@ OPUS_D inline void em3en4_finish_last_pair_with_pgr2_chunks(
     GA& g_a, GB& g_b, int future_tile, int tid, int stride_a, int stride_b)
 {
     s_waitcnt_lgkmcnt(0_I);
-    __builtin_amdgcn_s_barrier();  // pre-overwrite barrier (toggle was always true)
+    __builtin_amdgcn_s_barrier();
 
     em3en4_pgr2_store_reload_chunk<T, 0, HAS_FUTURE, 13, SA, GA, T::VEC_A>(s_a, g_a, pfa.c0, future_tile, tid, stride_a);
     em3en4_half_2mfma<false, 2, 3>(b2p, b3p, a0p, acc);
@@ -422,7 +387,6 @@ OPUS_D inline void em3en4_finish_last_pair_with_pgr2_chunks(
     em3en4_pgr2_store_reload_chunk<T, 7, HAS_FUTURE,  0, SB, GB, T::VEC_B>(s_b, g_b, pfb.c7, future_tile, tid, stride_b);
 
     s_waitcnt_lgkmcnt(0_I);
-    // post-refill barrier toggle was always false; omitted.
 }
 
 // Compute K-tile (3 pair-and-prefetch + 1 lo-head + finish_last_pair_with_pgr2_chunks).
