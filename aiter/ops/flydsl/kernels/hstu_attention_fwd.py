@@ -34,13 +34,11 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
     decode_lane,
@@ -289,12 +287,10 @@ def build_hstu_attention_fwd(
     stride_qk_n = num_heads * head_dim
 
     K_STRIDE = HEAD_DIM_K  # no PAD_K - XOR swizzle replaces it; 64-aligned so the swizzle stays in-row
-    k_lds_bytes = BLOCK_N * K_STRIDE * 2
 
     # V LDS: row-major V[kv, d], no row pad. The contiguous lane scatter matches the
     # natural global layout.
     V_STRIDE = hidden_dim
-    v_lds_bytes = BLOCK_N * V_STRIDE * 2
 
     # K DMA tiling (dword passes).
     k_tile_elems = BLOCK_N * K_STRIDE
@@ -319,13 +315,13 @@ def build_hstu_attention_fwd(
     NUM_BATCHES_V = max(1, BLOCK_N // ROWS_PER_BATCH_V)
     V_NEEDS_GUARD = ROWS_PER_BATCH_V > BLOCK_N
 
-    allocator = SmemAllocator(None, global_sym_name="hstu_attention_fwd_smem")
-    k_lds_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = k_lds_offset + k_lds_bytes
-    v_lds_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = v_lds_offset + v_lds_bytes
     # LDS map: [K row-major tile][V row-major tile]. K is XOR-swizzled by column; V stays
-    # natural [kv, d] so GEMM2 consumes it as operand B without a transpose scatter.
+    # natural [kv, d] so GEMM2 consumes it as operand B without a transpose scatter. Each field is
+    # a 16B-aligned fx.Array; SharedAllocator sizes the LDS global (no manual finalize/get_base).
+    @fx.struct
+    class SharedStorage:
+        k: fx.Array[elem_dtype, BLOCK_N * K_STRIDE, 16]
+        v: fx.Array[elem_dtype, BLOCK_N * V_STRIDE, 16]
 
     # ---- Device Kernel ----
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -340,7 +336,6 @@ def build_hstu_attention_fwd(
         elem_type = elem_dtype.ir_type
         compute_type = fx.Float32.ir_type
         v4f32_type = Vec.make_type(MFMA_ELEMS_PER_LANE, fx.Float32)
-        mfma_pack_type = Vec.make_type(MFMA_LANE_K, elem_dtype)
         c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
         # ---- MMA atom (layout algebra): one 16x16x16 f16/bf16 accumulate ----
@@ -396,10 +391,17 @@ def build_hstu_attention_fwd(
         # (row, col) with the stride carried by the memref layout (no manual row*stride+col). The
         # buffer is still contiguous row-major (K_STRIDE has no pad, V unpadded), so the DMA base
         # extraction and contiguous buffer_load_lds fetch order are preserved.
-        lds_base = allocator.get_base()
-        k_smem = SmemPtr(lds_base, k_lds_offset, elem_type, shape=(BLOCK_N, K_STRIDE))
-        v_smem = SmemPtr(lds_base, v_lds_offset, elem_type, shape=(BLOCK_N, V_STRIDE))
-        k_lds_byte_base = buffer_ops.extract_base_index(k_smem.get(), address_space=3)
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        # Shape-carried LDS views. Grouped by the access vector width (K packs MFMA_LANE_K, V publish
+        # VEC_V) so a load/store is view[row, colgrp, None].load()/.store(); the trailing group axis
+        # carries the stride (no manual row*stride+col). V reads gather single [kv, d] scalars.
+        k_read_view = lds.k.view(
+            fx.make_layout((BLOCK_N, K_STRIDE // MFMA_LANE_K, MFMA_LANE_K), (K_STRIDE, MFMA_LANE_K, 1))
+        )
+        # One V view (grouped by VEC_V) serves both the coalesced publish store and the scalar GEMM2
+        # gather, so only a single LDS base pointer stays live (register-pressure sensitive).
+        v_view = lds.v.view(fx.make_layout((BLOCK_N, V_STRIDE // VEC_V, VEC_V), (V_STRIDE, VEC_V, 1)))
+        k_lds_byte_base = buffer_ops.extract_base_index(k_read_view, address_space=3)
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
         # A BufferCopyLDS atom drives the buffer_load_lds instruction through the FlyDSL copy-atom.
@@ -591,7 +593,7 @@ def build_hstu_attention_fwd(
             """Write prefetched V vecs to LDS row-major V[kv, d] (the GEMM2 B layout), 2D-indexed."""
             for b in range_constexpr(NUM_BATCHES_V):
                 row = v_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_V)
-                Vec.store(Vec(vecs[b]), v_smem.get(), [fx.Index(row), fx.Index(v_load_col)])
+                v_view[row, v_load_col // fx.Int32(VEC_V), None].store(Vec(vecs[b]))
 
         # ==== GEMM1: Q·K^T -> P (P fragment already in GEMM2 A-operand layout) ====
         def read_k_packs(ng):
@@ -600,9 +602,9 @@ def build_hstu_attention_fwd(
             packs = []
             for ks in range_constexpr(K_STEPS_K):
                 k_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                packs.append(
-                    Vec.load(mfma_pack_type, k_smem.get(), [fx.Index(k_row), fx.Index(k_swz_col(k_row, k_col))])
-                )
+                # swz_col is MFMA_LANE_K-aligned (k_col and the swizzle shift are both >= that
+                # granularity), so //MFMA_LANE_K selects the packed-vector group.
+                packs.append(k_read_view[k_row, k_swz_col(k_row, k_col) // fx.Int32(MFMA_LANE_K), None].load())
             return packs
 
         def compute_p_tile(kv_start, k_packs_by_ng):
@@ -651,17 +653,12 @@ def build_hstu_attention_fwd(
                 for ng in range_constexpr(KV_SUBTILES):
                     d_col = fx.Int32(c * MFMA_M) + lane_mod_16  # d index (N of GEMM2)
                     kv_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)  # base kv
-                    # b[i] = V[kv_lane + i, d_col]; 2D-indexed on the LDS view V[kv, d].
-                    elems = []
-                    for i in range_constexpr(MFMA_LANE_K):
-                        elems.append(
-                            Vec.load(
-                                Vec.make_type(1, elem_dtype),
-                                v_smem.get(),
-                                [fx.Index(kv_lane + fx.Int32(i)), fx.Index(d_col)],
-                            )
-                        )
-                    v_packs.append(Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value())
+                    # b[i] = V[kv_lane + i, d_col]; scalar-gathered from the VEC_V-grouped V view
+                    # (col d_col -> group d_col//VEC_V, lane d_col%VEC_V).
+                    d_grp = d_col // fx.Int32(VEC_V)
+                    d_lane = d_col % fx.Int32(VEC_V)
+                    elems = [v_view[kv_lane + fx.Int32(i), d_grp, d_lane] for i in range_constexpr(MFMA_LANE_K)]
+                    v_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
                 for qg in range_constexpr(Q_SUBTILES):
                     acc_off = c * Q_SUBTILES + qg
                     cur = o_acc[acc_off]
@@ -689,7 +686,7 @@ def build_hstu_attention_fwd(
             rocdl.sched_dswr(NUM_BATCHES_V)  # keep the NUM_BATCHES_V V LDS writes grouped
             gpu.barrier()  # V[i] LDS published
             o_acc = accum_o_tile(o_acc, p_packs)  # GEMM2(i): O += P·V
-            # The next iteration's K publish barrier also fences GEMM2(i)'s v_smem reads before
+            # The next iteration's K publish barrier also fences GEMM2(i)'s V LDS reads before
             # store_v(i+1).
             return o_acc
 
@@ -737,11 +734,6 @@ def build_hstu_attention_fwd(
         out: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         grid = num_q_tiles * batch * num_heads
         hstu_attention_fwd(
             q,
