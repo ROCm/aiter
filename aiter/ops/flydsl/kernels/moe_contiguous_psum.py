@@ -12,7 +12,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
+from flydsl.expr.arith import ArithValue, CmpIPredicate, CmpFPredicate, _to_raw as _raw
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
@@ -563,3 +563,142 @@ def build_moe_route_psum_fused_module():
     }
 
     return launch_route_psum_fused
+
+
+def build_moe_ep_rowmap_module():
+    """JIT launcher: build the gemm2-fused EP row->dest/weight map (ep_rowmap).
+
+    Replaces the ~20 per-layer torch ops that used to build ep_rowmap on the host.
+    Single block, grid-stride. Phase 1 inits ep_rowmap[0:cap_rows] to (-1, 0).
+    Phase 2 scatters, for each valid LOCAL route (gather_w != 0), the packed dest
+    (origin_pe*slot_stride + origin_lid*topk + k) + f32-weight-bits into
+    ep_rowmap[final_row]. Remote experts (gather_w == 0, route kernel zeroed them)
+    and dead-tail routes (route >= num_valid_routes) stay at the -1 sentinel so the
+    gemm2 P2P epilogue skips them.
+
+    ep_rowmap is a flat (cap_rows+1, 2) i32 tensor: [2*row]=dst_packed,
+    [2*row+1]=f32 weight bits. tis[t] encodes origin = origin_pe*max_tok+origin_lid
+    (t = route // topk, k = route % topk).
+    """
+
+    @flyc.kernel(
+        name="moe_build_ep_rowmap",
+        known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
+    )
+    def ep_rowmap_kernel(
+        topids_to_rows: fx.Pointer,  # (numel,) i32 final rows
+        gather_w: fx.Pointer,        # (numel,) bf16 weights (0 for dropped)
+        tis: fx.Pointer,             # (recv_cap,) i32 recv_slot -> origin enc
+        ep_rowmap: fx.Pointer,       # (cap_rows+1, 2) i32 flat out
+        num_valid_routes: fx.Pointer,  # (1,) i32
+        cap_rows: Int32,
+        topk: Int32,
+        max_tok: Int32,
+        slot_stride: Int32,
+    ):
+        i32 = T.i32
+        tid = ArithValue(fx.thread_idx.x)
+        neg1 = arith.constant(-1, type=i32)
+        zero = arith.constant(0, type=i32)
+        one = arith.constant(1, type=i32)
+        two = arith.constant(2, type=i32)
+
+        rows_rsrc = ptr_rsrc(topids_to_rows)
+        w_rsrc = ptr_rsrc(gather_w)
+        tis_rsrc = ptr_rsrc(tis)
+        ep_rsrc = ptr_rsrc(ep_rowmap)
+
+        tid_idx = arith.index_cast(T.index, tid)
+        stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
+
+        # Phase 1: init ep_rowmap[0:cap_rows] = (-1, 0)
+        cap_idx = arith.index_cast(T.index, ArithValue(cap_rows))
+        init_loop = scf.ForOp(tid_idx, cap_idx, stride_idx)
+        with ir.InsertionPoint(init_loop.body):
+            row_i32 = arith.index_cast(i32, init_loop.induction_variable)
+            base = ArithValue(row_i32) * ArithValue(two)
+            buffer_ops.buffer_store(neg1, ep_rsrc, _raw(base))
+            buffer_ops.buffer_store(
+                zero, ep_rsrc, _raw(base + ArithValue(one))
+            )
+            scf.YieldOp([])
+
+        gpu.barrier()
+
+        # Phase 2: scatter valid local routes ([0, nvr), gather_w != 0)
+        nvr = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes), zero, vec_width=1, dtype=i32
+            )
+        )
+        nvr_idx = arith.index_cast(T.index, nvr)
+        topk_v = ArithValue(topk)
+        max_tok_v = ArithValue(max_tok)
+        slot_stride_v = ArithValue(slot_stride)
+        scat_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
+        with ir.InsertionPoint(scat_loop.body):
+            route = ArithValue(arith.index_cast(i32, scat_loop.induction_variable))
+            w_bf = buffer_ops.buffer_load(w_rsrc, _raw(route), vec_width=1, dtype=T.bf16)
+            w_f32 = ArithValue(w_bf).extf(T.f32)
+            is_kept = arith.cmpf(
+                CmpFPredicate.ONE, _raw(w_f32), arith.constant(0.0, type=T.f32)
+            )
+            kept_if = scf.IfOp(is_kept)
+            with ir.InsertionPoint(kept_if.then_block):
+                row = ArithValue(
+                    buffer_ops.buffer_load(rows_rsrc, _raw(route), vec_width=1, dtype=i32)
+                )
+                t = ArithValue(arith.divui(_raw(route), _raw(topk_v)))
+                k = route - t * topk_v
+                enc = ArithValue(
+                    buffer_ops.buffer_load(tis_rsrc, _raw(t), vec_width=1, dtype=i32)
+                )
+                origin_pe = ArithValue(arith.divui(_raw(enc), _raw(max_tok_v)))
+                origin_lid = enc - origin_pe * max_tok_v
+                packed = origin_pe * slot_stride_v + origin_lid * topk_v + k
+                w_bits = ArithValue(w_f32).bitcast(T.i32)
+                base = row * ArithValue(two)
+                buffer_ops.buffer_store(_raw(packed), ep_rsrc, _raw(base))
+                buffer_ops.buffer_store(
+                    _raw(w_bits), ep_rsrc, _raw(base + ArithValue(one))
+                )
+                scf.YieldOp([])
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_ep_rowmap(
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        tis: fx.Pointer,
+        ep_rowmap: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        cap_rows: fx.Int32,
+        topk: fx.Int32,
+        max_tok: fx.Int32,
+        slot_stride: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ep_rowmap_kernel(
+            topids_to_rows,
+            gather_w,
+            tis,
+            ep_rowmap,
+            num_valid_routes,
+            cap_rows,
+            topk,
+            max_tok,
+            slot_stride,
+        ).launch(
+            grid=(arith.index(1), 1, 1),
+            block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
+            stream=stream,
+        )
+
+    launch_ep_rowmap.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+
+    return launch_ep_rowmap
