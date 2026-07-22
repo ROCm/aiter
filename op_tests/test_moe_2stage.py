@@ -517,7 +517,7 @@ def test_fmoe(
     err = checkAllclose(
         out2_ref,
         out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token * model_dim * inter_dim * 3 * topk * 2 / us2 / 1000 / 1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
     def calc_diff(x: torch.Tensor, y: torch.Tensor):
@@ -535,7 +535,7 @@ def test_fmoe(
         assert not has_nan, "accuracy check failed: output contains NaN"
         assert not (
             err != 0 and logits_diff > 0.01
-        ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+        ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"  # fmt: skip
     elif has_nan:
         logger.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
@@ -886,10 +886,13 @@ def _iter_csv_cases():
         # configs have no pre-registered AOT cache entry).
         kwargs["check_aot_cache"] = args.csv_filter is None
         kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
-        yield kwargs, {
-            "kernelName1": kernel_name1,
-            "kernelName2": kernel_name2,
-        }
+        yield (
+            kwargs,
+            {
+                "kernelName1": kernel_name1,
+                "kernelName2": kernel_name2,
+            },
+        )
 
 
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
@@ -998,7 +1001,69 @@ def _iter_legacy_cases():
         if triple == _PER1X32_BF16_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
-                    yield _kw(
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            aiter.ActivationType.Swiglu,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ),
+                        extras,
+                    )
+        elif triple == _PER1X32_FP8_FP4:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield (
+                            _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                act_type,
+                                hidden_pad=hidden_pad,
+                                intermediate_pad=intermediate_pad,
+                                **_situv2_beta_kwargs(act_type),
+                            ),
+                            extras,
+                        )
+        elif triple == _PER1X32_FP4_FP4:
+            for preshuffle in args.preshuffle:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield (
+                            _kw(
+                                dtype,
+                                m,
+                                model_dim,
+                                inter_dim,
+                                quant_type,
+                                aq_dtype,
+                                wq_dtype,
+                                doweight_stage1,
+                                act_type,
+                                preshuffle=preshuffle,
+                                hidden_pad=0,
+                                intermediate_pad=0,
+                                **_situv2_beta_kwargs(act_type),
+                            ),
+                            extras,
+                        )
+        elif triple == _PER1X32_BF16_I4:
+            for m in args.tokenNum:
+                yield (
+                    _kw(
                         dtype,
                         m,
                         model_dim,
@@ -1007,60 +1072,10 @@ def _iter_legacy_cases():
                         aq_dtype,
                         wq_dtype,
                         doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
-        elif triple == _PER1X32_FP8_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-                for act_type in args.act:
-                    for m in args.tokenNum:
-                        yield _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            hidden_pad=hidden_pad,
-                            intermediate_pad=intermediate_pad,
-                            **_situv2_beta_kwargs(act_type),
-                        ), extras
-        elif triple == _PER1X32_FP4_FP4:
-            for preshuffle in args.preshuffle:
-                for act_type in args.act:
-                    for m in args.tokenNum:
-                        yield _kw(
-                            dtype,
-                            m,
-                            model_dim,
-                            inter_dim,
-                            quant_type,
-                            aq_dtype,
-                            wq_dtype,
-                            doweight_stage1,
-                            act_type,
-                            preshuffle=preshuffle,
-                            hidden_pad=0,
-                            intermediate_pad=0,
-                            **_situv2_beta_kwargs(act_type),
-                        ), extras
-        elif triple == _PER1X32_BF16_I4:
-            for m in args.tokenNum:
-                yield _kw(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    doweight_stage1,
-                    aiter.ActivationType.Silu,
-                ), extras
+                        aiter.ActivationType.Silu,
+                    ),
+                    extras,
+                )
         else:
             for act_type in args.act:
                 # SiTUv2 only routes to FlyDSL on per_1x32 + fp4/fp8; skip it for
@@ -1071,18 +1086,21 @@ def _iter_legacy_cases():
                 ):
                     continue
                 for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        act_type,
-                        **_situv2_beta_kwargs(act_type),
-                    ), extras
+                    yield (
+                        _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            **_situv2_beta_kwargs(act_type),
+                        ),
+                        extras,
+                    )
 
 
 def _iter_situv2_default_cases():
@@ -1177,6 +1195,15 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
+    stage1_plan_opt_in = os.environ.get(
+        "AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN", "0"
+    ) == "1" and str(extras.get("kernelName1", "")).startswith("flydsl_")
+    if stage1_plan_opt_in:
+        from aiter.ops.flydsl.moe_kernels import (
+            get_stage1_compile_plan_resolution_count,
+        )
+
+        plan_count_before = get_stage1_compile_plan_resolution_count()
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -1204,6 +1231,13 @@ for kwargs, extras in case_iter:
         torch.cuda.empty_cache()
     if ret is None:
         continue
+    if stage1_plan_opt_in:
+        plan_count_after = get_stage1_compile_plan_resolution_count()
+        assert plan_count_after > plan_count_before, (
+            "AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN=1 did not reach the "
+            "Stage1 CompilePlan runtime branch"
+        )
+        ret["stage1_compile_plan"] = True
     ret.update(extras)
     df.append(ret)
     _write_bench_csv(df)
