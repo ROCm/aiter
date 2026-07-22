@@ -79,6 +79,7 @@ KernelName = Literal[
     "aiter_f6f4",
     "aiter_f6f4_pv",
     "aiter_f8f4",
+    "aiter_f4f4",
     "aiter_bf16",
 ]
 
@@ -103,6 +104,7 @@ QUANT_KERNELS = {
     "aiter_f6f4",
     "aiter_f6f4_pv",
     "aiter_f8f4",
+    "aiter_f4f4",
 }
 
 
@@ -1220,7 +1222,15 @@ def make_kernel_runner(
             v_descale=v_descale,
         )
 
-    if args.kernel == "aiter_mxfp4":
+    if args.kernel in ("aiter_mxfp4", "aiter_f4f4"):
+        # aiter_f4f4 (fp4 Q/K + fp4 V, own .co) shares the mxfp4 input path; AITER_FMHA_F4F4=1
+        # redirects the mxfp4 slot to fwd_hd128_f4f4.co (baseline copy of mxfp4, then the exp /
+        # V-fp4 experiments). Baseline + the v_cvt_pk_u8 exp keep mxfp4's fp8 V; V-fp4 is a later step.
+        if args.kernel == "aiter_f4f4":
+            os.environ["AITER_FMHA_F4F4"] = "1"
+            os.environ.setdefault("AITER_MXFP4_V", "0")  # f4f4 kernel is PLAIN per-channel fp4-V (no E8M0)
+        else:
+            os.environ.pop("AITER_FMHA_F4F4", None)
         # Drive flash_attn_mxfp4_func with mxfp4 inputs from sage_quant_mxfp4 (the
         # same quantizer fav3_sage_mxfp4 uses): q/k are uint8-packed fp4 (head dim
         # 128 -> 64) with per-block E8M0 descales (head_dim/32), v is fp8 with
@@ -1273,9 +1283,18 @@ def make_kernel_runner(
             else None
         )
 
+        # f4f4: keep mxfp4's fp4 Q/K but re-pack V as per-channel fp4 (E2M1) like f6f4/f8f4, so the
+        # PV MMA is fp4 V x fp8 P. The fwd_hd128_f4f4.co (redirected via AITER_FMHA_F4F4) reads V via
+        # ds_read_b64_tr_b4 + a per-channel V descale in the epilogue.
+        _f4f4_vpacker = (
+            _build_fp4_v_packer(q_bshd.device) if args.kernel == "aiter_f4f4" else None
+        )
+
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
             if _fp4_kcoal_packer is not None:
                 k_fp4 = _fp4_kcoal_packer(k_fp4)
+            if _f4f4_vpacker is not None:
+                v_fp8, v_descale = _f4f4_vpacker(v_bshd)  # replace fp8 V with per-channel fp4 V
             return flash_attn_mxfp4_func(
                 q_fp4,
                 k_fp4,
@@ -1308,14 +1327,20 @@ def make_kernel_runner(
             # fp4-P kernel reads V via a plain ds_read_b128 (no tr_b4), so its V packer must emit the
             # DIRECT operand image, and V's kv order must match P's fp4 B-operand kv layout. The
             # aligning permutation (learned via the V=identity kv-layout probe: bit0<->bit3 swap of
-            # the group-of-4 index applied to meas) is 'measmu'. Defaults here; explicit env overrides.
+            # the group-of-4 index applied to meas) is 'measmu'. It uses per-block MX-V E8M0.
+            # Defaults here; explicit env overrides.
             os.environ.setdefault("AITER_VFP4_LAYOUT", "direct")
             os.environ.setdefault("AITER_VFP4_KPERM", "measmu")
+            os.environ.setdefault("AITER_MXFP4_V", "1")     # pv needs the per-block E8M0 image
         else:
             os.environ.pop("AITER_FMHA_F6F4_PV", None)  # don't leak into f6f4/mxfp6 (e.g. --kernel all)
             os.environ.pop("AITER_VFP4_LAYOUT", None)  # direct layout is pv-only
             if os.environ.get("AITER_VFP4_KPERM") == "measmu":
                 os.environ.pop("AITER_VFP4_KPERM")  # measmu is pv-only
+            if args.kernel == "aiter_f6f4":
+                # f6f4 is the PLAIN per-channel fp4-V baseline (MX-V lives only on the pv path). Feed
+                # the plain packer (no E8M0 image); the block-normalized MX codes would mismatch it.
+                os.environ.setdefault("AITER_MXFP4_V", "0")
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
@@ -2141,6 +2166,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_f6f4",
             "aiter_f6f4_pv",
             "aiter_f8f4",
+            "aiter_f4f4",
             "aiter_bf16",
             "all",
         ],
