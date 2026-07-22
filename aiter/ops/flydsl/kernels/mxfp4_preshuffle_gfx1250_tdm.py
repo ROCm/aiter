@@ -309,7 +309,7 @@ def launch_gemm_a8w4_tdm(
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
+        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl):
             act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
                 act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
@@ -317,21 +317,20 @@ def launch_gemm_a8w4_tdm(
             else:
                 rocdl.s_wait_dscnt(0)
             mma_rows(FRONT, act_f, wt, sa_k, sb_k)
-            if const_expr(prefetch_kt is not None):
-                rocdl.sched_barrier(0)
-                issue(prefetch_kt % num_buffers, prefetch_kt)
-                rocdl.sched_barrier(0)
             if const_expr(len(BACK) > 0):
                 rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
             return load_b_and_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
 
         def compute_ktile(buf, prefetch_kt):
+            if const_expr(prefetch_kt is not None):
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % num_buffers, prefetch_kt)
+                rocdl.sched_barrier(0)
             prev = load_b_and_scales(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                pk = prefetch_kt if const_expr(ksl == 0) else None
-                prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, prefetch_kt=pk)
+                prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl)
             fr, bk = front_wm * wmma_n_rep, len(BACK) * wmma_n_rep
             for ks in range_constexpr(KWS):
                 rocdl.sched_dsrd((BS_DS if ks == 0 else 0) + front_wm * DS_A)
