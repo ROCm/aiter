@@ -1372,7 +1372,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
                         stream,
-                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1389,7 +1388,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
                         stream,
-                        _swiglu_lim_rt,
                     )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1457,7 +1455,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
                         stream,
-                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1475,7 +1472,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
                         stream,
-                        _swiglu_lim_rt,
                     )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1539,7 +1535,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
                         stream,
-                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1557,7 +1552,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         2 * cfg.inter_dim,
                         _swiglu_lim_rt,
                         stream,
-                        _swiglu_lim_rt,
                     )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
