@@ -290,8 +290,6 @@ def _moe_gemm_a16w4(
 
     #W pointers
     W_base = W + expt_id * stride_w_e
-    # Wrap along N so a block extending past N (BLOCK_N need not divide N) does
-    # not read out of bounds; the extra columns are masked out at store time.
     offs_w_n = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(0, LOAD_LAYOUT_W))) % (N // W_N_DIVISOR)
     offs_w_n = tl.max_contiguous(
         tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),

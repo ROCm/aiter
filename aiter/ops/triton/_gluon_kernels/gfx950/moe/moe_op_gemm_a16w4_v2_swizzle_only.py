@@ -256,7 +256,6 @@ def _moe_gemm_a16w4(
     # TTGIR shared layouts: #shared2 (X), #shared (W, K-major), #shared1 (scale).
     SHARED_LAYOUT_X: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 8, order=[0, 1])  # vec=16 matches async 128-bit i8 write
-    #SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(4, 2, 8, order=[0, 1])  # vec=16 matches async 128-bit i8 write
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     # N-major consume layout for the scale local_load before unswizzle/broadcast.
 

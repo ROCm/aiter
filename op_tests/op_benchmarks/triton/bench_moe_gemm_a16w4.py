@@ -182,11 +182,12 @@ def bench_mlp_single_weight_init(
     wg = torch.randn((dim1, n_expts_tot), device=dev)
     w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
     w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+
     # biases
     bg = torch.randn((n_expts_tot,), device=dev)
     b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
     b2 = torch.randn((n_expts_tot, dim1), device=dev)
-    #print(f"w1.shape={w1.shape}, w2.shape={w2.shape} ")
+
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
@@ -197,17 +198,13 @@ def bench_mlp_single_weight_init(
     w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
-    #print(f"After swizzle w1_scale.shape={w1_scale.shape}, w2_scale.shape={w2_scale.shape} ")
 
     # -- benchmark --
     x_dtype_torch = torch.bfloat16 if x_dtype == "bf16" else torch.float16
 
     reps = 100
-    #reps = 1
     x = torch.randn((batch, dim1), dtype=x_dtype_torch, device=dev)
     xg = x
-
-    #print(f"x.shape={x.shape}")
 
     # run layer
     fpath = Path(tempfile.mktemp())
@@ -230,7 +227,6 @@ def bench_mlp_single_weight_init(
             apply_swiglu=True,
             backend=backend
         )
-        #print(f"Loop Post First MoE x.shape={x.shape}")
         x = moe_gemm_a16w4(
             x,
             w2,
@@ -246,7 +242,6 @@ def bench_mlp_single_weight_init(
             apply_swiglu=False,
             backend=backend
         )
-        #print(f"Loop Post 2nd MoE x.shape={x.shape}")
 
     proton.finalize()
     return parse_profile(

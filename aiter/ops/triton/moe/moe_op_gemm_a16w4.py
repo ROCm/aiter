@@ -205,7 +205,7 @@ def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
         block_n = 128
         num_warps = 4
         tile_per_warp = [1,1]
-        matrix_instr_nonkdim = 16
+        matrix_instr_nonkdim = 32
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -224,11 +224,11 @@ def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
         elif n <= 4096:
             tile_per_warp = [1,2]
             block_n = 256
-            num_warps = 8
+            num_warps = 4
         else:
             tile_per_warp = [1,2]
             block_n = 256
-            num_warps = 8
+            num_warps = 4
 
     else:
         tile_per_warp = [2,2]
@@ -246,7 +246,7 @@ def get_gluon_kernel_config_v2_swizzle(m, n, k, routing_data):
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
+        "matrix_instr_nonkdim": matrix_instr_nonkdim,
         "kpack": 1,
         "tile_per_warp0" : tile_per_warp[0],
         "tile_per_warp1" : tile_per_warp[1]
@@ -292,7 +292,7 @@ def get_gluon_kernel_config_v1_swizzle(m, n, k, routing_data):
         else:
             tile_per_warp = [1,2]
             block_n = 256
-            num_warps =4
+            num_warps = 4
 
     else:
         tile_per_warp = [2,2]
@@ -364,9 +364,7 @@ def moe_gemm_a16w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
 
-    arch = get_arch()
-    use_gluon = True if arch in ("gfx1250", "gfx950") and backend in[None, "gluon"] else False
-    #print(f"use_gluon={use_gluon}")
+
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"
@@ -382,12 +380,17 @@ def moe_gemm_a16w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
 
+    arch = get_arch()
+    mask_k_limit =K % 256
+    use_gluon = (True if arch in ("gfx1250", "gfx950") and backend in[None, "gluon"]  and 
+                        mask_k_limit == 0 and swizzle_mx_scale is not None 
+                 else False)
+
     # compute optimization flags
     if use_gluon:
-        mask_k_limit =K % 256
-        use_v2  = True
-        #use_v2  = False 
-        if use_v2 and mask_k_limit == 0 and swizzle_mx_scale is not None:
+        #use_v2  = True
+        use_v2  = False 
+        if use_v2:
             #print(f"v2 swizzle kernel")
             config = get_gluon_kernel_config_v2_swizzle(M, N, K, routing_data)       
         else:
@@ -396,6 +399,7 @@ def moe_gemm_a16w4(
     else:
         #print(f"triton kernel")
         config = get_kernel_config(M, N, K, routing_data)
+
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -443,7 +447,7 @@ def moe_gemm_a16w4(
     # launch kernel
     
     if use_gluon:
-        if use_v2 and mask_k_limit == 0 and swizzle_mx_scale is not None:
+        if use_v2:
               _moe_gemm_a16w4_gluon_gfx950_v2_swizzle[grid,](
               y,
               y.stride(0),
