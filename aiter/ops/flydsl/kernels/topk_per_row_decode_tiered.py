@@ -65,6 +65,9 @@ from flydsl.expr.typing import T
 BLOCK_THREADS = 1024
 WARP_SIZE = 64
 LOAD_VEC = 4
+# log2(LOAD_VEC); LOAD_VEC must be a power of two. vec_blocks = ceil(row_len/LOAD_VEC)
+# is a right shift, so the shift amount must track LOAD_VEC, not a hardcoded width.
+LOAD_VEC_LOG2 = LOAD_VEC.bit_length() - 1
 # Default histogram-scan staging (one of 1/2/4/8)
 SCAN_STAGES = 2
 
@@ -162,8 +165,17 @@ def create_topk_per_row_decode_tiered_kernel(
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
     if scan_stages not in (1, 2, 4, 8):
         raise ValueError(f"scan_stages must be one of (1, 2, 4, 8), got {scan_stages}")
-    if not 2 <= blocks_per_row <= 32:
-        raise ValueError(f"blocks_per_row must be in [2, 32], got {blocks_per_row}")
+
+    # blocks_per_row == 1 collapses the launch to grid=(1, num_rows): every row runs
+    # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
+    # blocks hogging co-resident slots). Only valid when the short tier exists
+    # (auto/short + bpp==11); mid/long forced modes still need >=2 cooperating parts.
+    _min_blocks_per_row = 1 if (tier_mode in ("auto", "short") and bits_per_pass == 11) else 2
+    if not _min_blocks_per_row <= blocks_per_row <= 32:
+        raise ValueError(
+            f"blocks_per_row must be in [{_min_blocks_per_row}, 32], got {blocks_per_row}"
+        )
+
     if mid_cap < 2 or long_cap < 2:
         raise ValueError(f"mid_cap/long_cap must be >= 2, got {mid_cap}/{long_cap}")
     if mid_max < short_max:
@@ -705,7 +717,7 @@ def create_topk_per_row_decode_tiered_kernel(
         global_vec_tid_idx = arith.index_cast(T.index, global_vec_tid)
         vec_blocks_i32 = ArithValue(
             ArithValue(row_len) + ArithValue(c_vec) - ArithValue(c_one)
-        ).shrui(fx.Int32(2))
+        ).shrui(fx.Int32(LOAD_VEC_LOG2))
         vec_blocks_idx = arith.index_cast(T.index, vec_blocks_i32)
 
         def scan_pass(pass_id: int, current_k, current_bits, barrier_token: int):
