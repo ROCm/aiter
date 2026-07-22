@@ -2,8 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FlyDSL prefill causal-conv1d kernel with fused split q/k/v output."""
 
-from __future__ import annotations
-
 import functools
 
 import torch
@@ -11,14 +9,9 @@ import torch
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith, rocdl
-    from flydsl.expr.arith import CmpIPredicate
+    from flydsl.expr import arith
     from flydsl.expr.typing import T, Int32
-    from flydsl._mlir import ir
     from flydsl.expr import buffer_ops
-    from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.runtime.device import get_rocm_arch
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
     _FLYDSL_AVAILABLE = True
 except Exception:  # pragma: no cover - flydsl optional
@@ -60,18 +53,14 @@ def build_causal_conv1d_flydsl_module(
     LOG2_TM = TM.bit_length() - 1  # =6
     NLDS = TN * LDS_PAD
     STORE_PAD = TN + 1
-    LDS_BYTES = NLDS * 2  # bf16 staging
     HAS_BIAS = bool(has_bias)
     SILU = bool(silu)
 
-    arch = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=arch,
-        global_sym_name=f"causal_conv1d_w{W}_tm{TM}_{dtype_str}",
-    )
-    lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_off + LDS_BYTES
+    fx_elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
+
+    @fx.struct
+    class SharedStorage:
+        lds: fx.Array[fx_elem_dtype, NLDS, 16]
 
     @flyc.kernel
     def conv1d_kernel(
@@ -105,50 +94,9 @@ def build_causal_conv1d_flydsl_module(
         vs0: Int32,
         vs1: Int32,
     ):
+        # dtype args for buffer_ops loads (MLIR types, not values)
         i32 = T.i32
         elem_dtype = T.bf16 if dtype_str == "bf16" else T.f16
-
-        def _v(x):
-            return x.ir_value() if hasattr(x, "ir_value") else x
-
-        dim = _v(dim)
-        kd = _v(kd)
-        vd = _v(vd)
-        sx0 = _v(sx0)
-        sx1 = _v(sx1)
-        sw0 = _v(sw0)
-        sw1 = _v(sw1)
-        scs0 = _v(scs0)
-        scs1 = _v(scs1)
-        scs2 = _v(scs2)
-        sci = _v(sci)
-        qs0 = _v(qs0)
-        qs1 = _v(qs1)
-        ks0 = _v(ks0)
-        ks1 = _v(ks1)
-        vs0 = _v(vs0)
-        vs1 = _v(vs1)
-
-        def c32(v):
-            return arith.constant(int(v), type=i32)
-
-        def cf(v):
-            return arith.constant(float(v), type=T.f32)
-
-        def to_i32(v):
-            return arith.index_cast(i32, v)
-
-        def mul(a, b):
-            return arith.muli(a, b)
-
-        def add(a, b):
-            return arith.addi(a, b)
-
-        def sub(a, b):
-            return arith.subi(a, b)
-
-        def f32(bf):
-            return arith.extf(T.f32, bf)
 
         def _rsrc(ptr):
             return buffer_ops.create_buffer_resource(ptr, max_size=True)
@@ -166,294 +114,263 @@ def build_causal_conv1d_flydsl_module(
         k_r = _rsrc(k_ptr)
         v_r = _rsrc(v_ptr)
 
-        lds = SmemPtr(allocator.get_base(), lds_off, elem_dtype, shape=(NLDS,))
-        lds.get()
+        lds_base = fx.SharedAllocator().allocate(SharedStorage).peek().lds.ptr
 
         def lds_st(val, idx):
-            lds.store(val, [idx])
+            fx.ptr_store(val, lds_base + fx.Int64(idx))
 
         def lds_ld(idx):
-            return lds.load([idx])
+            return fx.ptr_load(lds_base + fx.Int64(idx))
 
-        tid = to_i32(fx.thread_idx.x)
-        pid_x = to_i32(fx.block_idx.x)
-        pid_y = to_i32(fx.block_idx.y)
+        tid = fx.thread_idx.x
+        pid_x = fx.block_idx.x
+        pid_y = fx.block_idx.y
 
-        seq_idx = buffer_ops.buffer_load(batch_r, pid_x, vec_width=1, dtype=i32)
-        chunk_idx = buffer_ops.buffer_load(choff_r, pid_x, vec_width=1, dtype=i32)
-        seq_start = buffer_ops.buffer_load(qsl_r, seq_idx, vec_width=1, dtype=i32)
-        seq_end = buffer_ops.buffer_load(
-            qsl_r, add(seq_idx, c32(1)), vec_width=1, dtype=i32
+        seq_idx = fx.Int32(
+            buffer_ops.buffer_load(batch_r, pid_x, vec_width=1, dtype=i32)
         )
-        seqlen = sub(seq_end, seq_start)
+        chunk_idx = fx.Int32(
+            buffer_ops.buffer_load(choff_r, pid_x, vec_width=1, dtype=i32)
+        )
+        seq_start = fx.Int32(
+            buffer_ops.buffer_load(qsl_r, seq_idx, vec_width=1, dtype=i32)
+        )
+        seq_end = fx.Int32(
+            buffer_ops.buffer_load(qsl_r, seq_idx + 1, vec_width=1, dtype=i32)
+        )
+        seqlen = seq_end - seq_start
 
-        feat_start = mul(pid_y, c32(TN))
-        tok_start = mul(chunk_idx, c32(TM))
-        is_chunk0 = arith.cmpi(CmpIPredicate.eq, chunk_idx, c32(0))
+        feat_start = pid_y * TN
+        tok_start = chunk_idx * TM
+        is_chunk0 = chunk_idx == 0
 
-        feat_local = arith.shrui(tid, c32(2))
-        tok_group = arith.andi(tid, c32(3))
-        tok_base = mul(tok_group, c32(EPT))
-        gfeat = add(feat_start, feat_local)
-        feat_valid = arith.cmpi(CmpIPredicate.slt, gfeat, dim)
+        feat_local = tid >> 2
+        tok_group = tid & 3
+        tok_base = tok_group * EPT
+        gfeat = feat_start + feat_local
+        feat_valid = gfeat < dim
 
         # weights + bias (fp32)
-        w_base = mul(gfeat, sw0)
+        w_base = gfeat * sw0
         w_taps = []
         for j in fx.range_constexpr(W):
             w_taps.append(
-                f32(
+                fx.Float32(
                     buffer_ops.buffer_load(
                         w_r,
-                        add(w_base, mul(c32(j), sw1)),
+                        w_base + j * sw1,
                         vec_width=1,
                         dtype=elem_dtype,
                     )
                 )
             )
         if fx.const_expr(HAS_BIAS):
-            bias_f = f32(
+            bias_f = fx.Float32(
                 buffer_ops.buffer_load(b_r, gfeat, vec_width=1, dtype=elem_dtype)
             )
         else:
-            bias_f = cf(0.0)
+            bias_f = fx.Float32(0.0)
 
         # cooperative load into staging buffer
-        t_const = arith.andi(tid, c32(TM - 1))
-        f_base = arith.shrui(tid, c32(LOG2_TM))
-        hc = arith.shrui(tid, c32(6))
-        hf = arith.andi(tid, c32(63))
-        tok_gbase = add(sub(add(seq_start, tok_start), c32(KW - 1)), c32(0))
-        gt1 = add(tok_gbase, add(t_const, c32(KW - 1)))
+        t_const = tid & (TM - 1)
+        f_base = tid >> LOG2_TM
+        hc = tid >> 6
+        hf = tid & 63
+        tok_gbase = (seq_start + tok_start) - (KW - 1)
+        gt1 = tok_gbase + (t_const + (KW - 1))
 
-        all_feat = arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), dim)
-        all_tok1 = arith.cmpi(CmpIPredicate.slt, add(tok_start, c32(TM - 1)), seqlen)
-        all_tok2 = arith.cmpi(CmpIPredicate.sge, tok_start, c32(KW - 1))
-        fast = arith.andi(arith.andi(all_feat, all_tok1), all_tok2)
+        all_feat = (feat_start + TN) <= dim
+        all_tok1 = (tok_start + (TM - 1)) < seqlen
+        all_tok2 = tok_start >= (KW - 1)
+        fast = all_feat & all_tok1 & all_tok2
 
         if fast:
             # fast path: fully interior, coalesced, no bounds/state
-            cur = add(mul(add(feat_start, f_base), sx0), gt1)
-            fstep = mul(c32(FG), sx0)
+            cur = (feat_start + f_base) * sx0 + gt1
+            fstep = FG * sx0
             raws = []
             for j in fx.range_constexpr(ELEMS):
                 raws.append(
-                    buffer_ops.buffer_load(x_r, cur, vec_width=1, dtype=elem_dtype)
+                    fx_elem_dtype(
+                        buffer_ops.buffer_load(x_r, cur, vec_width=1, dtype=elem_dtype)
+                    )
                 )
                 if fx.const_expr(j + 1 < ELEMS):
-                    cur = add(cur, fstep)
-            do_halo = arith.cmpi(CmpIPredicate.slt, hc, c32(KW - 1))
-            prefix_off = arith.select(
-                do_halo, add(mul(add(feat_start, hf), sx0), add(tok_gbase, hc)), c32(0)
+                    cur = cur + fstep
+            do_halo = hc < (KW - 1)
+            prefix_off = do_halo.select((feat_start + hf) * sx0 + (tok_gbase + hc), 0)
+            prefix_v = fx_elem_dtype(
+                buffer_ops.buffer_load(x_r, prefix_off, vec_width=1, dtype=elem_dtype)
             )
-            prefix_v = buffer_ops.buffer_load(
-                x_r, prefix_off, vec_width=1, dtype=elem_dtype
-            )
-            lds_idx = add(mul(f_base, c32(LDS_PAD)), add(t_const, c32(KW - 1)))
+            lds_idx = f_base * LDS_PAD + (t_const + (KW - 1))
             for j in fx.range_constexpr(ELEMS):
-                cur_idx = lds_idx if j == 0 else add(lds_idx, c32(j * FG * LDS_PAD))
+                cur_idx = lds_idx if j == 0 else lds_idx + (j * FG * LDS_PAD)
                 lds_st(raws[j], cur_idx)
             if do_halo:
-                lds_st(prefix_v, add(mul(hf, c32(LDS_PAD)), hc))
+                lds_st(prefix_v, hf * LDS_PAD + hc)
         else:
             # slow path: sequence-relative bounds (still coalesced)
-            zero_e = arith.constant(0.0, type=elem_dtype)
-            body_wp = add(tok_start, t_const)
-            body_ok = arith.cmpi(CmpIPredicate.slt, body_wp, seqlen)
-            sl_m1 = arith.select(
-                arith.cmpi(CmpIPredicate.sgt, seqlen, c32(0)),
-                sub(seqlen, c32(1)),
-                c32(0),
-            )
-            body_gt = add(seq_start, arith.select(body_ok, body_wp, sl_m1))
+            zero_e = fx_elem_dtype(0.0)
+            body_wp = tok_start + t_const
+            body_ok = body_wp < seqlen
+            sl_m1 = (seqlen > 0).select(seqlen - 1, 0)
+            body_gt = seq_start + body_ok.select(body_wp, sl_m1)
             for j in fx.range_constexpr(ELEMS):
-                gf = add(add(feat_start, f_base), c32(j * FG))
-                gf_ok = arith.cmpi(CmpIPredicate.slt, gf, dim)
-                safe_gf = arith.select(gf_ok, gf, c32(0))
-                raw = buffer_ops.buffer_load(
-                    x_r, add(mul(safe_gf, sx0), body_gt), vec_width=1, dtype=elem_dtype
+                gf = (feat_start + f_base) + (j * FG)
+                gf_ok = gf < dim
+                safe_gf = gf_ok.select(gf, 0)
+                raw = fx_elem_dtype(
+                    buffer_ops.buffer_load(
+                        x_r, safe_gf * sx0 + body_gt, vec_width=1, dtype=elem_dtype
+                    )
                 )
-                val = arith.select(arith.andi(body_ok, gf_ok), raw, zero_e)
+                val = (body_ok & gf_ok).select(raw, zero_e)
                 lds_st(
                     val,
-                    add(
-                        mul(add(f_base, c32(j * FG)), c32(LDS_PAD)),
-                        add(t_const, c32(KW - 1)),
-                    ),
+                    (f_base + (j * FG)) * LDS_PAD + (t_const + (KW - 1)),
                 )
             # halo column with conv_state blend at chunk0
-            do_halo = arith.cmpi(CmpIPredicate.slt, hc, c32(KW - 1))
+            do_halo = hc < (KW - 1)
             if do_halo:
-                gf = add(feat_start, hf)
-                gf_ok = arith.cmpi(CmpIPredicate.slt, gf, dim)
-                wp = sub(add(tok_start, hc), c32(KW - 1))
-                wp_in = arith.andi(
-                    arith.cmpi(CmpIPredicate.sge, wp, c32(0)),
-                    arith.cmpi(CmpIPredicate.slt, wp, seqlen),
-                )
-                safe_xoff = arith.select(
-                    arith.andi(wp_in, gf_ok),
-                    add(mul(gf, sx0), add(seq_start, wp)),
-                    c32(0),
-                )
-                xv = arith.select(
-                    arith.andi(wp_in, gf_ok),
-                    buffer_ops.buffer_load(
-                        x_r, safe_xoff, vec_width=1, dtype=elem_dtype
+                gf = feat_start + hf
+                gf_ok = gf < dim
+                wp = (tok_start + hc) - (KW - 1)
+                wp_in = (wp >= 0) & (wp < seqlen)
+                both = wp_in & gf_ok
+                safe_xoff = both.select(gf * sx0 + (seq_start + wp), 0)
+                xv = both.select(
+                    fx_elem_dtype(
+                        buffer_ops.buffer_load(
+                            x_r, safe_xoff, vec_width=1, dtype=elem_dtype
+                        )
                     ),
                     zero_e,
                 )
                 # pre-seq source: conv_state at chunk0
-                hi8 = buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                hi_nz = arith.cmpi(CmpIPredicate.ne, hi8, arith.constant(0, type=T.i8))
-                need_cs = arith.andi(
-                    arith.andi(arith.cmpi(CmpIPredicate.slt, wp, c32(0)), is_chunk0),
-                    arith.andi(hi_nz, gf_ok),
+                hi8 = fx.Int8(
+                    buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
                 )
-                in_coord = buffer_ops.buffer_load(
-                    ci_r, mul(seq_idx, sci), vec_width=1, dtype=i32
+                hi_nz = hi8 != 0
+                need_cs = ((wp < 0) & is_chunk0) & (hi_nz & gf_ok)
+                in_coord = fx.Int32(
+                    buffer_ops.buffer_load(ci_r, seq_idx * sci, vec_width=1, dtype=i32)
                 )
-                slot = add(c32(KW - 1), wp)
-                cs_off = arith.select(
-                    need_cs,
-                    add(add(mul(in_coord, scs0), mul(gf, scs1)), mul(slot, scs2)),
-                    c32(0),
+                slot = (KW - 1) + wp
+                cs_off = need_cs.select((in_coord * scs0 + gf * scs1) + slot * scs2, 0)
+                csv = fx_elem_dtype(
+                    buffer_ops.buffer_load(cs_r, cs_off, vec_width=1, dtype=elem_dtype)
                 )
-                csv = buffer_ops.buffer_load(
-                    cs_r, cs_off, vec_width=1, dtype=elem_dtype
-                )
-                hv = arith.select(need_cs, csv, xv)
-                lds_st(hv, add(mul(hf, c32(LDS_PAD)), hc))
+                hv = need_cs.select(csv, xv)
+                lds_st(hv, hf * LDS_PAD + hc)
 
         fx.gpu.barrier()
 
         # compute: acc[e] = bias + sum_k w[k] * x[...]; the EPT outputs share a
         # contiguous window, loaded once into registers before the MAC.
-        row_base = add(mul(feat_local, c32(LDS_PAD)), tok_base)
+        row_base = feat_local * LDS_PAD + tok_base
         NSPAN = EPT + W - 1
         xw = []
         for i in fx.range_constexpr(NSPAN):
-            idx = row_base if i == 0 else add(row_base, c32(i))
-            xw.append(f32(lds_ld(idx)))
+            idx = row_base if i == 0 else row_base + i
+            xw.append(fx.Float32(lds_ld(idx)))
         acc = []
         for e in fx.range_constexpr(EPT):
             a = bias_f
             for kk in fx.range_constexpr(W):
-                a = arith.addf(a, arith.mulf(w_taps[kk], xw[e + kk]))
+                a = a + w_taps[kk] * xw[e + kk]
             if fx.const_expr(SILU):
-                ex = rocdl.exp2(T.f32, arith.mulf(a, cf(-_LOG2E)))
-                a = arith.mulf(a, rocdl.rcp(T.f32, arith.addf(cf(1.0), ex)))
+                ex = fx.math.exp2(a * fx.Float32(-_LOG2E))
+                a = a / (fx.Float32(1.0) + ex)
             acc.append(a)
 
         # store: transpose through staging (fast) or direct (slow)
-        store_fast = arith.andi(
-            arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), dim),
-            arith.cmpi(CmpIPredicate.slt, add(tok_start, c32(TM - 1)), seqlen),
-        )
-        vstart = mul(kd, c32(2))
-        blk_q = arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), kd)
-        blk_k = arith.andi(
-            arith.cmpi(CmpIPredicate.sge, feat_start, kd),
-            arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), vstart),
-        )
-        blk_v = arith.cmpi(CmpIPredicate.sge, feat_start, vstart)
+        store_fast = ((feat_start + TN) <= dim) & ((tok_start + (TM - 1)) < seqlen)
+        vstart = kd * 2
+        blk_q = (feat_start + TN) <= kd
+        blk_k = (feat_start >= kd) & ((feat_start + TN) <= vstart)
+        blk_v = feat_start >= vstart
 
         if store_fast:
             fx.gpu.barrier()
             for e in fx.range_constexpr(EPT):
                 lds_st(
-                    arith.truncf(elem_dtype, acc[e]),
-                    add(mul(add(tok_base, c32(e)), c32(STORE_PAD)), feat_local),
+                    acc[e].to(fx_elem_dtype),
+                    (tok_base + e) * STORE_PAD + feat_local,
                 )
             fx.gpu.barrier()
-            sf = arith.andi(tid, c32(TN - 1))
-            tg = arith.shrui(tid, c32(6))
-            tg_ept = mul(tg, c32(EPT))
-            tok0 = add(add(seq_start, tok_start), tg_ept)
+            sf = tid & (TN - 1)
+            tg = tid >> 6
+            tg_ept = tg * EPT
+            tok0 = (seq_start + tok_start) + tg_ept
 
             def emit_fast(cond, res, ts, ds, fo):
                 if cond:
-                    of = sub(add(feat_start, sf), fo)
-                    base_off = add(mul(tok0, ts), mul(of, ds))
+                    of = (feat_start + sf) - fo
+                    base_off = tok0 * ts + of * ds
                     cur = base_off
                     for e in fx.range_constexpr(EPT):
-                        val = lds_ld(add(mul(add(tg_ept, c32(e)), c32(STORE_PAD)), sf))
+                        val = lds_ld((tg_ept + e) * STORE_PAD + sf)
                         buffer_ops.buffer_store(val, res, cur)
                         if fx.const_expr(e + 1 < EPT):
-                            cur = add(cur, ts)
+                            cur = cur + ts
 
-            emit_fast(blk_q, q_r, qs0, qs1, c32(0))
+            emit_fast(blk_q, q_r, qs0, qs1, 0)
             emit_fast(blk_k, k_r, ks0, ks1, kd)
             emit_fast(blk_v, v_r, vs0, vs1, vstart)
         else:
 
             def emit_slow(cond, res, ts, ds, fo):
-                if arith.andi(cond, feat_valid):
-                    of = sub(gfeat, fo)
-                    base_off = add(
-                        mul(add(add(seq_start, tok_start), tok_base), ts), mul(of, ds)
-                    )
+                if cond & feat_valid:
+                    of = gfeat - fo
+                    base_off = ((seq_start + tok_start) + tok_base) * ts + of * ds
                     cur = base_off
                     for e in fx.range_constexpr(EPT):
-                        tok_ok = arith.cmpi(
-                            CmpIPredicate.slt,
-                            add(add(tok_start, tok_base), c32(e)),
-                            seqlen,
-                        )
+                        tok_ok = ((tok_start + tok_base) + e) < seqlen
                         if tok_ok:
-                            buffer_ops.buffer_store(
-                                arith.truncf(elem_dtype, acc[e]), res, cur
-                            )
+                            buffer_ops.buffer_store(acc[e].to(fx_elem_dtype), res, cur)
                         if fx.const_expr(e + 1 < EPT):
-                            cur = add(cur, ts)
+                            cur = cur + ts
 
-            emit_slow(blk_q, q_r, qs0, qs1, c32(0))
+            emit_slow(blk_q, q_r, qs0, qs1, 0)
             emit_slow(blk_k, k_r, ks0, ks1, kd)
             emit_slow(blk_v, v_r, vs0, vs1, vstart)
 
         # conv_state writeback (chunk 0)
         if fx.const_expr(SL > 0):
             if is_chunk0:
-                zero_e = arith.constant(0.0, type=elem_dtype)
+                zero_e = fx_elem_dtype(0.0)
                 slot = tok_group
-                should = arith.andi(
-                    arith.cmpi(CmpIPredicate.slt, slot, c32(KW - 1)),
-                    arith.cmpi(CmpIPredicate.slt, gfeat, dim),
-                )
+                should = (slot < (KW - 1)) & (gfeat < dim)
                 if should:
-                    in_coord = buffer_ops.buffer_load(
-                        ci_r, mul(seq_idx, sci), vec_width=1, dtype=i32
+                    in_coord = fx.Int32(
+                        buffer_ops.buffer_load(
+                            ci_r, seq_idx * sci, vec_width=1, dtype=i32
+                        )
                     )
-                    pos_x = add(sub(seqlen, c32(KW - 1)), slot)
-                    x_in = arith.cmpi(CmpIPredicate.sge, pos_x, c32(0))
-                    safe_x = arith.select(
-                        x_in, add(mul(gfeat, sx0), add(seq_start, pos_x)), c32(0)
+                    pos_x = (seqlen - (KW - 1)) + slot
+                    x_in = pos_x >= 0
+                    safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
+                    val_x = fx_elem_dtype(
+                        buffer_ops.buffer_load(
+                            x_r, safe_x, vec_width=1, dtype=elem_dtype
+                        )
                     )
-                    val_x = buffer_ops.buffer_load(
-                        x_r, safe_x, vec_width=1, dtype=elem_dtype
+                    hi8 = fx.Int8(
+                        buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
                     )
-                    hi8 = buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                    hi_nz = arith.cmpi(
-                        CmpIPredicate.ne, hi8, arith.constant(0, type=T.i8)
+                    hi_nz = hi8 != 0
+                    need_pr = (pos_x < 0) & hi_nz
+                    src = slot + seqlen
+                    safe_pr = need_pr.select(
+                        (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
                     )
-                    need_pr = arith.andi(
-                        arith.cmpi(CmpIPredicate.slt, pos_x, c32(0)), hi_nz
+                    val_pr = fx_elem_dtype(
+                        buffer_ops.buffer_load(
+                            cs_r, safe_pr, vec_width=1, dtype=elem_dtype
+                        )
                     )
-                    src = add(slot, seqlen)
-                    safe_pr = arith.select(
-                        need_pr,
-                        add(add(mul(in_coord, scs0), mul(gfeat, scs1)), mul(src, scs2)),
-                        c32(0),
-                    )
-                    val_pr = buffer_ops.buffer_load(
-                        cs_r, safe_pr, vec_width=1, dtype=elem_dtype
-                    )
-                    wb_val = arith.select(
-                        x_in, val_x, arith.select(need_pr, val_pr, zero_e)
-                    )
-                    cs_wr = add(
-                        add(mul(in_coord, scs0), mul(gfeat, scs1)), mul(slot, scs2)
-                    )
+                    wb_val = x_in.select(val_x, need_pr.select(val_pr, zero_e))
+                    cs_wr = (in_coord * scs0 + gfeat * scs1) + slot * scs2
                     buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
 
     @flyc.jit
@@ -491,10 +408,6 @@ def build_causal_conv1d_flydsl_module(
         grid_y_dim: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         gx = arith.index_cast(T.index, num_programs)
         gy = arith.index_cast(T.index, grid_y_dim)
         conv1d_kernel(

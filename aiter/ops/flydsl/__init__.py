@@ -13,7 +13,7 @@ from packaging.version import Version
 from .utils import is_flydsl_available
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.1.8")
+_MIN_FLYDSL_VERSION = Version("0.2.4")
 
 __all__ = [
     "is_flydsl_available",

@@ -713,7 +713,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
         sched_barrier_pairs<4, 5, 2>();
         bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max = all_below ? m_row : row_max;
+        row_max = all_below ? m_row : max(m_row, row_max);  // per-lane clamp: avoid exp2(m_row-row_max) overflow → NaN
         v_o = mma1.step_k(1_I, v_p, v_v, v_o);
         v_o = mma1.step_k(2_I, v_p, v_v, v_o);
         v_o = mma1.step_k(3_I, v_p, v_v, v_o);
@@ -777,7 +777,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, cha
         sched_barrier_pairs<4, 5, 4>();
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max = all_below ? m_row : row_max;
+        row_max = all_below ? m_row : max(m_row, row_max);  // per-lane clamp: avoid exp2(m_row-row_max) overflow → NaN
         v_o = mma1.step_k(1_I, v_p, v_v, v_o);
         v_o = mma1.step_k(2_I, v_p, v_v, v_o);
         v_o = mma1.step_k(3_I, v_p, v_v, v_o);
