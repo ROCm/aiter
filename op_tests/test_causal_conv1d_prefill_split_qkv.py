@@ -33,6 +33,7 @@ def torch_reference(
     k_dim,
     v_dim,
     activation="silu",
+    pad_slot_id=-1,
 ):
     """Unambiguous fp32 reference. Returns (q, k, v, new_conv_states)."""
     dim, T = x.shape
@@ -48,6 +49,8 @@ def torch_reference(
         start, end = qsl[s], qsl[s + 1]
         L = end - start
         ci = int(cache_indices[s])
+        if ci == pad_slot_id:
+            continue
         hi = bool(has_initial_state[s])
         for p in range(L):
             acc = bf.clone()
@@ -79,14 +82,25 @@ def torch_reference(
 
 
 def make_inputs(
-    cu_seqlens, with_initial_state=False, device="cuda", dtype=torch.bfloat16, seed=0
+    cu_seqlens,
+    with_initial_state=False,
+    with_bias=True,
+    channel_last=False,
+    device="cuda",
+    dtype=torch.bfloat16,
+    seed=0,
 ):
     torch.manual_seed(seed)
     T = cu_seqlens[-1]
     n = len(cu_seqlens) - 1
-    x = torch.randn(CONV_DIM, T, dtype=dtype, device=device) * 0.1
+    if channel_last:
+        x = (torch.randn(T, CONV_DIM, dtype=dtype, device=device) * 0.1).t()
+    else:
+        x = torch.randn(CONV_DIM, T, dtype=dtype, device=device) * 0.1
     weight = torch.randn(CONV_DIM, WIDTH, dtype=dtype, device=device) * 0.1
-    bias = torch.randn(CONV_DIM, dtype=dtype, device=device) * 0.1
+    bias = (
+        torch.randn(CONV_DIM, dtype=dtype, device=device) * 0.1 if with_bias else None
+    )
     conv_states = (
         torch.randn(n, STATE_LEN, CONV_DIM, dtype=dtype, device=device).transpose(1, 2)
         * 0.1
@@ -254,6 +268,149 @@ def test_backend_matches_reference(cu, with_is, backend):
     # conv_state writeback
     rel, absd = _max_abs_rel(cs_work, ref_cs)
     assert absd < 5e-2, f"{backend} conv_state mismatch: max_abs={absd:.4f}"
+
+
+@pytest.mark.parametrize("cu", [[0, 1], [0, 2], [0, 1, 3, 6], [0, 512]])
+@pytest.mark.parametrize("with_is", [False, True])
+def test_hip_channel_last_matches_reference(cu, with_is):
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+
+    x, w, b, cs, ci, hi, qsl = make_inputs(
+        cu, with_initial_state=with_is, channel_last=True
+    )
+    assert x.stride() == (1, CONV_DIM)
+    ref_q, ref_k, ref_v, ref_cs = torch_reference(
+        x, w, b, cs.clone(), qsl, ci, hi, K_DIM, V_DIM
+    )
+    cs_work = cs.clone()
+    q, k, v = _call_backend(
+        "hip",
+        x=x,
+        weight=w,
+        bias=b,
+        conv_states=cs_work,
+        query_start_loc=qsl,
+        cache_indices=ci,
+        has_initial_state=hi,
+        k_dim=K_DIM,
+        v_dim=V_DIM,
+        seq_lens_cpu=qsl.diff().tolist(),
+        activation="silu",
+    )
+
+    for name, got, ref in (("q", q, ref_q), ("k", k, ref_k), ("v", v, ref_v)):
+        rel, absd = _max_abs_rel(got, ref)
+        assert absd < 5e-2, f"hip channel-last {name}: max_abs={absd:.4f} rel={rel:.4f}"
+    rel, absd = _max_abs_rel(cs_work, ref_cs)
+    assert absd < 5e-2, f"hip channel-last state: max_abs={absd:.4f} rel={rel:.4f}"
+
+
+@pytest.mark.parametrize(
+    ("activation", "with_bias"),
+    [
+        (None, True),
+        ("silu", False),
+        (None, False),
+    ],
+)
+def test_hip_channel_last_optional_activation_and_bias(activation, with_bias):
+    """Cover channel-last dispatch with SiLU and/or bias disabled."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+
+    cu = [0, 7, 31, 90]
+    x, w, b, cs, ci, hi, qsl = make_inputs(
+        cu,
+        with_initial_state=True,
+        with_bias=with_bias,
+        channel_last=True,
+    )
+    assert x.stride() == (1, CONV_DIM)
+    assert (b is not None) == with_bias
+
+    ref_q, ref_k, ref_v, ref_cs = torch_reference(
+        x,
+        w,
+        b,
+        cs.clone(),
+        qsl,
+        ci,
+        hi,
+        K_DIM,
+        V_DIM,
+        activation=activation,
+    )
+    cs_work = cs.clone()
+    q, k, v = _call_backend(
+        "hip",
+        x=x,
+        weight=w,
+        bias=b,
+        conv_states=cs_work,
+        query_start_loc=qsl,
+        cache_indices=ci,
+        has_initial_state=hi,
+        k_dim=K_DIM,
+        v_dim=V_DIM,
+        seq_lens_cpu=qsl.diff().tolist(),
+        activation=activation,
+    )
+
+    case = f"activation={activation!r} with_bias={with_bias}"
+    for name, got, ref in (("q", q, ref_q), ("k", k, ref_k), ("v", v, ref_v)):
+        rel, absd = _max_abs_rel(got, ref)
+        assert (
+            absd < 5e-2
+        ), f"hip channel-last {name} {case}: max_abs={absd:.4f} rel={rel:.4f}"
+    rel, absd = _max_abs_rel(cs_work, ref_cs)
+    assert (
+        absd < 5e-2
+    ), f"hip channel-last state {case}: max_abs={absd:.4f} rel={rel:.4f}"
+
+
+@pytest.mark.parametrize("channel_last", [False, True])
+@pytest.mark.parametrize("with_is", [False, True])
+def test_hip_cache_mapping_and_padding(channel_last, with_is):
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+
+    cu = [0, 5, 12, 21]
+    x, w, b, cs, _, hi, qsl = make_inputs(
+        cu, with_initial_state=with_is, channel_last=channel_last
+    )
+    # Sequence 0 writes cache line 2, sequence 1 is padding, and sequence 2
+    # writes cache line 0. Cache line 1 must remain untouched.
+    ci = torch.tensor([2, -1, 0], dtype=torch.int32, device=x.device)
+    ref_q, ref_k, ref_v, ref_cs = torch_reference(
+        x, w, b, cs.clone(), qsl, ci, hi, K_DIM, V_DIM, pad_slot_id=-1
+    )
+
+    cs_work = cs.clone()
+    q, k, v = _call_backend(
+        "hip",
+        x=x,
+        weight=w,
+        bias=b,
+        conv_states=cs_work,
+        query_start_loc=qsl,
+        cache_indices=ci,
+        has_initial_state=hi,
+        k_dim=K_DIM,
+        v_dim=V_DIM,
+        seq_lens_cpu=qsl.diff().tolist(),
+        activation="silu",
+    )
+
+    # Padded output storage is intentionally unspecified; compare live ranges.
+    live = torch.cat(
+        (torch.arange(0, 5, device=x.device), torch.arange(12, 21, device=x.device))
+    )
+    for name, got, ref in (("q", q, ref_q), ("k", k, ref_k), ("v", v, ref_v)):
+        rel, absd = _max_abs_rel(got[live], ref[live])
+        assert absd < 5e-2, f"hip mapped {name}: max_abs={absd:.4f} rel={rel:.4f}"
+    rel, absd = _max_abs_rel(cs_work, ref_cs)
+    assert absd < 5e-2, f"hip mapped state: max_abs={absd:.4f} rel={rel:.4f}"
 
 
 def qsl_to(qsl):
