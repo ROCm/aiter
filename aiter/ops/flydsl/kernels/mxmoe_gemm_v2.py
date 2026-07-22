@@ -417,23 +417,14 @@ def gemm2_body_v2(
                 bsf[mw],
             )
 
-    def stream_b_half(kt_rt, half_n):
-        # Half-N B stream (straight_line_k2): only the two N-row groups of half_n.
-        bqf = [None, None, None, None]
-        for j in (2 * half_n, 2 * half_n + 1):
-            bqf[j] = [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
-            for half in range_constexpr(2):
-                fx.copy(
-                    b_catom,
-                    bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
-                    bqf[j][half],
-                )
-        bsf = fx.make_fragment_like(sc_frag_tmpl)
-        fx.copy(
-            sc_copy_atom,
-            bscale_views[half_n][lane_div_16, lane_mod_16, kt_rt, None],
-            bsf,
-        )
+    def stream_b_tile(kt_rt):
+        # Fresh per-iter fragments (B streamed, not register-resident) then issue_b_load_into.
+        bqf = [
+            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(2)]
+            for _ in range_constexpr(4)
+        ]
+        bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(2)]
+        issue_b_load_into(bqf, bsf, kt_rt)
         return bqf, bsf
 
     # Scaled-MFMA clusters over the loaded A / B / scale fragments.
@@ -470,23 +461,6 @@ def gemm2_body_v2(
                     i0=2 * sub,
                 )
 
-    def mfma_cluster_half(bqf, bsf, sa, half_n):
-        sb = _raw(Vec(bsf.load())[0])
-        for j in (2 * half_n, 2 * half_n + 1):
-            in_b = j % 2
-            for sub in range_constexpr(kSubBlocks):
-                mma_one_j(
-                    j,
-                    in_b,
-                    sa[sub],
-                    sb,
-                    bqf,
-                    a_frags,
-                    c_frags,
-                    mma_atoms,
-                    i0=2 * sub,
-                )
-
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = Vec.filled(4, 0.0, Float32)
     c_frags = [
@@ -508,27 +482,26 @@ def gemm2_body_v2(
                 n += 1
         return n
 
-    # Straight-line K=2 unroll (compile-time INTER_MAX==512 -> K_TILES_MAX==2): range_constexpr instead of
-    # scf.for drops the loop-carry (C/B regs freed -> lower VGPR) and collapses the per-tile barrier to one.
-    # fp8 needs the bf16-lds epilog; fp4 uses the c_frags epilog (mma_one_j is dtype-generic), no bf16-lds req.
-    straight_line_k2 = (
-        use_reduce
-        and (BM == 64)
-        and (K_TILES_MAX == 2)
-        and (g2_bf16_lds if is_f8_a else True)
-    )
-    if const_expr(straight_line_k2):
-        gpu.barrier()
-        for kt in range_constexpr(2):
-            issue_a_ds_read(fx.Int32(kt))
-            sa = load_a_scale_tile(fx.Int32(kt))
-            for half_n in range_constexpr(2):
-                bqf, bsf = stream_b_half(fx.Int32(kt), half_n)
-                rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
-                mfma_cluster_half(bqf, bsf, sa, half_n)
-                rocdl.s_setprio(0)
-                rocdl.sched_barrier(0)
+    if const_expr(BM == 64 and BN == 256):
+        # BM64/BN256 uses the 1-stage B path unconditionally; do not depend on env knobs.
+        for kt_iv, state in range(
+            fx.Int32(0),
+            K_TILES_RT,
+            fx.Int32(1),
+            init=load_c_carry(),
+        ):
+            store_c_carry(state)
+            kt_rt = fx.Int32(kt_iv)
+            gpu.barrier()
+            issue_a_ds_read(kt_rt % fx.Int32(aStages))
+            nxt = kt_rt + fx.Int32(kStages)
+            if nxt < K_TILES_RT:
+                issue_a_load_lds(nxt % fx.Int32(aStages), nxt)
+            bqf, bsf = stream_b_tile(kt_rt)
+            sa = load_a_scale_tile(kt_rt)
+            mfma_cluster(bqf, bsf, sa)
+            results = yield load_c_carry()
+        store_c_carry(results)
     else:
         # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
         cur_bqf = [
