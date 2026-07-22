@@ -10,8 +10,8 @@ struct opus_gqa_kargs {
     const void* __restrict__ ptr_v;  // [B, N, H_KV, D]
     void* __restrict__ ptr_o;        // [B, N, H, D]
     int B;
-    int N;      // seqlen_q (drives grid / Q tiling)
-    int N_KV;   // seqlen_kv (drives KV tile traversal / masks); == N for self-attention
+    int N;      // seqlen_q
+    int N_KV;   // seqlen_kv
     int H;
     int H_KV;
     int D;
@@ -78,8 +78,6 @@ struct opus_gqa_traits {
     static constexpr int VEC_KV   = 8;
     static constexpr int VEC_TR_V = 4;
     static constexpr int VEC_O    = 4;
-    // Widened O store: bf16 elements per buffer_store_dwordx4 (16 bytes). Used by the
-    // permlane32-packed write-back path (make_layout_o_x4 + the per-group store loop).
     static constexpr int VEC_O_X4 = 16 / sizeof(D_ATTN);   // 8
 
     // Minimal compact pixels for async copy for one wave

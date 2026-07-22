@@ -1921,10 +1921,6 @@ def _flash_attn_forward(
         return ret
 
     def _can_impl_fmha_fwd_hd128_bf16_opus():
-        # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
-        # supersedes v3/CK when enabled. Kernel handles cross-attention (seqlen_q !=
-        # seqlen_k), arbitrary seqlen, and bottom-right causal (incl. sq>sk, whose
-        # fully-masked leading rows are written as O=0).
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         if not (hdim_q == 128 and hdim_v == 128):
@@ -1944,8 +1940,9 @@ def _flash_attn_forward(
             return False
         # 32-bit buffer-offset limit (same as D=128): per-(batch,head) K/V byte extent must
         # fit in 2^32, else the 32-bit async-load soffset wraps and far KV tiles are misread.
-        if (seqlen_k * nhead_k * hdim_q * 2 >= (1 << 32)
-                or seqlen_k * nhead_k * hdim_v * 2 >= (1 << 32)):
+        if seqlen_k * nhead_k * hdim_q * 2 >= (
+            1 << 32
+        ) or seqlen_k * nhead_k * hdim_v * 2 >= (1 << 32):
             return False
         return True
 

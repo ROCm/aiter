@@ -29,9 +29,6 @@ __global__ void gqa_d128_kernel(opus_gqa_kargs kargs);
 template <class Traits>
 __global__ void gqa_d128_kernel(opus_gqa_kargs) {}
 #else
-// Pulls in opus + the full kernel template (depth-1 run_phase pipeline + parity
-// epilogue, compile-time STAGGER wave-group specialization, async-Q via LDS,
-// cross-attention (N_KV), arbitrary seqlen via OOB buffer bounds + border/-inf masking).
 #include "fmha_fwd_hd128_bf16_opus_kernel.hpp"
 #endif
 
