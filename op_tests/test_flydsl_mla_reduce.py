@@ -45,7 +45,6 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
     select_tier,
     should_use_persistent_launch,
     splitk_enabled,
-    waves_per_eu_from_env,
     _get_splitk_scratch,
 )
 
@@ -659,6 +658,7 @@ def make_runner(
     disable_guards=False,
     num_partial_rows=None,
     num_final_rows=None,
+    waves_per_eu=4,
 ):
     """Precompile + bind args; return a zero-overhead closure for the timed loop.
 
@@ -697,7 +697,7 @@ def make_runner(
                 out_dtype=out_dtype_str,
                 K=K,
                 output_lse=output_lse,
-                waves_per_eu=waves_per_eu_from_env(),
+                waves_per_eu=waves_per_eu,
             )
             sk_acc, sk_ml = _get_splitk_scratch(num_slots, K, Dv, fout.device.index)
             _npr = int(num_partial_rows)
@@ -729,7 +729,7 @@ def make_runner(
         output_lse=output_lse,
         use_reduce_final_map=True,
         disable_guards=disable_guards,
-        waves_per_eu=waves_per_eu_from_env(),
+        waves_per_eu=waves_per_eu,
     )
     head = (
         po,
@@ -2007,6 +2007,36 @@ def test_adaptive_launch_single_tile_uses_persistent():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
+def test_explicit_waves_per_eu_equivalence():
+    """Explicit occupancy hints must not change normal or split-K results."""
+    _require_cuda()
+
+    dt = "bf16"
+    for active_tiles, splits in ((8, 32), (1, 128)):
+        po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
+            active_tiles, splits, _out_dtype(dt)
+        )
+        ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+
+        for waves_per_eu in (1, 4):
+            fout.zero_()
+            flse.zero_()
+            flydsl_mla_reduce_v1(
+                po,
+                pl,
+                indptr,
+                fmap,
+                pmap,
+                1,
+                fout,
+                flse,
+                num_kv_splits=splits,
+                waves_per_eu=waves_per_eu,
+            )
+            torch.cuda.synchronize()
+            _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
 def run_checks():
     """Run every invariant/correctness check. Returns a list of ``(name, exc)``
     for any that failed; an empty list means everything passed. Aggregates
@@ -2120,6 +2150,7 @@ def run_checks():
         "adaptive_launch_single_tile_uses_persistent",
         test_adaptive_launch_single_tile_uses_persistent,
     )
+    _run("explicit_waves_per_eu_equivalence", test_explicit_waves_per_eu_equivalence)
 
     return failures
 

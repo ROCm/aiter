@@ -32,20 +32,14 @@ import enum
 import functools
 import math
 import os
-from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import buffer_ops, math as fly_math
 from flydsl.expr.typing import T
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf, math as mlir_math, gpu as mlir_gpu
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import rocdl
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from flydsl.runtime.device import get_rocm_arch
 
-from .tensor_shim import GTensor, STensor, _to_raw
+from .tensor_shim import GTensor, _to_raw
 
 _LOG2E = math.log2(math.e)
 fm_fast = fx.arith.FastMathFlags.fast
@@ -101,12 +95,12 @@ def _exp(x, use_exp2=True):
     """exp(x) via the hardware v_exp_f32 (exp2(x*log2e))."""
     if fx.const_expr(use_exp2):
         return fx.rocdl.exp2(T.f32, x * _LOG2E)
-    return mlir_math.exp(x, fastmath=fm_fast)
+    return fly_math.exp(x, fastmath=fm_fast)
 
 
 def _log(x):
     """natural log; mlir math dialect lowers to the device log."""
-    return mlir_math.log(x, fastmath=fm_fast)
+    return fly_math.log(x, fastmath=fm_fast)
 
 
 # Massive-path sub-tiers (mirror MlaReduceProblemSize, reduce.cu:121).
@@ -131,40 +125,6 @@ NLSE_MLDS = (LDS_MAX_SPLITS + WARP - 1) // WARP  # ceil(304/64) = 5
 
 # Production default (opt4 sweep: 4 ~= 6 < 8 on H=16 Dv=512 tiles=8 splits=32).
 _DEFAULT_WAVES_PER_EU = 4
-
-
-def waves_per_eu_from_env(default: int = _DEFAULT_WAVES_PER_EU) -> int:
-    """Read ``AITER_MLA_REDUCE_WAVES_PER_EU`` (sweep/tuning knob)."""
-    raw = os.environ.get("AITER_MLA_REDUCE_WAVES_PER_EU")
-    if raw is None:
-        return default
-    return int(raw)
-
-
-@contextmanager
-def _if_then(if_op):
-    """SCF IfOp then-region; auto-insert scf.yield if missing."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
-
-
-@contextmanager
-def _if_else(if_op):
-    """SCF IfOp else-region; auto-insert scf.yield if missing."""
-    if getattr(if_op, "else_block", None) is None:
-        raise RuntimeError("IfOp has no else block")
-    with ir.InsertionPoint(if_op.else_block):
-        try:
-            yield if_op.else_block
-        finally:
-            blk = if_op.else_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 def select_tier(num_splits: int) -> Tier:
@@ -245,26 +205,18 @@ def compile_mla_reduce(
     else:
         NLSE = _TIER_NLSE[tier]
 
-    # ---- LDS layout (all tiers: pmap; massive adds scale + overflow) ----
-    # [ pmap : LDS_MAX_SPLITS i32 ] ++ [ lse_scale : LDS_MAX_SPLITS f32 ]
-    # ++ [ local_lse overflow : (NLSE-4 lanes) f32 ]  (MLDS/ALL only)
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=f"mla_reduce_smem_{tier.value}_{Dv}_{H}",
+    kernel_value_attrs = (
+        {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
     )
-    pmap_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = pmap_off + LDS_MAX_SPLITS * 4
-    lse_scale_off = 0
-    local_lse_off = 0
-    if is_massive:
-        lse_scale_off = allocator._align(allocator.ptr, 16)
-        allocator.ptr = lse_scale_off + LDS_MAX_SPLITS * 4
-        if tier in (Tier.MLDS, Tier.ALL):
-            local_lse_off = allocator._align(allocator.ptr, 16)
-            overflow_slots = max(0, LDS_MAX_SPLITS - 256)
-            allocator.ptr = local_lse_off + overflow_slots * 4
+
+    # ---- LDS layout (all tiers: pmap; massive adds scale) ----
+    # Separate 16-byte aligned fields preserve the wide LDS load contract.
+    @fx.struct
+    class SharedStorage:
+        pmap: fx.Array[fx.Int32, LDS_MAX_SPLITS, 16]
+
+        if is_massive:
+            lse_scale: fx.Array[fx.Float32, LDS_MAX_SPLITS, 16]
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def mla_reduce_kernel(
@@ -317,7 +269,6 @@ def compile_mla_reduce(
         col = tid * c_VEC
         lane = tid % fx.Int32(WARP)
         wave = tid // fx.Int32(WARP)
-        width_i32 = _to_raw(fx.arith.constant(WARP, type=T.i32))
 
         g_po = GTensor(partial_output, dtype=T.f32, shape=(-1, H, Dv))
         g_pl = GTensor(partial_lse, dtype=T.f32, shape=(-1, H))
@@ -327,45 +278,22 @@ def compile_mla_reduce(
         g_fo = GTensor(final_output, dtype=out_t, shape=(-1,))
         g_flse = GTensor(final_lse, dtype=T.f32, shape=(-1,))
 
-        _glb_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+        indptr_rsrc = g_indptr.rsrc
 
         def _scalar_indptr(idx):
-            """Uniform ``reduce_indptr[idx]`` as a scalar SGPR value.
-
-            Mirrors HIP ``__builtin_amdgcn_readfirstlane(p_reduce_indptr[tile])``
-            (reduce.cu:688). Uses a raw pointer deref + readfirstlane rather than
-            the GTensor buffer_load path: a ``buffer_load`` is inherently a vector
-            memory op (voffset addressing) and never lowers to ``s_load_dword``,
-            so wrapping it in readfirstlane leaves the vector load + lgkmcnt(0)
-            floor stall in place. A raw ``llvm.load`` from the uniform address is
-            scalarizable, so the sentinel becomes an ``s_load_dword``.
-            """
-            idx_index = fx.arith.index_cast(T.index, _to_raw(idx))
-            byte_off = fx.arith.muli(idx_index, fx.arith.constant(4, index=True))
-            addr_i64 = g_indptr.get_llvm_ptr(reduce_indptr, byte_off)
-            addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _to_raw(addr_i64))
-            # invariant=True -> !invariant.load: reduce_indptr is read-only in
-            # this kernel, so the uniform-address load can be scalarized by the
-            # AMDGPU backend into s_load_dword (SMEM) instead of a per-lane
-            # global_load + s_waitcnt vmcnt(0), matching HIP's scalar sentinel.
-            val = llvm_dialect.load(T.i32, addr_ptr, invariant=True)
+            """Load a wave-uniform CSR pointer through the scalar memory path."""
+            val = buffer_ops.buffer_load(
+                indptr_rsrc, idx, vec_width=1, dtype=T.i32, is_scalar=True
+            )
             return fx.Int32(rocdl.readfirstlane(T.i32, val))
 
         c_H = fx.Int32(H)
         last = _scalar_indptr(_to_raw(num_reduce_tile))
 
-        base = allocator.get_base()
-        lds_pmap = STensor(
-            SmemPtr(base, pmap_off, T.i32, shape=(LDS_MAX_SPLITS,)),
-            dtype=T.i32,
-            shape=(LDS_MAX_SPLITS,),
-        )
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_pmap = lds.pmap
         if fx.const_expr(is_massive):
-            lds_scale = STensor(
-                SmemPtr(base, lse_scale_off, T.f32, shape=(LDS_MAX_SPLITS,)),
-                dtype=T.f32,
-                shape=(LDS_MAX_SPLITS,),
-            )
+            lds_scale = lds.lse_scale
 
         def process_work_item(head, block_idx, tile, ntg):
             """Reduce one (head, q-pos-group, tile) work item into final_output.
@@ -397,13 +325,10 @@ def compile_mla_reduce(
 
             # HIP kn_mla_reduce_v1_ps: skip tiles at the CSR sentinel
             # (reduce.cu:692) or with n_splits<=1. Collapse the seq-loop upper
-            # bound instead of an scf.IfOp body-wrap so inactive tiles never
+            # bound instead of a conditional body-wrap so inactive tiles never
             # enter gather/store paths even if reduce_final_map holds garbage
             # q-ranges (serving tail).
-            has_work = fx.arith.andi(
-                fx.arith.cmpi(fx.arith.CmpIPredicate.sgt, n_splits, fx.Int32(1)),
-                fx.arith.cmpi(fx.arith.CmpIPredicate.ne, t0, last),
-            )
+            has_work = (n_splits > fx.Int32(1)) & (t0 != last)
 
             if fx.const_expr(use_reduce_final_map):
                 q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
@@ -417,14 +342,9 @@ def compile_mla_reduce(
                 q_end = (fx.Int32(tile) + fx.Int32(1)) * qo_len
 
             if fx.const_expr(not disable_guards):
-                q_valid = fx.arith.andi(
-                    fx.arith.cmpi(fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)),
-                    fx.arith.cmpi(fx.arith.CmpIPredicate.slt, q_start, num_final_rows),
-                )
-                has_work = fx.arith.andi(has_work, q_valid)
-                q_end_oob = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.sgt, q_end, num_final_rows
-                )
+                q_valid = (q_start >= fx.Int32(0)) & (q_start < num_final_rows)
+                has_work = has_work & q_valid
+                q_end_oob = q_end > num_final_rows
                 q_end = q_end_oob.select(num_final_rows, q_end)
 
             seq0 = q_start + fx.Int32(block_idx)
@@ -439,30 +359,19 @@ def compile_mla_reduce(
                 """
                 row_i32 = pmap_i32 + local_seq
                 if fx.const_expr(not disable_guards):
-                    in_bounds = fx.arith.andi(
-                        fx.arith.cmpi(fx.arith.CmpIPredicate.sge, row_i32, fx.Int32(0)),
-                        fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.slt,
-                            row_i32,
-                            num_partial_rows,
-                        ),
-                    )
+                    in_bounds = (row_i32 >= fx.Int32(0)) & (row_i32 < num_partial_rows)
                     safe_row_i32 = in_bounds.select(row_i32, fx.Int32(0))
                 else:
-                    in_bounds = fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.eq, fx.Int32(0), fx.Int32(0)
-                    )
+                    in_bounds = fx.Int32(0) == fx.Int32(0)
                     safe_row_i32 = row_i32
-                row_idx = fx.arith.index_cast(ir.IndexType.get(), _to_raw(safe_row_i32))
+                row_idx = fx.Index(safe_row_i32)
                 return row_idx, in_bounds
 
             def pmap_value(split_i32, direct_pmap: bool = False):
                 if fx.const_expr(direct_pmap):
                     # Clamp the absolute pmap load address for masked tail slots.
                     # The contribution is later zeroed by the split-valid guard.
-                    in_split = fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.slt, split_i32, n_splits
-                    )
+                    in_split = split_i32 < n_splits
                     safe_split = in_split.select(split_i32, fx.Int32(0))
                     return fx.Int32(g_pmap[fx.Index(t0 + safe_split)])
                 return fx.Int32(lds_pmap[fx.Index(split_i32)])
@@ -519,14 +428,9 @@ def compile_mla_reduce(
                     lse_val = _log(sum_e) + max_lse
                     inf = fx.arith.constant(float("inf"), type=T.f32)
                     final_lse_val = bad.select(inf, lse_val)
-                    is_lane0 = fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.eq, tid, fx.Int32(0)
-                    )
-                    if_lane0 = scf.IfOp(is_lane0, results_=[], has_else=False)
-                    with ir.InsertionPoint(if_lane0.then_block):
+                    if tid == fx.Int32(0):
                         lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
                         g_flse[fx.Index(lse_off)] = final_lse_val
-                        scf.YieldOp([])
 
             # opt5: FlyDSL range (init=None -> scf_range without iter_args) so
             # hot_loop_scheduler can interleave the inner split-loop VMEM loads
@@ -587,39 +491,29 @@ def compile_mla_reduce(
                 make.
                 """
                 neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
-                is_wave0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, wave, fx.Int32(0))
-                if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
-                with ir.InsertionPoint(if_w0.then_block):
+                if wave == fx.Int32(0):
                     local_lses = []
                     max_lse = neg_inf
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
-                        in_rng = fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.slt, split_idx, n_splits
-                        )
+                        in_rng = split_idx < n_splits
                         safe = in_rng.select(split_idx, fx.Int32(0))
                         lse_j = load_split_lse(safe, local_seq, direct_pmap)
                         lse_j = in_rng.select(lse_j, neg_inf)
                         local_lses.append(lse_j)
                         max_lse = fx.arith.maximumf(max_lse, lse_j)
                     for off in [32, 16, 8, 4, 2, 1]:
-                        peer = mlir_gpu.ShuffleOp(
-                            _to_raw(max_lse),
-                            _to_raw(fx.arith.constant(off, type=T.i32)),
-                            width_i32,
-                            mode="xor",
-                        ).shuffleResult
+                        peer = fx.Float32(max_lse).shuffle_xor(
+                            fx.Int32(off), fx.Int32(WARP)
+                        )
                         max_lse = fx.arith.maximumf(max_lse, peer)
                     sum_e = fx.arith.constant(0.0, type=T.f32)
                     for j in fx.range_constexpr(nlse):
                         sum_e = sum_e + _exp(local_lses[j] - max_lse, use_exp2)
                     for off in [32, 16, 8, 4, 2, 1]:
-                        peer = mlir_gpu.ShuffleOp(
-                            _to_raw(sum_e),
-                            _to_raw(fx.arith.constant(off, type=T.i32)),
-                            width_i32,
-                            mode="xor",
-                        ).shuffleResult
+                        peer = fx.Float32(sum_e).shuffle_xor(
+                            fx.Int32(off), fx.Int32(WARP)
+                        )
                         sum_e = sum_e + peer
                     bad = fx.arith.ori(
                         fx.arith.cmpf(
@@ -633,24 +527,14 @@ def compile_mla_reduce(
                     global_lse = bad.select(inf, _log(sum_e) + max_lse)
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
-                        in_rng = fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.slt, split_idx, n_splits
-                        )
-                        if_s = scf.IfOp(in_rng, results_=[], has_else=False)
-                        with ir.InsertionPoint(if_s.then_block):
+                        in_rng = split_idx < n_splits
+                        if in_rng:
                             sc = _exp(local_lses[j] - global_lse, use_exp2)
                             lds_scale[fx.Index(split_idx)] = sc
-                            scf.YieldOp([])
                     if fx.const_expr(output_lse):
-                        is_l0 = fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.eq, lane, fx.Int32(0)
-                        )
-                        if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
-                        with ir.InsertionPoint(if_l0.then_block):
+                        if lane == fx.Int32(0):
                             lse_off = seq_i32 * fx.Int32(H) + fx.Int32(head)
                             g_flse[fx.Index(lse_off)] = global_lse
-                            scf.YieldOp([])
-                    scf.YieldOp([])
 
                 # Lever #1/#5: GRP-wide double-rate software pipeline. Process
                 # GRP splits per iteration and keep GRP output buffer_loads in
@@ -704,8 +588,10 @@ def compile_mla_reduce(
                     if fx.const_expr(direct_pmap):
                         pmap0 = fx.Int32(g_pmap[fx.Index(t0)])
                     else:
-                        base_idx = fx.Index(base_i32)
-                        pmap_v = lds_pmap.load(base_idx, vec_size=GRP)
+                        pmap_v = fx.ptr_load(
+                            fx.add_offset(lds_pmap.ptr, base_i32),
+                            T.vec(GRP, T.i32),
+                        )
                         pmap0 = fx.Int32(
                             fx.vector.extract(
                                 pmap_v, static_position=[0], dynamic_position=[]
@@ -715,9 +601,7 @@ def compile_mla_reduce(
                     valids = []
                     for j in fx.range_constexpr(GRP):
                         split_j = base_i32 + fx.Int32(j)
-                        in_split = fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.slt, split_j, n_splits
-                        )
+                        in_split = split_j < n_splits
                         if fx.const_expr(direct_pmap):
                             safe_split = in_split.select(split_j, fx.Int32(0))
                             pmap_raw = fx.Int32(g_pmap[fx.Index(t0 + safe_split)])
@@ -730,7 +614,7 @@ def compile_mla_reduce(
                         pmap_j = fx.Int32(in_split.select(pmap_raw, pmap0))
                         row_idx, in_bounds = row_from_pmap(pmap_j, local_seq)
                         os_raw = load_o_elems(g_po, row_idx, fx.Index(head), col)
-                        valid = fx.arith.andi(in_split, in_bounds)
+                        valid = in_split & in_bounds
                         os_list.append(os_raw)
                         valids.append(valid)
                     return os_list, valids
@@ -742,7 +626,10 @@ def compile_mla_reduce(
                     pmap0-substituted + row-clamped to a finite value, so no
                     separate float mask is needed. Must run after the scale
                     barrier."""
-                    scale_v = lds_scale.load(fx.Index(base_i32), vec_size=GRP)
+                    scale_v = fx.ptr_load(
+                        fx.add_offset(lds_scale.ptr, base_i32),
+                        T.vec(GRP, T.f32),
+                    )
                     scs = []
                     for j in fx.range_constexpr(GRP):
                         sc_j = fx.vector.extract(
@@ -833,71 +720,45 @@ def compile_mla_reduce(
             def dispatch_tier_body(seq_i32, local_seq, direct_pmap: bool = False):
                 """Select algorithm from n_splits (runtime for Tier.ALL)."""
                 if fx.const_expr(is_runtime_tier):
-                    is_lt_thr = fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.slt,
-                        n_splits,
-                        fx.Int32(MASSIVE_THR),
-                    )
-                    if_lt = scf.IfOp(is_lt_thr, results_=[], has_else=True)
-                    with _if_then(if_lt):
+                    if n_splits < fx.Int32(MASSIVE_THR):
                         emit_simple_body(seq_i32, local_seq, direct_pmap)
-                    with _if_else(if_lt):
-                        is_le_64 = fx.arith.cmpi(
-                            fx.arith.CmpIPredicate.sle,
-                            n_splits,
-                            fx.Int32(64),
-                        )
-                        if_le64 = scf.IfOp(is_le_64, results_=[], has_else=True)
-                        with _if_then(if_le64):
-                            if fx.const_expr(M64_HI_THR > 0):
-                                # Runtime M64 sub-split: high-split M64 tiles
-                                # (n_splits > thr) take the deeper GRP=M64_HI_GRP
-                                # pipeline; low-split tiles keep GRP_M64 (fewer
-                                # wasted masked lanes). Capture-safe (device-side
-                                # branch, no host tier baking).
-                                is_hi = fx.arith.cmpi(
-                                    fx.arith.CmpIPredicate.sgt,
-                                    n_splits,
-                                    fx.Int32(M64_HI_THR),
-                                )
-                                if_hi = scf.IfOp(is_hi, results_=[], has_else=True)
-                                with _if_then(if_hi):
-                                    emit_massive_body(
-                                        seq_i32,
-                                        local_seq,
-                                        1,
-                                        grp_override=M64_HI_GRP,
-                                        direct_pmap=direct_pmap,
-                                    )
-                                with _if_else(if_hi):
-                                    emit_massive_body(
-                                        seq_i32,
-                                        local_seq,
-                                        1,
-                                        direct_pmap=direct_pmap,
-                                    )
-                            else:
-                                emit_massive_body(
-                                    seq_i32, local_seq, 1, direct_pmap=direct_pmap
-                                )
-                        with _if_else(if_le64):
-                            is_le_256 = fx.arith.cmpi(
-                                fx.arith.CmpIPredicate.sle,
-                                n_splits,
-                                fx.Int32(256),
-                            )
-                            if_le256 = scf.IfOp(is_le_256, results_=[], has_else=True)
-                            with _if_then(if_le256):
-                                emit_massive_body(
-                                    seq_i32, local_seq, 4, direct_pmap=direct_pmap
-                                )
-                            with _if_else(if_le256):
+                    elif n_splits <= fx.Int32(64):
+                        if fx.const_expr(M64_HI_THR > 0):
+                            # Runtime M64 sub-split: high-split M64 tiles
+                            # (n_splits > thr) take the deeper GRP=M64_HI_GRP
+                            # pipeline; low-split tiles keep GRP_M64 (fewer
+                            # wasted masked lanes). Capture-safe (device-side
+                            # branch, no host tier baking).
+                            if n_splits > fx.Int32(M64_HI_THR):
                                 emit_massive_body(
                                     seq_i32,
                                     local_seq,
-                                    NLSE_MLDS,
+                                    1,
+                                    grp_override=M64_HI_GRP,
                                     direct_pmap=direct_pmap,
                                 )
+                            else:
+                                emit_massive_body(
+                                    seq_i32,
+                                    local_seq,
+                                    1,
+                                    direct_pmap=direct_pmap,
+                                )
+                        else:
+                            emit_massive_body(
+                                seq_i32, local_seq, 1, direct_pmap=direct_pmap
+                            )
+                    elif n_splits <= fx.Int32(256):
+                        emit_massive_body(
+                            seq_i32, local_seq, 4, direct_pmap=direct_pmap
+                        )
+                    else:
+                        emit_massive_body(
+                            seq_i32,
+                            local_seq,
+                            NLSE_MLDS,
+                            direct_pmap=direct_pmap,
+                        )
                 elif fx.const_expr(not is_massive):
                     emit_simple_body(seq_i32, local_seq, direct_pmap)
                 else:
@@ -910,15 +771,9 @@ def compile_mla_reduce(
                     dispatch_tier_body(seq_i32, local_seq, direct_pmap)
 
             if fx.const_expr(low_direct_pmap_thr > 0 and use_reduce_final_map):
-                use_direct_pmap = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.sle,
-                    n_splits,
-                    fx.Int32(low_direct_pmap_thr),
-                )
-                if_direct = scf.IfOp(use_direct_pmap, results_=[], has_else=True)
-                with _if_then(if_direct):
+                if n_splits <= fx.Int32(low_direct_pmap_thr):
                     run_seq_loop(direct_pmap=True)
-                with _if_else(if_direct):
+                else:
                     stage_pmap()
                     run_seq_loop(direct_pmap=False)
             else:
@@ -932,39 +787,24 @@ def compile_mla_reduce(
             # terminates once it reaches a tile at the CSR sentinel.
             tot_work = c_H * num_thread_group * num_reduce_tile
             grid_stride = fx.Int32(fx.grid_dim.x)
-            init_work = fx.Int32(fx.block_idx.x)
-
-            w = scf.WhileOp([T.i32], [_to_raw(init_work)])
-            before = ir.Block.create_at_start(w.before, [T.i32])
-            after = ir.Block.create_at_start(w.after, [T.i32])
-            with ir.InsertionPoint(before):
-                work_idx = fx.Int32(before.arguments[0])
-                in_range = fx.arith.cmpi(fx.arith.CmpIPredicate.slt, work_idx, tot_work)
-                scf.ConditionOp(in_range, [before.arguments[0]])
-            with ir.InsertionPoint(after):
-                work_idx = fx.Int32(after.arguments[0])
+            work_idx = fx.Int32(fx.block_idx.x)
+            while work_idx < tot_work:
                 head = work_idx % c_H
                 temp_idx = work_idx // c_H
                 block_idx = temp_idx % num_thread_group
                 tile = temp_idx // num_thread_group
 
-                # Uniform sentinel -> scalar s_load_dword (reduce.cu:688), not a
+                # Uniform sentinel -> scalar s_buffer_load (reduce.cu:688), not a
                 # per-lane buffer_load + s_waitcnt lgkmcnt(0) (the traversal floor).
                 tile_start = _scalar_indptr(tile)
-                is_past_end = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tile_start, last)
-                not_past_end = fx.arith.cmpi(
-                    fx.arith.CmpIPredicate.ne, tile_start, last
-                )
-                if_has_work = scf.IfOp(not_past_end, results_=[], has_else=False)
-                with ir.InsertionPoint(if_has_work.then_block):
+                is_past_end = tile_start == last
+                if tile_start != last:
                     process_work_item(head, block_idx, tile, num_thread_group)
                     # LDS (lds_pmap, lds_scale) is reused per work item; fence
                     # before the next iteration overwrites it.
                     fx.gpu.barrier()
-                    scf.YieldOp([])
 
-                next_work = is_past_end.select(tot_work, work_idx + grid_stride)
-                scf.YieldOp([_to_raw(next_work)])
+                work_idx = is_past_end.select(tot_work, work_idx + grid_stride)
         else:
             head = fx.block_idx.x
             block_idx = fx.block_idx.y  # q-pos group (NTG)
@@ -991,29 +831,13 @@ def compile_mla_reduce(
         num_final_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        ctx = CompilationContext.get_current()
-        allocator.finalized = False
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
-        # opt4: pin occupancy via rocdl.waves_per_eu on the emitted gpu.func.
-        if fx.const_expr(waves_per_eu >= 1):
-            _wpe = int(waves_per_eu)
-            for op in ctx.gpu_module_body.operations:
-                if getattr(op, "OPERATION_NAME", None) == "gpu.func":
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                        T.i32, _wpe
-                    )
-
-        idx_tiles = fx.arith.index_cast(T.index, num_reduce_tile)
+        idx_tiles = fx.Index(num_reduce_tile)
         idx_H = fx.Index(H)
-        idx_ntg = fx.arith.index_cast(T.index, _to_raw(max_seqlen_q))
+        idx_ntg = fx.Index(max_seqlen_q)
         if fx.const_expr(persistent and not adaptive):
             _ps_mult = int(os.environ.get("MLA_PS_GRID_MULT", PS_GRID_MULT))
-            ps_grid = fx.arith.muli(
-                _to_raw(max_splits), fx.arith.constant(_ps_mult, type=T.i32)
-            )
-            idx_grid = fx.arith.index_cast(T.index, ps_grid)
+            ps_grid = max_splits * fx.Int32(_ps_mult)
+            idx_grid = fx.Index(ps_grid)
             grid = (idx_grid, fx.Index(1), fx.Index(1))
         elif fx.const_expr(adaptive):
             # One block per active (tile, head, q-group). grid-z = num_final_rows
@@ -1038,6 +862,7 @@ def compile_mla_reduce(
             num_partial_rows,
             num_final_rows,
             max_seqlen_q,
+            value_attrs=kernel_value_attrs,
         ).launch(
             grid=grid,
             block=(NUM_THREADS, 1, 1),
@@ -1236,6 +1061,9 @@ def compile_mla_reduce_splitk(
     """
     assert Dv % NUM_THREADS == 0
     VEC = Dv // NUM_THREADS
+    kernel_value_attrs = (
+        {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
+    )
 
     def _f32_vec_load(g, row_idx, col_idx):
         if fx.const_expr(VEC == 1):
@@ -1301,7 +1129,7 @@ def compile_mla_reduce_splitk(
         chunk = (n_splits + fx.Int32(K - 1)) // c_K
         lo = j * chunk
         hi_full = lo + chunk
-        over = fx.arith.cmpi(fx.arith.CmpIPredicate.sgt, hi_full, n_splits)
+        over = hi_full > n_splits
         hi = over.select(n_splits, hi_full)
 
         neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
@@ -1310,23 +1138,20 @@ def compile_mla_reduce_splitk(
         init = [_to_raw(zero_f) for _ in fx.range_constexpr(VEC)]
         init += [_to_raw(neg_inf), _to_raw(zero_f)]
 
-        lo_idx = fx.arith.index_cast(T.index, _to_raw(lo))
-        hi_idx = fx.arith.index_cast(T.index, _to_raw(hi))
+        lo_idx = fx.Index(lo)
+        hi_idx = fx.Index(hi)
 
         results = init
         for s, state in range(lo_idx, hi_idx, fx.Index(1), init=init):
             regs = [state[i] for i in fx.range_constexpr(VEC)]
             m = state[VEC]
             lse_acc = state[VEC + 1]
-            s_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(s)))
+            s_i32 = fx.Int32(s)
             split_i32 = t0 + s_i32
             pmap_v = fx.Int32(g_pmap[fx.Index(split_i32)])
-            in_b = fx.arith.andi(
-                fx.arith.cmpi(fx.arith.CmpIPredicate.sge, pmap_v, fx.Int32(0)),
-                fx.arith.cmpi(fx.arith.CmpIPredicate.slt, pmap_v, num_partial_rows),
-            )
+            in_b = (pmap_v >= fx.Int32(0)) & (pmap_v < num_partial_rows)
             safe_row = in_b.select(pmap_v, fx.Int32(0))
-            row_idx = fx.arith.index_cast(T.index, _to_raw(safe_row))
+            row_idx = fx.Index(safe_row)
             os = _o3d_vec_load(g_po, row_idx, fx.Index(head), col)
             lse = g_pl[row_idx, fx.Index(head)]
             lse = in_b.select(lse, neg_inf)
@@ -1345,12 +1170,9 @@ def compile_mla_reduce_splitk(
         lse_acc = results[VEC + 1]
         prow = fx.Index(w)
         _f32_vec_store(g_acc, prow, col, regs)
-        is_t0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
-        if_t0 = scf.IfOp(is_t0, results_=[], has_else=False)
-        with ir.InsertionPoint(if_t0.then_block):
+        if tid == fx.Int32(0):
             g_ml[prow, fx.Index(0)] = m
             g_ml[prow, fx.Index(1)] = lse_acc
-            scf.YieldOp([])
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def sk_combine_kernel(
@@ -1383,10 +1205,7 @@ def compile_mla_reduce_splitk(
         base = slot * c_K
 
         q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
-        q_valid = fx.arith.andi(
-            fx.arith.cmpi(fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)),
-            fx.arith.cmpi(fx.arith.CmpIPredicate.slt, q_start, num_final_rows),
-        )
+        q_valid = (q_start >= fx.Int32(0)) & (q_start < num_final_rows)
 
         neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
         zero_f = fx.arith.constant(0.0, type=T.f32)
@@ -1413,8 +1232,7 @@ def compile_mla_reduce_splitk(
         inv = den_ok.select(fx.rocdl.rcp(T.f32, den), zero_f)
         out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
 
-        if_q = scf.IfOp(q_valid, results_=[], has_else=False)
-        with ir.InsertionPoint(if_q.then_block):
+        if q_valid:
             store_off = (
                 q_start * stride_s_o + head * stride_h_o + fx.Int32(tid) * fx.Int32(VEC)
             )
@@ -1436,22 +1254,9 @@ def compile_mla_reduce_splitk(
                 )
                 inf = fx.arith.constant(float("inf"), type=T.f32)
                 lse_val = bad.select(inf, _log(den) + M)
-                is_l0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
-                if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
-                with ir.InsertionPoint(if_l0.then_block):
+                if tid == fx.Int32(0):
                     lse_off = q_start * c_H + head
                     g_flse[fx.Index(lse_off)] = lse_val
-                    scf.YieldOp([])
-            scf.YieldOp([])
-
-    def _set_wpe(ctx):
-        if fx.const_expr(waves_per_eu >= 1):
-            _wpe = int(waves_per_eu)
-            for op in ctx.gpu_module_body.operations:
-                if getattr(op, "OPERATION_NAME", None) == "gpu.func":
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                        T.i32, _wpe
-                    )
 
     @flyc.jit
     def launch_partial(
@@ -1465,8 +1270,7 @@ def compile_mla_reduce_splitk(
         sk_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        _set_wpe(CompilationContext.get_current())
-        idx_grid = fx.arith.index_cast(T.index, _to_raw(sk_grid))
+        idx_grid = fx.Index(sk_grid)
         sk_partial_kernel(
             partial_output,
             partial_lse,
@@ -1475,6 +1279,7 @@ def compile_mla_reduce_splitk(
             sk_acc,
             sk_ml,
             num_partial_rows,
+            value_attrs=kernel_value_attrs,
         ).launch(
             grid=(idx_grid, fx.Index(1), fx.Index(1)),
             block=(NUM_THREADS, 1, 1),
@@ -1494,8 +1299,7 @@ def compile_mla_reduce_splitk(
         sk_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        _set_wpe(CompilationContext.get_current())
-        idx_grid = fx.arith.index_cast(T.index, _to_raw(sk_grid))
+        idx_grid = fx.Index(sk_grid)
         sk_combine_kernel(
             reduce_final_map,
             sk_acc,
@@ -1505,6 +1309,7 @@ def compile_mla_reduce_splitk(
             stride_s_o,
             stride_h_o,
             num_final_rows,
+            value_attrs=kernel_value_attrs,
         ).launch(
             grid=(idx_grid, fx.Index(1), fx.Index(1)),
             block=(NUM_THREADS, 1, 1),

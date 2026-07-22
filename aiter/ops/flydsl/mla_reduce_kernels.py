@@ -24,7 +24,6 @@ from .kernels.mla_reduce import (
     derive_actual_max_splits,
     plan_splitk_capture_safe,
     should_use_persistent_launch,
-    waves_per_eu_from_env,
 )
 
 __all__ = [
@@ -86,6 +85,7 @@ def flydsl_mla_reduce_v1(
     actual_max_splits: int | None = None,  # true max tile width; gates DA split-K
     *,
     stream: torch.cuda.Stream | None = None,
+    waves_per_eu: int = 4,
 ) -> None:
     """FlyDSL drop-in replacement for ``aiter.mla_reduce_v1`` (write-in-place).
 
@@ -105,6 +105,7 @@ def flydsl_mla_reduce_v1(
             Normally ``None`` -> auto-resolved from ``reduce_indptr``
             (:func:`_resolve_actual_max_splits`); an explicit value is used as-is.
         stream: launch stream; defaults to the device's current stream.
+        waves_per_eu: compile-time occupancy hint for FlyDSL kernels.
     """
     if reduce_indptr.numel() < 2:
         return
@@ -156,7 +157,7 @@ def flydsl_mla_reduce_v1(
                 out_dtype=out_dtype_str,
                 K=sk_K,
                 output_lse=output_lse,
-                waves_per_eu=waves_per_eu_from_env(),
+                waves_per_eu=waves_per_eu,
             )
             sk_acc, sk_ml = _get_splitk_scratch(
                 sk_slots, sk_K, Dv, final_output.device.index
@@ -216,7 +217,7 @@ def flydsl_mla_reduce_v1(
         persistent=use_persistent and not use_adaptive,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,
-        waves_per_eu=waves_per_eu_from_env(),
+        waves_per_eu=waves_per_eu,
         adaptive=use_adaptive,
         low_direct_pmap_thr=low_direct_pmap_thr,
     )
