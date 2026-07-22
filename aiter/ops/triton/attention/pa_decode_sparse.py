@@ -178,7 +178,7 @@ def pa_decode_sparse(
         kv_splits = triton.next_power_of_2(kv_splits)
 
     if use_gluon:
-        _lds_budget = 320 * 1024
+        _lds_budget = arch_info.get_lds_size()
         _lds_cap = max(1, _lds_budget // (block_d * 4))
         kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
         if kv_splits > 8:

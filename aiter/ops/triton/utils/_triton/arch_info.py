@@ -33,3 +33,16 @@ def is_tdm_avail():
 
 
 _LDS_CAP_BYTES = {"gfx950": 163840, "gfx942": 65536}
+
+
+def get_lds_size():
+    """Return the per-CU LDS (shared memory) budget in bytes for the current arch.
+
+    gfx1250: 320 KB, gfx950 (CDNA4): 160 KB, gfx942 and everything else: 64 KB.
+    """
+    arch = get_arch()
+    if arch == "gfx1250":
+        return 320 * 1024
+    if arch == "gfx950":
+        return 160 * 1024
+    return 64 * 1024
