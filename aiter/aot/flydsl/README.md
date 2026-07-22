@@ -28,6 +28,43 @@ directory of your checkout).
 
 ---
 
+## CPU compile-request baseline
+
+The standard two-stage MoE old-path call graph and backend boundaries are
+documented in
+[`docs/flydsl_moe_compile_inventory.md`](../../../docs/flydsl_moe_compile_inventory.md).
+This inventory and its golden are regression baselines, not a Manifest or a new
+source of dispatch truth.
+
+Run the baseline without a GPU:
+
+```bash
+source /opt/venv/bin/activate
+AITER_AOT_IMPORT=1 \
+  python -m pytest -q aiter/aot/flydsl/tests/test_moe_compile_baseline.py
+```
+
+The test mocks FlyDSL compile/launch and CUDA access, then compares complete
+normalized builder requests with
+`aiter/aot/flydsl/tests/data/moe_compile_requests_gfx950.json`.
+Update that golden only for an intentional, reviewed old-host-path semantic
+change. Regenerate it with the recorder, never by hand or from FlyDSL-private
+cache keys:
+
+```bash
+python aiter/aot/flydsl/tests/moe_compile_recorder.py \
+  --write aiter/aot/flydsl/tests/data/moe_compile_requests_gfx950.json
+AITER_AOT_IMPORT=1 \
+  python -m pytest -q aiter/aot/flydsl/tests/test_moe_compile_baseline.py
+```
+
+Use the recorder's direct script entry above. For pytest,
+`AITER_AOT_IMPORT=1` keeps its parent-package collection lightweight until the
+test installs the CPU-only isolation.
+Review the semantic golden diff before committing.
+
+---
+
 ## 1. Run AOT pre-compilation (compile smoke test)
 
 The most direct "test" is to run each module as a `python -m` entry point and
