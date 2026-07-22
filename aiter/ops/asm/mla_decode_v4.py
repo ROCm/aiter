@@ -35,6 +35,7 @@ from aiter.ops.asm.asm_utils import (
     get_warp_size,
     launch_co,
     load_asm_cfg_csv,
+    register_asm_custom_op,
 )
 
 # kV4DimNope + kV4DimRope = 448 + 64 = 512. The kernel hardcodes 1/sqrt(512)
@@ -108,34 +109,37 @@ def _get_heuristic_kernel(q_type, kv_type, gqa, ps, prefill, causal, qseqlen, ls
     )
 
 
-def mla_decode_v4_asm_gfx1250(
-    Q,
-    qrope,
-    KV,
-    kvrope,
-    qo_indptr,
-    kv_indptr,
-    kv_page_indices,
-    split_indptr,
-    sink,
-    max_seqlen_q,
-    softmax_scale,
-    out_16_nosplit,
-    num_kv_splits,
-    splitData,
-    splitLse,
-    output,
-    valid_split_count=None,
-    use_valid_split_count_reduce=0,
-    kv_last_page_lens=None,
-    stream=None,
+def mla_decode_v4_asm_gfx1250_eager(
+    Q: torch.Tensor,
+    qrope: torch.Tensor,
+    KV: torch.Tensor,
+    kvrope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    split_indptr: torch.Tensor,
+    sink: torch.Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    out_16_nosplit: int,
+    num_kv_splits: int,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    valid_split_count: torch.Tensor | None = None,
+    use_valid_split_count_reduce: int = 0,
+    kv_last_page_lens: torch.Tensor | None = None,
 ):
-    """gfx1250 v4 nm decode stage1 launch — Python peer of
-    ``aiter.mla_decode_v4_asm`` (asm_mla_v4.cu) restricted to the gfx1250
+    """gfx1250 v4 nm decode stage1 launch (eager, pure Python + ctypes) — Python
+    peer of ``aiter.mla_decode_v4_asm`` (asm_mla_v4.cu) restricted to the gfx1250
     preload path. Same call signature; ``softmax_scale`` and ``split_indptr``
     are accepted for parity but unused on this ABI (the preload kernarg carries
     neither: the kernel hardcodes 1/sqrt(512) and derives splits from
-    s_kv_split)."""
+    s_kv_split).
+
+    This is the raw launcher: lowest host overhead, but opaque to TorchDynamo.
+    Prefer the :func:`mla_decode_v4_asm_gfx1250` dispatcher, which routes to the
+    ``torch.compile``-safe custom op while tracing and here otherwise."""
     del softmax_scale  # kernel hardcodes 1/sqrt(512)
     del split_indptr  # not part of the compact preload kernarg
 
@@ -186,7 +190,9 @@ def mla_decode_v4_asm_gfx1250(
     args.ptr_Q = Q.data_ptr()
     args.ptr_KV = KV.data_ptr()
     args.ptr_LTP = kv_indptr.data_ptr()
-    args.ptr_LTL = kv_last_page_lens.data_ptr() if kv_last_page_lens is not None else None
+    args.ptr_LTL = (
+        kv_last_page_lens.data_ptr() if kv_last_page_lens is not None else None
+    )
     args.ptr_QTP = qo_indptr.data_ptr()
     args.ptr_QROPE = qrope.data_ptr()
     args.ptr_KVROPE = kvrope.data_ptr()
@@ -197,12 +203,13 @@ def mla_decode_v4_asm_gfx1250(
     args.out_16_nosplit = int(out_16_nosplit)
     args.ptr_LSE = splitLse.data_ptr()
     args.ptr_LTD = kv_page_indices.data_ptr()
-    if use_valid_split_count_reduce != 0:
-        if valid_split_count is None or valid_split_count.data_ptr() == 0:
-            raise ValueError(
-                "mla_decode_v4_asm_gfx1250: gfx1250 requires valid_split_count "
-                "scratch tensor when use_valid_split_count_reduce!=0"
-            )
+    if use_valid_split_count_reduce != 0 and (
+        valid_split_count is None or valid_split_count.data_ptr() == 0
+    ):
+        raise ValueError(
+            "mla_decode_v4_asm_gfx1250: gfx1250 requires valid_split_count "
+            "scratch tensor when use_valid_split_count_reduce!=0"
+        )
     if valid_split_count is not None and valid_split_count.data_ptr() != 0:
         if valid_split_count.dtype != torch.int32:
             raise ValueError(
@@ -228,4 +235,161 @@ def mla_decode_v4_asm_gfx1250(
     gdy = num_seqs
     gdz = int(num_kv_splits)
 
-    launch_co(func, (gdx, gdy, gdz), (block_dim, 1, 1), args, stream=stream)
+    launch_co(func, (gdx, gdy, gdz), (block_dim, 1, 1), args)
+
+
+# ---------------------------------------------------------------------------
+# torch.compile support.
+#
+# The launcher above is pure Python + ctypes, so it graph-breaks under
+# `torch.compile(fullgraph=True)`. Exposing it as an aiter custom op via the
+# generic `register_asm_custom_op` helper (asm_utils) makes Dynamo treat the
+# launch as one opaque graph node. This does NOT change the eager dispatch in
+# aiter/mla.py; callers opt in via
+# `torch.ops.aiter.mla_decode_v4_asm_gfx1250(...)`. Only the schema-clean,
+# type-annotated adapter below is op-specific — the registration + no-op fake
+# are shared.
+# ---------------------------------------------------------------------------
+# TODO(mla-pyco): remove this adapter once ``mla_decode_v4_asm_gfx1250_eager``
+# can be registered as a custom op directly. ``_eager`` is now fully type
+# annotated, so ``torch.library.infer_schema`` can derive a schema from it.
+# The ONLY remaining reason this adapter still exists is ARG ORDER (verified
+# empirically): ``_eager`` uses the C-ABI parity order (SymInt scalars BEFORE
+# the mutated buffers), and registering that order makes ``fullgraph=True`` fail
+# ("Attempted to call function marked as skipped"), because a SymInt ahead of
+# the mutated tensors breaks torch's auto-functionalization arg boxing. The
+# buffer-first order below is what makes fullgraph pass (12/12); this adapter
+# just reorders to buffer-first and forwards to ``_eager``.
+#
+# To drop it in the future, move the mutated buffers (``splitData`` /
+# ``splitLse`` / ``output`` / ``valid_split_count``) ahead of the SymInt scalars
+# in ``_eager`` itself, then pass ``_eager`` straight to
+# ``register_asm_custom_op`` and update the ``mla_decode_v4_asm_gfx1250``
+# dispatcher to the new arg order. The cost is that ``_eager`` stops mirroring
+# ``aiter.mla_decode_v4_asm``'s C-ABI signature. Alternatively, revisit if a
+# newer torch fixes the SymInt-before-mutated-tensor auto-functionalization
+# ordering constraint, which would remove the need entirely.
+def _mla_decode_v4_asm_gfx1250_op(
+    Q: torch.Tensor,
+    qrope: torch.Tensor,
+    KV: torch.Tensor,
+    kvrope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    split_indptr: torch.Tensor,
+    sink: torch.Tensor,
+    splitData: torch.Tensor,
+    splitLse: torch.Tensor,
+    output: torch.Tensor,
+    valid_split_count: torch.Tensor | None,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    out_16_nosplit: int,
+    num_kv_splits: int,
+    use_valid_split_count_reduce: int,
+    kv_last_page_lens: torch.Tensor | None = None,
+) -> None:
+    """Schema-clean, `torch.compile`-safe entry point for the gfx1250 v4 nm
+    launch. Thin adapter: reorders args to the positional signature of
+    :func:`mla_decode_v4_asm_gfx1250` (which carries keyword defaults torch
+    schema inference cannot represent) and forwards to it.
+
+    NOTE: the mutated tensors (`splitData` / `splitLse` / `output` /
+    `valid_split_count`) are deliberately placed BEFORE the SymInt scalars here.
+    Putting a value-0 SymInt (e.g. out_16_nosplit=0) ahead of the mutated tensors
+    trips torch's auto-functionalization arg boxing under
+    `torch.compile(fullgraph=True)` (it mis-types a later SymInt as a Tensor), so
+    this buffer-first order is load-bearing, not cosmetic."""
+    mla_decode_v4_asm_gfx1250_eager(
+        Q,
+        qrope,
+        KV,
+        kvrope,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        split_indptr,
+        sink,
+        max_seqlen_q,
+        softmax_scale,
+        out_16_nosplit,
+        num_kv_splits,
+        splitData,
+        splitLse,
+        output,
+        valid_split_count,
+        use_valid_split_count_reduce,
+        kv_last_page_lens,
+    )
+
+
+# Pure in-place op (writes splitData/splitLse/output/valid_split_count), so the
+# default no-op fake in register_asm_custom_op suffices — no fake_impl needed.
+mla_decode_v4_asm_gfx1250_compiled = register_asm_custom_op(
+    "mla_decode_v4_asm_gfx1250",
+    _mla_decode_v4_asm_gfx1250_op,
+    mutates_args=["splitData", "splitLse", "output", "valid_split_count"],
+)
+
+
+def mla_decode_v4_asm_gfx1250(
+    Q,
+    qrope,
+    KV,
+    kvrope,
+    qo_indptr,
+    kv_indptr,
+    kv_page_indices,
+    split_indptr,
+    sink,
+    max_seqlen_q,
+    softmax_scale,
+    out_16_nosplit,
+    num_kv_splits,
+    splitData,
+    splitLse,
+    output,
+    valid_split_count=None,
+    use_valid_split_count_reduce=0,
+    kv_last_page_lens=None,
+):
+    """gfx1250 v4 nm decode stage1 launch — always via the registered custom op.
+
+    Signature-compatible drop-in for the raw launcher, so callers (aiter/mla.py)
+    need no change. It ALWAYS routes through the custom op
+    ``torch.ops.aiter.mla_decode_v4_asm_gfx1250``: in eager it dispatches
+    straight to the ctypes launcher, and under ``torch.compile`` /
+    ``torch.export`` it becomes ONE opaque, ``fullgraph=True``-safe graph node.
+    This is the idiomatic "just wrap it as a custom op" pattern — one code path
+    for eager + traced, no ``is_compiling()`` branch to keep in sync. The launch
+    always runs on torch's current stream (as compiled/traced graphs require).
+
+    The op reorders the mutated buffers (``splitData`` / ``splitLse`` /
+    ``output`` / ``valid_split_count``) ahead of the SymInt scalars, as required
+    by torch's auto-functionalization (see ``_mla_decode_v4_asm_gfx1250_op``).
+    ``valid_split_count`` is an optional mutated tensor (``Tensor(a!)?``), so
+    ``None`` is accepted (null scratch ptr) in eager and under compile alike —
+    no separate fallback path is needed.
+    """
+    torch.ops.aiter.mla_decode_v4_asm_gfx1250(
+        Q,
+        qrope,
+        KV,
+        kvrope,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        split_indptr,
+        sink,
+        splitData,
+        splitLse,
+        output,
+        valid_split_count,
+        max_seqlen_q,
+        softmax_scale,
+        int(out_16_nosplit),
+        int(num_kv_splits),
+        int(use_valid_split_count_reduce),
+        kv_last_page_lens,
+    )

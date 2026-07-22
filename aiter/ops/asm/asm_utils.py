@@ -13,6 +13,7 @@ kernels off their C++ dispatchers:
                                      launch_co
   * asm kernel registry helpers   -> dtype_str / strip_csv_comments /
                                      load_asm_cfg_csv
+  * torch.compile interop          -> register_asm_custom_op
 
 The HIP handle is deliberately the SAME ``libamdhip64`` that torch already
 mapped (found by scanning ``/proc/self/maps``), so module-load / launch share
@@ -252,7 +253,7 @@ def strip_csv_comments(lines):
 DEFAULT_ASM_CSV_STR_COLS = frozenset({"qType", "kvType", "knl_name", "co_name"})
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def load_asm_cfg_csv(csv_path, str_cols=DEFAULT_ASM_CSV_STR_COLS):
     """Parse an asm-registry csv into a list of dict rows (process-cached per
     path). Integer columns are coerced to int; `str_cols` stay as text. Rows
@@ -279,3 +280,70 @@ def load_asm_cfg_csv(csv_path, str_cols=DEFAULT_ASM_CSV_STR_COLS):
     if not cfgs:
         raise RuntimeError(f"no kernel rows parsed from {csv_path}")
     return cfgs
+
+
+# ---------------------------------------------------------------------------
+# torch.compile interop
+#
+# A pure-Python ctypes ``.co`` launcher (see launch_co above) is opaque to
+# TorchDynamo: it can neither be traced into (untraceable C builtins + the
+# ctypes FFI) nor fake-run (it calls ``data_ptr()`` on FakeTensors). So any
+# function that reaches such a launch graph-breaks, and `torch.compile(
+# fullgraph=True)` over it raises.
+#
+# Registering the launch as an aiter custom op (schema inferred from the op
+# function's type hints, plus a fake/meta impl) makes Dynamo treat it as ONE
+# opaque graph node with known metadata: no graph break, and the real ctypes
+# launch still runs at execution time. This helper is the generic, op-agnostic
+# glue; each asm op only has to supply a schema-clean, type-annotated launch
+# function and the list of buffers it mutates.
+# ---------------------------------------------------------------------------
+def register_asm_custom_op(
+    op_name,
+    op_func,
+    mutates_args,
+    fake_impl=None,
+    dispatch_key="CUDA",
+):
+    """Register a pure-Python asm ``.co`` launcher as an aiter custom op so it is
+    ``torch.compile(fullgraph=True)``-safe.
+
+    Args:
+        op_name: op name under the ``aiter`` torch library (callable as
+            ``torch.ops.aiter.<op_name>``). Must be unique process-wide.
+        op_func: the launch function. It MUST be fully type-annotated (Tensor /
+            Optional[Tensor] / int / float / bool ...) because the op schema is
+            inferred from those hints via ``torch.library.infer_schema``; it may
+            NOT take a ``torch.cuda.Stream`` or other non-schema types (wrap the
+            real launcher in a thin, schema-clean adapter if needed).
+        mutates_args: names of the tensor args the kernel writes in place (the
+            aliasing the schema must record). For a pure in-place launch, list
+            every output/scratch buffer here.
+        fake_impl: meta/fake implementation. Omit it for a pure in-place op that
+            returns nothing (a no-op fake is registered); supply one that returns
+            correctly-shaped ``torch.empty_like``/``new_empty`` tensors if the op
+            has real return values.
+        dispatch_key: backend dispatch key (default "CUDA").
+
+    Returns:
+        The registered op callable (``torch.ops.aiter.<op_name>``).
+    """
+    # Lazy import: keeps this module import-light and dependency-scoped to torch
+    # + ctypes for callers that never register a compile-safe op.
+    from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+    if fake_impl is None:
+
+        def fake_impl(*args, **kwargs):
+            # Pure in-place op: mutated buffers are declared via `mutates_args`,
+            # so the fake produces no new tensors.
+            return None
+
+    direct_register_custom_op(
+        op_name,
+        op_func,
+        mutates_args=list(mutates_args),
+        fake_impl=fake_impl,
+        dispatch_key=dispatch_key,
+    )
+    return getattr(torch.ops.aiter, op_name)
