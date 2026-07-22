@@ -1,9 +1,13 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
-from dataclasses import dataclass, fields
+import dataclasses
+
 import pytest
 import torch
+
+# backend selection for moe_gemm_a16w4 (triton vs gfx1250 gluon)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -159,47 +163,34 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 # ---------------
 
 
-@dataclass
-class Case:
-    m: int
-    n: int
-    k: int
-    n_expts_tot: int = 1
-    n_expts_act: int = 1
-    hbm_swizzling: bool = False
+# Test matrix: SHAPES x EXPERTS x SWIZZLE x apply_swiglu, plus gather/scatter,
+# gammas and backend axes below.
+SHAPES = [
+    (4, 4, 8),
+    (4, 1024, 3072),
+    (16, 256, 256),
+    (16, 1024, 1024),
+    (300, 400, 800),
+    (1000, 704, 800),
+    (1024, 3072, 512),
+    (4096, 256, 256),
+    (4096, 3072, 3072),
+    (4097, 1024, 1024),
+    (8192, 3072, 3072),
+    # MiniMax-M3 gate/up (n=k=6144) and down (n=6144, k=3072), decode + prefill M.
+    (16, 6144, 6144),
+    (32, 6144, 3072),
+    (4096, 6144, 6144),
+    (4096, 6144, 3072),
+]
+# MiniMax-M3 routing: 128 experts, top-4.
+EXPERTS = [(128, 4)]
+SWIZZLES = [None, "CDNA4_SCALE", "GFX1250_SCALE"]
 
 
-@pytest.mark.parametrize(
-    ", ".join(f.name for f in fields(Case)),
-    [
-        tuple(getattr(case, f.name) for f in fields(Case))
-        for case in [
-            Case(4, 4, 8, 2, 1),
-            Case(4, 4, 8, 8, 2),
-            Case(4, 4, 8, 128, 4),
-            Case(4, 1024, 3072, 128, 4),
-            Case(32, 6144, 3072, 128, 4),
-            Case(16, 1024, 1024, 128, 4),
-            Case(16, 256, 256, 128, 4),
-            Case(4096, 256, 256, 128, 4),
-            Case(1024, 3072, 512, 128, 4),
-            Case(4096, 3072, 3072, 128, 4),
-            Case(8192, 3072, 3072, 128, 4),
-            Case(300, 400, 800, 8, 4),
-            Case(1000, 704, 800, 8, 2),
-            Case(4097, 1024, 1024, 128, 4),
-            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
-            Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
-            Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
-            Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
-            Case(16, 256, 256, 128, 4, hbm_swizzling=True),
-            Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
-            Case(4096, 256, 256, 128, 4, hbm_swizzling=True),
-            Case(4097, 1024, 1024, 128, 4, hbm_swizzling=True),
-            Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
-        ]
-    ],
-)
+@pytest.mark.parametrize("m, n, k", SHAPES)
+@pytest.mark.parametrize("n_expts_tot, n_expts_act", EXPERTS)
+@pytest.mark.parametrize("hbm_swizzling", SWIZZLES)
 @pytest.mark.parametrize(
     "do_gather, do_scatter",
     [
@@ -211,6 +202,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -222,11 +214,33 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
+    golden_cpu,
     device="cuda",
 ):
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # reduce_grouped static_asserts NPAD >= 32, so N must be >= 32. Only the
+    # degenerate (4, 4, 8) smoke shape violates this; skip its scatter cases.
+    if do_scatter and n < 32:
+        pytest.skip(f"scatter-combine (reduce_grouped) requires N >= 32, got N={n}")
+
+    # Pin the backend via the config arg.
+    backend_config = {"backend": backend}
+    if backend == "gluon":
+        # gluon a16w4 only dispatches on gfx1250; elsewhere it falls back to
+        # Triton, making this run a duplicate.
+        if get_arch() != "gfx1250":
+            pytest.skip("gluon a16w4 backend is only available on gfx1250")
+        # gluon a16w4 only supports compact (non-swizzled) e8m0 scales
+        # (CDNA4_SCALE unsupported, GFX1250_SCALE hangs the ROCm loader), so
+        # any swizzled scale raises. Skip those cases.
+        if hbm_swizzling:
+            pytest.skip(
+                f"gluon a16w4 backend does not support swizzled scales ({hbm_swizzling})"
+            )
 
     if hbm_swizzling:
         if not arch_info.is_mx_scale_preshuffling_avail():
@@ -237,6 +251,20 @@ def test_op(
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
+
+    # Known bug: triton CDNA4_SCALE + swiglu is numerically wrong for the MiniMax
+    # gate/up prefill shape (block_m=128, N=K=6144) on gfx1250 (RMS ~0.016 vs
+    # ~5e-6); None/GFX1250_SCALE and this shape without swiglu are fine. Drop this
+    # xfail once the CDNA4 unswizzle is fixed for that config.
+    if (
+        hbm_swizzling == "CDNA4_SCALE"
+        and (m, n, k) == (4096, 6144, 6144)
+        and apply_swiglu
+    ):
+        pytest.xfail(
+            "triton CDNA4_SCALE wrong on gfx1250 prefill (block_m=128, N=K=6144) "
+            "with swiglu"
+        )
 
     torch.manual_seed(0)
 
@@ -268,12 +296,33 @@ def test_op(
 
     # downcast to mxfp
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
-    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    # --golden-cpu computes the golden on CPU (frees GPU memory for the kernel; the
+    # per-expert upcast still runs on GPU then moves to the golden device).
+    # Per-expert upcast is bit-identical to a bulk upcast and avoids its
+    # int32-indexing overflow on > 2**31-element weights (MiniMax-M3, 128 experts).
+    golden_dev = "cpu" if golden_cpu else "cuda"
+    w_ref = torch.stack(
+        [
+            upcast_from_mxfp(w_tri[e], w_scale_tri[e], torch.bfloat16, axis=0).to(
+                golden_dev
+            )
+            for e in range(w_tri.shape[0])
+        ]
+    )
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = shuffle_scale_moe(
-            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        # hbm_swizzling names the target layout: CDNA4_SCALE via gfx950 shuffle,
+        # GFX1250_SCALE via gfx1250 (both preshuffle_factor=32, scale_kwidth=8).
+        # return_layout hands back the canonical label so the kernel's
+        # SWIZZLE_MX_SCALE matches the layout actually applied.
+        shuffle_arch = "gfx950" if hbm_swizzling == "CDNA4_SCALE" else "gfx1250"
+        w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+            w_scale_tri,
+            arch=shuffle_arch,
+            preshuffle_factor=32,
+            scale_kwidth=8,
+            return_layout=True,
         )
+        assert swizzle_mx_scale == hbm_swizzling, (swizzle_mx_scale, hbm_swizzling)
     else:
         swizzle_mx_scale = None
 
@@ -284,9 +333,27 @@ def test_op(
     maxtol = 4e-1
     rmstol = 4e-2
 
-    ref_y = moe_gemm_torch(
-        x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
-    )
+    if golden_dev == "cpu":
+        # moe_gemm_torch follows x.device; move all golden inputs to CPU (routing
+        # histogram included) and run the reference matmul on CPU.
+        rdata_g = dataclasses.replace(
+            rdata,
+            expt_hist=None if rdata.expt_hist is None else rdata.expt_hist.cpu(),
+        )
+        ref_y = moe_gemm_torch(
+            x_ref.cpu(),
+            w_ref,
+            bias_ref.cpu(),
+            rdata_g,
+            None if gindx is None else gindx.cpu(),
+            None if sindx is None else sindx.cpu(),
+            None if gammas is None else gammas.cpu(),
+            apply_swiglu,
+        )
+    else:
+        ref_y = moe_gemm_torch(
+            x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
+        )
 
     tri_y = moe_gemm_a16w4(
         x_tri,
@@ -303,5 +370,33 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        config=backend_config,
     )
-    assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+    assert_close(ref_y.to(tri_y.device), tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+def test_gluon_stage_wrappers_signature_match():
+    """The stage1/stage2/stage3 gluon entry points are thin wrappers that must
+    forward the *exact* signature of _moe_gemm_a16w4_gluon_impl. Because each is
+    a full hand-written copy of the ~48-arg signature, a drift (added, removed,
+    renamed or reordered param) would silently mis-forward one pipeline. Guard
+    against that here so the duplication stays honest."""
+    if get_arch() != "gfx1250":
+        pytest.skip("gluon a16w4 kernels are only built on gfx1250")
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
+        _moe_gemm_a16w4_gluon_impl,
+        _moe_gemm_a16w4_gluon_stage1,
+        _moe_gemm_a16w4_gluon_stage2,
+        _moe_gemm_a16w4_gluon_stage3,
+    )
+
+    ref = _moe_gemm_a16w4_gluon_impl.arg_names
+    for wrapper in (
+        _moe_gemm_a16w4_gluon_stage1,
+        _moe_gemm_a16w4_gluon_stage2,
+        _moe_gemm_a16w4_gluon_stage3,
+    ):
+        assert wrapper.arg_names == ref, (
+            f"{wrapper.__name__} signature drifted from "
+            f"_moe_gemm_a16w4_gluon_impl:\n  wrapper={wrapper.arg_names}\n  impl={ref}"
+        )

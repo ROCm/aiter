@@ -1,89 +1,20 @@
-import torch
-
 import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
-
-
-def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
-    M, N, K = None, args["N"], args["K"]
-    Y, X, W = args["Y"], args["X"], args["W"]
-    hist = args["ExptHist"]
-    if hist is not None:
-        n_rows = int(hist.float().mean())
-        n_tokens = float(hist.sum())
-        n_w_bytes = (W.numel() * W.element_size() // hist.numel()) * (hist > 0).sum()
-    else:
-        n_tokens = None
-        n_w_bytes = W.numel() * W.element_size()
-
-    def repr(s, x):
-        return f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
-
-    nbits = X.dtype.itemsize * 8
-    ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
-    gindx = args.get("GatherIndx", None)
-    if gindx is not None:
-        ret["name"] += "_layer1"
-    else:
-        ret["name"] += "_layer2"
-    if args["B"] is not None:
-        ret["name"] += "_bias"
-    if args["APPLY_SWIGLU"]:
-        ret["name"] += "_swiglu"
-
-    fM = n_tokens
-    fK = K if K is not None else n_tokens
-    ret[f"flops{nbits}"] = 2.0 * fM * N * fK
-
-    gindx = args.get("GatherIndx", None)
-    n_x_bytes = X.numel() * X.element_size()
-    n_y_bytes = Y.numel() * Y.element_size()
-    if hist is not None:
-        assert n_tokens is not None
-        n_expts_act = args["N_EXPTS_ACT"]
-
-        if gindx is not None:
-            # recreate inverse GatherIndx.
-            dst = torch.full_like(gindx, -1)
-            idx = torch.arange(len(gindx), device=gindx.device, dtype=torch.int32)
-            mask = gindx != -1
-            dst[gindx[mask]] = idx[mask]
-            n_read_rows = (dst.view((-1, n_expts_act)) != -1).any(dim=1).sum()
-        else:
-            n_read_rows = n_tokens
-        n_x_bytes = n_read_rows * X.shape[-1] * X.element_size()
-        n_y_bytes = n_tokens * Y.shape[-1] * Y.element_size()
-    ret["bytes"] = int(n_x_bytes + n_y_bytes + n_w_bytes)
-
-    return ret
-
-
-# TODO: using aiter swizzle instead can lead to perf degradation in rare cases
-@gluon.jit
-def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: gl.constexpr):
-    """
-    Swizzle the program id based on integer XCD_SWIZZLE.
-    """
-    pids_per_group = domain_size // XCD_SWIZZLE
-    extra_pid_groups = domain_size % XCD_SWIZZLE
-    group = pid % XCD_SWIZZLE
-    local_pid = pid // XCD_SWIZZLE
-    new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
-    return new_pid
+from aiter.ops.triton._triton_kernels.moe.launch_metadata import (
+    matmul_launch_metadata,
+)
 
 
 @gluon.jit
 def unswizzle_mx_scale_gfx1250(
     scale, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH, MX_PACK_DIVISOR
 ):
-    # Step 1: invert the host-side preshuffle. The loaded compact tile is
-    # (BLOCK_N // PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR); the
-    # contiguous dim packs (k0, n1, k1), so reshape + permute reassembles the
-    # logical compact scale (BLOCK_N, MX_SCALE_BLOCK_K) (one byte per 32-elem group).
+    # Invert the host-side preshuffle: the loaded tile packs (k0, n1, k1) along the
+    # contiguous dim; reshape + permute reassembles the logical compact scale
+    # (BLOCK_N, MX_SCALE_BLOCK_K), one byte per 32-elem group.
     scale = (
         scale.reshape(
             (
@@ -102,12 +33,9 @@ def unswizzle_mx_scale_gfx1250(
 
 @gluon.jit
 def _expand_mx_scale_k(scale, BLOCK_N: gl.constexpr, MX_SCALE_BLOCK_K: gl.constexpr):
-    # Local Triton's fp4 scaled_upcast wants one e8m0 scale per *unpacked* element
-    # (shape (BLOCK_N, BLOCK_K)), not the compact per-32-group scale
-    # (BLOCK_N, MX_SCALE_BLOCK_K). Repeat each group scale MX_PACK_DIVISOR (=32)
-    # times contiguously along K as a single stride-0 broadcast:
-    #   (BLOCK_N, MX_SCALE_BLOCK_K, 1) -> (BLOCK_N, MX_SCALE_BLOCK_K, 32) -> (BLOCK_N, BLOCK_K)
-    # so out[n, g*32 + r] == scale[n, g].
+    # scaled_upcast wants one e8m0 scale per unpacked element (BLOCK_N, BLOCK_K), not
+    # the compact per-32-group scale. Broadcast each group scale MX_PACK_DIVISOR (=32)
+    # times along K (stride-0) so out[n, g*32 + r] == scale[n, g].
     MX_PACK_DIVISOR: gl.constexpr = 32
     s = scale.reshape(BLOCK_N, MX_SCALE_BLOCK_K, 1)
     tgt = gl.full(
@@ -135,12 +63,15 @@ def _tdm_load_tile(
     PACKED_BLOCK_K_W: gl.constexpr,
     PACKED_MX_BLOCK: gl.constexpr,
 ):
-    # Issue the 3 TDM async loads (X, packed-fp4 W, e8m0 scale) for K-tile `ki`
-    # into the given LDS slots.
+    # Issue the 3 TDM async loads (X, packed-fp4 W, e8m0 scale) for K-tile `ki`.
     if GatherIndx is None:
         gl.amd.gfx1250.tdm.async_load(x_desc, [offs_x_m_scalar, ki * BLOCK_K], x_slot)
     else:
-        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
+        # gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, ki * BLOCK_K, x_slot)
+        x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            x_desc, add_offsets=[0, ki * BLOCK_K], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_gather(x_desc, offs_x_m, x_slot)
     gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, ki * PACKED_BLOCK_K_W], w_slot)
     gl.amd.gfx1250.tdm.async_load(
         ws_desc, [off_w_n_scale, ki * PACKED_MX_BLOCK], ws_slot
@@ -149,10 +80,8 @@ def _tdm_load_tile(
 
 @gluon.jit
 def _preload_tile(
-    x_slot,
     w_slot,
     ws_slot,
-    DOT_LAYOUT_X: gl.constexpr,
     L_IN_W: gl.constexpr,
     L_SCALE_W: gl.constexpr,
     COMPACT_SCALE_LAYOUT: gl.constexpr,
@@ -163,9 +92,13 @@ def _preload_tile(
     MX_PACK_DIVISOR: gl.constexpr,
     PRESHUFFLE_FACTOR: gl.constexpr,
     SCALE_KWIDTH: gl.constexpr,
+    SCALE_REG_SHARE: gl.constexpr,
+    SCALE_SEL: gl.constexpr,
 ):
-    # LDS -> register operands for one K-tile.
-    x_tile = x_slot.load(layout=DOT_LAYOUT_X)
+    # LDS -> register bf16 W operand for one K-tile (fp4 unpack + scale applied).
+    # Flip NO_MUL_UPCAST to route the compact scale through the software
+    # scaled_upcast instead of the hardware v_cvt_scale_pk8 (see the elif below).
+    NO_MUL_UPCAST: gl.constexpr = False
     w_packed = w_slot.permute([1, 0]).load(layout=L_IN_W)
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         ws_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -179,19 +112,54 @@ def _preload_tile(
         w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
         w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
         w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
+        # Software fp4->bf16 upcast with per-element expanded scale.
+        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
+    elif NO_MUL_UPCAST:
+        # Reference no-mul path: software scaled_upcast on the COMPACT scale (x32
+        # expand -> per-element scale -> software fp4->bf16). Correct for kWidth 8
+        # and 16, but ~45% slower as a drop-in at the current kWidth=16 config: the
+        # inner-loop x32 expansion + trans/convert_layout below are work the
+        # hardware scale_upcast avoids. Disabled (NO_MUL_UPCAST=False); kept for
+        # reference. The tuned kWidth=8 variant that drops the convert_layout lives
+        # in git fa8e11e4b.
+        w_scale = ws_slot.load(layout=COMPACT_SCALE_LAYOUT)
+        w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
+        w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
+        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
     else:
-        _dummy = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W)
-        _d3 = _dummy.reshape(MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N)
-        L_SCALE_3D: gl.constexpr = _d3.type.layout
-        w_scale = ws_slot.permute([1, 0]).load(layout=gl.SliceLayout(1, L_SCALE_3D))
-        w_scale = gl.expand_dims(w_scale, 1)
-        w_scale, _ = gl.broadcast(w_scale, _d3)
-        w_scale = w_scale.reshape(BLOCK_K, BLOCK_N)
-    return x_tile, w_packed, w_scale
+        # Hardware v_cvt_scale_pk8 upcast consuming the COMPACT e8m0 scale directly
+        # -- no x32 expansion, no software upcast. k_scale = SCALE_REG_SHARE (=16):
+        # each 32-group e8m0 covers DUP = 32/16 = 2 consecutive 16-blocks, duplicated
+        # along K. Scale layout (L_SCALE_W) derived by stripping the k_scale
+        # register-K identity. Raw e8m0 byte replicated across a uint32 so
+        # scale_sel byte routing is a no-op.
+        KW: gl.constexpr = SCALE_REG_SHARE
+        DUP: gl.constexpr = MX_PACK_DIVISOR // KW
+        SK: gl.constexpr = BLOCK_K // KW
+        _o3 = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W).reshape(
+            SK, KW, BLOCK_N
+        )
+        SCALE_L: gl.constexpr = gl.SliceLayout(1, _o3.type.layout)
+        _sc3 = gl.full((SK, BLOCK_N), 0, gl.uint8, layout=SCALE_L).reshape(
+            MX_SCALE_BLOCK_K, DUP, BLOCK_N
+        )
+        L_SC3: gl.constexpr = _sc3.type.layout
+        e8 = ws_slot.permute([1, 0]).load(layout=gl.SliceLayout(1, L_SC3))
+        e8 = gl.expand_dims(e8, 1)
+        e8, _ = gl.broadcast(e8, _sc3)
+        e8 = e8.reshape(SK, BLOCK_N)
+        # Replicate the e8m0 byte across all 4 bytes of a uint32 (multiply by
+        # 0x01010101; val <= 255 so no carry) so scale_sel byte routing is a no-op.
+        s = e8.to(gl.uint32)
+        w_scale = s * 0x01010101
+        w_kn = gl.amd.gfx1250.scale_upcast(
+            w_packed, w_scale, axis=0, scale_sel=SCALE_SEL, elem_type=gl.bfloat16
+        )
+    return w_kn
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata)
-def _moe_gemm_a16w4(
+@gluon.jit
+def _moe_gemm_a16w4_gluon_impl(
     Y,
     stride_y_k,
     stride_y_m,
@@ -237,7 +205,8 @@ def _moe_gemm_a16w4(
     GROUP_M: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    # Must be None: the kernel takes pre-expanded e8m0 scales (one byte per fp4 element).
+    # Pass None; compact e8m0 scale. GFX1250_SCALE branch hangs the ROCm loader;
+    # CDNA4_SCALE unsupported -- use the Triton kernel for swizzled scales.
     SWIZZLE_MX_SCALE: gl.constexpr,
     EVEN_K: gl.constexpr,
     SPLIT_K: gl.constexpr,
@@ -284,9 +253,8 @@ def _moe_gemm_a16w4(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    # Keep block/expert/pid indices int32 so TDM descriptor tile offsets stay
-    # 32-bit; apply .to(index_type) only at the int64 base-pointer arithmetic
-    # sites below (mirrors the local a8w4 gluon kernel).
+    # Keep block/expert/pid indices int32 so TDM tile offsets stay 32-bit; apply
+    # .to(index_type) only at the int64 base-pointer arithmetic sites below.
 
     # X / gather offsets
     offs_x_m_scalar = BLOCK_M * block_id
@@ -298,8 +266,7 @@ def _moe_gemm_a16w4(
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
                 0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
             )
-            # num_tokens is passed as a Python scalar; keep it scalar here and
-            # let the later gl.where cast it to the uint16 gather-index value.
+            # num_tokens is a Python scalar; the later gl.where casts it to uint16.
             oob_idx = num_tokens
         else:
             gl.static_assert(
@@ -339,48 +306,59 @@ def _moe_gemm_a16w4(
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
-        # Unused on the compact path (only unswizzle_mx_scale_gfx1250 reads it),
-        # but _preload_tile takes it as an arg unconditionally.
+        # Unused on the compact path, but _preload_tile takes it unconditionally.
         SCALE_KWIDTH: gl.constexpr = 8
 
     # Scale tile offsets are in units of the scale descriptor's own blocking
-    # (N block = SCALE_BLOCK_N, K block = PACKED_MX_BLOCK) -- NOT the weight's
-    # BLOCK_N / BLOCK_K. For the compact (non-swizzle) scale the K dimension is
-    # cdiv(K, 32), so the per-tile K step is PACKED_MX_BLOCK (= MX_SCALE_BLOCK_K),
-    # not BLOCK_K.
+    # (SCALE_BLOCK_N, PACKED_MX_BLOCK) -- NOT the weight's BLOCK_N / BLOCK_K.
     off_w_n_scale = pid_n * SCALE_BLOCK_N
 
-    # WMMA layout for plain bf16 x bf16: instr_shape [16, 16, 32], k_width=8.
-    # (Gluon wmma_scaled has no bf16 lhs, so a16w4 must upcast fp4->bf16 via
-    # scaled_upcast and use a plain bf16 x bf16 WMMA.)
-    if num_warps == 4:
+    # WMMA layout for plain bf16 x bf16 (gluon wmma_scaled has no bf16 lhs, so a16w4
+    # upcasts fp4->bf16 then uses plain WMMA). warp_bases are in 16x16 instr tiles:
+    # [1, 0] steps a 16-row M-tile, [0, 1] a 16-col N-tile.
+    if BLOCK_M == 16:
+        # Decode: BLOCK_M is a single 16-row M-tile, so warps along M would
+        # recompute rows and re-read the same W N-slice. Put every warp along N.
+        # Valid since the decode config guarantees BLOCK_N >= num_warps * 16.
+        gl.static_assert(
+            BLOCK_N >= num_warps * 16,
+            "decode warp-along-N layout requires BLOCK_N >= num_warps * 16",
+        )
+        if num_warps == 4:
+            WARP_BASES: gl.constexpr = [[0, 1], [0, 2]]
+        else:
+            WARP_BASES: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
+    elif num_warps == 4:
         WARP_BASES: gl.constexpr = [[0, 1], [1, 0]]
     else:
         WARP_BASES: gl.constexpr = [[0, 1], [1, 0], [2, 0]]
 
+    INSTR_K: gl.constexpr = 32
     WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=WARP_BASES,
         reg_bases=[],
-        instr_shape=[16, 16, 32],
+        instr_shape=[16, 16, INSTR_K],
     )
+    K_PER_INSR: gl.constexpr = 16
+    K_WIDTH: gl.constexpr = min(16, BLOCK_K // INSTR_K * K_PER_INSR)
+    # scale_upcast k_scale = min(K_WIDTH, 32); K_WIDTH=16 is block16 (OPSEL 4).
+    # Replicated scale bytes make the exact byte immaterial.
+    SCALE_SEL: gl.constexpr = 4 if min(K_WIDTH, MX_PACK_DIVISOR) == 16 else 0
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=WMMA_LAYOUT, k_width=8
+        operand_index=0, parent=WMMA_LAYOUT, k_width=K_WIDTH
     )
-    # scaled_upcast operand-aligned layouts (fp4 B in K-major (K/2,N), axis=0):
-    #   fp4 input  -> DotOperandLayout(op=1, k_width=4)  [packed]
-    #   scale      -> DotOperandLayout(op=1, k_width=8)  [op output layout]
-    # k_width doubles on unpack, so the bf16 output is k_width=8 == the WMMA B
-    # dot-operand layout directly -> the WMMA B operand needs NO convert_layout
-    # (a k_width 16->8 convert was 128 cross-lane v_permlanes/tile). The scale
-    # sits on the exact WMMA-fragment lanes the HW scale broadcast reads
-    # (BlockedLayout aliases them).
+    # scaled_upcast operand-aligned layouts: fp4 input k_width=K_WIDTH//2, scale
+    # k_width=K_WIDTH. k_width doubles on unpack so the bf16 output matches the
+    # WMMA B dot-operand layout directly -> WMMA B operand needs NO convert_layout
+    # (saves 128 cross-lane v_permlanes/tile). Scale sits on the lanes the HW
+    # broadcast reads.
     L_IN_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=4
+        operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH // 2
     )
     L_SCALE_W: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+        operand_index=1, parent=WMMA_LAYOUT, k_width=K_WIDTH
     )
 
     # Parametric blocked layout for the compact (BLOCK_N, MX_SCALE_BLOCK_K) scale
@@ -455,8 +433,7 @@ def _moe_gemm_a16w4(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
     if NUM_BUFFERS == 1:
-        # Non-pipelined baseline: load one K tile, wait for ALL outstanding TDM
-        # ops, consume. Two Membar barriers/iter (RAW after wait + WAR back-edge).
+        # Non-pipelined baseline: load one K tile, wait for all TDM ops, consume.
         for ki in range(num_k_iter):
             _tdm_load_tile(
                 x_desc,
@@ -476,11 +453,10 @@ def _moe_gemm_a16w4(
                 PACKED_MX_BLOCK,
             )
             gl.amd.gfx1250.tdm.async_wait(0)
-            x_tile, w_packed, w_scale = _preload_tile(
-                x_buffer.index(0),
+            x_tile = x_buffer.index(0).load(layout=DOT_LAYOUT_X)
+            w_kn = _preload_tile(
                 w_buffer.index(0),
                 ws_buffer.index(0),
-                DOT_LAYOUT_X,
                 L_IN_W,
                 L_SCALE_W,
                 COMPACT_SCALE_LAYOUT,
@@ -491,30 +467,24 @@ def _moe_gemm_a16w4(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
             )
-            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
     else:
         # ============================ STAGE 2 ============================
-        # LDS-prefetch pipeline (NUM_BUFFERS>=2, requires num_k_iter >= NUM_BUFFERS).
-        # Prefetch the tile (NUM_BUFFERS-1) ahead into a *different* LDS slot so its
-        # TDM latency overlaps the current tile's compute. Operands are loaded from
-        # LDS *within* each iteration and consumed immediately by the WMMA -- they
-        # are NOT carried in registers across iterations (the expanded bf16 weight +
-        # scale are large; a register pipeline spills).
+        # LDS-prefetch pipeline (NUM_BUFFERS>=2, needs num_k_iter >= NUM_BUFFERS).
+        # Prefetch the tile NUM_BUFFERS-1 ahead into a different LDS slot to overlap
+        # TDM latency with compute; operands load from LDS within each iter (not
+        # carried in registers -- the bf16 weight+scale are large and would spill).
         #
-        # NOTE(perf): this is the tuned stage-2 experiment. It does NOT beat the
-        # stage-1 (NUM_BUFFERS=1) kernel for the minimax-m3 prefill shapes: the X
-        # activation tile is ~78% of the 87 KB LDS footprint, so double-buffering it
-        # at the efficient BLOCK_K=256 collapses occupancy (14.9 ms vs stage-1's
-        # 7.56 ms). Smaller BLOCK_K fits the double-buffer but loses BLOCK_K=256's
-        # efficiency (best pipelined = ~8.96 ms at BLOCK_K=128). Kept for reference.
+        # NOTE(perf): does NOT beat stage-1 for minimax-m3 prefill: X is ~78% of the
+        # 87 KB LDS footprint, so double-buffering at BLOCK_K=256 collapses occupancy
+        # (14.9 vs 7.56 ms). Best pipelined ~8.96 ms at BLOCK_K=128. Kept for reference.
         #
-        # NOTE(correctness): verified against the test suite at the default
-        # BLOCK_K=256. The two explicit barriers below guard the cross-wave RAW
-        # (post-wait) and WAR (pre-prefetch) hazards on the shared slots that
-        # Membar does not cover for TDM async ops. A residual failure was observed
-        # at BLOCK_K=128 (short compute-per-tile) -- do not use BLOCK_K<256 here.
+        # NOTE(correctness): verified at the default BLOCK_K=256. The two barriers
+        # below guard cross-wave RAW/WAR hazards on the shared slots that Membar does
+        # not cover for TDM async ops. Fails at BLOCK_K=128 -- do not use BLOCK_K<256.
         for j in gl.static_range(NUM_BUFFERS - 1):
             _tdm_load_tile(
                 x_desc,
@@ -536,9 +506,9 @@ def _moe_gemm_a16w4(
 
         main_iters = num_k_iter - (NUM_BUFFERS - 1)
         for ki in range(main_iters):
-            prefetch_ki = ki + NUM_BUFFERS - 1
-            # WAR guard: the prefetch overwrites the LDS slot a prior iteration read.
+            gl.amd.gfx1250.tdm.async_wait(max(NUM_BUFFERS - 2, 0) * NUM_TDM_OPS)
             gl.barrier()
+            prefetch_ki = ki + NUM_BUFFERS - 1
             _tdm_load_tile(
                 x_desc,
                 w_desc,
@@ -556,17 +526,11 @@ def _moe_gemm_a16w4(
                 PACKED_BLOCK_K_W,
                 PACKED_MX_BLOCK,
             )
-            # Leave the NUM_BUFFERS-1 prefetched-ahead tiles outstanding; tile ki done.
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
-            # RAW guard: TDM writes visible CTA-wide before the LDS read.
-            gl.barrier()
-
             cur_slot = ki % NUM_BUFFERS
-            x_tile, w_packed, w_scale = _preload_tile(
-                x_buffer.index(cur_slot),
+            x_tile = x_buffer.index(cur_slot).load(layout=DOT_LAYOUT_X)
+            w_kn = _preload_tile(
                 w_buffer.index(cur_slot),
                 ws_buffer.index(cur_slot),
-                DOT_LAYOUT_X,
                 L_IN_W,
                 L_SCALE_W,
                 COMPACT_SCALE_LAYOUT,
@@ -577,8 +541,9 @@ def _moe_gemm_a16w4(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
             )
-            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
         # Epilogue: drain the last NUM_BUFFERS-1 already-prefetched tiles.
@@ -586,11 +551,10 @@ def _moe_gemm_a16w4(
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * NUM_TDM_OPS)
             gl.barrier()
             cur_slot = (main_iters + i) % NUM_BUFFERS
-            x_tile, w_packed, w_scale = _preload_tile(
-                x_buffer.index(cur_slot),
+            x_tile = x_buffer.index(cur_slot).load(layout=DOT_LAYOUT_X)
+            w_kn = _preload_tile(
                 w_buffer.index(cur_slot),
                 ws_buffer.index(cur_slot),
-                DOT_LAYOUT_X,
                 L_IN_W,
                 L_SCALE_W,
                 COMPACT_SCALE_LAYOUT,
@@ -601,8 +565,9 @@ def _moe_gemm_a16w4(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
+                min(K_WIDTH, MX_PACK_DIVISOR),
+                SCALE_SEL,
             )
-            w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
     # bias / activation / write-back
@@ -666,3 +631,324 @@ def _moe_gemm_a16w4(
         y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)
+
+
+@gluon.jit(launch_metadata=matmul_launch_metadata)
+def _moe_gemm_a16w4_gluon_stage1(
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,  # E8M0 compact scale (one byte per 32 values along K)
+    stride_w_mx_e,
+    stride_w_mx_n,
+    stride_w_mx_k,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: gl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: gl.constexpr,
+    # optimization config
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    # Pass None; compact e8m0 scale. GFX1250_SCALE branch hangs the ROCm loader;
+    # CDNA4_SCALE unsupported -- use the Triton kernel for swizzled scales.
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
+):
+    # Single-buffer (stage-1) entry point; distinct name for profiling/dispatch.
+    _moe_gemm_a16w4_gluon_impl(
+        Y=Y,
+        stride_y_k=stride_y_k,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        X=X,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        W=W,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        WMxScale=WMxScale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_n=stride_w_mx_n,
+        stride_w_mx_k=stride_w_mx_k,
+        B=B,
+        stride_b_e=stride_b_e,
+        Gammas=Gammas,
+        num_tokens=num_tokens,
+        N=N,
+        K=K,
+        GatherIndx=GatherIndx,
+        ExptHist=ExptHist,
+        ExptOffs=ExptOffs,
+        ExptOffsSum=ExptOffsSum,
+        ExptData=ExptData,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        APPLY_SWIGLU=APPLY_SWIGLU,
+        alpha=alpha,
+        limit=limit,
+        ACTIVATION_REDUCTION_N=ACTIVATION_REDUCTION_N,
+        ADD_RESIDUAL=ADD_RESIDUAL,
+        N_EXPTS_ACT=N_EXPTS_ACT,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        XCD_SWIZZLE=XCD_SWIZZLE,
+        NUM_BUFFERS=1,
+        SWIZZLE_MX_SCALE=SWIZZLE_MX_SCALE,
+        EVEN_K=EVEN_K,
+        SPLIT_K=SPLIT_K,
+        W_CACHE_MODIFIER=W_CACHE_MODIFIER,
+        num_warps=num_warps,
+        UPCAST_INDICES=UPCAST_INDICES,
+    )
+
+
+@gluon.jit(launch_metadata=matmul_launch_metadata)
+def _moe_gemm_a16w4_gluon_stage2(
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,  # E8M0 compact scale (one byte per 32 values along K)
+    stride_w_mx_e,
+    stride_w_mx_n,
+    stride_w_mx_k,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: gl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: gl.constexpr,
+    # optimization config
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    # Pass None; compact e8m0 scale. GFX1250_SCALE branch hangs the ROCm loader;
+    # CDNA4_SCALE unsupported -- use the Triton kernel for swizzled scales.
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
+):
+    # Double-buffer (stage-2) LDS-prefetch entry point.
+    _moe_gemm_a16w4_gluon_impl(
+        Y=Y,
+        stride_y_k=stride_y_k,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        X=X,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        W=W,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        WMxScale=WMxScale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_n=stride_w_mx_n,
+        stride_w_mx_k=stride_w_mx_k,
+        B=B,
+        stride_b_e=stride_b_e,
+        Gammas=Gammas,
+        num_tokens=num_tokens,
+        N=N,
+        K=K,
+        GatherIndx=GatherIndx,
+        ExptHist=ExptHist,
+        ExptOffs=ExptOffs,
+        ExptOffsSum=ExptOffsSum,
+        ExptData=ExptData,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        APPLY_SWIGLU=APPLY_SWIGLU,
+        alpha=alpha,
+        limit=limit,
+        ACTIVATION_REDUCTION_N=ACTIVATION_REDUCTION_N,
+        ADD_RESIDUAL=ADD_RESIDUAL,
+        N_EXPTS_ACT=N_EXPTS_ACT,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        XCD_SWIZZLE=XCD_SWIZZLE,
+        NUM_BUFFERS=NUM_BUFFERS,
+        SWIZZLE_MX_SCALE=SWIZZLE_MX_SCALE,
+        EVEN_K=EVEN_K,
+        SPLIT_K=SPLIT_K,
+        W_CACHE_MODIFIER=W_CACHE_MODIFIER,
+        num_warps=num_warps,
+        UPCAST_INDICES=UPCAST_INDICES,
+    )
+
+
+@gluon.jit(launch_metadata=matmul_launch_metadata)
+def _moe_gemm_a16w4_gluon_stage3(
+    Y,
+    stride_y_k,
+    stride_y_m,
+    stride_y_n,
+    X,
+    stride_x_m,
+    stride_x_k,
+    W,
+    stride_w_e,
+    stride_w_k,
+    stride_w_n,
+    WMxScale,  # E8M0 compact scale (one byte per 32 values along K)
+    stride_w_mx_e,
+    stride_w_mx_n,
+    stride_w_mx_k,
+    B,
+    stride_b_e,  # Bias
+    Gammas,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
+    # fused activation function
+    APPLY_SWIGLU: gl.constexpr,
+    alpha,
+    limit,
+    ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
+    # MoE config
+    N_EXPTS_ACT: gl.constexpr,
+    # optimization config
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    XCD_SWIZZLE: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    # Pass None; compact e8m0 scale. GFX1250_SCALE branch hangs the ROCm loader;
+    # CDNA4_SCALE unsupported -- use the Triton kernel for swizzled scales.
+    SWIZZLE_MX_SCALE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr = False,
+):
+    # Triple-buffer (stage-3) entry point: stage-2 pipeline with NUM_BUFFERS=3.
+    _moe_gemm_a16w4_gluon_impl(
+        Y=Y,
+        stride_y_k=stride_y_k,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        X=X,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        W=W,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        WMxScale=WMxScale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_n=stride_w_mx_n,
+        stride_w_mx_k=stride_w_mx_k,
+        B=B,
+        stride_b_e=stride_b_e,
+        Gammas=Gammas,
+        num_tokens=num_tokens,
+        N=N,
+        K=K,
+        GatherIndx=GatherIndx,
+        ExptHist=ExptHist,
+        ExptOffs=ExptOffs,
+        ExptOffsSum=ExptOffsSum,
+        ExptData=ExptData,
+        grid_m=grid_m,
+        grid_n=grid_n,
+        APPLY_SWIGLU=APPLY_SWIGLU,
+        alpha=alpha,
+        limit=limit,
+        ACTIVATION_REDUCTION_N=ACTIVATION_REDUCTION_N,
+        ADD_RESIDUAL=ADD_RESIDUAL,
+        N_EXPTS_ACT=N_EXPTS_ACT,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        GROUP_M=GROUP_M,
+        XCD_SWIZZLE=XCD_SWIZZLE,
+        NUM_BUFFERS=NUM_BUFFERS,
+        SWIZZLE_MX_SCALE=SWIZZLE_MX_SCALE,
+        EVEN_K=EVEN_K,
+        SPLIT_K=SPLIT_K,
+        W_CACHE_MODIFIER=W_CACHE_MODIFIER,
+        num_warps=num_warps,
+        UPCAST_INDICES=UPCAST_INDICES,
+    )
