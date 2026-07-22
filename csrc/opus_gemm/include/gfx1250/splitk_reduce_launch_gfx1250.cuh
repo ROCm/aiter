@@ -16,7 +16,7 @@
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 
-#include "opus_gemm_traits_a16w16_gfx1250.cuh" // opus_splitk_ws_handle
+#include "opus_gemm_traits_a16w16_gfx1250.cuh"
 #include <hip/hip_runtime.h>
 
 // Forward declaration of the reduce kernel (definition in splitk_reduce_gfx1250.cuh;
@@ -30,7 +30,7 @@ template <int VEC_,
           bool HAS_OOB_,
           int SPLIT_K_,
           typename D_WS_>
-__global__ void splitk_reduce_kernel_gfx1250(const opus_splitk_ws_handle* ws_handle,
+__global__ void splitk_reduce_kernel_gfx1250(const void* ws_ptr,
                                              D_OUT* c_out,
                                              int split_k,
                                              int M,
@@ -55,7 +55,7 @@ template <int VEC,
 inline void opus_splitk_reduce_launch_gfx1250(dim3 grid,
                                               dim3 block,
                                               hipStream_t stream,
-                                              const opus_splitk_ws_handle* ws_handle,
+                                              const void* ws_ptr,
                                               D_OUT* c_out,
                                               int split_k,
                                               int M,
@@ -69,7 +69,7 @@ inline void opus_splitk_reduce_launch_gfx1250(dim3 grid,
 #define OPUS_RDK(SK)                                                                     \
     splitk_reduce_kernel_gfx1250<VEC, BLOCK, D_OUT, HAS_BIAS, D_BIAS, HAS_OOB, SK, D_WS> \
         <<<grid, block, 0, stream>>>(                                                    \
-            ws_handle, c_out, split_k, M, N, batch, padded_M, padded_N, bias, stride_bias_batch)
+            ws_ptr, c_out, split_k, M, N, batch, padded_M, padded_N, bias, stride_bias_batch)
     switch(split_k)
     {
     case 1: OPUS_RDK(1); break;

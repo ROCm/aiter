@@ -19,22 +19,18 @@
 
 #include "aiter_tensor.h"  // aiter_tensor_t (torch-free)
 
-// a16w16-family launcher signature (see the gfx950 twin for the rationale):
-// 3 tensors + std::optional<bias> + int splitK, plain function pointer (no
-// std::function). Defined here -- rather than reused from gfx950's heuristic
-// header -- so opus_gemm_arch_gfx1250.cuh is self-contained and a gfx1250-only
-// build does not depend on any gfx950 header.
-using OpusA16W16NoscaleKernel = void (*)(
-    aiter_tensor_t &, aiter_tensor_t &,
-    aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
-
 // Shared flat-array dispatch POD types + comparators for gfx1250 (mirrors the
-// gfx950 set). Only depend on OpusA16W16NoscaleKernel above, so they are cheap
-// to include and carry no generated-lookup-macro cost. gen_instances.py emits
-// the tune / (M,N,K) lookup tables as arrays of these; std::lower_bound does the
-// O(log N) runtime match.
+// gfx950 set). gen_instances.py emits the tune / (M,N,K) lookup tables as
+// arrays of these; std::lower_bound does the O(log N) runtime match.
 namespace opus_gfx1250_detail
 {
+
+// a16w16-family launcher signature for gfx1250: 3 tensors + workspace +
+// std::optional<bias> + int splitK. Different from gfx950 (no workspace).
+using OpusA16W16NoscaleKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &, aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
+
 struct OpusA16W16Shape
 {
     int M;

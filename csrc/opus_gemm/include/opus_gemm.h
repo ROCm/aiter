@@ -25,6 +25,7 @@ void opus_gemm_a16w16_tune(aiter_tensor_t& XQ,
                            aiter_tensor_t& WQ,
                            aiter_tensor_t& Y,
                            std::optional<aiter_tensor_t> bias,
+                           std::optional<aiter_tensor_t> workspace,
                            int kernelId,
                            int splitK);
 

@@ -3,8 +3,8 @@
 //
 // Traits + kargs for the gfx1250 a16w16 cluster/TDM split-K pipeline that
 // reduces via an fp32 WORKSPACE + a separate REDUCE kernel (no atomic_add,
-// no self-clear, no semaphore). Mirrors the gfx950 flatmm-splitk ABI
-// (opus_splitk_ws_handle + opus_gemm_flatmm_splitk_kargs_gfx950).
+// no self-clear, no semaphore). The workspace buffer is allocated externally
+// (torch.empty on the Python side) and passed as a direct pointer in kargs.
 //
 // This header is the SINGLE source of truth for every compile-time constant
 // the pipeline needs: the pipeline file
@@ -51,17 +51,16 @@ struct opus_splitk_ws_handle {
 #ifndef OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 #define OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 // Kernel arguments for the gfx1250 a16w16 cluster/TDM split-K (workspace)
-// pipeline. The main kernel writes fp32 partial sums into
-// *ws_handle->ptr laid out as [split_k, padded_M, padded_N] (per host launch;
+// pipeline. The main kernel writes partial sums (bf16 by default) into
+// ptr_ws laid out as [split_k, padded_M, padded_N] (per host launch;
 // batch handled by a per-batch host launch with pointer offsets). The reduce
-// kernel consumes it, folds bias once, casts fp32 -> Y dtype, writes C[M, N].
-//
-// Field semantics mirror opus_gemm_flatmm_splitk_kargs_gfx950 so the shared
-// reduce kernel ABI (ws_handle*) is reused verbatim.
+// kernel consumes it, folds bias once, casts to Y dtype, writes C[M, N].
+// The workspace buffer is allocated externally (torch.empty on the Python
+// side) and passed in directly -- no indirection through a handle struct.
 struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
     const void* __restrict__ ptr_a;          // bf16 [M, K]
     const void* __restrict__ ptr_b;          // bf16 [N, K] (A @ B^T)
-    const opus_splitk_ws_handle* __restrict__ ws_handle;  // deref at kernel entry
+    void*       __restrict__ ptr_ws;         // workspace [split_k, padded_M, padded_N]
     void*       __restrict__ ptr_c;          // bf16/fp32 [M, N] (filled by reduce kernel)
     const void* __restrict__ ptr_bias;       // consumed by reduce kernel only
     int m;
@@ -86,15 +85,14 @@ struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
 // Kernel args for the FUSED single-kernel in-cluster split-K reduce pipeline
 // (a16w16_clusterlaunch_tdm_splitk_fuse). No separate reduce kernel: the last
 // split WG folds bias + reduces the DataWs partials in-kernel (cluster-barrier
-// sync) and writes C. The DataWs partial workspace is backed by the shared
-// opus_splitk_ws_handle; there is no semaphore buffer (the cluster barrier
-// replaces it). Defined in the traits header so BOTH the device pipeline pass
-// and the fused HOST TU (which includes only this traits header) see it.
+// sync) and writes C. The DataWs partial workspace is allocated externally
+// (torch.empty) and passed via ptr_ws; there is no semaphore buffer (the
+// cluster barrier replaces it).
 struct opus_gemm_splitk_fuse_kargs_gfx1250
 {
     const void* __restrict__ ptr_a;                      // bf16 [M, K]
     const void* __restrict__ ptr_b;                      // bf16 [N, K] (A @ B^T)
-    const opus_splitk_ws_handle* __restrict__ ws_handle; // DataWs partial workspace
+    void* __restrict__ ptr_ws;                           // DataWs partial workspace
     void* __restrict__ ptr_c;          // bf16/fp32 [M, N] (written by last split WG)
     const void* __restrict__ ptr_bias; // bf16 [N] or null (folded once by last WG)
     int m;

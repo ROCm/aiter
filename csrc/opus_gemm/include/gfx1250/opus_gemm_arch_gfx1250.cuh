@@ -93,11 +93,11 @@ inline void check_shape_4g(int M, int N, int K, size_t c_elem_bytes)
 }  // namespace opus_gfx1250_detail
 
 template <typename CDataType>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
 
 template <>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bias)
 {
     using namespace opus_gfx1250_detail;
@@ -116,7 +116,7 @@ opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bi
 }
 
 template <>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bias)
 {
     using namespace opus_gfx1250_detail;

@@ -4,7 +4,7 @@
 
 Wires the a16w16 cluster/TDM split-K pipeline that reduces via an fp32
 WORKSPACE + a separate REDUCE kernel (no atomic_add), mirroring the gfx950
-flatmm-splitk launcher (opus_splitk_ws_get + grow + main kernel + reduce
+flatmm-splitk launcher (workspace + main kernel + reduce
 kernel). The main kernel is always instantiated <fp32_t> (it writes the fp32
 workspace); the reduce kernel casts the fp32 partials to the runtime Y dtype
 (bf16 / fp32) and folds bias once.
@@ -55,7 +55,7 @@ KARGS_NAME_MAP = {
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_gemm_splitk_fuse_kargs_gfx1250",
 }
 
-# fuse workspace storage dtype -> (C type, byte size) for the launcher grow calc.
+# fuse workspace storage dtype -> (C type, byte size) for the fuse kernel instantiation.
 _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
 
 
@@ -73,7 +73,7 @@ def splitk_reduce_extra_device_instantiations():
         for sk in range(0, 17):
             out += (
                 f"template __global__ void splitk_reduce_kernel_gfx1250<8, 128, __bf16, true,  float,  {has_oob}, {sk}, __bf16>(\n"
-                "    const opus_splitk_ws_handle*, __bf16*, int, int, int, int, int, int,\n"
+                "    const void*, __bf16*, int, int, int, int, int, int,\n"
                 "    const float*,  int);\n"
             )
     return out
@@ -250,6 +250,7 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
@@ -293,44 +294,8 @@ void
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
 
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-    extern const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t, bool);
-    extern void opus_splitk_ws_sync_to_device(hipStream_t);
     auto stream = aiter::getCurrentHIPStream();
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
-    // Workspace sized for ONE batch's split slices [split_k, padded_M, padded_N].
-    size_t ws_bytes = (size_t)split_k * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    if (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes)
-    {{{{
-        AITER_CHECK(!capturing,
-            "splitk workspace grow inside HIP graph capture is not supported. "
-            "Warm the cache once eagerly via aiter.opus_gemm_workspace_init().");
-        void* new_ptr = nullptr;
-        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-        HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-        if (ws_handle_->ptr != nullptr)
-        {{{{
-            HIP_CALL(hipDeviceSynchronize());
-            HIP_CALL(hipFree(ws_handle_->ptr));
-        }}}}
-        ws_handle_->ptr = new_ptr;
-        ws_handle_->bytes = grow_bytes;
-        // Mirror the new buffer pointer into the device-resident handle that the
-        // kernels dereference (grow is eager-only; safe synchronous H2D copy).
-        opus_splitk_ws_sync_to_device(stream);
-    }}}}
-
-    // The kernels read the handle on-device: use the hipMalloc'd device mirror
-    // (L2-cached) rather than the host shadow (per-workgroup PCIe coherent read,
-    // ~5x slower). Address is stable, so a captured HIP graph stays valid across
-    // a post-capture grow (which only updates the mirror's contents in place).
-    const opus_splitk_ws_handle* ws_dev_ =
-        opus_splitk_ws_device_handle(stream, /*allow_create=*/!capturing);
+    void* ws_ptr_ = workspace.data_ptr();
 
 {cluster_fill_check}    dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
     dim3 block_main({k.BLOCK_SIZE});
@@ -353,7 +318,7 @@ void
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a     = XQ.data_ptr();
     kargs.ptr_b     = WQ.data_ptr();
-    kargs.ws_handle = ws_dev_;
+    kargs.ptr_ws    = workspace.data_ptr();
     kargs.ptr_c     = Y.data_ptr();
     kargs.ptr_bias  = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = split_k;
@@ -379,29 +344,29 @@ void
             // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, __bf16>(
                 grid_reduce, block_reduce, stream,
-                ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else if (ptr_bias_) {{{{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, __bf16>(
                 grid_reduce, block_reduce, stream,
-                ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, __bf16>(
                 grid_reduce, block_reduce, stream,
-                ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+                ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}} else {{{{
         float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
         if (ptr_bias_) {{{{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, __bf16>(
                 grid_reduce, block_reduce, stream,
-                ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
             opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, __bf16>(
                 grid_reduce, block_reduce, stream,
-                ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+                ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}}
 }}}}
@@ -417,6 +382,7 @@ void
             f"    aiter_tensor_t &XQ,\n"
             f"    aiter_tensor_t &WQ,\n"
             f"    aiter_tensor_t &Y,\n"
+            f"    aiter_tensor_t &workspace,\n"
             f"    std::optional<aiter_tensor_t>,\n"
             f"    int);\n"
         )
@@ -519,6 +485,7 @@ void
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
@@ -579,44 +546,12 @@ void
 
     using Traits = {k.name}_Traits<D_C>;
 
-    extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
-    extern const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t, bool);
-    extern void opus_splitk_ws_sync_to_device(hipStream_t);
     auto stream = aiter::getCurrentHIPStream();
-    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-    HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
-    const bool capturing = (capture_status != hipStreamCaptureStatusNone);
-    auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
-
-    // Fused workspace: (split_k-1) DataWs partial tiles per output tile,
-    // tile-major (each B_M x B_N). Reuses the shared per-stream ws_handle.
-    size_t ws_bytes = (size_t)({split_k} - 1) * (size_t)num_tiles_m * (size_t)num_tiles_n
-                      * (size_t){k.B_M} * (size_t){k.B_N} * (size_t){ws_bytes_elem};
-    if (ws_bytes > 0 && (ws_handle_->ptr == nullptr || ws_bytes > ws_handle_->bytes))
-    {{{{
-        AITER_CHECK(!capturing,
-            "splitk workspace grow inside HIP graph capture is not supported. "
-            "Warm the cache once eagerly via aiter.opus_gemm_workspace_init().");
-        void* new_ptr = nullptr;
-        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
-        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
-        HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
-        if (ws_handle_->ptr != nullptr)
-        {{{{
-            HIP_CALL(hipDeviceSynchronize());
-            HIP_CALL(hipFree(ws_handle_->ptr));
-        }}}}
-        ws_handle_->ptr = new_ptr;
-        ws_handle_->bytes = grow_bytes;
-        opus_splitk_ws_sync_to_device(stream);
-    }}}}
-    const opus_splitk_ws_handle* ws_dev_ =
-        opus_splitk_ws_device_handle(stream, /*allow_create=*/!capturing);
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a     = XQ.data_ptr();
     kargs.ptr_b     = WQ.data_ptr();
-    kargs.ws_handle = ws_dev_;
+    kargs.ptr_ws    = workspace.data_ptr();
     kargs.ptr_c     = Y.data_ptr();
     kargs.ptr_bias  = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = {split_k};
@@ -653,6 +588,7 @@ void
         f"    aiter_tensor_t &XQ,\n"
         f"    aiter_tensor_t &WQ,\n"
         f"    aiter_tensor_t &Y,\n"
+        f"    aiter_tensor_t &workspace,\n"
         f"    std::optional<aiter_tensor_t>,\n"
         f"    int);\n"
     )

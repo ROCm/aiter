@@ -67,7 +67,8 @@ OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
 #endif
 }
 
-// a16w16 arch routers: switch on opus_get_gfx_arch() to per-arch dispatch.
+// a16w16 arch routers (gfx950/gfx942 only; gfx1250 uses its own dispatch with workspace).
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
 template <typename CDataType>
 OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, bool has_bias = false)
 {
@@ -81,19 +82,14 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, boo
     case OpusGfxArch::Gfx942:
       return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch, has_bias);
 #endif
-#ifdef OPUS_BUILD_HAS_GFX1250
-    case OpusGfxArch::Gfx1250:
-      return opus_dispatch_a16w16_gfx1250<CDataType>(M, N, K, batch, has_bias);
-#endif
     default:
     {
       const auto &info = opus_get_arch_info();
       AITER_CHECK(false,
-                  "opus_gemm: a16w16 dispatch is only implemented for gfx950 today; "
+                  "opus_gemm: a16w16 dispatch via this path is only implemented for "
+                  "gfx950/gfx942; gfx1250 uses a separate dispatch with workspace. "
                   "current device ", info.dev,
-                  " has gcnArchName='", info.name,
-                  "'. Other archs (gfx940 / gfx942 / gfx1100 / ...) will be added "
-                  "as more pipelines land.");
+                  " has gcnArchName='", info.name, "'");
     }
   }
 }
@@ -112,21 +108,18 @@ opus_a16w16_tune_dispatch(int id)
     case OpusGfxArch::Gfx942:
       return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
 #endif
-#ifdef OPUS_BUILD_HAS_GFX1250
-    case OpusGfxArch::Gfx1250:
-      return opus_a16w16_tune_dispatch_gfx1250<CDataType>(id);
-#endif
     default:
     {
       const auto &info = opus_get_arch_info();
       AITER_CHECK(false,
-                  "opus_gemm_a16w16_tune: dispatch is only implemented for gfx950 today; "
+                  "opus_gemm_a16w16_tune: dispatch is only implemented for gfx950/gfx942 "
+                  "via this path; gfx1250 uses a separate dispatch with workspace. "
                   "current device ", info.dev,
-                  " has gcnArchName='", info.name,
-                  "'. Other archs will be added as more pipelines land.");
+                  " has gcnArchName='", info.name, "'");
     }
   }
 }
+#endif // OPUS_BUILD_HAS_GFX950 || OPUS_BUILD_HAS_GFX942
 
 // ── opus_gemm() — top-level a16w16 / a8w8 entry ─────────────────────────────
 
@@ -189,17 +182,51 @@ void opus_gemm(
     // Tuned-lookup-then-heuristic dispatch. splitK=0 = "launcher decides".
     int batch = XQ.size(0);
     const bool has_bias = bias.has_value();
-    if (Y.dtype() == AITER_DTYPE_bf16)
+#ifdef OPUS_BUILD_HAS_GFX1250
+    if (opus_get_gfx_arch() == OpusGfxArch::Gfx1250)
     {
-      opus_dispatch_a16w16<bf16_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
-    }
-    else if (Y.dtype() == AITER_DTYPE_fp32)
-    {
-      opus_dispatch_a16w16<fp32_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
+      // gfx1250: all kids are split-K and need a workspace. The heuristic
+      // dispatch returns a 6-arg function pointer (with workspace). We allocate
+      // a temporary workspace here for the auto/heuristic path. For the tuned
+      // path, Python allocates via torch.empty.
+      auto fn = opus_dispatch_a16w16_gfx1250<fp32_t>(M, N, K, batch, has_bias);
+      int padded_M = ((M + 63) / 64) * 64;
+      int padded_N = ((N + 63) / 64) * 64;
+      size_t ws_elems = (size_t)16 * padded_M * padded_N;
+      size_t ws_bytes = ws_elems * sizeof(bf16_t);
+      void* ws_ptr = nullptr;
+      HIP_CALL(hipMalloc(&ws_ptr, ws_bytes));
+      aiter_tensor_t ws_tensor{};
+      ws_tensor.ptr = ws_ptr;
+      ws_tensor.numel_ = ws_elems;
+      ws_tensor.ndim = 1;
+      ws_tensor.shape[0] = (int64_t)ws_elems;
+      ws_tensor.strides[0] = 1;
+      ws_tensor.dtype_ = AITER_DTYPE_bf16;
+      ws_tensor.device_id = 0;
+      fn(XQ, WQ, Y, ws_tensor, bias, 0);
+      HIP_CALL(hipDeviceSynchronize());
+      HIP_CALL(hipFree(ws_ptr));
     }
     else
+#endif
     {
-      AITER_CHECK(false, "opus_gemm a16w16: unsupported output dtype, expected bf16 or fp32");
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
+      if (Y.dtype() == AITER_DTYPE_bf16)
+      {
+        opus_dispatch_a16w16<bf16_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
+      }
+      else if (Y.dtype() == AITER_DTYPE_fp32)
+      {
+        opus_dispatch_a16w16<fp32_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
+      }
+      else
+      {
+        AITER_CHECK(false, "opus_gemm a16w16: unsupported output dtype, expected bf16 or fp32");
+      }
+#else
+      AITER_CHECK(false, "opus_gemm: no a16w16 dispatch available for this arch");
+#endif
     }
   }
   else
@@ -300,6 +327,7 @@ void opus_gemm_a16w16_tune(
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
     std::optional<aiter_tensor_t> bias,
+    std::optional<aiter_tensor_t> workspace,
     int kernelId,
     int splitK)
 {
@@ -328,15 +356,40 @@ void opus_gemm_a16w16_tune(
                   || Y.dtype() == AITER_DTYPE_fp32,
                   "opus_gemm_a16w16_tune splitk kid requires bf16 or fp32 Y "
                   "(reduce kernel writes the correct dtype)");
-      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#ifdef OPUS_BUILD_HAS_GFX1250
+      if (opus_kid_is_gfx1250_splitk(kernelId))
+      {
+        AITER_CHECK(workspace.has_value(),
+                    "gfx1250 split-K kids require a workspace tensor "
+                    "(allocated via torch.empty on the Python side)");
+        auto& ws = workspace.value();
+        opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kernelId)(XQ, WQ, Y, ws, bias, splitK);
+      }
+      else
+#endif
+      {
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
+        opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#else
+        AITER_CHECK(false, "opus_gemm_a16w16_tune: non-gfx1250 splitk dispatch unavailable");
+#endif
+      }
     }
     else if (Y.dtype() == AITER_DTYPE_bf16)
     {
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
       opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#else
+      AITER_CHECK(false, "opus_gemm_a16w16_tune: non-splitk bf16 dispatch unavailable for this arch");
+#endif
     }
     else if (Y.dtype() == AITER_DTYPE_fp32)
     {
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
       opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#else
+      AITER_CHECK(false, "opus_gemm_a16w16_tune: non-splitk fp32 dispatch unavailable for this arch");
+#endif
     }
     else
     {

@@ -24,12 +24,12 @@
 //     consumer waves pk-add them into `acc` and write the bf16/fp32 C tile.
 //   * Workspace layout (tile-major, split-minor): partial `s` of tile (gx,gy) at
 //       ((gx*ntiles_n+gy)*(SplitK-1) + s) * (B_M*B_N)  DataWs elems, row pitch B_N.
-//     Backing storage reuses the shared opus_splitk_ws_handle (deref on device).
+//     Backing storage is allocated externally (torch.empty) and passed via ptr_ws.
 //   * DataWs = bf16 by default; instantiate with fp32 if bf16 reduce precision is
 //     insufficient (workspace/reduce become fp32; C dtype unchanged).
 #pragma once
 
-#include "opus_gemm_traits_a16w16_gfx1250.cuh" // ws traits + make_layout_*_ctdm + opus_splitk_ws_handle
+#include "opus_gemm_traits_a16w16_gfx1250.cuh" // ws traits + make_layout_*_ctdm
 
 #ifdef __HIP_DEVICE_COMPILE__
 using namespace opus;
@@ -504,7 +504,7 @@ __global__ __launch_bounds__(128, 1)
 
         if(!is_last)
         {
-            DataWs* ws_ptr = reinterpret_cast<DataWs*>(kargs.ws_handle->ptr);
+            DataWs* ws_ptr = reinterpret_cast<DataWs*>(kargs.ptr_ws);
             const size_t ws_base =
                 ((size_t)sem_idx * (size_t)(SplitK - 1) + (size_t)split_idx) * tile_elems;
             auto g_ws   = opus::make_gmem<DataWs>(ws_ptr + ws_base,
@@ -562,7 +562,7 @@ __global__ __launch_bounds__(128, 1)
     {
         DataWs* lds_ws             = reinterpret_cast<DataWs*>(lds_buf);
         constexpr int kWsTileElems = T::kBlockM * T::kBlockN;
-        DataWs* ws_ptr             = reinterpret_cast<DataWs*>(kargs.ws_handle->ptr);
+        DataWs* ws_ptr             = reinterpret_cast<DataWs*>(kargs.ptr_ws);
         const int ws_lane_base     = (wave_split * (int)T::kWarp + lane_id) * NELEM;
         auto stage                 = [&](int slot, int s) __attribute__((always_inline)) {
             const size_t ws_base_s =

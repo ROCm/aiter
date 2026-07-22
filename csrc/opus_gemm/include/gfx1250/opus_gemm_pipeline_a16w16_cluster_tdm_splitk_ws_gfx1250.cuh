@@ -390,7 +390,7 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
 #endif
     using DataWs          = typename std::conditional<(OPUS_WS_BF16 != 0), DataA, DataAcc>::type;
     constexpr int kCVec   = T::kCVec; // 4 (fp32 dwordx4 / bf16 dwordx2)
-    DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ws_handle->ptr);
+    DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ptr_ws);
     const size_t ws_split = (size_t)split_idx * (size_t)kargs.stride_ws_batch;
     const size_t ws_base  = ws_split + (size_t)tile_row * (size_t)kargs.stride_ws + (size_t)tile_col;
     const unsigned int ws_bytes = (unsigned int)(((size_t)kargs.stride_ws_batch -
