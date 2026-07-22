@@ -1342,13 +1342,11 @@ def compile_wd_moe_down_reduce(
 
             # Inner accumulation over k_steps and k_pairs.
             #
-            # dot2 path uses an scf.ForOp for the k_step loop instead of
-            # range_constexpr.  Fully unrolling k_steps materialises all pair
-            # offsets simultaneously; for large n_k_steps (>= 5 with H2) this
-            # exhausts VGPRs and the register allocator aliases x_word's VGPR
-            # with a dot2 output, producing wrong results.  A ForOp keeps the
-            # inner body to k_pairs * h_per_warp dot2 calls per iteration,
-            # bounding register pressure regardless of n_k_steps.
+            # dot2 path uses an scf.ForOp for k_steps + BATCHED loads per step.
+            # Batched pattern: issue ALL loads → one vmcnt0 → independent dot2s
+            # → one s_nop(2) drain → reduce into cur_accs.  This mirrors the
+            # gate_up batched path (44%→65% HBM improvement) and eliminates the
+            # per-call s_waitcnt + s_nop serialisation that _dot2_dep caused.
             #
             # f32 path: no vmcnt constraints, range_constexpr is fine.
             curs: list = [zero_f32] * h_per_warp
@@ -1365,43 +1363,70 @@ def compile_wd_moe_down_reduce(
                     k_base_c = k_step_i32 * arith.constant(_k_step, type=i32)
                     lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
 
+                    # ── Phase A: issue ALL loads for this k-step ─────────────
+                    # Pre-init so AST rewriter resolves `slots` from both branches.
+                    slots: list = [zero_f32] * h_per_warp
                     if _use_fp8_w:
-                        # FP8 weight path: load one i32 = 4 FP8 per lane per
-                        # fp8_word, then sel=0/1 decode to 2 BF16 pairs each.
                         c_four = arith.constant(4, type=i32)
+                        x_fp8_loads: list = []  # [wi * 2*h_per_warp + sel*h_per_warp + h]
+                        w_fp8_loads: list = []  # [wi * h_per_warp + h]
                         for wi in range_constexpr(_k_fp8_words):
                             wi4 = arith.constant(wi * 4, type=i32)
                             w_i32_off = (lane_k + wi4) // c_four
-                            # Load FP8 word for each h channel
-                            w_fp8_h: list = []
                             for h in range_constexpr(h_per_warp):
-                                w_fp8_h.append(buffer_ops.buffer_load(
+                                w_fp8_loads.append(buffer_ops.buffer_load(
                                     w_row_rsrcs[h], w_i32_off, vec_width=1, dtype=i32
                                 ))
                             for sel in range_constexpr(2):
                                 pair_elem = arith.constant((wi * 2 + sel) * 2, type=i32)
                                 x_off = (inter_row_base + lane_k + pair_elem) // c_two
                                 for h in range_constexpr(h_per_warp):
-                                    x_word_h = buffer_ops.buffer_load(
+                                    x_fp8_loads.append(buffer_ops.buffer_load(
                                         inter_rsrc, x_off, vec_width=1, dtype=i32
+                                    ))
+                        _vmcnt0()
+                        # ── Phase B: pre-convert FP8→BF16, then independent dot2 ──
+                        for wi in range_constexpr(_k_fp8_words):
+                            for sel in range_constexpr(2):
+                                idx_x = (wi * 2 + sel) * h_per_warp
+                                idx_w = wi * h_per_warp
+                                for h in range_constexpr(h_per_warp):
+                                    xw = x_fp8_loads[idx_x + h]
+                                    wbf16 = _fp8x2_to_bf16(w_fp8_loads[idx_w + h], w_scale, sel)
+                                    slots[h] = arith.addf(
+                                        slots[h], _dot2_batched(zero_f32, xw, wbf16)
                                     )
-                                    w_bf16 = _fp8x2_to_bf16(w_fp8_h[h], w_scale, sel)
-                                    cur_accs[h] = _dot2_dep(cur_accs[h], x_word_h, w_bf16)
+                        rocdl.s_nop(2)
                     else:
-                        # BF16 weight path: load one i32 = 2 BF16 per pair.
+                        # BF16 weight path: one i32 = 2 BF16 per pair.
+                        x_loads: list = []   # [p * h_per_warp + h]
+                        w_loads: list = []   # [p * h_per_warp + h]
                         for p in range_constexpr(_k_pairs):
                             p2 = arith.constant(p * 2, type=i32)
                             x_off = (inter_row_base + lane_k + p2) // c_two
                             w_off = (lane_k + p2) // c_two
                             for h in range_constexpr(h_per_warp):
-                                x_word_h = buffer_ops.buffer_load(
+                                x_loads.append(buffer_ops.buffer_load(
                                     inter_rsrc, x_off, vec_width=1, dtype=i32
-                                )
-                                w_word = buffer_ops.buffer_load(
+                                ))
+                                w_loads.append(buffer_ops.buffer_load(
                                     w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
+                                ))
+                        _vmcnt0()
+                        # ── Phase B: independent dot2 per (p, h) ─────────────
+                        for p in range_constexpr(_k_pairs):
+                            for h in range_constexpr(h_per_warp):
+                                idx = p * h_per_warp + h
+                                slots[h] = arith.addf(
+                                    slots[h],
+                                    _dot2_batched(zero_f32, x_loads[idx], w_loads[idx]),
                                 )
-                                cur_accs[h] = _dot2_dep(cur_accs[h], x_word_h, w_word)
-                    scf.YieldOp(cur_accs)
+                        rocdl.s_nop(2)
+                    # ── Phase C: reduce k-step slots into running accumulators ─
+                    new_accs_inner: list = []
+                    for h in range_constexpr(h_per_warp):
+                        new_accs_inner.append(arith.addf(cur_accs[h], slots[h]))
+                    scf.YieldOp(new_accs_inner)
                 curs = list(inner_for.results)
             else:
                 for k_step in range_constexpr(_n_k_steps_per_batch):
