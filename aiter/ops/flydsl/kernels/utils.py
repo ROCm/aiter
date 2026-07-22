@@ -7,13 +7,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, rocdl
 from flydsl.expr.typing import T
 
-# Pointer/global-load helpers now live in mem_ops; re-exported here for back-compat.
-from .mem_ops import extract_global_ptr as extract_global_ptr
-from .mem_ops import global_load as global_load
-from .mem_ops import global_load_i32 as global_load_i32
-from .mem_ops import global_load_i64x2 as global_load_i64x2
-from .mem_ops import global_ptr_from_addr as global_ptr_from_addr
-
 
 def rcp_f32(value):
     return rocdl.rcp(T.f32, value)
