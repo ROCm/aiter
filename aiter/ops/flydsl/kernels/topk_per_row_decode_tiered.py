@@ -138,6 +138,7 @@ def create_topk_per_row_decode_tiered_kernel(
     tiered_long_cap: int = 32,
     mask_non_finite: bool = True,
     row_proportional_parts: bool = False,
+    early_stop: bool = False,
 ) -> Any:
     """Build a launcher that selects the Top-K largest values' column indices per
     decode row (unordered set, matching torch.topk by value). Implemented as a
@@ -220,6 +221,7 @@ def create_topk_per_row_decode_tiered_kernel(
         f"{'_1wg' if short_tier else ''}"
         f"{'_mf' if mask_non_finite else ''}"
         f"{'_rpp' if row_proportional_parts else ''}"
+        f"{'_es' if early_stop else ''}"
     )
 
     @fx.struct
@@ -737,6 +739,69 @@ def create_topk_per_row_decode_tiered_kernel(
                 col_base, load_row_vec(col_base), local_k, kth_bits
             )
 
+        def process_loaded_early_vec(col_base, vec, previous_start_bit: int, kth_bits):
+            # Early-stop write: the boundary bucket after the previous pass is taken
+            # whole (remaining_len == remaining_k), so every element whose prefix at
+            # the previous resolution is <= the boundary prefix is in the top-k. No
+            # tie-break needed. Mirrors HIP mb `previous_bits <= kth_value_bits`.
+            for j in range_constexpr(LOAD_VEC):
+                col_i32 = ArithValue(col_base) + ArithValue(fx.Int32(j))
+                if ArithValue(col_i32) < ArithValue(row_len):
+                    val = vector.extract(vec, static_position=[j], dynamic_position=[])
+                    key = radix_twiddle_key(val)
+                    prefix = prefix_for_key(key, previous_start_bit)
+                    if arith.cmpi(arith.CmpIPredicate.ule, prefix, kth_bits):
+                        pos = global_atomic_add_i32(
+                            counter_slot(COUNTER_OUT_FRONT), c_one
+                        )
+                        if ArithValue(pos) < ArithValue(c_top_k):
+                            buffer_ops.buffer_store(
+                                col_i32, indices_rsrc, row_out + ArithValue(pos)
+                            )
+
+        def early_write_vec_block(vblk, previous_start_bit: int, kth_bits):
+            col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
+            process_loaded_early_vec(
+                col_base, load_row_vec(col_base), previous_start_bit, kth_bits
+            )
+
+        def early_write_all(previous_start_bit: int, kth_bits):
+            # Same 4x-staged unroll as the normal last-pass write so the early-stop
+            # row re-scan is not slower than the pass it replaces.
+            unroll_limit_idx = ArithValue(vec_blocks_idx) - ArithValue(
+                active_stride3_idx
+            )
+            for vblk, write_state in range(
+                ArithValue(global_vec_tid_idx),
+                unroll_limit_idx,
+                ArithValue(active_stride4_idx),
+                init=[global_vec_tid_idx],
+            ):
+                for unroll_id in range_constexpr(4):
+                    early_write_vec_block(
+                        ArithValue(vblk)
+                        + ArithValue(
+                            arith.index_cast(
+                                T.index,
+                                ArithValue(active_threads)
+                                * ArithValue(fx.Int32(unroll_id)),
+                            )
+                        ),
+                        previous_start_bit,
+                        kth_bits,
+                    )
+                write_results = yield [
+                    ArithValue(vblk) + ArithValue(active_stride4_idx)
+                ]
+            for vblk, write_state in range(
+                write_results,
+                ArithValue(vec_blocks_idx),
+                ArithValue(active_stride_idx),
+                init=[c_zero],
+            ):
+                early_write_vec_block(vblk, previous_start_bit, kth_bits)
+                write_results = yield [write_state[0]]
+
         global_vec_tid = part * ArithValue(c_block_i32) + tid
         global_vec_tid_idx = arith.index_cast(T.index, global_vec_tid)
         vec_blocks_i32 = ArithValue(
@@ -1160,11 +1225,33 @@ def create_topk_per_row_decode_tiered_kernel(
 
         if persistent_active:
             local_k = c_top_k
+            local_len = row_len
             kth_bits = c_zero
-            for pass_id in range_constexpr(num_passes):
-                local_k, _local_len, kth_bits = scan_pass(
-                    pass_id, local_k, kth_bits, pass_id + 1
-                )
+            if early_stop:
+                # HIP-mb-style early termination: run every pass but the last (none of
+                # these write), then skip the final radix pass when the boundary bucket
+                # is taken whole (remaining_len == remaining_k) and write those elements
+                # directly. `early` is computed from the globally merged histogram, so it
+                # is identical across every block of the row -> the last pass's row_barrier
+                # is entered (or skipped) by all blocks together, no deadlock.
+                for pass_id in range_constexpr(num_passes - 1):
+                    local_k, local_len, kth_bits = scan_pass(
+                        pass_id, local_k, kth_bits, pass_id + 1
+                    )
+                last_pass = num_passes - 1
+                prev_start_bit = max(32 - last_pass * bits_per_pass, 0)
+                early = ArithValue(local_len) == ArithValue(local_k)
+                if early:
+                    early_write_all(prev_start_bit, kth_bits)
+                if ~early:
+                    local_k, local_len, kth_bits = scan_pass(
+                        last_pass, local_k, kth_bits, last_pass + 1
+                    )
+            else:
+                for pass_id in range_constexpr(num_passes):
+                    local_k, local_len, kth_bits = scan_pass(
+                        pass_id, local_k, kth_bits, pass_id + 1
+                    )
 
     @flyc.jit
     def launcher(

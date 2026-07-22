@@ -226,6 +226,12 @@ def _default_kernel_config(
     # are unchanged). Env FLYDSL_TOPK_TIERED_RPP (0/1) overrides; gfx942 frozen (0).
     rpp_on = _env_int("FLYDSL_TOPK_TIERED_RPP", 1 if arch == "gfx950" else 0)
 
+    # Early-stop (gfx950 only). Skips the final radix pass when the boundary bucket
+    # is taken whole; only enabled for the single-row (num_rows <= 1) decode case,
+    # where the merged histogram / row_barrier are cheapest and the win is cleanest.
+    # Env FLYDSL_TOPK_TIERED_ES (0/1) overrides; gfx942 frozen (0).
+    es_on = _env_int("FLYDSL_TOPK_TIERED_ES", 1 if arch == "gfx950" else 0)
+
     return dict(
         blocks_per_row=blocks_per_row,
         bits_per_pass=bits_per_pass,
@@ -237,6 +243,7 @@ def _default_kernel_config(
         mask_non_finite=True,
         tier_mode="auto",
         row_proportional_parts=bool(rpp_on),
+        early_stop=bool(es_on) and num_rows <= 1,
     )
 
 
