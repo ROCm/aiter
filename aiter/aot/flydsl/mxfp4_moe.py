@@ -26,6 +26,9 @@ DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
+# V2 GEMM2 enables fp8 route-out by default; the legacy MoE AOT path keeps its
+# own default behavior in moe.py.
+_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "1") == "1"
 
 
 def _job_key(job: dict) -> tuple:
@@ -44,6 +47,7 @@ def _job_key(job: dict) -> tuple:
             job["persist"],
             job["cu_num"] if job["persist"] else 0,
             job["has_pad"],
+            job["out_dtype"],
         )
     if job["stage"] == 1:
         return (
@@ -125,6 +129,11 @@ def parse_csv(csv_path: str):
                 bm = v2_g2["tile_m"]
                 inter_dim_pad = d_inter - inter_dim
                 model_dim_pad = 0
+                out_dtype = (
+                    "fp8"
+                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
+                    else "bf16"
+                )
                 _add(
                     {
                         "stage": 2,
@@ -145,6 +154,7 @@ def parse_csv(csv_path: str):
                         "inter_dim_pad": inter_dim_pad,
                         "model_dim_pad": model_dim_pad,
                         "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
+                        "out_dtype": out_dtype,
                     }
                 )
             elif _is_mxfp4_kname(kn2):
@@ -243,12 +253,34 @@ def _compile_stage2(job):
 
 
 def _compile_v2_stage2(job):
+    import torch
+
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
     d = _dummy()
     max_sorted = job["BM"]
     if job["persist"]:
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
+    is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
+    out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
+    if job["epilog"] == "reduce":
+        if is_fp8_route_out:
+            target = torch.empty(
+                (
+                    job["BM"] * job["topk"],
+                    job["N_OUT"] + job["N_OUT"] // 8,
+                ),
+                dtype=torch.uint8,
+                device="cpu",
+            )
+        else:
+            target = torch.empty(
+                (job["BM"], job["topk"], job["N_OUT"]),
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+    else:
+        target = out
     mxfp4_moe_gemm2(
         inter_sorted_quant=d,
         inter_sorted_shuffled_scale=d,
@@ -258,7 +290,7 @@ def _compile_v2_stage2(job):
         cumsum_tensor=d,
         sorted_token_ids=d,
         sorted_weights=d,
-        out=d,
+        out=target,
         M_logical=job["BM"],
         max_sorted=max_sorted,
         NE=job["NE"],
@@ -275,8 +307,23 @@ def _compile_v2_stage2(job):
         n_sorted_padded=max_sorted,
         inter_dim_pad=job["inter_dim_pad"],
         model_dim_pad=job["model_dim_pad"],
+        out_dtype=job["out_dtype"],
         stream=0,
     )
+    if job["epilog"] == "reduce":
+        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+        _run_moe_reduction(
+            target,
+            out,
+            job["BM"],
+            job["topk"],
+            job["N_OUT"],
+            expert_mask=None,
+            topk_ids=None,
+            stream=0,
+            is_fp8=is_fp8_route_out,
+        )
 
 
 def compile_one_config(**job):
@@ -284,6 +331,8 @@ def compile_one_config(**job):
     shape_str = (
         f"{job['kernel_name']} NE={job['NE']} D_INTER={job['D_INTER']} BM={job['BM']}"
     )
+    if job.get("v2_stage2"):
+        shape_str += f" out_dtype={job['out_dtype']}"
     result = {"kernel_name": job["kernel_name"], "stage": stage, "compile_time": None}
 
     t0 = time.time()
