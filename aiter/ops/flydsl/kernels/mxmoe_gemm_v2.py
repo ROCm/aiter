@@ -275,7 +275,9 @@ def gemm2_body_v2(
 
     # A activation: global->LDS DMA (issue_a_load_lds), then LDS->reg ds-read (issue_a_ds_read).
     aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * K_BYTES)
-    A_NDW = 8 if is_f8_a else 4  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
+    A_NDW = (
+        8 if is_f8_a else 4
+    )  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
     a_frags = [
         [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(2)]
         for _ in range_constexpr(kMChunks)
