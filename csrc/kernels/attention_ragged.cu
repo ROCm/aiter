@@ -388,6 +388,124 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     }
 }
 
+// Same as paged_attention_custom_launcher but exp_sums / max_logits / tmp_out are separate tensors
+// (used by paged_attention_ragged_nhd PyBind entrypoint).
+template <typename T,
+          typename KVT,
+          vllm::Fp8KVCacheDataType KV_DTYPE,
+          int BLOCK_SIZE,
+          int HEAD_SIZE,
+          typename OUTT,
+          int PARTITION_SIZE_OLD,
+          bool ALIBI_ENABLED,
+          bool LOGITS_SOFT_CAP_ENABLED>
+void paged_attention_custom_launcher_split_ws(torch::Tensor& out,
+                                              torch::Tensor& exp_sums,
+                                              torch::Tensor& max_logits,
+                                              torch::Tensor& tmp_out,
+                                              torch::Tensor& query,
+                                              torch::Tensor& key_cache,
+                                              torch::Tensor& value_cache,
+                                              float scale,
+                                              torch::Tensor& kv_indptr,
+                                              torch::Tensor& kv_page_indices,
+                                              std::optional<torch::Tensor>& kv_last_page_lens,
+                                              int max_num_partitions,
+                                              const std::optional<torch::Tensor>& alibi_slopes,
+                                              const std::string& kv_cache_layout,
+                                              float logits_soft_cap,
+                                              torch::Tensor& k_scale,
+                                              torch::Tensor& v_scale,
+                                              const std::optional<torch::Tensor>& fp8_out_scale)
+{
+    const int num_kv_heads = kv_cache_layout == "HND" ? key_cache.size(1) : key_cache.size(2);
+    int num_seqs           = query.size(0);
+    int num_heads          = query.size(1);
+    int head_size          = query.size(2);
+    int q_stride           = query.stride(0);
+    int kv_block_stride    = key_cache.stride(0);
+    int kv_head_stride     = kv_cache_layout == "HND" ? key_cache.stride(1) : key_cache.stride(2);
+    int kv_seq_stride      = kv_cache_layout == "HND" ? key_cache.stride(2) : key_cache.stride(1);
+
+    const float* alibi_slopes_ptr =
+        alibi_slopes ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr()) : nullptr;
+
+    T* query_ptr             = reinterpret_cast<T*>(query.data_ptr());
+    KVT* key_cache_ptr       = reinterpret_cast<KVT*>(key_cache.data_ptr());
+    KVT* value_cache_ptr     = reinterpret_cast<KVT*>(value_cache.data_ptr());
+    int* kv_indptr_ptr       = kv_indptr.data_ptr<int>();
+    int* kv_page_indices_ptr = kv_page_indices.data_ptr<int>();
+    int* kv_last_page_lens_ptr =
+        BLOCK_SIZE > 1 ? kv_last_page_lens.value().data_ptr<int>() : nullptr;
+
+    const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
+    const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
+    const float* fp8_out_scale_ptr =
+        fp8_out_scale ? reinterpret_cast<const float*>(fp8_out_scale.value().data_ptr()) : nullptr;
+    OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
+
+    const float logits_soft_cap_rcp = (LOGITS_SOFT_CAP_ENABLED ? 1.f / logits_soft_cap : 0.f);
+
+    // Template PSIZE matches Python `partition_size` (256 / 512 / 1024). Reduction uses this;
+    // the mfma16 attention kernel still uses a fixed T_PAR_SIZE in device code (see kernel above).
+    constexpr int PARTITION_SIZE = PARTITION_SIZE_OLD;
+    const int gqa_ratio          = num_heads / num_kv_heads;
+    assert(num_heads % num_kv_heads == 0);
+    assert(head_size == HEAD_SIZE);
+
+    TORCH_CHECK(exp_sums.scalar_type() == at::ScalarType::Float, "exp_sums must be float32");
+    TORCH_CHECK(max_logits.scalar_type() == at::ScalarType::Float, "max_logits must be float32");
+    float* exp_sums_ptr   = exp_sums.data_ptr<float>();
+    float* max_logits_ptr = max_logits.data_ptr<float>();
+    OUTT* tmp_out_ptr     = reinterpret_cast<OUTT*>(tmp_out.data_ptr());
+
+    ck_tile::ComposedAttention<LOGITS_SOFT_CAP_ENABLED * ck_tile::LOGITS_SOFT_CAP> variant;
+
+    constexpr int NTHR = 256;
+    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+    dim3 block(NTHR);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    switch(gqa_ratio)
+    {
+    case 1: LAUNCH_CUSTOM_ATTENTION_MFMA16(1); break;
+    case 2: LAUNCH_CUSTOM_ATTENTION_MFMA16(2); break;
+    case 3: LAUNCH_CUSTOM_ATTENTION_MFMA16(3); break;
+    case 4: LAUNCH_CUSTOM_ATTENTION_MFMA16(4); break;
+    case 5: LAUNCH_CUSTOM_ATTENTION_MFMA16(5); break;
+    case 6: LAUNCH_CUSTOM_ATTENTION_MFMA16(6); break;
+    case 7: LAUNCH_CUSTOM_ATTENTION_MFMA16(7); break;
+    case 8: LAUNCH_CUSTOM_ATTENTION_MFMA16(8); break;
+    case 9: LAUNCH_CUSTOM_ATTENTION_MFMA16(9); break;
+    case 10: LAUNCH_CUSTOM_ATTENTION_MFMA16(10); break;
+    case 11: LAUNCH_CUSTOM_ATTENTION_MFMA16(11); break;
+    case 12: LAUNCH_CUSTOM_ATTENTION_MFMA16(12); break;
+    case 13: LAUNCH_CUSTOM_ATTENTION_MFMA16(13); break;
+    case 14: LAUNCH_CUSTOM_ATTENTION_MFMA16(14); break;
+    case 15: LAUNCH_CUSTOM_ATTENTION_MFMA16(15); break;
+    case 16: LAUNCH_CUSTOM_ATTENTION_MFMA16(16); break;
+    default: TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break;
+    }
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    dim3 reduce_block(head_size);
+    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
+    constexpr bool ENABLE_LAST_PAGE_LENS = BLOCK_SIZE > 1;
+    switch(npar_loops)
+    {
+    case 1: LAUNCH_CUSTOM_REDUCTION(1); break;
+    case 2: LAUNCH_CUSTOM_REDUCTION(2); break;
+    case 3: LAUNCH_CUSTOM_REDUCTION(3); break;
+    case 4: LAUNCH_CUSTOM_REDUCTION(4); break;
+    case 5: LAUNCH_CUSTOM_REDUCTION(5); break;
+    case 6: LAUNCH_CUSTOM_REDUCTION(6); break;
+    case 7: LAUNCH_CUSTOM_REDUCTION(7); break;
+    case 8: LAUNCH_CUSTOM_REDUCTION(8); break;
+    default: TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops); break;
+    }
+}
+
 #define CALL_CUSTOM_LAUNCHER(                                                                   \
     T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, LOGITS_SOFT_CAP_ENABLED) \
     paged_attention_custom_launcher<T,                                                          \
@@ -487,6 +605,87 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     default: TORCH_CHECK(false, "Unsupported head size: ", head_size); break; \
     }
 
+#define CALL_CUSTOM_LAUNCHER_SPLIT(                                                                   \
+    T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, LOGITS_SOFT_CAP_ENABLED) \
+    paged_attention_custom_launcher_split_ws<T,                                                          \
+                                    KVT,                                                        \
+                                    KV_DTYPE,                                                   \
+                                    BLK_SIZE,                                                   \
+                                    HEAD_SIZE,                                                  \
+                                    OUTT,                                                       \
+                                    PSIZE,                                                      \
+                                    ALIBI_ENABLED,                                              \
+                                    LOGITS_SOFT_CAP_ENABLED>(out,                               \
+                                                             exp_sums,                  \
+                                                             max_logits,                  \
+                                                             tmp_out,                  \
+                                                             query,                             \
+                                                             key_cache,                         \
+                                                             value_cache,                       \
+                                                             scale,                             \
+                                                             kv_indptr,                         \
+                                                             kv_page_indices,                   \
+                                                             kv_last_page_lens,                 \
+                                                             max_num_partitions,                \
+                                                             alibi_slopes,                      \
+                                                             kv_cache_layout,                   \
+                                                             logits_soft_cap,                   \
+                                                             k_scale,                           \
+                                                             v_scale,                           \
+                                                             fp8_out_scale);
+
+#define CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(                                                 \
+    T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED)                 \
+    if(0.f < logits_soft_cap)                                                          \
+    {                                                                                  \
+        CALL_CUSTOM_LAUNCHER_SPLIT(                                                          \
+            T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, true);  \
+    }                                                                                  \
+    else if(logits_soft_cap == 0.f)                                                    \
+    {                                                                                  \
+        CALL_CUSTOM_LAUNCHER_SPLIT(                                                          \
+            T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, ALIBI_ENABLED, false); \
+    }                                                                                  \
+    else                                                                               \
+    {                                                                                  \
+        TORCH_CHECK(false, "logits_soft_cap must be non-negative");                    \
+    }
+
+// NHD entry (e.g. SGLang) always passes alibi_slopes=None; ALiBi template parameter fixed false.
+#define CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT)                    \
+    switch(partition_size)                                                                         \
+    {                                                                                              \
+    case 256: CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 256, false); break; \
+    case 512: CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 512, false); break; \
+    case 1024: CALL_CUSTOM_LAUNCHER_SOFT_CAP_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 1024, false); break; \
+    default: TORCH_CHECK(false, "Unsupported partition size (expected 256, 512, or 1024): ", partition_size); break; \
+    }
+
+#if defined(__HIPCC__) && defined(__gfx90a__)
+#define CALL_CUSTOM_LAUNCHER_OUT_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)       \
+    if(fp8_out_scale)                                                         \
+    {                                                                         \
+        TORCH_CHECK(false, "fp8 out scale unsupported for gfx90a");           \
+    }                                                                         \
+    else                                                                      \
+    {                                                                         \
+        CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T); \
+    }
+#else
+#define CALL_CUSTOM_LAUNCHER_OUT_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)             \
+    if(fp8_out_scale)                                                               \
+    {                                                                               \
+        CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, uint8_t); \
+    }                                                                               \
+    else                                                                            \
+    {                                                                               \
+        CALL_CUSTOM_LAUNCHER_PSIZE_SPLIT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T);       \
+    }
+#endif
+// NHD PyBind path: block_size=1 and head_size=256 only (matches pa_ragged_nhd JIT constraints).
+#define CALL_CUSTOM_LAUNCHER_BLK_HEAD_SPLIT(T, KVT, KV_DTYPE) \
+    CALL_CUSTOM_LAUNCHER_OUT_SPLIT(T, KVT, KV_DTYPE, 1, 256)
+
 void paged_attention_ragged(
     torch::Tensor& out, // [num_seqs, num_heads, head_size]
     torch::Tensor& workspace_buffer,
@@ -546,6 +745,59 @@ void paged_attention_ragged(
     else
     {
         TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+    }
+}
+
+void paged_attention_ragged_nhd(
+    torch::Tensor& out,
+    torch::Tensor& exp_sums,
+    torch::Tensor& max_logits,
+    torch::Tensor& tmp_out,
+    torch::Tensor& query,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    double scale,
+    torch::Tensor& kv_indptr,
+    torch::Tensor& kv_page_indices,
+    std::optional<torch::Tensor>& kv_last_page_lens,
+    int64_t block_size,
+    int64_t max_num_partitions,
+    const std::optional<torch::Tensor>& alibi_slopes,
+    const std::string& kv_cache_dtype,
+    const std::string& kv_cache_layout,
+    float logits_soft_cap,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale,
+    const std::optional<torch::Tensor>& fp8_out_scale,
+    int64_t partition_size)
+{
+    const int head_size = query.size(2);
+    // NHD path matches ctypes JIT pa_ragged_nhd: bf16 KV only (kv_cache_dtype "auto"); no FP8 KV.
+    TORCH_CHECK(
+        kv_cache_dtype == "auto",
+        "paged_attention_ragged_nhd only supports kv_cache_dtype=\"auto\" (bf16 KV); got ",
+        kv_cache_dtype);
+    TORCH_CHECK(
+        !alibi_slopes.has_value(),
+        "paged_attention_ragged_nhd does not support alibi_slopes (pass None / omit)");
+    TORCH_CHECK(block_size == 1, "paged_attention_ragged_nhd expects block_size==1, got ", block_size);
+    TORCH_CHECK(head_size == 256, "paged_attention_ragged_nhd expects head_size==256, got ", head_size);
+    TORCH_CHECK(
+        partition_size == 256 || partition_size == 512 || partition_size == 1024,
+        "paged_attention_ragged_nhd expects partition_size in {256, 512, 1024}, got ",
+        partition_size);
+    if(query.dtype() == at::ScalarType::Half)
+    {
+        CALL_CUSTOM_LAUNCHER_BLK_HEAD_SPLIT(_Float16, _Float16, vllm::Fp8KVCacheDataType::kAuto);
+    }
+    else if(query.dtype() == at::ScalarType::BFloat16)
+    {
+        CALL_CUSTOM_LAUNCHER_BLK_HEAD_SPLIT(
+            __hip_bfloat16, __hip_bfloat16, vllm::Fp8KVCacheDataType::kAuto);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
     }
 }
 
