@@ -1066,3 +1066,42 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+def flydsl_preshuffle_batched_gemm_a8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    enable_scheduler: bool = True,
+) -> Tensor:
+    """Batched FP8 preshuffle GEMM via per-batch dispatch of the non-batched kernel.
+
+    Shapes: XQ[B,M,K], WQ[B,N,K], x_scale[B,M,1], w_scale[B,1,N], Out[B,M,N].
+    """
+    B = XQ.shape[0]
+    for b in range(B):
+        flydsl_preshuffle_gemm_a8(
+            XQ[b],
+            WQ[b],
+            x_scale[b],
+            w_scale[b],
+            Out[b],
+            tile_m,
+            tile_n,
+            tile_k,
+            use_async_copy,
+            waves_per_eu,
+            xcd_swizzle,
+            lds_stage,
+            enable_scheduler,
+        )
+    return Out

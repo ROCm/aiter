@@ -14,6 +14,7 @@ from ..jit.core import (
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from aiter import logger
+from ..ops.gemm_op_a8w8 import is_flydsl_available
 
 
 def gen_batched_gemm_a8w8_fake_tensors(
@@ -116,6 +117,24 @@ def get_CKBatchedGEMM_config(
     return config
 
 
+_batched_flydsl_failed = False
+
+
+def _select_batched_flydsl_kernel(n: int, k: int):
+    """Select a default FlyDSL tile config for batched GEMM."""
+    try:
+        from .flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            default_kernels_dict,
+        )
+    except ImportError:
+        return None
+    fits = [ki for ki in default_kernels_dict.values()
+            if n % ki.tile_n == 0 and k % ki.tile_k == 0]
+    if not fits:
+        return None
+    return min(fits, key=lambda x: (-x.tile_n, -x.tile_k))
+
+
 def batched_gemm_a8w8_CK(
     XQ: Tensor,
     WQ: Tensor,
@@ -134,6 +153,35 @@ def batched_gemm_a8w8_CK(
     m = XQ.shape[1]
     n = WQ.shape[1]
     k = XQ.shape[2]
+
+    global _batched_flydsl_failed
+    if (
+        not _batched_flydsl_failed
+        and is_flydsl_available()
+        and XQ.dtype in [dtypes.fp8, dtypes.i8]
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and bias is None
+    ):
+        ki = _select_batched_flydsl_kernel(n, k)
+        if ki is not None:
+            from .shuffle import shuffle_weight
+            from .flydsl.gemm_kernels import flydsl_preshuffle_batched_gemm_a8
+
+            Y = torch.empty(b, m, n, dtype=dtype, device=XQ.device)
+            WQ_shuffled = torch.stack(
+                [shuffle_weight(WQ[i], layout=(16, 16)) for i in range(b)]
+            )
+            try:
+                return flydsl_preshuffle_batched_gemm_a8(
+                    XQ, WQ_shuffled, x_scale, w_scale, Y,
+                    ki.tile_m, ki.tile_n, ki.tile_k,
+                )
+            except Exception as e:
+                _batched_flydsl_failed = True
+                logger.warning(
+                    f"[FlyDSL] batched GEMM failed: {e}; falling back to CK"
+                )
+
     ck_config = get_CKBatchedGEMM_config(b, m, n, k)
     if splitK is None:
         if ck_config is not None:
