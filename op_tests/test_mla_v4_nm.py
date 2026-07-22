@@ -1664,7 +1664,8 @@ def _run_one_point(
     #   [fp8_ref vs asm]    = kernel math error (quant-independent)
     print(
         f"\n[v4 nm accuracy] batch={batch} kv_seq_lens={kv_seq_lens} "
-        f"q_seq_logical={q_seq_logical} num_kv_splits={num_kv_splits} seed={seed}"
+        f"q_seq_logical={q_seq_logical} gqa_ratio={gqa_ratio} "
+        f"attn_sink={attn_sink} num_kv_splits={num_kv_splits} seed={seed}"
     )
     # Per-element check at checkAllclose's default 1% tolerance (rtol=atol=1e-2).
     # checkAllclose prints pass/warning/failed with the offending-element ratio +
@@ -1719,7 +1720,7 @@ def _run_one_point(
         f"({flops / us_triton / 1e6:.2f} TFLOPS), "
         f"asm_k vs triton = {triton_speedup:.2f}x"
     )
-    return us_asm, us_ref
+    return us_asm, us_ref, us_triton, us_asm_total
 
 
 @needs_gfx950
@@ -2753,7 +2754,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split-kv",
         type=int,
-        default=1,
+        default=None,
     )
     parser.add_argument(
         "--gqa-ratio",
@@ -2794,7 +2795,7 @@ if __name__ == "__main__":
             f"\n========== batch={batch} kv_seq_lens={kv_seq_lens} "
             f"q_seq_logical={q_seq_logical} =========="
         )
-        us_asm, us_ref = _run_one_point(
+        us_asm, us_ref, us_triton, us_asm_total = _run_one_point(
             batch=batch,
             kv_seq_lens=kv_seq_lens,
             q_seq_logical=q_seq_logical,
@@ -2806,12 +2807,31 @@ if __name__ == "__main__":
             attn_sink=args.attn_sink,
             out_16_nosplit=args.out_16_nosplit,
         )
-        perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))
+        perf_rows.append(
+            (
+                batch,
+                kv_seq_lens,
+                q_seq_logical,
+                args.gqa_ratio,
+                args.attn_sink,
+                us_asm,
+                us_ref,
+                us_triton,
+                us_asm_total,
+            )
+        )
 
-    print("\n[v4 nm perf summary] (us; speedup = fp8_ref / asm_kernel)")
+    print("\n[v4 nm perf summary] (us; speedup = other / asm_tot, end-to-end)")
+    print("  asm_k = kernel only; asm_tot = kernel + stage2 merge (end-to-end)")
+    print("  triton/torch are end-to-end, so speedup uses asm_tot for a fair compare")
     print(
-        f"  {'batch':>6} {'kv_seq':>8} {'q_seq':>6} "
-        f"{'asm_k us':>10} {'fp8_ref us':>12} {'speedup':>9}"
+        f"  {'batch':>6} {'kv_seq':>8} {'q_seq':>6} {'gqa':>5} {'sink':>6} "
+        f"{'asm_k us':>10} {'asm_tot us':>11} {'triton us':>10} {'torch us':>10} "
+        f"{'triton/asm':>11} {'torch/asm':>10}"
     )
-    for b, k, q, ua, ur in perf_rows:
-        print(f"  {b:>6d} {k:>8d} {q:>6d} {ua:>10.2f} {ur:>12.2f} {ur / ua:>8.1f}x")
+    for b, k, q, g, s, ua, ur, ut, uat in perf_rows:
+        print(
+            f"  {b:>6d} {k:>8d} {q:>6d} {g:>5d} {str(s):>6} "
+            f"{ua:>10.2f} {uat:>11.2f} {ut:>10.2f} "
+            f"{ur:>10.2f} {ut / uat:>10.1f}x {ur / uat:>9.1f}x"
+        )
