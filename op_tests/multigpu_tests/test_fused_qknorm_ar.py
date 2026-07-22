@@ -12,7 +12,10 @@ import torch.distributed as dist
 import pandas as pd
 
 from aiter import dtypes
-from aiter.dist.communication_op import tensor_model_parallel_fused_qknorm_allreduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_fused_qknorm_allreduce,
+    tensor_model_parallel_fused_qknorm_allreduce_rope,
+)
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -37,6 +40,10 @@ def qknorm_allreduce(
     qkv_in,
     q_w,
     k_w,
+    cos_sin_cache,
+    position_ids,
+    head_dim,
+    rotary_dim,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
 ):
@@ -54,6 +61,8 @@ def qknorm_allreduce(
     qkv_in = qkv_in.to(device)
     q_w = q_w.to(device)
     k_w = k_w.to(device)
+    cos_sin_cache = cos_sin_cache.to(device)
+    position_ids = position_ids.to(device)
     # dist.barrier(device_ids=[i for i in range(tp_size)])
 
     # warmup and align all gpu
@@ -61,12 +70,25 @@ def qknorm_allreduce(
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
+    method = (
+        tensor_model_parallel_fused_qknorm_allreduce_rope
+        if rotary_dim > 0
+        else tensor_model_parallel_fused_qknorm_allreduce
+    )
+
     if withGraph:
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                q_out, k_out, v_out = tensor_model_parallel_fused_qknorm_allreduce(
-                    qkv_in, q_w, k_w, 1e-6
+                q_out, k_out, v_out = method(
+                    qkv_in,
+                    q_w,
+                    k_w,
+                    cos_sin_cache,
+                    position_ids,
+                    head_dim,
+                    rotary_dim,
+                    1e-6,
                 )
         q_out.fill_(0)
         k_out.fill_(0)
@@ -82,7 +104,16 @@ def qknorm_allreduce(
 
         @perftest()
         def run_ca(qkv_in, q_w, k_w):
-            return tensor_model_parallel_fused_qknorm_allreduce(qkv_in, q_w, k_w, 1e-6)
+            return method(
+                qkv_in,
+                q_w,
+                k_w,
+                cos_sin_cache,
+                position_ids,
+                head_dim,
+                rotary_dim,
+                1e-6,
+            )
 
         out = run_ca(qkv_in, q_w, k_w)
 
@@ -91,6 +122,26 @@ def qknorm_allreduce(
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
+    return out
+
+
+def apply_neox_rope_host(x, cos_sin_cache, positions, head_size, rotary_dim):
+    # x: [token_num, hidden_dim]
+    # cos_sin_cache: [max_pos, rotary_dim]
+    # positions: [token_num]
+    token_num = x.shape[0]
+    x = x.view(token_num, -1, head_size)  # [token_num, nheads, head_size]
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    cos_sin = cos_sin_cache[positions].to(x.dtype)  # [token_num, rotary_dim]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    cos = cos.unsqueeze(-2).to(x.dtype)  # [token_num, 1, rotary_dim/2]
+    sin = sin.unsqueeze(-2).to(x.dtype)  # [token_num, 1, rotary_dim/2]
+    x1, x2 = x_rot.chunk(2, dim=-1)  # (token_num, nheads, rotary_dim/2) * 2
+    out = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    if x_pass.numel() > 0:
+        out = torch.cat((out, x_pass), dim=-1)
+    out = out.view(token_num, -1)
     return out
 
 
@@ -144,23 +195,28 @@ def test_qknorm_allreduce(
     tp_size,
     pp_size,
     shape,
+    head_size,
+    rotary_dim,
     dtype,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
 ):
+    token_num = shape[0]
+    hidden_dim_q = shape[1]
+    hidden_dim_k = shape[2]
+    hidden_dim_v = shape[3]
+    hidden_dim = hidden_dim_q + hidden_dim_k + hidden_dim_v
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     pool = Pool(processes=tp_size)
     qkv_ins = []
     q_ws = []
     k_ws = []
+    COS_SIN_MAX_POS = 16384
+    cos_sin_cache = torch.randn((COS_SIN_MAX_POS, rotary_dim), dtype=dtype)
+    positions = torch.arange(token_num - 1, -1, -1, dtype=torch.long)
     rets = []
     for i in range(tp_size):
-        token_num = shape[0]
-        hidden_dim_q = shape[1]
-        hidden_dim_k = shape[2]
-        hidden_dim_v = shape[3]
-        hidden_dim = hidden_dim_q + hidden_dim_k + hidden_dim_v
         qkv_in = torch.randn((token_num, hidden_dim), dtype=dtype)
         q_w = torch.randn((hidden_dim_q,), dtype=dtype)
         k_w = torch.randn((hidden_dim_k,), dtype=dtype)
@@ -177,6 +233,10 @@ def test_qknorm_allreduce(
                     qkv_in,
                     q_w,
                     k_w,
+                    cos_sin_cache,
+                    positions,
+                    head_size,
+                    rotary_dim,
                     withGraph,
                     distributed_init_method,
                 ),
@@ -187,6 +247,14 @@ def test_qknorm_allreduce(
     rets = [el.get() for el in rets]
     all_us = [us for _, us in rets]
     q_outs, k_outs, v_outs = qknorm_allreduce_host(qkv_ins, q_ws, k_ws)
+    for i in range(tp_size):
+        q_outs[i] = apply_neox_rope_host(
+            q_outs[i], cos_sin_cache, positions, head_size, rotary_dim
+        )
+        k_outs[i] = apply_neox_rope_host(
+            k_outs[i], cos_sin_cache, positions, head_size, rotary_dim
+        )
+
     max_err = 0.0
     ii = 0
     for outs, us in rets:
@@ -273,6 +341,8 @@ try:
             tp,
             1,
             shape,
+            128,
+            64,
             dtypes.d_dtypes[dtype_str],
             withGraph=True,
             distributed_init_method=get_distributed_init_method(
@@ -308,6 +378,8 @@ if __name__ == "__main__":
                     tp,
                     1,
                     shape,
+                    128,
+                    64,
                     dtype,
                     withGraph=args.with_graph,
                     distributed_init_method=get_distributed_init_method(

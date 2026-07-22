@@ -14,10 +14,10 @@ import torch
 from torch import Tensor
 
 import flydsl.expr as fx
-import flydsl.compiler as flyc
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -69,14 +69,6 @@ _HGEMM_KERNEL_RE = re.compile(
 SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
-
-
-def _ptr_view_safe(t: torch.Tensor):
-    type_name = type(t).__name__
-    module_name = type(t).__module__
-    if type_name == "FakeTensor" or "fake_tensor" in module_name:
-        return flyc.from_c_void_p(fx.Uint8, 0)
-    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
@@ -851,13 +843,13 @@ def _compile_flydsl_hgemm(
         semaphore, signal = _get_split_k_tensors(a.device, launch_stream)
         return _run_compiled(
             kernel,
-            _ptr_view_safe(out),
-            _ptr_view_safe(a),
-            _ptr_view_safe(b),
-            _ptr_view_safe(launch_bias),
+            ptr_arg(out),
+            ptr_arg(a),
+            ptr_arg(b),
+            ptr_arg(launch_bias),
             runtime_m,
-            _ptr_view_safe(semaphore),
-            _ptr_view_safe(signal),
+            ptr_arg(semaphore),
+            ptr_arg(signal),
             fx.Stream(launch_stream),
         )
 
@@ -959,7 +951,7 @@ _flydsl_import_done = False
 
 
 def _get_compile_fn():
-    """Lazy-import compile_preshuffle_gemm_a8 so the module loads even without FlyDSL."""
+    """Lazy-import compile_preshuffle_gemm so the module loads even without FlyDSL."""
     global _flydsl_compile_fn, _flydsl_import_done
     if _flydsl_import_done:
         return _flydsl_compile_fn
@@ -968,9 +960,9 @@ def _get_compile_fn():
         logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
         return None
     try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-        _flydsl_compile_fn = compile_preshuffle_gemm_a8
+        _flydsl_compile_fn = compile_preshuffle_gemm
         logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
     except Exception as e:
         logger.info(
@@ -988,11 +980,11 @@ def flydsl_preshuffle_gemm_a8(
     tile_m: int,
     tile_n: int,
     tile_k: int,
-    lds_stage: int = 2,
-    use_cshuffle_epilog: int = 0,
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
     xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    enable_scheduler: bool = True,
 ) -> Tensor:
     """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
     compile_fn = _get_compile_fn()
@@ -1040,11 +1032,11 @@ def flydsl_preshuffle_gemm_a8(
         tile_k=tile_k,
         in_dtype=in_dtype,
         out_dtype=out_dtype,
-        lds_stage=lds_stage,
-        use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=wpe,
+        enable_scheduler=bool(enable_scheduler),
         xcd_swizzle=int(xcd_swizzle),
+        lds_stage=int(lds_stage),
     )
 
     def _as_i8(t):
@@ -1055,14 +1047,17 @@ def flydsl_preshuffle_gemm_a8(
     # epilogue != "none"). Pass an empty tensor as a placeholder for the
     # default epilogue="none" path.
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
+    # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
+    # pointers.
     _run_compiled(
         exe,
-        _ptr_view_safe(out_contig.view(-1)),
-        _ptr_view_safe(_as_i8(XQ.contiguous()).view(-1)),
-        _ptr_view_safe(_as_i8(WQ.contiguous()).view(-1)),
-        _ptr_view_safe(x_scale.contiguous().view(-1)),
-        _ptr_view_safe(w_scale.contiguous().view(-1)),
-        _ptr_view_safe(_dummy_bias),
+        out_contig.view(-1),
+        _as_i8(XQ.contiguous()).view(-1),
+        _as_i8(WQ.contiguous()).view(-1),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        _dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),

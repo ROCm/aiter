@@ -128,7 +128,7 @@ def make_tensor_descriptor_2d(
         _wid_i32 = _rocdl_ext.wave_id()
         wave_id = arith.index_cast(T.index, _wid_i32)
         warp_coord_outer = wave_id % arith.index(warps_dim0)
-        warp_coord_inner = wave_id / arith.index(warps_dim0)
+        warp_coord_inner = wave_id // arith.index(warps_dim0)
         warp_off_outer = warp_coord_outer * arith.index(bpw_outer)
         warp_off_inner = warp_coord_inner * arith.index(bpw_inner)
     else:

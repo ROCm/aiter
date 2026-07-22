@@ -64,6 +64,17 @@ def lds_store_b128(memref, elem_off, data):
     vector.store(typed_vec, memref, [elem_off])
 
 
+def lds_store_b64(memref, elem_off, data):
+    """Store 8 bytes to LDS (``ds_store_b64``).
+
+    Bitcasts *data* (any 64-bit vector, e.g. ``vec<4×bf16>`` / ``vec<2×i32>``)
+    to match the memref element type, then ``vector.store``.
+    """
+    vec_ty = _lds_vec_type(memref, 64)
+    typed_vec = vector.bitcast(vec_ty, data)
+    vector.store(typed_vec, memref, [elem_off])
+
+
 def extract_lds_base_idx(smem_ptr):
     """Extract the absolute LDS byte-base address as an index value."""
     from flydsl._mlir.dialects import memref as _memref
@@ -95,6 +106,19 @@ def lds_load_b128_raw(lds_base_idx, byte_offset):
     return llvm_dialect.load(
         ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
     )
+
+
+def lds_load_b32_raw(lds_base_idx, byte_offset):
+    """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index.
+
+    Produces ``ds_load_b32``; ``byte_offset`` must be 4-byte aligned.
+
+    Args:
+        lds_base_idx: Index value from ``extract_lds_base_idx``.
+        byte_offset: Byte offset (index-type) relative to the base.
+    """
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
 
 
 def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
