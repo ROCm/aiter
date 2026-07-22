@@ -430,14 +430,13 @@ def run_generalization_correctness(seed: int):
     print("[PASS] generalized FlyDSL paths match production HIP within tolerance.")
 
 
-def run_large_token_chunking_correctness(seed: int):
-    """Exercise the Q launch split at the 16-bit grid-Y boundary."""
+def _run_large_token_boundary_case(T_tok: int, seed: int):
+    """Run one production-parity case around the 16-bit grid-Y boundary."""
     import aiter
 
     torch.manual_seed(seed + 2000)
     dev = "cuda"
     kv_dtype = dtypes.fp8
-    T_tok = 65536
     H_Q = H_K = H_V = 1
     D = HEAD_SIZE
     num_blocks = (T_tok + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -516,14 +515,21 @@ def run_large_token_chunking_correctness(seed: int):
     )
     torch.cuda.synchronize()
 
-    print("[large-token] T=65536 exercises two Q grid-Y launches")
+    q_launches = (T_tok + 65535 - 1) // 65535
+    print(f"[large-token] T={T_tok} exercises {q_launches} Q grid-Y launch(es)")
     failures = []
     _assert_close("q_out", "production", q_f, q_p, failures)
     _assert_close("k_cache", "production", k_f.float(), k_p.float(), failures)
     _assert_close("v_cache", "production", v_f.float(), v_p.float(), failures)
     if failures:
         raise AssertionError("[FAIL] large-token chunking:\n  " + "\n  ".join(failures))
-    print("[PASS] T=65536 chunked Q launch matches production HIP.")
+    print(f"[PASS] T={T_tok} Q launch path matches production HIP.")
+
+
+def run_large_token_chunking_correctness(seed: int):
+    """Exercise both sides of the Q grid-Y chunking boundary."""
+    _run_large_token_boundary_case(65535, seed)
+    _run_large_token_boundary_case(65536, seed)
 
 
 def _time(fn, iters, warmup):
@@ -703,7 +709,7 @@ def main():
     ap.add_argument(
         "--test-large-token-chunking",
         action="store_true",
-        help="Also run the T=65536 grid-Y chunking parity test.",
+        help="Also run T=65535/65536 parity tests across the grid-Y boundary.",
     )
     ap.add_argument(
         "--no-production-check",

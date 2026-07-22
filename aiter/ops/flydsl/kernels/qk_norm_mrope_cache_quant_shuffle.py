@@ -94,6 +94,9 @@ _RUN_BYTES = 16
 # clear message instead of an opaque compiler/allocator error.
 _MAX_LDS_BYTES = 65536
 
+# HIP exposes gridDim.y as a 16-bit dimension.
+_MAX_GRID_Y = 65535
+
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
@@ -143,7 +146,7 @@ def _build_q_kernel(
     @flyc.kernel(name=kname)
     def kernel(
         qkv: fx.Pointer,  # [T, H_Q+H_K+H_V, D] bf16, contig
-        positions: fx.Pointer,  # [3, T] i64, contig (flat mid*T + tok)
+        positions: fx.Pointer,  # [3, T] i64, arbitrary 2-D strides
         cos_sin: fx.Pointer,  # [max_pos, D] bf16 (cos=[:, :D/2], sin=[:, D/2:])
         q_norm_w: fx.Pointer,  # [D] bf16
         q_out: fx.Pointer,  # [T, H_Q, D] bf16
@@ -192,8 +195,7 @@ def _build_q_kernel(
                     fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
                 )
 
-            pos_offset = sect_idx * positions_stride_0 + tok * positions_stride_1
-            pos_i64 = fx.Int64(positions_t[pos_offset])
+            pos_i64 = fx.Int64(positions_t[sect_idx, tok])
             pos = pos_i64.to(fx.Int32)
             cos_v = fx.BFloat16(cos_sin_t[pos, col]).to(fx.Float32)
             sin_v = fx.BFloat16(cos_sin_t[pos, col + HALF]).to(fx.Float32)
@@ -205,7 +207,12 @@ def _build_q_kernel(
         tid = fx.thread_idx.x  # 0..WAVE-1
 
         qkv_t = GTensor(qkv, dtype=T.bf16, shape=(-1, H_Q + H_K + H_V, D))
-        positions_t = GTensor(positions, dtype=T.i64, shape=(1,))
+        positions_t = GTensor(
+            positions,
+            dtype=T.i64,
+            shape=(3, -1),
+            stride=(positions_stride_0, positions_stride_1),
+        )
         cos_sin_t = GTensor(cos_sin, dtype=T.bf16, shape=(1, D))
         qw_t = GTensor(q_norm_w, dtype=T.bf16, shape=(D,))
         q_out_t = GTensor(q_out, dtype=T.bf16, shape=(-1, H_Q, D))
@@ -265,7 +272,7 @@ def _build_q_kernel(
             positions_stride_1,
         )
         k.launch(
-            grid=(H_Q, fx.Index(num_tokens), 1),
+            grid=(H_Q, fx.Int64(num_tokens), 1),
             block=(WAVE, 1, 1),
             stream=stream,
         )
@@ -337,10 +344,32 @@ def _build_kv_kernel(
         k_out: fx.Pointer,  # [T, H_K, D] u8 flat (dummy unless emit_flat_kv)
         v_out: fx.Pointer,  # [T, H_V, D] u8 flat (dummy unless emit_flat_kv)
         num_tokens: fx.Int32,
+        page_block_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
+        layout_tx_wave_lane = fx.make_layout(
+            (WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1)
+        )
+        layout_stage = fx.make_layout((block_size, D), stride=(D, 1))
+        layout_k_runs = fx.make_layout(
+            (D // x, block_size), stride=(block_size, 1)
+        )
+        layout_v_runs = fx.make_layout((block_size // x, D), stride=(D, 1))
+        layout_stage_i32_runs = fx.make_layout(
+            (block_size, D // x, x // 4), stride=(D // 4, x // 4, 1)
+        )
+        layout_run_i32 = fx.make_layout(x // 4, stride=1)
+        layout_k_cache = fx.make_layout(
+            (H_KV, D // x, block_size, x),
+            stride=(D * block_size, block_size * x, x, 1),
+        )
+        layout_v_cache = fx.make_layout(
+            (H_KV, block_size // x, D, x),
+            stride=(block_size * D, D * x, x, 1),
+        )
+        copy_128b_i32 = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
 
         def wave_reduce_add(v):
             for sh_exp in range_constexpr(_LOG2_WAVE):
@@ -366,8 +395,7 @@ def _build_kv_kernel(
                     fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
                 )
 
-            pos_offset = sect_idx * positions_stride_0 + tok * positions_stride_1
-            pos_i64 = fx.Int64(positions_t[pos_offset])
+            pos_i64 = fx.Int64(positions_t[sect_idx, tok])
             pos = pos_i64.to(fx.Int32)
             cos_v = fx.BFloat16(cos_sin_t[pos, col]).to(fx.Float32)
             sin_v = fx.BFloat16(cos_sin_t[pos, col + HALF]).to(fx.Float32)
@@ -386,7 +414,12 @@ def _build_kv_kernel(
         t = fx.thread_idx.x  # 0..KV_THREADS-1
 
         qkv_t = GTensor(qkv, dtype=T.bf16, shape=(-1, H_Q + 2 * H_KV, D))
-        positions_t = GTensor(positions, dtype=T.i64, shape=(1,))
+        positions_t = GTensor(
+            positions,
+            dtype=T.i64,
+            shape=(3, -1),
+            stride=(positions_stride_0, positions_stride_1),
+        )
         cos_sin_t = GTensor(cos_sin, dtype=T.bf16, shape=(1, D))
         kw_t = GTensor(k_norm_w, dtype=T.bf16, shape=(D,))
         slot_t = GTensor(slot_mapping, dtype=T.i64, shape=(-1,))
@@ -397,18 +430,20 @@ def _build_kv_kernel(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_lds = lds.k_lds
         v_lds = lds.v_lds
+        k_lds_view = k_lds.view(layout_stage)
+        v_lds_view = v_lds.view(layout_stage)
         mapping_ok = lds.mapping_ok
 
-        tok0 = blk * block_size
+        tok0 = (blk + page_block_offset) * block_size
 
         # ---------------- Phase 1: compute -> LDS stage ----------------
         # `num_tokens` need not be a multiple of `block_size` -- the very
         # last page-block (blk == num_page_blocks - 1) may have fewer than
         # `block_size` real tokens. `tok0` itself is always a valid row
-        # (num_page_blocks = ceil_div(num_tokens, block_size) guarantees
-        # tok0 = blk*block_size < num_tokens), but individual `tok` values
-        # within that last block's `token_local` range can run past
-        # `num_tokens`. Guard every `qkv`/`positions` read (and, in the
+        # (the host chunks page blocks but preserves their global offset, and
+        # ceil_div(num_tokens, block_size) guarantees tok0 < num_tokens), but
+        # individual `tok` values within that last block's `token_local` range
+        # can run past `num_tokens`. Guard every `qkv`/`positions` read (and, in the
         # return_kv path, every `k_out`/`v_out` write, which are sized to
         # exactly `num_tokens` rows) behind `tok < num_tokens`, and zero-fill
         # the LDS staging row for out-of-range tokens instead of leaving it
@@ -417,14 +452,13 @@ def _build_kv_kernel(
         # that's the fixed physical page granularity) writes deterministic
         # zero padding into the tail page's unused slots rather than
         # propagating garbage shared memory.
-        wid = t // WAVE
-        lane = t % WAVE
+        coord_wl = fx.idx2crd(fx.Int32(t), layout_tx_wave_lane)
+        wid = fx.get(coord_wl, 0)
+        lane = fx.get(coord_wl, 1)
         for it in range_constexpr(PHASE1_ITERS):
             token_local = wid + WAVES_PER_BLOCK * it
             if token_local < block_size:
-                tok = tok0 + token_local
-                k_row = token_local * D
-                v_row = token_local * D
+                tok = tok0 + fx.Int32(token_local)
                 if tok < num_tokens:
                     # GTensor is a Python-side wrapper, not a DSL value (see
                     # flydsl-best-practices.md S3) -- construct it fresh
@@ -438,7 +472,7 @@ def _build_kv_kernel(
                     k0s, k1s = [], []
                     sumsq_local = fx.Float32(0.0)
                     for p in range_constexpr(VEC_PAIRS):
-                        col = lane + WAVE * p
+                        col = fx.Int32(lane) + WAVE * p
                         k0 = fx.BFloat16(qkv_t[tok, H_Q + head, col]).to(fx.Float32)
                         k1 = fx.BFloat16(qkv_t[tok, H_Q + head, col + HALF]).to(
                             fx.Float32
@@ -450,7 +484,7 @@ def _build_kv_kernel(
                     rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
                     for p in range_constexpr(VEC_PAIRS):
-                        col = lane + WAVE * p
+                        col = fx.Int32(lane) + WAVE * p
                         w0 = fx.BFloat16(kw_t[col]).to(fx.Float32)
                         w1 = fx.BFloat16(kw_t[col + HALF]).to(fx.Float32)
                         if const_expr(gemma_norm):
@@ -462,8 +496,8 @@ def _build_kv_kernel(
                         o0 = xn0 * cos_v - xn1 * sin_v
                         o1 = xn1 * cos_v + xn0 * sin_v
                         kb0, kb1 = quant_pair_fp8(o0, o1, k_scale)
-                        k_lds[k_row + col] = kb0
-                        k_lds[k_row + col + HALF] = kb1
+                        k_lds_view[token_local, col] = kb0
+                        k_lds_view[token_local, col + HALF] = kb1
                         if const_expr(emit_flat_kv):
                             slot = fx.Int64(slot_t[tok])
                             if slot >= fx.Int64(0):
@@ -475,7 +509,7 @@ def _build_kv_kernel(
 
                     # ---- V: raw + per-tensor fp8 quant (no norm/rope) ----
                     for p in range_constexpr(VEC_PAIRS):
-                        col = lane + WAVE * p
+                        col = fx.Int32(lane) + WAVE * p
                         v0 = fx.BFloat16(qkv_t[tok, H_Q + H_KV + head, col]).to(
                             fx.Float32
                         )
@@ -483,8 +517,8 @@ def _build_kv_kernel(
                             qkv_t[tok, H_Q + H_KV + head, col + HALF]
                         ).to(fx.Float32)
                         vb0, vb1 = quant_pair_fp8(v0, v1, v_scale)
-                        v_lds[v_row + col] = vb0
-                        v_lds[v_row + col + HALF] = vb1
+                        v_lds_view[token_local, col] = vb0
+                        v_lds_view[token_local, col + HALF] = vb1
                         if const_expr(emit_flat_kv):
                             slot = fx.Int64(slot_t[tok])
                             if slot >= fx.Int64(0):
@@ -498,11 +532,11 @@ def _build_kv_kernel(
                     # be OOB on qkv/positions, and on k_out/v_out which are
                     # sized to exactly num_tokens rows) -- zero-fill instead.
                     for p in range_constexpr(VEC_PAIRS):
-                        col = lane + WAVE * p
-                        k_lds[k_row + col] = fx.Int8(0)
-                        k_lds[k_row + col + HALF] = fx.Int8(0)
-                        v_lds[v_row + col] = fx.Int8(0)
-                        v_lds[v_row + col + HALF] = fx.Int8(0)
+                        col = fx.Int32(lane) + WAVE * p
+                        k_lds_view[token_local, col] = fx.Int8(0)
+                        k_lds_view[token_local, col + HALF] = fx.Int8(0)
+                        v_lds_view[token_local, col] = fx.Int8(0)
+                        v_lds_view[token_local, col + HALF] = fx.Int8(0)
 
         # The first wave cooperatively validates this token group while the
         # other waves finish staging. The wave reduction completes before the
@@ -516,18 +550,21 @@ def _build_kv_kernel(
             for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
                 token_local = lane + WAVE * check_it
                 if token_local < block_size:
-                    tok = tok0 + token_local
-                    slot = fx.Int64(slot_t[tok])
-                    expected = base_slot + fx.Int64(token_local)
-                    valid = (
-                        full_page
-                        and (base_slot >= fx.Int64(0))
-                        and page_aligned
-                        and (slot == expected)
-                    )
-                    mapping_valid = mapping_valid & valid.select(
-                        fx.Int32(1), fx.Int32(0)
-                    )
+                    tok = tok0 + fx.Int32(token_local)
+                    if tok < num_tokens:
+                        slot = fx.Int64(slot_t[tok])
+                        expected = base_slot + fx.Int64(token_local)
+                        valid = (
+                            full_page
+                            and (base_slot >= fx.Int64(0))
+                            and page_aligned
+                            and (slot == expected)
+                        )
+                        mapping_valid = mapping_valid & valid.select(
+                            fx.Int32(1), fx.Int32(0)
+                        )
+                    else:
+                        mapping_valid = fx.Int32(0)
             for sh_exp in range_constexpr(_LOG2_WAVE):
                 off = WAVE // (2 << sh_exp)
                 peer_valid = mapping_valid.shuffle_xor(off, WAVE)
@@ -540,49 +577,46 @@ def _build_kv_kernel(
         if can_coalesce:
             # ---------------- Phase 2a: K coalesced write ----------------
             block_id = fx.Int64(slot_t[tok0]) // fx.Int64(block_size)
-            head_base = (
-                block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
-                + fx.Int64(head) * fx.Int64(_k_head_stride(D, block_size))
-            )
+            k_block_base = block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
+            v_block_base = block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
+            k_cache_block = (k_cache + k_block_base).view(layout_k_cache)
+            v_cache_block = (v_cache + v_block_base).view(layout_v_cache)
             k_lds_i32 = fx.recast_iter(fx.Int32, k_lds.ptr)
+            k_lds_i32_runs = k_lds_i32.view(layout_stage_i32_runs)
             for it in range_constexpr(K_ITERS):
                 r = t + KV_THREADS * it
                 if r < K_TOTAL_RUNS:
-                    f0 = r * _RUN_BYTES
-                    chunk_k = f0 // (block_size * x)
-                    block_off = (f0 % (block_size * x)) // x
-                    d0 = chunk_k * x
-                    src_elem_i32 = (block_off * D + d0) // 4
-                    vec4_k = fx.ptr_load(
-                        k_lds_i32 + src_elem_i32,
-                        result_type=fx.Vector.make_type(_RUN_BYTES // 4, fx.Int32),
+                    coord_k_run = fx.idx2crd(fx.Int32(r), layout_k_runs)
+                    chunk_k = fx.get(coord_k_run, 0)
+                    block_off = fx.get(coord_k_run, 1)
+                    src_k = fx.slice(
+                        k_lds_i32_runs, (block_off, chunk_k, None)
                     )
+                    dst_k = fx.slice(
+                        k_cache_block, (head, chunk_k, block_off, None)
+                    )
+                    reg_k = fx.make_rmem_tensor(layout_run_i32, fx.Int32)
+                    fx.copy_atom_call(copy_128b_i32, src_k, reg_k)
+                    vec4_k = fx.memref_load_vec(reg_k)
                     vec16_k = vector.bitcast(T.vec(_RUN_BYTES, T.i8), vec4_k)
-                    fx.ptr_store(
-                        vec16_k,
-                        k_cache + head_base + fx.Int64(f0),
-                    )
+                    fx.ptr_store(vec16_k, fx.get_iter(dst_k))
 
             # ---------------- Phase 2b: V coalesced write ----------------
-            v_head_base = (
-                block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
-                + fx.Int64(head) * fx.Int64(_v_head_stride(D, block_size, x))
-            )
             for it in range_constexpr(V_ITERS):
                 r = t + KV_THREADS * it
                 if r < V_TOTAL_RUNS:
-                    tile = r // D
-                    d = r % D
-                    v_dst_base = v_head_base + fx.Int64(tile * (D * x) + d * x)
+                    coord_v_run = fx.idx2crd(fx.Int32(r), layout_v_runs)
+                    tile = fx.get(coord_v_run, 0)
+                    d = fx.get(coord_v_run, 1)
                     vals = [
-                        v_lds[(tile * x + j) * D + d]
+                        v_lds_view[tile * x + j, d]
                         for j in range_constexpr(x)
                     ]
                     vec_x = vector.from_elements(T.vec(x, T.i8), vals)
-                    fx.ptr_store(
-                        vec_x,
-                        v_cache + v_dst_base,
+                    dst_v = fx.slice(
+                        v_cache_block, (head, tile, d, None)
                     )
+                    fx.ptr_store(vec_x, fx.get_iter(dst_v))
         else:
             # Generic HIP-compatible scatter for arbitrary/decode mappings.
             # Duplicate slots have the same last-writer-unspecified semantics
@@ -590,30 +624,33 @@ def _build_kv_kernel(
             for it in range_constexpr(SCATTER_ITERS):
                 elem = t + KV_THREADS * it
                 if elem < SCATTER_ELEMS:
-                    token_local = elem // D
-                    d = elem % D
-                    tok = tok0 + token_local
+                    coord_stage = fx.idx2crd(fx.Int32(elem), layout_stage)
+                    token_local = fx.get(coord_stage, 0)
+                    d = fx.get(coord_stage, 1)
+                    tok = tok0 + fx.Int32(token_local)
                     if tok < num_tokens:
                         slot = fx.Int64(slot_t[tok])
                         if slot >= fx.Int64(0):
                             block_id = slot // fx.Int64(block_size)
                             block_off = slot % fx.Int64(block_size)
-                            k_dst = (
-                                block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
-                                + fx.Int64(head) * fx.Int64(_k_head_stride(D, block_size))
-                                + fx.Int64(d // x) * fx.Int64(block_size * x)
-                                + block_off * fx.Int64(x)
-                                + fx.Int64(d % x)
+                            k_block_base = block_id * fx.Int64(
+                                _k_per_block(D, block_size, H_KV)
                             )
-                            v_dst = (
-                                block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
-                                + fx.Int64(head) * fx.Int64(_v_head_stride(D, block_size, x))
-                                + (block_off // fx.Int64(x)) * fx.Int64(D * x)
-                                + fx.Int64(d * x)
-                                + (block_off % fx.Int64(x))
+                            v_block_base = block_id * fx.Int64(
+                                _v_per_block(D, block_size, x, H_KV)
                             )
-                            fx.ptr_store(k_lds[elem], k_cache + k_dst)
-                            fx.ptr_store(v_lds[elem], v_cache + v_dst)
+                            k_cache_block = (k_cache + k_block_base).view(
+                                layout_k_cache
+                            )
+                            v_cache_block = (v_cache + v_block_base).view(
+                                layout_v_cache
+                            )
+                            k_cache_block[head, d // x, block_off, d % x] = (
+                                k_lds_view[token_local, d]
+                            )
+                            v_cache_block[
+                                head, block_off // x, d, block_off % x
+                            ] = v_lds_view[token_local, d]
 
     @flyc.jit
     def launch(
@@ -630,6 +667,7 @@ def _build_kv_kernel(
         v_out: fx.Pointer,
         num_tokens: fx.Int32,
         num_page_blocks: fx.Int32,
+        page_block_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -647,11 +685,12 @@ def _build_kv_kernel(
             k_out,
             v_out,
             num_tokens,
+            page_block_offset,
             positions_stride_0,
             positions_stride_1,
         )
         k.launch(
-            grid=(H_KV, fx.Index(num_page_blocks), 1),
+            grid=(H_KV, fx.Int64(num_page_blocks), 1),
             block=(KV_THREADS, 1, 1),
             stream=stream,
         )
@@ -896,9 +935,25 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         raise ValueError("return_kv=True requires k_out and v_out to be provided")
 
     H_Q, H_K, H_V, D = num_heads_q, num_heads_k, num_heads_v, head_size
-    qkv_flat = qkv.view(num_tokens, H_Q + H_K + H_V, D)
-    if not qkv_flat.is_contiguous():
+    total_heads = H_Q + H_K + H_V
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if qkv.dim() == 3:
+        expected_qkv_shape = (num_tokens, total_heads, D)
+    elif qkv.dim() == 2:
+        expected_qkv_shape = (num_tokens, total_heads * D)
+    else:
+        raise ValueError(
+            "qkv must be 2-D [T, (H_q+H_k+H_v)*D] or "
+            "3-D [T, H_q+H_k+H_v, D]"
+        )
+    if tuple(qkv.shape) != expected_qkv_shape:
+        raise ValueError(
+            f"qkv shape {tuple(qkv.shape)} != expected {expected_qkv_shape}"
+        )
+    if not qkv.is_contiguous():
         raise ValueError("qkv must be contiguous")
+    qkv_flat = qkv.view(num_tokens, total_heads, D)
     if qw.shape != (D,) or kw.shape != (D,):
         raise ValueError(f"qw/kw must both have shape ({D},)")
     if not qw.is_contiguous() or not kw.is_contiguous():
@@ -945,6 +1000,11 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         if k_out.device != qkv.device or v_out.device != qkv.device:
             raise ValueError("k_out/v_out must be on the same device as qkv")
 
+    # A zero-token call has no valid Q or KV launch grid. Validation above is
+    # still performed so malformed empty inputs fail consistently.
+    if num_tokens == 0:
+        return
+
     if stream is None:
         stream = torch.cuda.current_stream()
     fx_stream = fx.Stream(stream)
@@ -964,9 +1024,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     )
     positions_stride_0 = positions.stride(0)
     positions_stride_1 = positions.stride(1)
-    max_grid_y = 65535
-    for token_offset in range(0, num_tokens, max_grid_y):
-        chunk_tokens = min(max_grid_y, num_tokens - token_offset)
+    for token_offset in range(0, num_tokens, _MAX_GRID_Y):
+        chunk_tokens = min(_MAX_GRID_Y, num_tokens - token_offset)
         _run_compiled(
             q_launch,
             _ptr(qkv_flat),
@@ -1001,22 +1060,27 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     num_page_blocks = _ceil_div(num_tokens, block_size)
     k_out_arg = k_out if return_kv else k_cache.new_empty(1)
     v_out_arg = v_out if return_kv else v_cache.new_empty(1)
-    _run_compiled(
-        kv_launch,
-        _ptr(qkv_flat),
-        _ptr(positions),
-        _ptr(cos_sin),
-        _ptr(kw),
-        _ptr(k_cache),
-        _ptr(v_cache),
-        _ptr(slot_mapping),
-        _ptr(per_tensor_k_scale),
-        _ptr(per_tensor_v_scale),
-        _ptr(k_out_arg),
-        _ptr(v_out_arg),
-        num_tokens,
-        num_page_blocks,
-        positions_stride_0,
-        positions_stride_1,
-        fx_stream,
-    )
+    for page_block_offset in range(0, num_page_blocks, _MAX_GRID_Y):
+        chunk_page_blocks = min(
+            _MAX_GRID_Y, num_page_blocks - page_block_offset
+        )
+        _run_compiled(
+            kv_launch,
+            _ptr(qkv_flat),
+            _ptr(positions),
+            _ptr(cos_sin),
+            _ptr(kw),
+            _ptr(k_cache),
+            _ptr(v_cache),
+            _ptr(slot_mapping),
+            _ptr(per_tensor_k_scale),
+            _ptr(per_tensor_v_scale),
+            _ptr(k_out_arg),
+            _ptr(v_out_arg),
+            num_tokens,
+            chunk_page_blocks,
+            page_block_offset,
+            positions_stride_0,
+            positions_stride_1,
+            fx_stream,
+        )
