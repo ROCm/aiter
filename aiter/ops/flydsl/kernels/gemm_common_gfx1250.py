@@ -372,19 +372,24 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
         gs.append(g)
         us.append(u)
+    rocdl.sched_barrier(0)
+    for i in range_constexpr(N):
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
         exp_vals.append(exp_val)
     # Stage 2a: add 1+exp
+    rocdl.sched_barrier(0)
     sum_vals = []
     for i in range_constexpr(N):
         sum_vals.append(_one + exp_vals[i])
     # Stage 2b: rcp
+    rocdl.sched_barrier(0)
     rcp_vals = []
     for i in range_constexpr(N):
         rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
     # Stage 3: final mul
+    rocdl.sched_barrier(0)
     results = []
     for i in range_constexpr(N):
         if swiglu:
