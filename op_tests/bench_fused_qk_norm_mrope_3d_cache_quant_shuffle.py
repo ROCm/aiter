@@ -93,8 +93,42 @@ def run_once(inputs, outputs, return_kv: bool):
         False,
     )
 
+def run_once_flydsl(inputs, outputs, return_kv: bool):
+    m = inputs["qkv"].shape[0]
 
-def benchmark(args):
+    flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+        inputs["qkv"],
+        inputs["q_norm_w"],
+        inputs["k_norm_w"],
+        inputs["rope_emb"],
+        inputs["mrope_pos"],
+        m,
+        64,
+        4,
+        4,
+        128,
+        True,
+        [24, 20, 20],
+        True,
+        1e-6,
+        inputs["q_out"],
+        inputs["kv_k"],
+        inputs["kv_v"],
+        inputs["slot_map"],
+        inputs["per_tensor_k_scale"],
+        inputs["per_tensor_v_scale"],
+        outputs["k_out"],
+        outputs["v_out"],
+        return_kv,
+        True,
+        64,
+        inputs["x"],
+        128,
+        False,
+    )
+
+
+def benchmark(fname, fn, args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA/HIP device is required")
 
@@ -102,7 +136,7 @@ def benchmark(args):
     outputs = allocate_outputs(inputs, args.return_kv)
 
     for _ in range(args.warmup):
-        run_once(inputs, outputs, args.return_kv)
+        fn(inputs, outputs, args.return_kv)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -110,7 +144,7 @@ def benchmark(args):
 
     start.record()
     for _ in range(args.iters):
-        run_once(inputs, outputs, args.return_kv)
+        fn(inputs, outputs, args.return_kv)
     end.record()
     torch.cuda.synchronize()
 
@@ -119,7 +153,7 @@ def benchmark(args):
 
     slots = inputs["kv_k"].shape[0] * inputs["kv_k"].shape[1]
     print(
-        "[microbench] fused_qk_norm_mrope_3d_cache_pts_quant_shuffle "
+        f"[microbench] {fname} "
         f"M={args.m} slots={slots} qkv={tuple(inputs['qkv'].shape)} "
         f"kvcache={tuple(inputs['kv_k'].shape)} kv_dtype={inputs['kv_dtype']} "
         f"x={inputs['x']} warmup={args.warmup} iters={args.iters} avg={avg_us:.2f} us"
@@ -139,4 +173,6 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    benchmark(parse_args())
+    args = parse_args()
+    benchmark("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", run_once, args)
+    benchmark("flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", run_once_flydsl, args)
