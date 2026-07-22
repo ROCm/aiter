@@ -13,6 +13,8 @@ import torch
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
+_STAGE1_COMPILE_PLAN_ENV = "AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN"
+_STAGE1_COMPILE_PLAN_RESOLUTION_COUNT = 0
 
 
 def _get_dtypes():
@@ -24,6 +26,33 @@ def _get_dtypes():
 def _compile_only() -> bool:
     """True when running under AOT precompile (``COMPILE_ONLY=1``)."""
     return os.environ.get("COMPILE_ONLY", "0") == "1"
+
+
+def _stage1_compile_plan_enabled() -> bool:
+    return os.environ.get(_STAGE1_COMPILE_PLAN_ENV, "0") == "1"
+
+
+def get_stage1_compile_plan_resolution_count() -> int:
+    """Return the process-local count used by executable integration gates."""
+
+    return _STAGE1_COMPILE_PLAN_RESOLUTION_COUNT
+
+
+def _explicit_stage1_target():
+    from .compile_plan import RocmTarget
+
+    arch = os.environ.get("FLYDSL_GPU_ARCH")
+    cu_count = os.environ.get("CU_NUM")
+    if not arch or not cu_count:
+        raise RuntimeError(
+            f"{_STAGE1_COMPILE_PLAN_ENV}=1 requires explicit FLYDSL_GPU_ARCH and CU_NUM"
+        )
+    try:
+        return RocmTarget(arch, int(cu_count))
+    except ValueError as error:
+        raise ValueError(
+            f"invalid explicit Stage1 target: {arch!r}/{cu_count!r}"
+        ) from error
 
 
 def _launch_stream():
@@ -367,6 +396,33 @@ def _register_all_configs():
 _register_all_configs()
 
 
+def _resolve_stage1_plan_launchers(builder_kwargs):
+    """Resolve and compile the opt-in Stage1 graph from one builder mapping."""
+
+    if not _stage1_compile_plan_enabled():
+        return None
+
+    from .compile_plan import DEFAULT_COMPILE_OP_REGISTRY
+    from .moe_compile_plan import resolve_moe_stage1_compile_plan
+
+    plan = resolve_moe_stage1_compile_plan(
+        target=_explicit_stage1_target(),
+        **builder_kwargs,
+    )
+    launchers = DEFAULT_COMPILE_OP_REGISTRY.compile_plan(plan)
+    by_op_id = {}
+    for unit, launcher in zip(plan.units, launchers):
+        op_id = unit.spec.op_id
+        if op_id in by_op_id:
+            raise RuntimeError(f"duplicate Stage1 CompilePlan op_id: {op_id}")
+        by_op_id[op_id] = launcher
+
+    global _STAGE1_COMPILE_PLAN_RESOLUTION_COUNT
+    _STAGE1_COMPILE_PLAN_RESOLUTION_COUNT += 1
+    return by_op_id
+
+
+@functools.lru_cache(maxsize=None)
 def compile_flydsl_moe_stage1(
     model_dim: int,
     inter_dim: int,
@@ -392,13 +448,24 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    compile_target=None,
 ):
-    """Compile stage1 kernel (cached via underlying lru_cache)."""
+    """Compile Stage1, with explicit targets included in the wrapper cache.
+
+    Legacy calls omit ``compile_target`` and retain the underlying builder
+    caches. CompilePlan calls provide it and bypass those target-unaware caches;
+    this wrapper's cache then owns reuse with the target in its public key.
+    """
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
-        return compile_mixed_moe_gemm1(
+        builder = (
+            getattr(compile_mixed_moe_gemm1, "__wrapped__", compile_mixed_moe_gemm1)
+            if compile_target is not None
+            else compile_mixed_moe_gemm1
+        )
+        return builder(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -430,8 +497,12 @@ def compile_flydsl_moe_stage1(
 
         # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
         _use_cshuffle = None if k_batch > 1 else False
-
-        return compile_moe_gemm1(
+        builder = (
+            getattr(compile_moe_gemm1, "__wrapped__", compile_moe_gemm1)
+            if compile_target is not None
+            else compile_moe_gemm1
+        )
+        return builder(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -1025,8 +1096,9 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
+    compile_target=None,
 ):
-    """Compile and cache the fused gate activation + quant + scale-sort kernel."""
+    """Compile the fused activation helper; explicit targets enter its cache key."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -1040,8 +1112,8 @@ def _get_compiled_silu_fused(
 
 
 @functools.cache
-def _get_compiled_swiglu(inter_dim: int):
-    """Compile and cache the fused swiglu_and_mul kernel (interleaved input)."""
+def _get_compiled_swiglu(inter_dim: int, compile_target=None):
+    """Compile interleaved SwiGLU; explicit targets enter its cache key."""
     from aiter.ops.flydsl.kernels.swiglu_and_mul import build_swiglu_and_mul_module
 
     return build_swiglu_and_mul_module(inter_dim)
@@ -1590,7 +1662,7 @@ def flydsl_moe_stage1(
             _grid_y,
         )
 
-    exe = compile_flydsl_moe_stage1(
+    stage1_builder_kwargs = dict(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -1601,7 +1673,7 @@ def flydsl_moe_stage1(
         doweight_stage1=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        out_dtype=_gemm_out_dtype,
+        out_dtype=out_dtype,
         act=act,
         persist_m=_persist_m,
         use_async_copy=use_async_copy,
@@ -1611,11 +1683,38 @@ def flydsl_moe_stage1(
         gate_mode=gate_mode,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
-        enable_bias=(kernel_bias is not None),
+        enable_bias=(bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
     )
+    plan_launchers = _resolve_stage1_plan_launchers(stage1_builder_kwargs)
+
+    def take_plan_launcher(op_id):
+        try:
+            return plan_launchers.pop(op_id)
+        except KeyError as error:
+            raise RuntimeError(
+                f"Stage1 CompilePlan did not resolve required unit {op_id}"
+            ) from error
+
+    if plan_launchers is None:
+        legacy_kwargs = {
+            **stage1_builder_kwargs,
+            "out_dtype": _gemm_out_dtype,
+            "enable_bias": kernel_bias is not None,
+        }
+        exe = compile_flydsl_moe_stage1(**legacy_kwargs)
+    else:
+        from .moe_compile_plan import (
+            INT4_STAGE1_GEMM_OP_ID,
+            MIXED_STAGE1_GEMM_OP_ID,
+        )
+
+        primary_op_id = (
+            MIXED_STAGE1_GEMM_OP_ID if use_mx_gemm else INT4_STAGE1_GEMM_OP_ID
+        )
+        exe = take_plan_launcher(primary_op_id)
     _run_compiled(exe, args)
 
     num_sorted_rows = sorted_token_ids.shape[0]
@@ -1640,14 +1739,19 @@ def flydsl_moe_stage1(
     )
     if _gui_sk_fused:
         _quant_mode = "fp4" if _need_fp4 else "fp8"
-        _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            _quant_mode,
-            gui_layout=True,
-            act=act,
-            enable_bias=use_splitk_bias,
-        )
+        if plan_launchers is None:
+            _silu_fused_k = _get_compiled_silu_fused(
+                inter_dim,
+                topk,
+                _quant_mode,
+                gui_layout=True,
+                act=act,
+                enable_bias=use_splitk_bias,
+            )
+        else:
+            from .moe_compile_plan import FQ_ACTIVATION_OP_ID
+
+            _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
         _run_compiled(
             _silu_fused_k,
             (
@@ -1665,14 +1769,19 @@ def flydsl_moe_stage1(
             ),
         )
     elif _gui_sk:
-        _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            "none",
-            gui_layout=True,
-            act=act,
-            enable_bias=use_splitk_bias,
-        )
+        if plan_launchers is None:
+            _silu_fused_k = _get_compiled_silu_fused(
+                inter_dim,
+                topk,
+                "none",
+                gui_layout=True,
+                act=act,
+                enable_bias=use_splitk_bias,
+            )
+        else:
+            from .moe_compile_plan import FQ_ACTIVATION_OP_ID
+
+            _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
         _run_compiled(
             _silu_fused_k,
             (
@@ -1690,12 +1799,17 @@ def flydsl_moe_stage1(
             ),
         )
     elif _splitk_fp4:
-        _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim,
-            topk,
-            act=act,
-            enable_bias=use_splitk_bias,
-        )
+        if plan_launchers is None:
+            _silu_fused_k = _get_compiled_silu_fused(
+                inter_dim,
+                topk,
+                act=act,
+                enable_bias=use_splitk_bias,
+            )
+        else:
+            from .moe_compile_plan import FQ_ACTIVATION_OP_ID
+
+            _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
         _run_compiled(
             _silu_fused_k,
             (
@@ -1739,6 +1853,11 @@ def flydsl_moe_stage1(
                     -1, inter_dim * 2
                 )
             silu_and_mul(post_out, post_input)
+
+    if plan_launchers:
+        raise RuntimeError(
+            f"Stage1 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
+        )
 
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
@@ -2082,15 +2201,15 @@ def flydsl_moe_fused_route_quant_scatter(
     numel = token_num * topk
     model_dim = hidden_states.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"  # fmt: skip
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
-    assert out_max_m % rows_per_tile == 0, (
-        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        out_max_m % rows_per_tile == 0
+    ), f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"  # fmt: skip
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
@@ -2392,15 +2511,15 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert grouped_in.dtype == torch.bfloat16, (
-        f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
-    )
+    assert (
+        grouped_in.dtype == torch.bfloat16
+    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"  # fmt: skip
     device = grouped_in.device
     feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert max_m % rows_per_tile == 0, (
-        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
-    )
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"  # fmt: skip
 
     n_rows = E * max_m
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2

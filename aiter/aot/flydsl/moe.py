@@ -207,6 +207,7 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
     import torch
 
     from aiter.ops.flydsl.moe_kernels import (
+        _explicit_stage1_target,
         _get_compiled_silu_fused,
         _get_compiled_swiglu,
         _run_compiled,
@@ -214,21 +215,48 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
 
     dev = torch.device("cpu")
     rows = 256
+    plan_launcher = None
+    if os.environ.get("AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN", "0") == "1":
+        from aiter.ops.flydsl.compile_plan import DEFAULT_COMPILE_OP_REGISTRY
+        from aiter.ops.flydsl.moe_compile_plan import (
+            resolve_cktile_stage1_compile_plan,
+        )
+
+        plan = resolve_cktile_stage1_compile_plan(
+            target=_explicit_stage1_target(),
+            inter_dim=inter_dim,
+            topk=topk,
+            split_k=2,
+            act=act,
+            post_activation_layout="interleaved",
+        )
+        launchers = DEFAULT_COMPILE_OP_REGISTRY.compile_plan(plan)
+        if len(launchers) != 1:
+            raise RuntimeError("CK-Tile epilogue plan must contain exactly one unit")
+        plan_launcher = launchers[0]
 
     # COMPILE_ONLY=1 makes the executor compile + persist the artifact without
     # launching the kernel; without it _run_compiled would dispatch on the
     # (absent) GPU under fake tensors and fault.
     with compile_only_env():
         if act == "swiglu":
-            exe = _get_compiled_swiglu(inter_dim)
+            exe = (
+                plan_launcher
+                if plan_launcher is not None
+                else _get_compiled_swiglu(inter_dim)
+            )
             x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
             out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
             # trailing 0 = stream: null/default (compile-only, never launched)
             _run_compiled(exe, (x, out, rows, 0))
             return
 
-        exe = _get_compiled_silu_fused(
-            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+        exe = (
+            plan_launcher
+            if plan_launcher is not None
+            else _get_compiled_silu_fused(
+                inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+            )
         )
         x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
         out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
@@ -303,6 +331,16 @@ def compile_one_config(
         **kwargs,
     )
     cu_str = str(cu_num) if cu_num > 0 else None
+    stage1_plan_opt_in = (
+        stage == 1
+        and os.environ.get("AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN", "0") == "1"
+    )
+    if stage1_plan_opt_in:
+        from aiter.ops.flydsl.moe_kernels import (
+            get_stage1_compile_plan_resolution_count,
+        )
+
+        plan_count_before = get_stage1_compile_plan_resolution_count()
 
     t0 = time.time()
     try:
@@ -324,11 +362,21 @@ def compile_one_config(
                 get_cu_num.cache_clear()
                 if stage == 1:
                     flydsl_moe_stage1(**build_stage1_compile_inputs(**cfg))
+                    if stage1_plan_opt_in:
+                        plan_count_after = get_stage1_compile_plan_resolution_count()
+                        if plan_count_after <= plan_count_before:
+                            raise RuntimeError(
+                                "Stage1 AOT opt-in did not reach CompilePlan"
+                            )
+                        result["stage1_compile_plan"] = True
                 else:
                     flydsl_moe_stage2(**build_stage2_compile_inputs(**cfg))
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
+        plan_label = "  stage1_plan=True" if stage1_plan_opt_in else ""
+        print(
+            f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}{plan_label}"
+        )
     except Exception as e:
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
