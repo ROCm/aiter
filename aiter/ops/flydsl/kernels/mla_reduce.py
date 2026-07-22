@@ -94,7 +94,7 @@ def _out_t(out_dtype: str):
 def _exp(x, use_exp2=True):
     """exp(x) via the hardware v_exp_f32 (exp2(x*log2e))."""
     if fx.const_expr(use_exp2):
-        return fx.rocdl.exp2(T.f32, x * _LOG2E)
+        return fx.rocdl.exp2(T.f32, _to_raw(x * _LOG2E))
     return fly_math.exp(x, fastmath=fm_fast)
 
 
@@ -121,6 +121,10 @@ _TIER_NLSE = {
     Tier.ALL: None,
 }
 LDS_MAX_SPLITS = 304  # >= MI300X CU count; compile-time LDS cap
+# Vectorized LDS reads and the MLDS warp reduction can touch tail lanes through
+# ``ceil(LDS_MAX_SPLITS / WARP) * WARP - 1``. Keep that padded tail in the
+# same allocation so a masked load never crosses a static SharedAllocator leaf.
+LDS_PADDED_SPLITS = ((LDS_MAX_SPLITS + WARP - 1) // WARP) * WARP
 NLSE_MLDS = (LDS_MAX_SPLITS + WARP - 1) // WARP  # ceil(304/64) = 5
 
 # Production default (opt4 sweep: 4 ~= 6 < 8 on H=16 Dv=512 tiles=8 splits=32).
@@ -208,15 +212,21 @@ def compile_mla_reduce(
     kernel_value_attrs = (
         {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
     )
+    # `value_attrs` applies the IR attribute while tracing, but FlyDSL's JIT
+    # cache key ignores dictionary closure values and includes `compile_hints`.
+    # Keep WPE in the latter so variants cannot reuse each other's binary.
+    kernel_compile_hints = (
+        {"waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
+    )
 
     # ---- LDS layout (all tiers: pmap; massive adds scale) ----
     # Separate 16-byte aligned fields preserve the wide LDS load contract.
     @fx.struct
     class SharedStorage:
-        pmap: fx.Array[fx.Int32, LDS_MAX_SPLITS, 16]
+        pmap: fx.Array[fx.Int32, LDS_PADDED_SPLITS, 16]
 
         if is_massive:
-            lse_scale: fx.Array[fx.Float32, LDS_MAX_SPLITS, 16]
+            lse_scale: fx.Array[fx.Float32, LDS_PADDED_SPLITS, 16]
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def mla_reduce_kernel(
@@ -318,8 +328,9 @@ def compile_mla_reduce(
                     fx.Int32(tid), fx.Index(n_splits), fx.Int32(NUM_THREADS), init=None
                 ):
                     split_i32 = fx.Int32(split_i)
-                    lds_pmap[fx.Index(split_i32)] = fx.Int32(
-                        g_pmap[fx.Index(t0 + split_i32)]
+                    fx.ptr_store(
+                        fx.Int32(g_pmap[fx.Index(t0 + split_i32)]),
+                        fx.add_offset(lds_pmap.ptr, split_i32),
                     )
                 fx.gpu.barrier()
 
@@ -335,8 +346,10 @@ def compile_mla_reduce(
                 q_end = fx.Int32(g_fmap[tile, fx.Index(1)])
             else:
                 stage_pmap()
-                row0_idx0 = fx.Int32(lds_pmap[fx.Index(0)])
-                row1_idx0 = fx.Int32(lds_pmap[fx.Index(1)])
+                row0_idx0 = fx.Int32(fx.ptr_load(lds_pmap.ptr, T.i32))
+                row1_idx0 = fx.Int32(
+                    fx.ptr_load(fx.add_offset(lds_pmap.ptr, fx.Int32(1)), T.i32)
+                )
                 qo_len = row1_idx0 - row0_idx0
                 q_start = fx.Int32(tile) * qo_len
                 q_end = (fx.Int32(tile) + fx.Int32(1)) * qo_len
@@ -374,7 +387,9 @@ def compile_mla_reduce(
                     in_split = split_i32 < n_splits
                     safe_split = in_split.select(split_i32, fx.Int32(0))
                     return fx.Int32(g_pmap[fx.Index(t0 + safe_split)])
-                return fx.Int32(lds_pmap[fx.Index(split_i32)])
+                return fx.Int32(
+                    fx.ptr_load(fx.add_offset(lds_pmap.ptr, split_i32), T.i32)
+                )
 
             def gather_row(split_i32, local_seq, direct_pmap: bool = False):
                 pmap = pmap_value(split_i32, direct_pmap)
@@ -428,9 +443,9 @@ def compile_mla_reduce(
                     lse_val = _log(sum_e) + max_lse
                     inf = fx.arith.constant(float("inf"), type=T.f32)
                     final_lse_val = bad.select(inf, lse_val)
+                    lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
                     if tid == fx.Int32(0):
-                        lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
-                        g_flse[fx.Index(lse_off)] = final_lse_val
+                        buffer_ops.buffer_store(final_lse_val, g_flse.rsrc, lse_off)
 
             # opt5: FlyDSL range (init=None -> scf_range without iter_args) so
             # hot_loop_scheduler can interleave the inner split-loop VMEM loads
@@ -454,7 +469,7 @@ def compile_mla_reduce(
                     sum_e = state[VEC + 1]
                     os = load_split_o(fx.Int32(s), local_seq, direct_pmap)
                     lse = load_split_lse(fx.Int32(s), local_seq, direct_pmap)
-                    new_max = fx.arith.maximumf(max_lse, lse)
+                    new_max = fx.Float32(max_lse).maximumf(lse)
                     old = _exp(max_lse - new_max, use_exp2)
                     new = _exp(lse - new_max, use_exp2)
                     new_regs = [
@@ -491,6 +506,7 @@ def compile_mla_reduce(
                 make.
                 """
                 neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
+                zero_f = fx.arith.constant(0.0, type=T.f32)
                 if wave == fx.Int32(0):
                     local_lses = []
                     max_lse = neg_inf
@@ -501,12 +517,12 @@ def compile_mla_reduce(
                         lse_j = load_split_lse(safe, local_seq, direct_pmap)
                         lse_j = in_rng.select(lse_j, neg_inf)
                         local_lses.append(lse_j)
-                        max_lse = fx.arith.maximumf(max_lse, lse_j)
+                        max_lse = fx.Float32(max_lse).maximumf(lse_j)
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = fx.Float32(max_lse).shuffle_xor(
                             fx.Int32(off), fx.Int32(WARP)
                         )
-                        max_lse = fx.arith.maximumf(max_lse, peer)
+                        max_lse = fx.Float32(max_lse).maximumf(peer)
                     sum_e = fx.arith.constant(0.0, type=T.f32)
                     for j in fx.range_constexpr(nlse):
                         sum_e = sum_e + _exp(local_lses[j] - max_lse, use_exp2)
@@ -528,13 +544,15 @@ def compile_mla_reduce(
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = split_idx < n_splits
-                        if in_rng:
-                            sc = _exp(local_lses[j] - global_lse, use_exp2)
-                            lds_scale[fx.Index(split_idx)] = sc
+                        sc = _exp(local_lses[j] - global_lse, use_exp2)
+                        fx.ptr_store(
+                            in_rng.select(sc, zero_f),
+                            fx.add_offset(lds_scale.ptr, split_idx),
+                        )
                     if fx.const_expr(output_lse):
+                        lse_off = seq_i32 * fx.Int32(H) + fx.Int32(head)
                         if lane == fx.Int32(0):
-                            lse_off = seq_i32 * fx.Int32(H) + fx.Int32(head)
-                            g_flse[fx.Index(lse_off)] = global_lse
+                            buffer_ops.buffer_store(global_lse, g_flse.rsrc, lse_off)
 
                 # Lever #1/#5: GRP-wide double-rate software pipeline. Process
                 # GRP splits per iteration and keep GRP output buffer_loads in
@@ -563,7 +581,6 @@ def compile_mla_reduce(
                 else:
                     GRP = GRP_M256 if nlse >= 4 else GRP_M64
                 _grp_shift = GRP.bit_length() - 1
-                zero_f = fx.arith.constant(0.0, type=T.f32)
 
                 def load_os_group(base_i32):
                     """pmap-only phase of a group load: gather rows + issue the
@@ -869,6 +886,7 @@ def compile_mla_reduce(
             stream=stream,
         )
 
+    launch_mla_reduce.compile_hints = dict(kernel_compile_hints)
     return launch_mla_reduce
 
 
@@ -1064,6 +1082,11 @@ def compile_mla_reduce_splitk(
     kernel_value_attrs = (
         {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
     )
+    # Match the normal launcher: WPE must participate in the FlyDSL cache key,
+    # not only the traced kernel attributes.
+    kernel_compile_hints = (
+        {"waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
+    )
 
     def _f32_vec_load(g, row_idx, col_idx):
         if fx.const_expr(VEC == 1):
@@ -1155,7 +1178,7 @@ def compile_mla_reduce_splitk(
             os = _o3d_vec_load(g_po, row_idx, fx.Index(head), col)
             lse = g_pl[row_idx, fx.Index(head)]
             lse = in_b.select(lse, neg_inf)
-            new_m = fx.arith.maximumf(m, lse)
+            new_m = fx.Float32(m).maximumf(lse)
             c_old = _exp(m - new_m, use_exp2=True)
             c_new = _exp(lse - new_m, use_exp2=True)
             new_regs = [
@@ -1171,8 +1194,9 @@ def compile_mla_reduce_splitk(
         prow = fx.Index(w)
         _f32_vec_store(g_acc, prow, col, regs)
         if tid == fx.Int32(0):
-            g_ml[prow, fx.Index(0)] = m
-            g_ml[prow, fx.Index(1)] = lse_acc
+            ml_off = w * fx.Int32(2)
+            buffer_ops.buffer_store(m, g_ml.rsrc, ml_off)
+            buffer_ops.buffer_store(lse_acc, g_ml.rsrc, ml_off + fx.Int32(1))
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def sk_combine_kernel(
@@ -1215,7 +1239,7 @@ def compile_mla_reduce_splitk(
         for jj in fx.range_constexpr(K):
             prow = fx.Index(base + fx.Int32(jj))
             mj = g_ml[prow, fx.Index(0)]
-            M = fx.arith.maximumf(M, mj)
+            M = fx.Float32(M).maximumf(mj)
 
         regs = [zero_f for _ in fx.range_constexpr(VEC)]
         den = zero_f
@@ -1237,7 +1261,11 @@ def compile_mla_reduce_splitk(
                 q_start * stride_s_o + head * stride_h_o + fx.Int32(tid) * fx.Int32(VEC)
             )
             if fx.const_expr(VEC == 1):
-                g_fo[fx.Index(store_off)] = out_elems[0].truncf(_out_t_local)
+                buffer_ops.buffer_store(
+                    out_elems[0].truncf(_out_t_local),
+                    g_fo.rsrc,
+                    store_off,
+                )
             else:
                 out_vec = fx.vector.from_elements(
                     out_vt,
@@ -1246,7 +1274,7 @@ def compile_mla_reduce_splitk(
                         for i in fx.range_constexpr(VEC)
                     ],
                 )
-                g_fo.vec_store((fx.Index(store_off),), out_vec, VEC)
+                buffer_ops.buffer_store(out_vec, g_fo.rsrc, store_off)
             if fx.const_expr(output_lse):
                 bad = fx.arith.ori(
                     fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, den, zero_f),
@@ -1256,7 +1284,7 @@ def compile_mla_reduce_splitk(
                 lse_val = bad.select(inf, _log(den) + M)
                 if tid == fx.Int32(0):
                     lse_off = q_start * c_H + head
-                    g_flse[fx.Index(lse_off)] = lse_val
+                    buffer_ops.buffer_store(lse_val, g_flse.rsrc, lse_off)
 
     @flyc.jit
     def launch_partial(
@@ -1316,4 +1344,6 @@ def compile_mla_reduce_splitk(
             stream=stream,
         )
 
+    launch_partial.compile_hints = dict(kernel_compile_hints)
+    launch_combine.compile_hints = dict(kernel_compile_hints)
     return launch_partial, launch_combine

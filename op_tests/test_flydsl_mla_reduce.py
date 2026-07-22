@@ -2007,8 +2007,63 @@ def test_adaptive_launch_single_tile_uses_persistent():
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
+def test_explicit_waves_per_eu_compile_hints():
+    """WPE variants carry distinct primitive FlyDSL cache hints."""
+    _require_cuda()
+
+    compile_mla_reduce.cache_clear()
+    compile_mla_reduce_splitk.cache_clear()
+    try:
+        common = {
+            "H": 16,
+            "Dv": 512,
+            "out_dtype": "bf16",
+            "tier": Tier.ALL,
+            "output_lse": True,
+            "use_reduce_final_map": True,
+        }
+        normal_wpe1 = compile_mla_reduce(
+            **common,
+            persistent=False,
+            adaptive=True,
+            waves_per_eu=1,
+        )
+        normal_wpe4 = compile_mla_reduce(
+            **common,
+            persistent=False,
+            adaptive=True,
+            waves_per_eu=4,
+        )
+        assert normal_wpe1 is not normal_wpe4
+        assert normal_wpe1.compile_hints == {"waves_per_eu": 1}
+        assert normal_wpe4.compile_hints == {"waves_per_eu": 4}
+
+        splitk_common = {
+            "H": 16,
+            "Dv": 512,
+            "out_dtype": "bf16",
+            "K": 16,
+            "output_lse": True,
+        }
+        partial_wpe1, combine_wpe1 = compile_mla_reduce_splitk(
+            **splitk_common, waves_per_eu=1
+        )
+        partial_wpe4, combine_wpe4 = compile_mla_reduce_splitk(
+            **splitk_common, waves_per_eu=4
+        )
+        assert partial_wpe1 is not partial_wpe4
+        assert combine_wpe1 is not combine_wpe4
+        for launcher in (partial_wpe1, combine_wpe1):
+            assert launcher.compile_hints == {"waves_per_eu": 1}
+        for launcher in (partial_wpe4, combine_wpe4):
+            assert launcher.compile_hints == {"waves_per_eu": 4}
+    finally:
+        compile_mla_reduce.cache_clear()
+        compile_mla_reduce_splitk.cache_clear()
+
+
 def test_explicit_waves_per_eu_equivalence():
-    """Explicit occupancy hints must not change normal or split-K results."""
+    """Explicit occupancy hints preserve normal/split-K graph-replay results."""
     _require_cuda()
 
     dt = "bf16"
@@ -2021,19 +2076,22 @@ def test_explicit_waves_per_eu_equivalence():
         for waves_per_eu in (1, 4):
             fout.zero_()
             flse.zero_()
-            flydsl_mla_reduce_v1(
-                po,
-                pl,
-                indptr,
-                fmap,
-                pmap,
-                1,
-                fout,
-                flse,
-                num_kv_splits=splits,
-                waves_per_eu=waves_per_eu,
-            )
-            torch.cuda.synchronize()
+
+            def run():
+                flydsl_mla_reduce_v1(
+                    po,
+                    pl,
+                    indptr,
+                    fmap,
+                    pmap,
+                    1,
+                    fout,
+                    flse,
+                    num_kv_splits=splits,
+                    waves_per_eu=waves_per_eu,
+                )
+
+            run_cudagraph_replay(run)
             _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
@@ -2149,6 +2207,10 @@ def run_checks():
     _run(
         "adaptive_launch_single_tile_uses_persistent",
         test_adaptive_launch_single_tile_uses_persistent,
+    )
+    _run(
+        "explicit_waves_per_eu_compile_hints",
+        test_explicit_waves_per_eu_compile_hints,
     )
     _run("explicit_waves_per_eu_equivalence", test_explicit_waves_per_eu_equivalence)
 
