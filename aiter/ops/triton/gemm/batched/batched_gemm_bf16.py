@@ -123,8 +123,8 @@ def batched_gemm_bf16(
         SPLITK_BLOCK_SIZE = triton.cdiv(K, NUM_KSPLIT)
 
         num_k_tiles = triton.cdiv(SPLITK_BLOCK_SIZE, BLOCK_K)
-        _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
-        _DEPTH_SLACK = {"compute_bound": 2}
+        _MIN_BUFFERS = {"bandwidth_bound": 2, "compute_bound": 2}
+        _DEPTH_SLACK = {"bandwidth_bound": 2, "compute_bound": 2}
 
         if kernel_type_from_config is None:
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
@@ -136,7 +136,7 @@ def batched_gemm_bf16(
                     f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
                 )
                 kernel_type = "bandwidth_bound"
-                depth_cap = num_k_tiles
+                depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
         else:
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
 
