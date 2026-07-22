@@ -86,6 +86,16 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
             co_name = co_name.substr(0, pos) + "fwd_hd128_f6f4_pv.co";
         }
     }
+    // f4f4 (fp4 Q/K + fp4 V) shares the mxfp4 input dtypes/dispatch, so AITER_FMHA_F4F4=1 redirects
+    // the mxfp4 slot to its dedicated .co (baseline copy of mxfp4, then the exp/V-fp4 experiments).
+    if(getenv("AITER_FMHA_F4F4") != nullptr)
+    {
+        auto pos = co_name.rfind("fwd_hd128_mxfp4.co");
+        if(pos != std::string::npos)
+        {
+            co_name = co_name.substr(0, pos) + "fwd_hd128_f4f4.co";
+        }
+    }
     return co_name;
 }
 
