@@ -7,12 +7,15 @@
 Validates the FlyDSL drop-in against two independent baselines:
 
   1. ``torch_ref`` -- the exact torch reference used by
-     ``test_fused_qk_norm_mrope_cache_quant.py`` (RMSNorm + interleaved
-     3D-mrope RoPE + per-tensor FP8 quant + shuffle-layout cache scatter).
+     ``test_fused_qk_norm_mrope_cache_quant.py`` for the primary FP8 case.
   2. The production HIP op (``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``)
      itself, run on the *same* inputs, so the FlyDSL kernel's outputs are
      compared byte-for-byte (up to FP8 rounding-boundary noise) against
      what actually ships today -- not just against a hand-written reference.
+
+Focused production-parity cases additionally cover bf16 cache storage
+(``x=8``), head sizes 64/128/256, page sizes 16/64, aligned and arbitrary
+slots, and interleaved/blocked MRoPE.
 
 Correctness is gated: mismatch ratios are computed for every comparison and
 asserted against fixed thresholds (see ``MAX_MISMATCH_RATIO`` /
@@ -430,6 +433,132 @@ def run_generalization_correctness(seed: int):
     print("[PASS] generalized FlyDSL paths match production HIP within tolerance.")
 
 
+def run_cache_dtype_head_size_correctness(seed: int):
+    """Exercise bf16 cache/x=8 and D=64 against the production HIP op."""
+    import aiter
+
+    configs = [
+        # D, cache dtype, page size, interleaved, slot pattern
+        (64, torch.bfloat16, 16, True, "aligned"),
+        (64, dtypes.fp8, 64, False, "random"),
+        (128, torch.bfloat16, 64, False, "random"),
+        (128, torch.bfloat16, 16, True, "aligned"),
+        (256, torch.bfloat16, 64, True, "aligned"),
+    ]
+    sections = {
+        64: [12, 10, 10],
+        128: [24, 20, 20],
+        256: [48, 40, 40],
+    }
+    H_Q, H_K, H_V = 8, 2, 2
+    num_blocks = 4
+    dev = "cuda"
+
+    for case_idx, (D, cache_dtype, page_size, interleaved, slot_pattern) in enumerate(
+        configs
+    ):
+        torch.manual_seed(seed + 3000 + case_idx)
+        T_tok = page_size if slot_pattern == "aligned" else page_size + 3
+        x = 16 // torch.empty((), dtype=cache_dtype, device=dev).element_size()
+
+        qkv = torch.randn(
+            T_tok, H_Q + H_K + H_V, D, dtype=torch.bfloat16, device=dev
+        )
+        qw = torch.randn(D, dtype=torch.bfloat16, device=dev)
+        kw = torch.randn(D, dtype=torch.bfloat16, device=dev)
+        cos_sin = torch.randn(512, D, dtype=torch.bfloat16, device=dev) * 0.25
+        positions = torch.randint(
+            0, 512, (3, T_tok), dtype=torch.int64, device=dev
+        )
+        if slot_pattern == "aligned":
+            slot_mapping = torch.arange(T_tok, dtype=torch.int64, device=dev)
+        else:
+            slot_mapping = torch.randperm(
+                num_blocks * page_size, dtype=torch.int64, device=dev
+            )[:T_tok]
+
+        q_f = torch.empty(T_tok, H_Q, D, dtype=torch.bfloat16, device=dev)
+        q_p = torch.empty_like(q_f)
+        cache_shape = (num_blocks, page_size, H_K, D)
+        initial_k = torch.randn(
+            cache_shape, dtype=torch.bfloat16, device=dev
+        ).to(cache_dtype)
+        initial_v = torch.randn(
+            cache_shape, dtype=torch.bfloat16, device=dev
+        ).to(cache_dtype)
+        k_f, k_p = initial_k.clone(), initial_k.clone()
+        v_f, v_p = initial_v.clone(), initial_v.clone()
+        k_out_f = torch.empty(T_tok, H_K, D, dtype=cache_dtype, device=dev)
+        k_out_p = torch.empty_like(k_out_f)
+        v_out_f = torch.empty(T_tok, H_V, D, dtype=cache_dtype, device=dev)
+        v_out_p = torch.empty_like(v_out_f)
+        k_scale = torch.tensor(1.5, dtype=torch.float32, device=dev)
+        v_scale = torch.tensor(2.0, dtype=torch.float32, device=dev)
+
+        prefix = (
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            T_tok,
+            H_Q,
+            H_K,
+            H_V,
+            D,
+            True,
+            sections[D],
+            interleaved,
+            EPS,
+        )
+        suffix = (True, True, page_size, x, D, False)
+        flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            qkv,
+            *prefix,
+            q_f,
+            k_f,
+            v_f,
+            slot_mapping,
+            k_scale,
+            v_scale,
+            k_out_f,
+            v_out_f,
+            *suffix,
+        )
+        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            qkv.view(T_tok, -1),
+            *prefix,
+            q_p.view(T_tok, -1),
+            k_p,
+            v_p,
+            slot_mapping,
+            k_scale,
+            v_scale,
+            k_out_p,
+            v_out_p,
+            *suffix,
+        )
+        torch.cuda.synchronize()
+
+        label = (
+            f"D={D} cache={cache_dtype} x={x} page={page_size} "
+            f"mrope={'interleaved' if interleaved else 'blocked'} slots={slot_pattern}"
+        )
+        print(f"[cache/head-size parity] {label}")
+        failures = []
+        _assert_close("q_out", "production", q_f, q_p, failures)
+        _assert_close("k_cache", "production", k_f, k_p, failures)
+        _assert_close("v_cache", "production", v_f, v_p, failures)
+        _assert_close("k_out", "production", k_out_f, k_out_p, failures)
+        _assert_close("v_out", "production", v_out_f, v_out_p, failures)
+        if failures:
+            raise AssertionError(
+                f"[FAIL] cache/head-size parity ({label}):\n  "
+                + "\n  ".join(failures)
+            )
+
+    print("[PASS] bf16/x=8 and D=64 parity subset matches production HIP.")
+
+
 def _run_large_token_boundary_case(T_tok: int, seed: int):
     """Run one production-parity case around the 16-bit grid-Y boundary."""
     import aiter
@@ -704,7 +833,7 @@ def main():
     ap.add_argument(
         "--skip-generalizations",
         action="store_true",
-        help="Skip focused arbitrary-slot/strided-position/blocked-MRoPE/Gemma checks.",
+        help="Skip focused slot/layout/Gemma and cache-dtype/head-size checks.",
     )
     ap.add_argument(
         "--test-large-token-chunking",
@@ -739,6 +868,7 @@ def main():
         run_correctness(T_tok, args.seed, check_production=not args.no_production_check)
     if not args.skip_generalizations and not args.no_production_check:
         run_generalization_correctness(args.seed)
+        run_cache_dtype_head_size_correctness(args.seed)
     if args.test_large_token_chunking:
         if args.no_production_check:
             raise ValueError("--test-large-token-chunking requires the production check")
