@@ -26,16 +26,12 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import memref as memref_ops
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import buffer_ops, gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
@@ -173,23 +169,14 @@ def _fill_sentinel_slots(
 # ---------------------------------------------------------------------------
 # LDS helpers for multiphase kernels (module-level, used inside @flyc.kernel)
 # ---------------------------------------------------------------------------
-def _lds_load_raw(raw_mr, idx):
-    """Load i32 from LDS raw memref. idx can be i32 or index."""
-    raw_idx = idx.ir_value() if hasattr(idx, "ir_value") else idx
-    if not isinstance(raw_idx.type, ir.IndexType):
-        raw_idx = ArithValue(idx).index_cast(T.index)
-        raw_idx = raw_idx.ir_value() if hasattr(raw_idx, "ir_value") else raw_idx
-    return fx.Int32(memref_ops.load(raw_mr, [raw_idx]))
+def _lds_load_raw(raw_ptr, idx):
+    """Load i32 from an LDS pointer at element offset `idx` (i32 or index)."""
+    return fx.ptr_load(raw_ptr + fx.Int64(idx))
 
 
-def _lds_store_raw(raw_mr, val, idx):
-    """Store i32 to LDS raw memref. idx can be i32 or index."""
-    v = val.ir_value() if hasattr(val, "ir_value") else val
-    raw_idx = idx.ir_value() if hasattr(idx, "ir_value") else idx
-    if not isinstance(raw_idx.type, ir.IndexType):
-        raw_idx = ArithValue(idx).index_cast(T.index)
-        raw_idx = raw_idx.ir_value() if hasattr(raw_idx, "ir_value") else raw_idx
-    memref_ops.store(v, raw_mr, [raw_idx])
+def _lds_store_raw(raw_ptr, val, idx):
+    """Store i32 to an LDS pointer at element offset `idx` (i32 or index)."""
+    fx.ptr_store(val, raw_ptr + fx.Int64(idx))
 
 
 _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
@@ -251,24 +238,17 @@ def _compile_moe_sorting_oneshot(
     r_for_sub = min(r_for_sub, r_token_min)
     sub_tokens = r_for_sub
 
-    # SmemAllocator for the 3 LDS regions
-    allocator = SmemAllocator(None, arch=arch)
-
-    # Region 0: cumsum[E+1]  (exclusive prefix sums per expert)
-    cumsum_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = cumsum_offset + smem_cols * 4
-
-    # Region 1: cumdup[E+1]  (duplicate of cumsum for scatter phase)
-    cumdup_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = cumdup_offset + smem_cols * 4
-
-    # Region 2: tokens_mesh[sub_tokens, smem_cols]
-    mesh_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = mesh_offset + sub_tokens * smem_cols * 4
-
-    # Region 3: cross-wave scratch for all-wave parallel prefix sum [NUM_WAVES]
-    scratch_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = scratch_offset + NUM_WAVES * 4
+    # LDS regions for the oneshot kernel:
+    #   cumsum[E+1]  exclusive prefix sums per expert
+    #   cumdup[E+1]  duplicate of cumsum for scatter phase
+    #   mesh[sub_tokens, smem_cols]  token mesh (row-major linear elements)
+    #   scratch[NUM_WAVES]  cross-wave scratch for all-wave prefix sum
+    @fx.struct
+    class SharedStorage:
+        cumsum: fx.Array[fx.Int32, smem_cols, 16]
+        cumdup: fx.Array[fx.Int32, smem_cols, 16]
+        mesh: fx.Array[fx.Int32, sub_tokens * smem_cols, 16]
+        scratch: fx.Array[fx.Int32, NUM_WAVES, 16]
 
     @flyc.kernel(known_block_size=[ONESHOT_BLOCK, 1, 1])
     def moe_sorting_oneshot_kernel(
@@ -313,13 +293,12 @@ def _compile_moe_sorting_oneshot(
         nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
 
-        # LDS: get RAW memrefs ONCE — dominates all child scf.for/scf.if regions.
-        base_ptr = allocator.get_base()
-        cumsum_mr = SmemPtr(base_ptr, cumsum_offset, T.i32, shape=(smem_cols,)).get()
-        cumdup_mr = SmemPtr(base_ptr, cumdup_offset, T.i32, shape=(smem_cols,)).get()
-        mesh_mr = SmemPtr(
-            base_ptr, mesh_offset, T.i32, shape=(sub_tokens * smem_cols,)
-        ).get()
+        # LDS: capture field pointers ONCE — dominates all child scf.for/scf.if.
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        cumsum_mr = lds.cumsum.ptr
+        cumdup_mr = lds.cumdup.ptr
+        mesh_mr = lds.mesh.ptr
+        scratch_mr = lds.scratch.ptr
 
         c_topk = fx.Int32(topk)
         c_E = fx.Int32(E)
@@ -476,10 +455,6 @@ def _compile_moe_sorting_oneshot(
                 gpu.barrier()
 
             # Step 2: All-wave parallel prefix sum (cumsum → cumdup).
-            scratch_mr = SmemPtr(
-                base_ptr, scratch_offset, T.i32, shape=(NUM_WAVES,)
-            ).get()
-
             # All threads read cumsum[tid+1] (in chunks for E > ONESHOT_BLOCK)
             for _ps_chunk in range_constexpr(0, E, ONESHOT_BLOCK):
                 ps_eid = fx.Int32(_ps_chunk) + tid
@@ -776,11 +751,6 @@ def _compile_moe_sorting_oneshot(
         n_grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         launcher = moe_sorting_oneshot_kernel(
             topk_ids_tensor,
             topk_weights_tensor,
@@ -849,7 +819,6 @@ def _compile_moe_sorting_multiphase(
     unit_size : int
         GEMM tile-M for padding alignment (default 32).
     """
-    arch = get_hip_arch()
     E = num_experts
 
     @flyc.jit
@@ -1100,9 +1069,9 @@ def _compile_moe_sorting_multiphase(
     K3_WORDS_PER_ITER = K3_BLOCK * K3_VEC_WIDTH
     K3_WORDS_PER_ITER_LOG2 = (K3_WORDS_PER_ITER).bit_length() - 1
 
-    k3_allocator = SmemAllocator(None, arch=arch, global_sym_name="smem_storage_p1")
-    k3_reduce_offset = k3_allocator._align(k3_allocator.ptr, 16)
-    k3_allocator.ptr = k3_reduce_offset + K3_NUM_WAVES * 4
+    @fx.struct
+    class P1SharedStorage:
+        reduce: fx.Array[fx.Int32, K3_NUM_WAVES, 16]
 
     @flyc.kernel
     def p1_count_kernel(
@@ -1121,10 +1090,7 @@ def _compile_moe_sorting_multiphase(
         c_one = fx.Int32(1)
         c_ff = fx.Int32(0xFF)
 
-        base_ptr = k3_allocator.get_base()
-        reduce_mr = SmemPtr(
-            base_ptr, k3_reduce_offset, T.i32, shape=(K3_NUM_WAVES,)
-        ).get()
+        reduce_mr = fx.SharedAllocator().allocate(P1SharedStorage).peek().reduce.ptr
 
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
         i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
@@ -1212,11 +1178,6 @@ def _compile_moe_sorting_multiphase(
         i32_mesh_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        k3_allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            k3_allocator.finalize()
-
         launcher = p1_count_kernel(
             workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size
         )
@@ -1236,9 +1197,9 @@ def _compile_moe_sorting_multiphase(
     _p0v2_topk_log2 = topk.bit_length() - 1 if _p0v2_topk_is_po2 else 0
 
     # LDS for cross-wave reduction (same layout as K3)
-    p0v2_allocator = SmemAllocator(None, arch=arch, global_sym_name="smem_storage_p0v2")
-    p0v2_reduce_offset = p0v2_allocator._align(p0v2_allocator.ptr, 16)
-    p0v2_allocator.ptr = p0v2_reduce_offset + P0V2_NUM_WAVES * 4
+    @fx.struct
+    class P0V2SharedStorage:
+        reduce: fx.Array[fx.Int32, P0V2_NUM_WAVES, 16]
 
     @flyc.kernel(known_block_size=[P0V2_BLOCK, 1, 1])
     def p0v2_kernel(
@@ -1264,10 +1225,7 @@ def _compile_moe_sorting_multiphase(
         c_topk = fx.Int32(topk)
         c_block = fx.Int32(P0V2_BLOCK)
 
-        base_ptr = p0v2_allocator.get_base()
-        reduce_mr = SmemPtr(
-            base_ptr, p0v2_reduce_offset, T.i32, shape=(P0V2_NUM_WAVES,)
-        ).get()
+        reduce_mr = fx.SharedAllocator().allocate(P0V2SharedStorage).peek().reduce.ptr
 
         # Precompute mesh row base (in i32 words) and words per row
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
@@ -1398,11 +1356,6 @@ def _compile_moe_sorting_multiphase(
         i32_mesh_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        p0v2_allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            p0v2_allocator.finalize()
-
         launcher = p0v2_kernel(
             topk_ids,
             workspace,
@@ -1422,12 +1375,12 @@ def _compile_moe_sorting_multiphase(
 
     # LDS: cumsum[E+1] for prefix sums + cross-wave scratch for DPP scan
     K4_NUM_WAVES = K4_BLOCK // WARP_SIZE
-    k4_allocator = SmemAllocator(None, arch=arch)
     k4_smem_cols = max(E + 1, K4_BLOCK + 1)
-    k4_cumsum_offset = k4_allocator._align(k4_allocator.ptr, 16)
-    k4_allocator.ptr = k4_cumsum_offset + k4_smem_cols * 4
-    k4_scatter_offset = k4_allocator._align(k4_allocator.ptr, 16)
-    k4_allocator.ptr = k4_scatter_offset + K4_NUM_WAVES * 4
+
+    @fx.struct
+    class K4SharedStorage:
+        cumsum: fx.Array[fx.Int32, k4_smem_cols, 16]
+        scatter: fx.Array[fx.Int32, K4_NUM_WAVES, 16]
 
     @flyc.kernel(known_block_size=[K4_BLOCK, 1, 1])
     def p23_kernel(
@@ -1470,13 +1423,9 @@ def _compile_moe_sorting_multiphase(
         mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
 
         # LDS: cumsum[E+1] for prefix sums + cross-wave scratch
-        base_ptr = k4_allocator.get_base()
-        cumsum_mr = SmemPtr(
-            base_ptr, k4_cumsum_offset, T.i32, shape=(k4_smem_cols,)
-        ).get()
-        scatter_mr = SmemPtr(
-            base_ptr, k4_scatter_offset, T.i32, shape=(K4_NUM_WAVES,)
-        ).get()
+        lds = fx.SharedAllocator().allocate(K4SharedStorage).peek()
+        cumsum_mr = lds.cumsum.ptr
+        scatter_mr = lds.scatter.ptr
 
         is_sort_block = bid < c_E
         is_zero_block = bid >= c_E
@@ -1660,11 +1609,6 @@ def _compile_moe_sorting_multiphase(
         n_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        k4_allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            k4_allocator.finalize()
-
         launcher = p23_kernel(
             workspace,
             topk_weights_tensor,
@@ -1699,13 +1643,6 @@ def _compile_moe_sorting_multiphase(
         n_grid_p23: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        p0v2_allocator.finalized = False
-        k4_allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            p0v2_allocator.finalize()
-            k4_allocator.finalize()
-
         l1 = p0v2_kernel(
             topk_ids,
             workspace,
@@ -1754,13 +1691,6 @@ def _compile_moe_sorting_multiphase(
         n_grid_p23: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        k3_allocator.finalized = False
-        k4_allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            k3_allocator.finalize()
-            k4_allocator.finalize()
-
         l1 = clear_workspace_kernel(workspace, i32_ws_total)
         l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
 

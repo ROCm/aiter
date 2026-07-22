@@ -13,15 +13,11 @@ import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
-from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    STensor,
     ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -30,17 +26,31 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 MAX_EXPERTS_PER_BLOCK = 512
 
 
+@fx.struct
+class _PsumStorage:
+    lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+
+
+@fx.struct
+class _RoutePsumStorage:
+    cnt: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+
+
+def _lds_load(ptr, idx):
+    """Scalar i32 load from an LDS pointer at element offset ``idx``."""
+    return fx.ptr_load(ptr + fx.Int64(idx))
+
+
+def _lds_store(ptr, val, idx):
+    """Scalar i32 store to an LDS pointer at element offset ``idx``."""
+    fx.ptr_store(val, ptr + fx.Int64(idx))
+
+
 def build_moe_contiguous_psum_module():
     """JIT launcher: tile-aligned prefix sum over per-expert counts."""
-
-    gpu_arch = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="moe_contiguous_psum_smem"
-    )
-    lds0_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds0_off + MAX_EXPERTS_PER_BLOCK * 4
-    lds1_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds1_off + MAX_EXPERTS_PER_BLOCK * 4
 
     @flyc.kernel(
         name="moe_contiguous_psum",
@@ -59,17 +69,9 @@ def build_moe_contiguous_psum_module():
         tile_v = ArithValue(tile_m)
         tile_minus_1 = tile_v - arith.constant(1, type=i32)
 
-        lds_base = allocator.get_base()
-        lds0 = STensor(
-            SmemPtr(lds_base, lds0_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
-        lds1 = STensor(
-            SmemPtr(lds_base, lds1_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
+        lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
 
         m_rsrc = ptr_rsrc(masked_m)
         s_rsrc = ptr_rsrc(starts)
@@ -82,7 +84,7 @@ def build_moe_contiguous_psum_module():
             m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             q = arith.divui(ArithValue(m) + tile_minus_1, tile_v)
             aligned = ArithValue(q) * tile_v
-            lds0[fx.Index(tid)] = aligned
+            _lds_store(lds0, aligned, tid)
             scf.YieldOp([])
 
         gpu.barrier()
@@ -94,17 +96,17 @@ def build_moe_contiguous_psum_module():
                 continue
             _if_scan = scf.IfOp(in_range)
             with ir.InsertionPoint(_if_scan.then_block):
-                val = src[fx.Index(tid)]
+                val = _lds_load(src, tid)
                 has_prev = arith.cmpi(
                     CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
                 )
                 prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
                 with ir.InsertionPoint(prev_if.then_block):
-                    prev = src[fx.Index(tid - arith.constant(offset, type=i32))]
+                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
                     scf.YieldOp([_raw(prev)])
                 with ir.InsertionPoint(prev_if.else_block):
                     scf.YieldOp([arith.constant(0, type=i32)])
-                dst[fx.Index(tid)] = ArithValue(val) + ArithValue(prev_if.results[0])
+                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
                 scf.YieldOp([])
             gpu.barrier()
             src, dst = dst, src
@@ -116,12 +118,12 @@ def build_moe_contiguous_psum_module():
             with ir.InsertionPoint(start_if.then_block):
                 scf.YieldOp([arith.constant(0, type=i32)])
             with ir.InsertionPoint(start_if.else_block):
-                prev = src[fx.Index(tid - arith.constant(1, type=i32))]
+                prev = _lds_load(src, tid - arith.constant(1, type=i32))
                 scf.YieldOp([_raw(prev)])
-            start = ArithValue(start_if.results[0])
+            start = fx.Int32(start_if.results[0])
             m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
 
             is_last = arith.cmpi(
                 CmpIPredicate.eq,
@@ -130,7 +132,7 @@ def build_moe_contiguous_psum_module():
             )
             _if_last = scf.IfOp(is_last)
             with ir.InsertionPoint(_if_last.then_block):
-                final_cur = src[fx.Index(tid)]
+                final_cur = _lds_load(src, tid)
                 gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
                 cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
                 buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
@@ -147,10 +149,6 @@ def build_moe_contiguous_psum_module():
         tile_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         psum_kernel(masked_m, starts, psum, contiguous_m, experts, tile_m).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
@@ -169,15 +167,6 @@ def build_moe_contiguous_psum_module():
 
 def build_moe_contiguous_psum_remap_module():
     """JIT launcher: contiguous psum + in-place masked-to-contiguous row remap."""
-
-    gpu_arch = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="moe_contiguous_psum_remap_smem"
-    )
-    lds0_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds0_off + MAX_EXPERTS_PER_BLOCK * 4
-    lds1_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds1_off + MAX_EXPERTS_PER_BLOCK * 4
 
     @flyc.kernel(
         name="moe_contiguous_psum_remap",
@@ -199,17 +188,9 @@ def build_moe_contiguous_psum_remap_module():
         tile_v = ArithValue(tile_m)
         tile_minus_1 = tile_v - arith.constant(1, type=i32)
 
-        lds_base = allocator.get_base()
-        lds0 = STensor(
-            SmemPtr(lds_base, lds0_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
-        lds1 = STensor(
-            SmemPtr(lds_base, lds1_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
+        lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
 
         m_rsrc = ptr_rsrc(masked_m)
         rows_rsrc = ptr_rsrc(topids_to_rows)
@@ -223,7 +204,7 @@ def build_moe_contiguous_psum_remap_module():
             m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             q = arith.divui(ArithValue(m) + tile_minus_1, tile_v)
             aligned = ArithValue(q) * tile_v
-            lds0[fx.Index(tid)] = aligned
+            _lds_store(lds0, aligned, tid)
             scf.YieldOp([])
 
         gpu.barrier()
@@ -235,17 +216,17 @@ def build_moe_contiguous_psum_remap_module():
                 continue
             _if_scan = scf.IfOp(in_expert)
             with ir.InsertionPoint(_if_scan.then_block):
-                val = src[fx.Index(tid)]
+                val = _lds_load(src, tid)
                 has_prev = arith.cmpi(
                     CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
                 )
                 prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
                 with ir.InsertionPoint(prev_if.then_block):
-                    prev = src[fx.Index(tid - arith.constant(offset, type=i32))]
+                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
                     scf.YieldOp([_raw(prev)])
                 with ir.InsertionPoint(prev_if.else_block):
                     scf.YieldOp([arith.constant(0, type=i32)])
-                dst[fx.Index(tid)] = ArithValue(val) + ArithValue(prev_if.results[0])
+                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
                 scf.YieldOp([])
             gpu.barrier()
             src, dst = dst, src
@@ -257,12 +238,12 @@ def build_moe_contiguous_psum_remap_module():
             with ir.InsertionPoint(start_if.then_block):
                 scf.YieldOp([arith.constant(0, type=i32)])
             with ir.InsertionPoint(start_if.else_block):
-                prev = src[fx.Index(tid - arith.constant(1, type=i32))]
+                prev = _lds_load(src, tid - arith.constant(1, type=i32))
                 scf.YieldOp([_raw(prev)])
-            start = ArithValue(start_if.results[0])
+            start = fx.Int32(start_if.results[0])
             m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
             is_last = arith.cmpi(
                 CmpIPredicate.eq,
                 tid,
@@ -270,7 +251,7 @@ def build_moe_contiguous_psum_remap_module():
             )
             _if_last = scf.IfOp(is_last)
             with ir.InsertionPoint(_if_last.then_block):
-                final_cur = src[fx.Index(tid)]
+                final_cur = _lds_load(src, tid)
                 gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
                 cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
                 buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
@@ -308,10 +289,6 @@ def build_moe_contiguous_psum_remap_module():
         tile_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         psum_remap_kernel(
             masked_m,
             topids_to_rows,
@@ -351,17 +328,6 @@ def build_moe_route_psum_fused_module():
     + ``psum`` (m_tile_map) of the split-kernel path bit-for-bit.
     """
 
-    gpu_arch = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="moe_route_psum_fused_smem"
-    )
-    cnt_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = cnt_off + MAX_EXPERTS_PER_BLOCK * 4
-    lds0_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds0_off + MAX_EXPERTS_PER_BLOCK * 4
-    lds1_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds1_off + MAX_EXPERTS_PER_BLOCK * 4
-
     @flyc.kernel(
         name="moe_route_psum_fused",
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
@@ -382,22 +348,10 @@ def build_moe_route_psum_fused_module():
         tile_v = ArithValue(tile_m)
         tile_minus_1 = tile_v - arith.constant(1, type=i32)
 
-        lds_base = allocator.get_base()
-        lds_cnt = STensor(
-            SmemPtr(lds_base, cnt_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
-        lds0 = STensor(
-            SmemPtr(lds_base, lds0_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
-        lds1 = STensor(
-            SmemPtr(lds_base, lds1_off, T.i32, shape=(MAX_EXPERTS_PER_BLOCK,)),
-            dtype=T.i32,
-            shape=(MAX_EXPERTS_PER_BLOCK,),
-        )
+        lds = fx.SharedAllocator().allocate(_RoutePsumStorage).peek()
+        lds_cnt = lds.cnt.ptr
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
 
         topk_rsrc = ptr_rsrc(topk_ids)
         rows_rsrc = ptr_rsrc(topids_to_rows)
@@ -410,12 +364,11 @@ def build_moe_route_psum_fused_module():
         # Phase A: zero the LDS per-expert atomic counter.
         _if_zero = scf.IfOp(in_expert)
         with ir.InsertionPoint(_if_zero.then_block):
-            lds_cnt[fx.Index(tid)] = arith.constant(0, type=i32)
+            _lds_store(lds_cnt, arith.constant(0, type=i32), tid)
             scf.YieldOp([])
         gpu.barrier()
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
-        cnt_base_idx = buffer_ops.extract_base_index(lds_base)
         tid_idx = arith.index_cast(T.index, tid)
         numel_idx = arith.index_cast(T.index, ArithValue(numel))
         stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
@@ -423,12 +376,7 @@ def build_moe_route_psum_fused_module():
         with ir.InsertionPoint(route_loop.body):
             route_i32 = arith.index_cast(i32, route_loop.induction_variable)
             e = buffer_ops.buffer_load(topk_rsrc, route_i32, vec_width=1, dtype=i32)
-            e_idx = arith.index_cast(T.index, e)
-            addr = (
-                fx.Index(cnt_base_idx)
-                + fx.Index(cnt_off)
-                + fx.Index(e_idx) * fx.Index(4)
-            )
+            addr = fx.ptrtoint(lds_cnt + fx.Int64(e))
             ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
             ptr = ptr._value if hasattr(ptr, "_value") else ptr
             slot = llvm.AtomicRMWOp(
@@ -447,11 +395,11 @@ def build_moe_route_psum_fused_module():
         # Phase C: tile-aligned inclusive scan of per-expert counts.
         _if_load = scf.IfOp(in_expert)
         with ir.InsertionPoint(_if_load.then_block):
-            m = lds_cnt[fx.Index(tid)]
-            q = arith.divui(ArithValue(m) + tile_minus_1, tile_v)
+            m = _lds_load(lds_cnt, tid)
+            q = arith.divui(_raw(m) + tile_minus_1, tile_v)
             aligned = ArithValue(q) * tile_v
-            lds0[fx.Index(tid)] = aligned
-            buffer_ops.buffer_store(ArithValue(m), m_rsrc, tid)
+            _lds_store(lds0, aligned, tid)
+            buffer_ops.buffer_store(m, m_rsrc, tid)
             scf.YieldOp([])
         gpu.barrier()
 
@@ -462,17 +410,17 @@ def build_moe_route_psum_fused_module():
                 continue
             _if_scan = scf.IfOp(in_expert)
             with ir.InsertionPoint(_if_scan.then_block):
-                val = src[fx.Index(tid)]
+                val = _lds_load(src, tid)
                 has_prev = arith.cmpi(
                     CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
                 )
                 prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
                 with ir.InsertionPoint(prev_if.then_block):
-                    prev = src[fx.Index(tid - arith.constant(offset, type=i32))]
+                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
                     scf.YieldOp([_raw(prev)])
                 with ir.InsertionPoint(prev_if.else_block):
                     scf.YieldOp([arith.constant(0, type=i32)])
-                dst[fx.Index(tid)] = ArithValue(val) + ArithValue(prev_if.results[0])
+                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
                 scf.YieldOp([])
             gpu.barrier()
             src, dst = dst, src
@@ -484,12 +432,12 @@ def build_moe_route_psum_fused_module():
             with ir.InsertionPoint(start_if.then_block):
                 scf.YieldOp([arith.constant(0, type=i32)])
             with ir.InsertionPoint(start_if.else_block):
-                prev = src[fx.Index(tid - arith.constant(1, type=i32))]
+                prev = _lds_load(src, tid - arith.constant(1, type=i32))
                 scf.YieldOp([_raw(prev)])
-            start = ArithValue(start_if.results[0])
-            m_tid = lds_cnt[fx.Index(tid)]
+            start = fx.Int32(start_if.results[0])
+            m_tid = _lds_load(lds_cnt, tid)
             buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
             scf.YieldOp([])
         gpu.barrier()
 
@@ -520,10 +468,6 @@ def build_moe_route_psum_fused_module():
         tile_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         route_psum_fused_kernel(
             topk_ids,
             topids_to_rows,

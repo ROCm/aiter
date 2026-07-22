@@ -848,8 +848,6 @@ def mla_decode_v4_asm(
     kv_indptr: torch.Tensor,
     # [num_page_used]
     kv_page_indices: torch.Tensor,
-    # [num_seqs]
-    kv_last_page_lens: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
     # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
@@ -876,6 +874,11 @@ def mla_decode_v4_asm(
     # kernel skips the write and nullptr is fine.
     valid_split_count: Optional[torch.Tensor] = None,
     use_valid_split_count_reduce: int = 0,
+    # [num_seqs] int32. Unused on the v4 nm path (page_size=1 -> the kernel derives
+    # kv_seq_len from the token-level kv_indptr). Optional/nullable: None sends a
+    # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
+    # through it. Placed at the tail because it carries no data on this path.
+    kv_last_page_lens: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 

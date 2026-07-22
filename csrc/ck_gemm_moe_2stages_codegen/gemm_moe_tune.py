@@ -4182,8 +4182,18 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
-            profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m", "flat"], keep="first"
+            # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
+            # penalty below is applied only to non-fused, so dedup must not drop the
+            # fused kernel by raw us before that penalty runs.
+            profileDF["_is_fused"] = (
+                profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
+            )
+            profileDF = (
+                profileDF.sort_values("us")
+                .drop_duplicates(
+                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
+                )
+                .drop(columns=["_is_fused"])
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]

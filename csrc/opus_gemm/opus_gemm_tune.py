@@ -434,6 +434,14 @@ def kid_rejects_shape(k_inst, M, N, K):
                 return True
         return False
 
+    if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
+        waves_per_wg = k_inst.BLOCK_SIZE // 64
+        t_k = waves_per_wg // (k_inst.T_M * k_inst.T_N)
+        k_tile_full = k_inst.B_K * t_k
+        if K < k_tile_full or K % k_tile_full != 0:
+            return True
+        return False
+
     if k_inst.kernel_tag == "a16w16_flatmm":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True

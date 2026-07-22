@@ -983,7 +983,7 @@ void mla_decode_stage1_asm_fwd(
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
     }
-    int lse_flag = (lse != nullptr) ? 1 : 0;
+    int lse_flag = (lse != nullptr && persistent) ? 1 : 0;
 
     int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
