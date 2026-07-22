@@ -72,6 +72,7 @@ def test_fused_gemm_afp4wfp4_mul_add(
             pytest.skip(
                 f"K = {K} is not divisible by 256, skip this test for preshuffled weight/scales tests"
             )
+    torch.manual_seed(0)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 

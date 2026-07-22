@@ -1,16 +1,48 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import numpy as np
 import flydsl.compiler as flyc
 from itertools import product
 from abc import ABC, abstractmethod
 
+from flydsl._mlir.dialects import fly, llvm
+from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
-from flydsl.expr import buffer_ops, range_constexpr, vector
+from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
+
+# Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
+# kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
+# globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
+# number of kernel arguments to preload.
+AITER_FLYDSL_KERNARG_PRELOAD = bool(
+    int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1"))
+)
+AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
+    os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
+)
+
+
+def ptr_rsrc(ptr):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
+    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
+    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+
+
+def ptr_arg(t: torch.Tensor):
+    """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
+    import flydsl.expr as fx
+
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
 def _run_compiled(exe, *args):
@@ -59,6 +91,15 @@ def get_dtype_vec_size(dtype: str):
         return 8
     elif dtype == "bf16":
         return 8
+
+
+def get_dtype_bytes(dtype: str):
+    if dtype == "f32":
+        return 4
+    elif dtype == "f16":
+        return 2
+    elif dtype == "bf16":
+        return 2
 
 
 class TensorView:
@@ -271,9 +312,28 @@ class TorchTensor(TensorBase):
 
 
 class GTensor(TensorBase):
-    def __init__(self, memref, dtype, shape, stride=None, base_offset=0):
+    def __init__(
+        self,
+        memref,
+        dtype,
+        shape,
+        stride=None,
+        base_offset=0,
+        cache_modifier=0,
+        static_bytes_offset_i64=None,
+    ):
         super().__init__(dtype, shape, stride, base_offset)
-        self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        raw = extract_to_ir_values(memref)[0]
+        if static_bytes_offset_i64 is None:
+            if str(raw.type).startswith("!fly.ptr"):
+                base_i64 = arith.index_cast(T.i64, ptrtoint(memref))
+                self.rsrc = buffer_ops.create_buffer_resource_from_addr(base_i64)
+            else:
+                self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        else:
+            array_base_i64 = self.get_llvm_ptr(memref, (static_bytes_offset_i64))
+            self.rsrc = buffer_ops.create_buffer_resource_from_addr(array_base_i64)
+        self.cache_modifier = cache_modifier
 
     def load(self, offset, vec_size=1):
         return buffer_ops.buffer_load(
@@ -281,7 +341,23 @@ class GTensor(TensorBase):
         )
 
     def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(value, self.rsrc, offset)
+        buffer_ops.buffer_store(
+            value, self.rsrc, offset, cache_modifier=self.cache_modifier
+        )
+
+    def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
+        bytes_offset_i64 = arith.index_cast(T.i64, bytes_offset_i64)
+        _ptr_type = ir.Type.parse(ptr_type)
+        raw = extract_to_ir_values(ptr)[0]
+        if str(raw.type).startswith("!fly.ptr"):
+            base_ptr = arith.index_cast(T.i64, ptrtoint(ptr))
+        else:
+            base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, raw)
+            base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
+        llvm_ptr = llvm.AddOp(
+            base_ptr, bytes_offset_i64, llvm.IntegerOverflowFlags(0)
+        ).result
+        return llvm_ptr
 
 
 class STensor(TensorBase):

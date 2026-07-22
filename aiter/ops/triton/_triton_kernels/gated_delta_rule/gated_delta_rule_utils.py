@@ -4,6 +4,7 @@ import contextlib
 import functools
 import inspect
 import logging
+import math
 import os
 import sys
 import warnings
@@ -41,6 +42,32 @@ SUPPORTS_AUTOTUNE_CACHE = (
 autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
+
+GATED_DELTA_RULE_TRITON_AUTOTUNE = os.environ.get(
+    "GATED_DELTA_RULE_TRITON_AUTOTUNE", "0"
+).lower() in ("1", "true", "yes", "on")
+
+# log2(e) == 1/ln(2). Converts natural-log gate values to log2 space so
+# kernels can use exp2 instead of exp. Python/wrapper-only: pass into kernels
+# as a constexpr scale (e.g. G_SCALE); never reference inside @triton.jit kernels.
+RCP_LN2: float = math.log2(math.e)
+
+
+def gated_delta_rule_autotune_configs(
+    configs: list[triton.Config], default_config: triton.Config | None = None
+) -> list[triton.Config]:
+    """
+    Select Triton autotune configs based on the gated delta rule env flag.
+
+    When ``GATED_DELTA_RULE_TRITON_AUTOTUNE`` is enabled, return the full config
+    list so ``@triton.autotune`` benchmarks candidate kernels. When disabled,
+    return only ``default_config`` (or the first config) to skip tuning overhead
+    while keeping the decorator shape uniform across decode and prefill kernels.
+    """
+    if GATED_DELTA_RULE_TRITON_AUTOTUNE:
+        return configs
+    cfg = default_config if default_config is not None else configs[0]
+    return [cfg]
 
 
 @lru_cache(maxsize=1)

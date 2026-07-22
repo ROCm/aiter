@@ -99,6 +99,7 @@ def torch_moe_align_block_size(
 
 
 def input_helper(M: int, E: int, top_k: int):
+    torch.manual_seed(0)
     values = torch.randn(M, E, dtype=torch.float16, device="cuda")
 
     softmax_vals = torch.softmax(values, dim=1)

@@ -281,6 +281,6 @@ def test_op(
         preshuffled,
         out_dtype,
         apply_activation=apply_activation,
-        add_residual=apply_activation,
+        swiglu_add_residual=apply_activation,
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 
 def generate_inputs(M, N, has_res, dtype):
+    torch.manual_seed(0)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
     weight = torch.randn((N,), dtype=dtype, device="cuda")
     res = torch.randn((M, N), dtype=dtype, device="cuda") if has_res else None

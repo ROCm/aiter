@@ -133,6 +133,7 @@ def run_top_k_per_row_prefill(
     num_rows: int,
     stride_row: int,
     stride_col: int,
+    k: int = 2048,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -146,6 +147,7 @@ def run_top_k_per_row_prefill(
         num_rows,
         stride_row,
         stride_col,
+        k=k,
     )
 
 
@@ -159,11 +161,17 @@ def run_top_k_per_row_decode(
     stride0: int,
     stride1: int,
     fast: bool,
+    k: int = 2048,
 ) -> None:
     """
     Run the top_k_per_row kernel.
+
+    Note: the `_fast` ASM-kernel variant has `kTopK=2048` baked into its
+    precompiled `.co`; it ignores any caller-supplied `k`. The dispatch
+    here only allows `_fast` when k == 2048.
     """
     if fast:
+        assert k == 2048, "top_k_per_row_decode_fast only supports k=2048"
         return aiter.top_k_per_row_decode_fast(
             logits,
             next_n,
@@ -182,6 +190,7 @@ def run_top_k_per_row_decode(
             numRows,
             stride0,
             stride1,
+            k=k,
         )
 
 
@@ -216,6 +225,7 @@ def test_top_k_per_row_prefill(
         num_rows,
         logits.stride(0),
         logits.stride(1),
+        k=top_k,
     )
 
     # Run reference implementation
@@ -277,6 +287,7 @@ def test_top_k_per_row_decode(
         logits.stride(0),
         logits.stride(1),
         fast,
+        k=top_k,
     )
 
     torch.cuda.synchronize()
@@ -301,6 +312,49 @@ def test_top_k_per_row_decode(
     return ret
 
 
+def test_mb_workspace_reuse():
+    """Regression for the persistent multi-block workspace + kernel self-reset.
+
+    The mb path now runs on a cached, zeroed-once buffer (no per-call memset);
+    the kernel must reset its counters/histograms to zero on exit so the *next*
+    call on the same buffer is correct. This drives 3 calls with DIFFERENT data
+    on the same cached buffer -- if self-reset were broken, a later call would be
+    corrupted by an earlier call's leftover atomic counters / histograms.
+    """
+    num_rows, num_prefix, top_k = 4, 131072, 2048
+    row_starts, row_ends = create_row_boundaries(num_rows, num_prefix)
+    probe = create_random_logits(row_starts, row_ends, torch.float32, 0)
+    stride0 = probe.stride(0)
+    if not aiter.topk_use_mulblocks(num_rows, stride0):
+        print(
+            f"[mb_workspace_reuse] mb path not selected on this HW "
+            f"(num_rows={num_rows}, seq={stride0}); skipping"
+        )
+        return
+    max_end = int(max(row_ends))
+    for call_idx, seed in enumerate((11, 22, 33)):
+        logits = create_random_logits(row_starts, row_ends, torch.float32, seed)
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+        aiter.top_k_per_row_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            None,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=top_k,
+        )
+        ref = logits.topk(min(top_k, max_end), dim=-1)[1]
+        mask = (ref >= 0) & ((ref - (row_ends - row_starts)[:, None]) < 0)
+        ref = ref.masked_fill(~mask, -1)
+        assert compare_topk_results(
+            logits, indices, ref, row_starts, row_ends, top_k
+        ), f"mb workspace reuse mismatch on call #{call_idx} (seed={seed})"
+    print("[mb_workspace_reuse] PASS: 3 reused-buffer mb calls matched torch.topk")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -319,10 +373,12 @@ parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=[2048],
+    default=[512, 1024, 2048],
     nargs="+",
-    help="""top-k elements per row.
-    e.g.: -k 2048""",
+    help="""top-k elements per row. The radix backend supports any positive
+    int; the `_fast` ASM-kernel path only supports 2048 and is skipped
+    for other values.
+    e.g.: -k 512 1024 2048""",
 )
 
 parser.add_argument(
@@ -367,6 +423,9 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+# Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
+test_mb_workspace_reuse()
+
 
 df = []
 for data_generation in args.data_generation:
@@ -391,7 +450,8 @@ for data_generation in args.data_generation:
                         m, ctx, k, n, data_generation, False
                     )
                     df.append(ret)
-                    if get_gfx() == "gfx942":
+                    # `_fast` ASM kernel hardcodes k=2048; skip otherwise.
+                    if get_gfx() == "gfx942" and k == 2048:
                         ret = test_top_k_per_row_decode(
                             m, ctx, k, n, data_generation, True
                         )

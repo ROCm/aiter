@@ -112,6 +112,7 @@ def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     - w: (N, K) -> column-major format
     - y: (M, D, S3)
     """
+    torch.manual_seed(0)
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 

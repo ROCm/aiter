@@ -37,10 +37,12 @@ struct __attribute__((packed)) KernelArgs
     p3 _p16;
     unsigned int KVs;
     p3 _p17;
-    unsigned int GQA;
+    unsigned int mtp;
     p3 _p18;
+    unsigned int GQA;
+    p3 _p19;
     void* ptr_QTP;
-    p2 _p19;
+    p2 _p20;
 };
 
 
@@ -90,6 +92,8 @@ struct __attribute__((packed)) PsKernelArgs
     p2 _p25;
     unsigned int stride_scale_blk;
     p3 _p26;
+    unsigned int stride_scale_page;
+    p3 _p27;
 };
 
 
@@ -177,6 +181,10 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
             hipStream_t stream)
 {
     int batch            = context_lens->size(0);
+    if(max_qlen > 1)
+    {
+        batch = block_tables->size(0);
+    }
     std::string arch_id = get_gpu_arch();
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -196,7 +204,7 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
 
-    KernelArgs args;
+    KernelArgs args = {};
     size_t arg_size = sizeof(args);
     args.ptr_O      = out_->data_ptr();
     args.ptr_Q      = Q->data_ptr();
@@ -220,6 +228,7 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
     args.Qs        = stride_Q;
     args.Bs        = stride_KV_blk;
     args.KVs       = stride_KV_head;
+    args.mtp       = max_qlen - 1;
     args.GQA       = gqa_ratio;
     args.ptr_QTP   = (qo_indptr != nullptr) ? qo_indptr->data_ptr() : nullptr;
 
@@ -345,6 +354,9 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     int stride_scale_blk = (K_QScale != nullptr)
                                ? (K_QScale->stride(1) * K_QScale->element_size())
                                : (block_size * sizeof(float));
+    int stride_scale_page = (K_QScale != nullptr)
+                                ? (K_QScale->stride(0) * K_QScale->element_size())
+                                : (num_kv_heads * block_size * sizeof(float));
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
@@ -381,6 +393,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     args.ptr_SplitO   = (work_info != nullptr) ? splitData->data_ptr() : nullptr;
     args.ptr_SplitLSE = (work_info != nullptr) ? splitLse->data_ptr() : nullptr;
     args.stride_scale_blk = stride_scale_blk;
+    args.stride_scale_page = stride_scale_page;
     args.mtp          = max_qlen - 1;
 
     const HipDeviceGuard device_guard(Q->device_id);

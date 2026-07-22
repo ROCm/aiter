@@ -12,7 +12,7 @@
 #include "gemm_a8w8_blockscale_cktile_manifest.h"
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, bool, int)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -73,12 +73,12 @@ torch::Tensor gemm_a8w8_blockscale_cktile_tune(torch::Tensor& XQ,
     if(Y.dtype() == at::ScalarType::BFloat16)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_BF16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
     }
     else if(Y.dtype() == at::ScalarType::Half)
     {
         blockwise_dispatch_cktile<TILE_FP32, TILE_FP16>(kernelId)(
-            XQ, WQ, x_scale, w_scale, Y, preshuffleB);
+            XQ, WQ, x_scale, w_scale, Y, preshuffleB, KBatch);
     }
     else
     {

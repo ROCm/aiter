@@ -10,6 +10,8 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mha import fmha_fwd_hd128_bf16_opus_fwd
 from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
@@ -91,6 +93,7 @@ def run_ck(
     return_attn_probs=False,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
+    num_splits=0,
 ):
     (out, softmax_lse, S_dmask), us_fwd = run_perftest(
         aiter.flash_attn_func,
@@ -109,6 +112,7 @@ def run_ck(
         how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
+        num_splits=num_splits,
         num_rotate_args=1,
     )
 
@@ -158,7 +162,7 @@ def run_ck(
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "bias", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
@@ -210,14 +214,15 @@ def test_flash_attn_output(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
+    num_splits=0,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     return_lse = True
@@ -302,6 +307,7 @@ def test_flash_attn_output(
         deterministic,
         return_lse,
         return_attn_probs,
+        num_splits=num_splits,
     )
 
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
@@ -372,6 +378,7 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
+    fwd_flop = fwd_flop / 2 if causal else fwd_flop
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
         batch_size
@@ -384,10 +391,12 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
+    bwd_flop = bwd_flop / 2 if causal else bwd_flop
     bwd_num_bytes = (
         2 * fwd_num_bytes
         + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
+
     ret = {}
     ret["fwd_us"] = us_fwd
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
@@ -411,9 +420,10 @@ def flash_attn_output_benchmark(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
+    num_splits=0,
 ):
     return test_flash_attn_output(
         batch_size,
@@ -427,9 +437,10 @@ def flash_attn_output_benchmark(
         local,
         bias_type,
         deterministic,
-        mha_type,
+        gqa_ratio,
         dtype,
         input_layout,
+        num_splits=num_splits,
     )
 
 
@@ -438,7 +449,7 @@ def flash_attn_output_benchmark(
     ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no"])
 @pytest.mark.parametrize("local", [False, True])
@@ -491,14 +502,14 @@ def test_flash_attn_seq_padding(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
 ):
 
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     if bias_type == "bias":
@@ -694,7 +705,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=6,
+    default=16,
     help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
@@ -777,14 +788,14 @@ parser.add_argument(
          -det false # disable deterministic attention""",
 )
 parser.add_argument(
-    "-m",
-    "--mha_type",
-    type=str,
+    "-gr",
+    "--gqa_ratio",
+    type=int,
     nargs="+",
-    choices=["mha", "mqa", "gqa"],
-    default=["mha", "mqa", "gqa"],
-    help="""Type of multi-head attention.
-    e.g.: -m mha""",
+    choices=[1, 8],
+    default=[1, 8],
+    help="""gqa ratio.
+    e.g.: -gr 8""",
 )
 parser.add_argument(
     "-d",
@@ -805,6 +816,13 @@ parser.add_argument(
     help="""input_layout.
     e.g.: -i BSHD""",
 )
+parser.add_argument(
+    "-ns",
+    "--num_splits",
+    type=int,
+    default=0,
+    help="native split-K num_splits (0=auto/heuristic, 1=disable split-K, >=2 forces native if capable)",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
 
@@ -812,14 +830,14 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         causal,
         local,
         deterministic,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.causal,
         args.local,
         args.deterministic,
@@ -836,27 +854,28 @@ if __name__ == "__main__":
             local,
             args.bias_type,
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
+            args.num_splits,
         )
         collected.append(ret)
-        test_flash_attn_seq_padding(
-            "mixed",
-            args.batch_size,
-            args.nheads,
-            args.seqlen_q,
-            args.seqlen_k,
-            dim_qk,
-            dim_v,
-            args.dropout_p,
-            causal,
-            local,
-            args.bias_type if args.bias_type != "bias" else "no",
-            deterministic,
-            mha_type,
-            dtypes.d_dtypes[dtype],
-        )
+        # test_flash_attn_seq_padding(
+        #     "mixed",
+        #     args.batch_size,
+        #     args.nheads,
+        #     args.seqlen_q,
+        #     args.seqlen_k,
+        #     dim_qk,
+        #     dim_v,
+        #     args.dropout_p,
+        #     causal,
+        #     local,
+        #     args.bias_type if args.bias_type != "bias" else "no",
+        #     deterministic,
+        #     gqa_ratio,
+        #     dtypes.d_dtypes[dtype],
+        # )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")
@@ -1082,3 +1101,74 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     torch.testing.assert_close(
         d1, d2, msg="softmax_d differs with sink=None vs omitted"
     )
+
+
+# OPUS gfx950 dense D=128 via flash_attn_func. Cases span the gate (sq==sk):
+# le2 (<=128), pipelined odd/even, partial last tile (n%64), large n; MHA/GQA/MQA.
+_OPUS_CASES = [
+    (2, 64, 8, 2),  # le2 1-tile, GQA
+    (2, 128, 16, 1),  # le2 2-tile, MQA
+    (2, 100, 8, 2),  # partial last tile, GQA
+    (2, 127, 8, 8),  # partial last tile, MHA
+    (2, 129, 32, 8),  # pipelined odd (3 tiles), GQA
+    (1, 200, 16, 16),  # pipelined, MHA
+    (2, 256, 8, 1),  # pipelined even, MQA
+    (2, 512, 8, 2),  # pipelined even, GQA
+    (1, 1000, 8, 8),  # partial large, MHA
+    (2, 1023, 16, 4),  # partial odd, GQA
+    (1, 4096, 8, 2),  # large, GQA
+    (4, 256, 8, 8),  # larger batch, MHA
+]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen,nheads,nheads_k",
+    _OPUS_CASES,
+    ids=[f"b{b}_s{s}_h{h}_hkv{hk}" for (b, s, h, hk) in _OPUS_CASES],
+)
+def test_flash_attn_func_opus(
+    batch_size, seqlen, nheads, nheads_k, causal, monkeypatch
+):
+    """Validate the OPUS D=128 kernel THROUGH flash_attn_func.
+
+    Opus engages only with AITER_ENABLE_FMHA_OPUS=1 + the gate (gfx950, bf16,
+    D=128, dense, sq==sk, inference/no-LSE). The env is monkeypatched scoped to
+    this test so the other cases keep exercising the default v3/CK dispatch.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+
+    torch.manual_seed(0)
+    d = 128
+    q = torch.randn(batch_size, seqlen, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(batch_size, seqlen, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+
+    with torch.no_grad():
+        out = aiter.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            softmax_scale=None,  # -> default 1/sqrt(d), matches attention_ref
+            causal=causal,
+            window_size=(-1, -1),
+            return_lse=False,
+            return_attn_probs=False,
+        )
+
+    out_ref, _ = run_torch(q, k, v, causal=causal)
+    out_pt, _ = run_torch(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    print(f"[opus] out max diff: {(out - out_ref).abs().max().item()} tol={out_tol}")
+    assert (out - out_ref).abs().max().item() <= out_tol
+
+    with torch.no_grad():
+        out_opus = fmha_fwd_hd128_bf16_opus_fwd(
+            q, k, v, softmax_scale=d**-0.5, causal=causal
+        )
+    assert torch.equal(
+        out, out_opus
+    ), "flash_attn_func did not route to the opus kernel (env/gate not engaged)"

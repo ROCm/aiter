@@ -136,8 +136,7 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
                                              CodegenPipelineProblem::TransposeC,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
-                                             1,
-                                             false>>;
+                                             1>>;
 
         // Now we only use the BlockGemmASmemBSmemCRegV1DefaultPolicy.
         using Kernel = ck_tile::FlatmmKernel<TilePartitioner, CodegenFlatmmPipeline, GemmEpilogue>;
@@ -338,8 +337,8 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
     args.M        = m;
     args.N        = n;
     args.K        = k;
-    args.stride_A = k;
-    args.stride_B = k;
+    args.stride_A = XQ.stride(-2);
+    args.stride_B = WQ.stride(-2);
     args.stride_C = n;
     args.stride_E = n;
 

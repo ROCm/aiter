@@ -9,6 +9,7 @@ from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
 def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
+    torch.manual_seed(0)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 

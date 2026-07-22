@@ -91,6 +91,7 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    torch.manual_seed(0)
 
     (
         x_fp4,

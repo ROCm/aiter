@@ -1,7 +1,9 @@
+from functools import cache
 from typing import Optional
 import torch
 import triton
 import aiter
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_rms_fp8_group_quant_kernel,
@@ -281,37 +283,40 @@ def fused_rms_fp8_group_quant(
         out1_bs_col_stride = out1_bs.stride(1)
 
     _fused_rms_fp8_group_quant_kernel[(M,)](
-        inp1,
-        inp1_weight,
-        inp2,
-        inp2_weight,
-        res1,
-        out1_fp8,
-        out1_bs,
-        out2,
-        out_res1,
-        out1,
-        inp1_epsilon,
-        inp2_epsilon,
-        M,
-        N1,
-        N2,
-        inp1.stride(0),
-        inp2_row_stride,
-        inp1.stride(1),
-        inp2_col_stride,
-        res1_row_stride,
-        res1_col_stride,
-        out1_fp8.stride(0),
-        out1_fp8.stride(1),
-        out1_bs_row_stride,
-        out1_bs_col_stride,
-        out2_row_stride,
-        out2_col_stride,
-        out_res1_row_stride,
-        out_res1_col_stride,
-        out1_row_stride,
-        out1_col_stride,
+        inp1_ptr=inp1,
+        weight1_ptr=inp1_weight,
+        inp2_ptr=inp2,
+        weight2_ptr=inp2_weight,
+        res1_ptr=res1,
+        out1_fp8_ptr=out1_fp8,
+        out1_bs_ptr=out1_bs,
+        out2_ptr=out2,
+        out_res1_ptr=out_res1,
+        out1_ptr=out1,
+        eps1=inp1_epsilon,
+        eps2=inp2_epsilon,
+        n_rows=M,
+        inp1_n_cols=N1,
+        inp2_n_cols=N2,
+        inp1_row_stride=inp1.stride(0),
+        inp2_row_stride=inp2_row_stride,
+        inp1_col_stride=inp1.stride(1),
+        inp2_col_stride=inp2_col_stride,
+        res1_row_stride=res1_row_stride,
+        res1_col_stride=res1_col_stride,
+        out1_fp8_row_stride=out1_fp8.stride(0),
+        out1_fp8_col_stride=out1_fp8.stride(1),
+        out1_bs_row_stride=out1_bs_row_stride,
+        out1_bs_col_stride=out1_bs_col_stride,
+        out2_row_stride=out2_row_stride,
+        out2_col_stride=out2_col_stride,
+        out_res1_row_stride=out_res1_row_stride,
+        out_res1_col_stride=out_res1_col_stride,
+        out1_row_stride=out1_row_stride,
+        out1_col_stride=out1_col_stride,
+        gate_ptr=inp1,
+        linear_bias_ptr=inp1_weight,
+        stride_gate_row=inp1.stride(0),
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         QUANT_BLOCK_SIZE=group_size,
         DTYPE_MAX=DTYPE_MAX,
@@ -319,6 +324,20 @@ def fused_rms_fp8_group_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        GATED_RMS_FP8=False,
+        RMS_TILE=512,
+        ROWS_PER_BLOCK=1,
+        GROUP_SIZE_GATED=1,
+        NUM_GROUPS_GATED=1,
+        BLOCK_G=1,
+        HAS_BIAS_GATED=False,
+        HAS_Z_GATED=False,
+        NORM_BEFORE_GATE=False,
+        FP8_MIN=-DTYPE_MAX,
+        FP8_MAX=DTYPE_MAX,
+        USE_UE8M0=False,
+        FP8_MIN_SCALING_FACTOR=1.0,
+        ACTIVATION="silu",
         num_warps=num_warps,
     )
     # When transpose_scale=True, view the transposed buffer back to original shape
@@ -329,29 +348,218 @@ def fused_rms_fp8_group_quant(
     return (out1_fp8, out1_bs), out1, out2, out_res1
 
 
+def get_fp8_min_max_bounds(fp8_dtype: torch.dtype) -> tuple[float, float]:
+    """Match vLLM ``quant_utils.get_fp8_min_max`` for ``fp8_dtype`` (incl. ROCm fnuz ±224)."""
+    fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    if fnuz is not None and fp8_dtype == fnuz:
+        return -224.0, 224.0
+    finfo = torch.finfo(fp8_dtype)
+    return float(finfo.min), float(finfo.max)
+
+
+@cache
+def _num_compute_units(device_id: int = 0) -> int:
+    """Approximate vLLM ``num_compute_units`` for heuristic tuning."""
+    return int(torch.cuda.get_device_properties(device_id).multi_processor_count)
+
+
+def calc_rows_per_block(M: int, device: torch.device) -> int:
+    """Heuristic from vLLM ``input_quant_fp8.calc_rows_per_block`` (gated RMSNorm+FP8 launch)."""
+    if device.type != "cuda":
+        raise ValueError(
+            "calc_rows_per_block targets CUDA/HIP; expected a CUDA/HIP device."
+        )
+    device_id = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    sm_count = max(_num_compute_units(device_id), 1)
+    rows_per_block = triton.next_power_of_2(triton.cdiv(M, 2 * sm_count))
+    return min(int(rows_per_block), 4)
+
+
+def fused_rms_gated_fp8_group_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor,
+    eps: float,
+    *,
+    norm_before_gate: bool = True,
+    use_ue8m0: bool = False,
+    activation: str = "silu",
+    out_dtype: torch.dtype | None = None,
+    fp8_min: float | None = None,
+    fp8_max: float | None = None,
+    fp8_min_scaling_factor: float | None = None,
+    group_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gated RMSNorm + FP8 quant; launches ``_fused_rms_fp8_group_quant_kernel`` with ``GATED_RMS_FP8=True``.
+
+    Uses ``calc_rows_per_block`` and grid ``(cdiv(M, rows_per_block),)`` like the legacy gated-only kernel,
+    independent of the non-gated path (which stays at grid ``(M,)``)."""
+    assert x.is_contiguous() and z.is_contiguous()
+    assert x.shape == z.shape, "x and z must have the same shape"
+    fp8_dtype = out_dtype if out_dtype is not None else get_fp8_e4m3_dtype()
+    if (fp8_min is None) ^ (fp8_max is None):
+        raise ValueError("fp8_min and fp8_max must be passed together or both omitted.")
+    if fp8_min is None:
+        fp8_min, fp8_max = get_fp8_min_max_bounds(fp8_dtype)
+    if fp8_min_scaling_factor is None:
+        fp8_min_scaling_factor = 1.0 / (fp8_max * 512.0)
+
+    weight = weight.contiguous()
+    if bias is not None:
+        bias = bias.contiguous()
+
+    M, N = x.shape
+    if group_size is not None:
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {group_size}")
+        if group_size > N:
+            raise ValueError(
+                f"group_size ({group_size}) must be less than or equal to hidden size "
+                f"N ({N}); per-column FP8 groups cannot exceed the row width."
+            )
+        if N % group_size != 0:
+            raise ValueError(
+                f"hidden size N ({N}) must be divisible by group_size ({group_size})."
+            )
+
+    effective_gs = N if group_size is None else int(group_size)
+    num_groups = N // effective_gs
+
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    if N > MAX_FUSED_SIZE:
+        raise RuntimeError("This RMSNorm quant kernel does not support N >= 64KB.")
+
+    rms_tile = min(512, triton.next_power_of_2(N))
+    block_g = triton.next_power_of_2(effective_gs)
+    num_warps = min(max(block_g // 256, 1), 8)
+
+    x_quant = torch.empty(M, N, dtype=fp8_dtype, device=x.device)
+    if group_size is None:
+        scales = torch.empty(M, dtype=torch.float32, device=x.device)
+        stride_s_row = int(scales.stride(0))
+        stride_s_g = 0
+    else:
+        scales = torch.empty(M, num_groups, dtype=torch.float32, device=x.device)
+        stride_s_row, stride_s_g = (int(scales.stride(0)), int(scales.stride(1)))
+
+    bias_ptr = bias if bias is not None else weight
+
+    dummy = torch.empty(1, dtype=x.dtype, device=x.device)
+
+    rows_per_block = calc_rows_per_block(M, x.device)
+    grid = (triton.cdiv(M, rows_per_block),)
+    BLOCK_SIZE_PAD = max(triton.next_power_of_2(N), effective_gs)
+
+    _fused_rms_fp8_group_quant_kernel[grid](
+        inp1_ptr=x,
+        weight1_ptr=weight,
+        inp2_ptr=dummy,
+        weight2_ptr=dummy,
+        res1_ptr=dummy,
+        out1_fp8_ptr=x_quant,
+        out1_bs_ptr=scales,
+        out2_ptr=dummy,
+        out_res1_ptr=dummy,
+        out1_ptr=dummy,
+        eps1=eps,
+        eps2=0.0,
+        n_rows=M,
+        inp1_n_cols=N,
+        inp2_n_cols=0,
+        inp1_row_stride=x.stride(0),
+        inp2_row_stride=1,
+        inp1_col_stride=x.stride(1),
+        inp2_col_stride=1,
+        res1_row_stride=1,
+        res1_col_stride=1,
+        out1_fp8_row_stride=x_quant.stride(0),
+        out1_fp8_col_stride=x_quant.stride(1),
+        out1_bs_row_stride=stride_s_row,
+        out1_bs_col_stride=stride_s_g,
+        out2_row_stride=1,
+        out2_col_stride=1,
+        out_res1_row_stride=1,
+        out_res1_col_stride=1,
+        out1_row_stride=1,
+        out1_col_stride=1,
+        gate_ptr=z,
+        linear_bias_ptr=bias_ptr,
+        stride_gate_row=z.stride(0),
+        BLOCK_SIZE_N=BLOCK_SIZE_PAD,
+        QUANT_BLOCK_SIZE=effective_gs,
+        DTYPE_MAX=fp8_max,
+        DTYPE_MIN=-fp8_max,
+        HAVE_SECOND_INPUT=False,
+        FIRST_INPUT_RES=False,
+        FIRST_INPUT_OUT=False,
+        GATED_RMS_FP8=True,
+        RMS_TILE=rms_tile,
+        ROWS_PER_BLOCK=rows_per_block,
+        GROUP_SIZE_GATED=effective_gs,
+        NUM_GROUPS_GATED=num_groups,
+        BLOCK_G=block_g,
+        HAS_BIAS_GATED=(bias is not None),
+        HAS_Z_GATED=True,
+        NORM_BEFORE_GATE=norm_before_gate,
+        FP8_MIN=fp8_min,
+        FP8_MAX=fp8_max,
+        USE_UE8M0=use_ue8m0,
+        FP8_MIN_SCALING_FACTOR=fp8_min_scaling_factor,
+        ACTIVATION=activation,
+        num_warps=num_warps,
+    )
+    return x_quant, scales
+
+
 def fused_flatten_fp8_group_quant(
     x: torch.Tensor,
     group_size,
     dtype_quant=fp8_dtype,
+    transpose_scale: bool = False,
 ):
     """
     Flatten the last two dimension of x and perform FP8 per-token group quantization along the last dimension
 
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
+    - transpose_scale: If True, return scale with shape (M, cdiv(N1*N2, group_size))
+                       in column-major (transposed) memory layout, i.e. strides
+                       (1, M) instead of the default (num_bs_cols, 1). Element
+                       values at logical position [m, n] are unchanged; only the
+                       physical memory layout differs so downstream consumers
+                       (e.g. CK bpreshuffle GEMM) can skip an explicit
+                       .transpose(-1, -2).contiguous() before reading.
 
     Returns:
     - out: The output matrix with shape (M, N1 * N2).
     - out_block_scales: The output matrix with shape (M, cdiv((N1 * N2), group_size)).
+                        When transpose_scale=True, strides are (1, M)
+                        (column-major); otherwise (num_bs_cols, 1) (row-major).
     """
     M, N1, N2 = x.shape
 
     BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), group_size)
     N = N1 * N2
+    num_bs_cols = triton.cdiv(N, group_size)
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
-    out_block_scales = torch.empty(
-        (M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device
-    )
+
+    if transpose_scale:
+        # Physical buffer is (num_bs_cols, M) row-major; .T gives a
+        # (M, num_bs_cols) view with strides (1, M). The kernel writes
+        # at out_scales_ptr + m * stride_m + n * stride_n, so passing
+        # the natural strides of this view writes to the correct memory
+        # location regardless of layout — no special-case stride wiring
+        # or trailing .view() needed.
+        out_block_scales = torch.empty(
+            (num_bs_cols, M), dtype=torch.float32, device=x.device
+        ).T
+    else:
+        out_block_scales = torch.empty(
+            (M, num_bs_cols), dtype=torch.float32, device=x.device
+        )
 
     DTYPE_MAX = (
         torch.finfo(out.dtype).max
