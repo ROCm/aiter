@@ -34,7 +34,7 @@ _TIERED_MID_MAX = 65536
 _SHORT_MAX_PARAMS = {
     # arch:   (base, slope, cap)
     "gfx942": (16384, 1536, 40960),
-    "gfx950": (24576, 1792, 57344),
+    "gfx950": (18432, 1536, 40960),
 }
 
 
@@ -126,6 +126,23 @@ def _default_kernel_config(
     base, slope, cap = _SHORT_MAX_PARAMS.get(arch, _SHORT_MAX_PARAMS["gfx942"])
     short_max_rows = _next_pow2(num_rows)
     tiered_short_max = min(cap, base + short_max_rows * slope)
+
+    # Dead-block trim (gfx950 only; dispatch-only port of Step 4 Stage 17). The grid is
+    # (blocks_per_row, num_rows) but real workers per row = min(blocks_per_row, tier_cap);
+    # the excess return immediately yet still occupy co-resident slots ("dead" blocks).
+    # Trim blocks_per_row down to that cap: active_parts (a min) is unchanged, so results
+    # are identical and only wasted scheduling is cut. Applied only when the FULL padded
+    # grid (32*num_rows) already fits one co-resident wave (cu_count*occ, occ=2 -> num_rows
+    # <= 16); beyond that the extra blocks help hide latency (left to batch cap, Phase B).
+    # bpr stays >= 2 here (the bpr==1 grid=1 fold needs kernel bpr=1 support -> Phase B).
+    # Env FLYDSL_TOPK_TIERED_TRIM (0/1) overrides. gfx942 frozen (default 0).
+    trim_on = _env_int("FLYDSL_TOPK_TIERED_TRIM", 1 if arch == "gfx950" else 0)
+    if trim_on and max_model_len > tiered_short_max and num_rows * 32 <= cu_count * 2:
+        if max_model_len <= _TIERED_MID_MAX:
+            max_active_parts = tiered_mid_cap_default
+        else:
+            max_active_parts = max(tiered_mid_cap_default, tiered_long_cap_default)
+        blocks_per_row = max(2, min(blocks_per_row, max_active_parts))
 
     return dict(
         blocks_per_row=blocks_per_row,
