@@ -540,8 +540,8 @@ def build_hstu_attention_fwd(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_k = fx.Int32(PAIRS_PER_ROW_K)
 
-        wave_lds_base_k = k_lds_byte_base + fx.Index(wave_id) * fx.Index(WARP_SIZE * DMA_BYTES)
-        wave_lds_lane0_k = rocdl.readfirstlane(fx.Int64.ir_type, fx.Int64(wave_lds_base_k))
+        wave_lds_base_k = fx.Int64(k_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(WARP_SIZE * DMA_BYTES)
+        wave_lds_lane0_k = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_k)
         k_dma_rows = []
         k_dma_gcols = []
         for d in range_constexpr(NUM_DMA_K):
@@ -694,7 +694,7 @@ def build_hstu_attention_fwd(
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
             for kv_tile, it in range(
-                fx.Index(kv_tile_start), fx.Index(n_tiles), fx.Index(1), init=acc_init
+                fx.Int64(kv_tile_start), fx.Int64(n_tiles), fx.Int64(1), init=acc_init
             ):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
                 o_acc = [it_list[i] for i in range(N_ACC)]
