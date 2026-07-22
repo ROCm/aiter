@@ -12,8 +12,21 @@ from aiter.ops.triton._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
+
+# Architectures that have a gluon kernel
+_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _is_gluon_available():
+    """True if the current GPU arch has a Gluon port of this kernel."""
+    try:
+        arch = get_arch()
+        return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
+    except Exception:
+        return False
 
 
 def fused_clamp_act_mul(
@@ -28,6 +41,7 @@ def fused_clamp_act_mul(
     quant_block_size: int = 128,
     scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
     shuffle_scale: bool = False,
+    backend: Optional[str] = None,
 ):
     """
     Fused clamp (SwiGLU-style) + act(gate) * up + optional weights, with optional FP8 group quant.
@@ -45,6 +59,8 @@ def fused_clamp_act_mul(
         dtype_quant: if ``None``, no quantization; output is written in ``inp.dtype``
             (or the dtype of a pre-allocated ``out``) and ``scale`` is unused. Otherwise
             the result is FP8-group-quantized with ``dtype_quant`` and per-128 scales.
+        backend: ``"triton"`` or ``"gluon"``. If ``None`` (default), picks ``"gluon"``
+            on architectures with a Gluon port (``gfx1250``) and ``"triton"`` elsewhere.
 
     Constraints:
         ``N`` must be a power of two, ``N >= 128``, and ``N % 128 == 0`` so each row
@@ -181,7 +197,18 @@ def fused_clamp_act_mul(
         scale_col_stride = 0
         scale_arg = inp  # placeholder, unused when HAS_QUANT is False
 
-    _fused_clamp_silu_mul_kernel[(M,)](
+    # Resolve backend: gfx1250 uses the Gluon port, otherwise the Triton kernel.
+    if backend is None:
+        backend = "gluon" if _is_gluon_available() else "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    # Args are identical for both kernels; the Gluon kernel takes one extra
+    # `cache_modifier` constexpr (threaded into every gl.load).
+    kernel_args = (
         inp,
         out,
         scale_arg,
@@ -197,6 +224,8 @@ def fused_clamp_act_mul(
         weights.stride(0) if HAVE_WEIGHTS else 0,
         weights.stride(1) if HAVE_WEIGHTS else 0,
         swiglu_limit,
+    )
+    kernel_constexprs = dict(
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         QUANT_BLOCK_SIZE=quant_block_size,
         SCALE_FMT=scale_dtype_fmt,
@@ -211,6 +240,30 @@ def fused_clamp_act_mul(
         SCALE_N_PAD=scale_n_pad,
         num_warps=num_warps,
     )
+
+    if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        # Lazy import so non-gfx1250 environments never import the Gluon module.
+        from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
+            _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
+        )
+
+        _LOGGER.info(
+            "FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M=%d n_half=%d", M, n_half
+        )
+        # ".cg" matches the Triton reference's hardcoded cache hint.
+        _fused_clamp_silu_mul_gluon_kernel[(M,)](
+            *kernel_args,
+            **kernel_constexprs,
+            cache_modifier=".cg",
+        )
+    else:
+        _fused_clamp_silu_mul_kernel[(M,)](
+            *kernel_args,
+            **kernel_constexprs,
+        )
 
     if HAS_QUANT:
         if transpose_scale:
