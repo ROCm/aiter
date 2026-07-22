@@ -361,7 +361,11 @@ def launch_gemm_a8w4_tdm(
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
-            if const_expr(tile_m <= 64):
+            # Post-compute issue (double-buffered) wins for decode (small tile_m)
+            # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
+            # prefetches only num_buffers-1==1 tile and under-overlaps, so it
+            # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
+            if const_expr(tile_m <= 64 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
