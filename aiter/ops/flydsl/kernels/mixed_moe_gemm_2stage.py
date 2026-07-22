@@ -5069,7 +5069,7 @@ def compile_mixed_moe_gemm1_a16w4(
         _split_mfma = rocdl._split_mfma_operands
 
         def mfma_f32_bf16_k32(result_type, operands, *, loc=None, ip=None):
-            a, b, c, cbsz, abid, blgp = _split_mfma(operands, loc=loc)
+            a, b, c, cbsz, abid, blgp = _split_mfma(operands)
             return _mfma_k32_raw(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip)
 
     # ---- type helpers (A16W4 forces bf16 X / i8 W; generic dispatches on dtype flags) ----
@@ -7311,7 +7311,7 @@ def compile_mixed_moe_gemm2_a16w4(
         _split_mfma = rocdl._split_mfma_operands
 
         def mfma_f32_bf16_k32(result_type, operands, *, loc=None, ip=None):
-            a, b, c, cbsz, abid, blgp = _split_mfma(operands, loc=loc)
+            a, b, c, cbsz, abid, blgp = _split_mfma(operands)
             return _mfma_k32_raw(result_type, a, b, c, cbsz, abid, blgp, loc=loc, ip=ip)
 
     def _x_elem_type():
