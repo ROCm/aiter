@@ -151,7 +151,7 @@ def get_moe_a4w4_layouts_gfx1250(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[16, 16, 128],
+        instr_shape=[32, 16, 128],
         cga_layout=cga_layout_c,
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
@@ -159,7 +159,7 @@ def get_moe_a4w4_layouts_gfx1250(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[16, 16, 64],
+        instr_shape=[32, 16, 64],
         cga_layout=cga_layout_c,
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
