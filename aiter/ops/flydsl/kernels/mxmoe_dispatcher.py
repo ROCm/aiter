@@ -90,6 +90,7 @@ def compile_gemm2_a4w4_port(
     g2_ascale_pf=None,
     g2_spart=None,
     g2_bf16_lds=None,
+    out_dtype="bf16",
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -101,6 +102,12 @@ def compile_gemm2_a4w4_port(
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
     use_reduce = epilog == "reduce"
+    out_dtype = str(out_dtype).strip().lower()
+    if out_dtype not in ("bf16", "fp8"):
+        raise AssertionError(f"out_dtype must be 'bf16' or 'fp8', got {out_dtype!r}")
+    route_out_fp8 = out_dtype == "fp8"
+    if route_out_fp8 and not use_reduce:
+        raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
     # gemm2 perf knobs (default ON; env override, explicit arg wins): 2-stage B pipeline double-buffers B one tile ahead; bhoist hoists that prefetch above the LDS barrier; ascale_pf prefetches A-scale; spart = SpatiallyLocalTilePartitioner remap GroupNum*100+M01 (402; 0=naive).
     if g2_bhoist is None:
         g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
@@ -154,7 +161,8 @@ def compile_gemm2_a4w4_port(
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}_v2"
+    out_tag = "_fp8out" if route_out_fp8 else ""
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -246,6 +254,7 @@ def compile_gemm2_a4w4_port(
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
                 g2_bf16_lds=g2_bf16_lds,
+                route_out_fp8=route_out_fp8,
             )
 
         if const_expr(not persist and g2_spart <= 0):
@@ -406,9 +415,11 @@ def get_g2(
     persist=False,
     cu_num=0,
     has_pad=False,
+    out_dtype="bf16",
 ):
     # Cache key = compile-time dims; inter_dim + model_dim/hidden runtime (INTER_MAX/HIDDEN_MAX cap them), topk keyed only for reduce.
     SBM = _norm_sbm(SBM, BM)
+    out_dtype = str(out_dtype).strip().lower()
     topk_key = topk if epilog == "reduce" else 1
     cu_key = cu_num if persist else 0
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
@@ -432,6 +443,7 @@ def get_g2(
         g2_ascale_pf,
         g2_spart,
         g2_bf16_lds,
+        out_dtype,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -451,6 +463,7 @@ def get_g2(
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
+            out_dtype=out_dtype,
         )
         G2_CACHE[key] = launch
     return launch
@@ -483,6 +496,7 @@ def mxfp4_moe_gemm2(
     n_sorted_padded=None,
     inter_dim_pad=0,
     model_dim_pad=0,
+    out_dtype="bf16",
     stream=None,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
@@ -513,6 +527,7 @@ def mxfp4_moe_gemm2(
         persist=persist,
         cu_num=cu_num,
         has_pad=has_pad,
+        out_dtype=out_dtype,
     )
     if D_INTER > inter_max:
         raise AssertionError(

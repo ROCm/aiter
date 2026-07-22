@@ -1708,10 +1708,26 @@ def _flydsl_v2_stage2_wrapper(
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
     target = out
+    _s2_fp8_inter = (
+        epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
     if epilog == "reduce":
-        target = torch.empty(
-            (token_num, topk, model_dim_runtime), dtype=out.dtype, device=out.device
-        )
+        if _s2_fp8_inter:
+            if model_dim_runtime % 8 != 0:
+                raise ValueError(
+                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
+                )
+            target = torch.empty(
+                (token_num * topk, model_dim_runtime + model_dim_runtime // 8),
+                dtype=torch.uint8,
+                device=out.device,
+            )
+        else:
+            target = torch.empty(
+                (token_num, topk, model_dim_runtime),
+                dtype=out.dtype,
+                device=out.device,
+            )
     else:
         out.zero_()
     mxfp4_moe_gemm2(
@@ -1738,11 +1754,19 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
+        out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
-        _run_moe_reduction(target, out, token_num, topk, model_dim_runtime)
+        _run_moe_reduction(
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim_runtime,
+            is_fp8=_s2_fp8_inter,
+        )
     return out
 
 
