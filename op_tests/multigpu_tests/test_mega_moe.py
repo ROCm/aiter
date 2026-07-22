@@ -342,6 +342,19 @@ class Dist:
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return int(t.item())
 
+    def allreduce_avg_float(self, value):
+        """Average a scalar float across all ranks (collective; call on every rank)."""
+        t = torch.tensor([float(value)], dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return float(t.item()) / self.world
+
+    def gather_objects(self, obj):
+        """All-gather a python object from every rank (collective). Returns a list
+        indexed by rank."""
+        out = [None] * self.world
+        dist.all_gather_object(out, obj)
+        return out
+
     def shutdown(self):
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -584,12 +597,15 @@ class DeviceMoEPipeline:
         total_us = (time.perf_counter() - t0) * 1e6
         self.comm.barrier()
 
-        # torch.profiler breakdown (one eager pipeline pass; a graph replay would
-        # collapse to a single hipGraphLaunch).
+        # torch.profiler breakdown over CUDA-graph replays: roctracer/kineto does
+        # surface the per-kernel timeline inside the graph on this build, so we
+        # profile the actual graph (matches the measured per-layer wall) instead of
+        # a separate eager pass.
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
-            self._pipeline(self.x0_static)
+            for _ in range(3):
+                self.graph.replay()
             torch.cuda.synchronize()
         self.comm.barrier()
         self._prof = prof
@@ -615,6 +631,42 @@ def _event_device_us(e):
         if v:
             return float(v)
     return 0.0
+
+
+def _aggregate_prof_table(prof, dist_ctx, row_limit=25):
+    """Aggregate the torch.profiler per-kernel table ACROSS ranks (collective;
+    call on every rank). Each rank contributes {name: (self_device_us_total,
+    count)}; rank 0 returns a formatted table of the per-kernel self device time
+    AVERAGED over ranks (and per-call time). Non-zero ranks return None."""
+    local = {}
+    for e in prof.key_averages():
+        local[e.key] = (_event_device_us(e), int(e.count))
+    per_rank = dist_ctx.gather_objects(local)
+    if dist_ctx.rank != 0:
+        return None
+    agg = {}  # name -> [self_us_sum, count_sum, nranks]
+    for d in per_rank:
+        for name, (self_us, count) in d.items():
+            a = agg.setdefault(name, [0.0, 0, 0])
+            a[0] += self_us
+            a[1] += count
+            a[2] += 1
+    rows = []
+    for name, (self_sum, count_sum, nranks) in agg.items():
+        avg_self = self_sum / nranks
+        avg_count = count_sum / nranks
+        per_call = avg_self / avg_count if avg_count else 0.0
+        rows.append((avg_self, name, per_call, avg_count))
+    rows.sort(reverse=True)
+    lines = [
+        f"# per-kernel avg over {dist_ctx.world} ranks (self device time):",
+        f"{'Name':<58}{'avg_self(us)':>14}{'per_call(us)':>14}{'calls':>8}",
+    ]
+    for avg_self, name, per_call, avg_count in rows[:row_limit]:
+        lines.append(
+            f"{name[:58]:<58}{avg_self:>14.1f}{per_call:>14.3f}{avg_count:>8.1f}"
+        )
+    return "\n".join(lines)
 
 
 def _device_shared_ffn(tokens, sw1, sw2):
@@ -679,6 +731,13 @@ def main():
     pipe.setup(x0)
     pipe.capture(x0)
     total_us, per_layer_us, prof_us = pipe.bench()
+    # Aggregate perf across ranks (collective calls -> run on every rank).
+    total_us = dist_ctx.allreduce_avg_float(total_us)
+    per_layer_us = dist_ctx.allreduce_avg_float(per_layer_us)
+    prof_us = dist_ctx.allreduce_avg_float(prof_us)
+    tbl = (
+        _aggregate_prof_table(pipe._prof, dist_ctx) if args.profile_table else None
+    )
     if dist_ctx.rank == 0:
         prof_note = (
             f"prof_device={prof_us:.1f}us"
@@ -688,16 +747,11 @@ def main():
         print(
             f"# MEGA-MOE layers={n_layers} tokens/rank={ct}: "
             f"total={total_us:.1f} us per_layer={per_layer_us:.1f} us "
-            f"(dispatch+gemm+combine, 1 graph replay) {prof_note}",
+            f"(avg over {dist_ctx.world} ranks; dispatch+gemm+combine, 1 graph replay) "
+            f"{prof_note}",
             flush=True,
         )
-        if args.profile_table:
-            try:
-                tbl = pipe._prof.key_averages().table(
-                    sort_by="self_device_time_total", row_limit=25)
-            except Exception:
-                tbl = pipe._prof.key_averages().table(
-                    sort_by="self_cuda_time_total", row_limit=25)
+        if tbl is not None:
             print(tbl, flush=True)
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
@@ -707,10 +761,12 @@ def main():
         ref_out = ref.run(x0, routings).float()
         logits_diff = _calc_diff(ref_out, out_dev)
         errs = dist_ctx.allreduce_sum(0 if logits_diff < args.logits_tol else 1)
+        avg_diff = dist_ctx.allreduce_avg_float(logits_diff)
         if dist_ctx.rank == 0:
             print(
                 f"# MEGA-CHECK layers={n_layers}: {'PASS' if errs == 0 else 'FAIL'} "
-                f"(rank0 logits_diff={logits_diff:.6f} tol={args.logits_tol})",
+                f"(avg logits_diff={avg_diff:.6f} over {dist_ctx.world} ranks, "
+                f"tol={args.logits_tol})",
                 flush=True,
             )
 
