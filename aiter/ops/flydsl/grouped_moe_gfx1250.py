@@ -1445,44 +1445,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 "ep_scatter requires the split route-g2l path (_g2l_lut built); "
                 "unset AITER_FLYDSL_FUSED_ROUTE_G2L"
             )
+        if _gather_w_buf is None:
+            raise ValueError("ep_scatter requires the bf16 gather_w buffer")
+        # Build ep_rowmap on-device in a single FlyDSL kernel (was ~20 torch ops).
+        # gather_w (bf16) is 0 for dropped/remote routes -> those rows stay at the
+        # -1 sentinel; topids_to_rows is already the final (contiguous/masked) row.
         _cap_rows = int(route_E) * int(route_max_m)
-        _slot_stride = int(ep_max_tok) * int(ep_topk)
-        _g2l_full = _g2l_lut[topk_ids.reshape(-1).long()].view(token_num, topk)
-        _ep_drop_k = _g2l_full >= n_route_buckets
-        _rs = torch.arange(token_num, device=device, dtype=torch.int32).view(
-            token_num, 1
+        ep_rowmap = build_ep_rowmap(
+            topids_to_rows,
+            _gather_w_buf,
+            ep_tis,
+            _ep_nvr,
+            _cap_rows,
+            topk,
+            ep_max_tok,
         )
-        _kk = torch.arange(topk, device=device, dtype=torch.int32).view(1, topk)
-        _origin_enc = ep_tis[:token_num].view(token_num, 1).to(torch.int32)
-        _origin_pe = _origin_enc // int(ep_max_tok)
-        _origin_lid = _origin_enc % int(ep_max_tok)
-        _slot = _origin_lid * int(topk) + _kk
-        _packed = (_origin_pe * _slot_stride + _slot).to(torch.int32)
-        _valid = (~_ep_drop_k) & (_rs < _ep_nvt.view(1, 1))
-        _gr = topids_to_rows.view(token_num, topk).long()
-        _gr_idx = torch.where(
-            _valid, _gr, torch.full_like(_gr, _cap_rows)
-        ).view(-1)
-        _w = (
-            _gather_w_buf.view(token_num, topk).float()
-            if _gather_w_buf is not None
-            else gather_weight.view(token_num, topk).float()
-        )
-        _row2dst_full = torch.full(
-            (_cap_rows + 1,), -1, dtype=torch.int32, device=device
-        )
-        _row2w_full = torch.zeros(
-            (_cap_rows + 1,), dtype=torch.float32, device=device
-        )
-        _row2dst_full[_gr_idx] = _packed.view(-1)
-        _row2w_full[_gr_idx] = _w.view(-1)
-        ep_rowmap = torch.stack(
-            [
-                _row2dst_full[:_cap_rows],
-                _row2w_full[:_cap_rows].view(torch.int32),
-            ],
-            dim=1,
-        ).contiguous()
     _ep_stage2_kwargs = (
         dict(
             ep_p2p_write=True,
@@ -1749,6 +1726,43 @@ def _get_compiled_route_psum_fused():
     )
 
     return build_moe_route_psum_fused_module()
+
+
+@functools.cache
+def _get_compiled_ep_rowmap():
+    """Compile and cache the gemm2-fused EP row->dest/weight map builder."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_ep_rowmap_module,
+    )
+
+    return build_moe_ep_rowmap_module()
+
+
+def build_ep_rowmap(
+    topids_to_rows, gather_w, tis, num_valid_routes, cap_rows, topk, max_tok
+):
+    """On-device build of the gemm2-fused EP row->(dst_packed, f32 weight bits)
+    map, replacing the ~20 per-layer torch ops. gather_w (bf16, 0 for dropped)
+    drives the drop check; tis (recv_slot->origin enc) + ep params form the packed
+    dest. Returns ep_rowmap (cap_rows, 2) i32 (sentinel -1 for remote/dropped)."""
+    device = topids_to_rows.device
+    cap_rows = int(cap_rows)
+    slot_stride = int(max_tok) * int(topk)
+    ep_rowmap = torch.empty((cap_rows, 2), dtype=torch.int32, device=device)
+    launch = _get_compiled_ep_rowmap()
+    launch(
+        ptr_arg(topids_to_rows.reshape(-1)),
+        ptr_arg(gather_w.reshape(-1)),
+        ptr_arg(tis.reshape(-1)),
+        ptr_arg(ep_rowmap.reshape(-1)),
+        ptr_arg(num_valid_routes.reshape(-1)),
+        cap_rows,
+        int(topk),
+        int(max_tok),
+        int(slot_stride),
+        stream=torch.cuda.current_stream(),
+    )
+    return ep_rowmap
 
 
 # One workgroup handles every route, so the fused kernel only applies while the

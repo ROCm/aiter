@@ -568,6 +568,7 @@ class DeviceMoEPipeline:
 
     # ---- perf: torch.profiler breakdown + graph-replay wall-clock ---- #
     _N_WARMUP = 5
+    _N_PROF_REPLAYS = 3  # graph replays captured by torch.profiler in bench()
 
     def bench(self):
         """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
@@ -604,7 +605,7 @@ class DeviceMoEPipeline:
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
-            for _ in range(3):
+            for _ in range(self._N_PROF_REPLAYS):
                 self.graph.replay()
             torch.cuda.synchronize()
         self.comm.barrier()
@@ -633,11 +634,14 @@ def _event_device_us(e):
     return 0.0
 
 
-def _aggregate_prof_table(prof, dist_ctx, row_limit=25):
+def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     """Aggregate the torch.profiler per-kernel table ACROSS ranks (collective;
     call on every rank). Each rank contributes {name: (self_device_us_total,
     count)}; rank 0 returns a formatted table of the per-kernel self device time
-    AVERAGED over ranks (and per-call time). Non-zero ranks return None."""
+    AVERAGED over ranks. Also prints the TOTAL over ALL kernels and the implied
+    device time per layer (total / per_layer_denom, where per_layer_denom =
+    replays * n_layers) so it can be compared against the measured per_layer wall
+    -- if they match, the GPU has no idle bubble. Non-zero ranks return None."""
     local = {}
     for e in prof.key_averages():
         local[e.key] = (_event_device_us(e), int(e.count))
@@ -652,12 +656,15 @@ def _aggregate_prof_table(prof, dist_ctx, row_limit=25):
             a[1] += count
             a[2] += 1
     rows = []
+    total_self = 0.0
     for name, (self_sum, count_sum, nranks) in agg.items():
         avg_self = self_sum / nranks
         avg_count = count_sum / nranks
         per_call = avg_self / avg_count if avg_count else 0.0
+        total_self += avg_self
         rows.append((avg_self, name, per_call, avg_count))
     rows.sort(reverse=True)
+    dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
     lines = [
         f"# per-kernel avg over {dist_ctx.world} ranks (self device time):",
         f"{'Name':<58}{'avg_self(us)':>14}{'per_call(us)':>14}{'calls':>8}",
@@ -666,6 +673,10 @@ def _aggregate_prof_table(prof, dist_ctx, row_limit=25):
         lines.append(
             f"{name[:58]:<58}{avg_self:>14.1f}{per_call:>14.3f}{avg_count:>8.1f}"
         )
+    lines.append(
+        f"# TOTAL self device time over ALL {len(rows)} kernels = {total_self:.1f} us "
+        f"-> {dev_per_layer:.1f} us/layer (device-busy; compare to per_layer wall)"
+    )
     return "\n".join(lines)
 
 
@@ -735,9 +746,28 @@ def main():
     total_us = dist_ctx.allreduce_avg_float(total_us)
     per_layer_us = dist_ctx.allreduce_avg_float(per_layer_us)
     prof_us = dist_ctx.allreduce_avg_float(prof_us)
-    tbl = (
-        _aggregate_prof_table(pipe._prof, dist_ctx) if args.profile_table else None
-    )
+    tbl = None
+    if args.profile_table:
+        tbl = _aggregate_prof_table(
+            pipe._prof,
+            dist_ctx,
+            per_layer_denom=pipe._N_PROF_REPLAYS * n_layers,
+        )
+        # Save a chrome/perfetto timeline per rank so the actual kernel timeline
+        # (and any gaps) can be inspected directly. Opt-in (--save_trace): the
+        # export can stall multi-rank graph-profile runs, so it is off by default.
+        if args.save_trace:
+            _trace_path = f"/tmp/mega_trace_{args.combine}_rank{dist_ctx.rank}.json"
+            try:
+                pipe._prof.export_chrome_trace(_trace_path)
+                if dist_ctx.rank == 0:
+                    print(
+                        f"# trace saved: /tmp/mega_trace_{args.combine}_rank*.json",
+                        flush=True,
+                    )
+            except Exception as _e:
+                if dist_ctx.rank == 0:
+                    print(f"# trace export failed: {_e}", flush=True)
     if dist_ctx.rank == 0:
         prof_note = (
             f"prof_device={prof_us:.1f}us"
@@ -790,6 +820,9 @@ def _parse_args():
     p.add_argument("--logits_tol", type=float, default=0.1, help="end-to-end 1-cosine tol")
     p.add_argument("--acc_verify", type=int, default=1, help="run fp32 reference accuracy check")
     p.add_argument("--profile_table", type=int, default=0, help="print per-kernel table")
+    p.add_argument("--save_trace", type=int, default=0,
+                   help="export a chrome/perfetto timeline per rank to /tmp (opt-in; "
+                        "can stall multi-rank graph-profile runs)")
     p.add_argument("--dispatch_commu_dtype", type=str, choices=["auto", "bf16", "fp8"],
                    default="auto", help="dispatch transport (communication) dtype")
     p.add_argument("--combine", type=str,
