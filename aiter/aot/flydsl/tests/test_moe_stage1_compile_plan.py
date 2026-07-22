@@ -255,59 +255,25 @@ class TestStage1ResolverBoundaries(unittest.TestCase):
                             resolve()
 
                 expected_abi_names = {
-                    plan_module.MIXED_STAGE1_GEMM_OP_ID: (
-                        "arg_out",
-                        "arg_x",
-                        "arg_w",
-                        "arg_scale_x",
-                        "arg_scale_w",
-                        "arg_sorted_token_ids",
-                        "arg_expert_ids",
-                        "arg_sorted_weights",
-                        "arg_max_token_ids",
-                        "arg_bias",
-                        "arg_out_scale_sorted",
-                        "i32_tokens_in",
-                        "i32_inter_in",
-                        "i32_k_in",
-                        "i32_size_expert_ids_in",
-                        "f32_swiglu_limit",
-                        "stream",
-                    ),
-                    plan_module.INT4_STAGE1_GEMM_OP_ID: (
-                        "arg_out",
-                        "arg_x",
-                        "arg_w",
-                        "arg_scale_x",
-                        "arg_scale_w",
-                        "arg_sorted_token_ids",
-                        "arg_expert_ids",
-                        "arg_sorted_weights",
-                        "arg_max_token_ids",
-                        "i32_tokens_in",
-                        "i32_inter_in",
-                        "i32_k_in",
-                        "i32_size_expert_ids_in",
-                        "stream",
-                    ),
-                    plan_module.FQ_ACTIVATION_OP_ID: (
-                        "x",
-                        "out_buf",
-                        "out_scale_sorted",
-                        "sorted_ids",
-                        "num_valid_ids",
-                        "topk_ids",
-                        "bias",
-                        "token_num",
-                        "num_sorted_rows",
-                        "swiglu_limit_f",
-                        "stream",
-                    ),
+                    plan_module.MIXED_STAGE1_GEMM_OP_ID: """
+                        arg_out arg_x arg_w arg_scale_x arg_scale_w
+                        arg_sorted_token_ids arg_expert_ids arg_sorted_weights
+                        arg_max_token_ids arg_bias arg_out_scale_sorted
+                        i32_tokens_in i32_inter_in i32_k_in
+                        i32_size_expert_ids_in f32_swiglu_limit stream
+                    """.split(),
+                    plan_module.INT4_STAGE1_GEMM_OP_ID: """
+                        arg_out arg_x arg_w arg_scale_x arg_scale_w
+                        arg_sorted_token_ids arg_expert_ids arg_sorted_weights
+                        arg_max_token_ids i32_tokens_in i32_inter_in i32_k_in
+                        i32_size_expert_ids_in stream
+                    """.split(),
+                    plan_module.FQ_ACTIVATION_OP_ID: """
+                        x out_buf out_scale_sorted sorted_ids num_valid_ids
+                        topk_ids bias token_num num_sorted_rows swiglu_limit_f stream
+                    """.split(),
                     plan_module.CKTILE_SWIGLU_AND_MUL_OP_ID: (
-                        "x",
-                        "out",
-                        "num_rows",
-                        "stream",
+                        "x out num_rows stream".split()
                     ),
                 }
                 for op_id, names in expected_abi_names.items():
@@ -315,7 +281,7 @@ class TestStage1ResolverBoundaries(unittest.TestCase):
                         abi = plan_module.stage1_abi(op_id)
                         self.assertEqual(
                             tuple(argument.name for argument in abi.arguments),
-                            names,
+                            tuple(names),
                         )
                         hash(abi)
 

@@ -12,10 +12,16 @@ ROCm target environment.
 
 Artifact persistence, manifests, deduplication, and runtime lookup intentionally
 belong to later AOT layers.
+
+The small Python DSL at the bottom keeps per-op declarations focused on the
+parts that cannot be reflected safely: stable identity, target injection,
+launcher ABI, and graph semantics. Callable parameters and defaults always come
+from the referenced compiler itself.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +34,8 @@ from typing import Any, Callable, Iterator
 __all__ = [
     "ArgumentKind",
     "BoundCall",
+    "BoundCompileOp",
+    "CompileOp",
     "CompileOpRegistry",
     "CompilePlan",
     "CompileSpec",
@@ -36,6 +44,9 @@ __all__ = [
     "KernelSignature",
     "RocmTarget",
     "SignatureArg",
+    "PlanBuilder",
+    "op",
+    "plan_provider",
     "register_compile_op",
 ]
 
@@ -333,7 +344,11 @@ class CompileOpRegistry:
         try:
             bound = entry.signature.bind(**kwargs)
         except TypeError as error:
-            raise TypeError(f"{op_id}: {error}") from error
+            builder = (
+                f"{entry.compiler.__module__}."
+                f"{getattr(entry.compiler, '__qualname__', entry.compiler.__name__)}"
+            )
+            raise TypeError(f"{op_id} ({builder}): {error}") from error
         bound.apply_defaults()
         return BoundCall(
             tuple(
@@ -388,3 +403,224 @@ def register_compile_op(
     """Register a callable in the process-wide default registry."""
 
     return DEFAULT_COMPILE_OP_REGISTRY.register(op_id)
+
+
+def _callable_name(value: Callable[..., Any]) -> str:
+    name = getattr(
+        value, "__qualname__", getattr(value, "__name__", type(value).__name__)
+    )
+    return f"{value.__module__}.{name}"
+
+
+@dataclass(frozen=True)
+class CompileOp:
+    """A thin declaration around an existing compiler callable."""
+
+    op_id: str
+    compiler: Callable[..., Any]
+    abi: KernelSignature
+    target_kw: str | None = None
+
+    def register(self, registry: CompileOpRegistry) -> None:
+        try:
+            compiler = registry.lookup(self.op_id)
+        except KeyError:
+            registry.register(self.op_id)(self.compiler)
+        else:
+            if compiler is not self.compiler:
+                raise RuntimeError(
+                    f"{self.op_id} ({_callable_name(self.compiler)}): registered "
+                    f"to {_callable_name(compiler)}"
+                )
+
+
+def op(
+    op_id: str,
+    compiler: Callable[..., Any],
+    *,
+    abi: KernelSignature,
+    target_kw: str | None = None,
+) -> CompileOp:
+    """Declare one compile op without mirroring its callable parameters."""
+
+    _validate_op_id(op_id)
+    if not callable(compiler):
+        raise TypeError("compiler must be callable")
+    if not isinstance(abi, KernelSignature):
+        raise TypeError("abi must be a KernelSignature")
+    return CompileOp(op_id, compiler, abi, target_kw)
+
+
+@dataclass(frozen=True)
+class BoundCompileOp:
+    """One callable-bound declaration before or after plan emission."""
+
+    operation: CompileOp
+    unit: CompileUnit
+
+    def __getitem__(self, name: str) -> Any:
+        return dict(self.unit.spec.call.arguments)[name]
+
+
+class PlanBuilder:
+    """Bind semantic sources and emit ordered immutable compile units."""
+
+    def __init__(
+        self,
+        target: RocmTarget,
+        *sources: object,
+        registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
+        context: str = "compile plan",
+    ) -> None:
+        if not isinstance(target, RocmTarget):
+            raise TypeError(f"target must be a RocmTarget, got {type(target).__name__}")
+        self.target = target
+        self.registry = registry
+        self.context = context
+        self._sources = tuple(sources)
+        self._units: list[CompileUnit] = []
+
+    def _prefix(self, operation: CompileOp) -> str:
+        return (
+            f"{self.context}: {operation.op_id} ({_callable_name(operation.compiler)})"
+        )
+
+    def _source(self, operation: CompileOp, source: object) -> Mapping[str, Any]:
+        if isinstance(source, BoundCompileOp):
+            return dict(source.unit.spec.call.arguments)
+        if isinstance(source, Mapping):
+            return source
+        return vars(source)
+
+    def _bind(
+        self,
+        operation: CompileOp,
+        sources: tuple[object, ...],
+        overrides: dict[str, Any],
+    ) -> BoundCompileOp:
+        operation.register(self.registry)
+        parameters = inspect.signature(operation.compiler).parameters
+        if operation.target_kw in overrides:
+            raise TypeError(
+                f"{self._prefix(operation)}: target parameter "
+                f"{operation.target_kw!r} is owned by PlanBuilder"
+            )
+
+        values: dict[str, Any] = {}
+        for index, source in enumerate(sources):
+            for name, value in self._source(operation, source).items():
+                if name == operation.target_kw or name not in parameters:
+                    continue
+                if name in values and name not in overrides:
+                    if values[name] != value:
+                        raise TypeError(
+                            f"{self._prefix(operation)}: conflicting parameter "
+                            f"{name!r}: {values[name]!r} != source[{index}] "
+                            f"{value!r}; provide an explicit override"
+                        )
+                values[name] = value
+        values.update(overrides)
+        if operation.target_kw is not None:
+            values[operation.target_kw] = self.target
+
+        try:
+            unit = self.registry.make_unit(
+                operation.op_id,
+                target=self.target,
+                signature=operation.abi,
+                **values,
+            )
+        except (TypeError, ValueError) as error:
+            raise type(error)(f"{self.context}: {error}") from error
+        return BoundCompileOp(operation, unit)
+
+    def bind(
+        self,
+        operation: CompileOp,
+        *sources: object,
+        **overrides: Any,
+    ) -> BoundCompileOp:
+        return self._bind(operation, (*self._sources, *sources), overrides)
+
+    def replace(self, binding: BoundCompileOp, **overrides: Any) -> BoundCompileOp:
+        return self._bind(binding.operation, (binding,), overrides)
+
+    def emit(
+        self,
+        operation: CompileOp | BoundCompileOp,
+        *sources: object,
+        **overrides: Any,
+    ) -> BoundCompileOp:
+        if isinstance(operation, BoundCompileOp):
+            if sources:
+                raise TypeError("bound compile ops do not accept extra sources")
+            binding = self.replace(operation, **overrides)
+        else:
+            binding = self.bind(operation, *sources, **overrides)
+        self._units.append(binding.unit)
+        return binding
+
+    def require(
+        self,
+        condition: bool,
+        message: str,
+        *,
+        operation: CompileOp | None = None,
+    ) -> None:
+        if not condition:
+            prefix = self._prefix(operation) if operation is not None else self.context
+            raise ValueError(f"{prefix}: {message}")
+
+    def build(self) -> CompilePlan:
+        return CompilePlan(tuple(self._units))
+
+
+def plan_provider(provider: Callable[..., Any]) -> Callable[..., CompilePlan]:
+    """Turn ``provider(plan, ...)`` graph semantics into a plan resolver."""
+
+    signature = inspect.signature(provider)
+
+    def resolver(
+        *args: Any,
+        target: RocmTarget,
+        registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
+        **kwargs: Any,
+    ) -> CompilePlan:
+        plan = PlanBuilder(
+            target,
+            kwargs,
+            registry=registry,
+            context=f"{provider.__name__}[target={target!r}]",
+        )
+        result = provider(plan, *args, **kwargs)
+        if result is not None:
+            raise TypeError(
+                f"{provider.__name__}: plan providers emit units and return None"
+            )
+        return plan.build()
+
+    resolver.__name__ = provider.__name__
+    resolver.__doc__ = provider.__doc__
+    public = list(signature.parameters.values())[1:]
+    insertion = next(
+        (
+            index
+            for index, parameter in enumerate(public)
+            if parameter.kind
+            in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_KEYWORD)
+        ),
+        len(public),
+    )
+    public[insertion:insertion] = [
+        inspect.Parameter("target", inspect.Parameter.KEYWORD_ONLY),
+        inspect.Parameter(
+            "registry",
+            inspect.Parameter.KEYWORD_ONLY,
+            default=DEFAULT_COMPILE_OP_REGISTRY,
+        ),
+    ]
+    resolver.__signature__ = signature.replace(
+        parameters=public,
+        return_annotation=CompilePlan,
+    )
+    return resolver

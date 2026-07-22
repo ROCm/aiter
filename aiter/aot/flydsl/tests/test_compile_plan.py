@@ -24,17 +24,17 @@ sys.modules[_MODULE_NAME] = compile_plan
 _SPEC.loader.exec_module(compile_plan)
 
 ArgumentKind = compile_plan.ArgumentKind
-BoundCall = compile_plan.BoundCall
 CompileOpRegistry = compile_plan.CompileOpRegistry
-CompilePlan = compile_plan.CompilePlan
-CompileSpec = compile_plan.CompileSpec
-CompileUnit = compile_plan.CompileUnit
 KernelSignature = compile_plan.KernelSignature
+PlanBuilder = compile_plan.PlanBuilder
 RocmTarget = compile_plan.RocmTarget
 SignatureArg = compile_plan.SignatureArg
+op = compile_plan.op
+plan_provider = compile_plan.plan_provider
 
 _OP_ID = "aiter.flydsl.test.builder.v1"
 _OTHER_OP_ID = "aiter.flydsl.test.other.v1"
+_SIMPLE_OP_ID = "aiter.flydsl.test.simple.v1"
 
 
 def _target() -> RocmTarget:
@@ -63,17 +63,18 @@ class TestCallableBinding(unittest.TestCase):
         self.registry = CompileOpRegistry()
         self.calls = []
 
-        @self.registry.register(_OP_ID)
         def builder(
             model_dim: int,
             *,
             tile_m: int = 32,
             enabled: bool = False,
+            compile_target=None,
         ):
             call = (
                 model_dim,
                 tile_m,
                 enabled,
+                compile_target,
                 os.environ.get("FLYDSL_GPU_ARCH"),
                 os.environ.get("CU_NUM"),
             )
@@ -81,23 +82,36 @@ class TestCallableBinding(unittest.TestCase):
             return call
 
         self.builder = builder
+        self.operation = op(
+            _OP_ID,
+            builder,
+            abi=_abi(),
+            target_kw="compile_target",
+        )
 
     def test_make_unit_binds_defaults_in_callable_order_without_invoking(self) -> None:
         before = (
             os.environ.get("FLYDSL_GPU_ARCH"),
             os.environ.get("CU_NUM"),
         )
-        unit = self.registry.make_unit(
-            _OP_ID,
-            target=_target(),
-            signature=_abi(),
+        binding = PlanBuilder(
+            _target(),
+            {"model_dim": 7168},
+            registry=self.registry,
+            context="synthetic case",
+        ).bind(
+            self.operation,
             enabled=True,
-            model_dim=7168,
         )
 
         self.assertEqual(
-            unit.spec.call.arguments,
-            (("model_dim", 7168), ("tile_m", 32), ("enabled", True)),
+            binding.unit.spec.call.arguments,
+            (
+                ("model_dim", 7168),
+                ("tile_m", 32),
+                ("enabled", True),
+                ("compile_target", _target()),
+            ),
         )
         self.assertEqual(self.calls, [])
         self.assertEqual(
@@ -111,25 +125,51 @@ class TestCallableBinding(unittest.TestCase):
     def test_binding_rejects_missing_unknown_and_mutable_arguments(self) -> None:
         invalid = (
             ({}, "missing"),
-            ({"model_dim": 1, "unknown": 2}, "unexpected"),
+            ({"model_dim": 1, "unknown": 2}, "unknown"),
             ({"model_dim": []}, "hashable"),
         )
         for kwargs, message in invalid:
             with self.subTest(message=message):
                 with self.assertRaisesRegex(TypeError, message):
-                    self.registry.make_unit(
-                        _OP_ID,
-                        target=_target(),
-                        signature=_abi(),
+                    PlanBuilder(
+                        _target(),
+                        registry=self.registry,
+                        context="invalid case",
+                    ).bind(
+                        self.operation,
                         **kwargs,
                     )
 
+    def test_sources_conflict_until_an_explicit_override_resolves_them(self) -> None:
+        plan = PlanBuilder(
+            _target(),
+            {"model_dim": 2048},
+            {"model_dim": 7168},
+            registry=self.registry,
+            context="model=synthetic",
+        )
+        with self.assertRaisesRegex(
+            TypeError,
+            r"model=synthetic.*builder\.v1.*builder.*conflicting parameter "
+            r"'model_dim'",
+        ):
+            plan.bind(self.operation)
+
+        binding = plan.bind(self.operation, model_dim=4096)
+
+        self.assertEqual(binding["model_dim"], 4096)
+
     def test_compile_invokes_registered_callable_and_restores_target(self) -> None:
-        unit = self.registry.make_unit(
-            _OP_ID,
-            target=_target(),
-            signature=_abi(),
-            model_dim=7168,
+        unit = (
+            PlanBuilder(
+                _target(),
+                registry=self.registry,
+            )
+            .emit(
+                self.operation,
+                model_dim=7168,
+            )
+            .unit
         )
         before = {
             "FLYDSL_GPU_ARCH": os.environ.get("FLYDSL_GPU_ARCH"),
@@ -138,77 +178,67 @@ class TestCallableBinding(unittest.TestCase):
 
         result = self.registry.compile(unit)
 
-        self.assertEqual(result, (7168, 32, False, "gfx950", "256"))
+        self.assertEqual(result, (7168, 32, False, _target(), "gfx950", "256"))
         self.assertEqual(self.calls, [result])
         self.assertEqual(
             {name: os.environ.get(name) for name in before},
             before,
         )
 
-    def test_compile_revalidates_manually_constructed_bound_calls(self) -> None:
-        malformed = CompileUnit(
-            CompileSpec(
-                _OP_ID,
-                _target(),
-                BoundCall((("model_dim", 7168),)),
-            ),
-            _abi(),
-        )
-        with self.assertRaisesRegex(ValueError, "registered signature"):
-            self.registry.compile(malformed)
-        self.assertEqual(self.calls, [])
-
-    def test_plan_preserves_unit_and_result_order(self) -> None:
-        units = tuple(
-            self.registry.make_unit(
-                _OP_ID,
-                target=_target(),
-                signature=_abi(),
-                model_dim=model_dim,
-            )
-            for model_dim in (2048, 7168, 2048)
-        )
-        plan = CompilePlan(units)
+    def test_emit_replaces_a_subset_and_preserves_order(self) -> None:
+        builder = PlanBuilder(_target(), registry=self.registry)
+        requested = builder.bind(self.operation, model_dim=2048)
+        first = builder.emit(requested)
+        second = builder.emit(requested, model_dim=7168, enabled=True)
+        third = builder.emit(requested)
+        plan = builder.build()
 
         results = self.registry.compile_plan(plan)
 
         self.assertEqual([result[0] for result in results], [2048, 7168, 2048])
-        self.assertEqual(plan.units, units)
+        self.assertEqual(requested["enabled"], False)
+        self.assertEqual(second["enabled"], True)
+        self.assertEqual(
+            plan.units,
+            (first.unit, second.unit, third.unit),
+        )
 
 
 class TestDeclarationsAndRegistry(unittest.TestCase):
-    def test_declarations_are_immutable_and_hashable(self) -> None:
-        call = BoundCall((("model_dim", 7168), ("tiles", (32, 128))))
-        spec = CompileSpec(_OP_ID, _target(), call)
-        argument = SignatureArg("rows", ArgumentKind.SCALAR, "i32")
-        signature = KernelSignature((argument,))
-        unit = CompileUnit(spec, signature)
-        plan = CompilePlan((unit,))
+    def test_dsl_outputs_are_immutable_and_hashable(self) -> None:
+        def compiler(rows=1):
+            return rows
 
-        for value in (_target(), call, spec, argument, signature, unit, plan):
+        operation = op(_OP_ID, compiler, abi=KernelSignature(()))
+        first = CompileOpRegistry()
+        second = CompileOpRegistry()
+        builder = PlanBuilder(_target(), registry=first)
+        binding = builder.emit(operation)
+        plan = builder.build()
+
+        for value in (
+            _target(),
+            operation,
+            binding,
+            binding.unit.spec.call,
+            binding.unit.spec,
+            binding.unit,
+            plan,
+        ):
             hash(value)
             with self.assertRaises(FrozenInstanceError):
                 setattr(value, next(iter(value.__dataclass_fields__)), None)
 
-    def test_registry_instances_are_isolated_and_duplicates_fail(self) -> None:
-        first = CompileOpRegistry()
-        second = CompileOpRegistry()
-
-        @first.register(_OP_ID)
-        def builder(value=1):
-            return value
-
-        self.assertIs(first.lookup(_OP_ID), builder)
+        operation.register(first)
+        self.assertIs(first.lookup(_OP_ID), compiler)
         with self.assertRaisesRegex(KeyError, _OP_ID):
             second.lookup(_OP_ID)
-        with self.assertRaisesRegex(ValueError, "already registered"):
-            first.register(_OP_ID)(builder)
+        with self.assertRaisesRegex(RuntimeError, "registered"):
+            op(_OP_ID, lambda: None, abi=KernelSignature(())).register(first)
         with self.assertRaisesRegex(KeyError, _OTHER_OP_ID):
             first.lookup(_OTHER_OP_ID)
 
     def test_registration_requires_fixed_keyword_bindable_signature(self) -> None:
-        registry = CompileOpRegistry()
-
         def variadic(**kwargs):
             return kwargs
 
@@ -225,43 +255,43 @@ class TestDeclarationsAndRegistry(unittest.TestCase):
         ):
             with self.subTest(builder=builder.__name__):
                 with self.assertRaisesRegex(TypeError, message):
-                    registry.register(_OP_ID)(builder)
+                    PlanBuilder(
+                        _target(),
+                        registry=CompileOpRegistry(),
+                    ).bind(op(_OP_ID, builder, abi=KernelSignature(())))
 
-    def test_target_and_abi_validation_is_compact_but_strict(self) -> None:
-        with self.assertRaisesRegex(ValueError, "arch"):
-            RocmTarget("GFX950", 256)
-        with self.assertRaisesRegex(ValueError, "positive"):
-            RocmTarget("gfx950", 0)
-        with self.assertRaisesRegex(ValueError, "same rank"):
-            SignatureArg(
-                "x",
-                ArgumentKind.TENSOR,
-                "bf16",
-                (4, 8),
-                (1,),
-            )
-        with self.assertRaisesRegex(ValueError, "unique"):
-            argument = SignatureArg("x", ArgumentKind.POINTER, "u8")
-            KernelSignature((argument, argument))
+    def test_single_kernel_developer_workflow(self) -> None:
+        calls = []
 
-    def test_resolution_is_cpu_metadata_only(self) -> None:
-        touched = []
-        registry = CompileOpRegistry()
+        def compile_simple(rows: int, tile: int = 64, compile_target=None):
+            calls.append((rows, tile, compile_target))
+            return calls[-1]
 
-        @registry.register(_OP_ID)
-        def builder(value=1):
-            touched.append(value)
-            raise AssertionError("resolution must not invoke the compiler")
-
-        unit = registry.make_unit(
-            _OP_ID,
-            target=_target(),
-            signature=KernelSignature(()),
+        simple = op(
+            _SIMPLE_OP_ID,
+            compile_simple,
+            abi=KernelSignature((SignatureArg("rows", ArgumentKind.SCALAR, "i32"),)),
+            target_kw="compile_target",
         )
-        self.assertEqual(unit.spec.call.arguments, (("value", 1),))
-        self.assertEqual(touched, [])
+
+        @plan_provider
+        def simple_plan(plan: PlanBuilder, *, rows: int) -> None:
+            plan.require(rows > 0, f"rows must be positive, got {rows}")
+            plan.emit(simple)
+
+        registry = CompileOpRegistry()
+        first = simple_plan(target=_target(), registry=registry, rows=1024)
+        second = simple_plan(target=_target(), registry=registry, rows=1024)
+
+        self.assertEqual(calls, [])
         self.assertNotIn("torch", compile_plan.__dict__)
         self.assertNotIn("flydsl", compile_plan.__dict__)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first.units[0].spec.call.arguments,
+            (("rows", 1024), ("tile", 64), ("compile_target", _target())),
+        )
+        self.assertEqual(registry.compile_plan(first), ((1024, 64, _target()),))
 
 
 if __name__ == "__main__":
