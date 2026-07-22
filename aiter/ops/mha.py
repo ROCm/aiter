@@ -1927,13 +1927,27 @@ def _flash_attn_forward(
         # fully-masked leading rows are written as O=0).
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        return hdim_q == 128 and hdim_v == 128
+        if not (hdim_q == 128 and hdim_v == 128):
+            return False
+        # 32-bit buffer-offset limit: the kernel's async KV load uses a 32-bit soffset that
+        # is not rebuilt into the descriptor base per tile, so a per-(batch,head) KV byte
+        # extent >= 2^32 wraps and far KV tiles are silently misread. Fall back to v3/CK.
+        if seqlen_k * nhead_k * hdim_q * 2 >= (1 << 32):
+            return False
+        return True
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        return hdim_q == 192 and hdim_v == 128
+        if not (hdim_q == 192 and hdim_v == 128):
+            return False
+        # 32-bit buffer-offset limit (same as D=128): per-(batch,head) K/V byte extent must
+        # fit in 2^32, else the 32-bit async-load soffset wraps and far KV tiles are misread.
+        if (seqlen_k * nhead_k * hdim_q * 2 >= (1 << 32)
+                or seqlen_k * nhead_k * hdim_v * 2 >= (1 << 32)):
+            return False
+        return True
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
