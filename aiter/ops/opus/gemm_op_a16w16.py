@@ -39,6 +39,7 @@ Python surface is deliberately per-dtype: a16w16 here, a8w8 in its own
 module when that lands.
 """
 
+import functools
 import logging
 from typing import Optional
 
@@ -81,6 +82,7 @@ def _opus_gemm_a16w16_tune_raw(
     WQ: torch.Tensor,
     Y: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
@@ -163,6 +165,18 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
         )
 
 
+@functools.lru_cache(maxsize=32)
+def _get_opus_workspace(device: torch.device, ws_elems: int) -> torch.Tensor:
+    """Cached workspace allocation for opus split-K.
+
+    Uses lru_cache keyed by (device, size) so the tensor lives for the process
+    lifetime. This guarantees a stable data_ptr() across HIP graph capture and
+    replay -- without it, a torch.empty inside the captured callable would be
+    freed after capture, and graph replay would write to an unmapped address.
+    """
+    return torch.empty(ws_elems, dtype=torch.bfloat16, device=device)
+
+
 def opus_gemm_a16w16_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -211,6 +225,20 @@ def opus_gemm_a16w16_tune(
         splitK = new_splitK
         bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
+    # gfx1250 split-K kids [20000, 30000) need a workspace tensor allocated
+    # externally (torch.empty) and passed to the C++ launcher.
+    workspace = None
+    if 20000 <= kernelId < 30000:
+        batch, M, N = Y.shape
+        _, _, K = XQ.shape
+        # Workspace must be large enough for any kid's tile padding.
+        # Use the LARGEST tile dimensions (B_M=128, B_N=512) to compute
+        # padded_M/N -- a kid with B_N=512 and N=256 pads to padded_N=512.
+        sk = splitK if splitK > 1 else 16
+        padded_M = ((M + 127) // 128) * 128
+        padded_N = ((N + 511) // 512) * 512
+        ws_elems = sk * padded_M * padded_N
+        workspace = _get_opus_workspace(XQ.device, ws_elems)
     # Mono-tile kid guard: the launcher requires N / K to be tile-aligned
     # (the kernel has no N-tail mask and no K-tail mask; M-tail IS handled
     # via the bounded gmem desc). A CSV winner picked through
@@ -235,7 +263,7 @@ def opus_gemm_a16w16_tune(
     # refactor to aiter_tensor_t). Keep the wrapper's `return Y`
     # contract so callers that did `Y = opus_gemm_a16w16_tune(...)`
     # still see the populated Y.
-    _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, kernelId, splitK)
+    _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, workspace, kernelId, splitK)
     return Y
 
 
@@ -394,7 +422,7 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
         WQ = B
     else:
         raise ValueError(
-            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape " f"{tuple(B.shape)})"
+            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape {tuple(B.shape)})"
         )
 
     if out is not None:

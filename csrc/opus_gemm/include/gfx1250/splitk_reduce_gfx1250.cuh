@@ -3,10 +3,9 @@
 //
 // gfx1250 split-K reduce kernel: tile-agnostic; sums an fp32 workspace across
 // the split-K axis, folds an optional per-N bias once, casts fp32 -> D_OUT,
-// and writes C. The body mirrors gfx950/splitk_reduce_gfx950.cuh (same
-// ws_handle ABI), but the kernel is given a DISTINCT name
+// and writes C. The kernel is given a DISTINCT name
 // (splitk_reduce_kernel_gfx1250) so the explicit instantiations do NOT collide
-// with gfx950's identically-signatured splitk_reduce_kernel<ws_handle*> in a
+// with gfx950's splitk_reduce_kernel in a
 // multi-arch build (same mangled name + same ABI would be a duplicate symbol).
 //
 // The reduce path uses no WMMA -- on wave32 it is simply vectorized fp32
@@ -36,7 +35,7 @@
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
-#include "opus_gemm_traits_a16w16_gfx1250.cuh"  // opus_splitk_ws_handle
+#include "opus_gemm_traits_a16w16_gfx1250.cuh"
 #include <cstdint>
 
 template <int VEC_         = 8,
@@ -47,7 +46,7 @@ template <int VEC_         = 8,
           bool HAS_OOB_    = true,
           int SPLIT_K_     = 0,
           typename D_WS_   = float>
-__global__ void splitk_reduce_kernel_gfx1250(const opus_splitk_ws_handle* __restrict__ ws_handle,
+__global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
                                              D_OUT* __restrict__ c_out,
                                              int split_k,
                                              int M,
@@ -64,7 +63,7 @@ __global__ void splitk_reduce_kernel_gfx1250(const opus_splitk_ws_handle* __rest
     // split-K-dominated READ traffic (reduce reads split_k slices), summed in
     // fp32 here. The main GEMM must write the workspace in the SAME dtype.
     using D_WS                         = D_WS_;
-    const D_WS* __restrict__ workspace = reinterpret_cast<const D_WS*>(ws_handle->ptr);
+    const D_WS* __restrict__ workspace = reinterpret_cast<const D_WS*>(ws_ptr);
     constexpr int VEC   = VEC_;
     constexpr int BLOCK = BLOCK_;
     constexpr bool HAS_BIAS = HAS_BIAS_;
@@ -421,7 +420,7 @@ __global__ void splitk_reduce_kernel_gfx1250(const opus_splitk_ws_handle* __rest
 #undef OPUS_REDUCE_ST2
 #undef OPUS_REDUCE_ST1
 #else
-    (void)ws_handle; (void)c_out; (void)split_k; (void)M; (void)N; (void)batch;
+    (void)ws_ptr; (void)c_out; (void)split_k; (void)M; (void)N; (void)batch;
     (void)padded_M; (void)padded_N; (void)bias; (void)bias_stride_batch;
 #endif  // __gfx1250__
 #endif  // __HIP_DEVICE_COMPILE__

@@ -294,9 +294,10 @@ namespace py = pybind11;
           py::arg("XQ"),                      \
           py::arg("WQ"),                      \
           py::arg("Y"),                       \
-          py::arg("bias")     = std::nullopt, \
-          py::arg("kernelId") = 0,            \
-          py::arg("splitK")   = 0);
+          py::arg("bias")      = std::nullopt, \
+          py::arg("workspace") = std::nullopt, \
+          py::arg("kernelId")  = 0,            \
+          py::arg("splitK")    = 0);
 
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \

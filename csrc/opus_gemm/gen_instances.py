@@ -83,13 +83,12 @@ SPLITK_REDUCE_ABI_MAP = {
         "baseline_has_oob": (True,),
     },
     "gfx1250": {
-        # gfx1250 cluster/TDM split-K: fp32 workspace + separate reduce kernel.
-        # Distinct kernel NAME (splitk_reduce_kernel_gfx1250) but the same
-        # ws_handle ABI as gfx950, so it never collides in a multi-arch build.
+        # gfx1250 cluster/TDM split-K: workspace allocated externally (torch.empty)
+        # and passed as a direct void* pointer (no ws_handle indirection).
         "forward_decl_include": '#include "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh"\n',
         "kernel": "splitk_reduce_kernel_gfx1250",
-        "ws_arg": "const opus_splitk_ws_handle* ws_handle",
-        "ws_type": "const opus_splitk_ws_handle*",
+        "ws_arg": "const void* ws_ptr",
+        "ws_type": "const void*",
         "baseline_has_oob": (True, False),
     },
 }
@@ -691,11 +690,31 @@ void
     std::optional<aiter_tensor_t> bias,
     int splitK);
 """
+        # gfx1250 a16w16 split-K (6 args: workspace tensor passed from Python).
+        MANIFEST_NOSCALE_6ARG_WS = """
+template <typename D_C>
+void
+{kernel_name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    aiter_tensor_t &workspace,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);
+"""
+        GFX1250_SPLITK_TAGS = {
+            "a16w16_cluster_tdm_splitk_ws",
+            "a16w16_clusterlaunch_tdm_splitk_ws",
+            "a16w16_clusterlaunch_tdm_splitk_fuse",
+        }
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
             for mnk, k in kernels_dict.items():
                 if k.kernel_tag in A16W16_TUNE_TAGS:
-                    f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
+                    if k.kernel_tag in GFX1250_SPLITK_TAGS:
+                        f.write(MANIFEST_NOSCALE_6ARG_WS.format(kernel_name=k.name))
+                    else:
+                        f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
                 elif k.kernel_tag in NOSCALE_TAGS:
                     f.write(MANIFEST_NOSCALE_3ARG.format(kernel_name=k.name))
                 else:
