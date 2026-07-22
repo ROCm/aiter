@@ -2309,7 +2309,9 @@ def flydsl_moe_fused_quant_preshuffle(
     if out_payload is None:
         out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
     if out_scale is None:
-        out_scale = torch.empty(
+        # Zero (not empty): the GEMM reads MX scale for tile-aligned padding rows the
+        # quant never writes; a stale 0xFF e8m0 byte is NaN and poisons valid rows.
+        out_scale = torch.zeros(
             (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
         )
 

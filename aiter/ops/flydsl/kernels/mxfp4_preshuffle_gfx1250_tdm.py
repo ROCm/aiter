@@ -198,12 +198,22 @@ def launch_gemm_a8w4_tdm(
         # Per-expert A-data OOB: bound to the owning expert's valid-row 
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
-        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
+        # tile_m<=64: load_sa's A-scale index can over-read past a row's super-row
+        # into an unpopulated LDS slot; a stale 0xFF there is a NaN e8m0 scale that
+        # poisons valid rows via 0*NaN. Zero the arena so such slots read a finite 0.
+        _zblk = 16 * block
+        _arena = ((ARENA_B + _zblk - 1) // _zblk) * _zblk if tile_m <= 64 else ARENA_B
+        base_ptr = fx.SharedAllocator(static=False).allocate(_arena)._ptr
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
+        if const_expr(tile_m <= 64):
+            _zv = fx.constant_vector(0, T.vec(4, T.i32))
+            for _zi in range_constexpr(_arena // _zblk):
+                lds_store_b128_raw(stC_idx, (tid + _zi * block) * 16, _zv)
+            workgroup_barrier()
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
