@@ -1,0 +1,430 @@
+# FlyDSL standard two-stage MoE compile inventory
+
+## Status and scope
+
+This document records the **current old host path** on
+`zhimding/refactor_aot`. It is the behavioral baseline for a future CPU-only
+compile-request resolver. It is **not** a Manifest, a proposed source of truth,
+or a description of a future dispatch design.
+
+The inventory covers the standard
+`fused_moe -> fused_moe_ -> fused_moe_2stages` path and every FlyDSL artifact
+reachable from it:
+
+- optional FlyDSL MoE sorting, including oneshot and both multiphase launchers;
+- a FlyDSL stage1 or stage2 selected independently by a tuned row or a host
+  heuristic;
+- stage1 split-K activation/quantization helpers;
+- FlyDSL activation epilogues reached from a CK-Tile stage1;
+- stage2 plain and expert-parallel masked reduction.
+
+It intentionally excludes the one-stage assembly path, the separate
+`flydsl_mxmoe_*`/`aiter.aot.flydsl.mxfp4_moe` port, gfx1250 grouped MoE,
+Triton MoE, and standalone kernel tests. Mixed rows are still in scope: for
+example, CK stage1 + FlyDSL stage2 and FlyDSL stage1 + CK-Tile or Opus stage2.
+
+Primary implementation references:
+
+- [`aiter/fused_moe.py`](../aiter/fused_moe.py)
+- [`aiter/ops/flydsl/moe_kernels.py`](../aiter/ops/flydsl/moe_kernels.py)
+- [`aiter/ops/flydsl/moe_sorting.py`](../aiter/ops/flydsl/moe_sorting.py)
+- [`aiter/ops/flydsl/kernels/moe_sorting_kernel.py`](../aiter/ops/flydsl/kernels/moe_sorting_kernel.py)
+- [`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py)
+
+## Runtime call graph
+
+```text
+fused_moe
+└─ fused_moe_                         # torch_compile_guard custom-op body
+   ├─ derive M/topk/E/model_dim/inter_dim, quant dtypes and layout
+   ├─ get_2stage_cfgs
+   │  ├─ look up tuned_fmoe CSV row
+   │  ├─ decode kernelName1/kernelName2 into MOEMetadata
+   │  └─ otherwise apply host fallback heuristics
+   ├─ moe_sorting
+   │  ├─ _flydsl_moe_sorting         # opt-in and gate-compatible only
+   │  │  └─ flydsl_moe_sorting_fwd
+   │  │     └─ moe_sorting_flydsl
+   │  │        ├─ compile_moe_sorting
+   │  │        │  ├─ _compile_moe_sorting_oneshot
+   │  │        │  └─ _compile_moe_sorting_multiphase
+   │  │        └─ tensor_shim._run_compiled -> flyc.compile(selected launcher)
+   │  ├─ _moe_sorting_impl -> Opus or CK sorting
+   │  └─ specialized FLAT/output_aux paths
+   └─ fused_moe_2stages
+      ├─ prepare/quantize stage1 input
+      ├─ metadata.stage1
+      │  ├─ _flydsl_stage1_wrapper
+      │  │  └─ flydsl_moe_stage1
+      │  │     ├─ compile_flydsl_moe_stage1
+      │  │     │  ├─ compile_mixed_moe_gemm1  # fp4/fp8 weights
+      │  │     │  └─ compile_moe_gemm1        # bf16 x int4
+      │  │     ├─ _run_compiled -> flyc.compile
+      │  │     └─ optional split-K FlyDSL activation/quant helper
+      │  ├─ cktile_moe_stage1
+      │  │  └─ optional interleaved FlyDSL activation epilogue
+      │  └─ CK/HIP/assembly stage1
+      ├─ prepare or consume the inter-stage quantized tensor
+      └─ metadata.stage2
+         ├─ _flydsl_stage2_wrapper
+         │  └─ flydsl_moe_stage2
+         │     ├─ compile_flydsl_moe_stage2
+         │     │  ├─ compile_mixed_moe_gemm2  # fp4/fp8 weights
+         │     │  └─ compile_moe_gemm2        # bf16 x int4
+         │     ├─ _run_compiled -> flyc.compile
+         │     └─ reduce mode only:
+         │        _run_moe_reduction
+         │        └─ compile_moe_reduction
+         │           └─ _run_compiled -> flyc.compile
+         └─ CK, CK-Tile, Opus, or assembly stage2
+```
+
+Builder construction and artifact compilation are distinct. In particular,
+`compile_moe_sorting()` calls both sorting builder factories, but only the
+launcher selected for the current token range is passed to `flyc.compile`.
+The CPU baseline should record the agreed builder-request boundary, not infer
+coverage from private FlyDSL cache keys.
+
+## Dispatch and trigger conditions
+
+### Two-stage configuration selection
+
+`get_2stage_cfgs()` owns backend selection.
+
+1. It builds a lookup key from:
+   `gfx`, CU count, padded token tier, `model_dim`, `inter_dim`, local expert
+   count, routed `topk`, activation, output/activation/weight dtypes,
+   quantization type, gate/up shape, and `doweight_stage1`.
+   Below 32768 tokens the tier is `nextPow2(M)`; 32768 and 131072 are explicit
+   large tiers. In expert-parallel mode the always-masked fake top-k slot is
+   removed from the CSV lookup key.
+2. It reads `AITER_CONFIGS.AITER_CONFIG_FMOE_FILE`, first trying an exact
+   `act_type` row and then the activation-disabled fallback. Rows tagged
+   `_tag=flydsl_fallback` are excluded from runtime lookup. A missing large
+   tier may fall back to a smaller configured tier.
+3. A `kernelName1` or `kernelName2` beginning with `flydsl_` selects the
+   corresponding FlyDSL wrapper only when FlyDSL is available. Stages are
+   selected independently; the other stage may be CK, CK-Tile, Opus, or
+   assembly/HIP.
+4. Without a usable tuned row, current heuristics can synthesize FlyDSL names:
+   - per-1x32 bf16-activation/int4-weight (`a16wi4`) selects FlyDSL stage1 and
+     atomic stage2 when FlyDSL is available;
+   - the MX path requires bf16/fp16 output, per-1x32 quantization, fp4/fp8
+     activation and weight dtypes, preshuffled gate/up weights (`use_g1u1`),
+     `doweight_stage1=False`, FlyDSL availability, and either SwiGLU or
+     `AITER_FLYDSL_FORCE=1`. It selects FlyDSL stage1 and atomic stage2.
+     `AITER_FLYDSL_FORCE` currently defaults to `1`, so this heuristic is not
+     limited to SwiGLU.
+
+The `flydsl_mxmoe_*` name family is intercepted earlier by its separate port
+and is outside this inventory.
+
+### Optional FlyDSL sorting
+
+FlyDSL sorting is reached only when all of these are true:
+
+- `AITER_USE_CK_MOE_SORTING != 1`;
+- `AITER_USE_FLYDSL_MOE_SORTING == 1`;
+- FlyDSL is available;
+- no local-top-k-id result is requested;
+- the route is not FLAT;
+- the specialized `output_aux` route is not requested;
+- `moe_sorting_dispatch_policy == 0`.
+
+Otherwise standard sorting defaults to Opus, or to CK when
+`AITER_USE_CK_MOE_SORTING=1`. Requesting local top-k IDs or `output_aux`
+also forces a non-FlyDSL sorting path. Expert masking is supported by FlyDSL
+sorting and becomes the compile-time `has_mask` variant.
+
+Let `T` be `num_local_tokens` when supplied, otherwise `topk_ids.shape[0]`;
+`E` is the global routed expert count. With `BLOCK_SIZE=256`:
+
+```text
+sub_tokens =
+  floor((LDS_ints / 2 / (E + 1) - 2) / 8) * 8
+
+ONESHOT_MAX_T =
+  min(sub_tokens, max(16, 256 // max(topk, E // 8)))
+```
+
+The LDS size is 163840 bytes on gfx95*, 65536 bytes on gfx94* and the
+conservative fallback.
+
+- `T <= min(sub_tokens, ONESHOT_MAX_T)`: compile and launch the oneshot
+  artifact. `max_tokens` is `max(T, 8)` rounded up to a multiple of 8.
+- above that threshold and `T <= 2048`: compile and launch the combined
+  multiphase `P0v2 + P23` artifact.
+- `T > 2048`: compile and launch the combined four-kernel
+  `ClearWS + P0 + P1 + P23` artifact.
+
+Multiphase requests use `k4_block=256` for `E <= 256`; for
+`256 < E <= 512` they use 512 through `T=8192` and 256 above it; larger
+expert counts use 256. The other static request fields are `E`, `topk`,
+sorting `unit_size`/block-M, and `has_mask`. Architecture and wave size are
+implicit builder inputs.
+
+Sorting also owns zero-initialization for atomic stage2. For unmasked reduce
+mode it receives an empty `(0, 0)` `moe_buf`, so the sorting kernel has no
+output-zeroing work.
+
+## Stage1 compile requests
+
+### Primary GEMM
+
+`_flydsl_stage1_wrapper()` resolves the full kernel name through
+`get_flydsl_kernel_params()` and calls `flydsl_moe_stage1()`.
+The registry is pre-populated with supported named variants carrying complete
+static parameter dictionaries; its fallback suffix parser overlays `_kwN`,
+`_fp4`, `_fp8`, and `_sbmN` fields on a known base name.
+The stage entry derives the exact tensor dimensions and calls
+`compile_flydsl_moe_stage1()` with:
+
+- shape: `model_dim`, `inter_dim`, local `experts`, and runtime `topk`;
+- tile/type: `tile_m`, `tile_n`, `tile_k`, `a_dtype`, `b_dtype`,
+  and effective `out_dtype`;
+- route weighting: `doweight_stage1 = (sorted_weights is not None)`;
+- activation/layout: `act`, `gate_mode`, and compile-time bias presence;
+- scheduling: `persist_m`, `use_async_copy`, `k_batch`, `waves_per_eu`,
+  `b_nt`, `a_scale_one`, `xcd_swizzle`, and `k_wave`;
+- padding: `model_dim_pad` and `inter_dim_pad`.
+
+The wrapper hard-codes `use_async_copy=True`; stage1 `persist_m` normalizes to
+1 unless a direct caller overrides it. Bias disables wrapper-level padding via
+`_get_padding_for_flydsl()`. `swiglu_limit` is normalized to 7.0 for an unset
+SwiGLU limit and `+inf` for an unset SiLU limit, but remains a runtime scalar
+rather than a builder parameter.
+
+For fp4/fp8 weights, the next builder is
+`compile_mixed_moe_gemm1()`. For bf16 activations with int4 weights it is
+`compile_moe_gemm1()` with `in_dtype="int4_bf16"`, group size 32, bf16 scale,
+and CShuffle enabled automatically only for split-K.
+
+For non-split-K `_fp4`/`_fp8` stage1 names, activation, optional route
+weighting, quantization, and sorted E8M0-scale emission are fused into the
+primary GEMM artifact.
+
+### Split-K auxiliary activation and quantization
+
+`k_batch > 1` makes the primary FlyDSL GEMM write bf16/fp16 gate/up partials
+into a zeroed `[token, topk, 2 * inter_dim]` buffer. Therefore the primary
+builder receives the base output dtype, even when the requested final stage1
+output is fp4 or fp8. Post-processing is selected as follows:
+
+| Runtime predicate | Post-processing artifact |
+| --- | --- |
+| interleaved gate/up and final fp4/fp8 | `build_silu_and_mul_fq_module(inter_dim, topk, quant_mode="fp4" or "fp8", gui_layout=True, act, enable_bias)` |
+| interleaved gate/up and no final quantization | the same builder with `quant_mode="none"` and `gui_layout=True` |
+| separated gate/up and final fp4 | the same builder with `quant_mode="fp4"` and `gui_layout=False` |
+| every other split-K case | CK/HIP `silu_and_mul`, `swiglu_and_mul`, or bias variant at runtime; no auxiliary FlyDSL artifact |
+
+The FlyDSL helper owns activation, split-K result consumption, optional bias,
+optional fp4/fp8 quantization, and sorted scale output. Split-K bias requires
+`topk_ids`, because `sorted_token_ids` encodes token/slot but not expert ID.
+The bias-presence boolean is a compile parameter; the bias shape and
+`swiglu_limit` are runtime arguments.
+
+Under `COMPILE_ONLY=1`, the non-FlyDSL plain split-K activation is deliberately
+skipped after the primary GEMM compile.
+
+## CK-Tile stage1 with a FlyDSL epilogue
+
+`cktile_moe_stage1()` itself calls the CK-Tile/HIP
+`aiter.moe_cktile2stages_gemm1`; it is not a FlyDSL GEMM.
+A separate post-activation step exists only when `split_k > 1`.
+
+The result is treated as interleaved when
+`post_activation_layout="interleaved"`, or when
+`post_activation_layout="auto"` and `w1.dtype` is
+`torch.float4_e2m1fn_x2`. `"standard"` explicitly disables the interleaved
+route.
+
+- Interleaved SwiGLU calls
+  `flydsl_swiglu_and_mul_interleaved()` and builds
+  `build_swiglu_and_mul_module(inter_dim)`. Its request does not include
+  `topk`.
+- Interleaved SiLU calls
+  `flydsl_silu_and_mul_interleaved()` and builds
+  `build_silu_and_mul_fq_module(inter_dim, topk, quant_mode="none",
+  gui_layout=True, act="silu", enable_bias=False)`.
+- Interleaved GELU is implemented with PyTorch tensor operations, not FlyDSL.
+- Standard-layout SiLU/SwiGLU/GELU and bias variants call AITER activation
+  operators, not FlyDSL. Interleaved split-K bias is rejected.
+- Non-split-K CK-Tile keeps activation in the CK-Tile epilogue and does not
+  reach either FlyDSL helper.
+
+The current CSV AOT collector is intentionally broader than this runtime
+predicate: any `kernelName1` beginning with `cktile_` emits an epilogue job,
+without checking `split_k` or the runtime weight layout, and maps every
+non-SwiGLU activation to SiLU. That is an old-path over-approximation, not a
+new resolver contract.
+
+## Stage2 and reduction compile requests
+
+`_flydsl_stage2_wrapper()` resolves the stage2 kernel name and forwards its
+registered parameters to `flydsl_moe_stage2()`. The primary
+`compile_flydsl_moe_stage2()` request contains:
+
+- `model_dim`, `inter_dim`, local `experts`, runtime `topk`;
+- `tile_m`, `tile_n`, `tile_k`, activation/weight/output dtype tags;
+- `doweight_stage2 = (sorted_weights is not None)`;
+- `accumulate`, derived from configured mode and `return_per_slot`;
+- `persist_m`, `sort_block_m`, `waves_per_eu`, `use_async_copy`,
+  `cu_num_mul`, `b_nt`, and `xcd_swizzle`;
+- model/intermediate padding and compile-time bias presence.
+
+`doweight_stage1` determines routing-weight ownership: stage1 receives
+`sorted_weights` when true; otherwise stage2 receives them. A configured
+`mode="reduce"` makes `accumulate=False`. Atomic mode uses
+`accumulate=True`, writes directly into the sorting-zeroed `[T, model_dim]`
+buffer, and has no reduction artifact. `AITER_FLYDSL_FORCE_REDUCE=1` can
+override an atomic name at runtime.
+
+`persist_m` is runtime-derived:
+
+- explicit `persist=True` -> `-1` (persistent CU grid);
+- explicit `persist=False` -> 4 when `m_blocks > 256`, otherwise 1;
+- unspecified -> `-1` when `m_blocks > 256`, otherwise 1;
+- fp8 activation forces 1.
+
+For reduce mode, GEMM2 writes a contiguous
+`[token, topk, model_dim]` temporary and `_run_moe_reduction()` emits a second
+FlyDSL request:
+
+```text
+compile_moe_reduction(
+    topk=runtime_topk,
+    model_dim=model_dim,
+    dtype_str="f16" | "bf16" | "f32",
+    use_mask=(expert_mask is not None),
+    num_experts=expert_mask.numel() if masked else 0,
+)
+```
+
+- Plain reduction sums every top-k slot.
+- Expert-parallel masked reduction additionally gathers
+  `expert_mask[topk_ids[token, slot]]` and sums only valid slots. Both
+  `expert_mask` and `topk_ids` are normalized to contiguous int32 runtime
+  inputs. Missing `topk_ids` is an error.
+- An unsupported output dtype may use `torch.sum` only for the unmasked case;
+  masked reduction rejects it. The standard output dtypes above use FlyDSL.
+
+The runtime CSV lookup removes the EP fake slot from its key, but the actual
+stage2 and reduction requests receive the runtime `topk`, including that slot.
+
+## Parameter ownership summary
+
+| Owner/source | Parameters and decisions |
+| --- | --- |
+| User/model tensors | `M`, runtime `topk`, local `E`, dimensions, tensor dtypes/layout, scales, biases, `expert_mask`, `num_local_tokens`, `swiglu_limit` |
+| `fused_moe_` host logic | activation/quant dtype remapping, padded token tier, sorting backend eligibility, route-weight stage, inter-stage quantization, empty vs zeroed `moe_buf` |
+| Tuned CSV row | `block_m`, `ksplit`, `kernelName1`, `kernelName2`; row match also depends on architecture, shape, activation, dtypes, quant type, gate/up shape, and route-weight stage |
+| Kernel-name registry | stage, tile sizes, dtype tags, stage1 `k_batch`/gate mode/schedule knobs, stage2 atomic/reduce mode, `sort_block_m`, persistence and schedule variants |
+| Stage entry functions | exact compile dimensions, presence booleans, effective split-K output dtype, persistent-mode threshold, argument packing, auxiliary helper selection |
+| Sorting host code | oneshot threshold, `max_tokens` bucket, multiphase family, workspace size, `k4_block`, mask variant |
+| Environment/runtime architecture | FlyDSL availability, sorting backend flags, force-reduce/heuristic debug flags, CU count, ROCm architecture and wave size |
+| Current AOT adapter | CSV enumeration/deduplication, fake tensor shapes, target arch from `cu_num`, and compile-only execution; it does not own production dispatch semantics |
+
+Pointer signatures do not encode scale or routing tensor lengths, and tensor
+**presence** can still select compile-time booleans. One host-level exception
+is stage2: `sorted_expert_ids.shape[0]` contributes to `m_blocks`, which can
+change the derived `persist_m` request. Sorting also uses its token bucket,
+expert count, top-k, mask presence, unit size, and architecture to select an
+artifact.
+
+## FlyDSL and non-FlyDSL boundary
+
+- **FlyDSL:** selected standard stage1/stage2 GEMMs, split-K
+  `silu_and_mul_fq`, CK-Tile interleaved SiLU/SwiGLU epilogues, stage2
+  reduction, and opt-in sorting.
+- **CK/HIP:** opt-in CK sorting, CK/CK-Tile stage GEMMs, ordinary split-K
+  activation helpers, and the `get_hip_quant` family used before stage1 and
+  between stages when quantization is not fused by FlyDSL stage1.
+- **Opus:** default standard sorting when CK sorting is not forced, local-ID
+  and some auxiliary sorting routes, plus tuned Opus stage2 rows.
+- **Host/PyTorch:** tensor allocation/view logic, unsupported plain reduction
+  fallback, and CK-Tile interleaved GELU.
+
+Backend mixing is expected. A FlyDSL stage1 does not imply a FlyDSL stage2,
+and FlyDSL sorting is an independent opt-in.
+
+## Transitional AOT route and baseline contract
+
+The current [`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) route is
+transitional:
+
+1. It enumerates CSV rows and resolves `flydsl_` kernel names through the
+   current registry. It also emits broad CK-Tile epilogue jobs and both
+   supported bias-presence variants for eligible fp4-weight rows. Unlike
+   runtime lookup, this parser does not discard `_tag=flydsl_fallback` rows,
+   so it can over-collect jobs from them.
+2. It selects `FLYDSL_GPU_ARCH` from `cu_num` (`80`/`304` -> gfx942,
+   `256` -> gfx950, otherwise gfx950).
+3. Under `FakeTensorMode` and `COMPILE_ONLY=1`, it creates top-level stage
+   placeholders with `build_stage1_compile_inputs()` or
+   `build_stage2_compile_inputs()` and invokes `flydsl_moe_stage1/2`.
+4. The real stage host functions still own argument packing, the primary
+   builder call, split-K auxiliary builders, and stage2 reduction.
+
+Although routing pointer lengths are not part of the FlyDSL argument
+signature, the placeholder `sorted_expert_ids` length can still cross
+stage2's `m_blocks > 256` host threshold and change `persist_m`. The
+`_aot_routing_placeholder()` docstring refers to
+`aiter/aot/flydsl/_cache_key_parity.py`, but that guard is not present on this
+branch. The checked-in request golden therefore includes otherwise-matching
+small and large plain-reduce scenarios; the large scenario records the
+threshold-derived `persist_m=-1` request explicitly.
+
+This adapter bypasses `fused_moe_`, configuration lookup, quantization, and
+sorting; it is therefore neither a complete production call graph nor a
+Manifest source. In particular, sorting still touches CUDA properties/streams
+and is not driven by this direct stage AOT route. The adapter also supplies no
+`expert_mask`/`topk_ids` to stage2, so a reduce row compiles the plain
+reduction only; the masked reduction must be covered by the old-host-path
+baseline.
+
+The CPU baseline recorder enters the existing `flydsl_moe_stage1/2`,
+epilogue, and sorting host paths through production input builders and
+wrappers. It does not reimplement or execute `fused_moe_` configuration
+selection; those predicates remain the inventory contract above. With fake
+tensors and mocked compile/launch/CUDA boundaries, the test normalizes complete
+public builder kwargs plus a stable trigger ID and compares the exact request
+set with the checked-in gfx950 golden. It must not snapshot FlyDSL-private cache
+keys.
+That golden is a regression oracle for a future resolver: intentional old-path
+changes require an explicit reviewed golden update; incidental ordering,
+pointer values, launcher state, or cache implementation details do not.
+
+### Checked-in trigger matrix
+
+The golden's stable trigger IDs map to this inventory as follows. A trigger can
+emit more than one request when the host path builds a primary GEMM plus an
+auxiliary artifact, or when sorting constructs both launcher families before
+selecting one.
+
+- Stage1 primary builders:
+  `stage1.main.non_split.bias.route_weighted`,
+  `stage1.int4.splitk`,
+  `stage1.splitk.fp4.silu.separated`,
+  `stage1.splitk.fp8.swiglu.interleaved.bias`, and
+  `stage1.splitk.none.silu.interleaved`.
+  These cover mixed-MX and standard int4 GEMM1, route weighting, primary bias,
+  both gate layouts, and all three split-K post-activation quant modes.
+- CK-Tile FlyDSL epilogues:
+  `cktile.epilogue.silu` and `cktile.epilogue.swiglu`.
+- Stage2:
+  `stage2.atomic.bias`, `stage2.int4.atomic`,
+  `stage2.reduce.plain`, `stage2.reduce.plain.large_auto_persist`, and
+  `stage2.reduce.masked_ep`.
+  These cover mixed-MX and standard int4 GEMM2, atomic and reduce modes, the
+  automatic persistence threshold, and plain/masked reduction.
+- Sorting:
+  `sorting.oneshot.unmasked`, `sorting.oneshot.masked`,
+  `sorting.multiphase.p0v2.unmasked.e384`, and
+  `sorting.multiphase.4k.masked`.
+  The E384 case records the reachable `k4_block=512` multiphase specialization;
+  the E256 cases retain `k4_block=256`.
+
+Requests are sorted by stable ID before serialization, dictionaries are emitted
+with sorted keys, and non-finite floats use explicit string spellings. Repeated
+recordings therefore produce byte-identical canonical JSON without depending
+on import or scenario declaration order.
