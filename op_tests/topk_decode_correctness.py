@@ -26,6 +26,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def _has_built_flydsl(path) -> bool:
+    """True only if `path` holds a *built* flydsl (with the generated _mlir ext)."""
+    if not path:
+        return False
+    p = Path(path).expanduser().resolve()
+    if not (p / "flydsl").exists():
+        return False
+    return (p / "flydsl" / "_mlir").exists() or bool(
+        list((p / "flydsl").glob("_mlir*"))
+    )
+
+
 def _add_path(path) -> None:
     if not path:
         return
@@ -35,12 +47,17 @@ def _add_path(path) -> None:
 
 
 def load_flydsl():
-    _add_path(REPO_ROOT.parent / "FlyDSL" / "python")
+    # Only prepend a candidate FlyDSL path if it actually contains the compiled
+    # MLIR extension; a source-only checkout must not shadow the installed runtime.
     configured = os.environ.get("FLYDSL_PATH")
-    if configured:
-        _add_path(Path(configured) / "python")
-        _add_path(configured)
-    _add_path(REPO_ROOT.parent / ".r1_flydsl_pkgs")
+    for cand in (
+        REPO_ROOT.parent / "FlyDSL" / "python",
+        (Path(configured) / "python") if configured else None,
+        Path(configured) if configured else None,
+        REPO_ROOT.parent / ".r1_flydsl_pkgs",
+    ):
+        if _has_built_flydsl(cand):
+            _add_path(cand)
     from aiter.ops.flydsl.topk_per_row_decode import flydsl_top_k_per_row_decode
 
     return flydsl_top_k_per_row_decode
@@ -69,10 +86,36 @@ def make_logits(num_rows, max_width, row_len, distribution, seed, device, poison
     return logits
 
 
-def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison):
+def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison,
+              seq_rand_min_frac=0.0):
     device = torch.device("cuda")
-    seq_lens = torch.full((num_rows // next_n,), L, dtype=torch.int32, device=device)
-    logits = make_logits(num_rows, max_width, L, distribution, seed, device, poison)
+    batch = num_rows // next_n
+    if seq_rand_min_frac and seq_rand_min_frac > 0.0:
+        # Regime B: random per-row causal length in [frac*L, L].
+        gen = torch.Generator(device=device).manual_seed(seed)
+        lo = max(1, int(seq_rand_min_frac * L))
+        seq_lens = torch.randint(
+            lo, L + 1, (batch,), generator=gen, device=device, dtype=torch.int32
+        )
+    else:
+        seq_lens = torch.full((batch,), L, dtype=torch.int32, device=device)
+
+    # Per-row valid length (decode causal geometry: row r -> batch r//next_n at
+    # slot r%next_n -> valid length seq_len - next_n + slot + 1).
+    row_ids = torch.arange(num_rows, device=device)
+    batch_ids = row_ids // next_n
+    slots = row_ids % next_n
+    row_lens = (seq_lens[batch_ids].to(torch.int64) - next_n + slots + 1).clamp_min(0)
+    row_lens_cpu = row_lens.cpu().tolist()
+
+    # Base logits then poison each row's own tail [row_len:max_width).
+    base = make_logits(num_rows, max_width, max_width, distribution, seed, device, poison)
+    for r in range(num_rows):
+        rl = row_lens_cpu[r]
+        if rl < max_width:
+            base[r, rl:] = poison
+    logits = base
+
     indices = torch.empty((num_rows, k), dtype=torch.int32, device=device)
     op(
         logits,
@@ -87,18 +130,19 @@ def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison)
     )
     torch.cuda.synchronize()
 
-    ref_k = min(k, L)
-    expected = torch.topk(logits[:, :L], ref_k, dim=-1).indices.to(torch.int32)
     actual = indices.detach().cpu()
-    expected = expected.cpu()
     logits_cpu = logits.detach().cpu()
     for row in range(num_rows):
-        valid = min(k, L)
+        rl = row_lens_cpu[row]
+        valid = min(k, rl)
+        if valid <= 0:
+            continue
+        ref = torch.topk(logits_cpu[row, :rl], valid).indices.to(torch.int32)
         a = actual[row, :valid]
-        e = expected[row, :valid]
-        bad = (a < 0) | (a >= L)
+        e = ref
+        bad = (a < 0) | (a >= rl)
         if bad.any():
-            return False, f"row {row}: out-of-range/poison indices {a[bad][:4].tolist()}"
+            return False, f"row {row}(len={rl}): out-of-range/poison indices {a[bad][:4].tolist()}"
         a_set, e_set = set(a.tolist()), set(e.tolist())
         if len(a_set) != len(a.tolist()):
             return False, f"row {row}: duplicate indices"
@@ -117,7 +161,7 @@ def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison)
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--k", type=int, default=512)
+    ap.add_argument("--k", type=int, nargs="+", default=[512])
     ap.add_argument("--L", type=int, nargs="+", required=True)
     ap.add_argument("--num-rows", type=int, nargs="+", default=[1])
     ap.add_argument("--max-width", type=int, default=256000)
@@ -132,28 +176,38 @@ def main() -> None:
         "--unpadded", action="store_true",
         help="Use max_width == L (no padded tail) instead of --max-width.",
     )
+    ap.add_argument(
+        "--seq-rand-min-frac", type=float, default=0.0,
+        help="Regime B: per-row seq_len random in [frac*L, L] (0 = uniform L = regime A).",
+    )
     args = ap.parse_args()
 
     op = load_flydsl()
     fails = 0
+    total = 0
     for dist in args.distribution:
-        for rows in args.num_rows:
-            for L in args.L:
-                mw = L if args.unpadded else max(args.max_width, L)
-                ok, msg = check_one(
-                    op, args.k, L, rows, mw, dist, args.next_n, args.seed, args.poison
-                )
-                status = "PASS" if ok else "FAIL"
-                if not ok:
-                    fails += 1
-                print(
-                    f"[{status}] dist={dist:8s} rows={rows} L={L:7d} mw={mw} : {msg}",
-                    flush=True,
-                )
+        for k in args.k:
+            for rows in args.num_rows:
+                for L in args.L:
+                    mw = L if args.unpadded else max(args.max_width, L)
+                    ok, msg = check_one(
+                        op, k, L, rows, mw, dist, args.next_n, args.seed,
+                        args.poison, args.seq_rand_min_frac,
+                    )
+                    total += 1
+                    status = "PASS" if ok else "FAIL"
+                    if not ok:
+                        fails += 1
+                    print(
+                        f"[{status}] dist={dist:8s} k={k:5d} rows={rows:3d} "
+                        f"L={L:7d} mw={mw} : {msg}",
+                        flush=True,
+                    )
+    regime = "B(rand seq)" if args.seq_rand_min_frac else "A(seq==max)"
     if fails:
-        print(f"\n{fails} FAILED")
+        print(f"\n{fails}/{total} FAILED  [regime {regime}]")
         sys.exit(1)
-    print("\nall passed")
+    print(f"\nall {total} passed  [regime {regime}]")
 
 
 if __name__ == "__main__":
