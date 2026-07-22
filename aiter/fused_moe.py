@@ -1704,7 +1704,6 @@ def _flydsl_v2_stage2_wrapper(
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
     epilog = cfg["epilog"]
     max_sorted = inter_states.shape[0]
-    n_sorted_padded = int(num_valid_ids[0].item())
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
@@ -1737,7 +1736,6 @@ def _flydsl_v2_stage2_wrapper(
         epilog=epilog,
         SBM=sbm,
         persist=cfg["persist"],
-        n_sorted_padded=n_sorted_padded,
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
     )
