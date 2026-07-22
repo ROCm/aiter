@@ -251,7 +251,7 @@ def fused_clamp_act_mul(
         )
 
         _LOGGER.info(
-            "FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M=%d n_half=%d", M, n_half
+            f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
         # ".cg" matches the Triton reference's hardcoded cache hint.
         _fused_clamp_silu_mul_gluon_kernel[(M,)](
