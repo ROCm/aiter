@@ -186,7 +186,9 @@ def mla_decode_v4_asm_gfx1250(
     args.ptr_Q = Q.data_ptr()
     args.ptr_KV = KV.data_ptr()
     args.ptr_LTP = kv_indptr.data_ptr()
-    args.ptr_LTL = kv_last_page_lens.data_ptr() if kv_last_page_lens is not None else None
+    args.ptr_LTL = (
+        kv_last_page_lens.data_ptr() if kv_last_page_lens is not None else None
+    )
     args.ptr_QTP = qo_indptr.data_ptr()
     args.ptr_QROPE = qrope.data_ptr()
     args.ptr_KVROPE = kvrope.data_ptr()
