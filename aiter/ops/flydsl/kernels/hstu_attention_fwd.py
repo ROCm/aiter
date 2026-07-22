@@ -35,8 +35,7 @@ import math as host_math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
+from flydsl._mlir.dialects import fly
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -147,6 +146,9 @@ def validate_hstu_attention_fwd(
 
     if dtype_str not in {"f16", "bf16"}:
         raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
+    # `causal` is always True here; it is kept as an explicit parameter only for
+    # call-signature symmetry with the HSTU backward kernels (which share the same
+    # public wrapper). Non-causal HSTU is not a valid configuration.
     if not causal:
         raise ValueError("hstu_attention_fwd only supports causal attention")
     if contextual_seq_len < 0:
@@ -217,7 +219,10 @@ def build_hstu_attention_fwd(
     alpha: float,
     dtype_str: str,
     max_seq_len: int,
-    *,  # keyword-only tunables
+    *,
+    # keyword-only tunables. These defaults are correctness-safe, not perf-tuned:
+    # production selects tuned (block_m, block_n, num_waves, waves_per_eu) per shape
+    # from the per-arch tuned CSV via the kernel wrapper.
     block_m: int = 64,
     block_n: int = 16,
     num_waves: int = 2,
@@ -399,33 +404,20 @@ def build_hstu_attention_fwd(
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
         # A BufferCopyLDS atom drives the buffer_load_lds instruction through the FlyDSL copy-atom.
         # The atom hardcodes the cache-policy/aux operand to 0.
-        _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
         _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8)
         _lds_ptr_ty = fx.PointerType.get(elem_type, 2, DMA_BYTES)
 
         def _rebased_buffer_div(base_iter, byte_off, n_elems):
             # Fold the (large) seq/head base into the 48-bit descriptor base so the per-lane element
-            # index stays a small 32-bit voffset; max_size records via the 0xFFFFFFFF num-records.
+            # index stays a small 32-bit voffset; max_size (0xFFFFFFFF) num-records. Public
+            # make_buffer_tensor assembles the V# (buffer flags + descriptor); we only pre-shift the
+            # base pointer, mirroring the buffer_load_lds path in kernels/gemm/preshuffle_gemm.py.
             base_i64 = fx.Int64(fx.ptrtoint(base_iter))
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
-            buf_ptr_ty = fx.PointerType.get(
-                elem_ty=elem_type,
-                address_space=_TargetAddressSpace.BufferDesc,
-                alignment=base_iter.alignment,
+            g_flat = fx.rocdl.make_buffer_tensor(
+                fx.Tensor(fx.make_view(shifted, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))))
             )
-            buf_ptr = fx.make_ptr(
-                buf_ptr_ty,
-                [
-                    shifted,
-                    fx.Int16(0).ir_value(),
-                    fx.Int64(0xFFFFFFFF).ir_value(),
-                    _buf_flags_i32.ir_value(),
-                ],
-            )
-            return fx.logical_divide(
-                fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
-                fx.make_layout(1, 1),
-            )
+            return fx.logical_divide(g_flat, fx.make_layout(1, 1))
 
         k_div = _rebased_buffer_div(
             fx.get_iter(k), k_base_byte_offset, max_seq_len * stride_qk_n
@@ -468,20 +460,13 @@ def build_hstu_attention_fwd(
             """Saturating silu(alpha*s) for a list of scores, stage-batched for ILP.
             1/N is hoisted to the O epilogue.
 
-            The fastmath context gives every add/mul the `fast` flag; exp2 stays on the
-            amdgcn approximate hardware op (math.exp2 lowers to a slower expansion) and
-            rcp goes through the rocdl builder."""
+            The fastmath context gives every add/mul the `fast` flag; exp2 and rcp
+            both go through the rocdl builders (rocdl.exp2 -> v_exp_f32 approximate
+            hardware op; math.exp2 would lower to a slower expansion)."""
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
-                emu = [
-                    fx.Float32(
-                        llvm.call_intrinsic(
-                            compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], []
-                        )
-                    )
-                    for t in tt
-                ]
+                emu = [fx.Float32(rocdl.exp2(compute_type, t.ir_value())) for t in tt]
                 den = [c_one_f + e for e in emu]
                 sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
                 return [sc[i] * sig[i] for i in range(len(s_list))]
@@ -695,7 +680,7 @@ def build_hstu_attention_fwd(
             p_packs = compute_p_tile(kv_start, k_packs)  # GEMM1(i) overlaps V[i] global load
             _waitcnt_vm_n(0)  # V[i] arrived
             store_v_regs_to_lds(v_vecs)
-            rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_V, 0)
+            rocdl.sched_dswr(NUM_BATCHES_V)  # keep the NUM_BATCHES_V V LDS writes grouped
             gpu.barrier()  # V[i] LDS published
             o_acc = accum_o_tile(o_acc, p_packs)  # GEMM2(i): O += P·V
             # The next iteration's K publish barrier also fences GEMM2(i)'s v_smem reads before
