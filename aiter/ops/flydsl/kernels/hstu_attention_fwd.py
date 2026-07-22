@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """hstu_attention_fwd - FlyDSL kernel
 
 out_i = (1/N) * sum_j valid(i,j) * silu(alpha * q_i * k_j^T) * v_j
@@ -33,13 +36,18 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import ArithValue
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
+
+from aiter.ops.flydsl.kernels.hstu_attention_common import (
+    decode_lane,
+    grouped_loader,
+    swz_col,
+)
 
 
 def _dtype_to_elem_type(dtype_str: str):
@@ -135,7 +143,7 @@ def validate_hstu_attention_fwd(
     if arch is None:
         arch = get_rocm_arch()
     if not arch.startswith("gfx942") and not arch.startswith("gfx950"):
-        raise ValueError(f"hstu attention fwdunsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')")
+        raise ValueError(f"hstu_attention_fwd unsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')")
 
     if dtype_str not in {"f16", "bf16"}:
         raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
@@ -324,7 +332,6 @@ def build_hstu_attention_fwd(
     ) -> None:
         elem_type = elem_dtype.ir_type
         compute_type = fx.Float32.ir_type
-        fm_fast = arith.FastMathFlags.fast
         v4f32_type = Vec.make_type(MFMA_ELEMS_PER_LANE, fx.Float32)
         mfma_pack_type = Vec.make_type(MFMA_LANE_K, elem_dtype)
         c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
@@ -336,12 +343,11 @@ def build_hstu_attention_fwd(
             """MFMA accumulate through the layout MMA atom."""
             return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
 
-        # ---- Thread / lane indices ----
+        # ---- Thread / lane indices (layout-algebra decode) ----
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id = tid // fx.Int32(WARP_SIZE)
-        lane = tid % fx.Int32(WARP_SIZE)
-        lane_mod_16 = lane % fx.Int32(MFMA_N)
-        lane_div_16 = lane // fx.Int32(MFMA_N)
+        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+            tid, NUM_WAVES, WARP_SIZE, MFMA_N
+        )
 
         # ---- Group-major grid decode -> (batch_idx, head_idx, q_tile_idx) ----
         block_id = fx.Int32(gpu.block_idx.x)
@@ -369,32 +375,17 @@ def build_hstu_attention_fwd(
             max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
 
         # ---- Global tensor views (layout-algebra access; addresses carried by make_layout) ----
-        # Group rows into g-wide coordinate slices for coalesced vector loads.
-        #
-        # The row*row_stride term must be computed in 64-bit: on packed tensors the largest element
-        # index (L*H*dim) exceeds int32, and a 32-bit row multiply wraps -> OOB fault. A make_view
-        # built from Python-int strides lowers to an i32-index view (crd2idx truncates even an i64
-        # coord), so (row, head) is fixed through the tensor arg's own i64-strided layout first; the
-        # resulting sub-view carries the i64 base, and the g-wide in-row vector load is a small,
-        # coalesced i32 access over the < int32 in-row span.
-        def grouped_loader(t, dim, g):
-            in_row = fx.make_layout((dim // g, g), (g, 1))
-
-            def load(row_i64, head_val, colgrp):
-                sub = t[row_i64, head_val, None]
-                return fx.make_view(fx.get_iter(sub), in_row)[colgrp, None].load()
-
-            return load
-
+        # grouped_loader (shared) groups rows into g-wide coordinate slices for coalesced vector
+        # loads. The row*row_stride term is carried in 64-bit by the tensor arg's own i64-strided
+        # layout, so the base address cannot overflow on large packed tensors.
         q_load = grouped_loader(q, head_dim, MFMA_LANE_K)
         v_load = grouped_loader(v, hidden_dim, VEC_V)  # V register-prefetch path (coalesced global -> regs)
 
         q_head_offset = head_idx * fx.Int32(head_dim)
 
-        # ---- K DMA buffer resource (per-(seq,head) base folded into the descriptor) ----
+        # ---- K DMA base (per-(seq,head) byte offset folded into the rebased descriptor) ----
         # V uses a register-prefetch path (async_load_v_regs via v_load), not a buffer resource.
         k_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)) * fx.Int64(2)
-        k_rsrc = buffer_ops.create_buffer_resource(k, max_size=True, base_byte_offset=k_base_byte_offset)
 
         # LDS as shape-carried 2D views: [BLOCK_N, stride] so an LDS access is Vec.load/store on
         # (row, col) with the stride carried by the memref layout (no manual row*stride+col). The
@@ -405,10 +396,45 @@ def build_hstu_attention_fwd(
         v_smem = SmemPtr(lds_base, v_lds_offset, elem_type, shape=(BLOCK_N, V_STRIDE))
         k_lds_byte_base = buffer_ops.extract_base_index(k_smem.get(), address_space=3)
 
-        # Single source of truth for the K LDS swizzle: XOR the column with the tile row's low bits.
-        # Shared by the DMA global-fetch column and the LDS read column.
+        # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
+        # A BufferCopyLDS atom drives the buffer_load_lds instruction through the FlyDSL copy-atom.
+        # The atom hardcodes the cache-policy/aux operand to 0.
+        _buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
+        _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8)
+        _lds_ptr_ty = fx.PointerType.get(elem_type, 2, DMA_BYTES)
+
+        def _rebased_buffer_div(base_iter, byte_off, n_elems):
+            # Fold the (large) seq/head base into the 48-bit descriptor base so the per-lane element
+            # index stays a small 32-bit voffset; max_size records via the 0xFFFFFFFF num-records.
+            base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+            shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
+            buf_ptr_ty = fx.PointerType.get(
+                elem_ty=elem_type,
+                address_space=_TargetAddressSpace.BufferDesc,
+                alignment=base_iter.alignment,
+            )
+            buf_ptr = fx.make_ptr(
+                buf_ptr_ty,
+                [
+                    shifted,
+                    fx.Int16(0).ir_value(),
+                    fx.Int64(0xFFFFFFFF).ir_value(),
+                    _buf_flags_i32.ir_value(),
+                ],
+            )
+            return fx.logical_divide(
+                fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
+                fx.make_layout(1, 1),
+            )
+
+        k_div = _rebased_buffer_div(
+            fx.get_iter(k), k_base_byte_offset, max_seq_len * stride_qk_n
+        )
+
+        # Single source of truth for the K LDS swizzle (shared): XOR the column with the tile row's
+        # low bits. Shared by the DMA global-fetch column and the LDS read column.
         def k_swz_col(tile_row, col):
-            return col ^ ((tile_row & fx.Int32(K_SWZ_ROWS - 1)) << fx.Int32(K_SWZ_SHIFT))
+            return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
 
         q_wave_base = q_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(ROWS_PER_WAVE)
 
@@ -432,12 +458,6 @@ def build_hstu_attention_fwd(
             q_packs.append(per_qg)
 
         # ---- Score-gate helpers ----
-        def _fadd(a, b):
-            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
-
-        def _fmul(a, b):
-            return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
-
         c_alpha = fx.Float32(alpha)
         c_inv_n = fx.Float32(1.0 / max_seq_len)
         c_neg_log2e = fx.Float32(-_LOG2E)
@@ -446,13 +466,25 @@ def build_hstu_attention_fwd(
 
         def silu_scale_batch(s_list):
             """Saturating silu(alpha*s) for a list of scores, stage-batched for ILP.
-            1/N is hoisted to the O epilogue."""
-            sc = [_fmul(s, c_alpha) for s in s_list]
-            tt = [_fmul(s, c_neg_log2e) for s in sc]
-            emu = [llvm.call_intrinsic(compute_type, "llvm.amdgcn.exp2.f32", [t], [], []) for t in tt]
-            den = [_fadd(c_one_f, e) for e in emu]
-            sig = [llvm.call_intrinsic(compute_type, "llvm.amdgcn.rcp.f32", [d], [], []) for d in den]
-            return [_fmul(sc[i], sig[i]) for i in range(len(s_list))]
+            1/N is hoisted to the O epilogue.
+
+            The fastmath context gives every add/mul the `fast` flag; exp2 stays on the
+            amdgcn approximate hardware op (math.exp2 lowers to a slower expansion) and
+            rcp goes through the rocdl builder."""
+            with arith.fastmath(arith.FastMathFlags.fast):
+                sc = [s * c_alpha for s in s_list]
+                tt = [s * c_neg_log2e for s in sc]
+                emu = [
+                    fx.Float32(
+                        llvm.call_intrinsic(
+                            compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], []
+                        )
+                    )
+                    for t in tt
+                ]
+                den = [c_one_f + e for e in emu]
+                sig = [fx.Float32(rocdl.rcp(compute_type, d)) for d in den]
+                return [sc[i] * sig[i] for i in range(len(s_list))]
 
         def to_id(x):
             """Raw position -> masked id (contextual prefix shift, then target-tail clamp)."""
@@ -471,8 +503,8 @@ def build_hstu_attention_fwd(
                 cmask = fx.Int32(0xFFFF0000)
 
                 def bf16_pair(lo_f32, hi_f32):
-                    lo_i32 = fx.Int32(ArithValue(lo_f32).bitcast(fx.Int32.ir_type))
-                    hi_i32 = fx.Int32(ArithValue(hi_f32).bitcast(fx.Int32.ir_type))
+                    lo_i32 = fx.Float32(lo_f32).bitcast(fx.Int32)
+                    hi_i32 = fx.Float32(hi_f32).bitcast(fx.Int32)
                     return (hi_i32 & cmask) | lo_i32.shrui(c16)
 
                 pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
@@ -520,10 +552,6 @@ def build_hstu_attention_fwd(
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
 
         # ---- K DMA: global -> LDS (dword, swizzled global fetch) ----
-        dma_size = fx.Int32(DMA_BYTES)
-        dma_soff = fx.Int32(0)
-        dma_off = fx.Int32(0)
-        dma_aux = fx.Int32(1)
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_k = fx.Int32(PAIRS_PER_ROW_K)
 
@@ -542,15 +570,17 @@ def build_hstu_attention_fwd(
         c_stride_qk_n = fx.Int32(stride_qk_n)
 
         def async_load_k(kv_start):
-            """Issue the async K[kv_start] dword DMA passes, global->LDS (swizzled)."""
+            """Issue the async K[kv_start] dword DMA passes, global->LDS (swizzled), via the
+            BufferCopyLDS copy-atom."""
             for d in range_constexpr(NUM_DMA_K):
                 row = k_dma_rows[d]
                 in_bounds = (kv_start + row) < seq_len
                 local_tok = in_bounds.select(kv_start + row, fx.Int32(0))
-                g_elem = local_tok * c_stride_qk_n + k_dma_gcols[d]
-                voffset = g_elem * fx.Int32(2)
-                lds_ptr = buffer_ops.create_llvm_ptr(wave_lds_lane0_k + fx.Int64(d * BLOCK_THREADS * DMA_BYTES), address_space=3)
-                rocdl.raw_ptr_buffer_load_lds(k_rsrc, lds_ptr, dma_size, voffset, dma_soff, dma_off, dma_aux)
+                src_elem = local_tok * c_stride_qk_n + k_dma_gcols[d]
+                lds_byte = fx.Int32(wave_lds_lane0_k + fx.Int64(d * BLOCK_THREADS * DMA_BYTES))
+                dst = fx.make_view(fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1))
+                src = fx.slice(k_div, (None, fx.Int32(src_elem)))
+                fx.copy(_dma_atom, src, dst)
 
         # ---- V register prefetch: coalesced global -> registers (non-blocking) ----
         # Lane (tid) owns row = tid//THREADS_PER_ROW_V (+ batch*ROWS_PER_BATCH_V), col base =
@@ -687,16 +717,17 @@ def build_hstu_attention_fwd(
             # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
             # therefore q_wave_base + qg*16 + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
             results = list(loop_results) if isinstance(loop_results, (list, tuple)) else [loop_results]
-            for qg in range_constexpr(Q_SUBTILES):
-                q_row_base = q_wave_base + fx.Int32(qg * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                for e in range_constexpr(MFMA_ELEMS_PER_LANE):
-                    q_row_e = q_row_base + fx.Int32(e)
-                    if q_row_e < seq_len:
-                        for c in range_constexpr(D_CHUNKS):
-                            ov = results[c * Q_SUBTILES + qg]
-                            d_col = fx.Int32(c * MFMA_M) + lane_mod_16
-                            val = fx.Float32(_fmul(Vec(ov)[e], c_inv_n)).to(elem_dtype)
-                            out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
+            with arith.fastmath(arith.FastMathFlags.fast):
+                for qg in range_constexpr(Q_SUBTILES):
+                    q_row_base = q_wave_base + fx.Int32(qg * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    for e in range_constexpr(MFMA_ELEMS_PER_LANE):
+                        q_row_e = q_row_base + fx.Int32(e)
+                        if q_row_e < seq_len:
+                            for c in range_constexpr(D_CHUNKS):
+                                ov = results[c * Q_SUBTILES + qg]
+                                d_col = fx.Int32(c * MFMA_M) + lane_mod_16
+                                val = (Vec(ov)[e] * c_inv_n).to(elem_dtype)
+                                out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
 
     _hstu_compile_hints = {
         "fast_fp_math": True,
