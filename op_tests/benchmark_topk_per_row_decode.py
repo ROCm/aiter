@@ -250,8 +250,8 @@ def time_kernel(
         fn()
     torch.cuda.synchronize()
 
-    starts = [torch.cuda.Event(enable_timing=True)]
-    ends = [torch.cuda.Event(enable_timing=True)]
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     samples_us: list[float] = []
     for i in range(iters):
         starts[i].record()
