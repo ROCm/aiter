@@ -675,12 +675,9 @@ def pa_fp8_gqa_decode(
     assert num_query_tokens % mtp == 0
     assert num_kv_heads == 1 and num_q_heads == 8
     assert head_size == 128 and partition_size == 256
-    # block_size 16 is supported by all paths; block_size 64 only by the mg
-    # (mtp>=3) kernel.  The v2 path (mtp<=2) is block_size=16 only.
+    # block_size 16/64 is supported by all paths: the v2 path (mtp<=2) and the
+    # mg (mtp>=3) kernel both carry the BlockSz-templated wide-load addressing.
     assert block_size in (16, 64)
-    assert block_size == 16 or mtp >= 3, (
-        "block_size=64 is only supported by the mtp>=3 (multi-group) path"
-    )
 
     assert k_scale.dtype == torch.float32, (
         "k_scale must be the fp32 view of the packed FP8 scales; call "
@@ -804,10 +801,10 @@ def _pa_fp8_gqa_eligible(
     fp8 = dtypes.fp8
     query_is_fp8 = query.dtype == fp8
     # Per-mtp config gate:
-    #   mtp in {1,2} -> v2 kernel: block_size=16, fp8 OR bf16 query.
+    #   mtp in {1,2} -> v2 kernel: block_size in {16,64}, fp8 OR bf16 query.
     #   mtp == 3     -> mg kernel: block_size in {16,64}, fp8 query only.
     if mtp in (1, 2):
-        config_ok = block_size == 16
+        config_ok = block_size in (16, 64)
     elif mtp == 3:
         # mg kernel accepts fp8 OR bf16 query (bf16 quantised in-kernel),
         # same as the v2 path; block_size 16 or 64.

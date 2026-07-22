@@ -108,7 +108,7 @@ constexpr int kBytesPerWideQkhe    = v0::kRowsPerWarp * kBytesPerChunkAllSlot; /
 //            prefetch overhead in 1-iter-per-CTA short-ctx cases.
 template <typename output_t, int Mtp,
           typename QIn = __hip_fp8_e4m3_fnuz, bool HasPScale = false,
-          bool EnablePrefetch = true>
+          bool EnablePrefetch = true, int BlockSz = 16>
 __global__ __launch_bounds__(v0::kNumThreads, 2)
 void pa_fp8_main_kernel_v2(
     const QIn* __restrict__                  q,
@@ -138,6 +138,18 @@ void pa_fp8_main_kernel_v2(
     using namespace v0;
     constexpr int kMtp = Mtp;
     static_assert(Mtp == 1 || Mtp == 2, "v2 supports Mtp in {1, 2}");
+    // Runtime page size as a compile-time constant (shadows v0::kBlockSize).
+    // block_size 16/64 share the SAME wide-load addressing; every /kBlockSize
+    // and %kBlockSize below folds to a constant, so the bs=16 codegen is
+    // byte-identical to the pre-BlockSz kernel (zero perf regression).
+    constexpr int kBlockSize = BlockSz;
+    static_assert(BlockSz == 16 || BlockSz == 64, "v2 supports block_size 16 or 64");
+    // K wide-load byte strides, generalized off the runtime page size (the old
+    // v2::kBytes* constants were hard-wired to the 16-slot page).
+    constexpr unsigned int kBytesPerChunkAllSlot_l =
+        (unsigned int)(kBlockSize * kElems16B_fp8);
+    constexpr unsigned int kBytesPerWideQkhe_l =
+        (unsigned int)(kRowsPerWarp * kBlockSize * kElems16B_fp8);
 
     constexpr float kLog2E    = 1.4426950408889634f;
     constexpr float kInvLog2E = 0.6931471805599453f;
@@ -226,7 +238,9 @@ void pa_fp8_main_kernel_v2(
     // ds_read_b128 (4 contiguous fp32) per t.  Layout is warp-local so
     // no cross-warp sync needed; the compiler-emitted `s_waitcnt lgkmcnt`
     // handles the intra-wave RAW hazard between write and read.
-    __shared__ float ks_lds[kNWarps * kTLoop * kBlockSize];
+    // K-scale LDS: one fp32 per token in the 256-token partition (block-size
+    // independent).  kNWarps*kTokensPerWarp == kNWarps*kTLoop*16 == 256.
+    __shared__ float ks_lds[kNWarps * kTokensPerWarp];
 
     // ── Per-kbi phys-block-table LDS staging (FlyDSL-aligned) ───────────
     // Profiling (rocprof, bs=64 ctx=16384 mtp=2) showed our K/V buffer_loads
@@ -249,6 +263,16 @@ void pa_fp8_main_kernel_v2(
     const int q_token_for_lane = (kMtp == 1) ? 0 : (lane16id >> 3);
     const int head_for_lane    = lane16id & (kGqaRatio - 1);
     const int q_head_idx       = wg_start_head_idx + head_for_lane;
+
+    // Per-thread K-scale token → (phys-block, slot) mapping, block-size
+    // agnostic (matches pa_fp8_main_kernel_v2_mg).  `ks_tok` is this lane's
+    // token within the warp's 64-token tile; `ks_blk_idx` indexes the
+    // LDS-staged block table, `ks_slot` is the intra-block slot.  For bs=16
+    // this folds to ks_blk_idx = warpid*4 + rowid, ks_slot = lane16id — the
+    // exact addressing the pre-BlockSz kernel used.
+    const int ks_tok     = warpid * kTokensPerWarp + rowid * 16 + lane16id;
+    const int ks_blk_idx = ks_tok / kBlockSize;
+    const int ks_slot    = ks_tok % kBlockSize;
 
     float qk_base_log2;
     if constexpr (std::is_same<QIn, __hip_fp8_e4m3_fnuz>::value)
@@ -311,7 +335,7 @@ void pa_fp8_main_kernel_v2(
     float  my_ks_carried;
 
     const unsigned int k_chunk_row_off =
-        (unsigned int)rowid * (unsigned int)v2::kBytesPerChunkAllSlot;
+        (unsigned int)rowid * kBytesPerChunkAllSlot_l;
 
     // Cooperative single-shot load of kbi_in's block table into LDS buffer
     // `kbi_in & 1`.  Caller MUST issue a __syncthreads() before any thread
@@ -320,7 +344,9 @@ void pa_fp8_main_kernel_v2(
     // path adds its own).
     auto stage_bt_to_lds = [&](int kbi_in) __attribute__((always_inline))
     {
-        if (warpid == 0 && rowid == 0)
+        // Only the first kBlocksPerKbi lanes have a valid bt_lds slot: for
+        // bs=64 kBlocksPerKbi==4 (< 16), so guard against OOB LDS writes.
+        if (warpid == 0 && rowid == 0 && lane16id < kBlocksPerKbi)
         {
             const int g_idx      = kbi_in * kBlocksPerKbi + lane16id;
             const int g_idx_safe = (g_idx < num_context_blocks)
@@ -343,39 +369,31 @@ void pa_fp8_main_kernel_v2(
         for (int t = 0; t < kTLoop; t++)
         {
             const int klocal_token_idx  = kTokensPerWarp * warpid + t * 16 + lane16id;
-            const int kglobal_token_idx = partition_start_token_idx_x + klocal_token_idx;
             // Phys block from the LDS-staged block table (stage_bt_to_lds),
             // not a per-lane global_load — breaks the block_table_seq[...] ->
             // K-address dependency chain that serialised the K buffer_loads.
-            kphys_local[t]              = bt_lds[kbi_in & 1][warpid * kTLoop + t];
-            kphys_off_local[t]          = kglobal_token_idx % kBlockSize;
+            // Block-size agnostic: warp's t-th 16-token chunk maps to page
+            // (warp*64 + t*16)/block_size.  For bs=16 this is warpid*4 + t.
+            kphys_local[t]              = bt_lds[kbi_in & 1]
+                                            [(warpid * kTokensPerWarp + t * 16) / kBlockSize];
+            kphys_off_local[t]          = klocal_token_idx % kBlockSize;
         }
 
-        // Per-thread K-scale fetch (mirrors FlyDSL's `_load_my_k_scale_from_vgpr`):
-        // each thread gets its `kphys[rowid]` directly from VGPR (avoids
-        // the LDS round-trip needed by the K-data path's wider broadcast).
-        int my_kphys;
-        if (rowid == 0)      my_kphys = kphys_local[0];
-        else if (rowid == 1) my_kphys = kphys_local[1];
-        else if (rowid == 2) my_kphys = kphys_local[2];
-        else                 my_kphys = kphys_local[3];
-        // K-scale element offset using the tensor's REAL strides (fp32 elems):
+        // Per-thread K-scale fetch, block-size agnostic (matches
+        // pa_fp8_main_kernel_v2_mg).  This lane's token `ks_tok` lives in page
+        // `bt_lds[ks_blk_idx]` at slot `ks_slot`; k_scale is addressed with the
+        // tensor's REAL strides (fp32 elems) so dense flat AND FlyDSL
+        // packed/padded views are consumed zero-copy:
         //   ks_off = kphys*ks_block_stride + kv_head*ks_head_stride + slot
-        // This reads whatever layout k_scale actually has, so a strided/padded
-        // view is consumed zero-copy (no host .contiguous() needed):
         //   flat   [nb, nkv, bs]            → stride(0)=nkv*bs, stride(-2)=bs
         //   packed [nb, 1, nkv, head_dim/4] → stride(0)=padded-block stride,
         //                                     stride(-2)=head_dim/4
-        // The legacy formula (kphys*gridDim.z + kv_head)*ks_head_stride hard-wired
-        // the block stride to gridDim.z*ks_head_stride, which only held when the
-        // scale buffer was densely packed; it silently mis-addressed the padded
-        // FlyDSL view on the block axis.  For the packed layout scale_rows==1
-        // (block_size*4 <= head_dim at v2's fixed bs=16/hd=128) so slot stays in
-        // row 0 and the padding tail is never read.
+        // For bs=16 (ks_blk_idx=warpid*4+rowid, ks_slot=lane16id) this is the
+        // exact addressing the pre-BlockSz kernel used.
         const int64_t ks_off =
-              static_cast<int64_t>(my_kphys) * ks_block_stride
+              static_cast<int64_t>(bt_lds[kbi_in & 1][ks_blk_idx]) * ks_block_stride
             + static_cast<int64_t>(kv_head_idx) * ks_head_stride
-            + lane16id;
+            + ks_slot;
         my_ks_carried = k_scale_ptr[ks_off];
 
         // Issue all K-data buffer_loads for this kbi (8 dwordx4 / lane).
@@ -395,7 +413,7 @@ void pa_fp8_main_kernel_v2(
             {
                 const unsigned int voff =
                     k_base_voffset
-                    + (unsigned int)qkhe * (unsigned int)v2::kBytesPerWideQkhe;
+                    + (unsigned int)qkhe * kBytesPerWideQkhe_l;
                 const pa_u32x4 v = pa_buffer_load_b128(k_block_rsrc, voff);
                 Klocal_carried[t][qkhe].lo = pa_u32x4_low_long(v);
                 Klocal_carried[t][qkhe].hi = pa_u32x4_high_long(v);
@@ -555,13 +573,18 @@ void pa_fp8_main_kernel_v2(
             //     latency already paid for.
             //   EnablePrefetch=false → loaded inline at iter start (just
             //     above), compiler inserts implicit waitcnt here.
-            ks_lds[warpid * (kTLoop * kBlockSize) + rowid * kBlockSize + lane16id] =
+            // K-scale LDS is a flat per-token buffer (block-size independent):
+            // ks_lds[warp*64 + tok] holds the scale of the warp's local token
+            // `tok`.  ks_tok = rowid*16 + lane16id covers 0..63.  For bs=16
+            // this equals the old warp*(kTLoop*16) + rowid*16 + lane16id.
+            ks_lds[warpid * kTokensPerWarp + rowid * 16 + lane16id] =
                 my_ks_carried;
 
-            // Wide V phys-block table: rowid now selects which of the 4
-            // blocks within a v_group (= warp's tile of 4 blocks).  Each
-            // PV MFMA pair covers slots 0..7 (lo) + slots 8..15 (hi) of
-            // those 4 blocks → 64 tokens per (v_group, vhe).
+            // Wide V phys-block table.  Block-size agnostic: v_group's 64-token
+            // tile (offset rowid*16) maps to page (v_group*64 + rowid*16)/bs.
+            //   bs=16 → v_group*4 + rowid (rowid picks 1 of 4 blocks/v_group).
+            //   bs=64 → v_group           (the whole tile is one page; rowid
+            //           instead selects a 16-slot sub-range via v_base_voffset).
             unsigned int v_phys_block_wide[kNWarps];
             #pragma unroll
             for (int v_group = 0; v_group < kNWarps; v_group++)
@@ -571,7 +594,8 @@ void pa_fp8_main_kernel_v2(
                 // barrier / the prologue barrier) — removes the per-lane
                 // block_table_seq[...] global_load on the V-address path.
                 v_phys_block_wide[v_group] =
-                    (unsigned int)bt_lds[kbi & 1][v_group * kRowsPerWarp + rowid];
+                    (unsigned int)bt_lds[kbi & 1]
+                        [(v_group * kTokensPerWarp + rowid * 16) / kBlockSize];
             }
 
             // Wide V load: 1 dwordx4 per (v_group, vhe), reading 16 slots
@@ -585,8 +609,13 @@ void pa_fp8_main_kernel_v2(
                         v_cache + kv_head_base_offset
                         + static_cast<int64_t>(v_phys)
                               * static_cast<int64_t>(kv_block_stride));
+                // head_dim row (warp*16+lane16id) × block_size, plus the
+                // intra-page slot base for this v_group's rowid tile.  For
+                // bs=16 the slot base is 0 (each rowid is its own page); for
+                // bs=64 rowid selects slots {rowid*16 .. +15} within the page.
                 const unsigned int v_base_voffset =
-                    (unsigned int)(warpid * 16 + lane16id) * kBlockSize;
+                    (unsigned int)(warpid * 16 + lane16id) * kBlockSize
+                    + (unsigned int)((v_group * kTokensPerWarp + rowid * 16) % kBlockSize);
                 // Non-temporal (L2-bypass) V loads.  Each V byte is read
                 // exactly once per workgroup (paged-attention has no
                 // intra-WG V reuse), so caching V in L2 would only thrash
@@ -620,7 +649,7 @@ void pa_fp8_main_kernel_v2(
                 // (one ds_read_b128 per t).  The HBM K-scale load latency
                 // was hidden by prev iter's PV MFMA (cross-kbi prefetch).
                 const float* ks_row =
-                    &ks_lds[warpid * (kTLoop * kBlockSize) + t * kBlockSize + rowid * 4];
+                    &ks_lds[warpid * kTokensPerWarp + t * 16 + rowid * 4];
                 const float4 ks4 = *reinterpret_cast<const float4*>(ks_row);
                 d_out[t][0] *= qk_base_log2 * ks4.x;
                 d_out[t][1] *= qk_base_log2 * ks4.y;

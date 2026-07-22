@@ -243,7 +243,8 @@ void launch_main_v2_impl(
     TORCH_CHECK(num_q_heads == 8, "v2 requires num_q_heads=8, got ", num_q_heads);
     TORCH_CHECK(num_kv_heads == 1, "v2 requires num_kv_heads=1, got ", num_kv_heads);
     TORCH_CHECK(head_size == 128, "v2 requires head_size=128, got ", head_size);
-    TORCH_CHECK(block_size == 16, "v2 requires block_size=16, got ", block_size);
+    TORCH_CHECK(block_size == 16 || block_size == 64,
+                "v2 requires block_size in {16, 64}, got ", block_size);
     TORCH_CHECK(mtp == 1 || mtp == 2, "v2 requires mtp in {1, 2}, got ", mtp);
     TORCH_CHECK(num_kblocks_per_fat_part >= 1,
                 "num_kblocks_per_fat_part must be >= 1");
@@ -292,15 +293,16 @@ void launch_main_v2_impl(
     const float* p_scale_ptr     = maybe_data_ptr_f32(p_scale_t);
     const float* p_scale_inv_ptr = maybe_data_ptr_f32(p_scale_inv_t);
 
-    auto launch_full = [&](auto mtp_c, auto qin_tag, auto hps_c, auto pf_c) {
+    auto launch_full = [&](auto mtp_c, auto qin_tag, auto hps_c, auto pf_c, auto bs_c) {
         constexpr int  kMtp     = decltype(mtp_c)::value;
         using QIn               = typename decltype(qin_tag)::type;
         constexpr bool kHPS     = decltype(hps_c)::value;
         constexpr bool kPrefetch = decltype(pf_c)::value;
+        constexpr int  kBlockSz = decltype(bs_c)::value;
 
         const QIn* q_ptr = reinterpret_cast<const QIn*>(query.data_ptr());
 
-        pa_fp8_main_kernel_v2<output_t, kMtp, QIn, kHPS, kPrefetch>
+        pa_fp8_main_kernel_v2<output_t, kMtp, QIn, kHPS, kPrefetch, kBlockSz>
             <<<grid, block, 0, stream>>>(
                 q_ptr, k_ptr, v_ptr,
                 static_cast<float>(scale),
@@ -334,9 +336,16 @@ void launch_main_v2_impl(
     // actual context_len.
     const bool use_prefetch = (num_kblocks_per_fat_part >= 2);
 
+    auto launch_with_bs = [&](auto mtp_c, auto qin_tag, auto hps_c, auto pf_c) {
+        if (block_size == 64)
+            launch_full(mtp_c, qin_tag, hps_c, pf_c, std::integral_constant<int, 64>{});
+        else
+            launch_full(mtp_c, qin_tag, hps_c, pf_c, std::integral_constant<int, 16>{});
+    };
+
     auto launch_with_pf = [&](auto mtp_c, auto qin_tag, auto hps_c) {
-        if (use_prefetch) launch_full(mtp_c, qin_tag, hps_c, std::true_type{});
-        else              launch_full(mtp_c, qin_tag, hps_c, std::false_type{});
+        if (use_prefetch) launch_with_bs(mtp_c, qin_tag, hps_c, std::true_type{});
+        else              launch_with_bs(mtp_c, qin_tag, hps_c, std::false_type{});
     };
 
     auto launch_with_hps = [&](auto mtp_c, auto qin_tag) {
