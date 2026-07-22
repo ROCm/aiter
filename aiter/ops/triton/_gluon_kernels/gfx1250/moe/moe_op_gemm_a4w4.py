@@ -240,9 +240,9 @@ def _moe_gemm_a4w4_gfx1250(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
-    start_m = start_m.to(index_type)
-    pid_n = pid_n.to(index_type)
+    # expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
+    # start_m = start_m.to(index_type)
+    # pid_n = pid_n.to(index_type)
 
     # get the packed block sizes
     # both A and B tensors are mxfp4
@@ -263,7 +263,7 @@ def _moe_gemm_a4w4_gfx1250(
     # A pointers
     offs_x_m = PACKED_BLOCK_M_X * block_id
     if GatherIndx is None:
-        X += start_m * stride_x_m
+        X += start_m.to(index_type) * stride_x_m
     else:
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
             0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
@@ -273,7 +273,7 @@ def _moe_gemm_a4w4_gfx1250(
         offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
 
     # B pointers
-    W += expt_id * stride_w_e
+    W += expt_id.to(index_type) * stride_w_e
     if PRESHUFFLE_WEIGHTS:
         W_PRESHUFFLE_FACTOR: gl.constexpr = 16
         W_BLOCK_K: gl.constexpr = PACKED_BLOCK_K_W * W_PRESHUFFLE_FACTOR
@@ -286,7 +286,7 @@ def _moe_gemm_a4w4_gfx1250(
 
     # A scale pointers
     if GatherIndx is None:
-        XMxScale += start_m * stride_x_mx_m
+        XMxScale += start_m.to(index_type) * stride_x_mx_m
     if not X_SCALES_TDM:
         if GatherIndx is None:
             offs_x_m_scales = (
@@ -312,7 +312,7 @@ def _moe_gemm_a4w4_gfx1250(
         )
 
     # B scale pointers
-    WMxScale += expt_id * stride_w_mx_e
+    WMxScale += expt_id.to(index_type) * stride_w_mx_e
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         PRESHUFFLE_FACTOR: gl.constexpr = 32
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
@@ -803,7 +803,7 @@ def _moe_gemm_a4w4_gfx1250(
 
     # write-back via TDM store: registers -> shared memory -> global memory
     out = out.to(gl.bfloat16)
-    Y += start_m * stride_y_m
+    Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
         shape=[BLOCK_M, OUT_BLOCK_N],
