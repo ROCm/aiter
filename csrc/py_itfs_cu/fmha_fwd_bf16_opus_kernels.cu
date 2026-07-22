@@ -56,9 +56,8 @@ void launch_d128(aiter_tensor_t& q,
     AITER_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1 && out.stride(3) == 1,
                 "q/k/v/out must be contiguous along the head dim D");
 
-    // 32-bit buffer-offset guard: the kernel's async KV load uses a 32-bit soffset that is
-    // NOT rebuilt into the descriptor base per tile, so a per-(batch,head) KV byte extent
-    // >= 2^32 wraps and far KV tiles are silently misread. Reject rather than compute wrong.
+    // 32-bit KV buffer-offset guard: extent >= 2^32 wraps the async-load soffset (silent
+    // wrong output), reject instead.
     const long long kv_slice_bytes = (long long)N_KV * (long long)k.stride(1) * 2LL;  // bf16
     AITER_CHECK(kv_slice_bytes < (1LL << 32),
                 "OPUS D=128: KV byte extent ", kv_slice_bytes,
@@ -240,9 +239,8 @@ void launch_d192_v128(aiter_tensor_t& q,
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
 
-    // 32-bit buffer-offset guard (same as D=128): the per-sequence K/V byte extent must fit
-    // in 2^32, else the 32-bit async-load soffset wraps and far KV tiles are silently
-    // misread. N_KV bounds the per-group extent in group mode (max_seqlen_k).
+    // 32-bit KV buffer-offset guard (same as D=128); N_KV bounds the per-group extent in
+    // group mode (max_seqlen_k).
     const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
     const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
     AITER_CHECK(k_slice_bytes < (1LL << 32) && v_slice_bytes < (1LL << 32),

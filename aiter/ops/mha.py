@@ -1925,11 +1925,8 @@ def _flash_attn_forward(
             return False
         if not (hdim_q == 128 and hdim_v == 128):
             return False
-        # 32-bit buffer-offset limit: the kernel's async KV load uses a 32-bit soffset that
-        # is not rebuilt into the descriptor base per tile, so a per-(batch,head) KV byte
-        # extent >= 2^32 wraps and far KV tiles are silently misread. Use the actual seqlen
-        # stride (layout-aware; matches the C++ launcher's k.stride(1) guard) so BHSD /
-        # sliced / padded inputs are handled correctly. Fall back to v3/CK otherwise.
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
+        # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
         if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
             return False
         return True
@@ -1940,9 +1937,7 @@ def _flash_attn_forward(
             return False
         if not (hdim_q == 192 and hdim_v == 128):
             return False
-        # 32-bit buffer-offset limit (same as D=128): per-(batch,head) K/V byte extent must
-        # fit in 2^32, else the 32-bit async-load soffset wraps and far KV tiles are misread.
-        # Use actual seqlen strides (layout-aware; matches the C++ k/v.stride(1) guards).
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
         if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
             return False
         if seqlen_k * v.stride(1) * v.element_size() >= (1 << 32):
