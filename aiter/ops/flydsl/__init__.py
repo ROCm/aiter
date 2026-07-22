@@ -13,11 +13,7 @@ from packaging.version import Version
 from .utils import is_flydsl_available
 from .moe_common import GateMode
 
-# Kimi-K3 note: the K3 FlyDSL MoE kernels (mixed_moe_gemm_2stage.py) call
-# rocdl._split_mfma_operands(loc=...), an API flydsl removed in 0.2.4
-# (0.2.2 still accepts loc=). rocm main bumped _MIN_FLYDSL_VERSION to 0.2.4
-# for unrelated kernels; the K3 path needs 0.2.2, so pin it here.
-_MIN_FLYDSL_VERSION = Version("0.2.2")
+_MIN_FLYDSL_VERSION = Version("0.2.4")
 
 __all__ = [
     "is_flydsl_available",
