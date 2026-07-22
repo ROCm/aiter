@@ -198,7 +198,9 @@ def validate_hstu_attention_fwd(
         raise ValueError(f"block_threads={block_threads} must be divisible by threads_per_row_v={threads_per_row_v}")
     rows_per_batch_v = block_threads // threads_per_row_v
     if not (block_n % rows_per_batch_v == 0 or rows_per_batch_v > block_n):
-        raise ValueError(f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n")
+        raise ValueError(
+            f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n"
+        )
 
     lds_cap = lds_cap_bytes()
     lds_bytes = block_n * head_dim_k * 2 + block_n * hidden_dim * 2
@@ -350,9 +352,7 @@ def build_hstu_attention_fwd(
 
         # ---- Thread / lane indices (layout-algebra decode) ----
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
-            tid, NUM_WAVES, WARP_SIZE, MFMA_N
-        )
+        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(tid, NUM_WAVES, WARP_SIZE, MFMA_N)
 
         # ---- Group-major grid decode -> (batch_idx, head_idx, q_tile_idx) ----
         block_id = fx.Int32(gpu.block_idx.x)
@@ -419,9 +419,7 @@ def build_hstu_attention_fwd(
             )
             return fx.logical_divide(g_flat, fx.make_layout(1, 1))
 
-        k_div = _rebased_buffer_div(
-            fx.get_iter(k), k_base_byte_offset, max_seq_len * stride_qk_n
-        )
+        k_div = _rebased_buffer_div(fx.get_iter(k), k_base_byte_offset, max_seq_len * stride_qk_n)
 
         # Single source of truth for the K LDS swizzle (shared): XOR the column with the tile row's
         # low bits. Shared by the DMA global-fetch column and the LDS read column.
@@ -602,7 +600,9 @@ def build_hstu_attention_fwd(
             packs = []
             for ks in range_constexpr(K_STEPS_K):
                 k_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                packs.append(Vec.load(mfma_pack_type, k_smem.get(), [fx.Index(k_row), fx.Index(k_swz_col(k_row, k_col))]))
+                packs.append(
+                    Vec.load(mfma_pack_type, k_smem.get(), [fx.Index(k_row), fx.Index(k_swz_col(k_row, k_col))])
+                )
             return packs
 
         def compute_p_tile(kv_start, k_packs_by_ng):
@@ -654,7 +654,13 @@ def build_hstu_attention_fwd(
                     # b[i] = V[kv_lane + i, d_col]; 2D-indexed on the LDS view V[kv, d].
                     elems = []
                     for i in range_constexpr(MFMA_LANE_K):
-                        elems.append(Vec.load(Vec.make_type(1, elem_dtype), v_smem.get(), [fx.Index(kv_lane + fx.Int32(i)), fx.Index(d_col)]))
+                        elems.append(
+                            Vec.load(
+                                Vec.make_type(1, elem_dtype),
+                                v_smem.get(),
+                                [fx.Index(kv_lane + fx.Int32(i)), fx.Index(d_col)],
+                            )
+                        )
                     v_packs.append(Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value())
                 for qg in range_constexpr(Q_SUBTILES):
                     acc_off = c * Q_SUBTILES + qg
@@ -690,7 +696,9 @@ def build_hstu_attention_fwd(
         if active:
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
-            for kv_tile, it in range(fx.Index(kv_tile_start), fx.Index(n_tiles), fx.Index(1), init=acc_init):  # ty: ignore
+            for kv_tile, it in range(
+                fx.Index(kv_tile_start), fx.Index(n_tiles), fx.Index(1), init=acc_init
+            ):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
                 o_acc = [it_list[i] for i in range(N_ACC)]
                 kv_start = fx.Int32(kv_tile) * fx.Int32(BLOCK_N)

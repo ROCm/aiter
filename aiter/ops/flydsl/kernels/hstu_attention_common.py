@@ -12,6 +12,7 @@ division/modulo.
 All helpers build FlyDSL expressions and must be called from inside a
 @flyc.kernel body.
 """
+
 from __future__ import annotations
 
 import flydsl.expr as fx
@@ -31,9 +32,7 @@ def decode_lane(tid, num_waves: int, warp_size: int, mfma_n: int):
     wave_id = fx.Int32(fx.get(wave_lane, 0))
     lane = fx.Int32(fx.get(wave_lane, 1))
 
-    lane_split = fx.idx2crd(
-        lane, fx.make_layout((warp_size // mfma_n, mfma_n), (mfma_n, 1))
-    )
+    lane_split = fx.idx2crd(lane, fx.make_layout((warp_size // mfma_n, mfma_n), (mfma_n, 1)))
     lane_div_n = fx.Int32(fx.get(lane_split, 0))
     lane_mod_n = fx.Int32(fx.get(lane_split, 1))
     return wave_id, lane, lane_div_n, lane_mod_n
