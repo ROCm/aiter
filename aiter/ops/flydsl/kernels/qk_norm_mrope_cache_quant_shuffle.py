@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused RMSNorm + interleaved 3D-mrope RoPE + per-tensor FP8 quant, with a
-*coalesced* write into a shuffle-layout paged KV cache (FlyDSL, wave64).
+"""Fused RMSNorm + 3D-mrope RoPE + per-tensor FP8 quant, with a hybrid
+coalesced/scatter write into a shuffle-layout paged KV cache (FlyDSL, wave64).
 
 This is the production counterpart of
 ``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`` (the HIP kernel in
@@ -34,10 +34,10 @@ per-token kernel can only ever write isolated ``x``-strided bytes (see
      ``block_size`` tokens x one kv-head, staging the resulting fp8 bytes
      into an LDS tile ``[block_size, head_size]`` per K/V (looped over
      ``block_size // (KV_THREADS // WAVE)`` compile-time iterations);
-  2. after one ``gpu.barrier()``, re-purposes the same threads to copy the
-     whole page-block's-worth of bytes from LDS to the cache as a run of
-     16 B (``dwordx4``) coalesced global stores -- the exact granularity
-     the shuffle layout's contiguous runs support.
+  2. checks the page's slot mapping cooperatively; a complete aligned
+     contiguous page is copied from LDS with 16 B coalesced global stores,
+     while arbitrary/decode mappings, negative slots, and ragged tails use
+     an elementwise HIP-compatible scatter from the same staged bytes.
 
 Why two launches instead of one: Q's output is a plain contiguous
 ``[T, H_q, D]`` tensor with no write-amplification concern, so forcing it
@@ -46,18 +46,18 @@ HBM-traffic benefit. See ``op_tests/flydsl-best-practices.md`` S6.
 
 Scope of this implementation (validated against the Qwen3-VL worst-case
 config: ``H_q=64, H_k=H_v=4, D=128, mrope_section=[24,20,20]``): NEOX-style
-interleaved 3D-mrope, per-tensor FP8 quant, shuffle-layout cache, full
-(non-partial) rotary, non-Gemma RMSNorm, wave64 (gfx942/gfx950). Unsupported
+interleaved or blocked 3D-mrope, per-tensor FP8 quant, shuffle-layout cache,
+full (non-partial) rotary, standard or Gemma RMSNorm, wave64 (gfx942/gfx950).
+Unsupported
 combinations raise ``ValueError``/``NotImplementedError`` with a clear
 message rather than silently producing wrong results -- see
 ``flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``'s validation.
 
 ``num_tokens`` need not be a multiple of ``block_size``: the KV kernel grids
 ``ceil_div(num_tokens, block_size)`` page-blocks and guards every per-token
-read/write in the last (possibly ragged) block behind ``tok < num_tokens``,
-zero-filling that block's unused LDS staging rows so the unconditional
-Phase-2 coalesced copy writes deterministic zero padding rather than
-uninitialized shared memory into the tail page's unused slots.
+read/write in the last (possibly ragged) block behind ``tok < num_tokens``.
+Ragged blocks use the scatter path, so unused physical cache slots are
+preserved exactly as in the HIP implementation.
 """
 
 import math
@@ -131,6 +131,8 @@ def _build_q_kernel(
     head_size: int,
     mrope_section: List[int],
     eps: float,
+    is_interleaved: bool,
+    gemma_norm: bool,
 ):
     H_Q, H_K, H_V, D = num_heads_q, num_heads_k, num_heads_v, head_size
     HALF = D // 2
@@ -146,6 +148,9 @@ def _build_q_kernel(
         q_norm_w: fx.Pointer,  # [D] bf16
         q_out: fx.Pointer,  # [T, H_Q, D] bf16
         num_tokens: fx.Int32,
+        token_offset: fx.Int32,
+        positions_stride_0: fx.Int32,
+        positions_stride_1: fx.Int32,
     ):
         # NOTE: helpers are nested inside the @flyc.kernel body, not sibling
         # functions in _build_q_kernel -- FlyDSL's AST rewriter (dynamic
@@ -171,23 +176,32 @@ def _build_q_kernel(
             falls back to section 0 (temporal). Two ``select()`` ternaries,
             no branching -- valid for any ``col``, not just ``col < WAVE``
             (this is a pure function of the column value)."""
-            mid = col % fx.Int32(3)
-            is_mid1 = mid == fx.Int32(1)
-            boundary = is_mid1.select(
-                fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
-            )
-            in_range = col < boundary
-            use_mid = (mid != fx.Int32(0)) and in_range
-            sect_idx = use_mid.select(mid, fx.Int32(0))
+            if const_expr(is_interleaved):
+                mid = col % fx.Int32(3)
+                is_mid1 = mid == fx.Int32(1)
+                boundary = is_mid1.select(
+                    fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
+                )
+                in_range = col < boundary
+                use_mid = (mid != fx.Int32(0)) and in_range
+                sect_idx = use_mid.select(mid, fx.Int32(0))
+            else:
+                in_section_0 = col < fx.Int32(mrope_section[0])
+                in_section_1 = col < fx.Int32(mrope_section[0] + mrope_section[1])
+                sect_idx = in_section_0.select(
+                    fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
+                )
 
-            pos_i64 = fx.Int64(positions_t[sect_idx * num_tokens + tok])
+            pos_offset = sect_idx * positions_stride_0 + tok * positions_stride_1
+            pos_i64 = fx.Int64(positions_t[pos_offset])
             pos = pos_i64.to(fx.Int32)
             cos_v = fx.BFloat16(cos_sin_t[pos, col]).to(fx.Float32)
             sin_v = fx.BFloat16(cos_sin_t[pos, col + HALF]).to(fx.Float32)
             return cos_v, sin_v
 
         bid_x = fx.block_idx.x  # 0..H_Q-1
-        bid_t = fx.block_idx.y  # token id
+        bid_t = fx.block_idx.y  # token id within this launch chunk
+        tok = fx.Int32(bid_t) + token_offset
         tid = fx.thread_idx.x  # 0..WAVE-1
 
         qkv_t = GTensor(qkv, dtype=T.bf16, shape=(-1, H_Q + H_K + H_V, D))
@@ -202,8 +216,8 @@ def _build_q_kernel(
         sumsq_local = fx.Float32(0.0)
         for k in range_constexpr(VEC_PAIRS):
             col = tid + WAVE * k
-            x0 = fx.BFloat16(qkv_t[bid_t, bid_x, col]).to(fx.Float32)
-            x1 = fx.BFloat16(qkv_t[bid_t, bid_x, col + HALF]).to(fx.Float32)
+            x0 = fx.BFloat16(qkv_t[tok, bid_x, col]).to(fx.Float32)
+            x1 = fx.BFloat16(qkv_t[tok, bid_x, col + HALF]).to(fx.Float32)
             x0s.append(x0)
             x1s.append(x1)
             sumsq_local = sumsq_local + x0 * x0 + x1 * x1
@@ -215,13 +229,16 @@ def _build_q_kernel(
             col = tid + WAVE * k
             w0 = fx.BFloat16(qw_t[col]).to(fx.Float32)
             w1 = fx.BFloat16(qw_t[col + HALF]).to(fx.Float32)
+            if const_expr(gemma_norm):
+                w0 = w0 + fx.Float32(1.0)
+                w1 = w1 + fx.Float32(1.0)
             xn0 = x0s[k] * rstd * w0
             xn1 = x1s[k] * rstd * w1
-            cos_v, sin_v = mrope_cos_sin(col, bid_t, positions_t, cos_sin_t)
+            cos_v, sin_v = mrope_cos_sin(col, tok, positions_t, cos_sin_t)
             o0 = xn0 * cos_v - xn1 * sin_v
             o1 = xn1 * cos_v + xn0 * sin_v
-            q_out_t[bid_t, bid_x, col] = o0.to(fx.BFloat16)
-            q_out_t[bid_t, bid_x, col + HALF] = o1.to(fx.BFloat16)
+            q_out_t[tok, bid_x, col] = o0.to(fx.BFloat16)
+            q_out_t[tok, bid_x, col + HALF] = o1.to(fx.BFloat16)
 
     @flyc.jit
     def launch(
@@ -231,9 +248,22 @@ def _build_q_kernel(
         q_norm_w: fx.Pointer,
         q_out: fx.Pointer,
         num_tokens: fx.Int32,
+        token_offset: fx.Int32,
+        positions_stride_0: fx.Int32,
+        positions_stride_1: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        k = kernel(qkv, positions, cos_sin, q_norm_w, q_out, num_tokens)
+        k = kernel(
+            qkv,
+            positions,
+            cos_sin,
+            q_norm_w,
+            q_out,
+            num_tokens,
+            token_offset,
+            positions_stride_0,
+            positions_stride_1,
+        )
         k.launch(
             grid=(H_Q, fx.Index(num_tokens), 1),
             block=(WAVE, 1, 1),
@@ -258,6 +288,8 @@ def _build_kv_kernel(
     block_size: int,
     x: int,
     emit_flat_kv: bool,
+    is_interleaved: bool,
+    gemma_norm: bool,
 ):
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
@@ -270,11 +302,14 @@ def _build_kv_kernel(
     K_ITERS = _ceil_div(K_TOTAL_RUNS, KV_THREADS)
     V_TOTAL_RUNS = (block_size // x) * D  # dwordx4 runs to write (V)
     V_ITERS = _ceil_div(V_TOTAL_RUNS, KV_THREADS)
+    SCATTER_ELEMS = block_size * D
+    SCATTER_ITERS = _ceil_div(SCATTER_ELEMS, KV_THREADS)
 
     @fx.struct
     class SharedStorage:
         k_lds: fx.Array[fx.Int8, STAGE_ELEMS, 16]
         v_lds: fx.Array[fx.Int8, STAGE_ELEMS, 16]
+        mapping_ok: fx.Array[fx.Int32, 1, 4]
 
     _name_parts = [
         "qk_norm_mrope_kv_shuffle",
@@ -302,6 +337,8 @@ def _build_kv_kernel(
         k_out: fx.Pointer,  # [T, H_K, D] u8 flat (dummy unless emit_flat_kv)
         v_out: fx.Pointer,  # [T, H_V, D] u8 flat (dummy unless emit_flat_kv)
         num_tokens: fx.Int32,
+        positions_stride_0: fx.Int32,
+        positions_stride_1: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
 
@@ -313,16 +350,24 @@ def _build_kv_kernel(
             return v
 
         def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
-            mid = col % fx.Int32(3)
-            is_mid1 = mid == fx.Int32(1)
-            boundary = is_mid1.select(
-                fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
-            )
-            in_range = col < boundary
-            use_mid = (mid != fx.Int32(0)) and in_range
-            sect_idx = use_mid.select(mid, fx.Int32(0))
+            if const_expr(is_interleaved):
+                mid = col % fx.Int32(3)
+                is_mid1 = mid == fx.Int32(1)
+                boundary = is_mid1.select(
+                    fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
+                )
+                in_range = col < boundary
+                use_mid = (mid != fx.Int32(0)) and in_range
+                sect_idx = use_mid.select(mid, fx.Int32(0))
+            else:
+                in_section_0 = col < fx.Int32(mrope_section[0])
+                in_section_1 = col < fx.Int32(mrope_section[0] + mrope_section[1])
+                sect_idx = in_section_0.select(
+                    fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
+                )
 
-            pos_i64 = fx.Int64(positions_t[sect_idx * num_tokens + tok])
+            pos_offset = sect_idx * positions_stride_0 + tok * positions_stride_1
+            pos_i64 = fx.Int64(positions_t[pos_offset])
             pos = pos_i64.to(fx.Int32)
             cos_v = fx.BFloat16(cos_sin_t[pos, col]).to(fx.Float32)
             sin_v = fx.BFloat16(cos_sin_t[pos, col + HALF]).to(fx.Float32)
@@ -335,9 +380,6 @@ def _build_kv_kernel(
             byte0 = packed.to(fx.Int8)
             byte1 = (packed >> fx.Int32(8)).to(fx.Int8)
             return byte0, byte1
-
-        def slot_i32(slot_tensor, tok):
-            return fx.Int32(arith.trunci(T.i32, slot_tensor[tok]))
 
         head = fx.block_idx.x  # kv head 0..H_KV-1
         blk = fx.block_idx.y  # page-block index (contiguous-slot assumption)
@@ -355,6 +397,7 @@ def _build_kv_kernel(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_lds = lds.k_lds
         v_lds = lds.v_lds
+        mapping_ok = lds.mapping_ok
 
         tok0 = blk * block_size
 
@@ -388,10 +431,6 @@ def _build_kv_kernel(
                     # inside this dynamic branch (cheap: pointer + descriptor
                     # only) so the AST rewriter never has to thread it as
                     # if/else state.
-                    if const_expr(emit_flat_kv):
-                        k_out_t = GTensor(k_out, dtype=T.i8, shape=(-1, H_KV, D))
-                        v_out_t = GTensor(v_out, dtype=T.i8, shape=(-1, H_KV, D))
-
                     # ---- K: RMSNorm (over full D) + interleaved-mrope RoPE +
                     # per-tensor fp8 quant, one wave butterfly + VEC_PAIRS
                     # loop per thread (see _build_q_kernel for the same
@@ -414,6 +453,9 @@ def _build_kv_kernel(
                         col = lane + WAVE * p
                         w0 = fx.BFloat16(kw_t[col]).to(fx.Float32)
                         w1 = fx.BFloat16(kw_t[col + HALF]).to(fx.Float32)
+                        if const_expr(gemma_norm):
+                            w0 = w0 + fx.Float32(1.0)
+                            w1 = w1 + fx.Float32(1.0)
                         xn0 = k0s[p] * rstd * w0
                         xn1 = k1s[p] * rstd * w1
                         cos_v, sin_v = mrope_cos_sin(col, tok, positions_t, cos_sin_t)
@@ -423,8 +465,13 @@ def _build_kv_kernel(
                         k_lds[k_row + col] = kb0
                         k_lds[k_row + col + HALF] = kb1
                         if const_expr(emit_flat_kv):
-                            k_out_t[tok, head, col] = kb0
-                            k_out_t[tok, head, col + HALF] = kb1
+                            slot = fx.Int64(slot_t[tok])
+                            if slot >= fx.Int64(0):
+                                k_out_t = GTensor(
+                                    k_out, dtype=T.i8, shape=(-1, H_KV, D)
+                                )
+                                k_out_t[tok, head, col] = kb0
+                                k_out_t[tok, head, col + HALF] = kb1
 
                     # ---- V: raw + per-tensor fp8 quant (no norm/rope) ----
                     for p in range_constexpr(VEC_PAIRS):
@@ -439,8 +486,13 @@ def _build_kv_kernel(
                         v_lds[v_row + col] = vb0
                         v_lds[v_row + col + HALF] = vb1
                         if const_expr(emit_flat_kv):
-                            v_out_t[tok, head, col] = vb0
-                            v_out_t[tok, head, col + HALF] = vb1
+                            slot = fx.Int64(slot_t[tok])
+                            if slot >= fx.Int64(0):
+                                v_out_t = GTensor(
+                                    v_out, dtype=T.i8, shape=(-1, H_KV, D)
+                                )
+                                v_out_t[tok, head, col] = vb0
+                                v_out_t[tok, head, col + HALF] = vb1
                 else:
                     # Tail page-block padding row: no real token here (would
                     # be OOB on qkv/positions, and on k_out/v_out which are
@@ -452,57 +504,116 @@ def _build_kv_kernel(
                         v_lds[v_row + col] = fx.Int8(0)
                         v_lds[v_row + col + HALF] = fx.Int8(0)
 
+        # The first wave cooperatively validates this token group while the
+        # other waves finish staging. The wave reduction completes before the
+        # existing compute->copy barrier, so aligned prefill pays no additional
+        # block barriers. For block_size > WAVE, each lane checks multiple slots.
+        mapping_valid = fx.Int32(1)
+        if wid == 0:
+            base_slot = fx.Int64(slot_t[tok0])
+            full_page = tok0 + block_size <= num_tokens
+            page_aligned = (base_slot % fx.Int64(block_size)) == fx.Int64(0)
+            for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
+                token_local = lane + WAVE * check_it
+                if token_local < block_size:
+                    tok = tok0 + token_local
+                    slot = fx.Int64(slot_t[tok])
+                    expected = base_slot + fx.Int64(token_local)
+                    valid = (
+                        full_page
+                        and (base_slot >= fx.Int64(0))
+                        and page_aligned
+                        and (slot == expected)
+                    )
+                    mapping_valid = mapping_valid & valid.select(
+                        fx.Int32(1), fx.Int32(0)
+                    )
+            for sh_exp in range_constexpr(_LOG2_WAVE):
+                off = WAVE // (2 << sh_exp)
+                peer_valid = mapping_valid.shuffle_xor(off, WAVE)
+                mapping_valid = mapping_valid & peer_valid
+            if lane == 0:
+                mapping_ok[0] = mapping_valid
         gpu.barrier()
+        can_coalesce = mapping_ok[0] != fx.Int32(0)
 
-        # ---------------- Phase 2a: K coalesced write, LDS -> global ----
-        # Whole [head_size/x, block_size, x] region for this (head, block)
-        # is HD*BS contiguous bytes; thread run r (0..K_TOTAL_RUNS-1) owns
-        # 16 contiguous output bytes, which map to ONE token's contiguous
-        # x-elem head chunk on the src side (see proto_flydsl_shuffle_write
-        # .py's k_coalesced for the derivation). Looped so K_TOTAL_RUNS need
-        # not be an exact multiple of KV_THREADS.
-        block_id = slot_i32(slot_t, tok0) // block_size
-        head_base = block_id * _k_per_block(D, block_size, H_KV) + head * _k_head_stride(
-            D, block_size
-        )
-        k_lds_i32 = fx.recast_iter(fx.Int32, k_lds.ptr)
-        for it in range_constexpr(K_ITERS):
-            r = t + KV_THREADS * it
-            if r < K_TOTAL_RUNS:
-                # GTensor is a Python-side wrapper, not a DSL value -- build
-                # it fresh inside this dynamic branch (see S3 note above).
-                cache_k_i32 = GTensor(k_cache, dtype=T.i32, shape=(-1,))
-                f0 = r * _RUN_BYTES
-                chunk_k = f0 // (block_size * x)
-                block_off = (f0 % (block_size * x)) // x
-                d0 = chunk_k * x
-                src_elem_i32 = (block_off * D + d0) // 4
-                vec4_k = fx.ptr_load(
-                    k_lds_i32 + src_elem_i32,
-                    result_type=fx.Vector.make_type(_RUN_BYTES // 4, fx.Int32),
-                )
-                cache_k_i32.vec_store(
-                    ((head_base + f0) // 4,), vec4_k, _RUN_BYTES // 4
-                )
+        if can_coalesce:
+            # ---------------- Phase 2a: K coalesced write ----------------
+            block_id = fx.Int64(slot_t[tok0]) // fx.Int64(block_size)
+            head_base = (
+                block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
+                + fx.Int64(head) * fx.Int64(_k_head_stride(D, block_size))
+            )
+            k_lds_i32 = fx.recast_iter(fx.Int32, k_lds.ptr)
+            for it in range_constexpr(K_ITERS):
+                r = t + KV_THREADS * it
+                if r < K_TOTAL_RUNS:
+                    f0 = r * _RUN_BYTES
+                    chunk_k = f0 // (block_size * x)
+                    block_off = (f0 % (block_size * x)) // x
+                    d0 = chunk_k * x
+                    src_elem_i32 = (block_off * D + d0) // 4
+                    vec4_k = fx.ptr_load(
+                        k_lds_i32 + src_elem_i32,
+                        result_type=fx.Vector.make_type(_RUN_BYTES // 4, fx.Int32),
+                    )
+                    vec16_k = vector.bitcast(T.vec(_RUN_BYTES, T.i8), vec4_k)
+                    fx.ptr_store(
+                        vec16_k,
+                        k_cache + head_base + fx.Int64(f0),
+                    )
 
-        # ---------------- Phase 2b: V coalesced write, LDS -> global -----
-        # V_TOTAL_RUNS = (block_size/x) tiles * head_size positions; thread
-        # run r gathers x LDS bytes at stride D (one per token in the tile)
-        # and packs them into one 16 B contiguous cache run.
-        v_head_base = block_id * _v_per_block(D, block_size, x, H_KV) + head * _v_head_stride(
-            D, block_size, x
-        )
-        for it in range_constexpr(V_ITERS):
-            r = t + KV_THREADS * it
-            if r < V_TOTAL_RUNS:
-                cache_v_i32 = GTensor(v_cache, dtype=T.i32, shape=(-1,))
-                tile = r // D
-                d = r % D
-                v_dst_base = v_head_base + tile * (D * x) + d * x
-                vals = [v_lds[(tile * x + j) * D + d] for j in range_constexpr(x)]
-                vec_x = vector.from_elements(T.vec(x, T.i8), vals)
-                vec4_v = vector.bitcast(T.vec(x // 4, T.i32), vec_x)
-                cache_v_i32.vec_store((v_dst_base // 4,), vec4_v, x // 4)
+            # ---------------- Phase 2b: V coalesced write ----------------
+            v_head_base = (
+                block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
+                + fx.Int64(head) * fx.Int64(_v_head_stride(D, block_size, x))
+            )
+            for it in range_constexpr(V_ITERS):
+                r = t + KV_THREADS * it
+                if r < V_TOTAL_RUNS:
+                    tile = r // D
+                    d = r % D
+                    v_dst_base = v_head_base + fx.Int64(tile * (D * x) + d * x)
+                    vals = [
+                        v_lds[(tile * x + j) * D + d]
+                        for j in range_constexpr(x)
+                    ]
+                    vec_x = vector.from_elements(T.vec(x, T.i8), vals)
+                    fx.ptr_store(
+                        vec_x,
+                        v_cache + v_dst_base,
+                    )
+        else:
+            # Generic HIP-compatible scatter for arbitrary/decode mappings.
+            # Duplicate slots have the same last-writer-unspecified semantics
+            # as the production token-wise kernel.
+            for it in range_constexpr(SCATTER_ITERS):
+                elem = t + KV_THREADS * it
+                if elem < SCATTER_ELEMS:
+                    token_local = elem // D
+                    d = elem % D
+                    tok = tok0 + token_local
+                    if tok < num_tokens:
+                        slot = fx.Int64(slot_t[tok])
+                        if slot >= fx.Int64(0):
+                            block_id = slot // fx.Int64(block_size)
+                            block_off = slot % fx.Int64(block_size)
+                            k_dst = (
+                                block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
+                                + fx.Int64(head) * fx.Int64(_k_head_stride(D, block_size))
+                                + fx.Int64(d // x) * fx.Int64(block_size * x)
+                                + block_off * fx.Int64(x)
+                                + fx.Int64(d % x)
+                            )
+                            v_dst = (
+                                block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
+                                + fx.Int64(head) * fx.Int64(_v_head_stride(D, block_size, x))
+                                + (block_off // fx.Int64(x)) * fx.Int64(D * x)
+                                + fx.Int64(d * x)
+                                + (block_off % fx.Int64(x))
+                            )
+                            fx.ptr_store(k_lds[elem], k_cache + k_dst)
+                            fx.ptr_store(v_lds[elem], v_cache + v_dst)
 
     @flyc.jit
     def launch(
@@ -519,6 +630,8 @@ def _build_kv_kernel(
         v_out: fx.Pointer,
         num_tokens: fx.Int32,
         num_page_blocks: fx.Int32,
+        positions_stride_0: fx.Int32,
+        positions_stride_1: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         k = kernel(
@@ -534,6 +647,8 @@ def _build_kv_kernel(
             k_out,
             v_out,
             num_tokens,
+            positions_stride_0,
+            positions_stride_1,
         )
         k.launch(
             grid=(H_KV, fx.Index(num_page_blocks), 1),
@@ -549,7 +664,15 @@ def _build_kv_kernel(
 # ============================================================================
 @lru_cache(maxsize=32)
 def _compile_q(
-    *, num_heads_q, num_heads_k, num_heads_v, head_size, mrope_section, eps
+    *,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_size,
+    mrope_section,
+    eps,
+    is_interleaved,
+    gemma_norm,
 ):
     return _build_q_kernel(
         num_heads_q=num_heads_q,
@@ -558,6 +681,8 @@ def _compile_q(
         head_size=head_size,
         mrope_section=list(mrope_section),
         eps=eps,
+        is_interleaved=is_interleaved,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -572,6 +697,8 @@ def _compile_kv(
     block_size,
     x,
     emit_flat_kv,
+    is_interleaved,
+    gemma_norm,
 ):
     return _build_kv_kernel(
         num_heads_q=num_heads_q,
@@ -582,6 +709,8 @@ def _compile_kv(
         block_size=block_size,
         x=x,
         emit_flat_kv=emit_flat_kv,
+        is_interleaved=is_interleaved,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -632,7 +761,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         qw, kw: RMSNorm weights for Q / K, shape ``[D]``, bf16.
         cos_sin: ``[max_pos, D]`` bf16 (``cos = [:, :D/2]``, ``sin =
             [:, D/2:]``).
-        positions: 3D-mrope position ids, shape ``[3, T]``, int64, contig.
+        positions: 3D-mrope position ids, shape ``[3, T]``, int64. Both
+            strides are honored.
         num_tokens: T (must equal ``qkv.shape[0]``).
         num_heads_q/k/v: per-rank head counts. ``num_heads_k`` must equal
             ``num_heads_v`` (every real GQA/MQA config satisfies this --
@@ -644,9 +774,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             GPT-J interleaved-pair layout is not implemented).
         mrope_section_: 3-entry list summing to ``head_size // 2``
             (temporal / height / width sections for interleaved 3D-mrope).
-        is_interleaved: must be ``True`` (the interleaved column-reassignment
-            scheme from ``apply_interleaved_rope``; the alternative
-            "blocked" section layout is not implemented).
+        is_interleaved: selects the interleaved column-reassignment scheme
+            from ``apply_interleaved_rope`` or the blocked section layout.
         eps: RMSNorm epsilon.
         q_out: ``[T, H_q, D]`` bf16 output (always bf16 -- Q is never
             quantized by this op, matching the HIP kernel).
@@ -655,17 +784,10 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             ``head_size``/``num_heads_k`` regardless of the tensor's
             declared torch shape, exactly like the HIP kernel with
             ``use_shuffle_layout=True``).
-        slot_mapping: ``[T]`` int64, physical cache slot per token. Assumed
-            *page-block contiguous* for a run of ``block_size`` tokens
-            (i.e. token ``p*block_size + i`` for ``i in [0, block_size)``
-            all land in one page, at consecutive in-page offsets) -- the
-            standard prefill scatter pattern; this is what makes the
-            coalesced write possible. Decode-style scattered slot mappings
-            are not supported by this coalesced path. ``num_tokens`` need
-            not be a multiple of ``block_size``: the final page-block may be
-            a ragged tail (fewer than ``block_size`` real tokens); the
-            kernel writes deterministic zero bytes into that page's unused
-            trailing slots rather than reading/writing out of bounds.
+        slot_mapping: ``[T]`` int64 physical cache slot per token. Complete,
+            page-aligned contiguous groups use the coalesced page-write path;
+            arbitrary, decode-style, negative-slot, and ragged-tail groups
+            automatically use a HIP-compatible scatter fallback.
         per_tensor_k_scale, per_tensor_v_scale: 0-d/1-elem float32 CUDA
             tensors (read on-device inside the kernel -- no host sync).
         k_out, v_out: optional ``[T, H_k, D]`` / ``[T, H_v, D]`` uint8 (fp8
@@ -682,8 +804,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         rotary_dim: must be ``0`` or ``head_size`` (full rotary only;
             partial rotary -- rotating only a leading sub-range of the head
             -- is not implemented).
-        gemma_norm: must be ``False`` (Gemma's ``(1+weight)`` RMSNorm gamma
-            convention is not implemented).
+        gemma_norm: use Gemma's ``(1+weight)`` RMSNorm gamma convention.
         stream: torch CUDA stream to launch on; defaults to the current
             stream.
     """
@@ -702,15 +823,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         raise NotImplementedError(
             "is_neox_style=False (GPT-J interleaved-pair RoPE) is not "
             "implemented; only the NEOX pair layout (i, i+D/2) is supported."
-        )
-    if not is_interleaved:
-        raise NotImplementedError(
-            "is_interleaved=False (non-interleaved / 'blocked' 3D-mrope "
-            "section layout) is not implemented."
-        )
-    if gemma_norm:
-        raise NotImplementedError(
-            "gemma_norm=True ((1+weight) RMSNorm gamma) is not implemented."
         )
     if not use_shuffle_layout:
         raise NotImplementedError(
@@ -762,13 +874,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"{2 * head_size * block_size} B of LDS staging (K + V tiles), "
             f"exceeding the {_MAX_LDS_BYTES} B budget assumed here."
         )
-    if num_tokens > 65535:
-        raise NotImplementedError(
-            f"num_tokens ({num_tokens}) exceeds the HW grid-Y limit (65535) "
-            "used directly by the Q launch; chunking across multiple "
-            "launches (as qk_norm_rope_quant.py does for its 1-D positions) "
-            "is not implemented for the 3-D mrope position layout here."
-        )
     if qkv.dtype != torch.bfloat16:
         raise TypeError(f"qkv must be bf16, got {qkv.dtype}")
     if qw.dtype != torch.bfloat16 or kw.dtype != torch.bfloat16:
@@ -779,15 +884,66 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         raise ValueError(f"positions shape {tuple(positions.shape)} != (3, {num_tokens})")
     if slot_mapping.dtype != torch.int64:
         raise TypeError(f"slot_mapping must be int64, got {slot_mapping.dtype}")
+    if slot_mapping.shape != (num_tokens,):
+        raise ValueError(
+            f"slot_mapping shape {tuple(slot_mapping.shape)} != ({num_tokens},)"
+        )
     if per_tensor_k_scale.dtype != torch.float32 or per_tensor_v_scale.dtype != torch.float32:
         raise TypeError("per_tensor_k_scale/per_tensor_v_scale must be float32")
+    if per_tensor_k_scale.numel() != 1 or per_tensor_v_scale.numel() != 1:
+        raise ValueError("per_tensor_k_scale/per_tensor_v_scale must contain one element")
     if return_kv and (k_out is None or v_out is None):
         raise ValueError("return_kv=True requires k_out and v_out to be provided")
 
     H_Q, H_K, H_V, D = num_heads_q, num_heads_k, num_heads_v, head_size
     qkv_flat = qkv.view(num_tokens, H_Q + H_K + H_V, D)
-    if not (qkv_flat.stride(-1) == 1 and qkv_flat.stride(-2) == D):
-        raise ValueError("qkv must be contiguous in the trailing (head, D) block")
+    if not qkv_flat.is_contiguous():
+        raise ValueError("qkv must be contiguous")
+    if qw.shape != (D,) or kw.shape != (D,):
+        raise ValueError(f"qw/kw must both have shape ({D},)")
+    if not qw.is_contiguous() or not kw.is_contiguous():
+        raise ValueError("qw/kw must be contiguous")
+    if cos_sin.dtype != torch.bfloat16 or cos_sin.dim() != 2 or cos_sin.shape[1] != D:
+        raise TypeError(f"cos_sin must be 2-D bf16 with trailing dimension {D}")
+    if not cos_sin.is_contiguous():
+        raise ValueError("cos_sin must be contiguous")
+    if q_out.dtype != torch.bfloat16 or q_out.numel() != num_tokens * H_Q * D:
+        raise ValueError(
+            f"q_out must be bf16 with {num_tokens * H_Q * D} elements"
+        )
+    if not q_out.is_contiguous():
+        raise ValueError("q_out must be contiguous")
+    if k_cache.dtype != v_cache.dtype or k_cache.element_size() != 1:
+        raise TypeError("k_cache/v_cache must have the same 1-byte FP8 dtype")
+    if not k_cache.is_contiguous() or not v_cache.is_contiguous():
+        raise ValueError("k_cache/v_cache must be contiguous")
+    if not positions.is_cuda or not slot_mapping.is_cuda:
+        raise ValueError("positions and slot_mapping must be device tensors")
+    tensors = [
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        per_tensor_k_scale,
+        per_tensor_v_scale,
+    ]
+    if any(t.device != qkv.device for t in tensors):
+        raise ValueError("all tensor arguments must be on the same device as qkv")
+    if return_kv:
+        if k_out.dtype != k_cache.dtype or v_out.dtype != v_cache.dtype:
+            raise TypeError("k_out/v_out dtype must match the corresponding cache")
+        if k_out.numel() != num_tokens * H_K * D:
+            raise ValueError(f"k_out must contain {num_tokens * H_K * D} elements")
+        if v_out.numel() != num_tokens * H_V * D:
+            raise ValueError(f"v_out must contain {num_tokens * H_V * D} elements")
+        if not k_out.is_contiguous() or not v_out.is_contiguous():
+            raise ValueError("k_out/v_out must be contiguous")
+        if k_out.device != qkv.device or v_out.device != qkv.device:
+            raise ValueError("k_out/v_out must be on the same device as qkv")
 
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -803,17 +959,27 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         head_size=D,
         mrope_section=tuple(mrope_section_),
         eps=eps,
+        is_interleaved=is_interleaved,
+        gemma_norm=gemma_norm,
     )
-    _run_compiled(
-        q_launch,
-        _ptr(qkv_flat),
-        _ptr(positions),
-        _ptr(cos_sin),
-        _ptr(qw),
-        _ptr(q_out),
-        num_tokens,
-        fx_stream,
-    )
+    positions_stride_0 = positions.stride(0)
+    positions_stride_1 = positions.stride(1)
+    max_grid_y = 65535
+    for token_offset in range(0, num_tokens, max_grid_y):
+        chunk_tokens = min(max_grid_y, num_tokens - token_offset)
+        _run_compiled(
+            q_launch,
+            _ptr(qkv_flat),
+            _ptr(positions),
+            _ptr(cos_sin),
+            _ptr(qw),
+            _ptr(q_out),
+            chunk_tokens,
+            token_offset,
+            positions_stride_0,
+            positions_stride_1,
+            fx_stream,
+        )
 
     kv_launch = _compile_kv(
         num_heads_q=H_Q,
@@ -824,6 +990,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         block_size=block_size,
         x=x,
         emit_flat_kv=return_kv,
+        is_interleaved=is_interleaved,
+        gemma_norm=gemma_norm,
     )
     # num_tokens need not be a multiple of block_size -- the last page-block
     # may be a ragged tail with fewer than block_size real tokens; the
@@ -848,5 +1016,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         _ptr(v_out_arg),
         num_tokens,
         num_page_blocks,
+        positions_stride_0,
+        positions_stride_1,
         fx_stream,
     )

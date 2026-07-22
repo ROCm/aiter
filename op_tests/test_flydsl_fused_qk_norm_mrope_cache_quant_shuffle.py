@@ -175,6 +175,8 @@ MAX_MISMATCH_RATIO = {
     "q_out": 0.001,     # 0.1%
     "k_cache": 0.005,   # 0.5%
     "v_cache": 0.001,   # 0.1%
+    "k_out": 0.005,     # same quantized K values as k_cache
+    "v_out": 0.001,     # same quantized V values as v_cache
 }
 
 
@@ -280,6 +282,248 @@ def run_correctness(T_tok: int, seed: int, check_production: bool = True):
             f"[FAIL] T={T_tok} seed={seed}: "
             + f"{len(failures)} correctness check(s) failed:\n  " + "\n  ".join(failures)
         )
+
+
+def run_generalization_correctness(seed: int):
+    """Exercise the generic slot-scatter path and newly generalized flags.
+
+    This intentionally combines features that the original FlyDSL path did
+    not support: arbitrary and negative slots, a ragged final page, strided
+    positions, blocked MRoPE, Gemma RMSNorm, and return_kv.
+    """
+    import aiter
+
+    torch.manual_seed(seed + 1000)
+    dev = "cuda"
+    kv_dtype = dtypes.fp8
+    T_tok = BLOCK_SIZE + 6
+    num_blocks = 4
+    H_Q, H_K, H_V, D = NUM_Q_HEADS, NUM_KV_HEADS, NUM_KV_HEADS, HEAD_SIZE
+
+    qkv = torch.randn(
+        T_tok, H_Q + H_K + H_V, D, dtype=torch.bfloat16, device=dev
+    )
+    qw = torch.randn(D, dtype=torch.bfloat16, device=dev)
+    kw = torch.randn(D, dtype=torch.bfloat16, device=dev)
+    cos_sin = torch.randn(512, D, dtype=torch.bfloat16, device=dev) * 0.25
+
+    # Preserve a real non-contiguous [3, T] view. The HIP op consumes its
+    # strides and the FlyDSL kernel must do the same.
+    positions_storage = torch.randint(
+        0, 512, (3, T_tok * 2), dtype=torch.int64, device=dev
+    )
+    positions = positions_storage[:, ::2]
+    assert positions.shape == (3, T_tok) and not positions.is_contiguous()
+
+    # Unique but deliberately non-page-contiguous slots, plus one ignored
+    # token. Both token groups must select the scatter path; the second is
+    # also a ragged tail.
+    slot_mapping = torch.randperm(
+        num_blocks * BLOCK_SIZE, dtype=torch.int64, device=dev
+    )[:T_tok]
+    slot_mapping[3] = -1
+
+    q_out_f = torch.empty(T_tok, H_Q, D, dtype=torch.bfloat16, device=dev)
+    q_out_p = torch.empty_like(q_out_f)
+
+    cache_shape = (num_blocks, BLOCK_SIZE, H_K, D)
+    initial_k = torch.randn(cache_shape, dtype=torch.bfloat16, device=dev).to(kv_dtype)
+    initial_v = torch.randn(cache_shape, dtype=torch.bfloat16, device=dev).to(kv_dtype)
+    k_cache_f, k_cache_p = initial_k.clone(), initial_k.clone()
+    v_cache_f, v_cache_p = initial_v.clone(), initial_v.clone()
+
+    initial_k_out = torch.randn(
+        T_tok, H_K, D, dtype=torch.bfloat16, device=dev
+    ).to(kv_dtype)
+    initial_v_out = torch.randn(
+        T_tok, H_V, D, dtype=torch.bfloat16, device=dev
+    ).to(kv_dtype)
+    k_out_f, k_out_p = initial_k_out.clone(), initial_k_out.clone()
+    v_out_f, v_out_p = initial_v_out.clone(), initial_v_out.clone()
+    k_scale = torch.tensor(1.5, dtype=torch.float32, device=dev)
+    v_scale = torch.tensor(2.0, dtype=torch.float32, device=dev)
+
+    flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        T_tok,
+        H_Q,
+        H_K,
+        H_V,
+        D,
+        True,
+        MROPE_SECTION,
+        False,  # blocked MRoPE
+        EPS,
+        q_out_f,
+        k_cache_f,
+        v_cache_f,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        k_out_f,
+        v_out_f,
+        True,
+        True,
+        BLOCK_SIZE,
+        X,
+        D,
+        True,  # Gemma RMSNorm
+    )
+    aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+        qkv.view(T_tok, -1),
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        T_tok,
+        H_Q,
+        H_K,
+        H_V,
+        D,
+        True,
+        MROPE_SECTION,
+        False,
+        EPS,
+        q_out_p.view(T_tok, -1),
+        k_cache_p,
+        v_cache_p,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        k_out_p,
+        v_out_p,
+        True,
+        True,
+        BLOCK_SIZE,
+        X,
+        D,
+        True,
+    )
+    torch.cuda.synchronize()
+
+    print(
+        "[generalizations] arbitrary/negative slots, ragged tail, strided "
+        "positions, blocked MRoPE, Gemma RMSNorm, return_kv"
+    )
+    failures = []
+    _assert_close("q_out", "production", q_out_f, q_out_p, failures)
+    _assert_close("k_cache", "production", k_cache_f.float(), k_cache_p.float(), failures)
+    _assert_close("v_cache", "production", v_cache_f.float(), v_cache_p.float(), failures)
+    _assert_close("k_out", "production", k_out_f.float(), k_out_p.float(), failures)
+    _assert_close("v_out", "production", v_out_f.float(), v_out_p.float(), failures)
+
+    # The production kernel skips flat K/V output writes for negative slots.
+    neg = slot_mapping < 0
+    if not torch.equal(k_out_f[neg].view(torch.uint8), k_out_p[neg].view(torch.uint8)):
+        failures.append("k_out negative-slot preservation differs from production")
+    if not torch.equal(v_out_f[neg].view(torch.uint8), v_out_p[neg].view(torch.uint8)):
+        failures.append("v_out negative-slot preservation differs from production")
+
+    if failures:
+        raise AssertionError(
+            "[FAIL] generalized FlyDSL parity:\n  " + "\n  ".join(failures)
+        )
+    print("[PASS] generalized FlyDSL paths match production HIP within tolerance.")
+
+
+def run_large_token_chunking_correctness(seed: int):
+    """Exercise the Q launch split at the 16-bit grid-Y boundary."""
+    import aiter
+
+    torch.manual_seed(seed + 2000)
+    dev = "cuda"
+    kv_dtype = dtypes.fp8
+    T_tok = 65536
+    H_Q = H_K = H_V = 1
+    D = HEAD_SIZE
+    num_blocks = (T_tok + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    qkv = torch.randn(
+        T_tok, H_Q + H_K + H_V, D, dtype=torch.bfloat16, device=dev
+    )
+    qw = torch.randn(D, dtype=torch.bfloat16, device=dev)
+    kw = torch.randn(D, dtype=torch.bfloat16, device=dev)
+    cos_sin = torch.randn(512, D, dtype=torch.bfloat16, device=dev) * 0.25
+    positions = torch.randint(
+        0, 512, (3, T_tok), dtype=torch.int64, device=dev
+    )
+    slots = torch.arange(T_tok, dtype=torch.int64, device=dev)
+    k_scale = torch.tensor(1.5, dtype=torch.float32, device=dev)
+    v_scale = torch.tensor(2.0, dtype=torch.float32, device=dev)
+
+    q_f = torch.empty(T_tok, H_Q, D, dtype=torch.bfloat16, device=dev)
+    q_p = torch.empty_like(q_f)
+    cache_shape = (num_blocks, BLOCK_SIZE, H_K, D)
+    k_f = torch.zeros(cache_shape, dtype=kv_dtype, device=dev)
+    k_p = torch.zeros_like(k_f)
+    v_f = torch.zeros(cache_shape, dtype=kv_dtype, device=dev)
+    v_p = torch.zeros_like(v_f)
+
+    common = (
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        T_tok,
+        H_Q,
+        H_K,
+        H_V,
+        D,
+        True,
+        MROPE_SECTION,
+        True,
+        EPS,
+    )
+    flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+        qkv,
+        *common,
+        q_f,
+        k_f,
+        v_f,
+        slots,
+        k_scale,
+        v_scale,
+        None,
+        None,
+        False,
+        True,
+        BLOCK_SIZE,
+        X,
+        D,
+        False,
+    )
+    aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+        qkv.view(T_tok, -1),
+        *common,
+        q_p.view(T_tok, -1),
+        k_p,
+        v_p,
+        slots,
+        k_scale,
+        v_scale,
+        None,
+        None,
+        False,
+        True,
+        BLOCK_SIZE,
+        X,
+        D,
+        False,
+    )
+    torch.cuda.synchronize()
+
+    print("[large-token] T=65536 exercises two Q grid-Y launches")
+    failures = []
+    _assert_close("q_out", "production", q_f, q_p, failures)
+    _assert_close("k_cache", "production", k_f.float(), k_p.float(), failures)
+    _assert_close("v_cache", "production", v_f.float(), v_p.float(), failures)
+    if failures:
+        raise AssertionError("[FAIL] large-token chunking:\n  " + "\n  ".join(failures))
+    print("[PASS] T=65536 chunked Q launch matches production HIP.")
 
 
 def _time(fn, iters, warmup):
@@ -452,6 +696,16 @@ def main():
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument(
+        "--skip-generalizations",
+        action="store_true",
+        help="Skip focused arbitrary-slot/strided-position/blocked-MRoPE/Gemma checks.",
+    )
+    ap.add_argument(
+        "--test-large-token-chunking",
+        action="store_true",
+        help="Also run the T=65536 grid-Y chunking parity test.",
+    )
+    ap.add_argument(
         "--no-production-check",
         action="store_true",
         help="Skip the direct comparison against aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle "
@@ -477,6 +731,12 @@ def main():
     # unless disabled, the production HIP op) was within tolerance.
     for T_tok in args.tokens:
         run_correctness(T_tok, args.seed, check_production=not args.no_production_check)
+    if not args.skip_generalizations and not args.no_production_check:
+        run_generalization_correctness(args.seed)
+    if args.test_large_token_chunking:
+        if args.no_production_check:
+            raise ValueError("--test-large-token-chunking requires the production check")
+        run_large_token_chunking_correctness(args.seed)
     baselines = "torch_ref" if args.no_production_check else "torch_ref and the production HIP op"
     print(
         f"[PASS] flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle matches {baselines} "

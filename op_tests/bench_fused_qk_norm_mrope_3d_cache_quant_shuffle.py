@@ -8,7 +8,7 @@ from aiter.ops.flydsl import flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuff
 from aiter.utility import dtypes
 
 
-def build_inputs(m: int, seed: int):
+def build_inputs(m: int, seed: int, slot_pattern: str):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -25,7 +25,14 @@ def build_inputs(m: int, seed: int):
     kv_dtype = dtypes.fp8
     kv_k = torch.zeros(22988, 64, 4, 128, dtype=kv_dtype, device="cuda")
     kv_v = torch.zeros(22988, 64, 4, 128, dtype=kv_dtype, device="cuda")
-    slot_map = torch.randint(0, 22988 * 64, (m,), dtype=torch.int64, device="cuda")
+    if slot_pattern == "aligned":
+        if m > 22988 * 64:
+            raise ValueError("m exceeds the allocated cache capacity")
+        slot_map = torch.arange(m, dtype=torch.int64, device="cuda")
+    else:
+        slot_map = torch.randint(
+            0, 22988 * 64, (m,), dtype=torch.int64, device="cuda"
+        )
     per_tensor_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     per_tensor_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
@@ -132,7 +139,7 @@ def benchmark(fname, fn, args):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA/HIP device is required")
 
-    inputs = build_inputs(args.m, args.seed)
+    inputs = build_inputs(args.m, args.seed, args.slot_pattern)
     outputs = allocate_outputs(inputs, args.return_kv)
 
     for _ in range(args.warmup):
@@ -156,7 +163,8 @@ def benchmark(fname, fn, args):
         f"[microbench] {fname} "
         f"M={args.m} slots={slots} qkv={tuple(inputs['qkv'].shape)} "
         f"kvcache={tuple(inputs['kv_k'].shape)} kv_dtype={inputs['kv_dtype']} "
-        f"x={inputs['x']} warmup={args.warmup} iters={args.iters} avg={avg_us:.2f} us"
+        f"x={inputs['x']} slots={args.slot_pattern} warmup={args.warmup} "
+        f"iters={args.iters} avg={avg_us:.2f} us"
     )
 
 
@@ -168,6 +176,12 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Timed iterations")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed")
+    parser.add_argument(
+        "--slot-pattern",
+        choices=("aligned", "random"),
+        default="aligned",
+        help="Aligned exercises the coalesced path; random exercises scatter fallback.",
+    )
     parser.add_argument("--return-kv", action="store_true", help="Enable return_kv path")
     return parser.parse_args()
 
