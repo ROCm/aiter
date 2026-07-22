@@ -4,6 +4,7 @@ import argparse
 
 import torch
 import aiter
+from aiter.ops.flydsl import flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 from aiter.utility import dtypes
 
 
