@@ -167,6 +167,12 @@ def _default_kernel_config(
         if mb_cap:
             blocks_per_row = max(2, min(blocks_per_row, mb_cap))
 
+    # Row-proportional parts (gfx950 only). The launch grid width is sized for the
+    # padded buffer, so short rows over-provision cooperating workgroups; the kernel
+    # caps participating parts by each row's actual coverage need (a min, so results
+    # are unchanged). Env FLYDSL_TOPK_TIERED_RPP (0/1) overrides; gfx942 frozen (0).
+    rpp_on = _env_int("FLYDSL_TOPK_TIERED_RPP", 1 if arch == "gfx950" else 0)
+
     return dict(
         blocks_per_row=blocks_per_row,
         bits_per_pass=bits_per_pass,
@@ -177,6 +183,7 @@ def _default_kernel_config(
         tiered_long_cap=tiered_long_cap_default,
         mask_non_finite=True,
         tier_mode="auto",
+        row_proportional_parts=bool(rpp_on),
     )
 
 

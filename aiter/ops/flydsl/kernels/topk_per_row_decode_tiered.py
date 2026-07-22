@@ -137,6 +137,7 @@ def create_topk_per_row_decode_tiered_kernel(
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
     mask_non_finite: bool = True,
+    row_proportional_parts: bool = False,
 ) -> Any:
     """Build a launcher that selects the Top-K largest values' column indices per
     decode row (unordered set, matching torch.topk by value). Implemented as a
@@ -218,6 +219,7 @@ def create_topk_per_row_decode_tiered_kernel(
         f"{_cap_tag}"
         f"{'_1wg' if short_tier else ''}"
         f"{'_mf' if mask_non_finite else ''}"
+        f"{'_rpp' if row_proportional_parts else ''}"
     )
 
     @fx.struct
@@ -308,6 +310,28 @@ def create_topk_per_row_decode_tiered_kernel(
         long_parts = (ArithValue(c_parts) < ArithValue(c_long_cap)).select(
             c_parts, c_long_cap
         )
+        if const_expr(row_proportional_parts):
+            # gfx950: the launch grid (c_parts) is sized for the padded buffer width,
+            # so a short row would otherwise spin up far more cooperating workgroups
+            # than it needs -- each extra part only adds cross-CU barrier/merge latency
+            # (the mid/long floor). Cap participating workgroups by the row's actual
+            # coverage need: one part per items_per_block (LOAD_VEC*BLOCK_THREADS)
+            # elements, floored at 2 so the persistent tier still has >1 workgroup.
+            # Fewer parts is always correct (the scan stride covers all vec-blocks).
+            items_per_block = LOAD_VEC * block_threads
+            cover_shift = (items_per_block).bit_length() - 1
+            row_cover = ArithValue(
+                ArithValue(row_len) + ArithValue(fx.Int32(items_per_block - 1))
+            ).shrui(fx.Int32(cover_shift))
+            row_cover = (ArithValue(row_cover) < ArithValue(c_two)).select(
+                c_two, row_cover
+            )
+            mid_parts = (ArithValue(mid_parts) < ArithValue(row_cover)).select(
+                mid_parts, row_cover
+            )
+            long_parts = (ArithValue(long_parts) < ArithValue(row_cover)).select(
+                long_parts, row_cover
+            )
         if const_expr(tier_mode == "short"):
             active_parts = c_one
         elif const_expr(tier_mode == "mid"):
