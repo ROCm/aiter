@@ -145,6 +145,28 @@ def _default_kernel_config(
             max_active_parts = max(tiered_mid_cap_default, tiered_long_cap_default)
         blocks_per_row = max(2, min(blocks_per_row, max_active_parts))
 
+    # Mid-batch coordination cap (gfx950 only). Once the batch alone fills the device
+    # (num_rows > 16), the co-resident budget over-provisions blocks_per_row; the measured
+    # cooperation optimum in the multi-block regime is well below it. Cap blocks_per_row by
+    # a small L-keyed step. Only reduces blocks_per_row (a min), so results stay valid.
+    # (The rows>63 short-mid cap of 1 is omitted; it needs the kernel's single-workgroup
+    # launch path.) Env FLYDSL_TOPK_TIERED_MIDBATCH_CAP overrides the matched cap (0 off).
+    if arch == "gfx950" and max_model_len > tiered_short_max:
+        mb_cap = None
+        for mb_min_rows, mb_L_max, mb_cap_val in (
+            (16, 131072, 4),
+            (20, None, 6),
+            (16, None, 8),
+        ):
+            if num_rows > mb_min_rows and (mb_L_max is None or max_model_len <= mb_L_max):
+                mb_cap = mb_cap_val
+                break
+        mb_env = _env_int("FLYDSL_TOPK_TIERED_MIDBATCH_CAP")
+        if mb_env is not None and mb_cap is not None:
+            mb_cap = mb_env
+        if mb_cap:
+            blocks_per_row = max(2, min(blocks_per_row, mb_cap))
+
     return dict(
         blocks_per_row=blocks_per_row,
         bits_per_pass=bits_per_pass,
