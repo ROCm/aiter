@@ -202,11 +202,15 @@ def _default_kernel_config(
     # (num_rows > 16), the co-resident budget over-provisions blocks_per_row; the measured
     # cooperation optimum in the multi-block regime is well below it. Cap blocks_per_row by
     # a small L-keyed step. Only reduces blocks_per_row (a min), so results stay valid.
-    # (The rows>63 short-mid cap of 1 is omitted; it needs the kernel's single-workgroup
-    # launch path.) Env FLYDSL_TOPK_TIERED_MIDBATCH_CAP overrides the matched cap (0 off).
+    # The first rule (rows>63, L<=65536 -> cap=1) folds a wide short-mid batch onto the
+    # kernel's single-workgroup launch path (enabled by the Phase B bpr=1 support); it is
+    # NOT paired with force_single_wg (short_max stays < L), so the row runs the mid tier
+    # with a single cooperating block -- barrier-free, matching HIP's one-block shape.
+    # Env FLYDSL_TOPK_TIERED_MIDBATCH_CAP overrides the matched cap (0 off).
     if arch == "gfx950" and max_model_len > tiered_short_max:
         mb_cap = None
         for mb_min_rows, mb_L_max, mb_cap_val in (
+            (63, 65536, 1),
             (16, 131072, 4),
             (20, None, 6),
             (16, None, 8),
@@ -218,7 +222,7 @@ def _default_kernel_config(
         if mb_env is not None and mb_cap is not None:
             mb_cap = mb_env
         if mb_cap:
-            blocks_per_row = max(2, min(blocks_per_row, mb_cap))
+            blocks_per_row = max(1, min(blocks_per_row, mb_cap))
 
     # Row-proportional parts (gfx950 only). The launch grid width is sized for the
     # padded buffer, so short rows over-provision cooperating workgroups; the kernel
