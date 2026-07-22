@@ -248,20 +248,44 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
-    ``c`` carries the layout flags, SSA constants/types, buffer resources, the
-    source base (``feat_elem_base``), the intra-warp mapping (``block_in_wave``,
-    ``lane_in_block``, ``is_block_lead``), and ``c.dests``: a list of destination
-    namespaces, each with ``payload_row_byte_base`` and ``scale_row_dword_base``.
-    The current callers pass a single destination; keeping this as a list lets a
-    future caller experiment with multi-destination scattering without changing
-    the quant math. Shared verbatim by both stage1 and stage2; only the preamble
-    that computes ``c.dests`` differs.
+    ``c`` carries the layout flags, SSA constants/types, the i64 row bases
+    (``payload_base``, ``hidden_base``) with their per-row byte strides
+    (``payload_bytes_per_row``, ``feat_bytes_per_row``, ``feat_row_i32``), the
+    scale resource, the intra-warp mapping (``block_in_wave``, ``lane_in_block``,
+    ``is_block_lead``), and ``c.dests``: a list of destination namespaces, each
+    with ``payload_row_i32`` and ``scale_row_dword_base``. The current callers
+    pass a single destination; keeping this as a list lets a future caller
+    experiment with multi-destination scattering without changing the quant math.
+    Shared verbatim by both stage1 and stage2; only the preamble that computes
+    ``c.dests`` differs.
     """
     i32 = c.i32
     f32 = c.f32
     mx_group_base = getattr(c, "mx_group_base", None)
     if mx_group_base is None:
         mx_group_base = arith.constant(0, type=i32)
+
+    # i64 row base: at >64k tokens a grouped row index times model_dim exceeds the
+    # 32-bit buffer voffset (contiguous_m * feat_dim > 2**32), corrupting the store.
+    payload_bytes_per_row = c.payload_bytes_per_row
+    dst_payload = []
+    for dst in c.dests:
+        row_addr = c.payload_base + arith.extui(
+            T.i64, dst.payload_row_i32
+        ) * arith.constant(payload_bytes_per_row, type=T.i64)
+        dst_payload.append(
+            buffer_ops.create_buffer_resource_from_addr(
+                row_addr, num_records_bytes=payload_bytes_per_row
+            )
+        )
+
+    hidden_row_addr = c.hidden_base + arith.extui(
+        T.i64, c.feat_row_i32
+    ) * arith.constant(c.feat_bytes_per_row, type=T.i64)
+    hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        hidden_row_addr, num_records_bytes=c.feat_bytes_per_row
+    )
+    feat_elem_base = arith.constant(0, type=i32)
     for it in range_constexpr(c.block_iters):
         # MX block (along K) this lane works on this iteration.
         mx_block = (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
@@ -282,9 +306,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     + c.lane_in_block * c.c_elems_per_lane
                 )
                 # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
-                hidden_dword = (c.feat_elem_base + col_base) >> c.c1_i32
+                hidden_dword = (feat_elem_base + col_base) >> c.c1_i32
                 dwords4 = buffer_ops.buffer_load(
-                    c.hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
+                    hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
                 )
                 vec8_bf16_ty = T.vec(8, T.bf16)
                 vec8_f32_ty = T.vec(8, f32)
@@ -324,10 +348,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     mx_block * arith.constant(32, type=i32)
                     + c.lane_in_block * c.c_elems_per_lane
                 )
-                hidden_dword = (c.feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
+                hidden_dword = (feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
 
                 dword_raw = buffer_ops.buffer_load(
-                    c.hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
+                    hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
                 )
                 vec1_i32_ty = T.vec(1, i32)
                 vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
@@ -411,17 +435,14 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             scale_dword = arith.divui(mx_block, c.c4_i32)
             byte_in_dword = mx_block - scale_dword * c.c4_i32
             e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-            for dst in c.dests:
-                # payload byte offset within grouped_payload. offset_is_bytes=True
-                # so the i8 (fp4) / i16 (fp8) / i32 (pk8) store does not rescale
-                # this already-byte offset by the data element size.
+            for di, dst in enumerate(c.dests):
+                payload_rsrc = dst_payload[di]
                 payload_byte_off = (
-                    dst.payload_row_byte_base
-                    + mx_block * c.c_payload_bytes_per_block
+                    mx_block * c.c_payload_bytes_per_block
                     + c.lane_in_block * c.c_payload_bytes_per_lane
                 )
                 buffer_ops.buffer_store(
-                    payload_val, c.payload_rsrc, payload_byte_off, offset_is_bytes=True
+                    payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
                 )
 
                 # one e8m0 byte per block, written by the block's lead lane.
@@ -683,11 +704,8 @@ def build_moe_fused_route_quant_scatter_module(
             # dst dword base for out_row; scale_dword*wmma_rep added per block.
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
-            hidden_elem_base = token * c_model_dim  # bf16 element base for this token
-
-            hidden_rsrc = ptr_rsrc(hidden)
-            payload_rsrc = ptr_rsrc(grouped_payload)
+            payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
+            hidden_base = arith.index_cast(T.i64, ptrtoint(hidden))
             scale_rsrc = ptr_rsrc(grouped_scale)
 
             # this lane's position inside its MX block group
@@ -722,13 +740,15 @@ def build_moe_fused_route_quant_scatter_module(
                 is_block_lead=is_block_lead,
                 dests=[
                     SimpleNamespace(
-                        payload_row_byte_base=payload_row_byte_base,
+                        payload_row_i32=grouped_row,
                         scale_row_dword_base=scale_row_dword_base,
                     )
                 ],
-                feat_elem_base=hidden_elem_base,
-                hidden_rsrc=hidden_rsrc,
-                payload_rsrc=payload_rsrc,
+                payload_base=payload_base,
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=hidden_base,
+                feat_bytes_per_row=model_dim * 2,
+                feat_row_i32=token,
                 scale_rsrc=scale_rsrc,
             )
             _emit_quant_block_loop(c)
@@ -926,10 +946,9 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
-            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
 
-            hidden_rsrc = ptr_rsrc(hidden)
-            payload_rsrc = ptr_rsrc(grouped_payload)
+            payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
+            hidden_base = arith.index_cast(T.i64, ptrtoint(hidden))
             scale_rsrc = ptr_rsrc(grouped_scale)
 
             block_in_wave = arith.divui(lane, c_lanes_per_block)
@@ -963,13 +982,15 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
                 is_block_lead=is_block_lead,
                 dests=[
                     SimpleNamespace(
-                        payload_row_byte_base=payload_row_byte_base,
+                        payload_row_i32=grouped_row,
                         scale_row_dword_base=scale_row_dword_base,
                     )
                 ],
-                feat_elem_base=c0_i32,
-                hidden_rsrc=hidden_rsrc,
-                payload_rsrc=payload_rsrc,
+                payload_base=payload_base,
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=hidden_base,
+                feat_bytes_per_row=model_dim * 2,
+                feat_row_i32=c0_i32,
                 scale_rsrc=scale_rsrc,
             )
             _emit_quant_one_k_group(c, k_group)
@@ -1151,11 +1172,8 @@ def build_moe_fused_quant_preshuffle_module(
                     + wmma_row
                 )
 
-                payload_row_byte_base = row * c_payload_bytes_per_row
-                feat_elem_base = row * c_feat_dim  # bf16 element base for this row
-
-                hidden_rsrc = ptr_rsrc(grouped_in)
-                payload_rsrc = ptr_rsrc(grouped_payload)
+                payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
+                hidden_base = arith.index_cast(T.i64, ptrtoint(grouped_in))
                 scale_rsrc = ptr_rsrc(grouped_scale)
 
                 block_in_wave = arith.divui(lane, c_lanes_per_block)
@@ -1189,13 +1207,15 @@ def build_moe_fused_quant_preshuffle_module(
                     is_block_lead=is_block_lead,
                     dests=[
                         SimpleNamespace(
-                            payload_row_byte_base=payload_row_byte_base,
+                            payload_row_i32=row,
                             scale_row_dword_base=scale_row_dword_base,
                         )
                     ],
-                    feat_elem_base=feat_elem_base,
-                    hidden_rsrc=hidden_rsrc,
-                    payload_rsrc=payload_rsrc,
+                    payload_base=payload_base,
+                    payload_bytes_per_row=payload_bytes_per_row,
+                    hidden_base=hidden_base,
+                    feat_bytes_per_row=feat_dim * 2,
+                    feat_row_i32=row,
                     scale_rsrc=scale_rsrc,
                 )
                 _emit_quant_block_loop(c)
@@ -1395,19 +1415,18 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             out_row = scale_tile * c16_i32 + row_lane16
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-            payload_row_byte_base = row * c_payload_bytes_per_row
             if const_expr(source_topk > 0):
                 if const_expr(source_topk_is_pow2):
                     source_row = route >> c_source_topk_shift
                 else:
                     source_row = arith.divui(route, c_source_topk)
-                feat_elem_base = source_row * c_feat_dim
+                feat_row_i32 = source_row
             else:
-                feat_elem_base = row * c_feat_dim
+                feat_row_i32 = row
 
-            hidden_rsrc = ptr_rsrc(grouped_in)
-            payload_rsrc = ptr_rsrc(grouped_payload)
             scale_rsrc = ptr_rsrc(grouped_scale)
+            payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
+            hidden_base = arith.index_cast(T.i64, ptrtoint(grouped_in))
 
             block_in_wave = arith.divui(lane, c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -1417,6 +1436,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 i32=i32,
                 f32=f32,
                 block_iters=1 if ksplit else block_iters,
+                payload_base=payload_base,
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=hidden_base,
+                feat_bytes_per_row=feat_dim * 2,
+                feat_row_i32=feat_row_i32,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
                 mx_blocks_per_row=mx_blocks_per_row,
                 amax_shuffle_dists=amax_shuffle_dists,
@@ -1440,13 +1464,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 is_block_lead=is_block_lead,
                 dests=[
                     SimpleNamespace(
-                        payload_row_byte_base=payload_row_byte_base,
+                        payload_row_i32=row,
                         scale_row_dword_base=scale_row_dword_base,
                     )
                 ],
-                feat_elem_base=feat_elem_base,
-                hidden_rsrc=hidden_rsrc,
-                payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
             )
             if const_expr(ksplit):
@@ -1793,8 +1814,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
         # sum: it can return a stale 0 instead of the published row base, which
         # scatters the first route of an expert into row 0).
         starts_rd_rsrc = ptr_rsrc(starts)
-        hidden_rsrc = ptr_rsrc(hidden)
-        payload_rsrc = ptr_rsrc(grouped_payload)
+        payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
+        hidden_base = arith.index_cast(T.i64, ptrtoint(hidden))
         scale_rsrc = ptr_rsrc(grouped_scale)
         topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
 
@@ -1832,9 +1853,6 @@ def build_moe_fused_route_psum_quant_scatter_module(
             out_row = scale_tile * c16_i32 + row_lane16
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
-            hidden_elem_base = token * c_model_dim
-
             block_in_wave = arith.divui(lane, c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
@@ -1866,13 +1884,15 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 is_block_lead=is_block_lead,
                 dests=[
                     SimpleNamespace(
-                        payload_row_byte_base=payload_row_byte_base,
+                        payload_row_i32=grouped_row,
                         scale_row_dword_base=scale_row_dword_base,
                     )
                 ],
-                feat_elem_base=hidden_elem_base,
-                hidden_rsrc=hidden_rsrc,
-                payload_rsrc=payload_rsrc,
+                payload_base=payload_base,
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=hidden_base,
+                feat_bytes_per_row=model_dim * 2,
+                feat_row_i32=token,
                 scale_rsrc=scale_rsrc,
             )
             _emit_quant_block_loop(c)
