@@ -276,6 +276,7 @@ def compile_wd_moe_gate_up(
     k_vector: int = 8,
     w_dtype: str = "bf16",
     use_dot2: bool = False,
+    n_waves: int = 1,
 ):
     """Compile warp-decode gate_up and return a @flyc.jit launch wrapper.
 
@@ -285,14 +286,15 @@ def compile_wd_moe_gate_up(
     inter     : INTER dimension (output neurons per expert).
     experts   : E, number of experts.
     topk      : top-K experts per token.
-    k_vector  : elements per lane per K-step.  Must satisfy:
-                hidden % (WAVE_SIZE * k_vector) == 0.
-                Default 8 (one 128-bit load for BF16 or FP8).
-    w_dtype   : "bf16" (default) or "fp8" (OCP E4M3, gfx950 only).
-                FP8 enforces use_dot2=True automatically.
+    k_vector  : elements per lane per K-step.
+    w_dtype   : "bf16" (default), "fp8" (gfx950), or "fp4" (gfx950).
     use_dot2  : if True, use v_dot2_f32_bf16 (gfx950 only).
-                if False, use scalar FP32 path (gfx942 + gfx950).
-                Ignored (forced True) when w_dtype="fp8".
+    n_waves   : waves per block; all waves cooperatively load x[token,:]
+                into LDS so each block reads x once (reuse=n_waves×).
+                Grid: B × TOPK × (INTER / n_waves).
+                Reduces x-bandwidth by n_waves× — key for small-grid shapes
+                (e.g. qwen3next B=1: 14× gap → ~3-4× gap expected).
+                Requires hidden % (n_waves * WAVE_SIZE * 2) == 0.
     """
     if w_dtype not in ("bf16", "fp8", "fp4"):
         raise ValueError(f"w_dtype must be 'bf16', 'fp8', or 'fp4', got {w_dtype!r}")
@@ -300,6 +302,15 @@ def compile_wd_moe_gate_up(
         raise ValueError(
             f"hidden={hidden} must be divisible by WAVE_SIZE*k_vector"
             f"={_WAVE_SIZE * k_vector}"
+        )
+    if n_waves < 1:
+        raise ValueError(f"n_waves must be >= 1, got {n_waves}")
+    if n_waves > 1 and inter % n_waves != 0:
+        raise ValueError(f"inter={inter} must be divisible by n_waves={n_waves}")
+    if n_waves > 1 and hidden % (n_waves * _WAVE_SIZE * 2) != 0:
+        raise ValueError(
+            f"LDS gate_up: hidden={hidden} must be divisible by n_waves*WAVE_SIZE*2"
+            f"={n_waves * _WAVE_SIZE * 2}"
         )
 
     # FP8/FP4 weights always require dot2 (gfx950-only conversion instructions)
@@ -318,12 +329,19 @@ def compile_wd_moe_gate_up(
     _k_step = _WAVE_SIZE * k_vector  # K-elements per loop iteration
     _n_k_steps = hidden // _k_step
 
+    _block_threads_gu = n_waves * _WAVE_SIZE
+    _use_lds_gu = n_waves > 1
+    _lds_bytes_gu = hidden * 2 if _use_lds_gu else 0  # one BF16 x-row in LDS
+    _inter_per_thread_gu = hidden // _block_threads_gu if _use_lds_gu else 0
+
     w_tag = w_dtype if w_dtype in ("fp8", "fp4") else ("d2" if _use_dot2 else "f32")
+    nw_tag = f"_nw{n_waves}" if n_waves > 1 else ""
     module_name = (
-        f"wd_gate_up_h{hidden}_i{inter}_e{experts}_topk{topk}" f"_kv{k_vector}_w{w_tag}"
+        f"wd_gate_up_h{hidden}_i{inter}_e{experts}_topk{topk}"
+        f"_kv{k_vector}_w{w_tag}{nw_tag}"
     )
 
-    @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
+    @flyc.kernel(name=module_name, known_block_size=[_block_threads_gu, 1, 1])
     def _kernel(
         arg_inter_out: fx.Pointer,
         arg_x: fx.Pointer,
@@ -1368,7 +1386,9 @@ def compile_wd_moe_down_reduce(
                     slots: list = [zero_f32] * h_per_warp
                     if _use_fp8_w:
                         c_four = arith.constant(4, type=i32)
-                        x_fp8_loads: list = []  # [wi * 2*h_per_warp + sel*h_per_warp + h]
+                        # x: loaded once per (wi, sel) — shared between h=0,h=1
+                        # w: loaded once per (wi, h) — separate for each output channel
+                        x_fp8_loads: list = []  # [wi * 2 + sel] — one x per pair
                         w_fp8_loads: list = []  # [wi * h_per_warp + h]
                         for wi in range_constexpr(_k_fp8_words):
                             wi4 = arith.constant(wi * 4, type=i32)
@@ -1377,49 +1397,68 @@ def compile_wd_moe_down_reduce(
                                 w_fp8_loads.append(buffer_ops.buffer_load(
                                     w_row_rsrcs[h], w_i32_off, vec_width=1, dtype=i32
                                 ))
+                        for wi in range_constexpr(_k_fp8_words):
                             for sel in range_constexpr(2):
                                 pair_elem = arith.constant((wi * 2 + sel) * 2, type=i32)
                                 x_off = (inter_row_base + lane_k + pair_elem) // c_two
-                                for h in range_constexpr(h_per_warp):
-                                    x_fp8_loads.append(buffer_ops.buffer_load(
-                                        inter_rsrc, x_off, vec_width=1, dtype=i32
-                                    ))
+                                x_fp8_loads.append(buffer_ops.buffer_load(
+                                    inter_rsrc, x_off, vec_width=1, dtype=i32
+                                ))
                         _vmcnt0()
-                        # ── Phase B: pre-convert FP8→BF16, then independent dot2 ──
+                        # ── Phase B: pre-convert ALL FP8→BF16, then all dot2s ───
+                        # Pre-converting before any dot2 ensures fp8-word VGPRs are
+                        # dead by the time dot2 runs.  xw (per wi,sel) is shared
+                        # between h=0 and h=1; adjacent dot2 calls keep xw live so
+                        # LLVM won't alias the h=0 output with xw's VGPR.
+                        # Interleaving fp8_to_bf16 inside the dot2 loop allows LLVM
+                        # to hoist them (side_effects=False), breaking xw adjacency.
+                        wbf16_all: list = []
                         for wi in range_constexpr(_k_fp8_words):
                             for sel in range_constexpr(2):
-                                idx_x = (wi * 2 + sel) * h_per_warp
-                                idx_w = wi * h_per_warp
                                 for h in range_constexpr(h_per_warp):
-                                    xw = x_fp8_loads[idx_x + h]
-                                    wbf16 = _fp8x2_to_bf16(w_fp8_loads[idx_w + h], w_scale, sel)
+                                    wbf16_all.append(
+                                        _fp8x2_to_bf16(w_fp8_loads[wi * h_per_warp + h], w_scale, sel)
+                                    )
+                        for wi in range_constexpr(_k_fp8_words):
+                            for sel in range_constexpr(2):
+                                xw = x_fp8_loads[wi * 2 + sel]
+                                for h in range_constexpr(h_per_warp):
+                                    idx_bf16 = (wi * 2 + sel) * h_per_warp + h
                                     slots[h] = arith.addf(
-                                        slots[h], _dot2_batched(zero_f32, xw, wbf16)
+                                        slots[h], _dot2_batched(zero_f32, xw, wbf16_all[idx_bf16])
                                     )
                         rocdl.s_nop(2)
                     else:
                         # BF16 weight path: one i32 = 2 BF16 per pair.
-                        x_loads: list = []   # [p * h_per_warp + h]
+                        # x is loaded ONCE per pair (shared between h=0 and h=1)
+                        # to avoid LLVM CSE-aliasing: loading x per-h gives the
+                        # same address → LLVM CSEs to one SSA → h=0's dot2 output
+                        # aliases x's VGPR → h=1 reads wrong data (H2 aliasing bug).
+                        # Adjacent h=0,h=1 dot2 calls with shared xw prevent aliasing
+                        # since xw stays live until h=1's dot2 (same as _compute_bf16d2).
+                        x_loads: list = []   # [p] — one x per pair, shared across h
                         w_loads: list = []   # [p * h_per_warp + h]
                         for p in range_constexpr(_k_pairs):
                             p2 = arith.constant(p * 2, type=i32)
                             x_off = (inter_row_base + lane_k + p2) // c_two
                             w_off = (lane_k + p2) // c_two
+                            x_loads.append(buffer_ops.buffer_load(
+                                inter_rsrc, x_off, vec_width=1, dtype=i32
+                            ))
                             for h in range_constexpr(h_per_warp):
-                                x_loads.append(buffer_ops.buffer_load(
-                                    inter_rsrc, x_off, vec_width=1, dtype=i32
-                                ))
                                 w_loads.append(buffer_ops.buffer_load(
                                     w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
                                 ))
                         _vmcnt0()
                         # ── Phase B: independent dot2 per (p, h) ─────────────
+                        # xw (x_loads[p]) is shared between h=0 and h=1 for each p.
+                        # Adjacent calls keep xw live so LLVM won't alias.
                         for p in range_constexpr(_k_pairs):
+                            xw = x_loads[p]
                             for h in range_constexpr(h_per_warp):
-                                idx = p * h_per_warp + h
                                 slots[h] = arith.addf(
                                     slots[h],
-                                    _dot2_batched(zero_f32, x_loads[idx], w_loads[idx]),
+                                    _dot2_batched(zero_f32, xw, w_loads[p * h_per_warp + h]),
                                 )
                         rocdl.s_nop(2)
                     # ── Phase C: reduce k-step slots into running accumulators ─
