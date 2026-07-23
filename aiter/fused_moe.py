@@ -620,8 +620,13 @@ def fused_moe_(
             # SiTUv2 + separated == a16w4 (bf16 activation x mxfp4 weight); keep
             # the activation in bf16 (no fp4 quant). a4w4 SiTUv2 full 2-stage is
             # unsupported (no CK situv2 stage2), so separated-mode SiTUv2 always
-            # maps to the mixed_moe a16w4 kernel.
-            q_dtype_a = dtypes.bf16
+            # maps to the mixed_moe a16w4 kernel. AITER_SITUV2_A8W4=1 overrides
+            # to fp8 activation (a8w4) via the tuned flydsl afp8_wfp4 config.
+            q_dtype_a = (
+                dtypes.fp8
+                if os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+                else dtypes.bf16
+            )
         else:
             q_dtype_a = dtypes.fp4x2
 
