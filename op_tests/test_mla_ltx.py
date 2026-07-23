@@ -516,7 +516,9 @@ def kv_pool_boundary():
         os.environ.get("MLA_PAGE_OOB_NUM_PAGES", str(PAGE_ID_FIRST_OVER_4G + 2_000))
     )
     ranges = _seed_ranges(
-        [PointCase(b, c, l, "boundary") for b, c, l in _PYTEST_BOUNDARY], [], 0
+        [PointCase(b, c, label, "boundary") for b, c, label in _PYTEST_BOUNDARY],
+        [],
+        0,
     )
     try:
         pool = _build_kv_pool(n, ranges)
