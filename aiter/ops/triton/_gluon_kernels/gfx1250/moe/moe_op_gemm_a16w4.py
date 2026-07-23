@@ -92,13 +92,10 @@ def _preload_tile(
     MX_PACK_DIVISOR: gl.constexpr,
     PRESHUFFLE_FACTOR: gl.constexpr,
     SCALE_KWIDTH: gl.constexpr,
-    SCALE_REG_SHARE: gl.constexpr,
-    SCALE_SEL: gl.constexpr,
 ):
     # LDS -> register bf16 W operand for one K-tile (fp4 unpack + scale applied).
-    # Flip NO_MUL_UPCAST to route the compact scale through the software
-    # scaled_upcast instead of the hardware v_cvt_scale_pk8 (see the elif below).
-    NO_MUL_UPCAST: gl.constexpr = False
+    # `scaled_upcast` (the only upcast primitive; compact hw `scale_upcast` is gone)
+    # wants one e8m0 scale per unpacked element, in the op's output layout.
     w_packed = w_slot.permute([1, 0]).load(layout=L_IN_W)
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         ws_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -114,47 +111,22 @@ def _preload_tile(
         w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
         # Software fp4->bf16 upcast with per-element expanded scale.
         w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
-    elif NO_MUL_UPCAST:
-        # Reference no-mul path: software scaled_upcast on the COMPACT scale (x32
-        # expand -> per-element scale -> software fp4->bf16). Correct for kWidth 8
-        # and 16, but ~45% slower as a drop-in at the current kWidth=16 config: the
-        # inner-loop x32 expansion + trans/convert_layout below are work the
-        # hardware scale_upcast avoids. Disabled (NO_MUL_UPCAST=False); kept for
-        # reference. The tuned kWidth=8 variant that drops the convert_layout lives
-        # in git fa8e11e4b.
-        w_scale = ws_slot.load(layout=COMPACT_SCALE_LAYOUT)
-        w_scale = _expand_mx_scale_k(w_scale, BLOCK_N, MX_SCALE_BLOCK_K)
-        w_scale = gl.convert_layout(w_scale.trans(1, 0), layout=L_SCALE_W)
-        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
     else:
-        # Hardware v_cvt_scale_pk8 upcast consuming the COMPACT e8m0 scale directly
-        # -- no x32 expansion, no software upcast. k_scale = SCALE_REG_SHARE (=16):
-        # each 32-group e8m0 covers DUP = 32/16 = 2 consecutive 16-blocks, duplicated
-        # along K. Scale layout (L_SCALE_W) derived by stripping the k_scale
-        # register-K identity. Raw e8m0 byte replicated across a uint32 so
-        # scale_sel byte routing is a no-op.
-        KW: gl.constexpr = SCALE_REG_SHARE
-        DUP: gl.constexpr = MX_PACK_DIVISOR // KW
-        SK: gl.constexpr = BLOCK_K // KW
-        _o3 = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W).reshape(
-            SK, KW, BLOCK_N
-        )
-        SCALE_L: gl.constexpr = gl.SliceLayout(1, _o3.type.layout)
-        _sc3 = gl.full((SK, BLOCK_N), 0, gl.uint8, layout=SCALE_L).reshape(
-            MX_SCALE_BLOCK_K, DUP, BLOCK_N
-        )
-        L_SC3: gl.constexpr = _sc3.type.layout
-        e8 = ws_slot.permute([1, 0]).load(layout=gl.SliceLayout(1, L_SC3))
-        e8 = gl.expand_dims(e8, 1)
-        e8, _ = gl.broadcast(e8, _sc3)
-        e8 = e8.reshape(SK, BLOCK_N)
-        # Replicate the e8m0 byte across all 4 bytes of a uint32 (multiply by
-        # 0x01010101; val <= 255 so no carry) so scale_sel byte routing is a no-op.
-        s = e8.to(gl.uint32)
-        w_scale = s * 0x01010101
-        w_kn = gl.amd.gfx1250.scale_upcast(
-            w_packed, w_scale, axis=0, scale_sel=SCALE_SEL, elem_type=gl.bfloat16
-        )
+        # Compact e8m0 path (no swizzle): build the (BLOCK_K, BLOCK_N) scale
+        # directly in the scaled_upcast output layout (L_SCALE_W), no trans/
+        # convert_layout. Reshape L_SCALE_W to expose the 32-wide pack axis, load
+        # the compact e8m0 into that slice, then expand_dims + broadcast x32 so
+        # out[g*32 + r, n] == scale[g, n]. Faster than the convert_layout variant
+        # on MiniMax-M3 6144x6144: ~30-37% at decode, ~20% at GEMM1 prefill
+        # (GEMM2 prefill ~wash).
+        _dummy = gl.full((BLOCK_K, BLOCK_N), 0, gl.uint8, layout=L_SCALE_W)
+        _d3 = _dummy.reshape(MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N)
+        L_SCALE_3D: gl.constexpr = _d3.type.layout
+        w_scale = ws_slot.permute([1, 0]).load(layout=gl.SliceLayout(1, L_SCALE_3D))
+        w_scale = gl.expand_dims(w_scale, 1)
+        w_scale, _ = gl.broadcast(w_scale, _d3)
+        w_scale = w_scale.reshape(BLOCK_K, BLOCK_N)
+        w_kn = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=0)
     return w_kn
 
 
@@ -343,9 +315,6 @@ def _moe_gemm_a16w4_gluon_impl(
     )
     K_PER_INSR: gl.constexpr = 16
     K_WIDTH: gl.constexpr = min(16, BLOCK_K // INSTR_K * K_PER_INSR)
-    # scale_upcast k_scale = min(K_WIDTH, 32); K_WIDTH=16 is block16 (OPSEL 4).
-    # Replicated scale bytes make the exact byte immaterial.
-    SCALE_SEL: gl.constexpr = 4 if min(K_WIDTH, MX_PACK_DIVISOR) == 16 else 0
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=K_WIDTH
     )
@@ -467,8 +436,6 @@ def _moe_gemm_a16w4_gluon_impl(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
-                min(K_WIDTH, MX_PACK_DIVISOR),
-                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
     else:
@@ -541,8 +508,6 @@ def _moe_gemm_a16w4_gluon_impl(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
-                min(K_WIDTH, MX_PACK_DIVISOR),
-                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
@@ -565,8 +530,6 @@ def _moe_gemm_a16w4_gluon_impl(
                 MX_PACK_DIVISOR,
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
-                min(K_WIDTH, MX_PACK_DIVISOR),
-                SCALE_SEL,
             )
             acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
 
