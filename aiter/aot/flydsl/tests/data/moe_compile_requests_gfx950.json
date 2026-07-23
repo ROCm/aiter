@@ -609,7 +609,7 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
-          "aiter.ops.flydsl.moe_kernels._run_moe_reduction",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_reduction",
           "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction"
         ],
         "launchers": [
@@ -671,7 +671,7 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
-          "aiter.ops.flydsl.moe_kernels._run_moe_reduction",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_reduction",
           "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction"
         ],
         "launchers": [
@@ -733,7 +733,7 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
-          "aiter.ops.flydsl.moe_kernels._run_moe_reduction",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_reduction",
           "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction"
         ],
         "launchers": [

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Stage1 FlyDSL graph resolution using existing compiler signatures.
+"""MoE FlyDSL graph resolution using existing compiler signatures.
 
-There is deliberately no typed mirror of Stage1 builder parameters here.
+There is deliberately no typed mirror of MoE builder parameters here.
 ``CompileOpRegistry.make_unit`` binds directly to the existing compiler
 wrappers, so their signatures and defaults remain the only callable schema.
 This module owns only graph semantics and the launch ABI that FlyDSL cannot
@@ -35,16 +35,27 @@ MIXED_STAGE1_GEMM_OP_ID = "aiter.flydsl.moe.stage1.mixed_gemm.v1"
 INT4_STAGE1_GEMM_OP_ID = "aiter.flydsl.moe.stage1.int4_gemm.v1"
 FQ_ACTIVATION_OP_ID = "aiter.flydsl.moe.stage1.silu_and_mul_fq.v1"
 CKTILE_SWIGLU_AND_MUL_OP_ID = "aiter.flydsl.moe.stage1.cktile_swiglu_and_mul.v1"
+MIXED_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.mixed_gemm.v1"
+INT4_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.int4_gemm.v1"
+PLAIN_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.plain.v1"
+MASKED_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.masked.v1"
 
 __all__ = [
     "CKTILE_SWIGLU_AND_MUL_OP_ID",
     "FQ_ACTIVATION_OP_ID",
     "INT4_STAGE1_GEMM_OP_ID",
+    "INT4_STAGE2_GEMM_OP_ID",
+    "MASKED_REDUCTION_OP_ID",
     "MIXED_STAGE1_GEMM_OP_ID",
+    "MIXED_STAGE2_GEMM_OP_ID",
+    "PLAIN_REDUCTION_OP_ID",
     "register_moe_stage1_ops",
+    "register_moe_stage2_ops",
     "resolve_cktile_stage1_compile_plan",
     "resolve_moe_stage1_compile_plan",
+    "resolve_moe_stage2_compile_plan",
     "stage1_abi",
+    "stage2_abi",
 ]
 
 
@@ -104,11 +115,36 @@ _SWIGLU_EPILOGUE_ABI = _abi(
     ),
 )
 
+_MIXED_STAGE2_GEMM_ABI = _abi(
+    pointers="""
+        arg_out arg_x arg_w arg_scale_x arg_scale_w arg_sorted_token_ids
+        arg_expert_ids arg_sorted_weights arg_num_valid_ids arg_bias
+    """,
+    i32="i32_tokens_in i32_n_in i32_k_in i32_size_expert_ids_in",
+)
+
+_INT4_STAGE2_GEMM_ABI = _abi(
+    pointers="""
+        arg_out arg_x arg_w arg_scale_x arg_scale_w arg_sorted_token_ids
+        arg_expert_ids arg_sorted_weights arg_num_valid_ids
+    """,
+    i32="i32_tokens_in i32_n_in i32_k_in i32_size_expert_ids_in",
+)
+
+_REDUCTION_ABI = _abi(
+    pointers="X Y expert_mask topk_ids",
+    i32="i32_m_tokens",
+)
+
 _ABIS = {
     MIXED_STAGE1_GEMM_OP_ID: _MIXED_GEMM_ABI,
     INT4_STAGE1_GEMM_OP_ID: _INT4_GEMM_ABI,
     FQ_ACTIVATION_OP_ID: _FQ_ACTIVATION_ABI,
     CKTILE_SWIGLU_AND_MUL_OP_ID: _SWIGLU_EPILOGUE_ABI,
+    MIXED_STAGE2_GEMM_OP_ID: _MIXED_STAGE2_GEMM_ABI,
+    INT4_STAGE2_GEMM_OP_ID: _INT4_STAGE2_GEMM_ABI,
+    PLAIN_REDUCTION_OP_ID: _REDUCTION_ABI,
+    MASKED_REDUCTION_OP_ID: _REDUCTION_ABI,
 }
 
 
@@ -121,14 +157,29 @@ def stage1_abi(op_id: str) -> KernelSignature:
         raise KeyError(f"unknown Stage1 op_id: {op_id!r}") from error
 
 
+def stage2_abi(op_id: str) -> KernelSignature:
+    """Return the isolated manual ABI for one stable Stage2 operation."""
+
+    if op_id not in (
+        MIXED_STAGE2_GEMM_OP_ID,
+        INT4_STAGE2_GEMM_OP_ID,
+        PLAIN_REDUCTION_OP_ID,
+        MASKED_REDUCTION_OP_ID,
+    ):
+        raise KeyError(f"unknown Stage2 op_id: {op_id!r}")
+    return _ABIS[op_id]
+
+
 @lru_cache(maxsize=1)
 def _declared_ops() -> tuple[CompileOp, ...]:
-    """Declare Stage1 ops lazily so importing this module stays CPU-light."""
+    """Declare MoE ops lazily so importing this module stays CPU-light."""
 
     from .moe_kernels import (
+        compile_flydsl_moe_reduction,
         _get_compiled_silu_fused,
         _get_compiled_swiglu,
         compile_flydsl_moe_stage1,
+        compile_flydsl_moe_stage2,
     )
 
     declarations = (
@@ -139,6 +190,26 @@ def _declared_ops() -> tuple[CompileOp, ...]:
             CKTILE_SWIGLU_AND_MUL_OP_ID,
             _get_compiled_swiglu,
             _SWIGLU_EPILOGUE_ABI,
+        ),
+        (
+            MIXED_STAGE2_GEMM_OP_ID,
+            compile_flydsl_moe_stage2,
+            _MIXED_STAGE2_GEMM_ABI,
+        ),
+        (
+            INT4_STAGE2_GEMM_OP_ID,
+            compile_flydsl_moe_stage2,
+            _INT4_STAGE2_GEMM_ABI,
+        ),
+        (
+            PLAIN_REDUCTION_OP_ID,
+            compile_flydsl_moe_reduction,
+            _REDUCTION_ABI,
+        ),
+        (
+            MASKED_REDUCTION_OP_ID,
+            compile_flydsl_moe_reduction,
+            _REDUCTION_ABI,
         ),
     )
     return tuple(
@@ -156,8 +227,32 @@ def register_moe_stage1_ops(
 ) -> CompileOpRegistry:
     """Register all Stage1 declarations with ``registry``."""
 
+    stage1_op_ids = {
+        MIXED_STAGE1_GEMM_OP_ID,
+        INT4_STAGE1_GEMM_OP_ID,
+        FQ_ACTIVATION_OP_ID,
+        CKTILE_SWIGLU_AND_MUL_OP_ID,
+    }
     for operation in _declared_ops():
-        operation.register(registry)
+        if operation.op_id in stage1_op_ids:
+            operation.register(registry)
+    return registry
+
+
+def register_moe_stage2_ops(
+    registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
+) -> CompileOpRegistry:
+    """Register all Stage2 declarations with ``registry``."""
+
+    stage2_op_ids = {
+        MIXED_STAGE2_GEMM_OP_ID,
+        INT4_STAGE2_GEMM_OP_ID,
+        PLAIN_REDUCTION_OP_ID,
+        MASKED_REDUCTION_OP_ID,
+    }
+    for operation in _declared_ops():
+        if operation.op_id in stage2_op_ids:
+            operation.register(registry)
     return registry
 
 
@@ -179,6 +274,28 @@ def _primary_op(
         return operations[INT4_STAGE1_GEMM_OP_ID]
     raise ValueError(
         f"{plan.context}: unsupported Stage1 dtype combination: "
+        f"a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
+    )
+
+
+def _stage2_primary_op(
+    plan: PlanBuilder,
+    operations: dict[str, CompileOp],
+    builder_kwargs: dict[str, Any],
+) -> CompileOp:
+    try:
+        a_dtype = builder_kwargs["a_dtype"]
+        b_dtype = builder_kwargs["b_dtype"]
+    except KeyError as error:
+        raise TypeError(
+            f"{plan.context}: missing required Stage2 argument: {error.args[0]}"
+        ) from error
+    if a_dtype in ("fp4", "fp8") and b_dtype in ("fp4", "fp8"):
+        return operations[MIXED_STAGE2_GEMM_OP_ID]
+    if a_dtype == "bf16" and b_dtype == "int4":
+        return operations[INT4_STAGE2_GEMM_OP_ID]
+    raise ValueError(
+        f"{plan.context}: unsupported Stage2 dtype combination: "
         f"a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
     )
 
@@ -267,6 +384,161 @@ def resolve_moe_stage1_compile_plan(
         )
     # Other separated split-K paths use a CK/HIP activation and add no
     # FlyDSL compile unit.
+
+
+@plan_provider
+def resolve_moe_stage2_compile_plan(
+    plan: PlanBuilder,
+    *,
+    mode: str,
+    accumulate: bool,
+    return_per_slot: bool,
+    persist: bool | None,
+    token_num: int,
+    routing_block_count: int | None,
+    dtype_str: str,
+    use_mask: bool,
+    topk_ids_available: bool,
+    num_experts: int,
+    **builder_kwargs: Any,
+) -> None:
+    """Resolve one Stage2 GEMM and its optional top-k reduction.
+
+    Builder parameters bind directly to ``compile_flydsl_moe_stage2`` and
+    ``compile_flydsl_moe_reduction``. The explicit parameters above are graph
+    metadata that selects units or derives a builder value; they are not a
+    parallel copy of either callable schema.
+    """
+
+    if "persist_m" in builder_kwargs:
+        raise TypeError(f"{plan.context}: persist_m is owned by the Stage2 provider")
+
+    operations = _operations()
+    primary = _stage2_primary_op(plan, operations, builder_kwargs)
+    requested = plan.bind(primary, persist_m=1)
+
+    for name in (
+        "model_dim",
+        "inter_dim",
+        "experts",
+        "topk",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+    ):
+        value = requested[name]
+        plan.require(
+            not isinstance(value, bool) and isinstance(value, int) and value > 0,
+            f"{name} must be a positive integer, got {value!r}",
+            operation=primary,
+        )
+    plan.require(
+        isinstance(requested["doweight_stage2"], bool),
+        "doweight_stage2 must explicitly identify route-weight ownership",
+        operation=primary,
+    )
+    plan.require(
+        isinstance(requested["enable_bias"], bool),
+        f"enable_bias must be a bool, got {requested['enable_bias']!r}",
+        operation=primary,
+    )
+    plan.require(mode in ("atomic", "reduce"), f"unsupported Stage2 mode: {mode!r}")
+    plan.require(
+        isinstance(accumulate, bool),
+        f"accumulate must be a bool, got {accumulate!r}",
+        operation=primary,
+    )
+    plan.require(
+        isinstance(return_per_slot, bool),
+        f"return_per_slot must be a bool, got {return_per_slot!r}",
+        operation=primary,
+    )
+    expected_accumulate = mode != "reduce" and not return_per_slot
+    plan.require(
+        accumulate == expected_accumulate,
+        "accumulate disagrees with mode/return_per_slot: "
+        f"expected {expected_accumulate}, got {accumulate}",
+        operation=primary,
+    )
+
+    out_dtype = str(requested["out_dtype"]).lower()
+    expected_reduction_dtype = {
+        "bf16": "bf16",
+        "bfloat16": "bf16",
+        "f16": "f16",
+        "fp16": "f16",
+        "half": "f16",
+    }.get(out_dtype)
+    plan.require(
+        expected_reduction_dtype is not None,
+        f"unsupported Stage2 output dtype: {requested['out_dtype']!r}",
+        operation=primary,
+    )
+    plan.require(
+        dtype_str == expected_reduction_dtype,
+        "reduction dtype must match Stage2 output dtype: "
+        f"expected {expected_reduction_dtype!r}, got {dtype_str!r}",
+        operation=primary,
+    )
+    plan.require(
+        not (primary.op_id == INT4_STAGE2_GEMM_OP_ID and requested["enable_bias"]),
+        "bf16×int4 Stage2 does not support bias",
+        operation=primary,
+    )
+
+    needs_reduction = not accumulate and not return_per_slot
+    plan.require(
+        isinstance(use_mask, bool),
+        f"use_mask must be a bool, got {use_mask!r}",
+    )
+    plan.require(
+        isinstance(topk_ids_available, bool),
+        f"topk_ids_available must be a bool, got {topk_ids_available!r}",
+    )
+    plan.require(
+        not isinstance(num_experts, bool) and isinstance(num_experts, int),
+        f"num_experts must be an integer, got {num_experts!r}",
+    )
+    if use_mask:
+        plan.require(needs_reduction, "masked reduction requires reduction output")
+        plan.require(
+            topk_ids_available,
+            "masked reduction requires top-k-id semantics",
+        )
+        plan.require(
+            num_experts > 0,
+            "masked reduction requires a positive global expert count",
+        )
+    else:
+        plan.require(
+            not topk_ids_available,
+            "top-k-id semantics are only valid for masked reduction",
+        )
+        plan.require(
+            num_experts == 0,
+            "plain reduction requires num_experts=0",
+        )
+
+    from .moe_kernels import resolve_stage2_persist_m
+
+    persist_m = resolve_stage2_persist_m(
+        token_num=token_num,
+        topk=requested["topk"],
+        experts=num_experts if use_mask else requested["experts"],
+        tile_m=requested["tile_m"],
+        sort_block_m=requested["sort_block_m"],
+        routing_block_count=routing_block_count,
+        persist=persist,
+        a_dtype=requested["a_dtype"],
+    )
+    plan.emit(requested, persist_m=persist_m)
+
+    if not needs_reduction:
+        return
+    reduction = operations[
+        MASKED_REDUCTION_OP_ID if use_mask else PLAIN_REDUCTION_OP_ID
+    ]
+    plan.emit(reduction)
 
 
 @plan_provider

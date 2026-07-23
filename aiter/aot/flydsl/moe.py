@@ -30,21 +30,14 @@ import time
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
-    compile_only_env,
     cu_num_to_arch,
     job_identity,
-    override_env,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.aot_backend import compile_aot, create_compile_context
 from aiter.ops.flydsl.compile_plan import RocmTarget
-from aiter.ops.flydsl.launch_context import LaunchContext
-from aiter.ops.flydsl.moe_kernels import (
-    build_stage2_compile_inputs,
-    flydsl_moe_stage2,
-    get_flydsl_kernel_params,
-)
+from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -74,10 +67,9 @@ def parse_csv(csv_path: str):
 
     Each job is a dict with keys:
         kernel_name, stage, model_dim, inter_dim, experts, topk,
-        doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
+        explicit graph metadata, and all params from get_flydsl_kernel_params.
 
-    Deduplicates by
-    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
+    Jobs are deduplicated by their complete normalized metadata.
     """
     jobs = []
     seen = set()
@@ -113,15 +105,7 @@ def parse_csv(csv_path: str):
             )
             enable_bias_options = [False, True] if bias_supported else [False]
 
-            # Detect stage1's fuse_quant from kernel suffix to align stage2's
-            # a2_scale shape with what runtime actually passes.
             stage1_name = row.get("kernelName1", "").strip()
-            stage1_params = (
-                get_flydsl_kernel_params(stage1_name)
-                if stage1_name.startswith("flydsl_")
-                else None
-            )
-            stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
 
             # cktile_ stage1 runs a FlyDSL post-activation epilogue (silu ->
             # silu_and_mul_fq, swiglu -> swiglu_and_mul) that the flydsl_-only loop
@@ -174,14 +158,27 @@ def parse_csv(csv_path: str):
                         "block_m": block_m,
                         "swiglu_limit": swiglu_limit,
                     }
-                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
-                    # this changes the shape of a2_scale (sorted scale buffer
-                    # vs separate quant call output).
                     if params["stage"] == 2:
-                        job["stage1_fuse_quant"] = (
-                            stage1_out_dtype
-                            if stage1_out_dtype in ("fp4", "fp8")
-                            else None
+                        reduction_dtype = {
+                            "bf16": "bf16",
+                            "f16": "f16",
+                            "fp16": "f16",
+                        }.get(params["out_dtype"])
+                        if reduction_dtype is None:
+                            raise ValueError(
+                                f"{name}: unsupported Stage2 output dtype "
+                                f"{params['out_dtype']!r}"
+                            )
+                        job.update(
+                            doweight_stage2=not doweight_stage1,
+                            accumulate=params.get("mode", "atomic") != "reduce",
+                            return_per_slot=False,
+                            persist=params.get("persist"),
+                            routing_block_count=None,
+                            dtype_str=reduction_dtype,
+                            use_mask=False,
+                            topk_ids_available=False,
+                            num_experts=0,
                         )
                     else:
                         # This is the production Stage1 wrapper setting.  Keep
@@ -223,6 +220,17 @@ def _compile_stage1_plan(cfg: dict, context) -> int:
     )
 
     plan = resolve_moe_stage1_compile_plan(context=context, **cfg)
+    for unit in plan.units:
+        compile_aot(unit, context=context)
+    return len(plan.units)
+
+
+def _compile_stage2_plan(cfg: dict, context) -> int:
+    from aiter.ops.flydsl.moe_compile_plan import (
+        resolve_moe_stage2_compile_plan,
+    )
+
+    plan = resolve_moe_stage2_compile_plan(context=context, **cfg)
     for unit in plan.units:
         compile_aot(unit, context=context)
     return len(plan.units)
@@ -280,9 +288,8 @@ def compile_one_config(
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
 
-    Stage1 and its CK-Tile FlyDSL epilogues compile directly from resolved
-    ``CompileUnit.signature`` metadata. Stage2 intentionally remains on the
-    transitional FakeTensor/full-host path until its own CompilePlan migration.
+    Stage1, Stage2, reductions, and CK-Tile FlyDSL epilogues compile directly
+    from resolved ``CompileUnit.signature`` metadata.
 
     Returns a dict with timing info.
     """
@@ -326,34 +333,15 @@ def compile_one_config(
             result["compile_units"] = unit_count
             result["direct_stage1_aot"] = True
         elif stage == 2:
-            # Stage2 is deliberately transitional: it still executes its full
-            # host under FakeTensorMode, but receives an explicit null launch
-            # context instead of reading COMPILE_ONLY inside kernel code.
-            from torch._subclasses.fake_tensor import FakeTensorMode
-
-            with (
-                override_env("ARCH", target.arch),
-                override_env("FLYDSL_GPU_ARCH", target.arch),
-                compile_only_env(),
-                override_env("CU_NUM", str(target.cu_count)),
-                FakeTensorMode(),
-            ):
-                from aiter.jit.utils.chip_info import get_cu_num
-
-                get_cu_num.cache_clear()
-                flydsl_moe_stage2(
-                    **build_stage2_compile_inputs(**cfg),
-                    launch_context=LaunchContext(None),
-                )
+            unit_count = _compile_stage2_plan(cfg, context)
+            result["compile_units"] = unit_count
+            result["direct_stage2_aot"] = True
         else:
             raise ValueError(f"unsupported MoE AOT stage: {stage!r}")
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        direct_label = (
-            f"  direct_units={result['compile_units']}"
-            if result.get("direct_stage1_aot")
-            else "  stage2_transitional=True"
-        )
+        direct_stage = "stage1" if result.get("direct_stage1_aot") else "stage2"
+        direct_label = f"  direct_{direct_stage}_units={result['compile_units']}"
         print(
             f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  "
             f"arch={aot_arch}{direct_label}"

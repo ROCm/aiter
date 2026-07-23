@@ -341,58 +341,44 @@ artifact.
   between stages when quantization is not fused by FlyDSL stage1.
 - **Opus:** default standard sorting when CK sorting is not forced, local-ID
   and some auxiliary sorting routes, plus tuned Opus stage2 rows.
-- **Host/PyTorch:** tensor allocation/view logic, unsupported plain reduction
-  fallback, and CK-Tile interleaved GELU.
+- **Host/PyTorch:** tensor allocation/view logic and CK-Tile interleaved GELU.
 
 Backend mixing is expected. A FlyDSL stage1 does not imply a FlyDSL stage2,
 and FlyDSL sorting is an independent opt-in.
 
-## Transitional AOT route and baseline contract
+## ABI-driven AOT route and baseline contract
 
-The current [`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) route is
-transitional:
+[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) resolves Stage1,
+Stage2, and reduction `CompileUnit` objects directly:
 
 1. It enumerates CSV rows and resolves `flydsl_` kernel names through the
-   current registry. It also emits broad CK-Tile epilogue jobs and both
-   supported bias-presence variants for eligible fp4-weight rows. Unlike
-   runtime lookup, this parser does not discard `_tag=flydsl_fallback` rows,
-   so it can over-collect jobs from them.
-2. It selects `FLYDSL_GPU_ARCH` from `cu_num` (`80`/`304` -> gfx942,
-   `256` -> gfx950, otherwise gfx950).
-3. Under `FakeTensorMode` and `COMPILE_ONLY=1`, it creates top-level stage
-   placeholders with `build_stage1_compile_inputs()` or
-   `build_stage2_compile_inputs()` and invokes `flydsl_moe_stage1/2`.
-4. The real stage host functions still own argument packing, the primary
-   builder call, split-K auxiliary builders, and stage2 reduction.
+   current registry. It also emits CK-Tile epilogue jobs and both supported
+   bias-presence variants for eligible fp4-weight rows.
+2. It derives an explicit `RocmTarget` from `cu_num` and creates the shared
+   Aiter `AotBackend`.
+3. Stage1 and Stage2 providers bind existing compile-wrapper signatures and
+   defaults. Each unit carries a stable versioned op ID and exact launch ABI.
+4. The backend materializes pointer/scalar/stream metadata and invokes the
+   FlyDSL launcher in compile-only mode. No FakeTensor, runtime tensor
+   allocation, stream lookup, or full stage host call is involved.
 
-Although routing pointer lengths are not part of the FlyDSL argument
-signature, the placeholder `sorted_expert_ids` length can still cross
-stage2's `m_blocks > 256` host threshold and change `persist_m`. The
-`_aot_routing_placeholder()` docstring refers to
-`aiter/aot/flydsl/_cache_key_parity.py`, but that guard is not present on this
-branch. The checked-in request golden therefore includes otherwise-matching
-small and large plain-reduce scenarios; the large scenario records the
-threshold-derived `persist_m=-1` request explicitly.
+Stage2's kernel-owned persistence helper accepts either the real runtime
+routing-block count or the AOT token bucket and standard routing capacity.
+Both paths therefore share the automatic threshold and fp8 override rather
+than mirroring the `m_blocks > 256` decision. CSV reduce rows emit the plain
+reduction unit. Masked EP reduction remains an explicit provider operation
+case requiring top-k-ID semantics and a positive global expert count.
 
-This adapter bypasses `fused_moe_`, configuration lookup, quantization, and
-sorting; it is therefore neither a complete production call graph nor a
-Manifest source. In particular, sorting still touches CUDA properties/streams
-and is not driven by this direct stage AOT route. The adapter also supplies no
-`expert_mask`/`topk_ids` to stage2, so a reduce row compiles the plain
-reduction only; the masked reduction must be covered by the old-host-path
-baseline.
+This adapter still bypasses `fused_moe_`, quantization, and sorting; it is
+neither a complete production call graph nor a Manifest source. Sorting
+remains outside this direct AOT route.
 
-The CPU baseline recorder enters the existing `flydsl_moe_stage1/2`,
-epilogue, and sorting host paths through production input builders and
-wrappers. It does not reimplement or execute `fused_moe_` configuration
-selection; those predicates remain the inventory contract above. With fake
-tensors and mocked compile/launch/CUDA boundaries, the test normalizes complete
-public builder kwargs plus a stable trigger ID and compares the exact request
-set with the checked-in gfx950 golden. It must not snapshot FlyDSL-private cache
-keys.
-That golden is a regression oracle for a future resolver: intentional old-path
-changes require an explicit reviewed golden update; incidental ordering,
-pointer values, launcher state, or cache implementation details do not.
+The CPU baseline recorder enters the runtime stage and sorting hosts with
+test-owned fake inputs while mocking compile/launch/CUDA boundaries. It
+normalizes complete public builder kwargs plus a stable trigger ID and compares
+the exact request set with the checked-in gfx950 golden. Separate provider
+tests compare ordered Stage2 units, op IDs, bound builder requests, and ABIs
+against the same golden. Neither test snapshots FlyDSL-private cache keys.
 
 ### Checked-in trigger matrix
 

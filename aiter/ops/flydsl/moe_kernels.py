@@ -352,6 +352,22 @@ def _register_all_configs():
 _register_all_configs()
 
 
+def _resolve_plan_launchers(plan, compile_context):
+    """Resolve every unit once and return launchers keyed by stable op ID."""
+
+    by_op_id = {}
+    for unit in plan.units:
+        op_id = unit.spec.op_id
+        if op_id in by_op_id:
+            raise RuntimeError(f"duplicate CompilePlan op_id: {op_id}")
+        artifact = compile_context.backend.resolve_aot(
+            unit,
+            context=compile_context,
+        )
+        by_op_id[op_id] = getattr(artifact, "launcher", artifact)
+    return by_op_id
+
+
 def _resolve_stage1_plan_launchers(builder_kwargs, compile_context):
     """Resolve Stage1 once and obtain every launcher through its backend."""
 
@@ -361,17 +377,7 @@ def _resolve_stage1_plan_launchers(builder_kwargs, compile_context):
         context=compile_context,
         **builder_kwargs,
     )
-    by_op_id = {}
-    for unit in plan.units:
-        op_id = unit.spec.op_id
-        if op_id in by_op_id:
-            raise RuntimeError(f"duplicate Stage1 CompilePlan op_id: {op_id}")
-        artifact = compile_context.backend.resolve_aot(
-            unit,
-            context=compile_context,
-        )
-        by_op_id[op_id] = getattr(artifact, "launcher", artifact)
-    return by_op_id
+    return _resolve_plan_launchers(plan, compile_context)
 
 
 @functools.lru_cache(maxsize=None)
@@ -476,6 +482,7 @@ def compile_flydsl_moe_stage1(
         )
 
 
+@functools.lru_cache(maxsize=None)
 def compile_flydsl_moe_stage2(
     model_dim: int,
     inter_dim: int,
@@ -499,12 +506,19 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    compile_target=None,
 ):
-    """Compile stage2 kernel (cached via underlying lru_cache)."""
+    """Compile Stage2 with explicit targets included in the wrapper cache."""
+
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
-        return compile_mixed_moe_gemm2(
+        builder = (
+            getattr(compile_mixed_moe_gemm2, "__wrapped__", compile_mixed_moe_gemm2)
+            if compile_target is not None
+            else compile_mixed_moe_gemm2
+        )
+        return builder(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -537,7 +551,12 @@ def compile_flydsl_moe_stage2(
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
 
-        return compile_moe_gemm2(
+        builder = (
+            getattr(compile_moe_gemm2, "__wrapped__", compile_moe_gemm2)
+            if compile_target is not None
+            else compile_moe_gemm2
+        )
+        return builder(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -556,6 +575,100 @@ def compile_flydsl_moe_stage2(
         raise ValueError(
             f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
         )
+
+
+@functools.lru_cache(maxsize=None)
+def compile_flydsl_moe_reduction(
+    topk: int,
+    model_dim: int,
+    dtype_str: str = "f16",
+    use_mask: bool = False,
+    num_experts: int = 0,
+    compile_target=None,
+):
+    """Compile a top-k reduction with target-aware wrapper caching."""
+
+    from .kernels.moe_gemm_2stage import compile_moe_reduction
+
+    builder = (
+        getattr(compile_moe_reduction, "__wrapped__", compile_moe_reduction)
+        if compile_target is not None
+        else compile_moe_reduction
+    )
+    return builder(
+        topk=topk,
+        model_dim=model_dim,
+        dtype_str=dtype_str,
+        use_mask=use_mask,
+        num_experts=num_experts,
+    )
+
+
+def resolve_stage2_persist_m(
+    *,
+    token_num: int,
+    topk: int,
+    experts: int,
+    tile_m: int,
+    sort_block_m: int,
+    routing_block_count: int | None,
+    persist: bool | None,
+    a_dtype: str,
+) -> int:
+    """Resolve Stage2 persistence from CPU-only routing metadata.
+
+    Runtime supplies the allocated routing-block count. Direct AOT may omit it;
+    in that case this helper derives the standard routing capacity from the
+    explicit token bucket, expert count, top-k, and sorting block size.
+    """
+
+    positive = {
+        "token_num": token_num,
+        "topk": topk,
+        "experts": experts,
+        "tile_m": tile_m,
+    }
+    for name, value in positive.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if isinstance(sort_block_m, bool) or not isinstance(sort_block_m, int):
+        raise TypeError(f"sort_block_m must be an integer, got {sort_block_m!r}")
+    if sort_block_m < 0:
+        raise ValueError(f"sort_block_m must be non-negative, got {sort_block_m}")
+    if persist is not None and not isinstance(persist, bool):
+        raise TypeError(f"persist must be bool or None, got {persist!r}")
+    if a_dtype not in ("fp4", "fp8", "bf16"):
+        raise ValueError(f"unsupported Stage2 activation dtype: {a_dtype!r}")
+
+    sorting_block_m = sort_block_m if sort_block_m > 0 else tile_m
+    if routing_block_count is None:
+        route_capacity = token_num * topk + experts * sorting_block_m - topk
+        routing_block_count = (route_capacity + sorting_block_m - 1) // sorting_block_m
+    elif (
+        isinstance(routing_block_count, bool)
+        or not isinstance(routing_block_count, int)
+        or routing_block_count <= 0
+    ):
+        raise ValueError(
+            "routing_block_count must be a positive integer or None, "
+            f"got {routing_block_count!r}"
+        )
+
+    if sorting_block_m == tile_m:
+        m_blocks = min(routing_block_count, token_num * topk)
+    else:
+        total_sorted = routing_block_count * sorting_block_m
+        m_blocks = (total_sorted + tile_m - 1) // tile_m
+
+    if persist is True:
+        persist_m = -1
+    elif persist is False:
+        persist_m = 4 if m_blocks > 256 else 1
+    else:
+        persist_m = -1 if m_blocks > 256 else 1
+
+    # The fp8 activation path intentionally disables persistent scheduling.
+    return 1 if a_dtype == "fp8" else persist_m
 
 
 # Private helpers
@@ -766,6 +879,7 @@ def _run_compiled(exe, args):
 
 
 def _run_moe_reduction(
+    reduce_exe,
     target,
     out,
     token_num,
@@ -781,36 +895,8 @@ def _run_moe_reduction(
         raise ValueError(
             "topk_ids is required when expert_mask is provided for reduce mode"
         )
-    # Map torch dtype -> compile_moe_reduction dtype_str
-    if out.dtype == torch.float16:
-        _reduce_dtype_str = "f16"
-    elif out.dtype == torch.bfloat16:
-        _reduce_dtype_str = "bf16"
-    elif out.dtype == torch.float32:
-        _reduce_dtype_str = "f32"
-    else:
-        _reduce_dtype_str = None
-
-    if _reduce_dtype_str is None:
-        # Unsupported dtype for the masked kernel — fall back to torch.sum.
-        # This drops the EP mask, so only valid for non-EP runs.
-        if use_mask:
-            raise NotImplementedError(
-                f"Masked moe reduction not supported for dtype {out.dtype}"
-            )
-        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
-        return
-
-    from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-    reduce_exe = compile_moe_reduction(
-        topk=topk,
-        model_dim=model_dim,
-        dtype_str=_reduce_dtype_str,
-        use_mask=use_mask,
-        # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
-        num_experts=int(expert_mask.numel()) if use_mask else 0,
-    )
+    if out.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"unsupported FlyDSL reduction dtype: {out.dtype}")
     X = target.view(token_num, topk, model_dim)
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
@@ -1182,279 +1268,6 @@ def flydsl_silu_and_mul_interleaved(
             float("inf"),
             launch_context.stream,
         ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Transitional compile-input builders
-#
-# Stage1 production AOT resolves CompileUnits and materializes their declared
-# ABI directly; ``build_stage1_compile_inputs`` remains only for the CPU golden
-# recorder. Stage2 AOT still uses ``build_stage2_compile_inputs`` under its
-# explicitly marked FakeTensor/full-host transition.
-#
-# Only the *input* shapes (activations, weights, scales, routing) live here —
-# everything downstream of the stage entry point (out_scale_sorted_flat, arg
-# packing via _s1_args_*, the compile call, split-K secondary kernels, the
-# reduction epilogue) is owned solely by flydsl_moe_stage1/2.
-# ---------------------------------------------------------------------------
-
-
-def _aot_routing_placeholder(tokens: int, topk: int, num_experts: int, tile_m: int):
-    """Placeholder sizes for the AOT compile-only routing buffers.
-
-    These buffers (``sorted_token_ids`` / ``sorted_expert_ids`` /
-    ``sorted_weights``) reach the kernel as bare ``ptr_arg`` pointers (null under
-    ``FakeTensor``), so their length **never enters the JIT cache key** -- it only
-    feeds runtime-scalar grid dims that don't exist at compile time. We therefore
-    deliberately do NOT mirror ``aiter.fused_moe.moe_sorting``'s padded-size
-    formula (runtime keeps its own copy; there is no shared size contract to keep
-    in sync). A coarse non-zero over-estimate just keeps the host body's shape
-    math sane. Cache-key-neutrality is guarded by
-    ``aiter/aot/flydsl/_cache_key_parity.py``.
-    """
-    rows = tokens * topk + num_experts * tile_m
-    blocks = max(1, (rows + tile_m - 1) // tile_m)
-    return rows, blocks
-
-
-def _moe_storage_dtype(dtype: str):
-    """Map a FlyDSL dtype tag to its torch storage dtype."""
-    if dtype in ("fp4", "fp8"):
-        return torch.uint8
-    if dtype in ("fp16", "f16"):
-        return torch.float16
-    if dtype == "bf16":
-        return torch.bfloat16
-    if dtype == "int4":
-        return torch.int4 if hasattr(torch, "int4") else torch.uint8
-    return torch.int8
-
-
-def _moe_empty(shape, dtype, dev):
-    # torch.zeros doesn't support sub-byte dtypes (int4); use empty for those.
-    # Cache key only depends on shape+dtype+strides — values don't matter.
-    if dtype == getattr(torch, "int4", None):
-        return torch.empty(shape, device=dev, dtype=dtype)
-    return torch.zeros(shape, device=dev, dtype=dtype)
-
-
-def build_stage1_compile_inputs(
-    *,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    a_dtype: str = "fp4",
-    b_dtype: str = "fp4",
-    out_dtype: str = "bf16",
-    act: str = "silu",
-    doweight_stage1: bool = False,
-    waves_per_eu: Optional[int] = None,
-    k_batch: int = 1,
-    b_nt: int = 2,
-    gate_mode: str = "separated",
-    sort_block_m: int = 0,
-    token_num: int = 0,
-    block_m: int = 0,
-    a_scale_one: bool = False,
-    xcd_swizzle: int = 0,
-    enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
-    k_wave: int = 1,
-    dev=None,
-    **_ignored,
-) -> dict:
-    """Build Stage1 host kwargs for the CPU compile-request recorder.
-
-    Only the top-level ``a`` / ``w1`` shapes and the boolean flags (dtypes,
-    tile, ``doweight_stage1`` / ``enable_bias`` / ``a_scale_one`` ...) feed the
-    JIT cache key. The scale tensors reach the kernel as bare ``ptr_arg``
-    pointers, whose cache signature carries no shape; the routing tensors' sizes
-    only drive runtime-scalar grid dims. Neither affects the key -- empirically
-    verified byte-identical with ``a1_scale`` / ``w1_scale=None`` and length-1
-    routing across fp4/fp8/int4 x stage1/2 x split-K/bias/doweight. So we skip
-    mirroring the quant-kernel scale shapes (which have no runtime formula to
-    share anyway) and pass ``None``.
-    """
-    dev = dev if dev is not None else torch.device("cpu")
-    tokens = token_num if token_num > 0 else tile_m
-    E = experts
-    # sort_block_m / block_m no longer size these buffers (see
-    # _aot_routing_placeholder): the routing buffers are pointer args, so their
-    # length is irrelevant to the cache key.
-    max_num_tokens_padded, max_num_m_blocks = _aot_routing_placeholder(
-        tokens, topk, E, tile_m
-    )
-
-    # Activation / weight shapes DO set the cache key (model_dim / inter_dim / E,
-    # including the fp4 half-byte packing), so these stay exact.
-    a_shape = (tokens, model_dim // 2) if a_dtype == "fp4" else (tokens, model_dim)
-    if b_dtype in ("fp4", "int4"):
-        w1_shape = (E, 2 * inter_dim, model_dim // 2)
-    else:
-        w1_shape = (E, 2 * inter_dim, model_dim)
-
-    a = _moe_empty(a_shape, _moe_storage_dtype(a_dtype), dev)
-    w1 = _moe_empty(w1_shape, _moe_storage_dtype(b_dtype), dev)
-
-    sorted_token_ids = torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.int32)
-    sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
-    num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
-
-    # sorted_weights / bias / topk_ids: only their *presence* flips a cache-key
-    # flag (doweight_stage1 / enable_bias); their shapes are irrelevant.
-    sorted_weights = (
-        torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
-        if doweight_stage1
-        else None
-    )
-    bias = (
-        torch.zeros(E * inter_dim * 2, device=dev, dtype=torch.float32)
-        if enable_bias
-        else None
-    )
-    topk_ids = (
-        torch.zeros((tokens, topk), device=dev, dtype=torch.int32)
-        if enable_bias
-        else None
-    )
-
-    return dict(
-        a=a,
-        w1=w1,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        out=None,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        act=act,
-        w1_scale=None,
-        a1_scale=None,
-        sorted_weights=sorted_weights,
-        use_async_copy=True,
-        k_batch=k_batch,
-        waves_per_eu=waves_per_eu,
-        b_nt=b_nt,
-        gate_mode=gate_mode,
-        bias=bias,
-        topk_ids=topk_ids,
-        a_scale_one=a_scale_one,
-        xcd_swizzle=xcd_swizzle,
-        swiglu_limit=swiglu_limit,
-        k_wave=k_wave,
-    )
-
-
-def build_stage2_compile_inputs(
-    *,
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    a_dtype: str = "fp4",
-    b_dtype: str = "fp4",
-    out_dtype: str = "bf16",
-    doweight_stage1: bool = False,
-    waves_per_eu: Optional[int] = None,
-    b_nt: int = 2,
-    mode: str = "atomic",
-    persist=None,
-    sort_block_m: int = 0,
-    token_num: int = 0,
-    block_m: int = 0,
-    xcd_swizzle: int = 0,
-    enable_bias: bool = False,
-    use_async_copy: bool = False,
-    cu_num_mul: int = 1,
-    dev=None,
-    **_ignored,
-) -> dict:
-    """Build the kwargs to drive ``flydsl_moe_stage2`` for AOT precompile.
-
-    See ``build_stage1_compile_inputs``: only ``inter_states`` / ``w2`` shapes
-    and the boolean flags set the cache key. Scales are bare pointers and
-    routing sizes are runtime-scalar grid dims, so ``a2_scale`` / ``w2_scale``
-    are passed as ``None`` (empirically byte-identical key). This also drops the
-    ``stage1_fuse_quant`` / ``act`` / ``swiglu_limit`` inputs that were only used
-    to mirror the a2_scale shape (absorbed by ``**_ignored``).
-    """
-    dev = dev if dev is not None else torch.device("cpu")
-    tokens = token_num if token_num > 0 else tile_m
-    E = experts
-    # See _aot_routing_placeholder: pointer-arg routing buffers, size irrelevant
-    # to the cache key; sort_block_m / block_m no longer feed this.
-    max_num_tokens_padded, max_num_m_blocks = _aot_routing_placeholder(
-        tokens, topk, E, tile_m
-    )
-
-    a_shape = (
-        (tokens, topk, inter_dim // 2)
-        if a_dtype == "fp4"
-        else (tokens, topk, inter_dim)
-    )
-    if b_dtype in ("fp4", "int4"):
-        w2_shape = (E, model_dim, inter_dim // 2)
-    else:
-        w2_shape = (E, model_dim, inter_dim)
-
-    inter_states = _moe_empty(a_shape, _moe_storage_dtype(a_dtype), dev)
-    w2 = _moe_empty(w2_shape, _moe_storage_dtype(b_dtype), dev)
-
-    sorted_token_ids = torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.int32)
-    sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
-    num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
-
-    # Only the presence of sorted_weights / bias flips a cache-key flag.
-    sorted_weights = (
-        torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
-        if not doweight_stage1
-        else None
-    )
-    bias = (
-        torch.zeros(E * model_dim, device=dev, dtype=torch.float32)
-        if enable_bias
-        else None
-    )
-
-    return dict(
-        inter_states=inter_states,
-        w2=w2,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        out=None,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        mode=mode,
-        w2_scale=None,
-        a2_scale=None,
-        sorted_weights=sorted_weights,
-        sort_block_m=sort_block_m,
-        persist=persist,
-        waves_per_eu=waves_per_eu,
-        use_async_copy=use_async_copy,
-        cu_num_mul=cu_num_mul,
-        b_nt=b_nt,
-        xcd_swizzle=xcd_swizzle,
-        bias=bias,
     )
 
 
@@ -1868,6 +1681,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
+    compile_context=None,
     launch_context: LaunchContext | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
@@ -1891,6 +1705,10 @@ def flydsl_moe_stage2(
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
     """
+    if compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        compile_context = create_runtime_compile_context(inter_states.device)
     if launch_context is None:
         launch_context = _runtime_launch_context(inter_states.device)
 
@@ -1946,20 +1764,11 @@ def flydsl_moe_stage2(
     )
 
     _sbm = sort_block_m if sort_block_m > 0 else tile_m
-    if _sbm == tile_m:
-        m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
-    else:
-        total_sorted = sorted_expert_ids.shape[0] * _sbm
-        m_blocks = (total_sorted + tile_m - 1) // tile_m
-    if persist is True:
-        _persist_m = -1
-    elif persist is False:
-        _persist_m = 4 if m_blocks > 256 else 1
-    else:
-        _persist_m = -1 if m_blocks > 256 else 1
-
-    if a_dtype == "fp8":
-        _persist_m = 1
+    m_blocks = (
+        min(sorted_expert_ids.shape[0], token_num * topk)
+        if _sbm == tile_m
+        else (sorted_expert_ids.shape[0] * _sbm + tile_m - 1) // tile_m
+    )
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
@@ -2016,7 +1825,7 @@ def flydsl_moe_stage2(
             launch_context,
         )
 
-    exe = compile_flydsl_moe_stage2(
+    stage2_builder_kwargs = dict(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -2029,7 +1838,6 @@ def flydsl_moe_stage2(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         accumulate=accumulate,
-        persist_m=_persist_m,
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
@@ -2040,16 +1848,49 @@ def flydsl_moe_stage2(
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
     )
+    from .moe_compile_plan import (
+        INT4_STAGE2_GEMM_OP_ID,
+        MASKED_REDUCTION_OP_ID,
+        MIXED_STAGE2_GEMM_OP_ID,
+        PLAIN_REDUCTION_OP_ID,
+        resolve_moe_stage2_compile_plan,
+    )
+
+    use_mask = expert_mask is not None
+    dtype_str = "bf16" if out_dtype == "bf16" else "f16"
+    plan = resolve_moe_stage2_compile_plan(
+        context=compile_context,
+        mode=mode,
+        return_per_slot=return_per_slot,
+        persist=persist,
+        token_num=token_num,
+        routing_block_count=int(sorted_expert_ids.shape[0]),
+        dtype_str=dtype_str,
+        use_mask=use_mask,
+        topk_ids_available=use_mask and topk_ids is not None,
+        num_experts=int(expert_mask.numel()) if use_mask else 0,
+        **stage2_builder_kwargs,
+    )
+    plan_launchers = _resolve_plan_launchers(plan, compile_context)
+
+    def take_plan_launcher(op_id):
+        try:
+            return plan_launchers.pop(op_id)
+        except KeyError as error:
+            raise RuntimeError(
+                f"Stage2 CompilePlan did not resolve required unit {op_id}"
+            ) from error
+
+    primary_op_id = MIXED_STAGE2_GEMM_OP_ID if use_mx_gemm else INT4_STAGE2_GEMM_OP_ID
+    exe = take_plan_launcher(primary_op_id)
     _run_compiled(exe, args)
 
-    if not accumulate:
-        use_mask = expert_mask is not None
-        if use_mask and topk_ids is None:
-            raise ValueError(
-                "topk_ids is required when expert_mask is provided for reduce mode"
-            )
     if not accumulate and not return_per_slot:
+        reduce_exe = take_plan_launcher(
+            MASKED_REDUCTION_OP_ID if use_mask else PLAIN_REDUCTION_OP_ID
+        )
         _run_moe_reduction(
+            reduce_exe,
             target,
             out,
             token_num,
@@ -2058,6 +1899,10 @@ def flydsl_moe_stage2(
             expert_mask,
             topk_ids,
             launch_context,
+        )
+    if plan_launchers:
+        raise RuntimeError(
+            f"Stage2 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
         )
     return out
 

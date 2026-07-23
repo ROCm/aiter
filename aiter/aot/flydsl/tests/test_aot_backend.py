@@ -40,6 +40,37 @@ def _tensor_launcher(tensor: fx.Tensor, stream: fx.Stream) -> None:
     raise AssertionError("the fake launcher body must not execute")
 
 
+def _mixed_stage2_launcher(
+    arg_out: fx.Pointer,
+    arg_x: fx.Pointer,
+    arg_w: fx.Pointer,
+    arg_scale_x: fx.Pointer,
+    arg_scale_w: fx.Pointer,
+    arg_sorted_token_ids: fx.Pointer,
+    arg_expert_ids: fx.Pointer,
+    arg_sorted_weights: fx.Pointer,
+    arg_num_valid_ids: fx.Pointer,
+    arg_bias: fx.Pointer,
+    i32_tokens_in: fx.Int32,
+    i32_n_in: fx.Int32,
+    i32_k_in: fx.Int32,
+    i32_size_expert_ids_in: fx.Int32,
+    stream: fx.Stream,
+) -> None:
+    raise AssertionError("the fake launcher body must not execute")
+
+
+def _reduction_launcher(
+    X: fx.Pointer,
+    Y: fx.Pointer,
+    expert_mask: fx.Pointer,
+    topk_ids: fx.Pointer,
+    i32_m_tokens: fx.Int32,
+    stream: fx.Stream,
+) -> None:
+    raise AssertionError("the fake launcher body must not execute")
+
+
 class _FakeLauncher:
     def __init__(self, function, *, miss: bool = False) -> None:
         self.func = function
@@ -84,7 +115,14 @@ def _signature(core):
     )
 
 
-def _unit_context(core, backend_module, launcher, signature=None):
+def _unit_context(
+    core,
+    backend_module,
+    launcher,
+    signature=None,
+    *,
+    op_id=_OP_ID,
+):
     registry = core.CompileOpRegistry()
     builder_environments = []
 
@@ -98,12 +136,12 @@ def _unit_context(core, backend_module, launcher, signature=None):
         )
         return launcher
 
-    registry.register(_OP_ID)(builder)
+    registry.register(op_id)(builder)
     target = core.RocmTarget("gfx950", 256)
     backend = backend_module.AotBackend()
     context = core.CompileContext(target, registry, backend)
     unit = registry.make_unit(
-        _OP_ID,
+        op_id,
         target=target,
         signature=signature if signature is not None else _signature(core),
     )
@@ -368,6 +406,88 @@ class TestCompileAndStrictLoad(unittest.TestCase):
                 imports.aot_backend.compile_aot(unit, context=context)
 
 
+class TestDirectStage2BackendOperations(unittest.TestCase):
+    def test_main_plain_and_masked_units_compile_load_and_miss_strictly(self) -> None:
+        with _isolated_host_imports() as imports:
+            core = importlib.import_module("aiter.ops.flydsl.compile_plan")
+            plan_module = importlib.import_module("aiter.ops.flydsl.moe_compile_plan")
+            cases = (
+                (
+                    plan_module.MIXED_STAGE2_GEMM_OP_ID,
+                    _mixed_stage2_launcher,
+                ),
+                (
+                    plan_module.PLAIN_REDUCTION_OP_ID,
+                    _reduction_launcher,
+                ),
+                (
+                    plan_module.MASKED_REDUCTION_OP_ID,
+                    _reduction_launcher,
+                ),
+            )
+            for op_id, function in cases:
+                with self.subTest(op_id=op_id):
+                    signature = plan_module.stage2_abi(op_id)
+                    compile_launcher = _FakeLauncher(function)
+                    unit, context, _ = _unit_context(
+                        core,
+                        imports.aot_backend,
+                        compile_launcher,
+                        signature,
+                        op_id=op_id,
+                    )
+                    compiled = imports.aot_backend.compile_aot(
+                        unit,
+                        context=context,
+                    )
+                    self.assertFalse(compiled.loaded)
+                    self.assertEqual(len(compile_launcher.calls), 1)
+
+                    load_launcher = _FakeLauncher(function)
+                    unit, context, _ = _unit_context(
+                        core,
+                        imports.aot_backend,
+                        load_launcher,
+                        signature,
+                        op_id=op_id,
+                    )
+                    loaded = imports.aot_backend.load_aot(
+                        unit,
+                        context=context,
+                        strict=True,
+                    )
+                    self.assertTrue(loaded.loaded)
+                    self.assertEqual(
+                        load_launcher.calls[0][1]["FLYDSL_RUNTIME_RUN_ONLY"],
+                        "1",
+                    )
+
+                    miss_launcher = _FakeLauncher(function, miss=True)
+                    unit, context, _ = _unit_context(
+                        core,
+                        imports.aot_backend,
+                        miss_launcher,
+                        signature,
+                        op_id=op_id,
+                    )
+                    with mock.patch.object(
+                        context.backend,
+                        "compile_aot",
+                        wraps=context.backend.compile_aot,
+                    ) as compile_spy:
+                        with self.assertRaises(
+                            imports.aot_backend.AotCacheMissError
+                        ) as raised:
+                            imports.aot_backend.load_aot(
+                                unit,
+                                context=context,
+                                strict=True,
+                            )
+                    compile_spy.assert_not_called()
+                    self.assertEqual(raised.exception.op_id, op_id)
+                    self.assertEqual(len(miss_launcher.calls), 1)
+
+
 class TestDirectStage1Aot(unittest.TestCase):
     def test_stage1_and_cktile_jobs_never_enter_fake_or_runtime_host(self) -> None:
         with _isolated_host_imports() as imports, ExitStack() as stack:
@@ -474,6 +594,132 @@ class TestDirectStage1Aot(unittest.TestCase):
                     core.ArgumentKind.STREAM,
                 ],
             )
+            forbidden.assert_not_called()
+
+
+class TestDirectStage2Aot(unittest.TestCase):
+    def test_stage2_jobs_never_enter_fake_allocation_stream_or_runtime_host(
+        self,
+    ) -> None:
+        with _isolated_host_imports() as imports, ExitStack() as stack:
+            compiled_units = []
+
+            def record_compile(unit, *, context):
+                compiled_units.append((unit, context))
+                return mock.Mock(unit=unit)
+
+            forbidden = mock.Mock(
+                side_effect=AssertionError("forbidden Stage2 AOT boundary")
+            )
+            stack.enter_context(
+                mock.patch.object(imports.aot_moe, "compile_aot", record_compile)
+            )
+            forbidden_boundaries = (
+                (imports.moe, "flydsl_moe_stage2"),
+                (torch, "empty"),
+                (torch, "empty_like"),
+                (torch, "empty_strided"),
+                (torch, "full"),
+                (torch, "ones"),
+                (torch, "randn"),
+                (torch, "tensor"),
+                (torch, "zeros"),
+                (torch, "zeros_like"),
+                (torch.cuda, "current_stream"),
+                (torch.cuda, "get_device_properties"),
+                (torch.cuda, "current_device"),
+            )
+            for owner, attribute in forbidden_boundaries:
+                if hasattr(owner, attribute):
+                    stack.enter_context(mock.patch.object(owner, attribute, forbidden))
+            stack.enter_context(
+                mock.patch(
+                    "torch._subclasses.fake_tensor.FakeTensorMode",
+                    forbidden,
+                )
+            )
+
+            common = {
+                "kernel_name": "flydsl_test_stage2",
+                "model_dim": 7168,
+                "inter_dim": 2048,
+                "experts": 256,
+                "topk": 8,
+                "cu_num": 256,
+                "stage": 2,
+                "tile_m": 32,
+                "tile_n": 128,
+                "tile_k": 256,
+                "doweight_stage2": True,
+                "a_dtype": "fp4",
+                "b_dtype": "fp4",
+                "out_dtype": "bf16",
+                "return_per_slot": False,
+                "persist": None,
+                "token_num": 16,
+                "routing_block_count": None,
+                "dtype_str": "bf16",
+                "waves_per_eu": None,
+                "use_async_copy": False,
+                "cu_num_mul": 1,
+                "b_nt": 2,
+                "xcd_swizzle": 0,
+                "enable_bias": False,
+            }
+            cases = (
+                (
+                    {
+                        **common,
+                        "mode": "atomic",
+                        "accumulate": True,
+                        "use_mask": False,
+                        "topk_ids_available": False,
+                        "num_experts": 0,
+                    },
+                    ("aiter.flydsl.moe.stage2.mixed_gemm.v1",),
+                ),
+                (
+                    {
+                        **common,
+                        "mode": "reduce",
+                        "accumulate": False,
+                        "use_mask": False,
+                        "topk_ids_available": False,
+                        "num_experts": 0,
+                    },
+                    (
+                        "aiter.flydsl.moe.stage2.mixed_gemm.v1",
+                        "aiter.flydsl.moe.stage2.reduction.plain.v1",
+                    ),
+                ),
+                (
+                    {
+                        **common,
+                        "experts": 32,
+                        "mode": "reduce",
+                        "accumulate": False,
+                        "use_mask": True,
+                        "topk_ids_available": True,
+                        "num_experts": 256,
+                    },
+                    (
+                        "aiter.flydsl.moe.stage2.mixed_gemm.v1",
+                        "aiter.flydsl.moe.stage2.reduction.masked.v1",
+                    ),
+                ),
+            )
+            for config, expected_op_ids in cases:
+                compiled_units.clear()
+                result = imports.aot_moe.compile_one_config(**config)
+                self.assertIsNotNone(result["compile_time"])
+                self.assertTrue(result["direct_stage2_aot"])
+                self.assertEqual(result["compile_units"], len(expected_op_ids))
+                self.assertEqual(
+                    tuple(unit.spec.op_id for unit, _ in compiled_units),
+                    expected_op_ids,
+                )
+            self.assertFalse(hasattr(imports.moe, "build_stage1_compile_inputs"))
+            self.assertFalse(hasattr(imports.moe, "build_stage2_compile_inputs"))
             forbidden.assert_not_called()
 
 
