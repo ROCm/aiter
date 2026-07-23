@@ -13,7 +13,14 @@ Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 
 import time
 import unittest
+import importlib
+import multiprocessing as mp
 from multiprocessing import TimeoutError as MPTimeoutError
+
+
+def _wait_for_release(release, value):
+    release.wait(timeout=5)
+    return value
 
 
 class FakeAsyncResult:
@@ -289,6 +296,62 @@ class TestAcceleratorError(unittest.TestCase):
         self.assertIn(0, completed_ids)
         self.assertIn(1, completed_ids)
         self.assertNotIn(2, completed_ids, "Task 2 not reached due to break")
+
+
+class TestTaskExecutionTiming(unittest.TestCase):
+
+    def test_queued_task_has_no_elapsed_execution_time(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        elapsed_since_start = getattr(tuner, "_elapsed_since_task_start", None)
+
+        self.assertIsNotNone(
+            elapsed_since_start,
+            "mp_tuner must calculate timeout from the worker execution start",
+        )
+        self.assertIsNone(elapsed_since_start([0.0], 0, now=100.0))
+        self.assertEqual(elapsed_since_start([55.0], 0, now=100.0), 45.0)
+
+    def test_worker_records_start_only_when_task_leaves_queue(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        init_start_times = getattr(tuner, "_init_task_start_times", None)
+        run_with_tracking = getattr(tuner, "_run_with_start_tracking", None)
+
+        self.assertIsNotNone(init_start_times)
+        self.assertIsNotNone(run_with_tracking)
+
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 2)
+        manager = ctx.Manager()
+        release = manager.Event()
+        pool = ctx.Pool(1, initializer=init_start_times, initargs=(start_times,))
+        try:
+            first = pool.apply_async(
+                run_with_tracking, (0, _wait_for_release, (release, "first"))
+            )
+            second = pool.apply_async(
+                run_with_tracking, (1, _wait_for_release, (release, "second"))
+            )
+
+            deadline = time.monotonic() + 5
+            while start_times[0] == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertGreater(start_times[0], 0)
+            self.assertEqual(
+                start_times[1],
+                0,
+                "Queued task must not get a start timestamp",
+            )
+
+            release.set()
+            self.assertEqual(first.get(timeout=5), "first")
+            self.assertEqual(second.get(timeout=5), "second")
+            self.assertGreater(start_times[1], 0)
+        finally:
+            release.set()
+            pool.terminate()
+            pool.join()
+            manager.shutdown()
 
 
 if __name__ == "__main__":

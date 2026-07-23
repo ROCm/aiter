@@ -743,8 +743,12 @@ class FmoeTuner(TunerCommon):
             token_num=token,
             block_size=max(32, blockM),
         )
+        # Match the normal FlyDSL _fp8 tune variant: a_scale_one=True expects
+        # an unscaled bf16 -> fp8 cast, not a per-1x32 quantized activation.
+        a1_qt_fp8_cast = d["inp"].to(dtypes.fp8) if adtype == "fp8" else None
         return {
             "a1_qt": d["a1_qt"],
+            "a1_qt_fp8_cast": a1_qt_fp8_cast,
             "w1_shuf": d["base"]["w1_qt_shuf"],
             "w1_scale_shuf": d["base"]["w1_scale_shuf"],
             "a1_scale_sort": a1_scale_sort,
@@ -3352,13 +3356,14 @@ class FmoeTuner(TunerCommon):
                 else:
                     s1_name = kname + "_fp4"
                     s1_params = {**kparams, "out_dtype": "fp4"}
+                a1_key = "a1_qt_fp8_cast" if adtype == "fp8" else "a1_qt"
                 # info tag: (..., blockM, flat_flag=0, v2=1) -- tail[3]=flat (post_process int(tail[3]) default), tail[4]=v2 marker
                 tasks.append((
                     (info, "stage1", s1_name, blockM, 0, 1),
                     FmoeTuner.generate_v2_stage1_data,
                     (token, model_dim, inter_dim, expert, topk, blockM, adtype),
                     FmoeTuner.run_flydsl_v2_stage1_out,
-                    (["a1_qt", "w1_shuf", "w1_scale_shuf", "a1_scale_sort",
+                    ([a1_key, "w1_shuf", "w1_scale_shuf", "a1_scale_sort",
                       "sti", "sei", "cumsum", "isq", "n"],
                      model_dim, inter_dim, expert, topk, blockM, adtype, s1_params),
                     {},
