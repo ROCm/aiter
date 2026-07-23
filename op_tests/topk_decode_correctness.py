@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poison-tail correctness checker for the FlyDSL K=512 decode TopK kernel.
+r"""Poison-tail correctness checker for the FlyDSL K=512 decode TopK kernel.
 
 Runs the FlyDSL unordered (set-output) path for one or more shapes and compares
 the returned index set against ``torch.topk`` over the *masked* row region. The
@@ -10,6 +10,25 @@ poison columns would dominate the selection and break set-equivalence.
 The FlyDSL variant is selected entirely through the ``FLYDSL_TOPK_*``
 environment so this checker exercises whatever tier/scan/barrier configuration
 the caller sets (same contract as ``topk_decode_rocprof_runner.py``).
+
+Every flag accepts multiple values (``nargs="+"``) and the checker runs the full
+Cartesian product of ``distribution x k x num-rows x L``. Exit code is non-zero
+if any shape fails. Run ``-h`` for the complete flag list.
+
+Usage examples::
+
+    # Regime A (uniform row length == max_width): k/rows/L/dist sweep
+    python op_tests/topk_decode_correctness.py \
+        --k 512 2048 --num-rows 1 4 16 --L 8192 65536 131072 \
+        --distribution random ties 10LSBits
+
+    # Regime B (per-row random causal length in [0.3*L, L], poison tail)
+    python op_tests/topk_decode_correctness.py \
+        --k 2048 --num-rows 64 128 256 --L 65536 \
+        --distribution random ties --seq-rand-min-frac 0.3
+
+    # Unpadded (max_width == L, no poison tail) single shape
+    python op_tests/topk_decode_correctness.py --k 512 --L 120000 --unpadded
 """
 
 from __future__ import annotations
