@@ -82,27 +82,11 @@ from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-from .tensor_shim import STensor, _to_raw, _run_compiled
+from .tensor_shim import _to_raw, _run_compiled
 
 # Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
-
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the K-split LDS path references these only inside @flyc.kernel / @flyc.jit
-# closures, which formatters may not see).
-_FORCE_BIND_LDS = (
-    CompilationContext,
-    STensor,
-    SmemAllocator,
-    SmemPtr,
-    get_rocm_arch,
-    gpu,
-)
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -1309,6 +1293,8 @@ def _build_kernel_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
+    quant_mode: str = "per_row_fp8",  # "per_row_fp8" | "group_fp8" (nm-asm)
+    quant_group_size: int = 64,
 ):
     """K-split single-kernel: NW-wave LDS-reduced compress + norm + rope +
     scatter (BF16 or FP8). Constexpr knobs mirror :func:`_build_kernel` minus
@@ -1341,6 +1327,14 @@ def _build_kernel_ksplit(
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
+    # FP8 group_fp8 (V4 nm-asm) geometry: nope split into groups of
+    # GROUP_SIZE_Q; RTS lanes/group cooperate on amax. Scatter reuses the
+    # shared emitter (byte-identical to legacy / HCA). See _build_kernel.
+    nm_asm = quant_mode == "group_fp8"
+    GROUP_SIZE_Q = quant_group_size
+    RTS = (GROUP_SIZE_Q // VEC) if nm_asm else 1
+    log2_rts = int(math.log2(RTS)) if nm_asm else 0
+
     assert D % BLOCK_THREADS == 0, f"D={D} must divide {BLOCK_THREADS}"
     assert VEC in (2, 4, 8), f"VEC={VEC} outside supported set"
     assert NOPE >= 0 and NOPE % VEC == 0
@@ -1350,25 +1344,20 @@ def _build_kernel_ksplit(
     if quant and preshuffle:
         assert D % _PRESHUFFLE_TILE == 0
         assert k_per_block % _PRESHUFFLE_TILE == 0
+    if nm_asm:
+        assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
+        assert (
+            NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
+        ), f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D
-    LDS_BYTES = LDS_ELEMS * 4
 
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=(
-            f"csa_ksplit_smem_D{D}_R{ratio}_O{int(overlap)}_NW{NW}_S{state_size}"
-        ),
-    )
-    lds_m_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_m_off + LDS_BYTES
-    lds_kv_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_kv_off + LDS_BYTES
-    lds_w_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_w_off + LDS_BYTES
+    @fx.struct
+    class SharedStorage:
+        lds_m: fx.Array[fx.Float32, LDS_ELEMS, 16]
+        lds_kv: fx.Array[fx.Float32, LDS_ELEMS, 16]
+        lds_w: fx.Array[fx.Float32, LDS_ELEMS, 16]
 
     _name_parts = [
         "fused_compress_attn",
@@ -1382,10 +1371,13 @@ def _build_kernel_ksplit(
     ]
     if quant:
         _name_parts.append("Q")
-        if use_ue8m0:
-            _name_parts.append("ue8m0")
-        if preshuffle:
-            _name_parts.append("psh")
+        if nm_asm:
+            _name_parts.append(f"nmasm{GROUP_SIZE_Q}")
+        else:
+            if use_ue8m0:
+                _name_parts.append("ue8m0")
+            if preshuffle:
+                _name_parts.append("psh")
     if rms_weight_is_bf16:
         _name_parts.append("rmsbf16")
     _name_parts.append("flydsl")
@@ -1417,6 +1409,9 @@ def _build_kernel_ksplit(
         kv_cache_token_stride: Int32,
         cache_scale: fx.Tensor,  # [NB, k_per_block] f32 (dummy if not quant)
         cache_scale_block_stride: Int32,
+        k_rope_buff: fx.Tensor,  # nm_asm only: paged [NB, k_per_block, RD] bf16 rope (dummy otherwise)
+        krope_block_stride: Int32,
+        krope_token_stride: Int32,
         block_table: fx.Tensor,
         block_table_seq_stride: Int32,
     ):
@@ -1663,28 +1658,16 @@ def _build_kernel_ksplit(
             w_local = list(final[2 * VEC : 3 * VEC])
 
             # ---- LDS write: each lane writes VEC entries at wid*D + lid*VEC ----
-            lds_base = allocator.get_base()
-            lds_m = STensor(
-                SmemPtr(lds_base, lds_m_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_ELEMS,),
-            )
-            lds_kv = STensor(
-                SmemPtr(lds_base, lds_kv_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_ELEMS,),
-            )
-            lds_w = STensor(
-                SmemPtr(lds_base, lds_w_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_ELEMS,),
-            )
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            lds_m_ptr = lds.lds_m.ptr
+            lds_kv_ptr = lds.lds_kv.ptr
+            lds_w_ptr = lds.lds_w.ptr
             lds_thread_base = ArithValue(wid) * c_D + lid_x_vec
             for i in range_constexpr(VEC):
                 idx_i = lds_thread_base + arith.constant(i, type=i32)
-                lds_m[fx.Index(idx_i)] = m_local[i]
-                lds_kv[fx.Index(idx_i)] = kv_local[i]
-                lds_w[fx.Index(idx_i)] = w_local[i]
+                fx.ptr_store(m_local[i], lds_m_ptr + fx.Int32(idx_i))
+                fx.ptr_store(kv_local[i], lds_kv_ptr + fx.Int32(idx_i))
+                fx.ptr_store(w_local[i], lds_w_ptr + fx.Int32(idx_i))
 
             gpu.barrier()
 
@@ -1695,36 +1678,28 @@ def _build_kernel_ksplit(
                 comp_lane = []
                 for i in range_constexpr(VEC):
                     lane_off = lid_x_vec + arith.constant(i, type=i32)
-                    m_g = c_neg_inf
+                    m_g = fx.Float32(c_neg_inf)
                     m_arr = []
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * D, type=i32) + lane_off
-                        m_w = lds_m[fx.Index(idx_w)]
+                        m_w = fx.ptr_load(lds_m_ptr + fx.Int32(idx_w))
                         m_arr.append(m_w)
-                        m_g = arith.maximumf(m_g, m_w)
-                    kv_sum = c_zero_f32
-                    w_sum = c_zero_f32
+                        m_g = m_g.maximumf(m_w)
+                    kv_sum = fx.Float32(0.0)
+                    w_sum = fx.Float32(0.0)
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * D, type=i32) + lane_off
-                        kv_w = lds_kv[fx.Index(idx_w)]
-                        w_w = lds_w[fx.Index(idx_w)]
-                        scale_w = fexp_f32(arith.subf(m_arr[w], m_g))
-                        kv_sum = arith.AddFOp(
-                            kv_sum,
-                            arith.MulFOp(kv_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                        w_sum = arith.AddFOp(
-                            w_sum,
-                            arith.MulFOp(w_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                    rcp_w = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [w_sum], [], []
+                        kv_w = fx.ptr_load(lds_kv_ptr + fx.Int32(idx_w))
+                        w_w = fx.ptr_load(lds_w_ptr + fx.Int32(idx_w))
+                        scale_w = fx.Float32(fexp_f32(_to_raw(m_arr[w] - m_g)))
+                        kv_sum = kv_sum + kv_w * scale_w
+                        w_sum = w_sum + w_w * scale_w
+                    rcp_w = fx.Float32(
+                        llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
+                        )
                     )
-                    comp_lane.append(
-                        arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result
-                    )
+                    comp_lane.append(_to_raw(kv_sum * rcp_w))
 
                 # ---- RMSNorm (wave-reduce sum-of-squares over wave 0) ----
                 def wave_reduce_add(x):
@@ -1887,6 +1862,38 @@ def _build_kernel_ksplit(
                         buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                     else:
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                elif const_expr(nm_asm):
+                    # -- group_fp8 (V4 nm-asm): nope fp8 + inline dup e8m0; rope
+                    # bf16 -> separate k_rope_buff. Shared emitter, byte-identical
+                    # to the legacy single-wave / HCA paths (lane == wave-0 lid). --
+                    _nm_cache_base = ArithValue(physical_block) * ArithValue(
+                        kv_cache_block_stride
+                    ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                    _nm_krope_base = ArithValue(physical_block) * ArithValue(
+                        krope_block_stride
+                    ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                    emit_group_fp8_nm_asm_scatter(
+                        normed_lane=normed_lane,
+                        rotated_lane=rotated_lane,
+                        lane=lid,
+                        is_rope_t=is_rope_t,
+                        cache_base=_to_raw(_nm_cache_base),
+                        out_rsrc=buffer_ops.create_buffer_resource(
+                            kv_cache, max_size=True
+                        ),
+                        krope_base=_to_raw(_nm_krope_base),
+                        krope_rsrc=buffer_ops.create_buffer_resource(
+                            k_rope_buff, max_size=True
+                        ),
+                        VEC=VEC,
+                        NOPE=NOPE,
+                        RTS=RTS,
+                        log2_rts=log2_rts,
+                        ROPE_THREAD_LO=ROPE_THREAD_LO,
+                        wave_width=BLOCK_THREADS,
+                        vecVf32=vecVf32,
+                        fm_fast=fm_fast,
+                    )
                 else:
                     # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
@@ -2076,16 +2083,14 @@ def _build_kernel_ksplit(
         kv_cache_token_stride: fx.Int32,
         cache_scale: fx.Tensor,
         cache_scale_block_stride: fx.Int32,
+        k_rope_buff: fx.Tensor,
+        krope_block_stride: fx.Int32,
+        krope_token_stride: fx.Int32,
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
         plan_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         k = kernel(
             kv_in,
@@ -2109,6 +2114,9 @@ def _build_kernel_ksplit(
             kv_cache_token_stride,
             cache_scale,
             cache_scale_block_stride,
+            k_rope_buff,
+            krope_block_stride,
+            krope_token_stride,
             block_table,
             block_table_seq_stride,
         )
@@ -2243,6 +2251,8 @@ def compile_flydsl_fused_compress_attn_ksplit(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
+    quant_mode: str = "per_row_fp8",
+    quant_group_size: int = 64,
 ):
     launcher = _build_kernel_ksplit(
         head_dim=head_dim,
@@ -2257,6 +2267,8 @@ def compile_flydsl_fused_compress_attn_ksplit(
         preshuffle=preshuffle,
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
+        quant_mode=quant_mode,
+        quant_group_size=quant_group_size,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -2496,11 +2508,27 @@ def flydsl_fused_compress_attn(
     _is_csa_indexer = (
         head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap and quant
     )
-    if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
+    # group_fp8 (nm-asm) CSA Main shares the CSA Main geometry (D=512, K=8); it is
+    # ported to the K-split kernel via the shared nm-asm scatter emitter.
+    _is_csa_main_nm = (
+        head_dim == 512
+        and rope_head_dim == 64
+        and ratio == 4
+        and overlap
+        and quant
+        and nm_asm
+    )
+    if (
+        k_split_num_waves is None
+        and has_bt
+        and (_is_csa_main or _is_csa_indexer or _is_csa_main_nm)
+    ):
         nw_eff = csa_ksplit_num_waves(plan_capacity)
     else:
         nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
-    use_ksplit = nw_eff > 1 and has_bt and not nm_asm  # nm_asm: legacy only (for now)
+    # nm_asm now K-split-capable only on the validated CSA Main shape; all other
+    # nm_asm shapes still fall back to the legacy single-wave kernel.
+    use_ksplit = nw_eff > 1 and has_bt and (not nm_asm or _is_csa_main_nm)
     if use_ksplit:
         k_split_num_waves = nw_eff
         if K_pool % k_split_num_waves != 0:
@@ -2520,6 +2548,8 @@ def flydsl_fused_compress_attn(
             preshuffle=preshuffle,
             rms_weight_is_bf16=_rms_weight_is_bf16,
             rms_eps=float(rms_eps),
+            quant_mode=quant_mode,
+            quant_group_size=64,
         )
         if stream is None:
             stream = torch.cuda.current_stream()
@@ -2546,6 +2576,9 @@ def flydsl_fused_compress_attn(
             kv_cache_token_stride,
             cs_arg,
             cs_block_stride,
+            krope_arg,
+            krope_block_stride,
+            krope_token_stride,
             bt_arg,
             bt_seq_stride,
             plan_capacity,

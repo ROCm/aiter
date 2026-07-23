@@ -231,6 +231,7 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
+    prefill_ref_token_cap = 512 * 1024
     # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
     # (1M+) never trigger the O(N^2) ref.
@@ -238,6 +239,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
@@ -333,6 +335,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
@@ -482,7 +485,7 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_gluon():
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
@@ -505,7 +508,7 @@ def test_mla(
             use_2d_view = False
 
         (attn_logits, attn_lse), us_gluon_decode = run_perftest(
-            mla_decode_gluon,
+            mla_gluon,
             q_nope,
             q_pe,
             kv_c,
@@ -535,7 +538,7 @@ def test_mla(
         # Shared bh16bn{64,128} runner. The wrapper dispatches on
         # (nhead, kv dtype): name='bh16bn128' -> cast kv to fp8;
         # name='bh16bn64' -> keep bf16. -lse also validates the returned lse.
-        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+        from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
@@ -555,7 +558,7 @@ def test_mla(
             use_2d_view = False
 
         (_, lse), us_decode = run_perftest(
-            mla_decode_gluon,
+            mla_gluon,
             q_nope,
             q_pe,
             kv_c,
@@ -585,10 +588,7 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    # The ASM decode baseline aborts for these MLA configs when lse is requested
-    if return_lse:
-        pass
-    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
         8,
         16,
         32,
@@ -637,7 +637,7 @@ def test_mla(
         splits_needed = max(1, (256 + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
-        # PIPELINE_STAGES=3, BLOCK_N=64 → 192; mirror wrapper's bound.
+        # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
         min_ctx_required = num_kv_splits * (192 + num_kv_splits)
         if ctx_lens > min_ctx_required:
             err_gluon, us_gluon_decode = test_absorb_decode_gluon()
