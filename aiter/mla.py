@@ -124,8 +124,21 @@ def _fwd_kernel_stage2_asm(
 
 @functools.lru_cache()
 def get_meta_param(
-    num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype, tg_factor=1
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
 ):
+    # ignore_total_kv: experiment switch (default 0 = legacy behavior). When 1,
+    # the split-count search ignores `total_kv` entirely: the auto-search keeps
+    # only the CU-occupancy factor (drops the avg_kv / (avg_kv + overhead*i) HBM
+    # term) and the fp8 min-block cap is skipped. This yields the pure
+    # occupancy-driven pick (fill bs_occ*splits into cu_num, capped at 16),
+    # independent of how long each sequence's KV is.
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
     # a larger logical head count from multiple WGs -- e.g. the v4 nm gqa=128
@@ -149,17 +162,28 @@ def get_meta_param(
         is_gfx1250 = get_gfx() == "gfx1250"
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
-        tmp = [
-            (
-                bs_occ
-                * i
-                / ((bs_occ * i + cu_num - 1) // cu_num * cu_num)
-                * avg_kv
-                / (avg_kv + overhead * i),
-                i,
-            )
-            for i in range(1, 17)
-        ]
+        if ignore_total_kv:
+            # Occupancy-only: drop the avg_kv HBM term so the pick depends solely
+            # on how well bs_occ*i fills cu_num (ties -> smallest i).
+            tmp = [
+                (
+                    bs_occ * i / ((bs_occ * i + cu_num - 1) // cu_num * cu_num),
+                    i,
+                )
+                for i in range(1, 17)
+            ]
+        else:
+            tmp = [
+                (
+                    bs_occ
+                    * i
+                    / ((bs_occ * i + cu_num - 1) // cu_num * cu_num)
+                    * avg_kv
+                    / (avg_kv + overhead * i),
+                    i,
+                )
+                for i in range(1, 17)
+            ]
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_block_n_fp8 = {
@@ -175,7 +199,7 @@ def get_meta_param(
         512: 32,
     }
 
-    if dtype == dtypes.fp8:
+    if dtype == dtypes.fp8 and not ignore_total_kv:
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
@@ -1395,6 +1419,10 @@ def mla_decode_fwd_v4_nm(
     total_kv = kv_page_indices.shape[0]
     if num_kv_splits is None or split_indptr is None:
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+        # v4 nm forces occupancy-only split selection: ignore total_kv so the
+        # split count is driven purely by CU occupancy (drops the avg_kv HBM
+        # term + fp8 min-block cap in get_meta_param).
+        ignore_total_kv = 1
         meta_num_kv_splits, meta_split_indptr = get_meta_param(
             num_kv_splits,
             num_seqs,
@@ -1403,6 +1431,7 @@ def mla_decode_fwd_v4_nm(
             max_seqlen_q,
             q.dtype,
             tg_factor,
+            ignore_total_kv,
         )
         if num_kv_splits is None:
             num_kv_splits = meta_num_kv_splits
