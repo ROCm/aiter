@@ -84,8 +84,7 @@ def _scalar_store(tiles, idx, value, numeric_cls):
 
 
 def _layout_idx(layout, *coords):
-    # crd2idx's static-stride path wants index-typed coords.
-    idx_coords = [fx.Index(c) for c in coords]
+    idx_coords = [fx.Int64(c) for c in coords]
     flat = crd2idx(idx_coords, layout)
     return fx.Int32(flat)
 
@@ -153,26 +152,27 @@ def _gemm1_body(
     BM,
     BN,
     BK,
-    KH_TILE,
-    kAStages,
-    kSubBlocks,
-    kMChunks,
     inline_quant=False,
     K,
-    K_HALF,
-    K_TILES_TOTAL,
-    kUnroll,
-    kAS_per_chunk_dw,
-    kBS_stride_n0_dw,
-    kBS_per_expert_dw,
-    BQ_BYTES,
-    BSCALE_BYTES,
     N_OUT,
-    NUM_N_BLOCKS,
-    OUT_AS_PER_CHUNK_DW,
-    K_G2_HALF,
+    NE,
     interleave=False,
 ):
+    KH_TILE = BK // 2
+    K_HALF = k_half_for(K)
+    K_TILES_TOTAL = k_tiles_total_for(K, BK)
+    kUnroll = kunroll_for(K, BK)
+    kAS_per_chunk_dw = kas_per_chunk_dw_for(K)
+    kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)
+    kBS_per_expert_dw = kbs_per_expert_dw_for(N_OUT, K)
+    BQ_BYTES = bq_bytes_for(NE, N_OUT, K)
+    BSCALE_BYTES = bscale_bytes_for(NE, N_OUT, K)
+    NUM_N_BLOCKS = num_n_blocks_for(N_OUT, BN)
+    inter = N_OUT // 2
+    OUT_AS_PER_CHUNK_DW = kas_per_chunk_dw_for(inter)
+    K_G2_HALF = k_half_for(inter)
+    kAStages, kSubBlocks, kMChunks, _ = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL)
+
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
     M_REPS = BM // 16
@@ -187,9 +187,9 @@ def _gemm1_body(
     lane_div_8 = lane // fx.Int32(8)
     lane_mod_8 = lane % fx.Int32(8)
 
-    aq_num_records = fx.Index(i32_ntok * fx.Int32(K_HALF))
+    aq_num_records = fx.Int64(i32_ntok * fx.Int32(K_HALF))
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
-    ascale_num = fx.Index(i32_total_m_blocks) * fx.Index(_asc_per_mb)
+    ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
 
     # fx.copy's BufferCopy/BufferCopyLDS atoms take soffset as an element count,
     # not the bytes buffer_ops.buffer_load's soffset_bytes expects.
@@ -232,7 +232,7 @@ def _gemm1_body(
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
-        hidden_num = fx.Index(i32_ntok * fx.Int32(K * 2))
+        hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         hidden_reg_lay = fx.make_layout(4, 1)
@@ -807,21 +807,10 @@ def compile_gemm1_a4w4_port(
         _N_OUT % BN == 0
     ), f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
     _NE = NE
-    _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
-    _kUnroll = kunroll_for(_K, BK)
-    _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
-    _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
-    _kBS_per_expert_dw = kbs_per_expert_dw_for(_N_OUT, _K)
-    _BQ_BYTES = bq_bytes_for(_NE, _N_OUT, _K)
-    _BSCALE_BYTES = bscale_bytes_for(_NE, _N_OUT, _K)
     _NUM_N_BLOCKS = num_n_blocks_for(_N_OUT, BN)
-    _OUT_AS_PER_CHUNK_DW = kas_per_chunk_dw_for(_INTER)
-    _K_G2_HALF = k_half_for(_INTER)
 
-    kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(
-        BM, BN, KH_TILE, _K_TILES_TOTAL
-    )
+    _, _, _, lds_bytes = _bm_constants(BM, BN, KH_TILE, _K_TILES_TOTAL)
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
     # Tag with H/INTER/NE so different shape specializations get distinct
@@ -907,24 +896,10 @@ def compile_gemm1_a4w4_port(
                 BM=BM,
                 BN=BN,
                 BK=BK,
-                KH_TILE=KH_TILE,
-                kAStages=kAStages,
-                kSubBlocks=kSubBlocks,
-                kMChunks=kMChunks,
                 inline_quant=inline_quant,
                 K=_K,
-                K_HALF=_K_HALF,
-                K_TILES_TOTAL=_K_TILES_TOTAL,
-                kUnroll=_kUnroll,
-                kAS_per_chunk_dw=_kAS_per_chunk_dw,
-                kBS_stride_n0_dw=_kBS_stride_n0_dw,
-                kBS_per_expert_dw=_kBS_per_expert_dw,
-                BQ_BYTES=_BQ_BYTES,
-                BSCALE_BYTES=_BSCALE_BYTES,
                 N_OUT=_N_OUT,
-                NUM_N_BLOCKS=_NUM_N_BLOCKS,
-                OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
-                K_G2_HALF=_K_G2_HALF,
+                NE=_NE,
                 interleave=interleave,
             )
 
@@ -944,7 +919,7 @@ def compile_gemm1_a4w4_port(
         arg_hidden: fx.Int64,
         stream: fx.Stream,
     ):
-        grid_x = fx.Index(i32_grid)
+        grid_x = fx.Int64(i32_grid)
         gemm1_kernel(
             arg_aq,
             arg_ascale,
