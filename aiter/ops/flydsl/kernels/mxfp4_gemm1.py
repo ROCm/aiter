@@ -80,18 +80,22 @@ def _global_i32_load(tiles, idx):
     return fx.Vector(fx.memref_load_vec(r))[0]
 
 
-def _global_scalar_tiles(addr_i64, numeric_cls, ir_ty, num_elems):
+def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
     ptr_ty = fx.PointerType.get(
-        ir_ty, address_space=fx.AddressSpace.Global, alignment=numeric_cls.width // 8
+        numeric_cls.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=numeric_cls.width // 8,
     )
     ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
     flat = fx.make_view(ptr, fx.make_layout(num_elems, 1))
     return fx.logical_divide(flat, fx.make_layout(1, 1))
 
 
-def _scalar_store(tiles, idx, value, numeric_cls, ir_ty):
+def _scalar_store(tiles, idx, value, numeric_cls):
     atom = fx.make_copy_atom(fx.UniversalCopy(numeric_cls.width), numeric_cls)
-    reg_ty = fx.MemRefType.get(ir_ty, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+    reg_ty = fx.MemRefType.get(
+        numeric_cls.ir_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
+    )
     reg_lay = fx.make_layout(1, 1)
     r = fx.memref_alloca(reg_ty, reg_lay)
     fx.memref_store_vec(Vec.from_elements([numeric_cls(value)], numeric_cls), r)
@@ -811,14 +815,14 @@ def _gemm1_body(
         )
         out_row = m_row + row_local
         store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-        _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32, T.i32)
+        _scalar_store(aqout_tiles, store_off // fx.Int32(4), packed, fx.Int32)
 
     # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
     ascaleout_layout = fx.make_layout(
         (1 << 20, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
     )
-    ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, T.i8, 1 << 26)
-    ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, T.i16, 1 << 25)
+    ascaleout_i8_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int8, 1 << 26)
+    ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
     if kk == fx.Int32(0):
         ku = n_block_idx >> fx.Int32(1)
         ikxdl = n_block_idx & fx.Int32(1)
@@ -826,7 +830,7 @@ def _gemm1_body(
             chunk = m_block_idx
             dword_off = _layout_idx(ascaleout_layout, chunk, ku, wave_grp, m_lane)
             addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
-            _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8, T.i8)
+            _scalar_store(ascaleout_i8_tiles, addr, scales_per_mr[0], fx.Int8)
         else:
             for sub in range_constexpr(kSubBlocks):
                 chunk = m_block_idx * fx.Int32(kSubBlocks) + fx.Int32(sub)
@@ -836,7 +840,7 @@ def _gemm1_body(
                 )
                 addr = dword_off * fx.Int32(4) + ikxdl * fx.Int32(2)
                 _scalar_store(
-                    ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16, T.i16
+                    ascaleout_i16_tiles, addr // fx.Int32(2), pair_i32, fx.Int16
                 )
 
 
