@@ -5,6 +5,7 @@ import pytest
 import aiter
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
+    _is_gluon_available,
 )
 from aiter.utility import fp4_utils
 from op_tests.triton_tests.quant.test_fused_fp8_quant import (
@@ -12,6 +13,16 @@ from op_tests.triton_tests.quant.test_fused_fp8_quant import (
     upcast,
 )
 from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
+
+
+def _maybe_skip_backend(backend):
+    """Run only the backend that the card actually uses: Gluon on gfx1250,
+    Triton everywhere else (so gfx1250 skips the Triton cases entirely)."""
+    gluon_avail = _is_gluon_available()
+    if backend == "gluon" and not gluon_avail:
+        pytest.skip("gluon backend requires gfx1250")
+    if backend == "triton" and gluon_avail:
+        pytest.skip("gfx1250 runs the gluon backend only")
 
 
 def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
@@ -36,9 +47,12 @@ def _torch_reference(inp, swiglu_limit, weights, dtype_quant):
     [(False, False), (True, True), (True, False)],
 )
 @pytest.mark.parametrize("dtype_quant", [aiter.dtypes.fp8, None])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_fused_clamp_act_mul(
-    M, D, swiglu_limit, transpose_scale, with_weights, weight_broadcast, dtype_quant
+    M, D, swiglu_limit, transpose_scale, with_weights, weight_broadcast, dtype_quant,
+    backend,
 ):
+    _maybe_skip_backend(backend)
     torch.manual_seed(42)
     N = D // 2
     if with_weights:
@@ -71,6 +85,7 @@ def test_fused_clamp_act_mul(
             activation="silu",
             dtype_quant=dtype_quant,
             transpose_scale=transpose_scale,
+            backend=backend,
         )
 
         ref_q, ref_s = _torch_reference(inp, swiglu_limit, w, dtype_quant)
@@ -98,6 +113,7 @@ def test_fused_clamp_act_mul(
             weights=w,
             activation="silu",
             dtype_quant=None,
+            backend=backend,
         )
         ref = _torch_reference(inp, swiglu_limit, w, None)
 
@@ -140,10 +156,14 @@ def _torch_reference_ue8m0(inp, swiglu_limit, weights, dtype_quant, quant_block_
 @pytest.mark.parametrize("swiglu_limit", [0.0, 7.0])
 @pytest.mark.parametrize("with_weights", [False, True])
 @pytest.mark.parametrize("shuffle_scale", [False, True])
-def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_scale):
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_ue8m0(
+    M, D, swiglu_limit, with_weights, shuffle_scale, backend
+):
     """ue8m0 group quant. The fp8 output and e8m0 scales must match the torch
     reference; when ``shuffle_scale`` is set the kernel must lay the scales out
     exactly like ``fp4_utils.e8m0_shuffle`` applied to the unshuffled scales."""
+    _maybe_skip_backend(backend)
     torch.manual_seed(42)
     N = D // 2
     quant_block_size = 32
@@ -164,6 +184,7 @@ def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_sca
         quant_block_size=quant_block_size,
         scale_dtype_fmt="ue8m0",
         shuffle_scale=shuffle_scale,
+        backend=backend,
     )
 
     ref_out, ref_scale = _torch_reference_ue8m0(
