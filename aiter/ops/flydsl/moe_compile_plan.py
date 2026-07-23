@@ -33,6 +33,7 @@ from .compile_plan import (
     op,
     plan_provider,
 )
+from .moe_plan.aggregate import MoeOperationCase, resolve_moe_operation_plan
 from .moe_plan.stage1 import (
     FQ_ACTIVATION_OP_ID,
     INT4_STAGE1_GEMM_OP_ID,
@@ -53,6 +54,7 @@ from .moe_plan.stage2 import (
     MoeStage2Role,
     Stage2GemmMetadata,
     Stage2ReductionMetadata,
+    normalize_moe_stage2_operation_case,
     resolve_moe_stage2_operation_plan,
 )
 from .moe_plan.sorting import (
@@ -75,6 +77,7 @@ __all__ = [
     "MIXED_STAGE1_GEMM_OP_ID",
     "MIXED_STAGE2_GEMM_OP_ID",
     "MoeCompilePlanCase",
+    "MoeOperationCase",
     "MoeStage1OperationCase",
     "MoeStage1Role",
     "MoeStage2OperationCase",
@@ -89,7 +92,9 @@ __all__ = [
     "register_moe_stage2_ops",
     "register_moe_sorting_ops",
     "resolve_cktile_stage1_compile_plan",
+    "normalize_moe_stage2_operation_case",
     "resolve_moe_compile_plan",
+    "resolve_moe_operation_plan",
     "resolve_moe_sorting_compile_plan",
     "resolve_moe_sorting_operation_plan",
     "resolve_moe_stage1_compile_plan",
@@ -538,16 +543,20 @@ def resolve_moe_stage2_compile_plan(
             "reduction dtype must match Stage2 output dtype: "
             f"expected {expected_reduction_dtype!r}, got {dtype_str!r}"
         )
-    case = MoeStage2OperationCase.from_kwargs(
-        builder_kwargs,
-        mode=mode,
-        return_per_slot=return_per_slot,
-        persist=persist,
-        token_num=token_num,
-        routing_block_count=routing_block_count,
-        use_mask=use_mask,
-        topk_ids_available=topk_ids_available,
-        num_experts=num_experts,
+    case = normalize_moe_stage2_operation_case(
+        {
+            **builder_kwargs,
+            "accumulate": accumulate,
+            "dtype_str": dtype_str,
+            "mode": mode,
+            "return_per_slot": return_per_slot,
+            "persist": persist,
+            "token_num": token_num,
+            "routing_block_count": routing_block_count,
+            "use_mask": use_mask,
+            "topk_ids_available": topk_ids_available,
+            "num_experts": num_experts,
+        }
     )
     return resolve_moe_stage2_operation_plan(
         case,

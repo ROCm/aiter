@@ -3,6 +3,7 @@
 
 """Kernel-owned MoE OperationPlan providers."""
 
+from .aggregate import MoeOperationCase, resolve_moe_operation_plan
 from .stage1 import (
     FQ_ACTIVATION_OP_ID,
     INT4_STAGE1_GEMM_OP_ID,
@@ -51,6 +52,7 @@ __all__ = [
     "SORTING_P0V2_P23_OP_ID",
     "MoeSortingCompileCase",
     "MoeSortingRole",
+    "MoeOperationCase",
     "Stage1ExternalPostprocessMetadata",
     "Stage1FqMetadata",
     "Stage1GemmMetadata",
@@ -59,4 +61,5 @@ __all__ = [
     "resolve_moe_stage1_operation_plan",
     "resolve_moe_stage2_operation_plan",
     "resolve_moe_sorting_operation_plan",
+    "resolve_moe_operation_plan",
 ]
