@@ -73,6 +73,27 @@ class MoeStage2OperationCase:
         return dict(self.compile_kwargs)
 
 
+def normalize_moe_stage2_operation_case(
+    values: Mapping[str, Any],
+) -> MoeStage2OperationCase:
+    """Normalize legacy/runtime metadata without exposing graph rules to callers."""
+
+    kwargs = dict(values)
+    semantics = {
+        "mode": kwargs.pop("mode"),
+        "return_per_slot": kwargs.pop("return_per_slot"),
+        "persist": kwargs.pop("persist"),
+        "token_num": kwargs.pop("token_num"),
+        "routing_block_count": kwargs.pop("routing_block_count"),
+        "use_mask": kwargs.pop("use_mask"),
+        "topk_ids_available": kwargs.pop("topk_ids_available"),
+        "num_experts": kwargs.pop("num_experts"),
+    }
+    kwargs.pop("accumulate", None)
+    kwargs.pop("dtype_str", None)
+    return MoeStage2OperationCase.from_kwargs(kwargs, **semantics)
+
+
 @dataclass(frozen=True)
 class Stage2GemmMetadata:
     accumulate: bool

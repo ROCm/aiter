@@ -218,10 +218,15 @@ def _job_target(aot_arch: str, cu_num: int) -> RocmTarget:
 
 def _compile_stage1_plan(cfg: dict, context) -> int:
     from aiter.ops.flydsl.moe_compile_plan import (
-        resolve_moe_stage1_compile_plan,
+        MoeStage1OperationCase,
+        resolve_moe_stage1_operation_plan,
     )
 
-    plan = resolve_moe_stage1_compile_plan(context=context, **cfg)
+    operation_plan = resolve_moe_stage1_operation_plan(
+        MoeStage1OperationCase.from_kwargs(cfg),
+        context=context,
+    )
+    plan = operation_plan.compile_projection()
     for unit in plan.units:
         compile_aot(unit, context=context)
     return len(plan.units)
@@ -229,10 +234,15 @@ def _compile_stage1_plan(cfg: dict, context) -> int:
 
 def _compile_stage2_plan(cfg: dict, context) -> int:
     from aiter.ops.flydsl.moe_compile_plan import (
-        resolve_moe_stage2_compile_plan,
+        normalize_moe_stage2_operation_case,
+        resolve_moe_stage2_operation_plan,
     )
 
-    plan = resolve_moe_stage2_compile_plan(context=context, **cfg)
+    operation_plan = resolve_moe_stage2_operation_plan(
+        normalize_moe_stage2_operation_case(cfg),
+        context=context,
+    )
+    plan = operation_plan.compile_projection()
     for unit in plan.units:
         compile_aot(unit, context=context)
     return len(plan.units)
@@ -247,14 +257,17 @@ def compile_moe_sorting_case(case, *, context):
 
     from aiter.ops.flydsl.moe_compile_plan import (
         MoeSortingCompileCase,
-        resolve_moe_sorting_compile_plan,
+        resolve_moe_sorting_operation_plan,
     )
 
     if not isinstance(case, MoeSortingCompileCase):
         raise TypeError(
             f"case must be a MoeSortingCompileCase, got {type(case).__name__}"
         )
-    plan = resolve_moe_sorting_compile_plan(case, context=context)
+    plan = resolve_moe_sorting_operation_plan(
+        case,
+        context=context,
+    ).compile_projection()
     return tuple(compile_aot(unit, context=context) for unit in plan.units)
 
 

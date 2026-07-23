@@ -514,6 +514,90 @@ class TestAggregateMoeCompilePlan(unittest.TestCase):
                         context=other_context,
                     )
 
+    def test_operation_case_composes_compile_and_execution_projections(self) -> None:
+        recorder = _RequestRecorder()
+        with _recording_environment(), ExitStack() as stack:
+            _install_cuda_boundary_mocks(stack, recorder)
+            with _isolated_host_imports() as imports:
+                _install_boundary_mocks(stack, imports, recorder)
+                plan_module = importlib.import_module(
+                    "aiter.ops.flydsl.moe_compile_plan"
+                )
+                stage1_values = {
+                    "model_dim": 7168,
+                    "inter_dim": 2048,
+                    "experts": 256,
+                    "topk": 8,
+                    "tile_m": 32,
+                    "tile_n": 128,
+                    "tile_k": 256,
+                    "doweight_stage1": False,
+                    "a_dtype": "fp4",
+                    "b_dtype": "fp4",
+                    "out_dtype": "bf16",
+                }
+                stage2_values = {
+                    "model_dim": 7168,
+                    "inter_dim": 2048,
+                    "experts": 256,
+                    "topk": 8,
+                    "tile_m": 32,
+                    "tile_n": 128,
+                    "tile_k": 256,
+                    "doweight_stage2": True,
+                    "a_dtype": "fp4",
+                    "b_dtype": "fp4",
+                    "out_dtype": "bf16",
+                    "mode": "reduce",
+                    "accumulate": False,
+                    "return_per_slot": False,
+                    "persist": None,
+                    "token_num": 128,
+                    "routing_block_count": None,
+                    "dtype_str": "bf16",
+                    "use_mask": False,
+                    "topk_ids_available": False,
+                    "num_experts": 0,
+                }
+                case = plan_module.MoeOperationCase(
+                    sorting=plan_module.MoeSortingCompileCase(128, 256, 8, False),
+                    stage1=plan_module.MoeStage1OperationCase.from_kwargs(
+                        stage1_values
+                    ),
+                    stage2=plan_module.normalize_moe_stage2_operation_case(
+                        stage2_values
+                    ),
+                )
+                plan = plan_module.resolve_moe_operation_plan(
+                    case,
+                    context=recorder.compile_context,
+                )
+                self.assertEqual(
+                    [unit.spec.op_id for unit in plan.compile_projection().units],
+                    [
+                        plan_module.SORTING_P0V2_P23_OP_ID,
+                        plan_module.MIXED_STAGE1_GEMM_OP_ID,
+                        plan_module.MIXED_STAGE2_GEMM_OP_ID,
+                        plan_module.PLAIN_REDUCTION_OP_ID,
+                    ],
+                )
+                self.assertEqual(
+                    [node.node_id for node in plan.nodes],
+                    [
+                        "sorting.sorting",
+                        "stage1.gemm",
+                        "stage2.gemm",
+                        "stage2.reduction",
+                    ],
+                )
+                runtime = importlib.import_module("aiter.ops.flydsl.operation_runtime")
+                with recorder.scenario("aggregate.operation.execution"):
+                    steps = runtime.resolve_execution_steps(
+                        plan,
+                        context=recorder.compile_context,
+                    )
+                self.assertEqual(len(steps), 4)
+
 
 class TestDirectSortingAotBoundary(unittest.TestCase):
     def test_direct_case_never_enters_runtime_gpu_tensor_or_fake_boundaries(
