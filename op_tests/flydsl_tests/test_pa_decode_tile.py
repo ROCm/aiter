@@ -32,13 +32,13 @@ DEFAULT_SHAPES = [
 ]
 
 try:
-    from aiter.ops.flydsl.pa_decode_tile import (
+    from aiter.ops.flydsl.pa_decode import (
         get_recommended_splits,
-        pa_decode_tile,
+        pa_decode,
     )
 except ImportError:
     get_recommended_splits = None
-    pa_decode_tile = None
+    pa_decode = None
 
 
 def _quant_dtype() -> torch.dtype:
@@ -99,7 +99,7 @@ def _run_flydsl(
     psum,
     pout,
 ):
-    pa_decode_tile(
+    pa_decode(
         output,
         query,
         key_cache,
@@ -126,10 +126,10 @@ def test_pa_decode_tile(
     block_size,
     dtype,
 ):
-    if pa_decode_tile is None or get_recommended_splits is None:
+    if pa_decode is None or get_recommended_splits is None:
         raise RuntimeError("FlyDSL is not available")
     if dtype not in (dtypes.fp16, dtypes.bf16):
-        raise ValueError(f"pa_decode_tile only supports fp16/bf16, got {dtype}")
+        raise ValueError(f"pa_decode only supports fp16/bf16, got {dtype}")
     if num_query_heads % num_kv_heads != 0:
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
 
@@ -248,7 +248,7 @@ def test_pa_decode_tile(
             rtol=3e-2,
             atol=3e-2,
             tol_err_ratio=0.0,
-            msg=f"{name}: pa_decode_tile",
+            msg=f"{name}: pa_decode",
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
@@ -259,18 +259,18 @@ def test_pa_decode_tile(
 
 def main():
     if not torch.cuda.is_available():
-        aiter.logger.warning("ROCm is not available; skipping pa_decode_tile")
+        aiter.logger.warning("ROCm is not available; skipping pa_decode")
         return
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("pa_decode_tile unsupported on %s; skipping", get_gfx())
+        aiter.logger.warning("pa_decode unsupported on %s; skipping", get_gfx())
         return
-    if pa_decode_tile is None:
-        aiter.logger.warning("flydsl is unavailable; skipping pa_decode_tile")
+    if pa_decode is None:
+        aiter.logger.warning("flydsl is unavailable; skipping pa_decode")
         return
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL pa_decode_tile correctness + perf sweep",
+        description="FlyDSL pa_decode correctness + perf sweep",
     )
     parser.add_argument(
         "-d",
@@ -327,9 +327,7 @@ def main():
         )
 
     df = pd.DataFrame(rows)
-    aiter.logger.info(
-        "pa_decode_tile summary (markdown):\n%s", df.to_markdown(index=False)
-    )
+    aiter.logger.info("pa_decode summary (markdown):\n%s", df.to_markdown(index=False))
 
 
 if __name__ == "__main__":

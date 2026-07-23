@@ -54,7 +54,7 @@ def get_recommended_splits(
     return max(4, min(n, 8))
 
 
-def pa_decode_tile(
+def pa_decode(
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -89,7 +89,7 @@ def pa_decode_tile(
     assert block_size in (
         16,
         64,
-    ), f"pa_decode_tile only supports block_size in (16, 64), got {block_size}"
+    ), f"pa_decode only supports block_size in (16, 64), got {block_size}"
 
     trans_v = value_cache.dim() == 5
     if trans_v:
@@ -117,16 +117,14 @@ def pa_decode_tile(
     elif query.dtype == torch.float16:
         query_dtype = "f16"
     else:
-        raise ValueError(
-            f"pa_decode_tile only supports f16/bf16 query, got {query.dtype}"
-        )
+        raise ValueError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
     assert (
         output.dtype == query.dtype
-    ), f"pa_decode_tile requires output.dtype == query.dtype, got {output.dtype} vs {query.dtype}"
+    ), f"pa_decode requires output.dtype == query.dtype, got {output.dtype} vs {query.dtype}"
 
     assert (
         query.stride(2) == 1
-    ), f"pa_decode_tile requires a contiguous head_dim axis, got strides {query.stride()}"
+    ), f"pa_decode requires a contiguous head_dim axis, got strides {query.stride()}"
 
     dev = query.device
     key_scale_t = (

@@ -40,7 +40,7 @@ if is_flydsl_available():
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
-    from .pa_decode_tile import pa_decode_tile
+    from .pa_decode import pa_decode
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .kernels.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
@@ -62,7 +62,7 @@ if is_flydsl_available():
         "flydsl_moe_stage2",
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
-        "pa_decode_tile",
+        "pa_decode",
         "flydsl_qk_norm_rope_quant",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
