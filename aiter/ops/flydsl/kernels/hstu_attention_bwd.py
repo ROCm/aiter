@@ -31,14 +31,12 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
     decode_lane,
@@ -291,9 +289,7 @@ def build_hstu_attention_bwd_dvdk(
     stride_qk_n = num_heads * head_dim
 
     Q_STRIDE = HEAD_DIM_K
-    q_lds_bytes = BLOCK_N * Q_STRIDE * 2
     DO_STRIDE = hidden_dim
-    do_lds_bytes = BLOCK_N * DO_STRIDE * 2
 
     q_tile_elems = BLOCK_N * Q_STRIDE
     elems_per_dma_pass = BLOCK_THREADS * DMA_ELEMS
@@ -304,7 +300,7 @@ def build_hstu_attention_bwd_dvdk(
     do_tile_elems = BLOCK_N * hidden_dim
     assert do_tile_elems % elems_per_dma_pass == 0
     # Direct dO global->LDS DMA path (single-barrier variant): row-major [q, d], no
-    # swizzle (matches the do_smem read layout). Mirrors the Q DMA sans swizzle.
+    # swizzle (matches the dO LDS read layout). Mirrors the Q DMA sans swizzle.
     NUM_DMA_DO = do_tile_elems // elems_per_dma_pass
     PAIRS_PER_ROW_DO = DO_STRIDE // DMA_ELEMS
     SINGLE_BARRIER = _resolve_single_barrier(hidden_dim, single_barrier)
@@ -325,11 +321,14 @@ def build_hstu_attention_bwd_dvdk(
     N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES
     N_ACC = N_ACC_DV + N_ACC_DK
 
-    allocator = SmemAllocator(None, global_sym_name="hstu_attention_bwd_dvdk_smem")
-    q_lds_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = q_lds_offset + q_lds_bytes
-    do_lds_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = do_lds_offset + do_lds_bytes
+    # LDS map: [Q row-major tile][dO row-major tile]. Q is XOR-swizzled by column
+    # (mirrors the forward's K tile); dO stays natural [q, d]. Each field is a
+    # 16B-aligned fx.Array; SharedAllocator sizes the LDS global (no manual
+    # finalize/get_base/offset math).
+    @fx.struct
+    class SharedStorage:
+        q: fx.Array[elem_dtype, BLOCK_N * Q_STRIDE, 16]
+        do: fx.Array[elem_dtype, BLOCK_N * DO_STRIDE, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hstu_attention_bwd_dvdk(
@@ -346,7 +345,6 @@ def build_hstu_attention_bwd_dvdk(
         elem_type = elem_dtype.ir_type
         compute_type = fx.Float32.ir_type
         v4f32_type = Vec.make_type(MFMA_ELEMS_PER_LANE, fx.Float32)
-        mfma_pack_type = Vec.make_type(MFMA_LANE_K, elem_dtype)
         c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
         _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, MFMA_K, elem_dtype))
@@ -404,12 +402,31 @@ def build_hstu_attention_bwd_dvdk(
             fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
         ) * fx.Int64(2)
 
-        lds_base = allocator.get_base()
-        q_smem = SmemPtr(lds_base, q_lds_offset, elem_type, shape=(BLOCK_N, Q_STRIDE))
-        do_smem = SmemPtr(
-            lds_base, do_lds_offset, elem_type, shape=(BLOCK_N, DO_STRIDE)
+        # Shape-carried LDS views (no manual row*stride+col; the trailing group axis
+        # carries the stride). Q is grouped by MFMA_LANE_K for the swizzled GEMM1
+        # pack read + the dK scalar gather; dO is grouped by MFMA_LANE_K for the dA
+        # A-operand pack read + the dV scalar gather. The dO register-publish store
+        # (two-barrier path) writes VEC_DO-wide, so it takes a VEC_DO-grouped view of
+        # the same buffer.
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        q_view = lds.q.view(
+            fx.make_layout(
+                (BLOCK_N, Q_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (Q_STRIDE, MFMA_LANE_K, 1),
+            )
         )
-        q_lds_byte_base = buffer_ops.extract_base_index(q_smem.get(), address_space=3)
+        do_view = lds.do.view(
+            fx.make_layout(
+                (BLOCK_N, DO_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (DO_STRIDE, MFMA_LANE_K, 1),
+            )
+        )
+        do_store_view = lds.do.view(
+            fx.make_layout(
+                (BLOCK_N, DO_STRIDE // VEC_DO, VEC_DO), (DO_STRIDE, VEC_DO, 1)
+            )
+        )
+        q_lds_byte_base = buffer_ops.extract_base_index(q_view, address_space=3)
 
         # Direct dO global->LDS DMA (single-barrier variant). dO is [L, H, hidden],
         # so the per-token stride is num_heads*hidden_dim; base at this head's slice.
@@ -418,7 +435,7 @@ def build_hstu_attention_bwd_dvdk(
             fx.Int64(seq_start) * fx.Int64(stride_do_n)
             + fx.Int64(head_idx) * fx.Int64(hidden_dim)
         ) * fx.Int64(2)
-        do_lds_byte_base = buffer_ops.extract_base_index(do_smem.get(), address_space=3)
+        do_lds_byte_base = buffer_ops.extract_base_index(do_view, address_space=3)
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
         # Mirrors flash_attn_gfx950's _buffer_load_lds helper: a BufferCopyLDS atom
@@ -586,12 +603,10 @@ def build_hstu_attention_bwd_dvdk(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_q = fx.Int32(PAIRS_PER_ROW_Q)
 
-        wave_lds_base_q = q_lds_byte_base + fx.Index(wave_id) * fx.Index(
+        wave_lds_base_q = fx.Int64(q_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
             WARP_SIZE * DMA_BYTES
         )
-        wave_lds_lane0_q = rocdl.readfirstlane(
-            fx.Int64.ir_type, fx.Int64(wave_lds_base_q)
-        )
+        wave_lds_lane0_q = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_q)
         q_dma_rows = []
         q_dma_gcols = []
         for d in range_constexpr(NUM_DMA_Q):
@@ -623,12 +638,10 @@ def build_hstu_attention_bwd_dvdk(
         # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
         # value is multiplied out — same safe-garbage contract as the Q DMA.
         c_stride_do_n = fx.Int32(stride_do_n)
-        wave_lds_base_do = do_lds_byte_base + fx.Index(wave_id) * fx.Index(
+        wave_lds_base_do = fx.Int64(do_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
             WARP_SIZE * DMA_BYTES
         )
-        wave_lds_lane0_do = rocdl.readfirstlane(
-            fx.Int64.ir_type, fx.Int64(wave_lds_base_do)
-        )
+        wave_lds_lane0_do = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_do)
         do_dma_rows = []
         do_dma_cols = []
         for d in range_constexpr(NUM_DMA_DO):
@@ -677,8 +690,8 @@ def build_hstu_attention_bwd_dvdk(
         def store_do_regs_to_lds(vecs):
             for b in range_constexpr(NUM_BATCHES_DO):
                 row = do_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_DO)
-                Vec.store(
-                    Vec(vecs[b]), do_smem.get(), [fx.Index(row), fx.Index(do_load_col)]
+                do_store_view[row, do_load_col // fx.Int32(VEC_DO), None].store(
+                    Vec(vecs[b])
                 )
 
         def read_q_packs(ng):
@@ -686,12 +699,12 @@ def build_hstu_attention_bwd_dvdk(
             packs = []
             for ks in range_constexpr(K_STEPS_K):
                 q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                # swz_col is MFMA_LANE_K-aligned, so //MFMA_LANE_K selects the packed
+                # group and the trailing group axis carries the row stride.
                 packs.append(
-                    Vec.load(
-                        mfma_pack_type,
-                        q_smem.get(),
-                        [fx.Index(q_row), fx.Index(q_swz_col(q_row, q_col))],
-                    )
+                    q_view[
+                        q_row, q_swz_col(q_row, q_col) // fx.Int32(MFMA_LANE_K), None
+                    ].load()
                 )
             return packs
 
@@ -756,18 +769,13 @@ def build_hstu_attention_bwd_dvdk(
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 d_col = fx.Int32(c * MFMA_M) + lane_mod_16
                 q_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                elems = []
-                for i in range_constexpr(MFMA_LANE_K):
-                    elems.append(
-                        Vec.load(
-                            Vec.make_type(1, elem_dtype),
-                            do_smem.get(),
-                            [fx.Index(q_lane + fx.Int32(i)), fx.Index(d_col)],
-                        )
-                    )
-                do_packs.append(
-                    Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value()
-                )
+                d_grp = d_col // fx.Int32(MFMA_LANE_K)
+                d_lane = d_col % fx.Int32(MFMA_LANE_K)
+                elems = [
+                    do_view[q_lane + fx.Int32(i), d_grp, d_lane]
+                    for i in range_constexpr(MFMA_LANE_K)
+                ]
+                do_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
             return do_packs
 
         def accum_dv_tile(dv_acc, p_packs):
@@ -794,11 +802,7 @@ def build_hstu_attention_bwd_dvdk(
             for ks in range_constexpr(DK_STEPS):
                 d_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 packs.append(
-                    Vec.load(
-                        mfma_pack_type,
-                        do_smem.get(),
-                        [fx.Index(q_row), fx.Index(d_col)],
-                    )
+                    do_view[q_row, d_col // fx.Int32(MFMA_LANE_K), None].load()
                 )
             return packs
 
@@ -827,9 +831,9 @@ def build_hstu_attention_bwd_dvdk(
 
         def _dk_gather(c):
             # Q B-operand packs (4 adjacent q at a fixed hc) for output chunk c,
-            # read from the *streamed* q_smem [q, d] tile (per-element swizzled gather),
-            # reusing GEMM1's Q — no separate preshuffled q_t load. Mirrors the split
-            # dK's accum_dk_tile; removes the redundant second Q load.
+            # scalar-gathered from the *streamed* swizzled Q LDS view (col ->
+            # group col//MFMA_LANE_K, lane col%MFMA_LANE_K), reusing GEMM1's Q — no
+            # separate preshuffled q_t load. Mirrors the split dK's accum_dk_tile.
             qb_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 hc_col = fx.Int32(c * MFMA_M) + lane_mod_16
@@ -837,16 +841,15 @@ def build_hstu_attention_bwd_dvdk(
                 elems = []
                 for i in range_constexpr(MFMA_LANE_K):
                     q_row = q_lane + fx.Int32(i)
+                    col = q_swz_col(q_row, hc_col)
                     elems.append(
-                        Vec.load(
-                            Vec.make_type(1, elem_dtype),
-                            q_smem.get(),
-                            [fx.Index(q_row), fx.Index(q_swz_col(q_row, hc_col))],
-                        )
+                        q_view[
+                            q_row,
+                            col // fx.Int32(MFMA_LANE_K),
+                            col % fx.Int32(MFMA_LANE_K),
+                        ]
                     )
-                qb_packs.append(
-                    Vec.from_elements([Vec(e)[0] for e in elems], elem_dtype).ir_value()
-                )
+                qb_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
             return qb_packs
 
         def accum_dk_tile(dk_acc, ds_packs):
@@ -906,7 +909,7 @@ def build_hstu_attention_bwd_dvdk(
             acc_init = [c_zero_v4f32 for _ in range(N_ACC)]
             loop_results = acc_init
             for q_tile, it in range(
-                fx.Index(q_tile_start), fx.Index(n_q_tiles), fx.Index(1), init=acc_init
+                fx.Int64(q_tile_start), fx.Int64(n_q_tiles), fx.Int64(1), init=acc_init
             ):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
                 acc = [it_list[i] for i in range(N_ACC)]
@@ -959,11 +962,6 @@ def build_hstu_attention_bwd_dvdk(
         out_dk: fx.Tensor,
         stream: fx.Stream,
     ) -> None:
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         grid = num_kv_tiles * batch * num_heads
         hstu_attention_bwd_dvdk(
             q,
