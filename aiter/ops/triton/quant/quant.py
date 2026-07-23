@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
     _mxfp4_quant_op,
     _dynamic_mxfp8_quant_kernel,
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel,
     _mxfp8_quant_op,
     _fp8_legacy_to_mxfp8_kernel,
     _dynamic_nvfp4_quant_kernel,
@@ -27,6 +28,7 @@ __all__ = [
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
     "dynamic_mxfp8_quant",
+    "dynamic_mxfp8_quant_n32k4_mbn",
     "fp8_legacy_to_mxfp8",
     "_mxfp8_quant_op",
     "dynamic_nvfp4_quant",
@@ -294,6 +296,65 @@ def dynamic_mxfp8_quant(
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
     return y, s
+
+
+def dynamic_mxfp8_quant_n32k4_mbn(
+    o: torch.Tensor,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused per-1x32 MXFP8 quant + n32k4 scale preshuffle for an mbn activation.
+
+    Single Triton launch: quantizes ``o`` to FP8 e4m3 and writes the e8m0 scale
+    *directly* in the [M//32, B, (K//32)*32] n32k4 layout consumed by the flydsl
+    strided-batched a8w4 kernel (layout='mbn'). Replaces the
+    ``dynamic_mxfp8_quant`` + transpose/permute/contiguous chain (3 uint8 copies)
+    with zero post-quant copies.
+
+    Args:
+        o: [M(tokens), B(groups), K] bf16/fp16 activation, M-outer contiguous.
+        quant_dtype: FP8 dtype for the payload.
+
+    Returns:
+        (a_fp8, a_scales):
+          a_fp8   : [M, B, K] fp8 (mbn physical, M-outer)
+          a_scales: [ceil(M/32), B, (K//32)*32] uint8 e8m0 (n32k4, pre-zeroed)
+    """
+    assert o.dim() == 3, f"expected [M,B,K], got {tuple(o.shape)}"
+    M, B, K = o.shape
+    assert (
+        K % _MXFP8_QUANT_BLOCK_SIZE == 0
+    ), f"K={K} must be a multiple of {_MXFP8_QUANT_BLOCK_SIZE}"
+
+    R = M * B
+    x2d = o.reshape(R, K).contiguous()  # row r = m*B + b (no copy if o contiguous)
+    Ns = K // _MXFP8_QUANT_BLOCK_SIZE
+    S_SUPER = Ns * 32  # bytes per (super, batch) e8m0 block
+
+    y = torch.empty((R, K), dtype=quant_dtype, device=o.device)
+    n_super = (M + 31) // 32
+    # Pre-zeroed so padded rows (m >= M within the last super) stay benign.
+    scale = torch.zeros((n_super, B, S_SUPER), dtype=torch.uint8, device=o.device)
+
+    BLOCK_SIZE_N = triton.next_power_of_2(K)
+    grid = (R,)
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel[grid](
+        x2d,
+        y,
+        scale,
+        R,
+        K,
+        B,
+        x2d.stride(0),
+        x2d.stride(1),
+        y.stride(0),
+        y.stride(1),
+        S_SUPER,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+        NUM_PRGMS=R,
+    )
+
+    return y.view(M, B, K), scale
 
 
 def fp8_legacy_to_mxfp8(
