@@ -7,8 +7,8 @@ The registry binds compile arguments against the registered callable with
 ``inspect.signature(...).bind(...)`` and applies its defaults. Resolution only
 imports and inspects callables chosen by the caller; it never queries a GPU,
 allocates tensors, opens a stream, compiles, or launches. ``compile()`` is the
-only operation that invokes a registered callable, under the unit's explicit
-ROCm target environment.
+only operation that invokes a registered callable. Target/cache compatibility
+belongs to the backend carried by ``CompileContext``.
 
 Artifact persistence, manifests, deduplication, and runtime lookup intentionally
 belong to later AOT layers.
@@ -22,14 +22,12 @@ from the referenced compiler itself.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 import inspect
-import os
 import re
 from threading import RLock
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Generic, Protocol, TypeVar
 
 __all__ = [
     "ArgumentKind",
@@ -37,6 +35,8 @@ __all__ = [
     "BoundCompileOp",
     "CompileOp",
     "CompileOpRegistry",
+    "CompileBackend",
+    "CompileContext",
     "CompilePlan",
     "CompileSpec",
     "CompileUnit",
@@ -237,6 +237,35 @@ class CompileUnit:
             raise TypeError("signature must be a KernelSignature")
 
 
+ArtifactT = TypeVar("ArtifactT")
+
+
+class CompileBackend(Protocol[ArtifactT]):
+    """Backend interface carried by a generic :class:`CompileContext`."""
+
+    def compile_aot(
+        self,
+        unit: CompileUnit,
+        *,
+        context: "CompileContext[ArtifactT]",
+    ) -> ArtifactT: ...
+
+    def load_aot(
+        self,
+        unit: CompileUnit,
+        *,
+        context: "CompileContext[ArtifactT]",
+        strict: bool = True,
+    ) -> ArtifactT: ...
+
+    def resolve_aot(
+        self,
+        unit: CompileUnit,
+        *,
+        context: "CompileContext[ArtifactT]",
+    ) -> ArtifactT: ...
+
+
 @dataclass(frozen=True)
 class CompilePlan:
     """An ordered collection of compile units; duplicates are retained."""
@@ -257,25 +286,6 @@ class CompilePlan:
 class _RegisteredCompileOp:
     compiler: Callable[..., Any]
     signature: inspect.Signature
-
-
-_TARGET_ENV_LOCK = RLock()
-
-
-@contextmanager
-def _target_environment(target: RocmTarget) -> Iterator[None]:
-    values = {"FLYDSL_GPU_ARCH": target.arch, "CU_NUM": str(target.cu_count)}
-    with _TARGET_ENV_LOCK:
-        previous = {name: os.environ.get(name) for name in values}
-        os.environ.update(values)
-        try:
-            yield
-        finally:
-            for name, value in previous.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
 
 
 class CompileOpRegistry:
@@ -383,8 +393,7 @@ class CompileOpRegistry:
             raise ValueError(
                 f"{unit.spec.op_id}: bound call does not match registered signature"
             )
-        with _target_environment(unit.spec.target):
-            return entry.compiler(**kwargs)
+        return entry.compiler(**kwargs)
 
     def compile_plan(self, plan: CompilePlan) -> tuple[Any, ...]:
         """Compile units in declaration order."""
@@ -395,6 +404,26 @@ class CompileOpRegistry:
 
 
 DEFAULT_COMPILE_OP_REGISTRY = CompileOpRegistry()
+
+
+@dataclass(frozen=True)
+class CompileContext(Generic[ArtifactT]):
+    """Immutable target, registry, and backend for compilation or AOT loading."""
+
+    target: RocmTarget
+    registry: CompileOpRegistry
+    backend: CompileBackend[ArtifactT]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target, RocmTarget):
+            raise TypeError("target must be a RocmTarget")
+        if not isinstance(self.registry, CompileOpRegistry):
+            raise TypeError("registry must be a CompileOpRegistry")
+        for method_name in ("compile_aot", "load_aot", "resolve_aot"):
+            if not callable(getattr(self.backend, method_name, None)):
+                raise TypeError(
+                    f"backend must implement {method_name}(unit, *, context, ...)"
+                )
 
 
 def register_compile_op(
@@ -467,15 +496,18 @@ class PlanBuilder:
 
     def __init__(
         self,
-        target: RocmTarget,
+        compile_context: CompileContext[Any],
         *sources: object,
-        registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
         context: str = "compile plan",
     ) -> None:
-        if not isinstance(target, RocmTarget):
-            raise TypeError(f"target must be a RocmTarget, got {type(target).__name__}")
-        self.target = target
-        self.registry = registry
+        if not isinstance(compile_context, CompileContext):
+            raise TypeError(
+                "compile_context must be a CompileContext, "
+                f"got {type(compile_context).__name__}"
+            )
+        self.compile_context = compile_context
+        self.target = compile_context.target
+        self.registry = compile_context.registry
         self.context = context
         self._sources = tuple(sources)
         self._units: list[CompileUnit] = []
@@ -582,15 +614,13 @@ def plan_provider(provider: Callable[..., Any]) -> Callable[..., CompilePlan]:
 
     def resolver(
         *args: Any,
-        target: RocmTarget,
-        registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
+        context: CompileContext[Any],
         **kwargs: Any,
     ) -> CompilePlan:
         plan = PlanBuilder(
-            target,
+            context,
             kwargs,
-            registry=registry,
-            context=f"{provider.__name__}[target={target!r}]",
+            context=f"{provider.__name__}[target={context.target!r}]",
         )
         result = provider(plan, *args, **kwargs)
         if result is not None:
@@ -612,12 +642,7 @@ def plan_provider(provider: Callable[..., Any]) -> Callable[..., CompilePlan]:
         len(public),
     )
     public[insertion:insertion] = [
-        inspect.Parameter("target", inspect.Parameter.KEYWORD_ONLY),
-        inspect.Parameter(
-            "registry",
-            inspect.Parameter.KEYWORD_ONLY,
-            default=DEFAULT_COMPILE_OP_REGISTRY,
-        ),
+        inspect.Parameter("context", inspect.Parameter.KEYWORD_ONLY),
     ]
     resolver.__signature__ = signature.replace(
         parameters=public,

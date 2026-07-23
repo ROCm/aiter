@@ -10,10 +10,9 @@ import re
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.launch_context import LaunchContext
 
 _KERNEL_PARAMS: dict[str, dict] = {}
-_STAGE1_COMPILE_PLAN_ENV = "AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN"
-_STAGE1_COMPILE_PLAN_RESOLUTION_COUNT = 0
 
 
 def _get_dtypes():
@@ -50,53 +49,10 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
     )
 
 
-def _compile_only() -> bool:
-    """True when running under AOT precompile (``COMPILE_ONLY=1``)."""
-    return os.environ.get("COMPILE_ONLY", "0") == "1"
+def _runtime_launch_context(device=None) -> LaunchContext:
+    """Capture the current stream once at a public runtime boundary."""
 
-
-def _stage1_compile_plan_enabled() -> bool:
-    return os.environ.get(_STAGE1_COMPILE_PLAN_ENV, "0") == "1"
-
-
-def get_stage1_compile_plan_resolution_count() -> int:
-    """Return the process-local count used by executable integration gates."""
-
-    return _STAGE1_COMPILE_PLAN_RESOLUTION_COUNT
-
-
-def _explicit_stage1_target():
-    from .compile_plan import RocmTarget
-
-    arch = os.environ.get("FLYDSL_GPU_ARCH")
-    cu_count = os.environ.get("CU_NUM")
-    if not arch or not cu_count:
-        raise RuntimeError(
-            f"{_STAGE1_COMPILE_PLAN_ENV}=1 requires explicit FLYDSL_GPU_ARCH and CU_NUM"
-        )
-    try:
-        return RocmTarget(arch, int(cu_count))
-    except ValueError as error:
-        raise ValueError(
-            f"invalid explicit Stage1 target: {arch!r}/{cu_count!r}"
-        ) from error
-
-
-def _launch_stream():
-    """Stream used for kernel launch.
-
-    Under ``COMPILE_ONLY`` (AOT precompile) no kernel is actually launched and
-    we may be running without a live CUDA context (CPU / FakeTensor), so return
-    ``0`` instead of touching ``torch.cuda.current_stream()``. This keeps the
-    runtime stage1/stage2 path callable in compile-only mode, which lets AOT
-    drive the *same* runtime code instead of re-implementing its host logic.
-
-    At inference (``COMPILE_ONLY`` unset) this is exactly the previous default
-    of ``torch.cuda.current_stream()`` — behavior is unchanged.
-    """
-    if _compile_only():
-        return 0
-    return torch.cuda.current_stream()
+    return LaunchContext(torch.cuda.current_stream(device))
 
 
 _SUFFIX_RE = re.compile(
@@ -487,29 +443,25 @@ def _register_all_configs():
 _register_all_configs()
 
 
-def _resolve_stage1_plan_launchers(builder_kwargs):
-    """Resolve and compile the opt-in Stage1 graph from one builder mapping."""
+def _resolve_stage1_plan_launchers(builder_kwargs, compile_context):
+    """Resolve Stage1 once and obtain every launcher through its backend."""
 
-    if not _stage1_compile_plan_enabled():
-        return None
-
-    from .compile_plan import DEFAULT_COMPILE_OP_REGISTRY
     from .moe_compile_plan import resolve_moe_stage1_compile_plan
 
     plan = resolve_moe_stage1_compile_plan(
-        target=_explicit_stage1_target(),
+        context=compile_context,
         **builder_kwargs,
     )
-    launchers = DEFAULT_COMPILE_OP_REGISTRY.compile_plan(plan)
     by_op_id = {}
-    for unit, launcher in zip(plan.units, launchers):
+    for unit in plan.units:
         op_id = unit.spec.op_id
         if op_id in by_op_id:
             raise RuntimeError(f"duplicate Stage1 CompilePlan op_id: {op_id}")
-        by_op_id[op_id] = launcher
-
-    global _STAGE1_COMPILE_PLAN_RESOLUTION_COUNT
-    _STAGE1_COMPILE_PLAN_RESOLUTION_COUNT += 1
+        artifact = compile_context.backend.resolve_aot(
+            unit,
+            context=compile_context,
+        )
+        by_op_id[op_id] = getattr(artifact, "launcher", artifact)
     return by_op_id
 
 
@@ -810,15 +762,13 @@ def _s1_args_fp4(
     k_in,
     size_expert_ids_in,
     dev,
+    launch_context: LaunchContext,
     bias=None,
-    stream=None,
     swiglu_limit=float("inf"),
     pass_swiglu_limit: bool = True,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
-    if stream is None:
-        stream = _launch_stream()
     args = (
         ptr_arg(out),
         ptr_arg(a),
@@ -837,8 +787,8 @@ def _s1_args_fp4(
         size_expert_ids_in,
     )
     if pass_swiglu_limit:
-        return args + (float(swiglu_limit), stream)
-    return args + (stream,)
+        return args + (float(swiglu_limit), launch_context.stream)
+    return args + (launch_context.stream,)
 
 
 def _s1_args_std(
@@ -855,10 +805,8 @@ def _s1_args_std(
     n_in,
     k_in,
     size_expert_ids_in,
-    stream=None,
+    launch_context: LaunchContext,
 ):
-    if stream is None:
-        stream = _launch_stream()
     return (
         ptr_arg(out),
         ptr_arg(a),
@@ -873,7 +821,7 @@ def _s1_args_std(
         n_in,
         k_in,
         size_expert_ids_in,
-        stream,
+        launch_context.stream,
     )
 
 
@@ -892,16 +840,14 @@ def _s2_args_fp4(
     k_in,
     blocks,
     dev,
+    launch_context: LaunchContext,
     bias=None,
-    stream=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
-    if stream is None:
-        stream = _launch_stream()
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -917,7 +863,7 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
-        stream,
+        launch_context.stream,
     )
 
 
@@ -935,10 +881,8 @@ def _s2_args_std(
     n_in,
     k_in,
     blocks,
-    stream=None,
+    launch_context: LaunchContext,
 ):
-    if stream is None:
-        stream = _launch_stream()
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -953,7 +897,7 @@ def _s2_args_std(
         n_in,
         k_in,
         blocks,
-        stream,
+        launch_context.stream,
     )
 
 
@@ -991,7 +935,7 @@ def _run_moe_reduction(
     model_dim,
     expert_mask=None,
     topk_ids=None,
-    stream=None,
+    launch_context: LaunchContext | None = None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1037,8 +981,8 @@ def _run_moe_reduction(
         # Placeholders; kernel ignores them when use_mask=False.
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
-    if stream is None:
-        stream = _launch_stream()
+    if launch_context is None:
+        raise TypeError("launch_context is required for FlyDSL reduction")
     _run_compiled(
         reduce_exe,
         (
@@ -1047,7 +991,7 @@ def _run_moe_reduction(
             ptr_arg(em),
             ptr_arg(tk),
             token_num,
-            stream,
+            launch_context.stream,
         ),
     )
 
@@ -1290,9 +1234,40 @@ def _get_compiled_swiglu(inter_dim: int, compile_target=None):
     return build_swiglu_and_mul_module(inter_dim)
 
 
+def _resolve_cktile_stage1_launcher(
+    *,
+    compile_context,
+    inter_dim: int,
+    topk: int,
+    act: str,
+):
+    from .moe_compile_plan import resolve_cktile_stage1_compile_plan
+
+    plan = resolve_cktile_stage1_compile_plan(
+        context=compile_context,
+        inter_dim=inter_dim,
+        topk=topk,
+        split_k=2,
+        act=act,
+        post_activation_layout="interleaved",
+    )
+    if len(plan.units) != 1:
+        raise RuntimeError(
+            f"CK-Tile {act} epilogue must resolve exactly one CompileUnit"
+        )
+    artifact = compile_context.backend.resolve_aot(
+        plan.units[0],
+        context=compile_context,
+    )
+    return getattr(artifact, "launcher", artifact)
+
+
 def flydsl_swiglu_and_mul_interleaved(
     input: torch.Tensor,
     out: torch.Tensor,
+    *,
+    compile_context=None,
+    launch_context: LaunchContext | None = None,
 ) -> None:
     """Fused swiglu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1301,14 +1276,25 @@ def flydsl_swiglu_and_mul_interleaved(
     """
     inter_dim = out.shape[-1]
     num_rows = input.shape[0]
-    _swiglu_fn = _get_compiled_swiglu(inter_dim)
+    if compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        compile_context = create_runtime_compile_context(input.device)
+    if launch_context is None:
+        launch_context = _runtime_launch_context(input.device)
+    _swiglu_fn = _resolve_cktile_stage1_launcher(
+        compile_context=compile_context,
+        inter_dim=inter_dim,
+        topk=1,
+        act="swiglu",
+    )
     _run_compiled(
         _swiglu_fn,
         (
             input,
             out,
             num_rows,
-            _launch_stream(),
+            launch_context.stream,
         ),
     )
 
@@ -1322,19 +1308,31 @@ def flydsl_silu_and_mul_interleaved(
     topk: int,
     quant_mode: str = "none",
     gui_layout: bool = True,
+    *,
+    compile_context=None,
+    launch_context: LaunchContext | None = None,
 ) -> None:
     """Fused silu activation for interleaved (gate/up block-interleaved) layout.
 
     input: (rows, inter_dim*2) bf16, interleaved layout.
     out:   (rows, inter_dim) bf16.
     """
+    if quant_mode != "none" or not gui_layout:
+        raise ValueError(
+            "CK-Tile Stage1 epilogue requires quant_mode='none' and gui_layout=True"
+        )
     inter_dim = out.shape[-1]
     num_sorted_rows = sorted_token_ids.shape[0]
-    _silu_fn = _get_compiled_silu_fused(
-        inter_dim,
-        topk,
-        quant_mode=quant_mode,
-        gui_layout=gui_layout,
+    if compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        compile_context = create_runtime_compile_context(input.device)
+    if launch_context is None:
+        launch_context = _runtime_launch_context(input.device)
+    _silu_fn = _resolve_cktile_stage1_launcher(
+        compile_context=compile_context,
+        inter_dim=inter_dim,
+        topk=topk,
         act="silu",
     )
     empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
@@ -1353,20 +1351,18 @@ def flydsl_silu_and_mul_interleaved(
             token_num,
             num_sorted_rows,
             float("inf"),
-            _launch_stream(),
+            launch_context.stream,
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# AOT compile-input builders
+# Transitional compile-input builders
 #
-# These construct the *top-level* inputs to flydsl_moe_stage1 / flydsl_moe_stage2
-# for a given config, so AOT precompile can drive the SAME runtime code instead
-# of re-deriving the internal buffers / arg packing / compile call. Under
-# COMPILE_ONLY + FakeTensor the stage functions compile (and persist) the
-# artifact without launching, and because they execute the real host logic the
-# resulting JIT cache key is identical to the one inference looks up.
+# Stage1 production AOT resolves CompileUnits and materializes their declared
+# ABI directly; ``build_stage1_compile_inputs`` remains only for the CPU golden
+# recorder. Stage2 AOT still uses ``build_stage2_compile_inputs`` under its
+# explicitly marked FakeTensor/full-host transition.
 #
 # Only the *input* shapes (activations, weights, scales, routing) live here —
 # everything downstream of the stage entry point (out_scale_sorted_flat, arg
@@ -1428,7 +1424,7 @@ def build_stage1_compile_inputs(
     out_dtype: str = "bf16",
     act: str = "silu",
     doweight_stage1: bool = False,
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -1443,7 +1439,7 @@ def build_stage1_compile_inputs(
     dev=None,
     **_ignored,
 ) -> dict:
-    """Build the kwargs to drive ``flydsl_moe_stage1`` for AOT precompile.
+    """Build Stage1 host kwargs for the CPU compile-request recorder.
 
     Only the top-level ``a`` / ``w1`` shapes and the boolean flags (dtypes,
     tile, ``doweight_stage1`` / ``enable_bias`` / ``a_scale_one`` ...) feed the
@@ -1543,7 +1539,7 @@ def build_stage2_compile_inputs(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     doweight_stage1: bool = False,
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     b_nt: int = 2,
     mode: str = "atomic",
     persist=None,
@@ -1672,6 +1668,8 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    compile_context=None,
+    launch_context: LaunchContext | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1695,6 +1693,12 @@ def flydsl_moe_stage1(
     """
     if k_batch_intra_block is not None:
         k_batch = k_batch_intra_block
+    if compile_context is None:
+        from .aot_backend import create_runtime_compile_context
+
+        compile_context = create_runtime_compile_context(a.device)
+    if launch_context is None:
+        launch_context = _runtime_launch_context(a.device)
 
     token_num = a.shape[0]
     E = w1.shape[0]
@@ -1797,10 +1801,6 @@ def flydsl_moe_stage1(
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
 
-    # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
-    # handles activation + quant + scale-sort after the GEMM completes.
-    _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
-
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
@@ -1828,6 +1828,7 @@ def flydsl_moe_stage1(
             _k_in,
             _grid_y,
             dev,
+            launch_context,
             bias=(
                 kernel_bias.view(-1)
                 if kernel_bias is not None
@@ -1851,6 +1852,7 @@ def flydsl_moe_stage1(
             _n_in,
             _k_in,
             _grid_y,
+            launch_context,
         )
 
     stage1_builder_kwargs = dict(
@@ -1881,7 +1883,10 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
     )
-    plan_launchers = _resolve_stage1_plan_launchers(stage1_builder_kwargs)
+    plan_launchers = _resolve_stage1_plan_launchers(
+        stage1_builder_kwargs,
+        compile_context,
+    )
 
     def take_plan_launcher(op_id):
         try:
@@ -1891,23 +1896,13 @@ def flydsl_moe_stage1(
                 f"Stage1 CompilePlan did not resolve required unit {op_id}"
             ) from error
 
-    if plan_launchers is None:
-        legacy_kwargs = {
-            **stage1_builder_kwargs,
-            "out_dtype": _gemm_out_dtype,
-            "enable_bias": kernel_bias is not None,
-        }
-        exe = compile_flydsl_moe_stage1(**legacy_kwargs)
-    else:
-        from .moe_compile_plan import (
-            INT4_STAGE1_GEMM_OP_ID,
-            MIXED_STAGE1_GEMM_OP_ID,
-        )
+    from .moe_compile_plan import (
+        INT4_STAGE1_GEMM_OP_ID,
+        MIXED_STAGE1_GEMM_OP_ID,
+    )
 
-        primary_op_id = (
-            MIXED_STAGE1_GEMM_OP_ID if use_mx_gemm else INT4_STAGE1_GEMM_OP_ID
-        )
-        exe = take_plan_launcher(primary_op_id)
+    primary_op_id = MIXED_STAGE1_GEMM_OP_ID if use_mx_gemm else INT4_STAGE1_GEMM_OP_ID
+    exe = take_plan_launcher(primary_op_id)
     _run_compiled(exe, args)
 
     if _is_splitk and _is_a16w4:
@@ -1934,22 +1929,9 @@ def flydsl_moe_stage1(
         )
     )
     if _gui_sk_fused:
-        _quant_mode = "fp4" if _need_fp4 else "fp8"
-        if plan_launchers is None:
-            _silu_fused_k = _get_compiled_silu_fused(
-                inter_dim,
-                topk,
-                _quant_mode,
-                gui_layout=True,
-                act=act,
-                enable_bias=use_splitk_bias,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        else:
-            from .moe_compile_plan import FQ_ACTIVATION_OP_ID
+        from .moe_compile_plan import FQ_ACTIVATION_OP_ID
 
-            _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
+        _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
         _run_compiled(
             _silu_fused_k,
             (
@@ -1963,25 +1945,13 @@ def flydsl_moe_stage1(
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
-                _launch_stream(),
+                launch_context.stream,
             ),
         )
     elif _gui_sk:
-        if plan_launchers is None:
-            _silu_fused_k = _get_compiled_silu_fused(
-                inter_dim,
-                topk,
-                "none",
-                gui_layout=True,
-                act=act,
-                enable_bias=use_splitk_bias,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        else:
-            from .moe_compile_plan import FQ_ACTIVATION_OP_ID
+        from .moe_compile_plan import FQ_ACTIVATION_OP_ID
 
-            _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
+        _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
         _run_compiled(
             _silu_fused_k,
             (
@@ -1995,23 +1965,13 @@ def flydsl_moe_stage1(
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
-                _launch_stream(),
+                launch_context.stream,
             ),
         )
     elif _splitk_fp4:
-        if plan_launchers is None:
-            _silu_fused_k = _get_compiled_silu_fused(
-                inter_dim,
-                topk,
-                act=act,
-                enable_bias=use_splitk_bias,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-        else:
-            from .moe_compile_plan import FQ_ACTIVATION_OP_ID
+        from .moe_compile_plan import FQ_ACTIVATION_OP_ID
 
-            _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
+        _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
         _run_compiled(
             _silu_fused_k,
             (
@@ -2025,14 +1985,13 @@ def flydsl_moe_stage1(
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
-                _launch_stream(),
+                launch_context.stream,
             ),
         )
-    elif _is_splitk and not _compile_only():
-        # Plain split-K post-op is a CK activation kernel (not a FlyDSL kernel),
-        # so there is no artifact to precompile here. Skip under COMPILE_ONLY —
-        # the only FlyDSL kernel on this path (the split-K GEMM) was already
-        # compiled above via _run_compiled.
+    elif _is_splitk:
+        # Plain split-K post-op is a CK activation kernel (not a FlyDSL kernel).
+        # Direct AOT resolves only the FlyDSL graph and never enters this host
+        # runtime branch.
         from aiter.ops.activation import (
             silu_and_mul,
             silu_and_mul_bias,
@@ -2104,6 +2063,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    launch_context: LaunchContext | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2126,6 +2086,8 @@ def flydsl_moe_stage2(
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
     """
+    if launch_context is None:
+        launch_context = _runtime_launch_context(inter_states.device)
 
     token_num = inter_states.shape[0]
     E = w2.shape[0]
@@ -2230,6 +2192,7 @@ def flydsl_moe_stage2(
             _k_in,
             m_blocks,
             dev,
+            launch_context,
             bias=bias,
         )
     else:
@@ -2247,6 +2210,7 @@ def flydsl_moe_stage2(
             _n_in,
             _k_in,
             m_blocks,
+            launch_context,
         )
 
     exe = compile_flydsl_moe_stage2(
@@ -2283,7 +2247,14 @@ def flydsl_moe_stage2(
             )
     if not accumulate and not return_per_slot:
         _run_moe_reduction(
-            target, out, token_num, topk, model_dim, expert_mask, topk_ids
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim,
+            expert_mask,
+            topk_ids,
+            launch_context,
         )
     return out
 
