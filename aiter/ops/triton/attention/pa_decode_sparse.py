@@ -144,6 +144,7 @@ def pa_decode_sparse(
                 extra_indptr=extra_indptr,
                 kv_splits=kv_splits,
                 skip_reduce=skip_reduce,
+                has_invalid=bool(has_invalid),
             )
 
     assert (
@@ -370,12 +371,6 @@ def pa_decode_sparse(
     return out
 
 
-# gfx950 / CDNA4 DeepSeek-V4 sparse-MLA decode (gluon). One private driver,
-# _pa_decode_sparse_gfx950_gluon, handles all three formats (packed fp8_ds_mla,
-# uniform fp8 pool + kv_scales, bf16); pa_decode_sparse routes to it. Tuning config
-# is inlined there. The raw kernels are imported lazily to keep them off gfx1250.
-
-
 def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     if x.dtype == torch.int32 and x.ndim == 1 and x.is_contiguous():
         return x
@@ -415,6 +410,7 @@ def _pa_decode_sparse_gfx950_gluon(
     extra_indptr=None,
     kv_splits=None,
     skip_reduce=False,
+    has_invalid=False,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from ``cache.ndim``:
       3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -429,7 +425,9 @@ def _pa_decode_sparse_gfx950_gluon(
     fp32; ``m`` is the row-max in the base-2 exponent domain (row-max * softmax_scale
     * log2e) and ``l``/``acc`` are per-split un-normalized -- same convention as the
     triton skip_reduce partials -- instead of the final ``[N, H, D]`` output.
-    q is bf16/fp16."""
+    ``has_invalid`` (default False): when True, -1 sentinels anywhere in a token's
+    index range are clamped in-bounds for the gather and masked out of the softmax
+    """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
     from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
@@ -464,7 +462,7 @@ def _pa_decode_sparse_gfx950_gluon(
             main_bf16 = cache_scales.contiguous()
         else:
             main_bf16 = cache
-        # HAS_EXTRA=False -> reuse main tensors as unread placeholders.
+        # if HAS_EXTRA=False, reuse main tensors as unread placeholders.
         extra_cache, extra_bf16, extra_indices, extra_indptr = (
             cache,
             main_bf16,
@@ -585,6 +583,7 @@ def _pa_decode_sparse_gfx950_gluon(
         MFMA_K=MFMA_K,
         UNIFORM=UNIFORM,
         USE_BUFFER_LOAD=use_buffer_load,
+        HAS_INVALID=has_invalid,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
@@ -617,34 +616,3 @@ def _pa_decode_sparse_gfx950_gluon(
         num_warps=4,
     )
     return out
-
-
-def _rocm_sparse_attn_decode_ragged_triton(
-    q,
-    main_cache,
-    main_indices,
-    main_indptr,
-    scale,
-    attn_sink,
-    nope_head_dim,
-    rope_head_dim,
-    extra_cache=None,
-    extra_indices=None,
-    extra_indptr=None,
-):
-    """vLLM-compat entry (the DSv4 backend calls this name): packed fp8_ds_mla / bf16
-    block cache, single segment or SWA+top-k two-loop. Thin shim over the merged
-    gfx950 driver."""
-    assert nope_head_dim == 448 and rope_head_dim == 64
-    return _pa_decode_sparse_gfx950_gluon(
-        q,
-        main_cache,
-        None,
-        main_indices,
-        main_indptr,
-        scale,
-        attn_sink,
-        extra_cache=extra_cache,
-        extra_indices=extra_indices,
-        extra_indptr=extra_indptr,
-    )

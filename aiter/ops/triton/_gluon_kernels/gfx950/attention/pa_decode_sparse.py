@@ -72,10 +72,12 @@ def _decode_tile(
     MASKED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
 ):
     """One KV tile -> online-softmax update. MASKED=False (peeled full tiles) drops
-    the in-range / slot-validity / gather / score masking; MASKED=True (the tail)
-    keeps it. Used only for the peeled tail now -- full tiles go through _gd_fp8."""
+    the in-range / gather / score masking; MASKED=True (the tail) keeps it. When
+    HAS_INVALID, full tiles also clamp -1 sentinels in-bounds for the gather and
+    mask their scores to -inf (matching the tail's slot-validity handling)."""
     neg_inf = float("-inf")
     if not USE_BUFFER_LOAD:
         cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets (see _cache_load)
@@ -84,6 +86,10 @@ def _decode_tile(
         in_range = k_pos < hi
         slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1)
         valid1d = in_range & (slot >= 0) & (slot < num_rows)
+        safe_slot = gl.where(valid1d, slot, 0)
+    elif HAS_INVALID:
+        slot = gl.load(indices_ptr + seg_start + k_pos)
+        valid1d = slot >= 0  # -1 sentinels: clamp in-bounds, mask score below
         safe_slot = gl.where(valid1d, slot, 0)
     else:
         slot = gl.load(indices_ptr + seg_start + k_pos)
@@ -170,16 +176,17 @@ def _decode_tile(
     )
     # exp2 softmax: qk_scale folds in log2(e) so we hit the HW exp2 directly.
     # Running max stays in raw-score space; masked cols (-inf) give exp2=0.
-    NEED_MASK: gl.constexpr = MASKED or (not HEAD_ALIGNED)
+    COL_VALID: gl.constexpr = MASKED or HAS_INVALID  # valid1d defined in both cases
+    NEED_MASK: gl.constexpr = COL_VALID or (not HEAD_ALIGNED)
     if NEED_MASK:
-        if MASKED:
+        if COL_VALID:
             col_mask = gl.convert_layout(valid1d, gl.SliceLayout(0, qk_layout))[None, :]
             if not HEAD_ALIGNED:
                 col_mask = (
                     gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[:, None]
                     & col_mask
                 )
-        else:  # not HEAD_ALIGNED and not MASKED -> head mask only
+        else:  # not HEAD_ALIGNED and no col invalidity -> head mask only
             col_mask = gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[
                 :, None
             ]
@@ -218,15 +225,21 @@ def _gd_fp8(
     HEAD_SIZE: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
 ):
     """Gather + dequant one full fp8 tile to bf16 regs (k_nope, k_rope). Split from
     the LDS-write/MFMA so the pipeline runs this tile's gather+dequant while the
     previous tile's MFMAs are on the matrix core -> the dequant hides behind them.
     UNIFORM: one fp8 gather + separate fp32 scales, no RoPE (k_rope is a dead
-    alias). Else: packed NoPE fp8 (over-read) + embedded UE8M0 + RoPE bf16."""
+    alias). Else: packed NoPE fp8 (over-read) + embedded UE8M0 + RoPE bf16.
+    Returns (k_nope, k_rope, valid); valid is the per-slot >=0 mask (all-True and
+    DCE'd when HAS_INVALID is False), consumed by _qkpv_fp8 for the score mask."""
     slot = gl.load(indices_ptr + seg_start + k_start + k_rng_slot)
     if not USE_BUFFER_LOAD:
         cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets (see _cache_load)
+    valid = slot >= 0
+    if HAS_INVALID:
+        slot = gl.where(valid, slot, 0)  # clamp -1 sentinels in-bounds for the gather
     block_idx = (slot // BLOCK_SIZE).to(gl.int32)
     pos = (slot % BLOCK_SIZE).to(gl.int32)
     bg = gl.convert_layout(block_idx, gl.SliceLayout(1, gather_l))
@@ -256,13 +269,14 @@ def _gd_fp8(
         pgr = gl.convert_layout(pos, gl.SliceLayout(1, gather_rope_l))
         rope_off = (bgr * (cs0 // 2) + pgr * 288 + 224)[:, None] + offs_rope[None, :]
         k_rope = _cache_load(cache_bf16_ptr, rope_off, USE_BUFFER_LOAD)
-    return k_nope, k_rope
+    return k_nope, k_rope, valid
 
 
 @gluon.jit
 def _qkpv_fp8(
     k_nope,
     k_rope,
+    valid,
     q_dot,
     m_i,
     l_i,
@@ -282,9 +296,11 @@ def _qkpv_fp8(
     BLOCK_K: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
 ):
     """Write a prefetched bf16 tile to LDS, then QK -> softmax -> PV. UNIFORM skips
-    the RoPE slice-store (the whole head is one fp8 tile)."""
+    the RoPE slice-store (the whole head is one fp8 tile). When HAS_INVALID, mask the
+    columns of -1-sentinel slots (``valid`` from _gd_fp8) to -inf."""
     neg_inf = float("-inf")
     kv_smem.store(k_nope)
     if not UNIFORM:
@@ -293,8 +309,19 @@ def _qkpv_fp8(
     S = gl.amd.cdna4.mfma(
         q_dot, k, gl.zeros([BLOCK_M, BLOCK_K], gl.float32, layout=qk_layout)
     )
-    if not HEAD_ALIGNED:
-        col_mask = gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[:, None]
+    NEED_MASK: gl.constexpr = HAS_INVALID or (not HEAD_ALIGNED)
+    if NEED_MASK:
+        if HAS_INVALID:
+            col_mask = gl.convert_layout(valid, gl.SliceLayout(0, qk_layout))[None, :]
+            if not HEAD_ALIGNED:
+                col_mask = (
+                    gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[:, None]
+                    & col_mask
+                )
+        else:
+            col_mask = gl.convert_layout(head_mask, gl.SliceLayout(1, qk_layout))[
+                :, None
+            ]
         S = gl.where(col_mask, S, neg_inf)
     m_block = gl.max(S, axis=1)
     m_new = gl.maximum(m_i, m_block)
@@ -346,6 +373,7 @@ def _process_segment(
     HEAD_ALIGNED: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
 ):
     offs_full = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, gather_l))
     offs_rope = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, gather_rope_l))
@@ -362,7 +390,7 @@ def _process_segment(
         # waits on tile i-1's reads, but the gather+dequant is off the critical path.
         n_full = (hi_full - lo) // BLOCK_K
         if n_full > 0:
-            kn, kr = _gd_fp8(
+            kn, kr, vld = _gd_fp8(
                 cache_ptr,
                 cache_bf16_ptr,
                 indices_ptr,
@@ -378,9 +406,10 @@ def _process_segment(
                 HEAD_SIZE,
                 UNIFORM,
                 USE_BUFFER_LOAD,
+                HAS_INVALID,
             )
             for i in range(1, n_full):
-                kn2, kr2 = _gd_fp8(
+                kn2, kr2, vld2 = _gd_fp8(
                     cache_ptr,
                     cache_bf16_ptr,
                     indices_ptr,
@@ -396,10 +425,12 @@ def _process_segment(
                     HEAD_SIZE,
                     UNIFORM,
                     USE_BUFFER_LOAD,
+                    HAS_INVALID,
                 )
                 m_i, l_i, acc = _qkpv_fp8(
                     kn,
                     kr,
+                    vld,
                     q_dot,
                     m_i,
                     l_i,
@@ -419,11 +450,13 @@ def _process_segment(
                     BLOCK_K,
                     HEAD_ALIGNED,
                     UNIFORM,
+                    HAS_INVALID,
                 )
-                kn, kr = kn2, kr2
+                kn, kr, vld = kn2, kr2, vld2
             m_i, l_i, acc = _qkpv_fp8(
                 kn,
                 kr,
+                vld,
                 q_dot,
                 m_i,
                 l_i,
@@ -443,6 +476,7 @@ def _process_segment(
                 BLOCK_K,
                 HEAD_ALIGNED,
                 UNIFORM,
+                HAS_INVALID,
             )
     else:
         for k_start in range(lo, hi_full, BLOCK_K):
@@ -483,6 +517,7 @@ def _process_segment(
                 False,
                 UNIFORM,
                 USE_BUFFER_LOAD,
+                HAS_INVALID,
             )
 
     if hi_full < hi:
@@ -523,6 +558,7 @@ def _process_segment(
             True,
             UNIFORM,
             USE_BUFFER_LOAD,
+            HAS_INVALID,
         )
     return m_i, l_i, acc
 
@@ -580,10 +616,12 @@ def _pa_decode_sparse(
     MFMA_K: gl.constexpr,
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
 ):
     """One program = (query t, split, head-block). Two-loop: main (SWA) then
     extra (top-k). NUM_SPLITS==1 writes the output directly; NUM_SPLITS>1 stores
-    un-normalized partials for the reduce kernel."""
+    un-normalized partials for the reduce kernel. HAS_INVALID gates -1-sentinel
+    handling (clamp + score mask) on the full-tile fast paths."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     query_idx = gl.program_id(0)
     split_id = gl.program_id(1)
@@ -708,6 +746,7 @@ def _pa_decode_sparse(
         HEAD_ALIGNED,
         UNIFORM,
         USE_BUFFER_LOAD,
+        HAS_INVALID,
     )
 
     if HAS_EXTRA:
@@ -751,6 +790,7 @@ def _pa_decode_sparse(
             HEAD_ALIGNED,
             UNIFORM,
             USE_BUFFER_LOAD,
+            HAS_INVALID,
         )
 
     # m_i/l_i are in SliceLayout(1, qk_layout); acc in pv_layout. Move the row
