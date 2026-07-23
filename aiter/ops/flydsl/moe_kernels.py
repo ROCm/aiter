@@ -182,6 +182,8 @@ def get_flydsl_stage2_kernels(
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
+    # Keep compatibility aliases in the runtime registry. The mixed stage2
+    # compiler accepts this parameter but generates the same kernel for each alias.
     b_nts = [0, 2]
 
     xcd_swizzles = [0, 4]
@@ -218,7 +220,48 @@ def get_flydsl_stage2_kernels(
                                 "persist": True,
                             }
     _register_production_variants_stage2(kernels, a_dtype, b_dtype, out_dtype)
+    _register_fp4_reduce_launch_variants_stage2(
+        kernels, a_dtype, b_dtype, out_dtype
+    )
     return kernels
+
+
+def _register_fp4_reduce_launch_variants_stage2(
+    kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
+) -> None:
+    """Register supported launch-parameter variants for the FP4 reduce kernel."""
+    if (a_dtype, b_dtype, out_dtype) != ("fp4", "fp4", "bf16"):
+        return
+
+    base = flydsl_kernel_name(
+        2, a_dtype, b_dtype, out_dtype, 64, 256, 256, "reduce"
+    )
+    if base not in kernels:
+        return
+
+    for persist in (False, True):
+        cu_num_muls = (1,) if not persist else (1, 2, 3, 4)
+        for cu_num_mul in cu_num_muls:
+            for waves_per_eu in (None, 1, 2):
+                for use_async_copy in (False, True):
+                    for xcd_swizzle in (0, 4):
+                        suffix = "_legacy" if not persist else "_persist"
+                        if persist and cu_num_mul != 1:
+                            suffix += f"_cumul{cu_num_mul}"
+                        if waves_per_eu is not None:
+                            suffix += f"_w{waves_per_eu}"
+                        if use_async_copy:
+                            suffix += "_async"
+                        if xcd_swizzle:
+                            suffix += f"_xcd{xcd_swizzle}"
+                        kernels[base + suffix] = {
+                            **kernels[base],
+                            "persist": persist,
+                            "cu_num_mul": cu_num_mul,
+                            "waves_per_eu": waves_per_eu,
+                            "use_async_copy": use_async_copy,
+                            "xcd_swizzle": xcd_swizzle,
+                        }
 
 
 def _register_production_variants_stage2(

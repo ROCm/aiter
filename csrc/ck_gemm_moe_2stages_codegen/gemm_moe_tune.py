@@ -708,6 +708,9 @@ class FmoeTuner(TunerCommon):
             sorted_weights=sorted_weights,
             sort_block_m=sort_block_m,
             persist=persist,
+            waves_per_eu=kparams.get("waves_per_eu", None),
+            use_async_copy=kparams.get("use_async_copy", False),
+            cu_num_mul=kparams.get("cu_num_mul", 1),
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
@@ -2217,11 +2220,26 @@ class FmoeTuner(TunerCommon):
         )
         if fmoe_func is None:
             return task_1stage
+        skip_kernels = set(
+            name
+            for name in os.environ.get("TUNE_SKIP_KERNELS", "").split(",")
+            if name
+        )
+        only_kernels = set(
+            name
+            for name in os.environ.get("TUNE_ONLY_KERNELS", "").split(",")
+            if name
+        )
         for tile_m, tile_n, smf in asm_kernels_1stage.keys():
             if inter_dim % tile_n != 0 or smf != 0:
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
+                if (
+                    el in skip_kernels
+                    or (only_kernels and el not in only_kernels)
+                ):
+                    continue
                 # Per-kernel ``flat`` in asm manifest (FLAT == raw topk, no host sort).
                 flat_flag = int(asm_1stage_flat.get(el, 0))
                 if flat_flag:
@@ -2326,6 +2344,11 @@ class FmoeTuner(TunerCommon):
                 if inter_dim % tile_n != 0 or smf != 0:
                     continue
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
+                    if (
+                        el in skip_kernels
+                        or (only_kernels and el not in only_kernels)
+                    ):
+                        continue
                     # xbf16: internal quant; FLAT kernels (manifest flat=1) take raw topk.
                     flat_flag = int(xbf16_flat.get(el, 0))
                     if flat_flag:
@@ -2942,7 +2965,13 @@ class FmoeTuner(TunerCommon):
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
-                is_splitk = kparams.get("k_batch", 1) > 1
+                k_batch = kparams.get("k_batch", 1)
+                # Split-K codegen requires an exact partition of the stage1 K
+                # dimension. Skip incompatible global-manifest entries before
+                # dispatching them to worker processes.
+                if model_dim % k_batch != 0:
+                    continue
+                is_splitk = k_batch > 1
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
@@ -3063,6 +3092,10 @@ class FmoeTuner(TunerCommon):
                     )
 
             for kname, kparams in flydsl_s2_kernels.items():
+                # Mixed stage2 compatibility aliases compile identically.
+                # Benchmark only the canonical entry.
+                if kparams.get("b_nt", 0) != 0:
+                    continue
                 s2_tile_m = kparams["tile_m"]
                 if blockM % s2_tile_m != 0:
                     continue
@@ -3902,7 +3935,17 @@ class FmoeTuner(TunerCommon):
         args,
     ):
         mp_num = args.mp
-        blockMs = [16, 32, 64, 128]
+        block_ms_env = os.environ.get("TUNE_BLOCK_MS", "")
+        blockMs = (
+            [int(value) for value in block_ms_env.split(",") if value]
+            if block_ms_env
+            else [16, 32, 64, 128]
+        )
+        invalid_block_ms = set(blockMs) - {16, 32, 64, 128}
+        if invalid_block_ms:
+            raise ValueError(
+                f"TUNE_BLOCK_MS contains unsupported values: {sorted(invalid_block_ms)}"
+            )
         keys = self.keys
         tasks = []
         tasks_ck = []
@@ -3984,7 +4027,7 @@ class FmoeTuner(TunerCommon):
                         inter_dim_pad=args.opus_a8w4_inter_dim_pad,
                     )
                 )
-            if _want("asm"):
+            if _want("asm") or _want("asm_1stage"):
                 task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
