@@ -15,6 +15,28 @@ namespace pipeline_group_split
 
 using namespace pipeline_common;
 
+// M-major tile remap keeping contiguous work on one of 8 XCDs (flydsl xcd_remap), for HBM channel balance.
+template<typename T>
+__device__ __forceinline__ void xcd_remap_tile(int& route_tile, int& col_tile)
+{
+    constexpr int num_xcds = 8;
+    constexpr int group = T::XCD_SWIZZLE;
+    const int n_col = static_cast<int>(gridDim.x);
+    const int n_route = static_cast<int>(gridDim.y);
+    const int total = n_col * n_route;
+    const int per_xcd = total / num_xcds;
+    const int rem = total % num_xcds;
+    const int linear = route_tile * n_col + col_tile;
+    const int xcd = linear % num_xcds;
+    const int wgid = xcd * per_xcd + (xcd < rem ? xcd : rem) + linear / num_xcds;
+    const int per_group = group * n_col;
+    const int first_route = (wgid / per_group) * group;
+    const int group_rows = n_route - first_route < group ? n_route - first_route : group;
+    const int in_group = wgid % per_group;
+    route_tile = first_route + in_group % group_rows;
+    col_tile = in_group / group_rows;
+}
+
 template<typename T>
 static __device__ void process_tile(
     const OpusMoeStage1A8W4Kargs& kargs,
@@ -26,8 +48,10 @@ static __device__ void process_tile(
     static_assert(T::K_WAVE == 1,
                   "group-split stage1 pipeline does not split K across waves");
 
-    const int route_tile = static_cast<int>(opus::block_id_y());
-    const int col_tile = static_cast<int>(opus::block_id_x());
+    int route_tile = static_cast<int>(opus::block_id_y());
+    int col_tile = static_cast<int>(opus::block_id_x());
+    if constexpr(T::XCD_SWIZZLE > 0)
+        xcd_remap_tile<T>(route_tile, col_tile);
     const int tid = static_cast<int>(opus::thread_id_x());
     const int wave_id =
         __builtin_amdgcn_readfirstlane(tid / opus::get_warp_size());

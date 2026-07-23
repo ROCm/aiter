@@ -68,6 +68,8 @@ class OpusA8W4Stage1Instance:
     quant_group_blocks: int = 1
     activation: str = "silu"
     block_threads: int = 256
+    weight_load_stream: bool = False
+    xcd_swizzle: int = 0
 
     @property
     def profile_name(self) -> str:
@@ -85,6 +87,7 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         gate_up_group_split=True,
         min_blocks_per_cu_override=1,
         quant_group_blocks=6,
+        weight_load_stream=True,
     ),
     OpusA8W4Stage1Instance(
         kid=1001,
@@ -200,6 +203,23 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         quant_group_blocks=4,
         activation="swiglu",
         block_threads=512,
+    ),
+    # bm64 bn384 STREAM variant of kid1002; wins @tok2048 (tok/expert<block_m), cache kid1002 wins >=.
+    OpusA8W4Stage1Instance(
+        kid=1015,
+        name="opus_moe1_a8w4_bm64_bn384_gateup_groupsplit_t4096_noclamp_min1_asynca_caproutes_assumeroute_splitb_stream",
+        block_m=64,
+        block_n=384,
+        gate_up_group_split=True,
+        min_blocks_per_cu_override=1,
+        quant_group_blocks=3,
+        weight_load_stream=True,
+    ),
+    # bm64 bn384 CACHE+xcd4: wins large tokens @8192/16384/32768 (+13/+22/+4.5%, M-reuse L2 swizzle).
+    OpusA8W4Stage1Instance(
+        kid=1020, name="opus_moe1_a8w4_bm64_bn384_gateup_groupsplit_t4096_noclamp_min1_asynca_caproutes_assumeroute_splitb_cache_xcd4",
+        block_m=64, block_n=384, gate_up_group_split=True, min_blocks_per_cu_override=1,
+        quant_group_blocks=3, xcd_swizzle=4,
     ),
 )
 

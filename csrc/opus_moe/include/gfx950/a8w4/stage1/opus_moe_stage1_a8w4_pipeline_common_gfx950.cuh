@@ -238,10 +238,12 @@ __device__ __forceinline__ stage1_u32x4_t load_b_raw_stage1(
 {
     const int64_t b_offset =
         b_payload_offset<Traits>(payload_base, item, k_step, k_steps);
+    // aux=2 (stream/SLC) vs aux=0 (L2 cache) per WEIGHT_LOAD_STREAM (see traits).
     return __builtin_bit_cast(
         stage1_u32x4_t,
         g_b.template load<Traits::BYTES_PER_VEC>(
-            static_cast<int>(b_offset)));
+            static_cast<int>(b_offset), 0,
+            opus::number<Traits::WEIGHT_LOAD_STREAM ? 2 : 0>{}));
 }
 
 template<typename Traits, typename ALayout>

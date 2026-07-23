@@ -71,6 +71,8 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int WAVE_SIZE = opus::get_warp_size();
     static constexpr int K_WAVE = Policy::K_WAVE;
     static constexpr bool GATE_UP_GROUP_SPLIT = Policy::GATE_UP_GROUP_SPLIT;
+    static constexpr bool WEIGHT_LOAD_STREAM = Policy::WEIGHT_LOAD_STREAM;
+    static constexpr int XCD_SWIZZLE = Policy::XCD_SWIZZLE;
     static constexpr int KWAVE_BASE_WAVES =
         GATE_UP_GROUP_SPLIT ? Policy::BLOCK_THREADS / WAVE_SIZE : 2;
     static constexpr int BLOCK_SIZE =
@@ -158,7 +160,9 @@ template<bool GateUpGroupSplit = false,
          bool SkipInvalidAScaleGuard = false,
          int QuantGroupBlocks = 1,
          Stage1Activation Activation = Stage1Activation::Silu,
-         int BlockThreads = kDefaultCtaThreads>
+         int BlockThreads = kDefaultCtaThreads,
+         bool WeightLoadStream = false,
+         int XcdSwizzle = 0>
 struct OpusMoeStage1A8W4Policy
 {
     static constexpr bool GATE_UP_GROUP_SPLIT = GateUpGroupSplit;
@@ -168,6 +172,8 @@ struct OpusMoeStage1A8W4Policy
     static constexpr int QUANT_GROUP_BLOCKS = QuantGroupBlocks;
     static constexpr Stage1Activation ACTIVATION = Activation;
     static constexpr int BLOCK_THREADS = BlockThreads;
+    static constexpr bool WEIGHT_LOAD_STREAM = WeightLoadStream;
+    static constexpr int XCD_SWIZZLE = XcdSwizzle;
 };
 
 } // namespace stage1_a8w4

@@ -454,6 +454,8 @@ def _stage1_cpp_shape(inst) -> str:
         inst.quant_group_blocks,
         _stage1_cpp_activation(inst.activation),
         inst.block_threads,
+        inst.weight_load_stream,
+        inst.xcd_swizzle,
     )
     policy = (
         "OpusMoeStage1A8W4Policy<"
