@@ -4,8 +4,11 @@
 """Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h) regressions.
 
 Usage:
-    HIP_VISIBLE_DEVICES=7 pytest -sv aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
+    rm -rf ~/.triton/cache
+    export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-64k-qwen-ptpc-ali" -v -s
+    bash op_tests/flydsl_tests/run_test_flydsl_gdr_k5_prefill.sh
 """
 
 from __future__ import annotations
@@ -15,7 +18,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 import triton
-import triton.language as tl
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -30,7 +32,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        chunk_gated_delta_rule_fwd_h_flydsl,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -50,6 +52,26 @@ try:
 except Exception:
     chunk_gated_delta_rule_fwd_h_vllm = None
     _HAS_VLLM_K5 = False
+
+# HIP/C++ K5 (chunk_gated_delta_rule_fwd_h.cu). JIT-compiled on first call.
+# Same public VK outputs as the FlyDSL / Triton opt_vk backends, but it
+# requires K=V=128 + bf16 inputs, so cases that violate that are skipped
+# in the correctness test and excluded from the perf launch.
+try:
+    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+        chunk_gated_delta_rule_fwd_h_hip_fn,
+    )
+
+    _HAS_HIP_K5 = True
+except Exception:
+    chunk_gated_delta_rule_fwd_h_hip_fn = None
+    _HAS_HIP_K5 = False
+
+# When True, ``test_consistency_flydsl_mfma16_hip_vs_hip`` requires the
+# flydsl-hip fork to match HIP/C++ BIT-FOR-BIT (torch.equal). Until the LDS /
+# layout / (optionally) numeric alignment work fully lands it stays False and
+# the test only records the gap + asserts a loose same-algorithm band.
+_MFMA16_HIP_VS_HIP_BITEXACT = False
 
 torch.set_default_device("cuda")
 
@@ -88,6 +110,11 @@ class PrefillArgs:
     # shapes share the same ``(T, num_seqs)``. Typical values are a log
     # count or a hex digest of cu_seqlens.
     trace_tag: str = ""
+    # Appended to the display id when a group sweeps multiple
+    # ``max_num_batched_tokens`` values, so a fixed (tp, full_prompt_len) stays
+    # unique across the batched-token sweep. Empty for single-value groups, so
+    # their ids are unchanged.
+    bt_tag: str = ""
 
     @property
     def Hg(self):
@@ -123,6 +150,8 @@ class PrefillArgs:
         tag = self.model_name + "_" if self.model_name else ""
         tag += f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
         tag += f"_TP{self.tp}_T{self.full_prompt_len}"
+        if self.bt_tag:
+            tag += f"_{self.bt_tag}"
         if not self.is_varlen:
             tag += "_novarlen"
         if not self.output_final_state:
@@ -167,7 +196,13 @@ class PrefillGroup:
     is_varlen: bool = True
     output_final_state: bool = True
     ssm_state_dtype: torch.dtype = torch.float32
-    # Three semantics for ``max_num_batched_tokens``:
+    # Semantics for ``max_num_batched_tokens``:
+    #   - list/tuple : sweep -- materialise one case per element (Cartesian with
+    #           tps x full_prompt_lens). Each element is itself one of the specs
+    #           below (int / "full_prompt_len" / None). For the varlen path this
+    #           sweeps the batch size N = mnbt // full_prompt_len. ids get an
+    #           ``mnbt{value}`` suffix so a fixed (tp, full_prompt_len) stays
+    #           unique. Example: ``max_num_batched_tokens=[16384, 32768, 65536]``.
     #   - int : use this exact value for every expanded case (e.g. you want
     #           a fixed scheduler budget across a sweep of full_prompt_len).
     #   - "full_prompt_len" : tie it to each case's full_prompt_len. The
@@ -181,36 +216,134 @@ class PrefillGroup:
     #           length 1024. Preserving that behavior is what keeps the
     #           varlen path's per-case shape unchanged across this refactor.
     max_num_batched_tokens: object = None
+    # Optional "trace-derived 3-segment" expansion knob. When set, each
+    # expanded case overrides ``_build_context_lens`` with the explicit
+    # 3-segment layout ``[head, mid_seqlen, full_prompt_len - head - mid_seqlen]``,
+    # i.e. cu_seqlens = [0, head, head + mid_seqlen, full_prompt_len].
+    # This reproduces the worst K5 regression family found in bench
+    # results 20260603 (n=3, T ~= 16384, middle segment == 10000): the
+    # K5 kernel exhibits a near-constant ~543us cost across this whole
+    # cluster regardless of head_seqlen, while triton K5 varies with the
+    # head split between ~460-495us. Sweeping head_seqlens lets us probe
+    # the kernel's sensitivity (or lack thereof) to the head boundary.
+    # Group is materialised as the (tps x full_prompt_lens x head_seqlens)
+    # Cartesian product when this is not None.
+    head_seqlens: object = None  # list[int] | None
+    mid_seqlen: int = 10000
+    # Number of segments per expanded case when ``head_seqlens`` is set:
+    #   num_segments=3 (default): context_lens = [head, mid_seqlen, full_len-head-mid_seqlen]
+    #     -> cu_seqlens = [0, head, head+mid_seqlen, full_len]   (n=3)
+    #   num_segments=2          : context_lens = [head, full_len-head]
+    #     -> cu_seqlens = [0, head, full_len]                    (n=2)
+    #     ``mid_seqlen`` is ignored in this mode; the tail length is whatever
+    #     remains after ``head``. Used to cover the n=2 T=16384 regression
+    #     clusters (head near 6400 / 8192 / 9912 / 10000) found in the
+    #     bench_gdr 20260604 trace.
+    num_segments: int = 3
 
 
 def expand_groups(groups):
     out = []
     for g in groups:
+        # ``max_num_batched_tokens`` may be a single spec (int / "full_prompt_len"
+        # / None) OR a list/tuple of such specs. A list materialises one case per
+        # value (Cartesian with tps x full_prompt_lens) -- e.g. to sweep the
+        # scheduler token budget, which for the varlen path sweeps the batch size
+        # (N = mnbt // full_prompt_len). When more than one value is present, ids
+        # gain an ``mnbt{value}`` suffix so a fixed (tp, full_prompt_len) stays
+        # unique; a single value keeps the original ids unchanged.
+        mnbt_specs = g.max_num_batched_tokens
+        if not isinstance(mnbt_specs, (list, tuple)):
+            mnbt_specs = [mnbt_specs]
+        _sweep_mnbt = len(mnbt_specs) > 1
         for tp in g.tps:
             for full_len in g.full_prompt_lens:
-                if g.max_num_batched_tokens == "full_prompt_len":
-                    mnbt = full_len
-                elif g.max_num_batched_tokens is None:
-                    mnbt = 32768  # PrefillArgs dataclass default
-                else:
-                    mnbt = g.max_num_batched_tokens
-                out.append(
-                    PrefillArgs(
-                        K=g.K,
-                        V=g.V,
-                        Hk=g.Hk,
-                        Hv=g.Hv,
-                        tp=tp,
-                        full_prompt_len=full_len,
-                        model_name=g.model_name,
-                        BT=g.BT,
-                        max_num_batched_tokens=mnbt,
-                        dtype=g.dtype,
-                        is_varlen=g.is_varlen,
-                        output_final_state=g.output_final_state,
-                        ssm_state_dtype=g.ssm_state_dtype,
-                    )
-                )
+                for mnbt_spec in mnbt_specs:
+                    if mnbt_spec == "full_prompt_len":
+                        mnbt = full_len
+                    elif mnbt_spec is None:
+                        mnbt = 32768  # PrefillArgs dataclass default
+                    else:
+                        mnbt = mnbt_spec
+                    bt_tag = f"mnbt{mnbt}" if _sweep_mnbt else ""
+
+                    # head_seqlens=None : preserve the original "equal split via
+                    # _build_context_lens" behavior. Otherwise materialise one
+                    # PrefillArgs per (tp, full_len, head) triple with an
+                    # explicit 3-segment cu_seqlens layout
+                    # [head, mid_seqlen, full_len - head - mid_seqlen].
+                    if g.head_seqlens is None:
+                        out.append(
+                            PrefillArgs(
+                                K=g.K,
+                                V=g.V,
+                                Hk=g.Hk,
+                                Hv=g.Hv,
+                                tp=tp,
+                                full_prompt_len=full_len,
+                                model_name=g.model_name,
+                                BT=g.BT,
+                                max_num_batched_tokens=mnbt,
+                                dtype=g.dtype,
+                                is_varlen=g.is_varlen,
+                                output_final_state=g.output_final_state,
+                                ssm_state_dtype=g.ssm_state_dtype,
+                                bt_tag=bt_tag,
+                            )
+                        )
+                    else:
+                        for head in g.head_seqlens:
+                            if g.num_segments == 2:
+                                tail = full_len - head
+                                if tail <= 0:
+                                    raise ValueError(
+                                        f"head_seqlens (num_segments=2) produced "
+                                        f"non-positive tail ({tail}) for "
+                                        f"group={g.model_name!r} "
+                                        f"full_prompt_len={full_len} head={head}."
+                                    )
+                                context_lens = [head, tail]
+                                tag = f"head{head}_tail{tail}"
+                            elif g.num_segments == 3:
+                                tail = full_len - head - g.mid_seqlen
+                                if tail <= 0:
+                                    raise ValueError(
+                                        f"head_seqlens (num_segments=3) produced "
+                                        f"non-positive tail ({tail}) for "
+                                        f"group={g.model_name!r} "
+                                        f"full_prompt_len={full_len} head={head} "
+                                        f"mid_seqlen={g.mid_seqlen}. Drop this "
+                                        f"(full_len, head) combo or raise "
+                                        f"full_prompt_len."
+                                    )
+                                context_lens = [head, g.mid_seqlen, tail]
+                                tag = f"head{head}_mid{g.mid_seqlen}"
+                            else:
+                                raise ValueError(
+                                    f"num_segments={g.num_segments} unsupported; "
+                                    f"only 2 or 3 are implemented."
+                                )
+                            if _sweep_mnbt:
+                                tag = f"{tag}_mnbt{mnbt}"
+                            out.append(
+                                PrefillArgs(
+                                    K=g.K,
+                                    V=g.V,
+                                    Hk=g.Hk,
+                                    Hv=g.Hv,
+                                    tp=tp,
+                                    full_prompt_len=full_len,
+                                    model_name=g.model_name,
+                                    BT=g.BT,
+                                    max_num_batched_tokens=mnbt,
+                                    dtype=g.dtype,
+                                    is_varlen=g.is_varlen,
+                                    output_final_state=g.output_final_state,
+                                    ssm_state_dtype=g.ssm_state_dtype,
+                                    context_lens=context_lens,
+                                    trace_tag=tag,
+                                )
+                            )
     return out
 
 
@@ -237,6 +370,14 @@ _PREFILL_GROUPS = [
         output_final_state=False,
         max_num_batched_tokens="full_prompt_len",
     ),
+    PrefillGroup(
+        model_name="Qwen3.5-397B-ptpc-ali",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[1024, 2048, 4096, 8192],
+        is_varlen=False,
+        max_num_batched_tokens="full_prompt_len",
+    ),
     # varlen + final_state (default path), TP=4 / TP=8 share everything
     # else, so they collapse into a single group. Original rows left
     # max_num_batched_tokens at the PrefillArgs default of 32768, which
@@ -251,10 +392,17 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
+        model_name="varlen-64k-qwen-ptpc-ali",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[8192],
+        # max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        max_num_batched_tokens=[65536],
+    ),
+    PrefillGroup(
         model_name="varlen-16k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[1000, 5000, 10000],
         max_num_batched_tokens=16384,
     ),
@@ -262,39 +410,41 @@ _PREFILL_GROUPS = [
         model_name="varlen-32k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[1000, 5000, 10000],
+        # full_prompt_lens=[1000],
         max_num_batched_tokens=32768,
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n1",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[5000, 10000],
+        max_num_batched_tokens="full_prompt_len",
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n3-mid10k",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[16384],
+        max_num_batched_tokens=16384,
+        head_seqlens=[5, 10, 65, 704, 936, 1820, 4467, 5508],
+        mid_seqlen=10000,
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n2-16k",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[16384],
+        max_num_batched_tokens=16384,
+        head_seqlens=[4000, 6396, 8192, 9912, 10000],
+        num_segments=2,
     ),
 ]
 
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
 
-# Perf-test parametrization is identical to the correctness one; trace-
-# derived shapes have been removed from this file.
-PERF_PARAMS = list(PREFILL_PARAMS)
-PERF_TEST_IDS = [repr(p) for p in PERF_PARAMS]
-
-
-# Mirror every base shape with a bf16-SSM-state variant. The bf16 vs f32
-# kernel paths only differ in two ``if const_expr`` branches:
-#   - h0 load (gated by USE_INITIAL_STATE)
-#   - ht store (gated by STORE_FINAL_STATE)
-# The bf16 mirror keeps ``output_final_state`` from the base shape, so:
-#   - ``_nofs`` shapes (use_h0=True, store_fs=False) cover the h0 load path
-#   - default shapes (use_h0=True, store_fs=True) cover both paths
-# Only ``(use_h0=False, store_fs=False)`` would generate IR identical to
-# the f32 path; none of the current PREFILL_PARAMS hits that combo, so we
-# do not filter here. If you add such a case later, gate the mirror with
-# ``if _base.output_final_state or _make_inputs(...) provides h0``.
-# NOTE: bf16 SSM-state mirrors disabled for focused perf profiling.
-# PREFILL_PARAMS.extend(
-#     [
-#         _dataclass_replace(_base, ssm_state_dtype=torch.bfloat16)
-#         for _base in list(PREFILL_PARAMS)
-#     ]
-# )
+PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 
 # -- bf16 SSM-state params (paired with TestStateDtypeBF16 below) ------
@@ -517,18 +667,111 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
+def _is_gfx950() -> bool:
+    """Whether the current GPU is CDNA4 / gfx950 (MI350).
+
+    The baseline / ``naive`` / ``naive_opt`` FlyDSL K5 forks emit the
+    ``mfma_f32_16x16x32_bf16`` (K=32 bf16) MFMA and ``mfma32_vk`` emits
+    ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
+    (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
+    abort, so the perf harness skips them there. The remaining forks
+    (``kv`` / ``mfma16_hip`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
+    use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
+    """
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return "gfx950" in arch
+
+
+def _hip_k5_supported(args: PrefillArgs) -> bool:
+    """The HIP K5 kernel only handles K=V=128, bf16 inputs, chunk_size=64."""
+    return (
+        _HAS_HIP_K5
+        and args.K == 128
+        and args.V == 128
+        and args.dtype == torch.bfloat16
+        and args.BT == 64
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_hip_k5(
+    k,
+    w,
+    u,
+    g=None,
+    initial_state=None,
+    output_final_state=False,
+    cu_seqlens=None,
+):
+    """HIP/C++ K5 host wrapper, adapted to this file's K5 calling convention.
+
+    Mirrors the FlyDSL / Triton ``opt_vk`` backends: takes the GQA-layout
+    ``k`` ([B, T, Hg, K]), head-major ``w`` / ``u`` ([B, H, T, K/V]), and a
+    head-major cumulative-gate ``g`` ([H, T_total] or [B, H, T_total]) in
+    natural-log space, and returns VK-ordered ``h`` ([B, NT, H, V, K]),
+    head-major ``v_new`` ([B, H, T, V]), and VK ``final_state``
+    ([N, H, V, K]) -- identical public outputs to the other backends, so
+    the shared ``_assert_k5_outputs_match_ref`` comparator applies directly.
+
+    The underlying kernel's ``USE_EXP2`` path expects log2-space gates, so we
+    pass ``use_exp2=False`` here to keep the natural-log-space ``g`` contract
+    shared with the PyTorch reference (the kernel then applies the LOG2E
+    scale internally).
+    """
+    H = w.shape[1]
+    T_flat = w.shape[2]
+
+    # The HIP wrapper wants a 3-D head-major g [B, H, T_flat]. This file
+    # produces a 2-D [H, T_total] gate for the B=1 varlen / dense cases.
+    if g is not None:
+        if g.dim() == 2:
+            g_hip = g.reshape(1, H, T_flat).contiguous()
+        else:
+            g_hip = g.contiguous()
+    else:
+        g_hip = None
+
+    return chunk_gated_delta_rule_fwd_h_hip_fn(
+        k,
+        w,
+        u,
+        g=g_hip,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        use_exp2=False,
+        g_head_major=True,
+    )
+
+
 # -- Performance benchmark ----------------------------------------------
 
 
 _K5_KERNEL_PREFIXES = [
     "chunk_gdn_fwd_h_flydsl_vk",
+    "chunk_gdn_fwd_h_flydsl_kv",
+    "chunk_gdn_fwd_h_flydsl_mfma16",
+    "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
+]
+
+# The HIP/C++ K5 kernel is a templated __global__ whose profiler symbol is
+# either the demangled ``...chunk_gated_delta_rule_fwd_h_hip_kernel<...>`` or
+# a mangled ``_ZN...`` form. Match it as a substring (the templated name never
+# appears at offset 0 after demangling because of the leading return type).
+_K5_KERNEL_SUBSTRINGS = [
+    "chunk_gated_delta_rule_fwd_h_hip_kernel",
 ]
 
 
 def _is_k5_kernel(name: str) -> bool:
     """Return True if *name* is a K5 hidden-state recurrence kernel."""
-    return any(name.startswith(p) for p in _K5_KERNEL_PREFIXES)
+    if any(name.startswith(p) for p in _K5_KERNEL_PREFIXES):
+        return True
+    return any(s in name for s in _K5_KERNEL_SUBSTRINGS)
 
 
 def _bench_fn(fn, *args, **kwargs):
@@ -560,7 +803,69 @@ def _bench_fn(fn, *args, **kwargs):
 
 # -- Correctness tests ---------------------------------------------------
 
-PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
+
+def _assert_mean_abs_within(out, ref, *, mean_atol, label):
+    """Guard the *mean* absolute error, not just the per-element worst case.
+
+    ``torch.testing.assert_close``'s ``atol`` only bounds the single worst
+    element, which for bf16 K5 over a long chunked recurrence sits close to
+    the 5e-2 element tolerance (a few outlier tokens at the tail of the
+    33-segment chain). The mean abs error, by contrast, is ~2-3e-3 in
+    practice and is what actually moves when an implementation regresses the
+    *whole* distribution (e.g. a gating / accumulation bug) without yet
+    tripping any single element past 5e-2. Bound it here.
+    """
+    mean_abs = (out.float() - ref.float()).abs().mean().item()
+    assert mean_abs <= mean_atol, (
+        f"{label}: mean abs error {mean_abs:.3e} exceeds mean_atol "
+        f"{mean_atol:.3e} (per-element atol may still pass; this guards "
+        f"whole-distribution drift)"
+    )
+
+
+def _assert_close_lowmem(a, b, *, atol, rtol, msg, chunk_rows=1 << 22):
+    """Memory-frugal elementwise ``|a-b| <= atol + rtol*|b|`` check.
+
+    Equivalent in semantics to ``torch.testing.assert_close(a, b, atol, rtol)``
+    but streams over a flattened view in row chunks so it never materialises
+    more than one chunk-sized fp32 temporary. Used for the mfma16_2wave_opt1/triton_vk
+    consistency check, where the h / v_new tensors at long context are
+    multi-GiB and the stock ``assert_close`` (which up-casts both whole tensors
+    and builds a full mismatch report) OOMs on a 256 GiB card. On mismatch it
+    reports the worst element's abs error / allowed tol rather than dumping the
+    entire tensor.
+    """
+    assert a.shape == b.shape, f"{msg}: shape {tuple(a.shape)} vs {tuple(b.shape)}"
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    n = af.numel()
+    worst_abs = 0.0
+    worst_allowed = 0.0
+    worst_idx = -1
+    n_bad = 0
+    for s in range(0, n, chunk_rows):
+        e = min(s + chunk_rows, n)
+        ac = af[s:e].float()
+        bc = bf[s:e].float()
+        abs_e = (ac - bc).abs()
+        allowed = atol + rtol * bc.abs()
+        bad = abs_e > allowed
+        nb = int(bad.sum().item())
+        if nb:
+            n_bad += nb
+            # track the single worst (abs - allowed) margin in this chunk
+            margin = abs_e - allowed
+            mi = int(margin.argmax().item())
+            if abs_e[mi].item() - allowed[mi].item() > worst_abs - worst_allowed:
+                worst_abs = abs_e[mi].item()
+                worst_allowed = allowed[mi].item()
+                worst_idx = s + mi
+        del ac, bc, abs_e, allowed, bad
+    assert n_bad == 0, (
+        f"{msg}: {n_bad}/{n} elements exceed atol={atol:g}+rtol={rtol:g}*|b|. "
+        f"Worst @ flat idx {worst_idx}: abs_err={worst_abs:.3e} > "
+        f"allowed={worst_allowed:.3e}."
+    )
 
 
 def _assert_k5_outputs_match_ref(
@@ -575,6 +880,7 @@ def _assert_k5_outputs_match_ref(
     label,
     atol=5e-2,
     rtol=5e-2,
+    mean_atol=5e-3,
 ):
     """Compare a K5 backend's outputs against the PyTorch FP32 reference.
 
@@ -587,28 +893,45 @@ def _assert_k5_outputs_match_ref(
     f32-state is one ``truncf`` on the final_state, which stays well within
     bf16 ULP for sane inputs and never exceeds the historical f32-state
     margins.
+
+    Two complementary bounds are enforced per output:
+      * ``atol`` / ``rtol`` (5e-2): the per-element worst case.
+      * ``mean_atol`` (5e-3): the mean abs error, which catches a regression
+        that shifts the whole distribution before any single element trips
+        the looser element tolerance. Measured mean abs is ~2-3e-3 on the
+        varlen-32k-aws shape, so 5e-3 leaves ~2x headroom over bf16 noise.
     """
+    h_out_f = h_out.float()
+    vn_out_f = _normalize_opt_v_new(vn_out).float()
     torch.testing.assert_close(
-        h_out.float(),
+        h_out_f,
         h_ref.float(),
         atol=atol,
         rtol=rtol,
         msg=f"{label}: h mismatch",
     )
+    _assert_mean_abs_within(h_out_f, h_ref, mean_atol=mean_atol, label=f"{label} h")
     torch.testing.assert_close(
-        _normalize_opt_v_new(vn_out).float(),
+        vn_out_f,
         vn_ref.float(),
         atol=atol,
         rtol=rtol,
         msg=f"{label}: v_new mismatch",
     )
+    _assert_mean_abs_within(
+        vn_out_f, vn_ref, mean_atol=mean_atol, label=f"{label} v_new"
+    )
     if output_final_state:
+        fs_out_f = fs_out.float()
         torch.testing.assert_close(
-            fs_out.float(),
+            fs_out_f,
             fs_ref.float(),
             atol=atol,
             rtol=rtol,
             msg=f"{label}: final_state mismatch",
+        )
+        _assert_mean_abs_within(
+            fs_out_f, fs_ref, mean_atol=mean_atol, label=f"{label} final_state"
         )
     else:
         assert fs_out is None, f"{label}: expected None final_state"
@@ -619,13 +942,16 @@ class TestCorrectness:
     """Correctness against PyTorch FP32 reference for all three K5 backends."""
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_flydsl(self, args: PrefillArgs):
+    def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
+        """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
+        MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
+        path; only the BV==64 configs exercise the kernel, others fall back."""
         context_lens = args.resolve_context_lens()
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k,
             w_c,
             u_c,
@@ -652,1062 +978,140 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=args.output_final_state,
-            label="flydsl",
+            label="flydsl_mfma16_hip",
         )
 
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_triton_vk(self, args: PrefillArgs):
-        """Triton VK K5 (h: [V, K]) -- same input/output layout as FlyDSL."""
-        if args.ssm_state_dtype != torch.float32:
-            pytest.skip("Triton VK reference only supports f32 SSM state.")
-        context_lens = args.resolve_context_lens()
-        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
-            context_lens, args=args
-        )
 
-        h_vk, vn_vk, fs_vk = chunk_gated_delta_rule_fwd_h_opt_vk(
-            k,
-            w_c,
-            u_c,
-            g=g,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
-            k,
-            w_orig,
-            u_orig,
-            g=g,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-        _assert_k5_outputs_match_ref(
-            h_vk,
-            vn_vk,
-            fs_vk,
-            h_ref,
-            vn_ref,
-            fs_ref,
-            output_final_state=args.output_final_state,
-            label="triton_vk",
-        )
-
-    @pytest.mark.skipif(
-        not _HAS_VLLM_K5,
-        reason="vllm.model_executor.layers.fla.ops.chunk_delta_h not importable",
-    )
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_vllm(self, args: PrefillArgs):
-        """vLLM upstream K5 (h: [V, K]) -- same input/output layout as FlyDSL.
-
-        vLLM's ``chunk_gated_delta_rule_fwd_h`` is the FLA upstream port that
-        powers ``vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule``,
-        and shares the ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64``
-        kernel source with aiter's ``opt_vk``. We still cover it explicitly
-        to catch upstream version drift (e.g. signature, scaling factors,
-        or default chunk_size changes that would not show up in the aiter
-        ``opt_vk`` test above).
-        """
-        if args.ssm_state_dtype != torch.float32:
-            pytest.skip("vLLM K5 reference only supports f32 SSM state.")
-        context_lens = args.resolve_context_lens()
-        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
-            context_lens, args=args
-        )
-
-        # vLLM's host wrapper infers ``H = u.shape[-2]`` and ``T = k.shape[1]``
-        # (T-major), so it needs the un-permuted ``w_orig`` / ``u_orig`` of
-        # shape ``[B, T, H, *]``, NOT the H-major ``w_c`` / ``u_c`` that
-        # aiter's ``opt_vk`` consumes. Feeding ``u_c`` would make vLLM think
-        # ``H = T`` and try to allocate ``(B, NT, T, V, K)`` for ``h``
-        # (terabytes for long contexts). vLLM supports GQA natively, so we
-        # also do NOT repeat_interleave ``k``.
-        # vLLM's upstream K5 host wrapper indexes ``g`` as token-major
-        # ``[T_total, H]`` (FLA's original layout). Our test fixture now
-        # produces ``g`` in head-major ``[H, T_total]`` (matching the
-        # aiter / FlyDSL K5 convention), so transpose+contiguous it back
-        # to token-major before launching vLLM.
-        g_token_major = g.transpose(0, 1).contiguous()
-        h_vllm, vn_vllm, fs_vllm = chunk_gated_delta_rule_fwd_h_vllm(
-            k,
-            w_orig,
-            u_orig,
-            g=g_token_major,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
-            k,
-            w_orig,
-            u_orig,
-            g=g,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-        # vLLM's ``v_new = empty_like(u_orig)`` is already T-major [B, T, H, V],
-        # matching ``vn_ref`` directly -- we must NOT route through
-        # ``_assert_k5_outputs_match_ref`` because that helper calls
-        # ``_normalize_opt_v_new`` (permute 0,2,1,3) on the assumption that the
-        # K5 returned ``v_new`` in head-major [B, H, T, V] layout (aiter's
-        # convention). ``h`` and ``final_state`` follow the same vk layout as
-        # the aiter ``opt_vk`` path, so we compare them directly.
-        atol, rtol = 5e-2, 5e-2
-        torch.testing.assert_close(
-            h_vllm.float(),
-            h_ref.float(),
-            atol=atol,
-            rtol=rtol,
-            msg="vllm: h mismatch",
-        )
-        torch.testing.assert_close(
-            vn_vllm.float(),
-            vn_ref.float(),
-            atol=atol,
-            rtol=rtol,
-            msg="vllm: v_new mismatch",
-        )
-        if args.output_final_state:
-            torch.testing.assert_close(
-                fs_vllm.float(),
-                fs_ref.float(),
-                atol=atol,
-                rtol=rtol,
-                msg="vllm: final_state mismatch",
-            )
-        else:
-            assert fs_vllm is None, "vllm: expected None final_state"
-
-    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_triton_origin_opt(self, args: PrefillArgs):
-        """triton_origin_opt K5: standalone fwd_h (BV=16 + exp2) variant.
-
-        Same kernel as triton_origin but with BV=16 + USE_EXP2 (the
-        ``new pipeline`` config from ``0423_gdr_prefill_bench_standalone.py``).
-        Unlike triton_origin this K5 supports GQA natively (the kernel
-        takes ``Hg`` as a constexpr), so the GQA expand step is skipped.
-        """
-        if args.ssm_state_dtype != torch.float32:
-            pytest.skip("triton_origin_opt reference only supports f32 SSM state.")
-        context_lens = args.resolve_context_lens()
-        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
-            context_lens, args=args
-        )
-
-        # GQA-aware K5: no repeat_interleave needed. Hidden state in [K,V]
-        # layout (same as triton_origin), so use h0 transposed from the
-        # VK reference layout.
-        h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
-
-        h_origin_opt, vn_origin_opt, fs_origin_opt = (
-            chunk_gated_delta_rule_fwd_h_origin_opt(
-                k,
-                w_orig,
-                u_orig,
-                g=g,
-                initial_state=h0_kv,
-                output_final_state=args.output_final_state,
-                cu_seqlens=cu,
-            )
-        )
-        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
-            k,
-            w_orig,
-            u_orig,
-            g=g,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-        h_origin_opt_vk = h_origin_opt.transpose(-2, -1).contiguous()
-        fs_origin_opt_vk = (
-            fs_origin_opt.transpose(-2, -1).contiguous()
-            if fs_origin_opt is not None
-            else None
-        )
-
-        atol, rtol = 5e-2, 5e-2
-        torch.testing.assert_close(
-            h_origin_opt_vk.float(),
-            h_ref.float(),
-            atol=atol,
-            rtol=rtol,
-            msg="triton_origin_opt: h mismatch",
-        )
-        torch.testing.assert_close(
-            vn_origin_opt.float(),
-            vn_ref.float(),
-            atol=atol,
-            rtol=rtol,
-            msg="triton_origin_opt: v_new mismatch",
-        )
-        if args.output_final_state:
-            torch.testing.assert_close(
-                fs_origin_opt_vk.float(),
-                fs_ref.float(),
-                atol=atol,
-                rtol=rtol,
-                msg="triton_origin_opt: final_state mismatch",
-            )
-
+# -- Performance benchmark (flydsl-hip vs hip vs triton) -----------------
 
 _perf_results: list[dict] = []
 
 
 def _run_perf_comparison(args: PrefillArgs):
-    """Per-shape K5 perf body used by ``TestPerformance``.
-
-    Bench 4 backends (FlyDSL, Triton opt_vk, Triton origin_opt, vLLM)
-    under identical inputs and append a row to ``_perf_results``. The
-    summary table is printed once at session teardown by
-    ``_print_summary_table``.
-    """
+    """Bench the same shape on flydsl-hip / hip(C++) / triton(opt_vk) and record
+    a row into ``_perf_results``; the session-scoped ``_print_summary_table``
+    fixture prints an aligned table after all tests finish. hip/triton are
+    mainline backends used only as references; hip is skipped for shapes it does
+    not support (needs K=V=128, bf16, chunk_size=64)."""
     context_lens = args.resolve_context_lens()
     k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
-    total_tokens = sum(context_lens)
+    ofs = args.output_final_state
+    total_tokens = int(cu[-1].item())
 
-    # Triton K5 host wrappers only accept f32 ``initial_state`` and always
-    # produce an f32 ``final_state``. When FlyDSL is benched with a bf16
-    # SSM state, we still want a Triton baseline for comparison, so we
-    # promote h0 to f32 once (outside the timed window) and feed it to
-    # the Triton closures. The resulting "Triton(f32) vs FlyDSL(bf16)"
-    # row answers the practical question "how much does enabling
-    # bf16-state win against the existing Triton baseline?".
-    h0_triton_vk = h0.float() if (h0 is not None and h0.dtype != torch.float32) else h0
-
-    # triton_origin_opt uses a [K, V] hidden-state layout, so its h0
-    # is the VK reference h0 transposed on the last two dims.
-    h0_origin_kv = (
-        h0_triton_vk.transpose(-2, -1).contiguous()
-        if h0_triton_vk is not None
-        else None
+    us_fly = _bench_fn(
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        k,
+        w_c,
+        u_c,
+        g=g,
+        initial_state=h0,
+        output_final_state=ofs,
+        cu_seqlens=cu,
     )
-
-    # K5 launch closures: each invokes the K5 host wrapper of its backend.
-    def flydsl_launch():
-        chunk_gated_delta_rule_fwd_h_flydsl(
-            k=k,
-            w=w_c,
-            u=u_c,
+    us_tri = _bench_fn(
+        chunk_gated_delta_rule_fwd_h_opt_vk,
+        k,
+        w_c,
+        u_c,
+        g=g,
+        initial_state=h0,
+        output_final_state=ofs,
+        cu_seqlens=cu,
+    )
+    if _HAS_HIP_K5 and _hip_k5_supported(args):
+        us_hip = _bench_fn(
+            chunk_gated_delta_rule_fwd_h_hip_k5,
+            k,
+            w_c,
+            u_c,
             g=g,
             initial_state=h0,
-            output_final_state=args.output_final_state,
+            output_final_state=ofs,
             cu_seqlens=cu,
         )
-
-    def triton_vk_launch():
-        chunk_gated_delta_rule_fwd_h_opt_vk(
-            k=k,
-            w=w_c,
-            u=u_c,
-            g=g,
-            initial_state=h0_triton_vk,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-    # vLLM upstream K5 (chunk_delta_h.chunk_gated_delta_rule_fwd_h). Uses
-    # the same vk hidden-state layout and same final_state dtype as the
-    # aiter ``opt_vk`` wrapper, but unlike ``opt_vk`` its host wrapper
-    # infers ``H = u.shape[-2]`` (T-major), so it requires the un-permuted
-    # ``w_orig`` / ``u_orig`` -- feeding the H-major ``w_c`` / ``u_c``
-    # would make vLLM compute ``H = T`` and try to allocate a
-    # terabyte-sized ``h``. vLLM supports GQA natively, so ``k`` is also
-    # passed un-expanded. We still feed the same h0_triton_vk (fp32) as
-    # ``triton_vk_launch`` because vk hidden-state layout is identical.
-    def vllm_launch():
-        chunk_gated_delta_rule_fwd_h_vllm(
-            k=k,
-            w=w_orig,
-            u=u_orig,
-            g=g,
-            initial_state=h0_triton_vk,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-    def triton_origin_opt_launch():
-        # GQA-aware (uses unexpanded k) BV=16 + exp2 variant of fwd_h
-        # from the standalone bench's new pipeline. Hidden state in
-        # [K,V] layout, so it needs h0_origin_kv (h0 transposed from
-        # the VK reference layout).
-        chunk_gated_delta_rule_fwd_h_origin_opt(
-            k=k,
-            w=w_orig,
-            u=u_orig,
-            g=g,
-            initial_state=h0_origin_kv,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-    # Warmup FlyDSL once so its internal BV-autotune sweep does not
-    # leak into the timed window. Triton's own ``triton.autotune`` is
-    # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude, except
-    # for vLLM upstream's K5 -- its first call also runs a BV/warps/
-    # stages sweep and the 5-iter prelude is not always enough to
-    # converge the autotuner on long-T shapes. Pre-warm it once here
-    # for parity with FlyDSL so that ``us_vllm`` reflects steady-state
-    # kernel time, not the autotune sweep.
-    flydsl_launch()
-    if _HAS_VLLM_K5:
-        vllm_launch()
-    torch.cuda.synchronize()
-
-    us_fly = _bench_fn(flydsl_launch)
-    us_triton_vk = _bench_fn(triton_vk_launch)
-    us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
-    us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
-
-    fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
-    fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
-    fly_vs_vllm = (
-        us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
-    )
-
-    # bench333 cases carry trace-derived structural features (head/mid/
-    # tail seqlen, log_count); compute these once so the summary table
-    # can display them in a bench333-specific sub-table. Non-bench333
-    # rows leave these fields at their defaults (None / 0).
-    head_seqlen = mid_seqlen = tail_seqlen = 0
-    log_count = 0
-    if args.context_lens is not None and args.model_name == "prefill-bench333":
-        lens = list(args.context_lens)
-        if len(lens) == 1:
-            head_seqlen, tail_seqlen = int(lens[0]), 0
-        elif len(lens) == 2:
-            head_seqlen, tail_seqlen = int(lens[0]), int(lens[1])
-        elif len(lens) >= 3:
-            mids = lens[1:-1]
-            head_seqlen = int(lens[0])
-            tail_seqlen = int(lens[-1])
-            mid_seqlen = int(mids[0]) if all(m == mids[0] for m in mids) else 0
-        # trace_tag is set to "cnt{log_count}" by _build_bench407_params.
-        if args.trace_tag.startswith("cnt"):
-            try:
-                log_count = int(args.trace_tag[3:])
-            except ValueError:
-                log_count = 0
-
-    # For bench333 trace shapes the model name is the same string for
-    # all 333 rows ("prefill-bench333") which is useless in the per-row
-    # summary table. Use the trailing "T{T}_n{N}_cnt{log_count}" suffix
-    # of the pytest id instead, so each row's Model cell uniquely
-    # identifies the case.
-    if args.model_name == "prefill-bench333" and args.context_lens is not None:
-        n_seqs = len(args.context_lens)
-        T_total = sum(args.context_lens)
-        model_label = f"T{T_total}_n{n_seqs}_{args.trace_tag}"
     else:
-        model_label = args.model_name or "-"
+        us_hip = float("nan")
 
+    has_hip = us_hip == us_hip  # not NaN
     _perf_results.append(
         {
-            "Model": model_label,
+            "Model": args.model_name or "-",
             "TP": args.tp,
-            "K": args.K,
-            "V": args.V,
             "Hg": args.Hg,
             "H": args.H,
             "SeqLen": args.full_prompt_len,
             "T": total_tokens,
             "varlen": args.is_varlen,
-            "final_st": args.output_final_state,
-            "state": "bf16" if args.ssm_state_dtype == torch.bfloat16 else "fp32",
-            # bench333-only fields (0 for main-table rows)
-            "T_prefill": total_tokens if args.model_name == "prefill-bench333" else 0,
-            "num_seqs_prefill": (
-                len(args.context_lens)
-                if args.context_lens is not None
-                and args.model_name == "prefill-bench333"
-                else 0
-            ),
-            "head_seqlen": head_seqlen,
-            "mid_seqlen": mid_seqlen,
-            "tail_seqlen": tail_seqlen,
-            "log_count": log_count,
-            # Perf columns (same for all rows)
-            "FlyDSL_vk(us)": us_fly,
-            "Triton_vk(us)": us_triton_vk,
-            "Triton_origin_opt(us)": us_triton_origin_opt,
-            "vLLM_vk(us)": us_vllm,
-            "flydsl_vs_vk": fly_vs_vk,
-            "flydsl_vs_origin_opt": fly_vs_origin_opt,
-            "flydsl_vs_vllm": fly_vs_vllm,
+            "final_st": ofs,
+            "fly_hip": us_fly,
+            "HIP": us_hip,
+            "Triton": us_tri,
+            # speedup vs hip (hip is the baseline): >1 faster than hip, <1 slower.
+            "fly/hip": (us_hip / us_fly) if has_hip else float("nan"),
+            "tri/hip": (us_hip / us_tri) if has_hip else float("nan"),
         }
     )
-
-
-class TestPerformance:
-    """Kernel-only performance comparison: FlyDSL vs Triton opt_vk vs Triton opt3_kv."""
-
-    @pytest.mark.parametrize("args", PERF_PARAMS, ids=PERF_TEST_IDS)
-    def test_perf_comparison(self, args: PrefillArgs):
-        _run_perf_comparison(args)
 
 
 def _print_perf_table():
     if not _perf_results:
         return
-
-    # Two column layouts:
-    #   - main_cols  : for hand-written PrefillGroup shapes (Qwen3.5-35B
-    #                  / 397B / varlen-fs / bench333-varlen) showing
-    #                  SeqLen + T + varlen + final_st.
-    #   - bench_cols : for bench333 trace-derived shapes showing
-    #                  T_prefill + num_seqs_prefill + head/mid/tail
-    #                  + log_count instead. SeqLen / T are redundant
-    #                  here because T_prefill carries the same info.
-    perf_tail_cols = [
-        ("FlyDSL", "FlyDSL_vk(us)", 8),
-        ("Tri_vk", "Triton_vk(us)", 8),
-        ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
-        ("vLLM", "vLLM_vk(us)", 8),
-        ("fly/vk", "flydsl_vs_vk", 7),
-        ("fly/o_opt", "flydsl_vs_origin_opt", 9),
-        ("fly/vllm", "flydsl_vs_vllm", 8),
+    _model_w = max([len("Model")] + [len(str(r["Model"])) for r in _perf_results])
+    # (header_display, row_key, width): header uses the 1st, cell lookup the 2nd.
+    cols = [
+        ("Model", "Model", _model_w),
+        ("TP", "TP", 2),
+        ("Hg", "Hg", 2),
+        ("H", "H", 2),
+        ("SeqLen", "SeqLen", 6),
+        ("T", "T", 6),
+        ("varlen", "varlen", 6),
+        ("final_st", "final_st", 8),
+        ("FlyDSL_hip(us)", "fly_hip", 14),
+        ("HIP(us)", "HIP", 8),
+        ("Triton(us)", "Triton", 10),
+        ("fly/hip", "fly/hip", 7),
+        ("tri/hip", "tri/hip", 7),
     ]
-    main_cols = [
-        ("Model", "Model", 16),
-        ("TP", "TP", 3),
-        ("Hg", "Hg", 3),
-        ("H", "H", 3),
-        ("SeqLen", "SeqLen", 7),
-        ("T", "T", 7),
-        ("var", "varlen", 3),
-        ("fs", "final_st", 3),
-    ] + perf_tail_cols
-    bench_cols = [
-        ("Model", "Model", 22),
-        ("TP", "TP", 3),
-        ("Hg", "Hg", 3),
-        ("H", "H", 3),
-        ("T_prefill", "T_prefill", 9),
-        ("n_pref", "num_seqs_prefill", 6),
-        ("head", "head_seqlen", 6),
-        ("mid", "mid_seqlen", 6),
-        ("tail", "tail_seqlen", 6),
-        ("log_cnt", "log_count", 7),
-    ] + perf_tail_cols
 
-    def _build_header_sep(cols):
-        header = " | ".join(display.rjust(width) for display, _, width in cols)
-        sep = "-+-".join("-" * width for _, _, width in cols)
-        return header, sep
+    def _fmt_cell(val, key, width):
+        if isinstance(val, bool):
+            return ("Y" if val else "N").rjust(width)
+        if isinstance(val, float):
+            if val != val:  # NaN (hip skipped for unsupported shapes)
+                return "-".rjust(width)
+            return (f"{val:.2f}x" if "/" in key else f"{val:.1f}").rjust(width)
+        return str(val).rjust(width)
 
-    def _fmt_row(row, cols):
-        cells = []
-        for display, key, width in cols:
-            val = row[key]
-            if isinstance(val, bool):
-                cells.append(("Y" if val else "N").rjust(width))
-            elif isinstance(val, float):
-                if val != val:  # NaN (e.g. vLLM column when vllm not installed)
-                    cells.append("-".rjust(width))
-                elif "_vs_" in key:
-                    cells.append(f"{val:.2f}x".rjust(width))
-                else:
-                    cells.append(f"{val:.1f}".rjust(width))
-            else:
-                cells.append(str(val).rjust(width))
-        return " | ".join(cells)
-
-    main_header, main_sep = _build_header_sep(main_cols)
-    bench_header, bench_sep = _build_header_sep(bench_cols)
-    border = "=" * max(len(main_header), len(bench_header))
-
-    # Bucket rows by SSM-state dtype and by main-vs-bench333. Keep each
-    # bucket's order consistent with ``_perf_results`` insertion so rows
-    # line up with the parametrize id order. bench333 trace rows are
-    # tagged by ``log_count > 0`` (main groups all leave log_count at 0).
-    def _split(rows):
-        main = [r for r in rows if r.get("log_count", 0) == 0]
-        bench = [r for r in rows if r.get("log_count", 0) > 0]
-        return main, bench
-
-    rows_fp32_main, rows_fp32_bench = _split(
-        [r for r in _perf_results if r["state"] == "fp32"]
-    )
-    rows_bf16_main, rows_bf16_bench = _split(
-        [r for r in _perf_results if r["state"] == "bf16"]
-    )
-
-    lines = ["", border]
-    lines.append(
-        "K5 Prefill Performance Summary "
-        "(K5 device kernel time only, via torch.profiler)"
-    )
-    lines.append(
-        "  Triton K5 references always use fp32 SSM state; only FlyDSL's "
-        "SSM-state dtype changes between the sub-tables below."
-    )
-    lines.append(border)
-
-    def _emit_subtable(title, rows, cols, header, sep):
-        if not rows:
-            return
-        lines.append("")
-        lines.append(title)
-        lines.append(sep)
-        lines.append(header)
-        lines.append(sep)
-        for row in rows:
-            lines.append(_fmt_row(row, cols))
-        lines.append(sep)
-
-    _emit_subtable(
-        "[FlyDSL SSM state = fp32] -- main groups",
-        rows_fp32_main,
-        main_cols,
-        main_header,
-        main_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = fp32] -- bench333 trace shapes",
-        rows_fp32_bench,
-        bench_cols,
-        bench_header,
-        bench_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = bf16] -- main groups",
-        rows_bf16_main,
-        main_cols,
-        main_header,
-        main_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = bf16] -- bench333 trace shapes",
-        rows_bf16_bench,
-        bench_cols,
-        bench_header,
-        bench_sep,
-    )
+    header = "|".join(disp.rjust(w) for disp, _, w in cols)
+    sep = "+".join("-" * w for _, _, w in cols)
+    border = "=" * len(header)
+    lines = [
+        "",
+        border,
+        "K5 Prefill Perf Summary (mfma16_hip vs hip vs triton; K5 device kernel us via "
+        "torch.profiler; fly/hip & tri/hip = speedup vs hip, >1 faster / <1 slower)",
+        border,
+        "",
+        sep,
+        header,
+        sep,
+    ]
+    for row in _perf_results:
+        lines.append("|".join(_fmt_cell(row[k], k, w) for _, k, w in cols))
+    lines.append(sep)
     lines.append("")
     print("\n".join(lines))
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _print_summary_table(request):
-    """Print the summary performance table after all tests finish."""
+    """Print the perf summary table after all tests in the session finish."""
     yield
     _print_perf_table()
 
 
-# -- bf16 SSM-state correctness ----------------------------------------
-
-
-class TestStateDtypeBF16:
-    """Validate that ``state_dtype=bfloat16`` matches the ``float32`` path.
-
-    The bf16-state kernel keeps the f32 accumulator unchanged and only
-    rounds h0 (extf) and final_state (truncf) at the HBM boundary, so its
-    output should agree with the f32-state kernel up to one bf16 trunc
-    error on the SSM state plus accumulated round-off through the chunk
-    loop. We compare against the *flydsl f32-state* path on the exact same
-    shape rather than the PyTorch reference, which gives the tightest
-    regression signal for this specific feature.
-    """
-
-    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
-    def test_state_bf16_matches_state_f32(self, args: PrefillArgs):
-        context_lens = args.resolve_context_lens()
-        k, _, _, w_c, u_c, g, h0_f32, cu, _ = _make_inputs(context_lens, args=args)
-        h0_bf16 = h0_f32.to(torch.bfloat16)
-
-        h_f32, vn_f32, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
-            k,
-            w_c,
-            u_c,
-            g=g,
-            initial_state=h0_f32,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-        h_bf16, vn_bf16, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
-            k,
-            w_c,
-            u_c,
-            g=g,
-            initial_state=h0_bf16,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-
-        # final_state dtype must follow the input dtype.
-        if args.output_final_state:
-            assert (
-                fs_f32 is not None and fs_f32.dtype == torch.float32
-            ), f"f32 path produced {fs_f32.dtype} final_state"
-            assert (
-                fs_bf16 is not None and fs_bf16.dtype == torch.bfloat16
-            ), f"bf16 path produced {fs_bf16.dtype} final_state"
-        else:
-            assert fs_f32 is None and fs_bf16 is None
-
-        # h and v_new are bf16 in both paths (decoupled from state dtype).
-        assert h_f32.dtype == h_bf16.dtype == k.dtype
-        if vn_f32 is not None:
-            assert vn_f32.dtype == vn_bf16.dtype == u_c.dtype
-
-        # The two paths diverge only by the rounding applied to h0/ht. With
-        # f32 accumulation this stays well within bf16 ULP * (1 + chunk
-        # length) for sane inputs.
-        atol = 5e-2
-        rtol = 5e-2
-        torch.testing.assert_close(
-            h_bf16.float(),
-            h_f32.float(),
-            atol=atol,
-            rtol=rtol,
-            msg="bf16-state vs f32-state: h mismatch",
-        )
-        if vn_f32 is not None:
-            torch.testing.assert_close(
-                vn_bf16.float(),
-                vn_f32.float(),
-                atol=atol,
-                rtol=rtol,
-                msg="bf16-state vs f32-state: v_new mismatch",
-            )
-        if args.output_final_state:
-            torch.testing.assert_close(
-                fs_bf16.float(),
-                fs_f32.float(),
-                atol=atol,
-                rtol=rtol,
-                msg="bf16-state vs f32-state: final_state mismatch",
-            )
-
-    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
-    def test_state_dtype_kwarg_no_initial_state(self, args: PrefillArgs):
-        """``state_dtype`` kwarg controls final_state dtype when h0 is None."""
-        if not args.output_final_state:
-            pytest.skip("kwarg only meaningful when final_state is requested")
-        context_lens = args.resolve_context_lens()
-        k, _, _, w_c, u_c, g, _, cu, _ = _make_inputs(
-            context_lens, args=args, with_initial_state=False
-        )
-
-        _, _, fs_f32 = chunk_gated_delta_rule_fwd_h_flydsl(
-            k,
-            w_c,
-            u_c,
-            g=g,
-            initial_state=None,
-            output_final_state=True,
-            cu_seqlens=cu,
-            # default -> f32
-        )
-        assert fs_f32 is not None and fs_f32.dtype == torch.float32
-
-        _, _, fs_bf16 = chunk_gated_delta_rule_fwd_h_flydsl(
-            k,
-            w_c,
-            u_c,
-            g=g,
-            initial_state=None,
-            output_final_state=True,
-            cu_seqlens=cu,
-            state_dtype=torch.bfloat16,
-        )
-        assert fs_bf16 is not None and fs_bf16.dtype == torch.bfloat16
-
-    def test_state_dtype_conflict_raises(self):
-        """Mismatched ``state_dtype`` and ``initial_state.dtype`` must raise."""
-        args = STATE_BF16_PARAMS[0]
-        context_lens = args.resolve_context_lens()
-        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
-        with pytest.raises(ValueError):
-            chunk_gated_delta_rule_fwd_h_flydsl(
-                k,
-                w_c,
-                u_c,
-                g=g,
-                initial_state=h0,  # f32
-                output_final_state=args.output_final_state,
-                cu_seqlens=cu,
-                state_dtype=torch.bfloat16,  # conflict
-            )
-
-    def test_state_dtype_unsupported_raises(self):
-        """Unsupported state dtypes must raise (e.g. fp16)."""
-        args = STATE_BF16_PARAMS[0]
-        context_lens = args.resolve_context_lens()
-        k, _, _, w_c, u_c, g, _, cu, _ = _make_inputs(
-            context_lens, args=args, with_initial_state=False
-        )
-        with pytest.raises(ValueError):
-            chunk_gated_delta_rule_fwd_h_flydsl(
-                k,
-                w_c,
-                u_c,
-                g=g,
-                initial_state=None,
-                output_final_state=True,
-                cu_seqlens=cu,
-                state_dtype=torch.float16,
-            )
-
-
-# -- triton_origin_opt: BV=16 + exp2 variant of fwd_h --------------------
-#
-# Inlined from the (now-deleted) standalone benchmark script
-# ``0423_gdr_prefill_bench_standalone.py``. Launches the same recurrence
-# kernel as the existing ``chunk_gated_delta_rule_fwd_h`` (``triton_origin``
-# in this file), but with two changes that the standalone bench's new
-# pipeline applies on top of the original RTP config:
-#
-#   - BV = 16 (was 32): smaller V-tile -> more (V/BV) blocks per (B*H)
-#     program-id pair -> better occupancy on MI355X.
-#   - USE_EXP2 = True (was False): emits a single ``v_exp_f32`` per
-#     gate evaluation instead of the ``v_log + v_mul + v_exp`` chain that
-#     ``tl.exp`` lowers to.
-#
-# Because USE_EXP2 expects gates pre-scaled by ``1/ln(2)``, the wrapper
-# multiplies the supplied ``g`` (already a per-chunk cumsum, as produced
-# by ``_make_inputs``) by RCP_LN2 before launching. That scale step is
-# excluded from the K5 kernel time -- we time only the kernel itself, in
-# line with how the other K5 wrappers in this file are benchmarked.
-#
-# The kernel itself is wrapped in a ``triton.autotune`` sweep over
-# (BV, num_warps, num_stages); the standalone version pinned BV=16
-# only, but exposing the sweep here matches what aiter's own
-# ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` does internally
-# and lets each shape pick its own best config on first run.
-
-_RCP_LN2 = 1.0 / 0.6931471805599453
-
-_exp = tl.exp
-_exp2 = tl.math.exp2
-
-
-# Decorator stack mirrors FLA's K5 kernels (Heuristics outer, Autotune
-# inner) so that Triton 3.x writes the sweep result to its persistent
-# autotune cache (`~/.triton/autotune`) via ``cache_results=True``. After
-# the first run each (H, K, V, BT, IS_VARLEN) key is served from disk and
-# subsequent runs no longer launch the full BV/warps/stages sweep -- the
-# rocprof kernel-stats CSV then reports the same ~56 calls as the other
-# K5 kernels, instead of the 9000+ that an un-cached sweep produces.
-#
-# ``Hg`` is intentionally excluded from ``key``: it only affects host-side
-# address arithmetic (``H // Hg`` divisor for the K block-ptr), not the
-# compiled binary or tile shape, so adding it would just multiply the
-# number of unique keys and force redundant sweeps.
-@triton.heuristics(
-    {
-        "USE_G": lambda args: args["g"] is not None,
-        "USE_GK": lambda args: args["gk"] is not None,
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-        "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in (16, 32, 64)
-        for num_warps in (2, 4)
-        for num_stages in (2, 3)
-    ],
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
-    cache_results=True,
-)
-@triton.jit(do_not_specialize=["T"])
-def chunk_gated_delta_rule_fwd_kernel_h_origin_opt(
-    k,
-    v,
-    w,
-    v_new,
-    g,
-    gk,
-    h,
-    h0,
-    ht,
-    cu_seqlens,
-    chunk_offsets,
-    T,
-    H: tl.constexpr,
-    Hg: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    SAVE_NEW_VALUE: tl.constexpr,
-    USE_EXP2: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_h = i_nh // H, i_nh % H
-    if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
-        T = eos - bos
-        NT = tl.cdiv(T, BT)
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        NT = tl.cdiv(T, BT)
-        boh = i_n * NT
-
-    b_h1 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 64:
-        b_h2 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 128:
-        b_h3 = tl.zeros([64, BV], dtype=tl.float32)
-    if K > 192:
-        b_h4 = tl.zeros([64, BV], dtype=tl.float32)
-
-    h += ((boh * H + i_h) * K * V).to(tl.int64)
-    v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
-    w += ((bos * H + i_h) * K).to(tl.int64)
-    if SAVE_NEW_VALUE:
-        v_new += ((bos * H + i_h) * V).to(tl.int64)
-    stride_v = H * V
-    stride_h = H * K * V
-    stride_k = Hg * K
-    stride_w = H * K
-    if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K * V
-    if STORE_FINAL_STATE:
-        ht = ht + i_nh * K * V
-
-    if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-        if K > 64:
-            p_h0_2 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-        if K > 128:
-            p_h0_3 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
-        if K > 192:
-            p_h0_4 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
-
-    for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
-
-        p_w = tl.make_block_ptr(
-            w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
-        )
-        b_w = tl.load(p_w, boundary_check=(0, 1))
-        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
-        if K > 64:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (stride_w, 1), (i_t * BT, 64), (BT, 64), (1, 0)
-            )
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
-        if K > 128:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (stride_w, 1), (i_t * BT, 128), (BT, 64), (1, 0)
-            )
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
-        if K > 192:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (stride_w, 1), (i_t * BT, 192), (BT, 64), (1, 0)
-            )
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
-        p_v = tl.make_block_ptr(
-            v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
-
-        if SAVE_NEW_VALUE:
-            p_v2 = tl.make_block_ptr(
-                v_new, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-            )
-            tl.store(p_v2, b_v.to(p_v2.dtype.element_ty), boundary_check=(0, 1))
-
-        last_idx = min((i_t + 1) * BT, T) - 1
-        if USE_G:
-            m_t = (i_t * BT + tl.arange(0, BT)) < T
-            b_g_last = tl.load(g + (bos * H + last_idx * H + i_h).to(tl.int64)).to(
-                tl.float32
-            )
-            p_g = tl.make_block_ptr(
-                g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-            )
-            b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
-            if USE_EXP2:
-                b_v = b_v * tl.where(m_t, _exp2(b_g_last - b_g), 0)[:, None]
-                b_g_last = _exp2(b_g_last)
-            else:
-                b_v = b_v * tl.where(m_t, _exp(b_g_last - b_g), 0)[:, None]
-                b_g_last = _exp(b_g_last)
-            b_h1 = b_h1 * b_g_last
-            if K > 64:
-                b_h2 = b_h2 * b_g_last
-            if K > 128:
-                b_h3 = b_h3 * b_g_last
-            if K > 192:
-                b_h4 = b_h4 * b_g_last
-
-        b_v = b_v.to(k.dtype.element_ty)
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.dot(b_k, b_v)
-        if K > 64:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h2 += tl.dot(b_k, b_v)
-        if K > 128:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h3 += tl.dot(b_k, b_v)
-        if K > 192:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h4 += tl.dot(b_k, b_v)
-
-    if STORE_FINAL_STATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-
-
-_TRITON_ORIGIN_OPT_KERNEL = chunk_gated_delta_rule_fwd_kernel_h_origin_opt
-
-
-def chunk_gated_delta_rule_fwd_h_origin_opt(
-    k,
-    w,
-    u,
-    g=None,
-    initial_state=None,
-    output_final_state=False,
-    cu_seqlens=None,
-):
-    """``triton_origin_opt`` K5: USE_EXP2 + autotuned BV/warps/stages variant.
-
-    Mirrors the standalone bench's ``fwd_h`` host wrapper but adds a
-    Triton autotune sweep over ``BV ? {16, 32, 64}``, ``num_warps ?
-    {2, 4}``, ``num_stages ? {1, 2, 3}``. Keyed on ``(H, Hg, K, V, BT,
-    IS_VARLEN)`` so each shape picks its own best config on first run.
-
-    Inputs use the GQA layout from PREFILL_PARAMS unchanged -- since this
-    K5 kernel accepts ``Hg`` directly, no ``repeat_interleave`` is needed
-    (unlike the original ``chunk_gated_delta_rule_fwd_h``, which is
-    MHA-only).
-
-    NOTE: The RCP_LN2 scale required by USE_EXP2=True is applied here so
-    that callers can pass the same per-chunk-cumsum ``g`` as the other
-    K5 wrappers. This scale is a cheap elementwise multiply and is
-    excluded from the kernel-time measurement when ``_bench_fn`` profiles
-    only the kernel launch.
-    """
-    import triton as _triton
-
-    B, T, Hg, K = k.shape
-    V = u.shape[-1]
-    H = u.shape[-2]
-    BT = 64
-    if cu_seqlens is None:
-        N, NT, chunk_offsets = B, _triton.cdiv(T, BT), None
-    else:
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
-            prepare_chunk_indices,
-            prepare_chunk_offsets,
-        )
-
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-        N = len(cu_seqlens) - 1
-        NT = len(chunk_indices)
-        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
-
-    h = k.new_empty(B, NT, H, K, V)
-    v_new = torch.empty_like(u)
-    final_state = (
-        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
-    )
-
-    # USE_EXP2=True expects gates pre-scaled by 1/ln(2). Cheap elementwise
-    # op; excluded from kernel time when profiled via torch.profiler.
-    # ``triton_origin_opt`` reads g with token-major offsets
-    # ``(bos*H + row*H + i_h)`` so transpose head-major [H, T_total] back
-    # to token-major [T_total, H] before launch.
-    if g is not None:
-        if g.dim() == 2:
-            g_for_kernel = g.transpose(0, 1).contiguous()  # [T_total, H]
-        else:
-            g_for_kernel = g.transpose(-2, -1).contiguous()
-        g_scaled = g_for_kernel * _RCP_LN2
-    else:
-        g_scaled = None
-
-    def grid(meta):
-        return (_triton.cdiv(V, meta["BV"]), N * H)
-
-    _TRITON_ORIGIN_OPT_KERNEL[grid](
-        k=k,
-        v=u,
-        w=w,
-        v_new=v_new,
-        g=g_scaled,
-        gk=None,
-        h=h,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        USE_EXP2=True,
-    )
-    return h, v_new, final_state
+class TestPerformance:
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_perf_comparison(self, args: PrefillArgs):
+        _run_perf_comparison(args)
