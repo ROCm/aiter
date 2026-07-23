@@ -231,10 +231,19 @@ def sage_quant_mxfp6(
     Returns (q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s). bshd only.
     """
     if q_packer is None or k_packer is None:
-        from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-            quantize_fp6_lastdim_triton,
-            quantize_fp6_k_lds_order_triton,
-        )
+        import os as _os
+        from aiter.ops.triton.quant import mxfp6_fmha_pack as _hp
+
+        # Default to the fused TRITON packers (single in-graph kernels; hide the all-to-all far
+        # better under torch.compile than the many-kernel torch packs). Set AITER_MXFP6_QK_TRITON=0
+        # for the pure-torch (traceable ATen) packers.
+        _use_triton_qk = _os.environ.get("AITER_MXFP6_QK_TRITON", "1") != "0"
+        if _use_triton_qk:
+            _default_q_packer = _hp.quantize_fp6_lastdim_triton
+            _default_k_packer = lambda _k: _hp.quantize_fp6_k_lds_order_triton(_k, tile=128)
+        else:
+            _default_q_packer = _hp.quantize_fp6_lastdim_torch
+            _default_k_packer = lambda _k: _hp.quantize_fp6_k_lds_order_torch(_k, tile=128)
 
     assert layout == "bshd", f"sage_quant_mxfp6 expects bshd, got {layout}"
     b, qo_len, h_qo, head_dim = q.shape
@@ -284,10 +293,8 @@ def sage_quant_mxfp6(
 
     # Q -> base fp6 pack; K -> coalesced LDS-order pack (E8M0 K-scale in the tile tail).
     # Use caller-supplied packers when given (overridable), else the in-tree Triton packers.
-    q_fp6, q_scale = q_packer(q) if q_packer is not None else quantize_fp6_lastdim_triton(q)
-    k_view, k_scale = (
-        k_packer(k) if k_packer is not None else quantize_fp6_k_lds_order_triton(k, tile=128)
-    )
+    q_fp6, q_scale = q_packer(q) if q_packer is not None else _default_q_packer(q)
+    k_view, k_scale = k_packer(k) if k_packer is not None else _default_k_packer(k)
     return q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s
 
 
