@@ -365,13 +365,10 @@ def moe_gemm_a8w4(
         logical_N = unpadded_N
     if unpadded_K and block_m == 16:
         logical_K = unpadded_K
-    # CDNA4 swizzle bakes the scale permutation over PADDED N, so N must stay
-    # physical (unpadded_N desyncs scale addressing → corrupt output); K is
-    # masked, not permuted, so logical_K is address-safe. Non-CDNA4 has no
-    # permutation → both logical.
-    if swizzle_mx_scale == "CDNA4_SCALE":
-        K = logical_K  # N stays physical (padded)
-    else:
+    # CDNA4 scale swizzle is laid out over the padded tensor dimensions. Keep
+    # physical N/K for swizzled scale addressing while still using logical dims
+    # for dispatch lookup below.
+    if swizzle_mx_scale != "CDNA4_SCALE":
         N = logical_N
         K = logical_K
     if use_gluon:
