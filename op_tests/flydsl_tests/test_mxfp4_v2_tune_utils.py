@@ -41,3 +41,36 @@ def test_v2_stage1_sorted_ref_and_compare():
         ref, v["isq"], msg="t", printLog=False, inter_dim=idim, adtype="fp4",
     )
     assert err < 0.1  # cosine 通过 (err = 1 - cos)
+
+
+@pytest.mark.parametrize(
+    ("q_dtype_a", "expected_key"),
+    [
+        (torch.float8_e4m3fn, "a1_qt_fp8_cast"),
+        (torch.float4_e2m1fn_x2, "a1_qt"),
+    ],
+)
+def test_v2_stage1_task_selects_activation_input_by_dtype(q_dtype_a, expected_key):
+    from aiter import ActivationType, QuantType, dtypes
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+    info = (
+        "gfx950",
+        304,
+        4,
+        7168,
+        768,
+        384,
+        6,
+        ActivationType.Silu,
+        dtypes.bf16,
+        q_dtype_a,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        False,
+    )
+    tasks = FmoeTuner.gen_flydsl_v2_2stages_task(None, info, [32])
+    stage1_task = next(task for task in tasks if task[0][1] == "stage1")
+
+    assert stage1_task[4][0][0] == expected_key
