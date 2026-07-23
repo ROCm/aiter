@@ -4455,7 +4455,7 @@ __launch_bounds__(256, 8) __global__
 template <int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
           bool Is2D,
-          typename scalar_t = ck_tile::fp16_t>
+          typename scalar_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                          const int32_t size_s_w,
                                                          const int32_t size_b,
@@ -7237,7 +7237,7 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // implementation. ds_swizzle and DPP latencies are symmetric, so reversing the
 // order vs the natural DPP-first form is a free constraint that buys us
 // bitwise-identical output to the prior bpermute-based reduce.
-// All lanes hold the full sum on return — XOR butterfly is symmetric, so no
+// All lanes hold the full sum on return -- XOR butterfly is symmetric, so no
 // follow-up broadcast is needed.
 //
 // Body is wrapped in #ifdef __HIP_DEVICE_COMPILE__ to match the rest of this
@@ -7246,7 +7246,7 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // and break any TU that includes rope_common.h without otherwise pulling in
 // opus.hpp (e.g. csrc/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu).
 // In the host pass the body is empty and the function returns `val`
-// unchanged — fine because these helpers are __device__-only.
+// unchanged -- fine because these helpers are __device__-only.
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
@@ -7398,7 +7398,7 @@ struct alignas(sizeof(T) * vec_size) vec_t
             }
             else
             {
-                data[i] = ck_tile::type_convert<T>(ck_tile::type_convert<float>(src[i]) / scale);
+                data[i] = static_cast<T>(static_cast<float>(src[i]) / scale);
             }
         }
     }
@@ -7428,12 +7428,12 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
 // Unlike warp_reduce_sum / half_warp_reduce_sum where opus::* only appears in
 // the body (and so can be hidden with #ifdef __HIP_DEVICE_COMPILE__ to keep
 // the host pass building), here opus::number<XorOffset> is a default
-// argument in the SIGNATURE — the signature is parsed in both passes, so
+// argument in the SIGNATURE -- the signature is parsed in both passes, so
 // it cannot be #ifdef'd. We use std::integral_constant<int, XorOffset>
 // instead (which doesn't need opus.hpp). Existing callers passing
 // opus::number<X>{} continue to work because opus::number<I> is publicly
 // derived from std::integral_constant<index_t, I> (csrc/include/opus/opus.hpp:57)
-// — pass-by-value slicing of the empty derived type to its empty base is a no-op.
+// -- pass-by-value slicing of the empty derived type to its empty base is a no-op.
 template <typename T, int vec_size, int XorOffset>
 __inline__ __device__ vec_t<T, vec_size>
 warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
@@ -7474,7 +7474,7 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 //
 // Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
 //   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
-// This is the standard RNE bias trick — adds 0x7FFF for normal rounding, plus the
+// This is the standard RNE bias trick -- adds 0x7FFF for normal rounding, plus the
 // 17-bit ("round") position to break ties to even.
 //
 // NaN handling differs from the ctor: the ctor preserves the NaN payload upper
@@ -7488,11 +7488,11 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 // mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
 // expansions, each of which serializes the warp via s_and_saveexec / s_xor /
 // s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
-// v_cvt_pk_bf16_f32 — not implemented here yet.
+// v_cvt_pk_bf16_f32 -- not implemented here yet.
 __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 {
     constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias
-    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN → BF16 0x7fff
+    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN -> BF16 0x7fff
     constexpr uint32_t MERGE_MASK = 0xffff0000u; // upper-half mask for and_or merge
     uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
     uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
@@ -7550,7 +7550,7 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 // scalar static_cast for other element types. N must be even.
 //
 // The bf16 path saves ~50% of the conversion cost relative to the default
-// per-element static_cast<bf16>(float) — see the comment on
+// per-element static_cast<bf16>(float) -- see the comment on
 // f32x2_to_bf16x2_rne above.
 template <typename T, int N>
 __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float (&src)[N])
@@ -7591,7 +7591,7 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
         float v = (float)input[i];
         acc += v * v;
     }
-    // XOR butterfly leaves the same sum in every lane — no extra broadcast needed.
+    // XOR butterfly leaves the same sum in every lane -- no extra broadcast needed.
     acc        = block_utils::warp_reduce_sum<float>(acc);
     auto s_val = rsqrtf(acc / rms_dim + rms_eps);
 #pragma unroll

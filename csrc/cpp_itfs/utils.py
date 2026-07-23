@@ -39,13 +39,25 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
-DEFAULT_GPU_ARCH = (
-    subprocess.run(
-        "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
+
+
+def get_amdgpu_arch():
+    """Find amdgpu-arch and return the detected GPU architecture."""
+    result = subprocess.run(
+        "which amdgpu-arch", shell=True, capture_output=True, text=True
     )
-    .stdout.strip()
-    .split("\n")[0]
-)
+    amdgpu_arch_path = (
+        result.stdout.strip()
+        if result.returncode == 0
+        else "/opt/rocm/llvm/bin/amdgpu-arch"
+    )
+    result = subprocess.run(
+        amdgpu_arch_path, shell=True, capture_output=True, text=True
+    )
+    return result.stdout.strip().split("\n")[0]
+
+
+DEFAULT_GPU_ARCH = get_amdgpu_arch()
 GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
 
@@ -141,6 +153,7 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx950",
+        "gfx1151",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -266,7 +279,7 @@ def run_lib(func_name, folder=None):
 
 
 def hash_signature(signature: str):
-    return hashlib.md5(signature.encode("utf-8")).hexdigest()
+    return hashlib.md5(signature.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 @lru_cache(maxsize=None)
