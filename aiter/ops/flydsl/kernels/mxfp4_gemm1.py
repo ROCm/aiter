@@ -3,11 +3,9 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
 
 from . import dpp_utils
 from .layout_utils import crd2idx
@@ -36,13 +34,11 @@ from .mxfp4_gemm_common import (
 
 
 def _udiv(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
 
 
 def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
 
 
 def _global_i32_ptr(addr_i64):
@@ -55,29 +51,17 @@ def _global_i32_ptr(addr_i64):
 def _global_i32_at(addr_i64, idx):
     # fx.ptr_load/add_offset for a plain scalar read -- no tiling needed, so
     # skip the Tensor/tile/register-fragment machinery fx.copy requires.
-    return fx.Int32(fx.ptr_load(fx.add_offset(_global_i32_ptr(addr_i64), idx)))
-
-
-def _global_i32_tiles(addr_i64):
-    # 1<<24 is a placeholder: layout shape only affects profile checks, not the
-    # computed index.
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-    flat = fx.make_view(ptr, fx.make_layout(1 << 24, 1))
-    return fx.logical_divide(flat, fx.make_layout(1, 1))
+    return _global_i32_ptr(addr_i64)[idx]
 
 
 def _global_i32_load(tiles, idx):
     # Must build atom/types here, not as module globals -- they need an active
     # MLIR trace context.
-    atom = fx.make_copy_atom(fx.UniversalCopy(32), fx.Int32)
-    reg_ty = fx.MemRefType.get(T.i32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register)
+    atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
     reg_lay = fx.make_layout(1, 1)
-    r = fx.memref_alloca(reg_ty, reg_lay)
+    r = fx.make_rmem_tensor(reg_lay, fx.Int32)
     fx.copy_atom_call(atom, fx.slice(tiles, (None, idx)), r)
-    return fx.Vector(fx.memref_load_vec(r))[0]
+    return r.load()[0]
 
 
 def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
@@ -93,12 +77,9 @@ def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
 
 def _scalar_store(tiles, idx, value, numeric_cls):
     atom = fx.make_copy_atom(fx.UniversalCopy(numeric_cls.width), numeric_cls)
-    reg_ty = fx.MemRefType.get(
-        numeric_cls.ir_type, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
-    )
     reg_lay = fx.make_layout(1, 1)
-    r = fx.memref_alloca(reg_ty, reg_lay)
-    fx.memref_store_vec(Vec.from_elements([numeric_cls(value)], numeric_cls), r)
+    r = fx.make_rmem_tensor(reg_lay, numeric_cls)
+    r.store(fx.Vector.from_elements([numeric_cls(value)], numeric_cls))
     fx.copy_atom_call(atom, r, fx.slice(tiles, (None, idx)))
 
 
@@ -113,14 +94,6 @@ def n_out_for(inter):
     return 2 * inter
 
 
-def out_as_per_chunk_dw_for(inter):
-    return ((inter // 32) // 4 // 2) * 64
-
-
-def k_g2_half_for(inter):
-    return inter // 2
-
-
 LOG2E = 1.4426950408889634
 
 
@@ -131,7 +104,7 @@ def _silu_mul_batch(gs, us):
 
 
 def _pkmax_u16(a_i32, b_i32):
-    _v2i16 = ir.Type.parse("vector<2xi16>")
+    _v2i16 = T.vec(2, T.i16)
     va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
     vb = llvm.BitcastOp(_v2i16, _raw(b_i32)).result
     vm = arith.MaxUIOp(va, vb).result
@@ -240,37 +213,28 @@ def _gemm1_body(
         )
 
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
-    bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(128, b_aux), fx.Int32)
-    bq_reg_ty = fx.MemRefType.get(
-        T.i32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
-    )
+    bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
     bq_reg_lay = fx.make_layout(4, 1)
 
     bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, 1)
-    bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(32), fx.Int32)
-    bscale_reg_ty = fx.MemRefType.get(
-        T.i32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
-    )
+    bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     bscale_reg_lay = fx.make_layout(1, 1)
 
     # aq/ascale: global->LDS async DMA (no register fragment), via BufferCopyLDS.
     aq_buf = _global_i32_buffer_view(arg_aq, aq_num_records)
     aq_dma_tiles4 = fx.logical_divide(aq_buf, fx.make_layout(4, 1))
-    aq_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(128), fx.Int32)
+    aq_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
 
     ascale_buf = _global_i32_buffer_view(arg_ascale, ascale_num)
     ascale_dma_tiles4 = fx.logical_divide(ascale_buf, fx.make_layout(4, 1))
     ascale_dma_tiles1 = fx.logical_divide(ascale_buf, fx.make_layout(1, 1))
-    ascale_dma_atom16 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(128), fx.Int32)
-    ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(32), fx.Int32)
+    ascale_dma_atom16 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
+    ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
         hidden_num = fx.Index(i32_ntok * fx.Int32(K * 2))
         hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
-        hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(128), fx.Int32)
-        hidden_reg_ty = fx.MemRefType.get(
-            T.i32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
-        )
+        hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         hidden_reg_lay = fx.make_layout(4, 1)
 
     # Union LDS region [s_aq | s_asc], reused as lds_acc (f32 accumulator) in
@@ -278,10 +242,10 @@ def _gemm1_body(
     # +kAStages*BM*KH_TILE.
 
     cached_actual_row = []
-    cached_row_inline = []
+    cached_row_inline = None
     if const_expr(inline_quant):
         rcls = wave * fx.Int32(4) + lane_div_16
-        cached_row_inline = [_global_i32_at(arg_mind, m_row + rcls)]
+        cached_row_inline = _global_i32_at(arg_mind, m_row + rcls)
     else:
         for sub in range_constexpr(kSubBlocks):
             idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
@@ -345,28 +309,15 @@ def _gemm1_body(
     )
     s_aq_i32x4_tiles = fx.logical_divide(s_aq_i32_flat, fx.make_layout(4, 1))
     s_aq_i32x1_tiles = fx.logical_divide(s_aq_i32_flat, fx.make_layout(1, 1))
-    i32x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.Int32)
-    i32x4_reg_ty = fx.MemRefType.get(
-        T.i32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
-    )
+    i32x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
     i32x4_reg_lay = fx.make_layout(4, 1)
 
-    def _lds_i32_store(tiles, idx, value):
-        atom = fx.make_copy_atom(fx.UniversalCopy(32), fx.Int32)
-        reg_ty = fx.MemRefType.get(
-            T.i32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
-        )
-        reg_lay = fx.make_layout(1, 1)
-        r = fx.memref_alloca(reg_ty, reg_lay)
-        fx.memref_store_vec(Vec.from_elements([fx.Int32(value)], fx.Int32), r)
-        fx.copy_atom_call(atom, r, fx.slice(tiles, (None, idx)))
-
     def _lds_i32x4_load(tile_idx):
-        r = fx.memref_alloca(i32x4_reg_ty, i32x4_reg_lay)
+        r = fx.make_rmem_tensor(i32x4_reg_lay, fx.Int32)
         fx.copy_atom_call(
             i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r
         )
-        return fx.memref_load_vec(r)
+        return r.load()
 
     def issue_a_ds_read(slot):
         mask = _lds_swizzle_mask(lane_mod_16)
@@ -449,50 +400,16 @@ def _gemm1_body(
             + lib * fx.Int32(16)
         )
         s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
-        r = fx.memref_alloca(hidden_reg_ty, hidden_reg_lay)
+        r = fx.make_rmem_tensor(hidden_reg_lay, fx.Int32)
         fx.copy(
             hidden_copy_atom,
             fx.slice(hidden_tiles, (None, v_voff // fx.Int32(16))),
             r,
             soffset=s_soff // fx.Int32(4),
         )
-        return Vec(fx.memref_load_vec(r))
+        return r.load()
 
-    def _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum):
-        h_dw = [fx.Int32(_raw(h_v[j])) for j in range_constexpr(4)]
-        hm = [h_dw[j] & fx.Int32(0x7FFF7FFF) for j in range_constexpr(4)]
-        m01 = _pkmax_u16(hm[0], hm[1])
-        m23 = _pkmax_u16(hm[2], hm[3])
-        m0123 = _pkmax_u16(m01, m23)
-        lo = m0123 & fx.Int32(0xFFFF)
-        hi = m0123.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
-        local_amax = _umax_i32(lo, hi)
-        amax_u32 = _inline_dpp_quad_amax(local_amax)
-        e8m0 = _inline_e8m0(amax_u32)
-        qs = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
-        pk = _raw(fx.Int32(0))
-        qs_raw = _raw(qs)
-        for j in range_constexpr(4):
-            src_bf16x2 = _raw(
-                Vec.from_elements([h_dw[j]], fx.Int32).bitcast(fx.BFloat16)
-            )
-            pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
-        pk = fx.Int32(pk)
-        r = fx.Int32(SUB * 16) + r_in_chunk
-        kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
-        mask_r = _lds_swizzle_mask(r)
-        b_off = lib * fx.Int32(4)
-        off = (
-            fx.Int32(slot * (BM * KH_TILE))
-            + r * fx.Int32(KH_TILE)
-            + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
-            + b_off
-        )
-        _lds_i32_store(s_aq_i32x1_tiles, off // fx.Int32(4), pk)
-        pack_byte = B128_IDX * 2 + SUB
-        scale_accum[0] = scale_accum[0] | (e8m0 << fx.Int32(pack_byte * 8))
-
-    def _inline_quant_core_pair(specs, slot, kt, scale_accum):
+    def _inline_quant_core_batch(specs, slot, scale_accum):
         n = len(specs)
         h_dw = [
             [fx.Int32(_raw(h_v[j])) for j in range_constexpr(4)]
@@ -529,7 +446,7 @@ def _gemm1_body(
             pk = _raw(fx.Int32(0))
             for j in range_constexpr(4):
                 src_bf16x2 = _raw(
-                    Vec.from_elements([h_dw[i][j]], fx.Int32).bitcast(fx.BFloat16)
+                    fx.Vector.from_elements([h_dw[i][j]], fx.Int32).bitcast(fx.BFloat16)
                 )
                 pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
             pk = fx.Int32(pk)
@@ -543,18 +460,19 @@ def _gemm1_body(
                 + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
                 + b_off
             )
-            _lds_i32_store(s_aq_i32x1_tiles, off // fx.Int32(4), pk)
+            _scalar_store(s_aq_i32x1_tiles, off // fx.Int32(4), pk, fx.Int32)
             pack_byte = B128_IDX * 2 + SUB
-            scale_accum[0] = scale_accum[0] | (e8[i] << fx.Int32(pack_byte * 8))
+            scale_accum = scale_accum | (e8[i] << fx.Int32(pack_byte * 8))
+        return scale_accum
 
     def inline_quant_kt(B128_IDX, SUB, slot, kt, row_token, scale_accum):
         h_v = inline_quant_load_kt(B128_IDX, kt, row_token)
-        _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum)
+        return _inline_quant_core_batch([(B128_IDX, SUB, h_v)], slot, scale_accum)
 
     def inline_quant_pack_write(kt, scale_accum):
         lane_tgt = lane_shr2_and3 * fx.Int32(16) + r_in_chunk
         off = fx.Int32(kt * 256) + lane_tgt * fx.Int32(4)
-        _lds_i32_store(asc_i32_tiles, off // fx.Int32(4), scale_accum[0])
+        _scalar_store(asc_i32_tiles, off // fx.Int32(4), scale_accum, fx.Int32)
 
     def issue_b_load_j(b_slot, K_C, j):
         v = (
@@ -564,15 +482,14 @@ def _gemm1_body(
         )
         for half in range_constexpr(2):
             tile_idx = (v + fx.Int32(half * 1024)) // fx.Int32(16)
-            r = fx.memref_alloca(bq_reg_ty, bq_reg_lay)
+            r = fx.make_rmem_tensor(bq_reg_lay, fx.Int32)
             fx.copy(
                 bq_copy_atom,
                 fx.slice(bq_tiles, (None, tile_idx)),
                 r,
                 soffset=b_load_s_base[j] // fx.Int32(4),
             )
-            frag = fx.memref_load_vec(r)
-            b_slot[j][half] = Vec(frag)
+            b_slot[j][half] = r.load()
 
     def issue_b_scale_load(bs_slot, K_C):
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
@@ -581,17 +498,17 @@ def _gemm1_body(
         for mw in range_constexpr(2):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             idx = (v + fx.Int32(imm)) // fx.Int32(4)
-            r = fx.memref_alloca(bscale_reg_ty, bscale_reg_lay)
+            r = fx.make_rmem_tensor(bscale_reg_lay, fx.Int32)
             fx.copy(
                 bscale_copy_atom,
                 fx.slice(bscale_tiles, (None, idx)),
                 r,
                 soffset=s_off // fx.Int32(4),
             )
-            bs_slot[mw] = fx.Vector(fx.memref_load_vec(r))[0]
+            bs_slot[mw] = r.load()[0]
 
     mfma_ty = T.f32x4
-    zero4 = Vec.filled(4, 0.0, fx.Float32)
+    zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
         if const_expr(interleave):
@@ -646,11 +563,15 @@ def _gemm1_body(
         issue_a_scale_load()
     for K_C in range_constexpr(kStages):
         if const_expr(inline_quant):
-            scale_accum = [fx.Int32(0)]
-            inline_quant_kt(0, 0, K_C, K_C, cached_row_inline[0], scale_accum)
+            scale_accum = fx.Int32(0)
+            scale_accum = inline_quant_kt(
+                0, 0, K_C, K_C, cached_row_inline, scale_accum
+            )
             issue_b_load_j(b[K_C], K_C, 0)
             issue_b_load_j(b[K_C], K_C, 1)
-            inline_quant_kt(1, 0, K_C, K_C, cached_row_inline[0], scale_accum)
+            scale_accum = inline_quant_kt(
+                1, 0, K_C, K_C, cached_row_inline, scale_accum
+            )
             issue_b_load_j(b[K_C], K_C, 2)
             issue_b_load_j(b[K_C], K_C, 3)
             inline_quant_pack_write(K_C, scale_accum)
@@ -683,8 +604,8 @@ def _gemm1_body(
         if const_expr(not inline_quant):
             issue_a_load_lds(write_slot, K_C)
         if const_expr(inline_quant):
-            h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline[0])
-            h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline[0])
+            h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
+            h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
             rocdl.sched_barrier(0)
         for J in range_constexpr(4):
             if const_expr(BM != 128):
@@ -700,9 +621,8 @@ def _gemm1_body(
             rocdl.sched_barrier(0)
         issue_b_scale_load(b_scale_v[slot_b], K_C)
         if const_expr(inline_quant):
-            scale_accum = [fx.Int32(0)]
-            _inline_quant_core_pair(
-                [(0, 0, h_v0), (1, 0, h_v1)], write_slot, K_C, scale_accum
+            scale_accum = _inline_quant_core_batch(
+                [(0, 0, h_v0), (1, 0, h_v1)], write_slot, fx.Int32(0)
             )
             inline_quant_pack_write(K_C, scale_accum)
 
@@ -728,10 +648,7 @@ def _gemm1_body(
     def acc_idx(row, col):
         return _layout_idx(acc_layout, row, col)
 
-    acc_copy_atom = fx.make_copy_atom(fx.UniversalCopy(32), fx.Float32)
-    acc_reg_ty = fx.MemRefType.get(
-        T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
-    )
+    acc_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
     acc_reg_lay = fx.make_layout(1, 1)
     acc_flat_view = fx.make_view(
         fx.recast_iter(fx.Float32, lds_raw_ptr), fx.make_layout(BM * BN, 1)
@@ -739,14 +656,14 @@ def _gemm1_body(
     acc_flat_tiles = fx.logical_divide(acc_flat_view, fx.make_layout(1, 1))
 
     def acc_store(idx, value):
-        r = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
-        fx.memref_store_vec(Vec.from_elements([fx.Float32(value)], fx.Float32), r)
+        r = fx.make_rmem_tensor(acc_reg_lay, fx.Float32)
+        r.store(fx.Vector.from_elements([fx.Float32(value)], fx.Float32))
         fx.copy_atom_call(acc_copy_atom, r, fx.slice(acc_flat_tiles, (None, idx)))
 
     def acc_load(idx):
-        r = fx.memref_alloca(acc_reg_ty, acc_reg_lay)
+        r = fx.make_rmem_tensor(acc_reg_lay, fx.Float32)
         fx.copy_atom_call(acc_copy_atom, fx.slice(acc_flat_tiles, (None, idx)), r)
-        return fx.Float32(Vec(fx.memref_load_vec(r))[0])
+        return r.load()[0]
 
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -755,7 +672,7 @@ def _gemm1_body(
             J_local = J // 2
             col_local = wave * fx.Int32(32) + fx.Int32(J_local * 16) + lane_mod_16
             lds_col = (fx.Int32(128) + col_local) if is_up else col_local
-            vec = Vec(accm[i][J])
+            vec = fx.Vector(accm[i][J])
             for v in range_constexpr(4):
                 idx = acc_idx(row_base + fx.Int32(v), lds_col)
                 acc_store(idx, vec[v])
@@ -770,7 +687,7 @@ def _gemm1_body(
 
     aqout_layout = fx.make_layout((BM, K_G2_HALF), (K_G2_HALF, 1))
     # UniversalCopy has no nontemporal/cache-hint knob; dropped (perf-neutral).
-    aqout_tiles = _global_i32_tiles(arg_aqout)
+    aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
     scales_per_mr = [None] * M_REPS
 
     for mr in range_constexpr(M_REPS):
@@ -899,8 +816,8 @@ def compile_gemm1_a4w4_port(
     _BQ_BYTES = bq_bytes_for(_NE, _N_OUT, _K)
     _BSCALE_BYTES = bscale_bytes_for(_NE, _N_OUT, _K)
     _NUM_N_BLOCKS = num_n_blocks_for(_N_OUT, BN)
-    _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
-    _K_G2_HALF = k_g2_half_for(_INTER)
+    _OUT_AS_PER_CHUNK_DW = kas_per_chunk_dw_for(_INTER)
+    _K_G2_HALF = k_half_for(_INTER)
 
     kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(
         BM, BN, KH_TILE, _K_TILES_TOTAL
