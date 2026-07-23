@@ -16,7 +16,7 @@ from aiter import per_tensor_quant
 from aiter.ops.flydsl import (
     flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
 )
-from aiter.test_common import checkAllclose
+from aiter.test_common import checkAllclose, run_perftest
 from aiter.utility import dtypes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -185,20 +185,6 @@ def torch_ref(
     return q, k_cache, v_cache, k_out, v_out
 
 
-def _time(fn, iters: int, warmup: int) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000.0 / iters
-
-
 def run_case(
     *,
     num_tokens: int,
@@ -325,36 +311,6 @@ def run_case(
         gemma_norm,
     )
 
-    def run_flydsl():
-        flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-            qkv,
-            *common,
-            q_fly,
-            k_fly,
-            v_fly,
-            slots,
-            k_scale,
-            v_scale,
-            k_out_fly,
-            v_out_fly,
-            *suffix,
-        )
-
-    def run_production():
-        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-            qkv.view(num_tokens, -1),
-            *common,
-            q_prod.view(num_tokens, -1),
-            k_prod,
-            v_prod,
-            slots,
-            k_scale,
-            v_scale,
-            k_out_prod,
-            v_out_prod,
-            *suffix,
-        )
-
     ref_args = (
         qkv,
         qw,
@@ -380,10 +336,48 @@ def run_case(
         "return_kv": return_kv,
     }
 
-    run_flydsl()
-    run_production()
-    reference = torch_ref(*ref_args, **ref_kwargs)
-    torch.cuda.synchronize()
+    _, flydsl_us = run_perftest(
+        flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
+        qkv,
+        *common,
+        q_fly,
+        k_fly,
+        v_fly,
+        slots,
+        k_scale,
+        v_scale,
+        k_out_fly,
+        v_out_fly,
+        *suffix,
+        num_iters=iters,
+        num_warmup=warmup,
+        use_cuda_event=True,
+    )
+    _, production_us = run_perftest(
+        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
+        qkv.view(num_tokens, -1),
+        *common,
+        q_prod.view(num_tokens, -1),
+        k_prod,
+        v_prod,
+        slots,
+        k_scale,
+        v_scale,
+        k_out_prod,
+        v_out_prod,
+        *suffix,
+        num_iters=iters,
+        num_warmup=warmup,
+        use_cuda_event=True,
+    )
+    reference, torch_ref_us = run_perftest(
+        torch_ref,
+        *ref_args,
+        **ref_kwargs,
+        num_iters=1,
+        num_warmup=0,
+        use_cuda_event=True,
+    )
 
     label = (
         f"T={num_tokens} Hq={num_q_heads} Hkv={num_kv_heads} D={head_size} "
@@ -422,11 +416,6 @@ def run_case(
             msg=f"{name} vs production",
         )
 
-    flydsl_us = _time(run_flydsl, iters, warmup)
-    production_us = _time(run_production, iters, warmup)
-    torch_ref_us = _time(
-        lambda: torch_ref(*ref_args, **ref_kwargs), 1, 0
-    )
     print(
         f"  latency: flydsl={flydsl_us:.2f} us, "
         f"production={production_us:.2f} us, "
