@@ -24,6 +24,7 @@ from aiter.ops.triton.attention.mha import flash_attn_func, mha_set_swizzle
 def restore_swizzle():
     """Save swizzle state before each test and restore it on teardown."""
     from aiter.ops.triton.attention import mha as mha_mod
+
     saved = mha_mod._MHA_SWIZZLE
     yield
     mha_set_swizzle(saved)
@@ -44,12 +45,16 @@ def _run(swizzle: str, B: int, Hq: int, Hk: int, S: int, D: int, causal: bool):
 # GQA configs — spatial_gqa path
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("Hq,Hk", [
-    (128, 8),   # aligned HK == NUM_XCDS
-    (64,  8),
-    (32,  8),
-])
+@pytest.mark.parametrize(
+    "Hq,Hk",
+    [
+        (128, 8),  # aligned HK == NUM_XCDS
+        (64, 8),
+        (32, 8),
+    ],
+)
 def test_spatial_gqa_aligned(Hq, Hk, causal):
     """HK == NUM_XCDS (8): one KV head per XCD."""
     out0 = _run("default", 1, Hq, Hk, 8192, 128, causal)
@@ -57,10 +62,13 @@ def test_spatial_gqa_aligned(Hq, Hk, causal):
     assert torch.equal(out0, out1), f"HQ={Hq} HK={Hk} causal={causal}: outputs differ"
 
 
-@pytest.mark.parametrize("Hq,Hk", [
-    (128, 16),  # HK > NUM_XCDS
-    (128, 32),
-])
+@pytest.mark.parametrize(
+    "Hq,Hk",
+    [
+        (128, 16),  # HK > NUM_XCDS
+        (128, 32),
+    ],
+)
 def test_spatial_gqa_hk_gt_nxcd(Hq, Hk):
     """HK > NUM_XCDS: each XCD owns multiple KV heads."""
     out0 = _run("default", 1, Hq, Hk, 8192, 128, causal=True)
@@ -68,10 +76,13 @@ def test_spatial_gqa_hk_gt_nxcd(Hq, Hk):
     assert torch.equal(out0, out1), f"HQ={Hq} HK={Hk}: outputs differ"
 
 
-@pytest.mark.parametrize("Hq,Hk", [
-    (128, 4),   # HK < NUM_XCDS
-    (128, 2),
-])
+@pytest.mark.parametrize(
+    "Hq,Hk",
+    [
+        (128, 4),  # HK < NUM_XCDS
+        (128, 2),
+    ],
+)
 def test_spatial_gqa_hk_lt_nxcd(Hq, Hk):
     """HK < NUM_XCDS: multiple XCDs share each KV head."""
     out0 = _run("default", 1, Hq, Hk, 8192, 128, causal=True)
@@ -90,6 +101,7 @@ def test_spatial_gqa_batched(causal):
 # ---------------------------------------------------------------------------
 # MHA configs — spatial_mha path
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("H", [16, 32, 64, 128])
