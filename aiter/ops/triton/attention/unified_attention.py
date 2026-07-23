@@ -114,7 +114,7 @@ def select_2d_config(
             assert (
                 block_size >= 32
             ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-        TILE_SIZE = min(block_size, 32) if arch.name == "gfx1201" else block_size
+        TILE_SIZE = block_size
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
 
@@ -154,7 +154,10 @@ def select_3d_config(
     attn_stages = 1 if DEVICE_ARCH == "gfx1201" else 2
     if IS_DEVICE_ARCH_GFX12:
         attn_warps = 1
-        TILE_SIZE = min(block_size, 32) if DEVICE_ARCH == "gfx1201" else block_size
+        if shuffled_kv_cache:
+            TILE_SIZE = block_size
+        else:
+            TILE_SIZE = min(block_size, 32) if DEVICE_ARCH == "gfx1201" else block_size
         if shuffled_kv_cache and head_size < 128:
             if kv_cache_dtype == torch.bfloat16:
                 if block_size <= 64:
@@ -671,7 +674,7 @@ def unified_attention(
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
         gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
         use_gluon_reduce = (
-            IS_DEVICE_ARCH_GFX12
+            IS_DEVICE_ARCH_GFX1250
             and _reduce_segments_gluon is not None
             and ALL_DECODE
             and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
