@@ -67,7 +67,7 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
@@ -77,7 +77,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
-    use_flydsl_fp8_scale = get_gfx() == "gfx1250" and ck_preshuffle
+    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
     if use_flydsl_fp8_scale:
         FP8_E4M3_MAX = 448.0
         x_scale = fp4_utils.f32_to_mx_e8m0_scale(
@@ -101,17 +101,19 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    if not use_flydsl_fp8_scale:
-        tag = "asm"
-        weight_asm = shuffle_weight(weight, layout=(16, 16))
-        c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+    if use_flydsl_fp8_scale:
+        return ret
+    
+    tag = "asm"
+    weight_asm = shuffle_weight(weight, layout=(16, 16))
+    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-        err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
-        ret[f"{tag} us"] = avg_c
-        ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-        ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-        ret[f"{tag} err"] = err_asm
-        ret["asm/ck"] = avg_c / avg_b
+    err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
+    ret[f"{tag} us"] = avg_c
+    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    ret[f"{tag} err"] = err_asm
+    ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -302,6 +304,11 @@ parser.add_argument(
     """,
 )
 parser.add_argument(
+    "--flydsl",
+    action="store_true",
+    help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -345,6 +352,7 @@ if args.csv is not None:
                     int(row["N"]),
                     int(row["K"]),
                     ck_preshuffle=preshuffle,
+                    use_flydsl=args.flydsl,
                 )
                 df.append(ret)
 else:
@@ -352,7 +360,9 @@ else:
         for m in args.m:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
-                    ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                    ret = test_gemm(
+                        dtype, m, n, k, ck_preshuffle=ck_p, use_flydsl=args.flydsl
+                    )
                     df.append(ret)
 
 df = pd.DataFrame(df)

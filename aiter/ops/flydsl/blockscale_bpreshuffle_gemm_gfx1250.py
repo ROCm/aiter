@@ -12,28 +12,28 @@ from torch import Tensor
 
 from aiter import dtypes
 
-_compile_blockscale_gemm = None
-_run_compiled = None
+_launch_gemm_a8w8_bsc_col = None
+_ptr_arg = None
 _fx = None
 
 _BLOCK_K = 128
 _BLOCK_N = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
-_MAX_SPLIT_K = 4
+_MAX_SPLIT_K = 1
 
 
 def _lazy_import():
-    global _compile_blockscale_gemm, _run_compiled, _fx
-    if _compile_blockscale_gemm is not None:
+    global _launch_gemm_a8w8_bsc_col, _ptr_arg, _fx
+    if _launch_gemm_a8w8_bsc_col is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_fp8fp4_gfx1250 import compile_blockscale_gemm
-    from .kernels.tensor_shim import _run_compiled as runner
+    from .kernels.gemm_a8w8_blockscale_gfx1250 import launch_gemm_a8w8_bsc_col
+    from .kernels.tensor_shim import ptr_arg
 
-    _compile_blockscale_gemm = compile_blockscale_gemm
-    _run_compiled = runner
+    _launch_gemm_a8w8_bsc_col = launch_gemm_a8w8_bsc_col
+    _ptr_arg = ptr_arg
     _fx = fx_mod
 
 
@@ -143,57 +143,46 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
             f"K-tiles per split-k chunk, got {num_k_tiles}"
         )
 
+    if not x_scale_transposed:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 blockscale] x_scale_transposed=False is not supported "
+            "by the dedicated blockscale kernel (A-scale must be M-contiguous)"
+        )
+
     k_blocks = K // _BLOCK_K
     a_scale = _require_e8m0_scale(x_scale, (M, k_blocks), "x_scale")
     b_scale = _require_e8m0_scale(w_scale, (N // _BLOCK_N, k_blocks), "w_scale")
-    ascale_layout = "col_major" if x_scale_transposed else "row_major"
-    stride_ascale_m = a_scale.stride(1) if x_scale_transposed else a_scale.stride(0)
-    stride_ascale_k = (
-        (a_scale.numel() // a_scale.stride(0))
-        if x_scale_transposed
-        else a_scale.stride(1)
-    )
-
-    exe = _compile_blockscale_gemm(
-        N=N,
-        K=K,
-        data_format="fp8",
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        m_warp=m_warp,
-        n_warp=n_warp,
-        num_buffers=nb,
-        waves_per_eu=(None if waves_per_eu <= 0 else waves_per_eu),
-        cluster_m=cluster_m,
-        cluster_n=cluster_n,
-        out_dtype=out_dtype,
-        split_k=split_k,
-        scale_block_k=_BLOCK_K,
-        scale_block_n=_BLOCK_N,
-        ascale_layout=ascale_layout,
-    )
+    stride_ascale_k = a_scale.numel() // a_scale.stride(0)
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
     if split_k > 1:
         Out.zero_()
+    out_is_f16 = 1 if out_dtype == "f16" else 0
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _run_compiled(
-        exe,
+    _launch_gemm_a8w8_bsc_col(
         Out,
-        XQ.view(torch.uint8),
-        WQ.view(torch.uint8),
+        _ptr_arg(XQ),
+        _ptr_arg(WQ),
         a_scale.view(torch.uint8),
         b_scale.view(torch.uint8),
         M,
+        stream,
         N,
+        K,
+        stride_ascale_k,
         lda,
         ldc,
-        stride_ascale_m,
-        stride_ascale_k,
-        stream,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        nb,
+        cluster_m,
+        cluster_n,
     )
     return Out
 
