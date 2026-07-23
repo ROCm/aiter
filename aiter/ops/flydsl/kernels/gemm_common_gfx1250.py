@@ -419,6 +419,7 @@ __all__ = [
     "get_lds_memref",
     "issue_tdm_loads",
     "lds_load_b128_raw",
+    "lds_store_b128_raw",
     "lds_transpose_load_raw",
     "pipeline_fence",
     "pipeline_fence_signal",
