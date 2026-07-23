@@ -17,8 +17,16 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_nvfp4_quant_kernel,
     _nvfp4_quant_op,
 )
+
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx950,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils._triton import arch_info
 
 __all__ = [
     "static_per_tensor_quant_fp8_i8",
@@ -208,27 +216,69 @@ def dynamic_mxfp4_quant(
         triton.cdiv(M, BLOCK_SIZE_M),
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
+    even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-    _dynamic_mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        blockscale_e8m0,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-        num_stages=1,
-    )
+    if arch_info.get_arch() in ("gfx950"):
+        gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+        )
 
+    elif arch_info.get_arch() in ("gfx1250"):
+        gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+        )
+    else:
+        _dynamic_mxfp4_quant_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            EVEN_M_N=even_m_n,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+        )
     return (x_fp4, blockscale_e8m0)
 
 
