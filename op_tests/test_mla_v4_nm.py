@@ -1651,20 +1651,23 @@ def test_v4_nm_sink():
     args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
     args_b["sink"] = torch.full((sink_size,), 10.0, dtype=torch.float32, device=device)
 
-    logits_a, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_a)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_a)
     torch.cuda.synchronize()
-    # Single-pass (V3-style) now returns packed-BF16 (2-byte) logits aliased
-    # onto `output`, so reinterpret the raw bits as int16 (not int32) to keep
-    # the last-dim aligned with the finite mask for the byte-level sink diff.
-    logits_a_bits = logits_a.view(torch.int16).clone()
+    # `output` is the authoritative BF16 result for BOTH single-pass (kernel
+    # writes packed-BF16 into it) and multi-pass (stage2 merges into it). Read
+    # it directly instead of the returned `logits` so the byte-level sink diff
+    # is robust to whatever split count the heuristic picks — v4 nm forces
+    # occupancy-only splits (ignore_total_kv), which can be >1 even for short
+    # KV, making `logits` an FP32 partial buffer rather than packed BF16.
+    out_a = args_a["output"]  # [total_q, num_heads, dv] BF16
+    out_a_bits = out_a.view(torch.int16).clone()
 
-    logits_b, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_b)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_b)
     torch.cuda.synchronize()
-    logits_b_bits = logits_b.view(torch.int16)
+    out_b = args_b["output"]
+    out_b_bits = out_b.view(torch.int16)
 
-    # logits is 4D [total_q, num_kv_splits=1, num_heads, dv]; only [:, 0]
-    # is kernel-written.
-    finite_both = torch.isfinite(logits_a[:, 0]) & torch.isfinite(logits_b[:, 0])
+    finite_both = torch.isfinite(out_a) & torch.isfinite(out_b)
     assert finite_both.any(), (
         "All output cells were NaN/inf under both sink values — the quant "
         "pipeline returned junk OR sink=10 pushed the running max into a "
@@ -1672,7 +1675,7 @@ def test_v4_nm_sink():
         "sink_b's magnitude."
     )
 
-    diff_finite = (logits_a_bits[:, 0] != logits_b_bits[:, 0]) & finite_both
+    diff_finite = (out_a_bits != out_b_bits) & finite_both
     assert diff_finite.any(), (
         "PR-2 regression: sink=-inf and sink=10.0 produced bit-identical "
         "output among finite cells. Either the dispatcher stopped writing "
@@ -1691,12 +1694,13 @@ def test_v4_nm_sink():
         (sink_size,), -1.0e9, dtype=torch.float32, device=device
     )
 
-    logits_inf, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
-    logits_big, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_big)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_big)
     torch.cuda.synchronize()
 
-    nan_inf = torch.isnan(logits_inf[:, 0])
-    nan_big = torch.isnan(logits_big[:, 0])
+    # Compare the authoritative BF16 `output` (single/multi-pass agnostic).
+    nan_inf = torch.isnan(args_inf["output"])
+    nan_big = torch.isnan(args_big["output"])
 
     # -inf must not produce *more* NaNs than the -1e9 control. The inverse
     # would mean sink=-inf hits a kernel-side division-by-zero or

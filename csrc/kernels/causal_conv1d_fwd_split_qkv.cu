@@ -38,6 +38,176 @@ static constexpr int TN  = 64;   // feature tile
 static constexpr int KW  = 4;    // kernel width (conv window)
 static constexpr int NT  = 256;  // threads per block
 
+// SGLang prefill supplies a logical [D,T] view backed by contiguous [T,D]
+// storage: stride_dim=1, stride_token=D.  Assign one thread to one feature so
+// every wave reads/writes adjacent features.  A four-value rolling window
+// avoids LDS and loads each body input only once.
+template <int TM>
+__global__ __launch_bounds__(256) void conv1d_split_qkv_channel_last_t(
+    const unsigned short* __restrict__ x,
+    const unsigned short* __restrict__ w,
+    const unsigned short* __restrict__ bias_ptr,
+    unsigned short* __restrict__ q_out,
+    unsigned short* __restrict__ k_out,
+    unsigned short* __restrict__ v_out,
+    unsigned short* __restrict__ conv_states,
+    const int* __restrict__ cache_indices,
+    const unsigned char* __restrict__ has_initial_state,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ batch_ptr,
+    const int* __restrict__ token_chunk_offset_ptr,
+    int dim,
+    int k_dim,
+    int T,
+    int stride_x_dim,
+    int stride_x_token,
+    int stride_q_tok,
+    int stride_q_dim,
+    int stride_k_tok,
+    int stride_k_dim,
+    int stride_v_tok,
+    int stride_v_dim,
+    int scs0,
+    int scs1,
+    int scs2,
+    int sci,
+    int has_bias,
+    int do_silu,
+    int pad_slot_id)
+{
+    const int pid     = blockIdx.x;
+    const int seq_idx = batch_ptr[pid];
+    const int cache_idx = cache_indices[seq_idx * sci];
+    if(cache_idx == pad_slot_id)
+        return;
+
+    const int chunk_idx = token_chunk_offset_ptr[pid];
+    const int seq_start = query_start_loc[seq_idx];
+    const int seqlen    = query_start_loc[seq_idx + 1] - seq_start;
+    const int tok_start = chunk_idx * TM;
+    const int gfeat     = (int)blockIdx.y * NT + threadIdx.x;
+    if(gfeat >= dim || tok_start >= seqlen)
+        return;
+
+    const unsigned short* wp = w + (long long)gfeat * KW;
+    const unsigned int w_raw0 = *(const unsigned int*)wp;
+    const unsigned int w_raw1 = *(const unsigned int*)(wp + 2);
+    const float wr0 = bf16_to_f32((unsigned short)w_raw0);
+    const float wr1 = bf16_to_f32((unsigned short)(w_raw0 >> 16));
+    const float wr2 = bf16_to_f32((unsigned short)w_raw1);
+    const float wr3 = bf16_to_f32((unsigned short)(w_raw1 >> 16));
+    const float bias = has_bias ? bf16_to_f32(bias_ptr[gfeat]) : 0.f;
+
+    float x0 = 0.f, x1 = 0.f, x2 = 0.f;
+    if(tok_start >= 3)
+    {
+        const long long base = (long long)gfeat * stride_x_dim +
+                               (long long)(seq_start + tok_start - 3) * stride_x_token;
+        x0 = bf16_to_f32(x[base]);
+        x1 = bf16_to_f32(x[base + stride_x_token]);
+        x2 = bf16_to_f32(x[base + 2LL * stride_x_token]);
+    }
+    else
+    {
+        // Only chunk zero can start before token 3.
+        const bool use_state = has_initial_state[seq_idx] != 0;
+        const long long state_base = (long long)cache_idx * scs0 +
+                                     (long long)gfeat * scs1;
+        x0 = use_state ? bf16_to_f32(conv_states[state_base]) : 0.f;
+        x1 = use_state ? bf16_to_f32(conv_states[state_base + scs2]) : 0.f;
+        x2 = use_state ? bf16_to_f32(conv_states[state_base + 2LL * scs2]) : 0.f;
+    }
+
+    unsigned short* out_ptr;
+    int out_ts, out_ds, out_feat;
+    if(gfeat < k_dim)
+    {
+        out_ptr = q_out;
+        out_ts = stride_q_tok;
+        out_ds = stride_q_dim;
+        out_feat = gfeat;
+    }
+    else if(gfeat < 2 * k_dim)
+    {
+        out_ptr = k_out;
+        out_ts = stride_k_tok;
+        out_ds = stride_k_dim;
+        out_feat = gfeat - k_dim;
+    }
+    else
+    {
+        out_ptr = v_out;
+        out_ts = stride_v_tok;
+        out_ds = stride_v_dim;
+        out_feat = gfeat - 2 * k_dim;
+    }
+
+    const int count = min(TM, seqlen - tok_start);
+    long long in_addr = (long long)gfeat * stride_x_dim +
+                        (long long)(seq_start + tok_start) * stride_x_token;
+    long long out_addr = (long long)(seq_start + tok_start) * out_ts +
+                         (long long)out_feat * out_ds;
+#pragma unroll
+    for(int i = 0; i < TM; ++i)
+    {
+        if(i < count)
+        {
+            const float x3 = bf16_to_f32(x[in_addr]);
+            float acc = bias + wr0 * x0 + wr1 * x1 + wr2 * x2 + wr3 * x3;
+            if(do_silu)
+            {
+                const float exp2v = __builtin_amdgcn_exp2f(acc * (-1.4426950408889634f));
+                acc *= __builtin_amdgcn_rcpf(1.f + exp2v);
+            }
+            out_ptr[out_addr] = f32_to_bf16(acc);
+            x0 = x1;
+            x1 = x2;
+            x2 = x3;
+            in_addr += stride_x_token;
+            out_addr += out_ts;
+        }
+    }
+
+    // Exactly one chunk updates the persistent tail for each sequence.
+    if(chunk_idx == 0)
+    {
+        const long long state_base = (long long)cache_idx * scs0 +
+                                     (long long)gfeat * scs1;
+        if(seqlen >= 3)
+        {
+            const long long tail = (long long)gfeat * stride_x_dim +
+                                   (long long)(seq_start + seqlen - 3) * stride_x_token;
+            conv_states[state_base] = x[tail];
+            conv_states[state_base + scs2] = x[tail + stride_x_token];
+            conv_states[state_base + 2LL * scs2] = x[tail + 2LL * stride_x_token];
+        }
+        else
+        {
+            // Preserve the required suffix of the initial state for T < 3.
+            unsigned short old0 = conv_states[state_base];
+            unsigned short old1 = conv_states[state_base + scs2];
+            unsigned short old2 = conv_states[state_base + 2LL * scs2];
+            if(!has_initial_state[seq_idx])
+                old0 = old1 = old2 = 0;
+            if(seqlen == 1)
+            {
+                conv_states[state_base] = old1;
+                conv_states[state_base + scs2] = old2;
+                conv_states[state_base + 2LL * scs2] =
+                    x[(long long)gfeat * stride_x_dim + (long long)seq_start * stride_x_token];
+            }
+            else if(seqlen == 2)
+            {
+                const long long tail = (long long)gfeat * stride_x_dim +
+                                       (long long)seq_start * stride_x_token;
+                conv_states[state_base] = old2;
+                conv_states[state_base + scs2] = x[tail];
+                conv_states[state_base + 2LL * scs2] = x[tail + stride_x_token];
+            }
+        }
+    }
+}
+
 // Cooperative-staging load + full conv_state, templated on TM in {8,16,32,64}.
 // Fast path covers fully-interior tiles; the slow path applies
 // sequence-relative bounds at chunk/sequence boundaries and blends conv_states.
@@ -75,7 +245,8 @@ __global__ __launch_bounds__(256) void conv1d_split_qkv_t(const unsigned short* 
 {
     const int pid     = blockIdx.x;
     const int seq_idx = batch_ptr[pid];
-    if(seq_idx == pad_slot_id)
+    const int cache_idx = cache_indices[seq_idx * sci];
+    if(cache_idx == pad_slot_id)
         return;
 
     const int chunk_idx  = token_chunk_offset_ptr[pid];
@@ -196,9 +367,8 @@ __global__ __launch_bounds__(256) void conv1d_split_qkv_t(const unsigned short* 
                 }
                 else if(wp < 0 && gf < dim && (chunk_idx == 0) && has_initial_state[seq_idx] != 0)
                 {
-                    int in_coord = cache_indices[seq_idx * sci];
                     int slot     = (KW - 1) + wp; // chunk0 -> tok_start+hc, in [0,KW-2]
-                    pv           = conv_states[(long long)in_coord * scs0 + (long long)gf * scs1 +
+                    pv           = conv_states[(long long)cache_idx * scs0 + (long long)gf * scs1 +
                                      (long long)slot * scs2];
                 }
                 shmem[hf * LDS_PAD + hc] = pv;
@@ -329,7 +499,6 @@ __global__ __launch_bounds__(256) void conv1d_split_qkv_t(const unsigned short* 
         const int slot = tok_group; // 0..3, only < KW-1 used
         if(slot < (KW - 1) && gfeat < dim)
         {
-            const int in_coord = cache_indices[seq_idx * sci];
             const int pos_x    = seqlen - (KW - 1) + slot;
             float val;
             if(pos_x >= 0)
@@ -340,14 +509,14 @@ __global__ __launch_bounds__(256) void conv1d_split_qkv_t(const unsigned short* 
             else if(has_initial_state[seq_idx] != 0)
             {
                 int src = slot + seqlen; // seqlen < KW-1 edge case
-                val     = bf16_to_f32(conv_states[(long long)in_coord * scs0 +
+                val     = bf16_to_f32(conv_states[(long long)cache_idx * scs0 +
                                               (long long)gfeat * scs1 + (long long)src * scs2]);
             }
             else
             {
                 val = 0.f;
             }
-            conv_states[(long long)in_coord * scs0 + (long long)gfeat * scs1 +
+            conv_states[(long long)cache_idx * scs0 + (long long)gfeat * scs1 +
                         (long long)slot * scs2] = f32_to_bf16(val);
         }
     }
@@ -377,6 +546,9 @@ void causal_conv1d_fwd_split_qkv_hip_impl(
     AITER_CHECK(x.dtype() == AITER_DTYPE_bf16,
                 "causal_conv1d HIP kernel requires bfloat16 input.");
     AITER_CHECK(x.dim() == 2, "`x` must be 2-D [dim, cu_seqlen].");
+    AITER_CHECK(x.stride(0) == 1 || x.stride(1) == 1,
+                "`x` must be contiguous in the feature dimension (stride(0)=1) or "
+                "the token dimension (stride(1)=1).");
     AITER_CHECK(block_m == 8 || block_m == 16 || block_m == 32 || block_m == 64,
                 "`block_m` must be 8, 16, 32, or 64.");
     AITER_CHECK(weight.dtype() == AITER_DTYPE_bf16, "`weight` must be bfloat16.");
@@ -424,6 +596,38 @@ void causal_conv1d_fwd_split_qkv_hip_impl(
         (int)conv_states.stride(1), (int)conv_states.stride(2), (int)cache_indices.stride(0), \
         has_bias ? 1 : 0, silu ? 1 : 0, (int)pad_slot_id
 
+#define CONV1D_CHANNEL_LAST_ARGS                                                             \
+    (const unsigned short*)x.data_ptr(), (const unsigned short*)weight.data_ptr(),        \
+        bias_data, (unsigned short*)q.data_ptr(), (unsigned short*)k.data_ptr(),          \
+        (unsigned short*)v.data_ptr(), (unsigned short*)conv_states.data_ptr(),           \
+        (const int*)cache_indices.data_ptr(), (const unsigned char*)has_initial_state.data_ptr(), \
+        (const int*)query_start_loc.data_ptr(), (const int*)batch_ptr.data_ptr(),         \
+        (const int*)token_chunk_offset_ptr.data_ptr(), dim, (int)k_dim, cu_seqlen,        \
+        (int)x.stride(0), (int)x.stride(1), (int)q.stride(0), (int)q.stride(1),           \
+        (int)k.stride(0), (int)k.stride(1), (int)v.stride(0), (int)v.stride(1),           \
+        (int)conv_states.stride(0), (int)conv_states.stride(1),                           \
+        (int)conv_states.stride(2), (int)cache_indices.stride(0),                         \
+        has_bias ? 1 : 0, silu ? 1 : 0, (int)pad_slot_id
+
+    if(x.stride(0) == 1)
+    {
+        dim3 channel_last_grid((unsigned)n_programs, (unsigned)((dim + NT - 1) / NT));
+        if(block_m == 8)
+            conv1d_split_qkv_channel_last_t<8><<<channel_last_grid, block, 0, stream>>>(
+                CONV1D_CHANNEL_LAST_ARGS);
+        else if(block_m == 16)
+            conv1d_split_qkv_channel_last_t<16><<<channel_last_grid, block, 0, stream>>>(
+                CONV1D_CHANNEL_LAST_ARGS);
+        else if(block_m == 32)
+            conv1d_split_qkv_channel_last_t<32><<<channel_last_grid, block, 0, stream>>>(
+                CONV1D_CHANNEL_LAST_ARGS);
+        else
+            conv1d_split_qkv_channel_last_t<64><<<channel_last_grid, block, 0, stream>>>(
+                CONV1D_CHANNEL_LAST_ARGS);
+        HIP_CALL_LAUNCH(hipGetLastError());
+        return;
+    }
+
     if(block_m == 8)
     {
         conv1d_split_qkv_t<8><<<grid, block, 0, stream>>>(CONV1D_ARGS);
@@ -441,6 +645,7 @@ void causal_conv1d_fwd_split_qkv_hip_impl(
         conv1d_split_qkv_t<64><<<grid, block, 0, stream>>>(CONV1D_ARGS);
     }
 #undef CONV1D_ARGS
+#undef CONV1D_CHANNEL_LAST_ARGS
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 

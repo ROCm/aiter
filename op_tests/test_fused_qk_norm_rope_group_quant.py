@@ -38,6 +38,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
@@ -54,6 +55,9 @@ torch.set_default_device("cuda")
 
 _FP8 = dtypes.fp8
 _FP8_MAX = float(torch.finfo(_FP8).max)
+_FP8_MX_DTYPE = (
+    MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
+)
 _DEV = "cuda"
 PE_BYTE_OFFSET = 464
 # MI355X HBM3e peak. Used only for the "%peak" perf column.
@@ -106,13 +110,14 @@ def _norm_rope_nope_fp8(x, weight, cos, sin, pos, eps, *, is_neox, group_size):
     nope, pe = normed[..., :nope_dim], normed[..., nope_dim:]
     pe_rotated = _apply_gptj_rope(pe, cos, sin, pos, is_neox=is_neox)
 
-    # nope: per-group amax -> e8m0 scale (MX RoundUp, FP8 E4M3) -> fp8. Uses the shared
-    # reference helper (== the kernel's fp_f32_to_e8m0_scale<RoundUp, FP8_E4M3>).
+    # nope: per-group amax -> e8m0 scale (MX RoundUp, HW-native FP8 E4M3) -> fp8.
+    # gfx942 uses E4M3_FNUZ (max=240), while gfx950+ uses OCP E4M3 (max=448),
+    # matching kHwFp8E4m3Dtype in the HIP kernel.
     amax = (
         nope.reshape(T, n_heads, n_groups, group_size).abs().amax(-1).clamp_min(1e-12)
     )
     scale_e8m0 = f32_to_mx_e8m0_scale(
-        amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+        amax, mode=MxScaleRoundModeInt.RoundUp, dtype=_FP8_MX_DTYPE
     ).view(
         torch.uint8
     )  # reinterpret the e8m0 byte (== biased exponent), not numeric cast
