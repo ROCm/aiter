@@ -63,7 +63,9 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
     waves_per_eu: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
-    gl.static_assert(NUM_BUFFERS >= 2, "bandwidth_bound kernel requires NUM_BUFFERS >= 2")
+    gl.static_assert(
+        NUM_BUFFERS >= 2, "bandwidth_bound kernel requires NUM_BUFFERS >= 2"
+    )
 
     batch_id = gl.program_id(axis=0)
     pid_unified = gl.program_id(axis=1)
