@@ -16,6 +16,7 @@ from aiter import dtypes
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.utility import fp4_utils
 from einops import rearrange
 from einops import repeat as eirp
 
@@ -30,6 +31,10 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
+    if x_scale.dtype == dtypes.fp8_e8m0:
+        x_scale = fp4_utils.e8m0_to_f32(x_scale)
+    if w_scale.dtype == dtypes.fp8_e8m0:
+        w_scale = fp4_utils.e8m0_to_f32(w_scale)
     x = x.to(x_scale.dtype).view(
         m, k // block_shape[1], block_shape[1]
     ) * x_scale.unsqueeze(-1)
@@ -81,7 +86,7 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
@@ -91,6 +96,15 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
+    if use_flydsl_fp8_scale:
+        FP8_E4M3_MAX = 448.0
+        x_scale = fp4_utils.f32_to_mx_e8m0_scale(
+            x_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+        )
+        w_scale = fp4_utils.f32_to_mx_e8m0_scale(
+            w_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+        )
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -106,27 +120,28 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(16, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+    if not use_flydsl_fp8_scale:
+        tag = "asm"
+        weight_asm = shuffle_weight(weight, layout=(16, 16))
+        c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+        err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
+        ret[f"{tag} us"] = avg_c
+        ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+        ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+        ret[f"{tag} err"] = err_asm
+        ret["asm/ck"] = avg_c / avg_b
 
-    # Triton path requires a preshuffled weight. When not preshuffled we simply omit
-    # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
-    if ck_preshuffle:
-        d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
-        err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
-        ret["triton us"] = avg_d
-        ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
-        ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
-        ret["triton err"] = err_triton
-        ret["triton/ck"] = avg_d / avg_b
+        # Triton path requires a preshuffled weight. When not preshuffled we simply omit
+        # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
+        if ck_preshuffle:
+            d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
+            err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
+            ret["triton us"] = avg_d
+            ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
+            ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
+            ret["triton err"] = err_triton
+            ret["triton/ck"] = avg_d / avg_b
 
     return ret
 
@@ -288,6 +303,11 @@ parser.add_argument(
     """,
 )
 parser.add_argument(
+    "--flydsl",
+    action="store_true",
+    help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -331,6 +351,7 @@ if args.csv is not None:
                     int(row["N"]),
                     int(row["K"]),
                     ck_preshuffle=preshuffle,
+                    use_flydsl=args.flydsl,
                 )
                 df.append(ret)
 else:
@@ -338,7 +359,9 @@ else:
         for m in args.m:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
-                    ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                    ret = test_gemm(
+                        dtype, m, n, k, ck_preshuffle=ck_p, use_flydsl=args.flydsl
+                    )
                     df.append(ret)
 
 df = pd.DataFrame(df)
