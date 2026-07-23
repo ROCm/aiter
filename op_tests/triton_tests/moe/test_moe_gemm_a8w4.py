@@ -402,7 +402,9 @@ def test_cdna4_swizzled_scales_with_padded_physical_dims(device="cuda"):
         w_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
     )
 
-    x_static_scale = x_physical.abs().max().float() / 448.0
+    x_static_scale = (
+        x_physical.abs().max().float() / torch.finfo(torch.float8_e4m3fn).max
+    )
     x_tri = downcast_to_static_fp8(x_physical, x_static_scale)
     # unpadded_N/K are dispatch keys only for CDNA4 swizzle; the kernel must
     # still launch over the physical padded tensor dimensions.
