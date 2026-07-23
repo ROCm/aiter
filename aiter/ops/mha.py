@@ -1921,17 +1921,28 @@ def _flash_attn_forward(
         return ret
 
     def _can_impl_fmha_fwd_hd128_bf16_opus():
-        # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
-        # supersedes v3/CK when enabled. Kernel requires seqlen_q == seqlen_k.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        return (hdim_q == 128 and hdim_v == 128) and (seqlen_q == seqlen_k)
+        if not (hdim_q == 128 and hdim_v == 128):
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
+        # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
+        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
+            return False
+        return True
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        return hdim_q == 192 and hdim_v == 128
+        if not (hdim_q == 192 and hdim_v == 128):
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
+        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
+            return False
+        if seqlen_k * v.stride(1) * v.element_size() >= (1 << 32):
+            return False
+        return True
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
