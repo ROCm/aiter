@@ -1096,6 +1096,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 "fused grouped stage1 prep requires bf16 hidden_states "
                 f"(got {hidden_states.dtype}); set AITER_GROUPED_GEMM_NAIVE=1"
             )
+        # ep_scatter contiguous path builds ep_rowmap inside the remap (Opp A);
+        # None => the standalone build_ep_rowmap kernel is used (masked path).
+        _ep_rowmap_prebuilt = None
         if effective_grouped_contiguous_m:
             from aiter.ops.flydsl.moe_kernels import (
                 flydsl_moe_fused_quant_preshuffle,
@@ -1124,9 +1127,29 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 num_valid_routes=_ep_nvr,
             )
             _grouped_dbg("route done, start psum+remap")
+            # Opportunity A: on the contiguous EP path, fold the ep_rowmap build
+            # into the remap pass (it already computes each route's final row) so
+            # the standalone moe_build_ep_rowmap launch is dropped.
+            _ep_remap = None
+            if ep_scatter:
+                _cap_rows = int(route_E) * int(route_max_m)
+                ep_rowmap = torch.empty(
+                    (_cap_rows + 1, 2), dtype=torch.int32, device=device
+                )
+                _ep_rowmap_prebuilt = ep_rowmap
+                _ep_remap = dict(
+                    gather_w=_gather_w_buf,
+                    tis=ep_tis,
+                    ep_rowmap=ep_rowmap,
+                    cap_rows=_cap_rows,
+                    topk=int(topk),
+                    max_tok=int(ep_max_tok),
+                    slot_stride=int(ep_max_tok) * int(ep_topk),
+                )
             _starts_t, psum_t, _ = contiguous_psum_remap(
                 masked_m, topids_to_rows, n_route_buckets, max_m, tile_m,
                 num_valid_routes=_ep_nvr,
+                ep=_ep_remap,
             )
             m_tile_map = psum_t
             rows_to_tokens = None
@@ -1447,19 +1470,24 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             )
         if _gather_w_buf is None:
             raise ValueError("ep_scatter requires the bf16 gather_w buffer")
-        # Build ep_rowmap on-device in a single FlyDSL kernel (was ~20 torch ops).
-        # gather_w (bf16) is 0 for dropped/remote routes -> those rows stay at the
-        # -1 sentinel; topids_to_rows is already the final (contiguous/masked) row.
-        _cap_rows = int(route_E) * int(route_max_m)
-        ep_rowmap = build_ep_rowmap(
-            topids_to_rows,
-            _gather_w_buf,
-            ep_tis,
-            _ep_nvr,
-            _cap_rows,
-            topk,
-            ep_max_tok,
-        )
+        if _ep_rowmap_prebuilt is not None:
+            # Opportunity A: already built inside the contiguous psum+remap pass;
+            # no standalone moe_build_ep_rowmap launch.
+            ep_rowmap = _ep_rowmap_prebuilt
+        else:
+            # Masked path (no contiguous remap): build ep_rowmap in its own kernel.
+            # gather_w (bf16) is 0 for dropped/remote routes -> those rows stay at
+            # the -1 sentinel; topids_to_rows is already the final (masked) row.
+            _cap_rows = int(route_E) * int(route_max_m)
+            ep_rowmap = build_ep_rowmap(
+                topids_to_rows,
+                _gather_w_buf,
+                ep_tis,
+                _ep_nvr,
+                _cap_rows,
+                topk,
+                ep_max_tok,
+            )
     _ep_stage2_kwargs = (
         dict(
             ep_p2p_write=True,
@@ -1719,6 +1747,16 @@ def _get_compiled_contiguous_psum_remap():
 
 
 @functools.cache
+def _get_compiled_contiguous_psum_remap_ep():
+    """psum + remap FUSED with the gemm2 EP ep_rowmap build (Opportunity A)."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_remap_ep_module,
+    )
+
+    return build_moe_contiguous_psum_remap_ep_module()
+
+
+@functools.cache
 def _get_compiled_route_psum_fused():
     """Compile and cache the single-TG fused route+atomic+psum+remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
@@ -1835,8 +1873,13 @@ def contiguous_psum_remap(
     route_max_m: int,
     tile_m: int,
     num_valid_routes: Optional[torch.Tensor] = None,
+    ep: Optional[dict] = None,
 ):
-    """Tile-aligned psum and in-place masked-row -> contiguous-row remap."""
+    """Tile-aligned psum and in-place masked-row -> contiguous-row remap.
+
+    When ``ep`` is given (dict of gather_w/tis/ep_rowmap/cap_rows/topk/max_tok/
+    slot_stride), the same remap pass ALSO scatters the gemm2-fused EP row map
+    (Opportunity A: folds the standalone moe_build_ep_rowmap launch in here)."""
     device = masked_m.device
     experts = int(experts)
     masked_m_i32 = masked_m[:experts].to(torch.int32)
@@ -1854,6 +1897,29 @@ def contiguous_psum_remap(
         num_valid_routes_i32 = num_valid_routes.reshape(-1)[:1].to(
             device=device, dtype=torch.int32
         ).contiguous()
+    if ep is not None:
+        launch = _get_compiled_contiguous_psum_remap_ep()
+        launch(
+            ptr_arg(masked_m_i32),
+            ptr_arg(topids_flat),
+            ptr_arg(starts),
+            ptr_arg(psum),
+            ptr_arg(contiguous_m_t),
+            int(topids_flat.numel()),
+            experts,
+            int(route_max_m),
+            int(tile_m),
+            ptr_arg(num_valid_routes_i32),
+            ptr_arg(ep["gather_w"].reshape(-1)),
+            ptr_arg(ep["tis"].reshape(-1)),
+            ptr_arg(ep["ep_rowmap"].reshape(-1)),
+            int(ep["cap_rows"]),
+            int(ep["topk"]),
+            int(ep["max_tok"]),
+            int(ep["slot_stride"]),
+            stream=torch.cuda.current_stream(),
+        )
+        return starts, psum, contiguous_m_t
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),

@@ -209,14 +209,15 @@ def compile_mxscale_gemm(
             # fused row->dest/weight map is smuggled through), so it is unavailable.
             raise ValueError("ep_p2p_write requires the non-persistent scheduler")
 
-    # Direction D (AITER_EP_P2P_LDS=1): de-interleave the tile into the LDS store
-    # tile, then per-row coalesced P2P. Measured net perf-neutral-to-slightly-worse
-    # vs the per-lane register->remote scatter (gemm2 P2P gets faster but the
-    # coupled combine cross-device barrier absorbs it), so it defaults OFF. The
-    # per-lane epilogue (default) stays the production path; set AITER_EP_P2P_LDS=1
-    # to A/B the LDS-coalesced variant.
+    # Direction D (AITER_EP_P2P_LDS, default ON): de-interleave the tile into the
+    # LDS store tile, then per-row coalesced P2P. The per-lane register->remote
+    # scatter gives each lane a divergent peer base (16 distinct descriptors/wave
+    # -> buffer-store waterfall); the LDS path coalesces the remote writes. On the
+    # DSv4 a8w4 shape (E=384 k=6 hd=7168, 2 ranks) this is a robust ~1.6% end-to-end
+    # win over the per-lane path (gemm2 down-proj ~417 vs ~440 us/call) and matches
+    # or beats gather. Set AITER_EP_P2P_LDS=0 to fall back to the per-lane scatter.
     _ep_lds = ep_p2p_write and (
-        os.environ.get("AITER_EP_P2P_LDS", "0")
+        os.environ.get("AITER_EP_P2P_LDS", "1")
         in ("1", "true", "True", "yes", "on")
     )
 
