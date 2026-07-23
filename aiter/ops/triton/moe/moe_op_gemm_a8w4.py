@@ -3,26 +3,22 @@
 
 import functools
 import itertools
-import json
 import os
+import json
 import warnings
-
 import torch
 import triton
-
-from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
-    _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
-    _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
-)
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
+    _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
+    _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
+)
 from aiter.ops.triton.moe.reduce import reduce_grouped
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
@@ -250,75 +246,75 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
 _GLUON_TUNED_CONFIGS = {
     #                                      block_n  block_k  num_buffers
     # --- K=384 (down-proj, inter_dim=384) ---
-    (16, 7168, 384, "tiny"): (64, 128, 3),
-    (16, 7168, 384, "small"): (64, 128, 3),
-    (16, 7168, 384, "medium"): (64, 128, 3),
-    (16, 7168, 384, "medium2"): (128, 128, 3),
-    (16, 7168, 384, "large"): (256, 128, 1),
-    (16, 7168, 384, "xlarge"): (256, 128, 2),
+    (16, 7168, 384, "tiny"):               (64,     128,     3),
+    (16, 7168, 384, "small"):              (64,     128,     3),
+    (16, 7168, 384, "medium"):             (64,     128,     3),
+    (16, 7168, 384, "medium2"):            (128,    128,     3),
+    (16, 7168, 384, "large"):              (256,    128,     1),
+    (16, 7168, 384, "xlarge"):             (256,    128,     2),
     # --- K=512 (down-proj, inter_dim=512) ---
-    (16, 7168, 512, "tiny"): (64, 256, 3),
-    (16, 7168, 512, "small"): (512, 512, 2),
-    (16, 7168, 512, "medium"): (512, 256, 2),
-    (16, 7168, 512, "medium2"): (512, 512, 1),
-    (16, 7168, 512, "large"): (512, 256, 1),
-    (16, 7168, 512, "xlarge"): (512, 512, 1),
+    (16, 7168, 512, "tiny"):               (64,     256,     3),
+    (16, 7168, 512, "small"):              (512,    512,     2),
+    (16, 7168, 512, "medium"):             (512,    256,     2),
+    (16, 7168, 512, "medium2"):            (512,    512,     1),
+    (16, 7168, 512, "large"):              (512,    256,     1),
+    (16, 7168, 512, "xlarge"):             (512,    512,     1),
     # --- K=768 (down-proj, inter_dim=768) ---
-    (16, 7168, 768, "tiny"): (64, 256, 3),
-    (16, 7168, 768, "small"): (64, 256, 3),
-    (16, 7168, 768, "medium"): (512, 256, 2),
-    (16, 7168, 768, "medium2"): (512, 256, 2),
-    (16, 7168, 768, "large"): (512, 256, 1),
-    (16, 7168, 768, "xlarge"): (512, 256, 2),
+    (16, 7168, 768, "tiny"):               (64,     256,     3),
+    (16, 7168, 768, "small"):              (64,     256,     3),
+    (16, 7168, 768, "medium"):             (512,    256,     2),
+    (16, 7168, 768, "medium2"):            (512,    256,     2),
+    (16, 7168, 768, "large"):              (512,    256,     1),
+    (16, 7168, 768, "xlarge"):             (512,    256,     2),
     # --- K=1536 (down-proj, inter_dim=1536) ---
-    (16, 7168, 1536, "tiny"): (256, 512, 2),
-    (16, 7168, 1536, "small"): (512, 512, 2),
-    (16, 7168, 1536, "medium"): (128, 512, 2),
-    (16, 7168, 1536, "medium2"): (512, 512, 1),
-    (16, 7168, 1536, "large"): (256, 256, 2),
-    (16, 7168, 1536, "xlarge"): (512, 256, 2),
+    (16, 7168, 1536, "tiny"):              (256,    512,     2),
+    (16, 7168, 1536, "small"):             (512,    512,     2),
+    (16, 7168, 1536, "medium"):            (128,    512,     2),
+    (16, 7168, 1536, "medium2"):           (512,    512,     1),
+    (16, 7168, 1536, "large"):             (256,    256,     2),
+    (16, 7168, 1536, "xlarge"):            (512,    256,     2),
     # --- K=2048 (down-proj, inter_dim=2048) ---
-    (16, 4096, 2048, "tiny"): (64, 512, 3),
-    (16, 4096, 2048, "small"): (64, 512, 3),
-    (16, 4096, 2048, "medium"): (128, 512, 2),
-    (16, 4096, 2048, "medium2"): (512, 512, 2),
-    (16, 4096, 2048, "large"): (512, 512, 1),
-    (16, 4096, 2048, "xlarge"): (512, 256, 3),
+    (16, 4096, 2048, "tiny"):              (64,     512,     3),
+    (16, 4096, 2048, "small"):             (64,     512,     3),
+    (16, 4096, 2048, "medium"):            (128,    512,     2),
+    (16, 4096, 2048, "medium2"):           (512,    512,     2),
+    (16, 4096, 2048, "large"):             (512,    512,     1),
+    (16, 4096, 2048, "xlarge"):            (512,    256,     3),
     # --- K=4096 (gate_up, model_dim=4096) ---
-    (16, 4096, 4096, "tiny"): (64, 512, 3),
-    (16, 4096, 4096, "small"): (64, 512, 3),
-    (16, 4096, 4096, "medium"): (128, 512, 2),
-    (16, 4096, 4096, "medium2"): (128, 512, 2),
-    (16, 4096, 4096, "large"): (512, 512, 1),
-    (16, 4096, 4096, "xlarge"): (512, 256, 3),
+    (16, 4096, 4096, "tiny"):              (64,     512,     3),
+    (16, 4096, 4096, "small"):             (64,     512,     3),
+    (16, 4096, 4096, "medium"):            (128,    512,     2),
+    (16, 4096, 4096, "medium2"):           (128,    512,     2),
+    (16, 4096, 4096, "large"):             (512,    512,     1),
+    (16, 4096, 4096, "xlarge"):            (512,    256,     3),
     # --- K=7168, N=768 (gate_up, inter_dim=384) ---
-    (16, 768, 7168, "tiny"): (64, 512, 3),
-    (16, 768, 7168, "small"): (64, 512, 3),
-    (16, 768, 7168, "medium"): (64, 512, 3),
-    (16, 768, 7168, "medium2"): (64, 512, 3),
-    (16, 768, 7168, "large"): (64, 512, 3),
-    (16, 768, 7168, "xlarge"): (256, 512, 2),
+    (16, 768, 7168, "tiny"):               (64,     512,     3),
+    (16, 768, 7168, "small"):              (64,     512,     3),
+    (16, 768, 7168, "medium"):             (64,     512,     3),
+    (16, 768, 7168, "medium2"):            (64,     512,     3),
+    (16, 768, 7168, "large"):              (64,     512,     3),
+    (16, 768, 7168, "xlarge"):             (256,    512,     2),
     # --- K=7168, N=1024 (gate_up, inter_dim=512) ---
-    (16, 1024, 7168, "tiny"): (64, 512, 3),
-    (16, 1024, 7168, "small"): (64, 512, 3),
-    (16, 1024, 7168, "medium"): (64, 512, 3),
-    (16, 1024, 7168, "medium2"): (64, 512, 3),
-    (16, 1024, 7168, "large"): (128, 512, 2),
-    (16, 1024, 7168, "xlarge"): (512, 512, 1),
+    (16, 1024, 7168, "tiny"):              (64,     512,     3),
+    (16, 1024, 7168, "small"):             (64,     512,     3),
+    (16, 1024, 7168, "medium"):            (64,     512,     3),
+    (16, 1024, 7168, "medium2"):           (64,     512,     3),
+    (16, 1024, 7168, "large"):             (128,    512,     2),
+    (16, 1024, 7168, "xlarge"):            (512,    512,     1),
     # --- K=7168, N=1536 (gate_up, inter_dim=768) ---
-    (16, 1536, 7168, "tiny"): (64, 512, 3),
-    (16, 1536, 7168, "small"): (64, 512, 3),
-    (16, 1536, 7168, "medium"): (64, 512, 3),
-    (16, 1536, 7168, "medium2"): (64, 512, 3),
-    (16, 1536, 7168, "large"): (256, 512, 3),
-    (16, 1536, 7168, "xlarge"): (256, 256, 2),
+    (16, 1536, 7168, "tiny"):              (64,     512,     3),
+    (16, 1536, 7168, "small"):             (64,     512,     3),
+    (16, 1536, 7168, "medium"):            (64,     512,     3),
+    (16, 1536, 7168, "medium2"):           (64,     512,     3),
+    (16, 1536, 7168, "large"):             (256,    512,     3),
+    (16, 1536, 7168, "xlarge"):            (256,    256,     2),
     # --- K=7168, N=3072 (gate_up, inter_dim=1536) ---
-    (16, 3072, 7168, "tiny"): (64, 512, 3),
-    (16, 3072, 7168, "small"): (64, 512, 3),
-    (16, 3072, 7168, "medium"): (512, 512, 2),
-    (16, 3072, 7168, "medium2"): (512, 512, 2),
-    (16, 3072, 7168, "large"): (256, 256, 2),
-    (16, 3072, 7168, "xlarge"): (512, 256, 3),
+    (16, 3072, 7168, "tiny"):              (64,     512,     3),
+    (16, 3072, 7168, "small"):             (64,     512,     3),
+    (16, 3072, 7168, "medium"):            (512,    512,     2),
+    (16, 3072, 7168, "medium2"):           (512,    512,     2),
+    (16, 3072, 7168, "large"):             (256,    256,     2),
+    (16, 3072, 7168, "xlarge"):            (512,    256,     3),
 }
 
 
@@ -521,6 +517,8 @@ def moe_gemm_a8w4(
             "scatter+combine would need fp8-aware reduce_grouped"
         )
         out_dtype = torch.float8_e4m3fn
+    else:
+        out_dtype = out_dtype
     y, y_final = allocate_output(
         M,
         padded_N,
