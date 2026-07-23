@@ -93,8 +93,7 @@ def run_benchmark(args):
     weighted = bool(args.weighted)
 
     @triton.testing.perf_report([benchmark])
-    def bench_fused_clamp_act_mul(M, N, metric, **kwargs):
-        n_half = N
+    def bench_fused_clamp_act_mul(M, n_half, metric, **kwargs):
         inp = torch.randn((M, 2 * n_half), dtype=dtype, device="cuda") * 3.0
         weights = (
             torch.randn((M, 1), dtype=dtype, device="cuda") if weighted else None

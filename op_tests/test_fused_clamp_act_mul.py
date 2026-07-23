@@ -186,7 +186,7 @@ def test_fused_clamp_act_mul(
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "fused_clamp_act_mul unsupported on %s; skipping", get_gfx()
+            f"fused_clamp_act_mul unsupported on {get_gfx()}; skipping"
         )
         return
 
@@ -245,7 +245,7 @@ def main():
                 backend = "gluon" if _is_gluon_available() else "triton"
             elif backend == "gluon" and not _is_gluon_available():
                 aiter.logger.warning(
-                    "gluon backend unavailable on %s; skipping", get_gfx()
+                    f"gluon backend unavailable on {get_gfx()}; skipping"
                 )
                 continue
             df.append(
@@ -255,9 +255,8 @@ def main():
             )
         df = pd.DataFrame(df)
         aiter.logger.info(
-            "fused_clamp_act_mul summary (dtype=%s, markdown):\n%s",
-            dtype,
-            df.to_markdown(index=False),
+            f"fused_clamp_act_mul summary (dtype={dtype}, markdown):\n"
+            f"{df.to_markdown(index=False)}"
         )
 
 
