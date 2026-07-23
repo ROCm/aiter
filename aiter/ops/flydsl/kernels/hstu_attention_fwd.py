@@ -114,7 +114,11 @@ def _waitcnt_vm_n(n: int):
     lgkmcnt_expcnt_base = 0x3F70
     vmcnt_hi_shift = 14
     vmcnt_hi_mask = 0x3
-    val = (n & vmcnt_lo_mask) | lgkmcnt_expcnt_base | (((n >> 4) & vmcnt_hi_mask) << vmcnt_hi_shift)
+    val = (
+        (n & vmcnt_lo_mask)
+        | lgkmcnt_expcnt_base
+        | (((n >> 4) & vmcnt_hi_mask) << vmcnt_hi_shift)
+    )
     rocdl.s_waitcnt(val)
 
 
@@ -140,7 +144,9 @@ def validate_hstu_attention_fwd(
     if arch is None:
         arch = get_rocm_arch()
     if not arch.startswith("gfx942") and not arch.startswith("gfx950"):
-        raise ValueError(f"hstu_attention_fwd unsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')")
+        raise ValueError(
+            f"hstu_attention_fwd unsupported arch: {arch!r} (expected 'gfx942' or 'gfx950')"
+        )
 
     if dtype_str not in {"f16", "bf16"}:
         raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
@@ -150,7 +156,9 @@ def validate_hstu_attention_fwd(
     if not causal:
         raise ValueError("hstu_attention_fwd only supports causal attention")
     if contextual_seq_len < 0:
-        raise ValueError(f"contextual_seq_len must be non-negative, got {contextual_seq_len}")
+        raise ValueError(
+            f"contextual_seq_len must be non-negative, got {contextual_seq_len}"
+        )
     if max_attn_len < 0:
         raise ValueError(f"max_attn_len must be non-negative, got {max_attn_len}")
     if batch <= 0:
@@ -162,11 +170,17 @@ def validate_hstu_attention_fwd(
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
     if head_dim <= 0 or head_dim % MFMA_K != 0:
-        raise ValueError(f"head_dim must be positive and a multiple of MFMA_K={MFMA_K}, got {head_dim}")
+        raise ValueError(
+            f"head_dim must be positive and a multiple of MFMA_K={MFMA_K}, got {head_dim}"
+        )
     if hidden_dim <= 0 or hidden_dim % MFMA_M != 0:
-        raise ValueError(f"hidden_dim must be positive and a multiple of MFMA_M={MFMA_M}, got {hidden_dim}")
+        raise ValueError(
+            f"hidden_dim must be positive and a multiple of MFMA_M={MFMA_M}, got {hidden_dim}"
+        )
     if (batch * num_heads) % NUM_GRID_GROUPS != 0:
-        raise ValueError(f"require (batch*num_heads) % {NUM_GRID_GROUPS} == 0, got {batch * num_heads}")
+        raise ValueError(
+            f"require (batch*num_heads) % {NUM_GRID_GROUPS} == 0, got {batch * num_heads}"
+        )
 
     if block_m <= 0:
         raise ValueError(f"block_m must be positive, got {block_m}")
@@ -177,7 +191,9 @@ def validate_hstu_attention_fwd(
     if waves_per_eu < 0:
         raise ValueError(f"waves_per_eu must be non-negative, got {waves_per_eu}")
     if block_m % (num_waves * MFMA_M) != 0:
-        raise ValueError(f"block_m {block_m} must be a multiple of num_waves*MFMA_M ({num_waves * MFMA_M})")
+        raise ValueError(
+            f"block_m {block_m} must be a multiple of num_waves*MFMA_M ({num_waves * MFMA_M})"
+        )
     if block_n % MFMA_M != 0:
         raise ValueError(f"block_n {block_n} must be a multiple of MFMA_M={MFMA_M}")
 
@@ -190,10 +206,16 @@ def validate_hstu_attention_fwd(
     if (block_n * hidden_dim) % elems_per_dma_pass != 0:
         raise ValueError("V DMA tile does not divide the dword DMA pass evenly")
 
-    vec_v = 8 if (hidden_dim % 8 == 0 and (block_n * hidden_dim) % (block_threads * 8) == 0) else dma_elems
+    vec_v = (
+        8
+        if (hidden_dim % 8 == 0 and (block_n * hidden_dim) % (block_threads * 8) == 0)
+        else dma_elems
+    )
     threads_per_row_v = hidden_dim // vec_v
     if block_threads % threads_per_row_v != 0:
-        raise ValueError(f"block_threads={block_threads} must be divisible by threads_per_row_v={threads_per_row_v}")
+        raise ValueError(
+            f"block_threads={block_threads} must be divisible by threads_per_row_v={threads_per_row_v}"
+        )
     rows_per_batch_v = block_threads // threads_per_row_v
     if not (block_n % rows_per_batch_v == 0 or rows_per_batch_v > block_n):
         raise ValueError(
@@ -307,7 +329,11 @@ def build_hstu_attention_fwd(
     # of one V row, coalesced (dwordx{VEC_V//2}). One pass = ROWS_PER_BATCH_V rows; NUM_BATCHES_V
     # passes cover the BLOCK_N×hidden_dim tile. Coalesced AND overlappable (register dest, not
     # buffer_load_lds), so the load can stay in flight across GEMM1 under a counted vmcnt.
-    VEC_V = 8 if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0) else DMA_ELEMS
+    VEC_V = (
+        8
+        if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0)
+        else DMA_ELEMS
+    )
     THREADS_PER_ROW_V = hidden_dim // VEC_V
     assert BLOCK_THREADS % THREADS_PER_ROW_V == 0
     ROWS_PER_BATCH_V = BLOCK_THREADS // THREADS_PER_ROW_V
@@ -347,7 +373,9 @@ def build_hstu_attention_fwd(
 
         # ---- Thread / lane indices (layout-algebra decode) ----
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(tid, NUM_WAVES, WARP_SIZE, MFMA_N)
+        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+            tid, NUM_WAVES, WARP_SIZE, MFMA_N
+        )
 
         # ---- Group-major grid decode -> (batch_idx, head_idx, q_tile_idx) ----
         block_id = fx.Int32(gpu.block_idx.x)
@@ -379,13 +407,17 @@ def build_hstu_attention_fwd(
         # loads. The row*row_stride term is carried in 64-bit by the tensor arg's own i64-strided
         # layout, so the base address cannot overflow on large packed tensors.
         q_load = grouped_loader(q, head_dim, MFMA_LANE_K)
-        v_load = grouped_loader(v, hidden_dim, VEC_V)  # V register-prefetch path (coalesced global -> regs)
+        v_load = grouped_loader(
+            v, hidden_dim, VEC_V
+        )  # V register-prefetch path (coalesced global -> regs)
 
         q_head_offset = head_idx * fx.Int32(head_dim)
 
         # ---- K DMA base (per-(seq,head) byte offset folded into the rebased descriptor) ----
         # V uses a register-prefetch path (async_load_v_regs via v_load), not a buffer resource.
-        k_base_byte_offset = (fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)) * fx.Int64(2)
+        k_base_byte_offset = (
+            fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
+        ) * fx.Int64(2)
 
         # LDS as shape-carried 2D views: [BLOCK_N, stride] so an LDS access is Vec.load/store on
         # (row, col) with the stride carried by the memref layout (no manual row*stride+col). The
@@ -396,17 +428,24 @@ def build_hstu_attention_fwd(
         # VEC_V) so a load/store is view[row, colgrp, None].load()/.store(); the trailing group axis
         # carries the stride (no manual row*stride+col). V reads gather single [kv, d] scalars.
         k_read_view = lds.k.view(
-            fx.make_layout((BLOCK_N, K_STRIDE // MFMA_LANE_K, MFMA_LANE_K), (K_STRIDE, MFMA_LANE_K, 1))
+            fx.make_layout(
+                (BLOCK_N, K_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (K_STRIDE, MFMA_LANE_K, 1),
+            )
         )
         # One V view (grouped by VEC_V) serves both the coalesced publish store and the scalar GEMM2
         # gather, so only a single LDS base pointer stays live (register-pressure sensitive).
-        v_view = lds.v.view(fx.make_layout((BLOCK_N, V_STRIDE // VEC_V, VEC_V), (V_STRIDE, VEC_V, 1)))
+        v_view = lds.v.view(
+            fx.make_layout((BLOCK_N, V_STRIDE // VEC_V, VEC_V), (V_STRIDE, VEC_V, 1))
+        )
         k_lds_byte_base = buffer_ops.extract_base_index(k_read_view, address_space=3)
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
         # A BufferCopyLDS atom drives the buffer_load_lds instruction through the FlyDSL copy-atom.
         # The atom hardcodes the cache-policy/aux operand to 0.
-        _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8)
+        _dma_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8
+        )
         _lds_ptr_ty = fx.PointerType.get(elem_type, 2, DMA_BYTES)
 
         def _rebased_buffer_div(base_iter, byte_off, n_elems):
@@ -417,11 +456,17 @@ def build_hstu_attention_fwd(
             base_i64 = fx.Int64(fx.ptrtoint(base_iter))
             shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
             g_flat = fx.rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(shifted, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))))
+                fx.Tensor(
+                    fx.make_view(
+                        shifted, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))
+                    )
+                )
             )
             return fx.logical_divide(g_flat, fx.make_layout(1, 1))
 
-        k_div = _rebased_buffer_div(fx.get_iter(k), k_base_byte_offset, max_seq_len * stride_qk_n)
+        k_div = _rebased_buffer_div(
+            fx.get_iter(k), k_base_byte_offset, max_seq_len * stride_qk_n
+        )
 
         # Single source of truth for the K LDS swizzle (shared): XOR the column with the tile row's
         # low bits. Shared by the DMA global-fetch column and the LDS read column.
@@ -441,11 +486,15 @@ def build_hstu_attention_fwd(
         # ---- Q B-operand packs (register-resident, per query sub-tile) ----
         q_packs = []  # q_packs[ks][qg]
         for ks in range_constexpr(K_STEPS):
-            q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)  # column within the head
+            q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(
+                MFMA_LANE_K
+            )  # column within the head
             per_qg = []
             for qg in range_constexpr(Q_SUBTILES):
                 safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
-                raw = q_load(fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_LANE_K)).ir_value()
+                raw = q_load(
+                    fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_LANE_K)
+                ).ir_value()
                 per_qg.append(q_in_bounds[qg].select(raw, c_zero_mfma_pack))
             q_packs.append(per_qg)
 
@@ -540,7 +589,9 @@ def build_hstu_attention_fwd(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row_k = fx.Int32(PAIRS_PER_ROW_K)
 
-        wave_lds_base_k = fx.Int64(k_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(WARP_SIZE * DMA_BYTES)
+        wave_lds_base_k = fx.Int64(k_lds_byte_base) + fx.Int64(wave_id) * fx.Int64(
+            WARP_SIZE * DMA_BYTES
+        )
         wave_lds_lane0_k = rocdl.readfirstlane(fx.Int64.ir_type, wave_lds_base_k)
         k_dma_rows = []
         k_dma_gcols = []
@@ -562,8 +613,12 @@ def build_hstu_attention_fwd(
                 in_bounds = (kv_start + row) < seq_len
                 local_tok = in_bounds.select(kv_start + row, fx.Int32(0))
                 src_elem = local_tok * c_stride_qk_n + k_dma_gcols[d]
-                lds_byte = fx.Int32(wave_lds_lane0_k + fx.Int64(d * BLOCK_THREADS * DMA_BYTES))
-                dst = fx.make_view(fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1))
+                lds_byte = fx.Int32(
+                    wave_lds_lane0_k + fx.Int64(d * BLOCK_THREADS * DMA_BYTES)
+                )
+                dst = fx.make_view(
+                    fx.inttoptr(_lds_ptr_ty, lds_byte), fx.make_layout(1, 1)
+                )
                 src = fx.slice(k_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
@@ -585,8 +640,12 @@ def build_hstu_attention_fwd(
                 if V_NEEDS_GUARD:
                     in_bounds = in_bounds & (row < fx.Int32(BLOCK_N))
                 safe_tok = in_bounds.select(seq_start + tok, seq_start)
-                raw = v_load(fx.Int64(safe_tok), head_idx, v_load_col // fx.Int32(VEC_V)).ir_value()
-                vecs.append(in_bounds.select(raw, Vec.filled(VEC_V, 0.0, elem_dtype).ir_value()))
+                raw = v_load(
+                    fx.Int64(safe_tok), head_idx, v_load_col // fx.Int32(VEC_V)
+                ).ir_value()
+                vecs.append(
+                    in_bounds.select(raw, Vec.filled(VEC_V, 0.0, elem_dtype).ir_value())
+                )
             return vecs
 
         def store_v_regs_to_lds(vecs):
@@ -604,20 +663,39 @@ def build_hstu_attention_fwd(
                 k_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
                 # swz_col is MFMA_LANE_K-aligned (k_col and the swizzle shift are both >= that
                 # granularity), so //MFMA_LANE_K selects the packed-vector group.
-                packs.append(k_read_view[k_row, k_swz_col(k_row, k_col) // fx.Int32(MFMA_LANE_K), None].load())
+                packs.append(
+                    k_read_view[
+                        k_row, k_swz_col(k_row, k_col) // fx.Int32(MFMA_LANE_K), None
+                    ].load()
+                )
             return packs
 
         def compute_p_tile(kv_start, k_packs_by_ng):
             """Q·K^T MFMA, apply the mask, silu-gate -> P packs for one KV tile.
 
             k_packs_by_ng: LDS-read A-operand packs [ng][ks] from `read_k_packs`."""
-            p_packs = [[None for _ in range_constexpr(Q_SUBTILES)] for _ in range_constexpr(KV_SUBTILES)]
+            p_packs = [
+                [None for _ in range_constexpr(Q_SUBTILES)]
+                for _ in range_constexpr(KV_SUBTILES)
+            ]
             for ng in range_constexpr(KV_SUBTILES):
-                k_packs = [Vec(k_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)]
-                kv_base = kv_start + fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                col_raw = [kv_base + fx.Int32(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                col_in_seq = [col_raw[i] < seq_len for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                col_id = [to_id(col_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                k_packs = [
+                    Vec(k_packs_by_ng[ng][ks]) for ks in range_constexpr(K_STEPS_K)
+                ]
+                kv_base = (
+                    kv_start
+                    + fx.Int32(ng * MFMA_M)
+                    + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                )
+                col_raw = [
+                    kv_base + fx.Int32(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
+                col_in_seq = [
+                    col_raw[i] < seq_len for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
+                col_id = [
+                    to_id(col_raw[i]) for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                ]
                 for qg in range_constexpr(Q_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(K_STEPS_K):
@@ -638,7 +716,10 @@ def build_hstu_attention_fwd(
                         keep = keep & col_in_seq[i]
                         return keep
 
-                    s_vals = [keep_col(i).select(s_vals[i], c_zero_f) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
+                    s_vals = [
+                        keep_col(i).select(s_vals[i], c_zero_f)
+                        for i in range_constexpr(MFMA_ELEMS_PER_LANE)
+                    ]
                     p_packs[ng][qg] = pack_p(silu_scale_batch(s_vals))
             return p_packs
 
@@ -652,12 +733,17 @@ def build_hstu_attention_fwd(
                 v_packs = []
                 for ng in range_constexpr(KV_SUBTILES):
                     d_col = fx.Int32(c * MFMA_M) + lane_mod_16  # d index (N of GEMM2)
-                    kv_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)  # base kv
+                    kv_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(
+                        MFMA_LANE_K
+                    )  # base kv
                     # b[i] = V[kv_lane + i, d_col]; scalar-gathered from the VEC_V-grouped V view
                     # (col d_col -> group d_col//VEC_V, lane d_col%VEC_V).
                     d_grp = d_col // fx.Int32(VEC_V)
                     d_lane = d_col % fx.Int32(VEC_V)
-                    elems = [v_view[kv_lane + fx.Int32(i), d_grp, d_lane] for i in range_constexpr(MFMA_LANE_K)]
+                    elems = [
+                        v_view[kv_lane + fx.Int32(i), d_grp, d_lane]
+                        for i in range_constexpr(MFMA_LANE_K)
+                    ]
                     v_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
                 for qg in range_constexpr(Q_SUBTILES):
                     acc_off = c * Q_SUBTILES + qg
@@ -671,19 +757,27 @@ def build_hstu_attention_fwd(
         # V is prefetched by ordinary global loads, so the K publish barrier does not drain it.
         # GEMM1 runs while V is in flight; vmcnt(0) drains V before the LDS publish for GEMM2.
         # Only the O accumulators are loop-carried.
-        v_reg_outstanding = NUM_BATCHES_V  # V register loads kept in flight while waiting on K
+        v_reg_outstanding = (
+            NUM_BATCHES_V  # V register loads kept in flight while waiting on K
+        )
 
         def run_kv_tile(o_acc, kv_start):
             """K staged global->LDS by swizzled DMA; V register-prefetched."""
             async_load_k(kv_start)  # K[i] global -> LDS (GEMM1 A-operand)
             v_vecs = async_load_v_regs(kv_start)  # V[i] global -> regs, in flight
-            _waitcnt_vm_n(v_reg_outstanding)  # wait K[i] DMA only; V[i] stays outstanding
+            _waitcnt_vm_n(
+                v_reg_outstanding
+            )  # wait K[i] DMA only; V[i] stays outstanding
             gpu.barrier()  # K[i] LDS published (V[i] regs survive the barrier)
             k_packs = [read_k_packs(ng) for ng in range_constexpr(KV_SUBTILES)]
-            p_packs = compute_p_tile(kv_start, k_packs)  # GEMM1(i) overlaps V[i] global load
+            p_packs = compute_p_tile(
+                kv_start, k_packs
+            )  # GEMM1(i) overlaps V[i] global load
             _waitcnt_vm_n(0)  # V[i] arrived
             store_v_regs_to_lds(v_vecs)
-            rocdl.sched_dswr(NUM_BATCHES_V)  # keep the NUM_BATCHES_V V LDS writes grouped
+            rocdl.sched_dswr(
+                NUM_BATCHES_V
+            )  # keep the NUM_BATCHES_V V LDS writes grouped
             gpu.barrier()  # V[i] LDS published
             o_acc = accum_o_tile(o_acc, p_packs)  # GEMM2(i): O += P·V
             # The next iteration's K publish barrier also fences GEMM2(i)'s V LDS reads before
@@ -706,10 +800,18 @@ def build_hstu_attention_fwd(
             # GEMM2 writes a transposed C fragment: A=P, B=V, C[d, query].
             # tid%16 = d (N-dim), and (lane_div_16, e) = query (M-dim). The query row stored is
             # therefore q_wave_base + qg*16 + lane_div_16*4 + e; the d column is c*16 + lane_mod_16.
-            results = list(loop_results) if isinstance(loop_results, (list, tuple)) else [loop_results]
+            results = (
+                list(loop_results)
+                if isinstance(loop_results, (list, tuple))
+                else [loop_results]
+            )
             with arith.fastmath(arith.FastMathFlags.fast):
                 for qg in range_constexpr(Q_SUBTILES):
-                    q_row_base = q_wave_base + fx.Int32(qg * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    q_row_base = (
+                        q_wave_base
+                        + fx.Int32(qg * MFMA_M)
+                        + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                    )
                     for e in range_constexpr(MFMA_ELEMS_PER_LANE):
                         q_row_e = q_row_base + fx.Int32(e)
                         if q_row_e < seq_len:
@@ -717,7 +819,9 @@ def build_hstu_attention_fwd(
                                 ov = results[c * Q_SUBTILES + qg]
                                 d_col = fx.Int32(c * MFMA_M) + lane_mod_16
                                 val = (Vec(ov)[e] * c_inv_n).to(elem_dtype)
-                                out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = val
+                                out[fx.Int64(seq_start + q_row_e), head_idx, d_col] = (
+                                    val
+                                )
 
     _hstu_compile_hints = {
         "fast_fp_math": True,

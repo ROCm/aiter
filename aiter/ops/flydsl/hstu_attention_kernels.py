@@ -51,6 +51,7 @@ _CSV_COLUMNS: list[str] = [
     "duration",
 ]
 
+
 def _problem_key(
     arch: str,
     dtype: str,
@@ -81,9 +82,7 @@ def _problem_key(
 def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
     def _parse_row(row: dict) -> tuple[tuple, float, dict]:
         if set(row.keys()) != set(_CSV_COLUMNS):
-            raise KeyError(
-                f"unexpected columns: {set(row.keys()) ^ set(_CSV_COLUMNS)}"
-            )
+            raise KeyError(f"unexpected columns: {set(row.keys()) ^ set(_CSV_COLUMNS)}")
 
         duration = float(row["duration"])
 

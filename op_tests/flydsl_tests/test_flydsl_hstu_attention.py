@@ -218,7 +218,9 @@ def test_hstu_attention_fwd(
         ),
     }
 
-    flops, nbytes = _roofline(seq_offsets, num_heads, head_dim, hidden_dim, q.element_size())
+    flops, nbytes = _roofline(
+        seq_offsets, num_heads, head_dim, hidden_dim, q.element_size()
+    )
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
