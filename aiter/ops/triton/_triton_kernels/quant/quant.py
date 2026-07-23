@@ -455,6 +455,77 @@ def _dynamic_mxfp8_quant_kernel(
         )
 
 
+@triton.jit
+def _dynamic_mxfp8_quant_n32k4_mbn_kernel(
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    R,  # total rows = M_tok * B
+    N,  # K
+    B,  # batch (n_groups in the mbn sense; here the middle dim)
+    stride_xm,
+    stride_xn,
+    stride_ym,
+    stride_yn,
+    S_SUPER,  # (K//32)*32 = bytes per (super, batch) e8m0 block
+    BLOCK_SIZE_N: tl.constexpr,  # power-of-2 covering full N
+    QUANT_BLOCK_SIZE: tl.constexpr,  # =32
+    NUM_PRGMS: tl.constexpr,
+):
+    """Per-1x32 MXFP8 quant that writes the e8m0 scale *directly* in the n32k4
+    (mbn) layout the batched a8w4 kernel reads -- fusing the quant + scale
+    preshuffle so no separate transpose/permute copies are needed.
+
+    Input rows are ordered ``r = m*B + b`` (mbn: [M_tok, B, K] contiguous).
+    The fp8 payload is written row-major (== mbn [M_tok, B, K]).  The scale for
+    (row m, batch b, group g) lands at::
+
+        s[(super*B + b)*S_SUPER + (g//4)*128 + (m%32)*4 + (g%4)]
+
+    with ``super = m//32`` -- i.e. the [M_tok//32, B, (K//32)*32] n32k4 buffer
+    (column order ``remain_k*128 + row32*4 + r``, matching shuffle_scale_n32k4).
+    The destination buffer must be pre-zeroed so padded (m >= M_tok) supers are
+    benign.
+    """
+    row_start = tl.program_id(0)
+    col_offsets = tl.arange(0, BLOCK_SIZE_N)
+    mask = col_offsets < N
+    n_groups: tl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE
+
+    for row_idx in tl.range(row_start, R, NUM_PRGMS, num_stages=2):
+        x = tl.load(
+            x_ptr + row_idx * stride_xm + col_offsets * stride_xn,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        x_2d = tl.reshape(x, (n_groups, QUANT_BLOCK_SIZE))
+        scale_e8m0, quant_scale = _mxfp8_quant_op(x_2d, QUANT_AXIS=1)
+
+        qx_2d = x_2d * quant_scale
+        qx = tl.reshape(qx_2d, (BLOCK_SIZE_N,))
+        y = qx.to(y_ptr.type.element_ty)
+        tl.store(
+            y_ptr + row_idx * stride_ym + col_offsets * stride_yn,
+            y,
+            mask=mask,
+        )
+
+        # Decompose the flat mbn row into (token m, batch b) and scatter each
+        # group's e8m0 byte to its n32k4 destination.
+        m = row_idx // B
+        b = row_idx % B
+        super_idx = m // 32
+        row32 = m % 32
+        base = (super_idx * B + b) * S_SUPER + row32 * 4
+
+        g = tl.arange(0, n_groups)
+        group_mask = g < (N // QUANT_BLOCK_SIZE)
+        dst = base + (g // 4) * 128 + (g % 4)
+        scale_flat = tl.reshape(scale_e8m0, (n_groups,))
+        tl.store(s_ptr + dst, scale_flat, mask=group_mask)
+
+
 # Transcoder: (FP8 fnuz, fp32 1x128 scale) -> (FP8 fn, e8m0 1x32 scale).
 # Replaces the Python dequant+requant cascade (fp32 cast + multiply + bf16 cast
 # + per_1x32_mxfp8 quant) used in linear.py's MXFP8 fallback path for MLA wq_b
