@@ -78,13 +78,16 @@ def _gfx942_tile_fits_lds(
 
 
 # Runtime autotune for the gfx942 non-gluon indexer tile. Candidates are
-# pre-filtered to those that fit LDS at occupancy=1 (a single workgroup's
-# tile <= 0.9*64KB), so none can trigger a JIT/LDS-overflow abort; among
-# those we micro-benchmark and keep the fastest, cached per (head_size,
-# seq_len bucket). This replaces the old static occupancy=2 heuristic: no
-# hard-coded tile -- long prefill keeps (128,2), short/occupancy-bound
-# shapes can pick a smaller tile if it actually benchmarks faster.
-_GFX942_MQA_TILE_CANDS = [(128, 2), (64, 1), (64, 2), (128, 1)]
+# pre-pruned by a KV-tile LDS estimate at occupancy=1, then each is tried
+# under a guarded probe/benchmark: any tile that fails to compile (e.g. an
+# older Triton that spills Q/scores to LDS and overflows 64KB) is skipped,
+# never fatal, and we fall back through smaller tiles down to (64,1) -- the
+# config #3257 validated as crash-safe for the DSv4 indexer on MI300X.
+# Among the tiles that compile we keep the fastest, cached per (head_size,
+# seq_len bucket). Replaces the static occupancy=2 gate: no hard-coded tile
+# -- long prefill keeps (128,2); short/occupancy-bound shapes pick a smaller
+# tile when it actually benchmarks faster.
+_GFX942_MQA_TILE_CANDS = [(128, 2), (128, 1), (64, 2), (64, 1)]
 _gfx942_mqa_tile_cache = {}
 
 
@@ -95,11 +98,24 @@ def _mqa_seq_bucket(seq_len: int) -> int:
     return 1 << 20
 
 
+def _probe_ok(launch, bk, ns) -> bool:
+    # Compile + run once; catches an LDS-overflow JIT abort (e.g. an older
+    # Triton that spills Q/scores to LDS) so a too-big tile is rejected, not fatal.
+    try:
+        launch(bk, ns)
+        return True
+    except Exception:
+        return False
+
+
 def _autotune_gfx942_mqa_tile(head_size: int, seq_len: int, launch):
     key = (head_size, _mqa_seq_bucket(seq_len))
     cached = _gfx942_mqa_tile_cache.get(key)
     if cached is not None:
         return cached
+    # Pre-prune by the KV-tile LDS estimate at occupancy=1 (single-workgroup
+    # upper bound); the guarded probe/bench below is what actually guarantees
+    # the chosen tile compiles.
     cands = [
         (bk, ns)
         for (bk, ns) in _GFX942_MQA_TILE_CANDS
@@ -111,20 +127,33 @@ def _autotune_gfx942_mqa_tile(head_size: int, seq_len: int, launch):
         from triton.testing import do_bench
     except Exception:
         do_bench = None
-    # No benchmarking available -> largest LDS-safe tile (first candidate).
-    if do_bench is None:
-        _gfx942_mqa_tile_cache[key] = cands[0]
-        return cands[0]
-    best, best_t = cands[0], float("inf")
-    for bk, ns in cands:
-        try:
-            t = do_bench(lambda bk=bk, ns=ns: launch(bk, ns), warmup=3, rep=8)
-        except Exception:
-            continue
-        if t < best_t:
-            best_t, best = t, (bk, ns)
+
+    best = None
+    if do_bench is not None:
+        best_t = float("inf")
+        for bk, ns in cands:
+            try:
+                t = do_bench(lambda bk=bk, ns=ns: launch(bk, ns), warmup=3, rep=8)
+            except Exception:
+                continue  # won't compile/fit on this Triton -> skip (never fatal)
+            if t < best_t:
+                best_t, best = t, (bk, ns)
+    else:
+        # No benchmarking: probe-compile in preference order, take the first
+        # tile that actually runs (keeps fast (128,2) when it compiles).
+        for bk, ns in cands:
+            if _probe_ok(launch, bk, ns):
+                best = (bk, ns)
+                break
+
+    if best is None:
+        # Every candidate failed to compile (e.g. an old Triton on a large
+        # head_size). Fall back to the smallest tile -- the (64, 1) config
+        # #3257 validated as crash-safe for the DSv4 indexer on MI300X.
+        best = (64, 1)
     _gfx942_mqa_tile_cache[key] = best
     return best
+
 
 
 def fp8_mqa_logits(
@@ -232,8 +261,8 @@ def fp8_mqa_logits(
                 matrix_instr_nonkdim=matrix_instr_nonkdim,
             )
 
-        # Runtime-autotuned tile on gfx942 (candidates pre-pruned to fit LDS
-        # at occupancy=1, so none can JIT-abort); cached per (head_size, seq).
+        # Runtime-autotuned tile on gfx942: pre-pruned by the occupancy=1 LDS
+        # estimate, then guarded-probed so a too-big tile is skipped (never fatal).
         if arch == "gfx942":
             block_kv, num_stages = _autotune_gfx942_mqa_tile(
                 head_size, seq_len, _launch
