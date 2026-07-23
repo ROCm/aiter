@@ -6737,7 +6737,7 @@ def compile_mixed_moe_gemm1_a16w4(
                     for _mi in range_constexpr(m_repeat):
                         for _ni in range_constexpr(num_acc_n):
                             _aidx = _mi * num_acc_n + _ni
-                            _bsplat = vector.splat(vec4_f32, _bias_gate_vals[_ni])
+                            _bsplat = vector.broadcast(vec4_f32, _bias_gate_vals[_ni])
                             acc_gate[_aidx] = arith.addf(acc_gate[_aidx], _bsplat)
 
                     if not (gate_only or gate_up_interleave):
@@ -6757,7 +6757,7 @@ def compile_mixed_moe_gemm1_a16w4(
                         for _mi in range_constexpr(m_repeat):
                             for _ni in range_constexpr(num_acc_n):
                                 _aidx = _mi * num_acc_n + _ni
-                                _bsplat = vector.splat(vec4_f32, _bias_up_vals[_ni])
+                                _bsplat = vector.broadcast(vec4_f32, _bias_up_vals[_ni])
                                 acc_up[_aidx] = arith.addf(acc_up[_aidx], _bsplat)
 
                 # ---- Epilogue ----
