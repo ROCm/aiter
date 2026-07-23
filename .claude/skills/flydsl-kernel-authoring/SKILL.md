@@ -489,7 +489,7 @@ Use `Vec.filled(...)` for splats and `Vec.from_elements(...)` for vectors from s
 | Multiply | `a * b` | Yes | Use direct FOp only for explicit fastmath |
 | Negate | `-a` | Yes | |
 | Max | `a.maximumf(b)` | Yes | Good for ReLU |
-| Compare | `a < b`, `a == b`, `a > b` | Yes | Operators; keep `arith.cmpf(...)` only for fastmath/unordered predicates |
+| Compare | `a < b`, `a == b`, `a > b` | Yes | Boolean result (i1 / vec<i1>) |
 | Select | `cond.select(t, f)` | Yes | |
 | Abs | no direct helper | Use `-v`, comparison, and `cond.select(...)` |
 | FMA | `a * b + c` | Yes | Use direct FOp only when explicit fastmath is needed |
