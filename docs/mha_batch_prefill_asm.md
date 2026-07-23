@@ -21,7 +21,7 @@ Two `.co` binaries are shipped and selected automatically by `page_block_size`:
 | `page_block_size` | Kernel `.co` | Addressing |
 |---|---|---|
 | `16` | `fmha_fwd_hd128_fp8_causal_qkptph_vph_ps.co` | 16-token pages; full 64-bit K/V/`k_descale` addressing (per-lane `global_load`), so KV pools >4GB (and `k_descale` pools >2GB) are supported. |
-| `64` | `fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64.co` | 64-token pages; scalar per-page SRD-rebase 64-bit addressing (multi-TB KV pool reachable without per-lane 64-bit VALU). |
+| `64` | `fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64_ptl.co` | 64-token pages; PTL=1 tuned scalar per-page SRD-rebase 64-bit addressing (multi-TB KV pool reachable without per-lane 64-bit VALU). |
 
 Both are causal, persistent-scheduler, packed-varlen, freeze-max builds. The
 launcher is otherwise identical — it derives every stride/pointer from the input
