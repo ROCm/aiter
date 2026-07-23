@@ -136,9 +136,36 @@ class _FakeExecutable:
         )
 
 
+class _RecorderBackend:
+    """Resolve registered builders without entering the real FlyDSL compiler."""
+
+    def __init__(self, recorder: "_RequestRecorder") -> None:
+        self.recorder = recorder
+        self.calls: list[tuple[str, str]] = []
+
+    def _artifact(self, mode: str, unit: Any, context: Any, *, consume: bool):
+        self.calls.append((mode, unit.spec.op_id))
+        launcher = context.registry.compile(unit)
+        if consume:
+            self.recorder.run_moe_compiled(launcher, ())
+        return types.SimpleNamespace(launcher=launcher, unit=unit)
+
+    def compile_aot(self, unit: Any, *, context: Any):
+        return self._artifact("compile", unit, context, consume=True)
+
+    def load_aot(self, unit: Any, *, context: Any, strict: bool = True):
+        if not strict:
+            raise AssertionError("recorder only supports strict loads")
+        return self._artifact("load", unit, context, consume=True)
+
+    def resolve_aot(self, unit: Any, *, context: Any):
+        return self._artifact("resolve", unit, context, consume=False)
+
+
 @dataclass(frozen=True)
 class _HostImports:
     flyc: types.ModuleType
+    aot_backend: types.ModuleType
     moe: types.ModuleType
     mixed_gemm: types.ModuleType
     standard_gemm: types.ModuleType
@@ -251,6 +278,7 @@ def _isolated_host_imports() -> Iterator[_HostImports]:
 
         imports = _HostImports(
             flyc=importlib.import_module("flydsl.compiler"),
+            aot_backend=importlib.import_module("aiter.ops.flydsl.aot_backend"),
             moe=importlib.import_module("aiter.ops.flydsl.moe_kernels"),
             mixed_gemm=importlib.import_module(
                 "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage"
@@ -302,6 +330,8 @@ def _recording_environment() -> Iterator[None]:
 class _RequestRecorder:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.backend: _RecorderBackend | None = None
+        self.compile_context: Any = None
         self._scenario: str | None = None
         self._request_label_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
         self._cuda_calls: defaultdict[str, list[str]] = defaultdict(list)
@@ -327,6 +357,12 @@ class _RequestRecorder:
                 module_name = str(frame.f_globals.get("__name__", ""))
                 if module_name in _HOST_MODULES:
                     item = f"{module_name}.{frame.f_code.co_name}"
+                    if frame.f_code.co_name in {
+                        "_resolve_stage1_plan_launchers",
+                        "_compile_cktile_epilogue_plan",
+                    }:
+                        frame = frame.f_back
+                        continue
                     if not path or path[-1] != item:
                         path.append(item)
                 frame = frame.f_back
@@ -492,6 +528,21 @@ class _RequestRecorder:
 def _install_boundary_mocks(
     stack: ExitStack, imports: _HostImports, recorder: _RequestRecorder
 ) -> None:
+    core = importlib.import_module("aiter.ops.flydsl.compile_plan")
+    recorder.backend = _RecorderBackend(recorder)
+    recorder.compile_context = core.CompileContext(
+        target=core.RocmTarget(_ARCH, _CU_COUNT),
+        registry=core.DEFAULT_COMPILE_OP_REGISTRY,
+        backend=recorder.backend,
+    )
+    stack.enter_context(
+        mock.patch.object(
+            imports.aot_backend,
+            "create_runtime_compile_context",
+            lambda _device=None: recorder.compile_context,
+        )
+    )
+
     builder_specs = (
         (
             imports.mixed_gemm,
@@ -643,6 +694,8 @@ def _run_stage1(
         **options,
     }
     inputs = imports.moe.build_stage1_compile_inputs(**config)
+    inputs["compile_context"] = imports.aot_backend.create_runtime_compile_context()
+    inputs["launch_context"] = imports.moe.LaunchContext(0)
     imports.moe.flydsl_moe_stage1(**inputs)
 
 
@@ -664,6 +717,7 @@ def _run_stage2(
         inputs["topk_ids"] = torch.zeros(
             (config["token_num"], config["topk"]), dtype=torch.int32
         )
+    inputs["launch_context"] = imports.moe.LaunchContext(0)
     imports.moe.flydsl_moe_stage2(**inputs)
 
 
@@ -763,13 +817,19 @@ def _record_scenarios(imports: _HostImports, recorder: _RequestRecorder) -> None
         (
             "cktile.epilogue.silu",
             lambda: imports.aot_moe._precompile_epilogue_to_cache(
-                act="silu", inter_dim=2048, topk=8
+                act="silu",
+                inter_dim=2048,
+                topk=8,
+                context=recorder.compile_context,
             ),
         ),
         (
             "cktile.epilogue.swiglu",
             lambda: imports.aot_moe._precompile_epilogue_to_cache(
-                act="swiglu", inter_dim=2048, topk=8
+                act="swiglu",
+                inter_dim=2048,
+                topk=8,
+                context=recorder.compile_context,
             ),
         ),
         (

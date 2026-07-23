@@ -1084,15 +1084,6 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    stage1_plan_opt_in = os.environ.get(
-        "AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN", "0"
-    ) == "1" and str(extras.get("kernelName1", "")).startswith("flydsl_")
-    if stage1_plan_opt_in:
-        from aiter.ops.flydsl.moe_kernels import (
-            get_stage1_compile_plan_resolution_count,
-        )
-
-        plan_count_before = get_stage1_compile_plan_resolution_count()
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -1120,13 +1111,6 @@ for kwargs, extras in case_iter:
         torch.cuda.empty_cache()
     if ret is None:
         continue
-    if stage1_plan_opt_in:
-        plan_count_after = get_stage1_compile_plan_resolution_count()
-        assert plan_count_after > plan_count_before, (
-            "AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN=1 did not reach the "
-            "Stage1 CompilePlan runtime branch"
-        )
-        ret["stage1_compile_plan"] = True
     ret.update(extras)
     df.append(ret)
     _write_bench_csv(df)

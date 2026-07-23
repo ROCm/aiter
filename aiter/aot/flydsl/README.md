@@ -5,6 +5,15 @@ FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter'
 tuned CSV configs and compiles them into the cache up front, so that at runtime
 the JIT path hits the cache instead of compiling again.
 
+MoE Stage1 resolves the shared `CompilePlan` and compiles each `CompileUnit`
+directly from its declared ABI. It does not construct FakeTensors or enter the
+full Stage1 host. MoE Stage2 remains on the transitional FakeTensor/full-host
+path until its later migration.
+
+For a complete CPU and isolated gfx950 validation procedure, including strict
+positive/negative controls, see the
+**[Stage1 ABI-driven AOT testing guide](../../../docs/flydsl_stage1_aot_testing.md)**.
+
 | Module | OpKind | Description |
 | --- | --- | --- |
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
@@ -111,9 +120,10 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
-> for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, use
+> and carried by an explicit `CompileContext`. The compatibility backend applies
+> FlyDSL 0.2.x's `ARCH` and `FLYDSL_GPU_ARCH` plus `CU_NUM` for each unit, then
+> restores the prior environment. Shell target variables therefore do **not**
+> override a CSV target. To cross-compile, use
 > `chunk_gdn_h --target-arch <arch>` (the only module that exposes an override),
 > or edit the `cu_num` column in the CSV.
 
@@ -129,9 +139,9 @@ AITER_FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
 
 Compiling successfully is not enough — you also want to verify that the **runtime
 actually hits the AOT cache** (no cache miss). That is done by
-`op_tests/test_moe_2stage.py`, which wraps test cases with
-`aiter.aot.flydsl.common.fail_on_aot_cache_miss`: if the runtime falls back to
-JIT compilation, the case fails.
+`op_tests/test_moe_2stage.py`, which runs selected cases under FlyDSL run-only
+mode. A missing artifact raises with the op ID, target, signature, and cache
+directory; it cannot fall back to JIT compilation.
 
 Full flow:
 

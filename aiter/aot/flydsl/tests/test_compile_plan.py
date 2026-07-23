@@ -24,6 +24,7 @@ sys.modules[_MODULE_NAME] = compile_plan
 _SPEC.loader.exec_module(compile_plan)
 
 ArgumentKind = compile_plan.ArgumentKind
+CompileContext = compile_plan.CompileContext
 CompileOpRegistry = compile_plan.CompileOpRegistry
 KernelSignature = compile_plan.KernelSignature
 PlanBuilder = compile_plan.PlanBuilder
@@ -39,6 +40,27 @@ _SIMPLE_OP_ID = "aiter.flydsl.test.simple.v1"
 
 def _target() -> RocmTarget:
     return RocmTarget("gfx950", 256)
+
+
+class _Backend:
+    def compile_aot(self, unit, *, context):
+        return (unit, context)
+
+    def load_aot(self, unit, *, context, strict=True):
+        return (unit, context, strict)
+
+    def resolve_aot(self, unit, *, context):
+        return (unit, context)
+
+
+def _context(
+    registry: CompileOpRegistry | None = None,
+) -> CompileContext:
+    return CompileContext(
+        target=_target(),
+        registry=registry if registry is not None else CompileOpRegistry(),
+        backend=_Backend(),
+    )
 
 
 def _abi() -> KernelSignature:
@@ -95,9 +117,8 @@ class TestCallableBinding(unittest.TestCase):
             os.environ.get("CU_NUM"),
         )
         binding = PlanBuilder(
-            _target(),
+            _context(self.registry),
             {"model_dim": 7168},
-            registry=self.registry,
             context="synthetic case",
         ).bind(
             self.operation,
@@ -132,8 +153,7 @@ class TestCallableBinding(unittest.TestCase):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(TypeError, message):
                     PlanBuilder(
-                        _target(),
-                        registry=self.registry,
+                        _context(self.registry),
                         context="invalid case",
                     ).bind(
                         self.operation,
@@ -142,10 +162,9 @@ class TestCallableBinding(unittest.TestCase):
 
     def test_sources_conflict_until_an_explicit_override_resolves_them(self) -> None:
         plan = PlanBuilder(
-            _target(),
+            _context(self.registry),
             {"model_dim": 2048},
             {"model_dim": 7168},
-            registry=self.registry,
             context="model=synthetic",
         )
         with self.assertRaisesRegex(
@@ -159,11 +178,10 @@ class TestCallableBinding(unittest.TestCase):
 
         self.assertEqual(binding["model_dim"], 4096)
 
-    def test_compile_invokes_registered_callable_and_restores_target(self) -> None:
+    def test_registry_compile_invokes_without_mutating_target_environment(self) -> None:
         unit = (
             PlanBuilder(
-                _target(),
-                registry=self.registry,
+                _context(self.registry),
             )
             .emit(
                 self.operation,
@@ -178,7 +196,17 @@ class TestCallableBinding(unittest.TestCase):
 
         result = self.registry.compile(unit)
 
-        self.assertEqual(result, (7168, 32, False, _target(), "gfx950", "256"))
+        self.assertEqual(
+            result,
+            (
+                7168,
+                32,
+                False,
+                _target(),
+                before["FLYDSL_GPU_ARCH"],
+                before["CU_NUM"],
+            ),
+        )
         self.assertEqual(self.calls, [result])
         self.assertEqual(
             {name: os.environ.get(name) for name in before},
@@ -186,7 +214,7 @@ class TestCallableBinding(unittest.TestCase):
         )
 
     def test_emit_replaces_a_subset_and_preserves_order(self) -> None:
-        builder = PlanBuilder(_target(), registry=self.registry)
+        builder = PlanBuilder(_context(self.registry))
         requested = builder.bind(self.operation, model_dim=2048)
         first = builder.emit(requested)
         second = builder.emit(requested, model_dim=7168, enabled=True)
@@ -212,12 +240,14 @@ class TestDeclarationsAndRegistry(unittest.TestCase):
         operation = op(_OP_ID, compiler, abi=KernelSignature(()))
         first = CompileOpRegistry()
         second = CompileOpRegistry()
-        builder = PlanBuilder(_target(), registry=first)
+        context = _context(first)
+        builder = PlanBuilder(context)
         binding = builder.emit(operation)
         plan = builder.build()
 
         for value in (
             _target(),
+            context,
             operation,
             binding,
             binding.unit.spec.call,
@@ -256,8 +286,7 @@ class TestDeclarationsAndRegistry(unittest.TestCase):
             with self.subTest(builder=builder.__name__):
                 with self.assertRaisesRegex(TypeError, message):
                     PlanBuilder(
-                        _target(),
-                        registry=CompileOpRegistry(),
+                        _context(),
                     ).bind(op(_OP_ID, builder, abi=KernelSignature(())))
 
     def test_single_kernel_developer_workflow(self) -> None:
@@ -280,8 +309,9 @@ class TestDeclarationsAndRegistry(unittest.TestCase):
             plan.emit(simple)
 
         registry = CompileOpRegistry()
-        first = simple_plan(target=_target(), registry=registry, rows=1024)
-        second = simple_plan(target=_target(), registry=registry, rows=1024)
+        context = _context(registry)
+        first = simple_plan(context=context, rows=1024)
+        second = simple_plan(context=context, rows=1024)
 
         self.assertEqual(calls, [])
         self.assertNotIn("torch", compile_plan.__dict__)

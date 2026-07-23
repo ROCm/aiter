@@ -197,7 +197,10 @@ def resolve_moe_stage1_compile_plan(
 
     operations = _operations()
     primary = _primary_op(plan, operations, builder_kwargs)
-    requested = plan.bind(primary, **builder_kwargs)
+    # ``plan_provider`` installed the provider kwargs as a reflected source.
+    # Bind only fields accepted by the real compiler; AOT job metadata such as
+    # token counts and CSV labels must not become a mirrored callable schema.
+    requested = plan.bind(primary)
 
     k_batch = requested["k_batch"]
     plan.require(

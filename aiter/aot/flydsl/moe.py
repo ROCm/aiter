@@ -37,11 +37,11 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
+from aiter.ops.flydsl.aot_backend import compile_aot, create_compile_context
+from aiter.ops.flydsl.compile_plan import RocmTarget
+from aiter.ops.flydsl.launch_context import LaunchContext
 from aiter.ops.flydsl.moe_kernels import (
-    build_stage1_compile_inputs,
     build_stage2_compile_inputs,
-    flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_kernel_params,
 )
@@ -136,6 +136,9 @@ def parse_csv(csv_path: str):
                     "inter_dim": inter_dim,
                     "topk": topk,
                     "cu_num": cu_num,
+                    "split_k": 2,
+                    "post_activation_layout": "interleaved",
+                    "enable_bias": False,
                     # Not used by the epilogue compile; zeroed so dedup keys on
                     # (act, inter_dim, topk, cu_num) only.
                     "model_dim": 0,
@@ -180,6 +183,11 @@ def parse_csv(csv_path: str):
                             if stage1_out_dtype in ("fp4", "fp8")
                             else None
                         )
+                    else:
+                        # This is the production Stage1 wrapper setting.  Keep
+                        # it in job metadata so direct plan resolution sees the
+                        # same real compiler argument without entering the host.
+                        job["use_async_copy"] = True
 
                     full_job = {**job, **params}
                     key = job_identity(full_job)
@@ -192,95 +200,73 @@ def parse_csv(csv_path: str):
     return jobs
 
 
-def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
-    """Precompile the CK-Tile split-K post-activation epilogue kernel.
+def _job_target(aot_arch: str, cu_num: int) -> RocmTarget:
+    """Resolve an explicit CSV/build target without querying a live device."""
 
-    cktile_moe_stage1 with split_k>1 emits a workspace of interleaved gate/up
-    output and then runs a FlyDSL epilogue to apply the activation:
-      silu  -> flydsl_silu_and_mul_interleaved (silu_and_mul_fq with
-               quant_mode="none", gui_layout=True)
-      swiglu -> flydsl_swiglu_and_mul_interleaved (swiglu_and_mul)
-    Dispatch through the same runtime builders so the cache key matches; the
-    key depends only on inter_dim (swiglu) / (inter_dim, topk) (silu), and the
-    row/token dims are dynamic, so dummy buffers suffice.
-    """
-    import torch
+    resolved_cu = int(cu_num)
+    if resolved_cu <= 0:
+        configured = os.environ.get("CU_NUM")
+        resolved_cu = int(configured) if configured else 0
+    if resolved_cu <= 0 and aot_arch == MOE_AOT_ARCH_DEFAULT:
+        resolved_cu = 256
+    if resolved_cu <= 0:
+        raise ValueError(
+            f"cu_num must be explicit for AOT target {aot_arch!r}; "
+            "set it in the CSV or CU_NUM"
+        )
+    return RocmTarget(aot_arch, resolved_cu)
 
-    from aiter.ops.flydsl.moe_kernels import (
-        _explicit_stage1_target,
-        _get_compiled_silu_fused,
-        _get_compiled_swiglu,
-        _run_compiled,
+
+def _compile_stage1_plan(cfg: dict, context) -> int:
+    from aiter.ops.flydsl.moe_compile_plan import (
+        resolve_moe_stage1_compile_plan,
     )
 
-    dev = torch.device("cpu")
-    rows = 256
-    plan_launcher = None
-    if os.environ.get("AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN", "0") == "1":
-        from aiter.ops.flydsl.compile_plan import DEFAULT_COMPILE_OP_REGISTRY
-        from aiter.ops.flydsl.moe_compile_plan import (
-            resolve_cktile_stage1_compile_plan,
-        )
+    plan = resolve_moe_stage1_compile_plan(context=context, **cfg)
+    for unit in plan.units:
+        compile_aot(unit, context=context)
+    return len(plan.units)
 
-        plan = resolve_cktile_stage1_compile_plan(
-            target=_explicit_stage1_target(),
-            inter_dim=inter_dim,
-            topk=topk,
-            split_k=2,
-            act=act,
-            post_activation_layout="interleaved",
-        )
-        launchers = DEFAULT_COMPILE_OP_REGISTRY.compile_plan(plan)
-        if len(launchers) != 1:
-            raise RuntimeError("CK-Tile epilogue plan must contain exactly one unit")
-        plan_launcher = launchers[0]
 
-    # COMPILE_ONLY=1 makes the executor compile + persist the artifact without
-    # launching the kernel; without it _run_compiled would dispatch on the
-    # (absent) GPU under fake tensors and fault.
-    with compile_only_env():
-        if act == "swiglu":
-            exe = (
-                plan_launcher
-                if plan_launcher is not None
-                else _get_compiled_swiglu(inter_dim)
-            )
-            x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
-            out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
-            # trailing 0 = stream: null/default (compile-only, never launched)
-            _run_compiled(exe, (x, out, rows, 0))
-            return
+def _compile_cktile_epilogue_plan(cfg: dict, context) -> int:
+    from aiter.ops.flydsl.moe_compile_plan import (
+        resolve_cktile_stage1_compile_plan,
+    )
 
-        exe = (
-            plan_launcher
-            if plan_launcher is not None
-            else _get_compiled_silu_fused(
-                inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
-            )
-        )
-        x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
-        out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
-        empty_scale = torch.empty(0, dtype=torch.uint8, device=dev)
-        empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
-        empty_f32 = torch.empty(0, dtype=torch.float32, device=dev)
-        sorted_token_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
-        num_valid_ids = torch.zeros(2, dtype=torch.int32, device=dev)
-        _run_compiled(
-            exe,
-            (
-                _ptr_view_safe(x),
-                _ptr_view_safe(out),
-                _ptr_view_safe(empty_scale),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(empty_i32),
-                _ptr_view_safe(empty_f32),
-                rows,
-                sorted_token_ids.shape[0],
-                float("inf"),  # swiglu_limit (unused for silu)
-                0,  # stream: null/default (compile-only, kernel is never launched)
-            ),
-        )
+    plan = resolve_cktile_stage1_compile_plan(
+        context=context,
+        inter_dim=cfg["inter_dim"],
+        topk=cfg["topk"],
+        split_k=cfg["split_k"],
+        act=cfg["act"],
+        post_activation_layout=cfg["post_activation_layout"],
+        enable_bias=cfg["enable_bias"],
+    )
+    for unit in plan.units:
+        compile_aot(unit, context=context)
+    return len(plan.units)
+
+
+def _precompile_epilogue_to_cache(
+    act: str,
+    inter_dim: int,
+    topk: int,
+    *,
+    context,
+) -> int:
+    """Resolve and directly compile one CK-Tile Stage1 FlyDSL epilogue."""
+
+    return _compile_cktile_epilogue_plan(
+        {
+            "act": act,
+            "inter_dim": inter_dim,
+            "topk": topk,
+            "split_k": 2,
+            "post_activation_layout": "interleaved",
+            "enable_bias": False,
+        },
+        context,
+    )
 
 
 def compile_one_config(
@@ -294,11 +280,9 @@ def compile_one_config(
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
 
-    Drives the *runtime* ``flydsl_moe_stage1`` / ``flydsl_moe_stage2`` with fake
-    top-level inputs under ``COMPILE_ONLY=1`` + ``FakeTensorMode``. Because the
-    same runtime host code derives the internal buffers, packs the kernel args
-    and issues the compile, the JIT cache key written here is identical to the
-    one inference looks up -- there is no hand-mirrored shape/arg logic to drift.
+    Stage1 and its CK-Tile FlyDSL epilogues compile directly from resolved
+    ``CompileUnit.signature`` metadata. Stage2 intentionally remains on the
+    transitional FakeTensor/full-host path until its own CompilePlan migration.
 
     Returns a dict with timing info.
     """
@@ -321,8 +305,6 @@ def compile_one_config(
         "compile_arch": aot_arch,
     }
 
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
     cfg = dict(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -330,52 +312,51 @@ def compile_one_config(
         topk=topk,
         **kwargs,
     )
-    cu_str = str(cu_num) if cu_num > 0 else None
-    stage1_plan_opt_in = (
-        stage == 1
-        and os.environ.get("AITER_FLYDSL_USE_STAGE1_COMPILE_PLAN", "0") == "1"
-    )
-    if stage1_plan_opt_in:
-        from aiter.ops.flydsl.moe_kernels import (
-            get_stage1_compile_plan_resolution_count,
-        )
-
-        plan_count_before = get_stage1_compile_plan_resolution_count()
 
     t0 = time.time()
     try:
-        with (
-            override_env("FLYDSL_GPU_ARCH", aot_arch),
-            compile_only_env(),
-            override_env("CU_NUM", cu_str),
-            FakeTensorMode(),
-        ):
-            if is_epilogue:
-                _precompile_epilogue_to_cache(
-                    act=kwargs.get("act", "silu"),
-                    inter_dim=inter_dim,
-                    topk=topk,
-                )
-            else:
+        target = _job_target(aot_arch, cu_num)
+        context = create_compile_context(target)
+        if stage == 1:
+            unit_count = _compile_stage1_plan(cfg, context)
+            result["compile_units"] = unit_count
+            result["direct_stage1_aot"] = True
+        elif is_epilogue:
+            unit_count = _compile_cktile_epilogue_plan(cfg, context)
+            result["compile_units"] = unit_count
+            result["direct_stage1_aot"] = True
+        elif stage == 2:
+            # Stage2 is deliberately transitional: it still executes its full
+            # host under FakeTensorMode, but receives an explicit null launch
+            # context instead of reading COMPILE_ONLY inside kernel code.
+            from torch._subclasses.fake_tensor import FakeTensorMode
+
+            with (
+                override_env("ARCH", target.arch),
+                override_env("FLYDSL_GPU_ARCH", target.arch),
+                compile_only_env(),
+                override_env("CU_NUM", str(target.cu_count)),
+                FakeTensorMode(),
+            ):
                 from aiter.jit.utils.chip_info import get_cu_num
 
                 get_cu_num.cache_clear()
-                if stage == 1:
-                    flydsl_moe_stage1(**build_stage1_compile_inputs(**cfg))
-                    if stage1_plan_opt_in:
-                        plan_count_after = get_stage1_compile_plan_resolution_count()
-                        if plan_count_after <= plan_count_before:
-                            raise RuntimeError(
-                                "Stage1 AOT opt-in did not reach CompilePlan"
-                            )
-                        result["stage1_compile_plan"] = True
-                else:
-                    flydsl_moe_stage2(**build_stage2_compile_inputs(**cfg))
+                flydsl_moe_stage2(
+                    **build_stage2_compile_inputs(**cfg),
+                    launch_context=LaunchContext(None),
+                )
+        else:
+            raise ValueError(f"unsupported MoE AOT stage: {stage!r}")
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        plan_label = "  stage1_plan=True" if stage1_plan_opt_in else ""
+        direct_label = (
+            f"  direct_units={result['compile_units']}"
+            if result.get("direct_stage1_aot")
+            else "  stage2_transitional=True"
+        )
         print(
-            f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}{plan_label}"
+            f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  "
+            f"arch={aot_arch}{direct_label}"
         )
     except Exception as e:
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
