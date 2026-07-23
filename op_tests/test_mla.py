@@ -588,10 +588,7 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    # The ASM decode baseline aborts for these MLA configs when lse is requested
-    if return_lse:
-        pass
-    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+    if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
         8,
         16,
         32,
@@ -640,7 +637,7 @@ def test_mla(
         splits_needed = max(1, (256 + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
-        # PIPELINE_STAGES=3, BLOCK_N=64 → 192; mirror wrapper's bound.
+        # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
         min_ctx_required = num_kv_splits * (192 + num_kv_splits)
         if ctx_lens > min_ctx_required:
             err_gluon, us_gluon_decode = test_absorb_decode_gluon()

@@ -13,13 +13,10 @@ import triton.language as tl
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
-from flydsl.utils.smem_allocator import SmemAllocator
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -40,9 +37,6 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
         fx.Int32
     )
-
-
-allocator = None
 
 
 @triton.jit
@@ -185,7 +179,6 @@ def build_pa_mqa_logits_fp4_module(
         head_dim % 128 == 0
     ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
-    global allocator
 
     N_TILES = block_k // MFMA_N
     assert (
@@ -214,9 +207,6 @@ def build_pa_mqa_logits_fp4_module(
     # KV_scale: [block_id, K_TILES, K_chunks=4, block_size]
     _stride_kvs_ktile = 4 * kv_block_size  # bytes per K_TILE block
     _stride_kvs_block = k_tiles * _stride_kvs_ktile
-
-    allocator = SmemAllocator(None, arch="gfx950", global_sym_name="mqa_fp4_smem")
-    allocator.ptr = 16  # minimal, no LDS needed for this approach
 
     QS_DW = (m_tiles + 3) // 4
     qs_pad = QS_DW * 4
@@ -615,10 +605,9 @@ def build_pa_mqa_logits_fp4_module(
             kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last
         )
 
-    # Attach actual block threads count for the launcher (so the test can use
-    # the right block dim when num_warps != module-level default).
-    allocator.block_threads = block_threads_k
-    return pa_mqa_logits_fp4_kernel, allocator
+    # Return the actual block threads count for the launcher (so the test can
+    # use the right block dim when num_warps != module-level default).
+    return pa_mqa_logits_fp4_kernel, block_threads_k
 
 
 # ============================================================================
@@ -637,7 +626,7 @@ def compile_pa_mqa_logits_fp4(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
 ):
-    kfn, alloc = build_pa_mqa_logits_fp4_module(
+    kfn, block_threads = build_pa_mqa_logits_fp4_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
         max_blocks_per_seq=max_blocks_per_seq,
@@ -646,7 +635,6 @@ def compile_pa_mqa_logits_fp4(
         heads=heads,
         head_dim=head_dim,
     )
-    block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
     @flyc.jit
     def launch_pa_mqa_logits_fp4(
@@ -663,11 +651,6 @@ def compile_pa_mqa_logits_fp4(
         gx: fx.Int32,
         stream: fx.Stream,
     ):
-        # Re-finalize the smem allocator into this launch's gpu module body.
-        alloc.finalized = False
-        cctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(cctx.gpu_module_body):
-            alloc.finalize()
         gxi = arith.index_cast(T.index, gx.ir_value())
         kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream

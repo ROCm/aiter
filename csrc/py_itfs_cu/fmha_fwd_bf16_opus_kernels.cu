@@ -38,14 +38,15 @@ void launch_d128(aiter_tensor_t& q,
     AITER_CHECK(out.dim() == 4, "out must be 4-D [B, N, H, D], got ndim=", out.dim());
 
     const int B    = static_cast<int>(q.size(0));
-    const int N    = static_cast<int>(q.size(1));
+    const int N    = static_cast<int>(q.size(1));      // seqlen_q
     const int H    = static_cast<int>(q.size(2));
     const int D    = static_cast<int>(q.size(3));
     const int H_KV = static_cast<int>(k.size(2));
+    const int N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
 
     AITER_CHECK(D == 128, "launch_d128 only compiles D=128, got D=", D);
     AITER_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
-    AITER_CHECK(k.size(1) == N && v.size(1) == N, "k/v seqlen must equal q seqlen N");
+    AITER_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
     AITER_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
     AITER_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal D=128");
     AITER_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
@@ -54,6 +55,13 @@ void launch_d128(aiter_tensor_t& q,
 
     AITER_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1 && out.stride(3) == 1,
                 "q/k/v/out must be contiguous along the head dim D");
+
+    // 32-bit KV buffer-offset guard: extent >= 2^32 wraps the async-load soffset (silent
+    // wrong output), reject instead.
+    const long long kv_slice_bytes = (long long)N_KV * (long long)k.stride(1) * 2LL;  // bf16
+    AITER_CHECK(kv_slice_bytes < (1LL << 32),
+                "OPUS D=128: KV byte extent ", kv_slice_bytes,
+                " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
 
     if (B == 0 || N == 0 || H == 0) return;
 
@@ -64,6 +72,7 @@ void launch_d128(aiter_tensor_t& q,
     kargs.ptr_o = out.data_ptr();
     kargs.B     = B;
     kargs.N     = N;
+    kargs.N_KV  = N_KV;
     kargs.H     = H;
     kargs.H_KV  = H_KV;
     kargs.D     = D;
@@ -229,6 +238,14 @@ void launch_d192_v128(aiter_tensor_t& q,
     if (B == 0 || H == 0) return;
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
+
+    // 32-bit KV buffer-offset guard (same as D=128); N_KV bounds the per-group extent in
+    // group mode (max_seqlen_k).
+    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
+    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
+    AITER_CHECK(k_slice_bytes < (1LL << 32) && v_slice_bytes < (1LL << 32),
+                "OPUS D_QK=192/D_V=128: K/V byte extent (k=", k_slice_bytes, " v=", v_slice_bytes,
+                ") reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv");
 
     // Head/tail merge (causal load balance): host is the single source of truth; the
     // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
