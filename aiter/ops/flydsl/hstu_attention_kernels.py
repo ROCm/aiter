@@ -19,7 +19,6 @@ from typing import Optional, Callable
 from flydsl.runtime.device import get_rocm_arch
 from aiter import logger
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
-from aiter.utility.dtypes import str2bool
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
@@ -52,6 +51,23 @@ _CSV_COLUMNS: list[str] = [
 ]
 
 
+def _str2bool(v: bool | str) -> bool:
+    """Local, dependency-free bool coercion for CSV/string flags.
+
+    Intentionally not imported from ``aiter.utility.dtypes`` to keep this module
+    importable during the setup.py AOT phase: that module pulls in
+    ``aiter.ops.enum``, which instantiates compiled bindings not yet built at
+    setup time.
+    """
+    if isinstance(v, bool):
+        return v
+    if v.strip().lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.strip().lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise ValueError(f"Boolean value expected, got {v!r}")
+
+
 def _problem_key(
     arch: str,
     dtype: str,
@@ -72,9 +88,9 @@ def _problem_key(
         int(hidden_dim),
         prev_power_of_2(int(batch)),
         prev_power_of_2(int(max_seq_len)),
-        str2bool(has_window),
-        str2bool(has_contextual),
-        str2bool(has_targets),
+        _str2bool(has_window),
+        _str2bool(has_contextual),
+        _str2bool(has_targets),
     )
 
 
