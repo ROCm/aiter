@@ -86,8 +86,6 @@ def lds_cap_bytes(arch: str | None = None) -> int:
 _LOG2E = host_math.log2(host_math.e)
 
 
-
-
 def _waitcnt_vm_n(n: int):
     """Emit `s_waitcnt vmcnt(n)` only (lgkmcnt/expcnt left unconstrained, so
     outstanding LDS/export traffic isn't serialized).
@@ -288,8 +286,7 @@ def build_hstu_attention_bwd_dvdk(
 
     # LDS map: [Q row-major tile][dO row-major tile]. Q is XOR-swizzled by column
     # (mirrors the forward's K tile); dO stays natural [q, d]. Each field is a
-    # 16B-aligned fx.Array; SharedAllocator sizes the LDS global (no manual
-    # finalize/get_base/offset math).
+    # 16B-aligned fx.Array; SharedAllocator sizes the LDS global.
     @fx.struct
     class SharedStorage:
         q: fx.Array[elem_dtype, BLOCK_N * Q_STRIDE, 16]
@@ -366,8 +363,7 @@ def build_hstu_attention_bwd_dvdk(
             fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
         ) * fx.Int64(2)
 
-        # Shape-carried LDS views (no manual row*stride+col; the trailing group axis
-        # carries the stride). Q is grouped by MFMA_LANE_K for the swizzled GEMM1
+        # Shape-carried LDS views (the trailing group axis carries the stride). Q is grouped by MFMA_LANE_K for the swizzled GEMM1
         # pack read + the dK scalar gather; dO is grouped by MFMA_LANE_K for the dA
         # A-operand pack read + the dV scalar gather.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -385,7 +381,7 @@ def build_hstu_attention_bwd_dvdk(
         )
         q_lds_byte_base = buffer_ops.extract_base_index(q_view, address_space=3)
 
-        # Direct dO global->LDS DMA (single-barrier variant). dO is [L, H, hidden],
+        # Direct dO global->LDS DMA. dO is [L, H, hidden],
         # so the per-token stride is num_heads*hidden_dim; base at this head's slice.
         stride_do_n = num_heads * hidden_dim
         do_base_byte_offset = (
@@ -591,7 +587,7 @@ def build_hstu_attention_bwd_dvdk(
                 src = fx.slice(q_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
-        # Direct dO global->LDS DMA (single-barrier variant), row-major [q, d].
+        # Direct dO global->LDS DMA, row-major [q, d].
         # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
         # value is multiplied out — same safe-garbage contract as the Q DMA.
         c_stride_do_n = fx.Int32(stride_do_n)
@@ -707,8 +703,7 @@ def build_hstu_attention_bwd_dvdk(
 
         def accum_dv_tile(dv_acc, p_packs):
             # Prefetch next chunk's B-operand gather before consuming the current
-            # chunk's MFMAs, so the ds_read latency overlaps the MFMA chain (the
-            # gather reads are the fused kernel's #1 stall).
+            # chunk's MFMAs, so the ds_read latency overlaps the MFMA chain.
             do_cur = _dv_gather(0)
             for c in range_constexpr(D_CHUNKS):
                 if const_expr(c + 1 < D_CHUNKS):
@@ -760,7 +755,7 @@ def build_hstu_attention_bwd_dvdk(
             # Q B-operand packs (4 adjacent q at a fixed hc) for output chunk c,
             # scalar-gathered from the *streamed* swizzled Q LDS view (col ->
             # group col//MFMA_LANE_K, lane col%MFMA_LANE_K), reusing GEMM1's Q — no
-            # separate preshuffled q_t load. Mirrors the split dK's accum_dk_tile.
+            # separate preshuffled q_t load.
             qb_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 hc_col = fx.Int32(c * MFMA_M) + lane_mod_16

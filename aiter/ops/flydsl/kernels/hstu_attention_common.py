@@ -12,6 +12,7 @@ integer division/modulo.
 All helpers build FlyDSL expressions and must be called from inside a
 @flyc.kernel body.
 """
+
 from __future__ import annotations
 
 import flydsl.expr as fx

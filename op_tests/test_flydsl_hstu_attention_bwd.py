@@ -16,7 +16,6 @@ input validation, autograd end-to-end) stay in the pytest suite
 ``op_tests/flydsl_tests/test_flydsl_hstu_attention_bwd.py``; this file is the
 perf-oriented gate.
 
-    HIP_VISIBLE_DEVICES=6 PYTHONPATH=/workspaces/git/meta/aiter \
       python op_tests/test_flydsl_hstu_attention_bwd.py -b 120 -s 512 1024 --mask causal hstu
 """
 
