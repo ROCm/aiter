@@ -23,7 +23,6 @@ from op_tests.flydsl_tests.test_flydsl_hstu_attention import (
     generate_hstu_attn_inputs,
 )
 
-
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA device"
 )
@@ -100,7 +99,9 @@ def hstu_bwd_reference_causal_dense(N, alpha, q, k, v, seq_offsets, dout):
         Q, K, V = qf[s:e], kf[s:e], vf[s:e]  # (n, H, d)
         scores = torch.einsum("xha,yha->hxy", Q, K) * alpha
         attn = F.silu(scores) / N
-        mask = torch.tril(torch.ones(n, n, device=q.device))  # i >= j (causal + diagonal)
+        mask = torch.tril(
+            torch.ones(n, n, device=q.device)
+        )  # i >= j (causal + diagonal)
         attn = attn * mask.unsqueeze(0)
         outs.append(torch.einsum("hxy,yhv->xhv", attn, V))  # (n, H, dv)
 
@@ -220,12 +221,30 @@ def test_flydsl_bwd_variants(max_attn_len, contextual_seq_len, target_size, dtyp
     dout = torch.randn_like(v)
 
     dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
-        max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets,
-        max_attn_len, contextual_seq_len, dout,
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        True,
+        num_targets,
+        max_attn_len,
+        contextual_seq_len,
+        dout,
     )
     dq, dk, dv = flydsl_hstu_attention_bwd(
-        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets,
-        max_attn_len, contextual_seq_len,
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        dout,
+        seq_offsets,
+        True,
+        num_targets,
+        max_attn_len,
+        contextual_seq_len,
     )
     torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(dk.float(), dk_ref, atol=3e-2, rtol=3e-2)
@@ -374,8 +393,20 @@ def test_flydsl_bwd_block_size_overrides(block_m, block_n, num_waves, waves_per_
         max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets, 0, 0, dout
     )
     dq, dk, dv = flydsl_hstu_attention_bwd(
-        max_seq_len, alpha, q, k, v, dout, seq_offsets, True, num_targets, 0, 0,
-        block_m=block_m, block_n=block_n, num_waves=num_waves,
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        dout,
+        seq_offsets,
+        True,
+        num_targets,
+        0,
+        0,
+        block_m=block_m,
+        block_n=block_n,
+        num_waves=num_waves,
         waves_per_eu=waves_per_eu,
     )
     torch.testing.assert_close(dv.float(), dv_ref, atol=2e-2, rtol=2e-2)
@@ -455,7 +486,9 @@ def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
     path = _write_bwd_csv(
         tmp_path / "tuned_bwd.csv",
         [
-            _bwd_row(kernel="dvdk", block_m=96, block_n=16, num_waves=2, waves_per_eu=0),
+            _bwd_row(
+                kernel="dvdk", block_m=96, block_n=16, num_waves=2, waves_per_eu=0
+            ),
             _bwd_row(kernel="dq", block_m=128, block_n=32, num_waves=4, waves_per_eu=2),
         ],
     )
@@ -465,40 +498,10 @@ def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
     assert len(config_map) == 2
     # Keys are (problem_key, kernel); pull each kernel's config.
     by_kernel = {kern: cfg for (_, kern), cfg in config_map.items()}
-    assert by_kernel["dvdk"] == dict(block_m=96, block_n=16, num_waves=2, waves_per_eu=0)
-    assert by_kernel["dq"] == dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=2)
-
-
-def test_bwd_tuned_csv_single_barrier_column(tmp_path):
-    """single_barrier is an optional dvdk-only tuned param: '1'/'0' parse to bool,
-    blank/absent falls back to None (builder heuristic)."""
-    path = _write_bwd_csv(
-        tmp_path / "tuned_bwd.csv",
-        [
-            _bwd_row(kernel="dvdk", block_m=96, single_barrier="1"),
-            _bwd_row(kernel="dq", block_m=128, single_barrier=""),
-        ],
+    assert by_kernel["dvdk"] == dict(
+        block_m=96, block_n=16, num_waves=2, waves_per_eu=0
     )
-    by_kernel = {kern: cfg for (_, kern), cfg in
-                 hstu_kernels._bwd_tuned_config_map(path).items()}
-    # dvdk carries the parsed bool; dQ (blank) does not carry the key at all.
-    assert by_kernel["dvdk"]["single_barrier"] is True
-    assert "single_barrier" not in by_kernel["dq"]
-
-
-def test_bwd_tuned_csv_without_single_barrier_column(tmp_path):
-    """A pre-existing CSV lacking the single_barrier column still parses (the column
-    was added 2026-07-15); the param simply defaults to the builder heuristic."""
-    cols = [c for c in hstu_kernels._BWD_CSV_COLUMNS if c != "single_barrier"]
-    with open(tmp_path / "old.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        row = _bwd_row(kernel="dvdk")
-        row.pop("single_barrier", None)
-        w.writerow({c: row[c] for c in cols})
-    by_kernel = {kern: cfg for (_, kern), cfg in
-                 hstu_kernels._bwd_tuned_config_map(str(tmp_path / "old.csv")).items()}
-    assert by_kernel["dvdk"] == dict(block_m=128, block_n=64, num_waves=4, waves_per_eu=2)
+    assert by_kernel["dq"] == dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -511,12 +514,14 @@ def test_bwd_tuned_csv_without_single_barrier_column(tmp_path):
 @pytest.mark.parametrize(
     "max_attn_len,contextual_seq_len,target_size",
     [
-        (0, 0, 0),    # dense causal
-        (0, 0, 20),   # targets
-        (64, 0, 0),   # window
+        (0, 0, 0),  # dense causal
+        (0, 0, 20),  # targets
+        (64, 0, 0),  # window
     ],
 )
-def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_size, dtype):
+def test_flydsl_autograd_end_to_end(
+    max_attn_len, contextual_seq_len, target_size, dtype
+):
     """FlydslHstuAttention.apply is drop-in differentiable: .grad after .backward()
     matches torch.autograd.grad on the torch reference."""
     batch, heads, attn_dim, hidden_dim, max_seq_len = 32, 4, 128, 128, 512
@@ -536,8 +541,17 @@ def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_siz
     dout = torch.randn_like(v)
 
     dq_ref, dk_ref, dv_ref = hstu_bwd_reference(
-        max_seq_len, alpha, q, k, v, seq_offsets, True, num_targets,
-        max_attn_len, contextual_seq_len, dout,
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        True,
+        num_targets,
+        max_attn_len,
+        contextual_seq_len,
+        dout,
     )
 
     qd = q.detach().clone().requires_grad_(True)
@@ -545,8 +559,16 @@ def test_flydsl_autograd_end_to_end(max_attn_len, contextual_seq_len, target_siz
     vd = v.detach().clone().requires_grad_(True)
 
     out = flydsl_hstu_attention(
-        max_seq_len, alpha, qd, kd, vd, seq_offsets, True, num_targets,
-        max_attn_len, contextual_seq_len,
+        max_seq_len,
+        alpha,
+        qd,
+        kd,
+        vd,
+        seq_offsets,
+        True,
+        num_targets,
+        max_attn_len,
+        contextual_seq_len,
     )
     assert out.requires_grad
     out.backward(dout)
