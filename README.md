@@ -108,6 +108,10 @@ git submodule sync && git submodule update --init --recursive
 
 AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
 
+For CPU-only MoE `CompilePlan`, explicit sorting AOT, strict-cache correctness,
+and negative-control commands, see
+[FlyDSL MoE ABI-driven AOT testing](docs/flydsl_moe_aot_testing.md).
+
 To install it manually:
 
 ```bash

@@ -2,10 +2,10 @@
 
 ## Status and scope
 
-This document records the **current old host path** on
-`zhimding/refactor_aot`. It is the behavioral baseline for a future CPU-only
-compile-request resolver. It is **not** a Manifest, a proposed source of truth,
-or a description of a future dispatch design.
+This document records the standard host path and its CPU-only compile-request
+resolver on `zhimding/refactor_aot`. It is a behavioral baseline and
+CompilePlan inventory. It is **not** a Manifest, persistence format, global
+deduplication policy, or packaged-artifact design.
 
 The inventory covers the standard
 `fused_moe -> fused_moe_ -> fused_moe_2stages` path and every FlyDSL artifact
@@ -44,11 +44,10 @@ fused_moe
    ├─ moe_sorting
    │  ├─ _flydsl_moe_sorting         # opt-in and gate-compatible only
    │  │  └─ flydsl_moe_sorting_fwd
+   │  │     ├─ resolve_moe_sorting_compile_plan
+   │  │     ├─ AotBackend.resolve_aot(selected concrete unit)
    │  │     └─ moe_sorting_flydsl
-   │  │        ├─ compile_moe_sorting
-   │  │        │  ├─ _compile_moe_sorting_oneshot
-   │  │        │  └─ _compile_moe_sorting_multiphase
-   │  │        └─ tensor_shim._run_compiled -> flyc.compile(selected launcher)
+   │  │        └─ tensor_shim._run_compiled -> strict-load/JIT selected launcher
    │  ├─ _moe_sorting_impl -> Opus or CK sorting
    │  └─ specialized FLAT/output_aux paths
    └─ fused_moe_2stages
@@ -79,11 +78,12 @@ fused_moe
          └─ CK, CK-Tile, Opus, or assembly stage2
 ```
 
-Builder construction and artifact compilation are distinct. In particular,
-`compile_moe_sorting()` calls both sorting builder factories, but only the
-launcher selected for the current token range is passed to `flyc.compile`.
-The CPU baseline should record the agreed builder-request boundary, not infer
-coverage from private FlyDSL cache keys.
+Builder construction and artifact compilation are distinct. Sorting now emits
+one concrete `CompileUnit` for the selected launcher: oneshot, combined
+P0v2+P23, or combined ClearWS+P0+P1+P23. The private multiphase factory still
+constructs its internal launcher tuple, but the registered compile operation
+returns exactly the launcher passed to FlyDSL compile/cache/load. The CPU
+baseline records this agreed builder-request boundary, not private cache keys.
 
 ## Dispatch and trigger conditions
 
@@ -136,8 +136,10 @@ Otherwise standard sorting defaults to Opus, or to CK when
 also forces a non-FlyDSL sorting path. Expert masking is supported by FlyDSL
 sorting and becomes the compile-time `has_mask` variant.
 
-Let `T` be `num_local_tokens` when supplied, otherwise `topk_ids.shape[0]`;
-`E` is the global routed expert count. With `BLOCK_SIZE=256`:
+Let `T_bucket` be the explicit maximum token count; normal runtime uses
+`topk_ids.shape[0]`. A dynamic `num_local_tokens` tensor is only read while
+packing the selected launch and must not exceed the bucket. `E` is the global
+routed expert count. With `BLOCK_SIZE=256`:
 
 ```text
 sub_tokens =
@@ -150,18 +152,20 @@ ONESHOT_MAX_T =
 The LDS size is 163840 bytes on gfx95*, 65536 bytes on gfx94* and the
 conservative fallback.
 
-- `T <= min(sub_tokens, ONESHOT_MAX_T)`: compile and launch the oneshot
-  artifact. `max_tokens` is `max(T, 8)` rounded up to a multiple of 8.
-- above that threshold and `T <= 2048`: compile and launch the combined
+- `T_bucket <= min(sub_tokens, ONESHOT_MAX_T)`: compile and launch the oneshot
+  artifact. Its launcher bound is `max(T_bucket, 8)` rounded to a multiple of 8.
+- above that threshold and `T_bucket <= 2048`: compile and launch the combined
   multiphase `P0v2 + P23` artifact.
-- `T > 2048`: compile and launch the combined four-kernel
+- `T_bucket > 2048`: compile and launch the combined four-kernel
   `ClearWS + P0 + P1 + P23` artifact.
 
 Multiphase requests use `k4_block=256` for `E <= 256`; for
 `256 < E <= 512` they use 512 through `T=8192` and 256 above it; larger
 expert counts use 256. The other static request fields are `E`, `topk`,
-sorting `unit_size`/block-M, and `has_mask`. Architecture and wave size are
-implicit builder inputs.
+sorting `unit_size`/block-M, and `has_mask`. The provider requires an explicit
+`RocmTarget`; gfx94, gfx95, and supported RDNA-family LDS capacities and wave
+size are resolved by kernel-owned pure helpers. Missing or unsupported
+architecture metadata is an error.
 
 Sorting also owns zero-initialization for atomic stage2. For unmasked reduce
 mode it receives an empty `(0, 0)` `moe_buf`, so the sorting kernel has no
@@ -322,7 +326,7 @@ stage2 and reduction requests receive the runtime `topk`, including that slot.
 | Stage entry functions | exact compile dimensions, presence booleans, effective split-K output dtype, persistent-mode threshold, argument packing, auxiliary helper selection |
 | Sorting host code | oneshot threshold, `max_tokens` bucket, multiphase family, workspace size, `k4_block`, mask variant |
 | Environment/runtime architecture | FlyDSL availability, sorting backend flags, force-reduce/heuristic debug flags, CU count, ROCm architecture and wave size |
-| Current AOT adapter | CSV enumeration/deduplication, fake tensor shapes, target arch from `cu_num`, and compile-only execution; it does not own production dispatch semantics |
+| Current AOT adapter | Explicit target, declared launch ABI materialization, CSV stage enumeration, explicit sorting cases, and compile-only execution; it does not own Manifest policy |
 
 Pointer signatures do not encode scale or routing tensor lengths, and tensor
 **presence** can still select compile-time booleans. One host-level exception
@@ -348,8 +352,8 @@ and FlyDSL sorting is an independent opt-in.
 
 ## ABI-driven AOT route and baseline contract
 
-[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) resolves Stage1,
-Stage2, and reduction `CompileUnit` objects directly:
+[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) resolves explicit
+sorting, Stage1, Stage2, and reduction `CompileUnit` objects directly:
 
 1. It enumerates CSV rows and resolves `flydsl_` kernel names through the
    current registry. It also emits CK-Tile epilogue jobs and both supported
@@ -358,9 +362,12 @@ Stage2, and reduction `CompileUnit` objects directly:
    Aiter `AotBackend`.
 3. Stage1 and Stage2 providers bind existing compile-wrapper signatures and
    defaults. Each unit carries a stable versioned op ID and exact launch ABI.
-4. The backend materializes pointer/scalar/stream metadata and invokes the
-   FlyDSL launcher in compile-only mode. No FakeTensor, runtime tensor
-   allocation, stream lookup, or full stage host call is involved.
+4. `compile_moe_sorting_case()` accepts explicit token bucket, global expert
+   count, top-k, unit size, mask state, and optional path/k4 assertions. It does
+   not infer sorting from ordinary tuned rows.
+5. The backend materializes tensor/pointer/scalar/stream metadata and invokes
+   the FlyDSL launcher in compile-only mode. No FakeTensor, runtime tensor
+   allocation, stream lookup, or full sorting/stage host call is involved.
 
 Stage2's kernel-owned persistence helper accepts either the real runtime
 routing-block count or the AOT token bucket and standard routing capacity.
@@ -369,9 +376,10 @@ than mirroring the `m_blocks > 256` decision. CSV reduce rows emit the plain
 reduction unit. Masked EP reduction remains an explicit provider operation
 case requiring top-k-ID semantics and a positive global expert count.
 
-This adapter still bypasses `fused_moe_`, quantization, and sorting; it is
-neither a complete production call graph nor a Manifest source. Sorting
-remains outside this direct AOT route.
+`MoeCompilePlanCase` concatenates an explicitly optional sorting sub-plan,
+an already-bound Stage1 plan, and an already-bound Stage2/reduction plan. It is
+an ordered input to future Manifest generation, not a Manifest, persistence
+format, global deduplication policy, or packaged artifact source.
 
 The CPU baseline recorder enters the runtime stage and sorting hosts with
 test-owned fake inputs while mocking compile/launch/CUDA boundaries. It
@@ -383,9 +391,8 @@ against the same golden. Neither test snapshots FlyDSL-private cache keys.
 ### Checked-in trigger matrix
 
 The golden's stable trigger IDs map to this inventory as follows. A trigger can
-emit more than one request when the host path builds a primary GEMM plus an
-auxiliary artifact, or when sorting constructs both launcher families before
-selecting one.
+emit more than one request when a stage builds a primary GEMM plus an auxiliary
+artifact. Each sorting trigger emits only its selected concrete builder.
 
 - Stage1 primary builders:
   `stage1.main.non_split.bias.route_weighted`,

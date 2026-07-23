@@ -71,6 +71,67 @@ def _reduction_launcher(
     raise AssertionError("the fake launcher body must not execute")
 
 
+def _sorting_oneshot_launcher(
+    topk_ids_tensor: fx.Tensor,
+    topk_weights_tensor: fx.Tensor,
+    sorted_token_ids: fx.Tensor,
+    sorted_weights_out: fx.Tensor,
+    sorted_expert_ids: fx.Tensor,
+    num_valid_ids_out: fx.Tensor,
+    moe_buf: fx.Tensor,
+    expert_mask_tensor: fx.Tensor,
+    i32_tokens: fx.Int32,
+    i32_moe_buf_elems: fx.Int32,
+    n_grid_blocks: fx.Int32,
+    stream: fx.Stream,
+) -> None:
+    raise AssertionError("the fake launcher body must not execute")
+
+
+def _sorting_p0v2_p23_launcher(
+    topk_ids: fx.Tensor,
+    workspace: fx.Tensor,
+    topk_weights_tensor: fx.Tensor,
+    sorted_token_ids: fx.Tensor,
+    sorted_weights_out: fx.Tensor,
+    sorted_expert_ids: fx.Tensor,
+    num_valid_ids_out: fx.Tensor,
+    moe_buf: fx.Tensor,
+    expert_mask_tensor: fx.Tensor,
+    i32_tokens: fx.Int32,
+    i32_mesh_stride: fx.Int32,
+    i32_mesh_size: fx.Int32,
+    i32_moe_buf_elems: fx.Int32,
+    n_grid_p23: fx.Int32,
+    stream: fx.Stream,
+) -> None:
+    raise AssertionError("the fake launcher body must not execute")
+
+
+def _sorting_4k_fused_launcher(
+    topk_ids: fx.Tensor,
+    workspace: fx.Tensor,
+    topk_weights_tensor: fx.Tensor,
+    sorted_token_ids: fx.Tensor,
+    sorted_weights_out: fx.Tensor,
+    sorted_expert_ids: fx.Tensor,
+    num_valid_ids_out: fx.Tensor,
+    moe_buf: fx.Tensor,
+    expert_mask_tensor: fx.Tensor,
+    i32_tokens: fx.Int32,
+    i32_mesh_stride: fx.Int32,
+    i32_mesh_size: fx.Int32,
+    i32_moe_buf_elems: fx.Int32,
+    i32_ws_total: fx.Int32,
+    i32_p0_niters: fx.Int32,
+    n_grid_k1: fx.Int32,
+    n_grid_k2: fx.Int32,
+    n_grid_p23: fx.Int32,
+    stream: fx.Stream,
+) -> None:
+    raise AssertionError("the fake launcher body must not execute")
+
+
 class _FakeLauncher:
     def __init__(self, function, *, miss: bool = False) -> None:
         self.func = function
@@ -442,6 +503,94 @@ class TestDirectStage2BackendOperations(unittest.TestCase):
                     )
                     self.assertFalse(compiled.loaded)
                     self.assertEqual(len(compile_launcher.calls), 1)
+
+                    load_launcher = _FakeLauncher(function)
+                    unit, context, _ = _unit_context(
+                        core,
+                        imports.aot_backend,
+                        load_launcher,
+                        signature,
+                        op_id=op_id,
+                    )
+                    loaded = imports.aot_backend.load_aot(
+                        unit,
+                        context=context,
+                        strict=True,
+                    )
+                    self.assertTrue(loaded.loaded)
+                    self.assertEqual(
+                        load_launcher.calls[0][1]["FLYDSL_RUNTIME_RUN_ONLY"],
+                        "1",
+                    )
+
+                    miss_launcher = _FakeLauncher(function, miss=True)
+                    unit, context, _ = _unit_context(
+                        core,
+                        imports.aot_backend,
+                        miss_launcher,
+                        signature,
+                        op_id=op_id,
+                    )
+                    with mock.patch.object(
+                        context.backend,
+                        "compile_aot",
+                        wraps=context.backend.compile_aot,
+                    ) as compile_spy:
+                        with self.assertRaises(
+                            imports.aot_backend.AotCacheMissError
+                        ) as raised:
+                            imports.aot_backend.load_aot(
+                                unit,
+                                context=context,
+                                strict=True,
+                            )
+                    compile_spy.assert_not_called()
+                    self.assertEqual(raised.exception.op_id, op_id)
+                    self.assertEqual(len(miss_launcher.calls), 1)
+
+
+class TestDirectSortingBackendOperations(unittest.TestCase):
+    def test_every_concrete_family_compiles_loads_and_misses_strictly(self) -> None:
+        with _isolated_host_imports() as imports:
+            core = importlib.import_module("aiter.ops.flydsl.compile_plan")
+            plan_module = importlib.import_module("aiter.ops.flydsl.moe_compile_plan")
+            cases = (
+                (
+                    plan_module.SORTING_ONESHOT_OP_ID,
+                    _sorting_oneshot_launcher,
+                ),
+                (
+                    plan_module.SORTING_P0V2_P23_OP_ID,
+                    _sorting_p0v2_p23_launcher,
+                ),
+                (
+                    plan_module.SORTING_4K_FUSED_OP_ID,
+                    _sorting_4k_fused_launcher,
+                ),
+            )
+            for op_id, function in cases:
+                with self.subTest(op_id=op_id):
+                    signature = plan_module.sorting_abi(op_id)
+                    compile_launcher = _FakeLauncher(function)
+                    unit, context, _ = _unit_context(
+                        core,
+                        imports.aot_backend,
+                        compile_launcher,
+                        signature,
+                        op_id=op_id,
+                    )
+                    compiled = imports.aot_backend.compile_aot(
+                        unit,
+                        context=context,
+                    )
+                    self.assertFalse(compiled.loaded)
+                    self.assertEqual(len(compile_launcher.calls), 1)
+                    self.assertTrue(
+                        any(
+                            type(argument).__name__ == "TorchTensorJitArg"
+                            for argument in compiled.compile_args
+                        )
+                    )
 
                     load_launcher = _FakeLauncher(function)
                     unit, context, _ = _unit_context(

@@ -103,19 +103,19 @@ _EXPECTED_SCENARIOS = {
         ("stage2.gemm", "stage2.reduction"),
     ),
     "sorting.oneshot.unmasked": (
-        ("_compile_moe_sorting_oneshot", "_compile_moe_sorting_multiphase"),
+        ("_compile_moe_sorting_oneshot",),
         ("sorting.oneshot",),
     ),
     "sorting.oneshot.masked": (
-        ("_compile_moe_sorting_oneshot", "_compile_moe_sorting_multiphase"),
+        ("_compile_moe_sorting_oneshot",),
         ("sorting.oneshot",),
     ),
     "sorting.multiphase.p0v2.unmasked.e384": (
-        ("_compile_moe_sorting_oneshot", "_compile_moe_sorting_multiphase"),
+        ("_compile_moe_sorting_multiphase",),
         ("sorting.multiphase.p0v2_p23",),
     ),
     "sorting.multiphase.4k.masked": (
-        ("_compile_moe_sorting_oneshot", "_compile_moe_sorting_multiphase"),
+        ("_compile_moe_sorting_multiphase",),
         ("sorting.multiphase.4k_fused",),
     ),
 }
@@ -516,9 +516,7 @@ class _RequestRecorder:
                 )
             cuda_calls = tuple(self._cuda_calls.get(scenario, ()))
             expected_cuda = (
-                ("get_device_properties", "current_stream")
-                if scenario.startswith("sorting.")
-                else ()
+                ("current_stream",) if scenario.startswith("sorting.") else ()
             )
             if cuda_calls != expected_cuda:
                 raise AssertionError(
@@ -660,6 +658,9 @@ def _clear_scenario_caches(imports: _HostImports) -> None:
     imports.moe.compile_flydsl_moe_stage2.cache_clear()
     imports.sorting_kernel._compute_sub_tokens.cache_clear()
     imports.sorting_kernel._p23_block_size.cache_clear()
+    imports.sorting_kernel.compile_moe_sorting_oneshot.cache_clear()
+    imports.sorting_kernel.compile_moe_sorting_p0v2_p23.cache_clear()
+    imports.sorting_kernel.compile_moe_sorting_4k_fused.cache_clear()
     imports.sorting_wrapper._workspace_cache.clear()
 
 

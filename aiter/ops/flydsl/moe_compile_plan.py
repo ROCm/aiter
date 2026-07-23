@@ -16,13 +16,16 @@ imported lazily when an operation set is first registered.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 from .compile_plan import (
     ArgumentKind,
+    CompileContext,
     CompileOp,
     CompileOpRegistry,
+    CompilePlan,
     DEFAULT_COMPILE_OP_REGISTRY,
     KernelSignature,
     PlanBuilder,
@@ -39,6 +42,9 @@ MIXED_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.mixed_gemm.v1"
 INT4_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.int4_gemm.v1"
 PLAIN_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.plain.v1"
 MASKED_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.masked.v1"
+SORTING_ONESHOT_OP_ID = "aiter.flydsl.moe.sorting.oneshot.v1"
+SORTING_P0V2_P23_OP_ID = "aiter.flydsl.moe.sorting.multiphase.p0v2_p23.v1"
+SORTING_4K_FUSED_OP_ID = "aiter.flydsl.moe.sorting.multiphase.k4_fused.v1"
 
 __all__ = [
     "CKTILE_SWIGLU_AND_MUL_OP_ID",
@@ -48,15 +54,46 @@ __all__ = [
     "MASKED_REDUCTION_OP_ID",
     "MIXED_STAGE1_GEMM_OP_ID",
     "MIXED_STAGE2_GEMM_OP_ID",
+    "MoeCompilePlanCase",
+    "MoeSortingCompileCase",
     "PLAIN_REDUCTION_OP_ID",
+    "SORTING_4K_FUSED_OP_ID",
+    "SORTING_ONESHOT_OP_ID",
+    "SORTING_P0V2_P23_OP_ID",
     "register_moe_stage1_ops",
     "register_moe_stage2_ops",
+    "register_moe_sorting_ops",
     "resolve_cktile_stage1_compile_plan",
+    "resolve_moe_compile_plan",
+    "resolve_moe_sorting_compile_plan",
     "resolve_moe_stage1_compile_plan",
     "resolve_moe_stage2_compile_plan",
+    "sorting_abi",
     "stage1_abi",
     "stage2_abi",
 ]
+
+
+@dataclass(frozen=True)
+class MoeSortingCompileCase:
+    """Explicit CPU metadata for one independently cached sorting launcher."""
+
+    max_tokens: int
+    num_experts: int
+    topk: int
+    has_mask: bool
+    unit_size: int = 32
+    path: str | None = None
+    k4_block: int | None = None
+
+
+@dataclass(frozen=True)
+class MoeCompilePlanCase:
+    """Already-bound stage plans plus an explicitly optional sorting case."""
+
+    sorting: MoeSortingCompileCase | None
+    stage1: CompilePlan
+    stage2: CompilePlan
 
 
 def _abi(
@@ -136,6 +173,59 @@ _REDUCTION_ABI = _abi(
     i32="i32_m_tokens",
 )
 
+
+def _tensor(name: str, dtype: str, rank: int) -> SignatureArg:
+    if rank == 1:
+        return SignatureArg(name, ArgumentKind.TENSOR, dtype, (None,), (1,))
+    if rank == 2:
+        return SignatureArg(
+            name,
+            ArgumentKind.TENSOR,
+            dtype,
+            (None, None),
+            (None, 1),
+        )
+    raise ValueError(f"unsupported sorting tensor rank: {rank}")
+
+
+_SORTING_COMMON_TENSORS = (
+    _tensor("topk_ids_tensor", "i32", 2),
+    _tensor("topk_weights_tensor", "f32", 2),
+    _tensor("sorted_token_ids", "i32", 1),
+    _tensor("sorted_weights_out", "f32", 1),
+    _tensor("sorted_expert_ids", "i32", 1),
+    _tensor("num_valid_ids_out", "i32", 1),
+    _tensor("moe_buf", "i32", 2),
+    _tensor("expert_mask_tensor", "i32", 1),
+)
+
+_SORTING_ONESHOT_ABI = _abi(
+    tensors=_SORTING_COMMON_TENSORS,
+    i32="i32_tokens i32_moe_buf_elems n_grid_blocks",
+)
+
+_SORTING_MULTIPHASE_TENSORS = (
+    _tensor("topk_ids", "i32", 2),
+    _tensor("workspace", "i32", 1),
+    *_SORTING_COMMON_TENSORS[1:],
+)
+
+_SORTING_P0V2_P23_ABI = _abi(
+    tensors=_SORTING_MULTIPHASE_TENSORS,
+    i32="""
+        i32_tokens i32_mesh_stride i32_mesh_size i32_moe_buf_elems
+        n_grid_p23
+    """,
+)
+
+_SORTING_4K_FUSED_ABI = _abi(
+    tensors=_SORTING_MULTIPHASE_TENSORS,
+    i32="""
+        i32_tokens i32_mesh_stride i32_mesh_size i32_moe_buf_elems
+        i32_ws_total i32_p0_niters n_grid_k1 n_grid_k2 n_grid_p23
+    """,
+)
+
 _ABIS = {
     MIXED_STAGE1_GEMM_OP_ID: _MIXED_GEMM_ABI,
     INT4_STAGE1_GEMM_OP_ID: _INT4_GEMM_ABI,
@@ -145,6 +235,9 @@ _ABIS = {
     INT4_STAGE2_GEMM_OP_ID: _INT4_STAGE2_GEMM_ABI,
     PLAIN_REDUCTION_OP_ID: _REDUCTION_ABI,
     MASKED_REDUCTION_OP_ID: _REDUCTION_ABI,
+    SORTING_ONESHOT_OP_ID: _SORTING_ONESHOT_ABI,
+    SORTING_P0V2_P23_OP_ID: _SORTING_P0V2_P23_ABI,
+    SORTING_4K_FUSED_OP_ID: _SORTING_4K_FUSED_ABI,
 }
 
 
@@ -167,6 +260,18 @@ def stage2_abi(op_id: str) -> KernelSignature:
         MASKED_REDUCTION_OP_ID,
     ):
         raise KeyError(f"unknown Stage2 op_id: {op_id!r}")
+    return _ABIS[op_id]
+
+
+def sorting_abi(op_id: str) -> KernelSignature:
+    """Return the exact ABI for one concrete sorting launcher family."""
+
+    if op_id not in (
+        SORTING_ONESHOT_OP_ID,
+        SORTING_P0V2_P23_OP_ID,
+        SORTING_4K_FUSED_OP_ID,
+    ):
+        raise KeyError(f"unknown sorting op_id: {op_id!r}")
     return _ABIS[op_id]
 
 
@@ -222,6 +327,43 @@ def _operations() -> dict[str, CompileOp]:
     return {operation.op_id: operation for operation in _declared_ops()}
 
 
+@lru_cache(maxsize=1)
+def _declared_sorting_ops() -> tuple[CompileOp, ...]:
+    """Declare concrete sorting launchers without invoking their builders."""
+
+    from .kernels.moe_sorting_kernel import (
+        compile_moe_sorting_4k_fused,
+        compile_moe_sorting_oneshot,
+        compile_moe_sorting_p0v2_p23,
+    )
+
+    declarations = (
+        (
+            SORTING_ONESHOT_OP_ID,
+            compile_moe_sorting_oneshot,
+            _SORTING_ONESHOT_ABI,
+        ),
+        (
+            SORTING_P0V2_P23_OP_ID,
+            compile_moe_sorting_p0v2_p23,
+            _SORTING_P0V2_P23_ABI,
+        ),
+        (
+            SORTING_4K_FUSED_OP_ID,
+            compile_moe_sorting_4k_fused,
+            _SORTING_4K_FUSED_ABI,
+        ),
+    )
+    return tuple(
+        op(op_id, compiler, abi=abi, target_kw="compile_target")
+        for op_id, compiler, abi in declarations
+    )
+
+
+def _sorting_operations() -> dict[str, CompileOp]:
+    return {operation.op_id: operation for operation in _declared_sorting_ops()}
+
+
 def register_moe_stage1_ops(
     registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
 ) -> CompileOpRegistry:
@@ -253,6 +395,16 @@ def register_moe_stage2_ops(
     for operation in _declared_ops():
         if operation.op_id in stage2_op_ids:
             operation.register(registry)
+    return registry
+
+
+def register_moe_sorting_ops(
+    registry: CompileOpRegistry = DEFAULT_COMPILE_OP_REGISTRY,
+) -> CompileOpRegistry:
+    """Register all concrete sorting launcher declarations."""
+
+    for operation in _declared_sorting_ops():
+        operation.register(registry)
     return registry
 
 
@@ -297,6 +449,101 @@ def _stage2_primary_op(
     raise ValueError(
         f"{plan.context}: unsupported Stage2 dtype combination: "
         f"a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
+    )
+
+
+@plan_provider
+def resolve_moe_sorting_compile_plan(
+    plan: PlanBuilder,
+    case: MoeSortingCompileCase,
+) -> None:
+    """Resolve one explicit sorting case to exactly one concrete launcher."""
+
+    if not isinstance(case, MoeSortingCompileCase):
+        raise TypeError(
+            f"{plan.context}: case must be a MoeSortingCompileCase, "
+            f"got {type(case).__name__}"
+        )
+    from .kernels.moe_sorting_kernel import (
+        SORTING_PATH_4K_FUSED,
+        SORTING_PATH_ONESHOT,
+        SORTING_PATH_P0V2_P23,
+        resolve_moe_sorting_specialization,
+    )
+
+    specialization = resolve_moe_sorting_specialization(
+        arch=plan.target.arch,
+        max_tokens=case.max_tokens,
+        num_experts=case.num_experts,
+        topk=case.topk,
+        unit_size=case.unit_size,
+        has_mask=case.has_mask,
+        path=case.path,
+        k4_block=case.k4_block,
+    )
+    operations = _sorting_operations()
+    if specialization.path == SORTING_PATH_ONESHOT:
+        plan.emit(
+            operations[SORTING_ONESHOT_OP_ID],
+            case,
+            max_tokens=specialization.launcher_max_tokens,
+        )
+    elif specialization.path == SORTING_PATH_P0V2_P23:
+        plan.emit(
+            operations[SORTING_P0V2_P23_OP_ID],
+            case,
+            k4_block=specialization.k4_block,
+        )
+    elif specialization.path == SORTING_PATH_4K_FUSED:
+        plan.emit(
+            operations[SORTING_4K_FUSED_OP_ID],
+            case,
+            k4_block=specialization.k4_block,
+        )
+    else:
+        raise RuntimeError(
+            f"{plan.context}: unhandled sorting path {specialization.path!r}"
+        )
+
+
+def resolve_moe_compile_plan(
+    case: MoeCompilePlanCase,
+    *,
+    context: CompileContext[Any],
+) -> CompilePlan:
+    """Compose optional sorting, Stage1, and Stage2 plans in launch order."""
+
+    if not isinstance(context, CompileContext):
+        raise TypeError(
+            f"context must be a CompileContext, got {type(context).__name__}"
+        )
+    if not isinstance(case, MoeCompilePlanCase):
+        raise TypeError(f"case must be a MoeCompilePlanCase, got {type(case).__name__}")
+    if case.sorting is not None and not isinstance(
+        case.sorting,
+        MoeSortingCompileCase,
+    ):
+        raise TypeError(
+            "sorting must be an explicit MoeSortingCompileCase or None, "
+            f"got {type(case.sorting).__name__}"
+        )
+    for name, subplan in (("stage1", case.stage1), ("stage2", case.stage2)):
+        if not isinstance(subplan, CompilePlan):
+            raise TypeError(f"{name} must be a CompilePlan")
+        for unit in subplan.units:
+            if unit.spec.target != context.target:
+                raise ValueError(
+                    f"{name} unit {unit.spec.op_id!r} targets "
+                    f"{unit.spec.target!r}, expected {context.target!r}"
+                )
+
+    sorting_plan = (
+        CompilePlan(())
+        if case.sorting is None
+        else resolve_moe_sorting_compile_plan(case.sorting, context=context)
+    )
+    return CompilePlan(
+        sorting_plan.units + case.stage1.units + case.stage2.units,
     )
 
 

@@ -3,12 +3,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compilation for MoE / Mixed-MoE FlyDSL kernels from aiter CSV configs.
+"""AOT pre-compilation for MoE / Mixed-MoE FlyDSL kernels.
 
 Reads tuned CSV config files (e.g. dsv3_fp4_tuned_fmoe.csv), extracts all
-unique FlyDSL kernel names, and pre-compiles them into the cache. The default
-CSV set is resolved through ``AITER_CONFIGS`` so model-specific tuned CSVs can
-be merged the same way as runtime JIT config lookup.
+unique Stage1/Stage2 FlyDSL kernel names, and pre-compiles them into the cache.
+Sorting is available only through the explicit ``compile_moe_sorting_case``
+API. The default CSV set is resolved through ``AITER_CONFIGS`` so
+model-specific tuned CSVs can be merged the same way as runtime JIT config
+lookup.
 
 Usage:
     # Compile all unique FlyDSL kernels from default CSVs
@@ -236,6 +238,26 @@ def _compile_stage2_plan(cfg: dict, context) -> int:
     return len(plan.units)
 
 
+def compile_moe_sorting_case(case, *, context):
+    """Directly compile one explicit sorting case through Aiter's AOT backend.
+
+    Ordinary Stage1/Stage2 CSV rows never call this function: sorting inclusion
+    remains explicit until tuning metadata and Manifest generation own it.
+    """
+
+    from aiter.ops.flydsl.moe_compile_plan import (
+        MoeSortingCompileCase,
+        resolve_moe_sorting_compile_plan,
+    )
+
+    if not isinstance(case, MoeSortingCompileCase):
+        raise TypeError(
+            f"case must be a MoeSortingCompileCase, got {type(case).__name__}"
+        )
+    plan = resolve_moe_sorting_compile_plan(case, context=context)
+    return tuple(compile_aot(unit, context=context) for unit in plan.units)
+
+
 def _compile_cktile_epilogue_plan(cfg: dict, context) -> int:
     from aiter.ops.flydsl.moe_compile_plan import (
         resolve_cktile_stage1_compile_plan,
@@ -289,7 +311,8 @@ def compile_one_config(
     """Compile one MoE kernel configuration and save to cache.
 
     Stage1, Stage2, reductions, and CK-Tile FlyDSL epilogues compile directly
-    from resolved ``CompileUnit.signature`` metadata.
+    from resolved ``CompileUnit.signature`` metadata. Sorting is deliberately
+    excluded; use ``compile_moe_sorting_case`` with explicit metadata.
 
     Returns a dict with timing info.
     """

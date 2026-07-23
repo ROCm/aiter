@@ -54,34 +54,13 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_4k_fused",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_multiphase_launchers",
           "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase"
         ],
         "launchers": [
           "sorting.multiphase.4k_fused"
         ],
-        "scenario": "sorting.multiphase.4k.masked"
-      }
-    },
-    {
-      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot",
-      "id": "sorting.multiphase.4k.masked/oneshot_builder",
-      "kwargs": {
-        "has_mask": true,
-        "max_tokens": 128,
-        "num_experts": 256,
-        "topk": 8,
-        "unit_size": 32
-      },
-      "trigger": {
-        "host_path": [
-          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot"
-        ],
-        "launchers": [],
         "scenario": "sorting.multiphase.4k.masked"
       }
     },
@@ -98,56 +77,14 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_p0v2_p23",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_multiphase_launchers",
           "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase"
         ],
         "launchers": [
           "sorting.multiphase.p0v2_p23"
         ],
         "scenario": "sorting.multiphase.p0v2.unmasked.e384"
-      }
-    },
-    {
-      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot",
-      "id": "sorting.multiphase.p0v2.unmasked.e384/oneshot_builder",
-      "kwargs": {
-        "has_mask": false,
-        "max_tokens": 128,
-        "num_experts": 384,
-        "topk": 8,
-        "unit_size": 32
-      },
-      "trigger": {
-        "host_path": [
-          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot"
-        ],
-        "launchers": [],
-        "scenario": "sorting.multiphase.p0v2.unmasked.e384"
-      }
-    },
-    {
-      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase",
-      "id": "sorting.oneshot.masked/multiphase_builder",
-      "kwargs": {
-        "has_mask": true,
-        "k4_block": 256,
-        "num_experts": 256,
-        "topk": 8,
-        "unit_size": 32
-      },
-      "trigger": {
-        "host_path": [
-          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase"
-        ],
-        "launchers": [],
-        "scenario": "sorting.oneshot.masked"
       }
     },
     {
@@ -163,35 +100,13 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_oneshot",
           "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot"
         ],
         "launchers": [
           "sorting.oneshot"
         ],
         "scenario": "sorting.oneshot.masked"
-      }
-    },
-    {
-      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase",
-      "id": "sorting.oneshot.unmasked/multiphase_builder",
-      "kwargs": {
-        "has_mask": false,
-        "k4_block": 256,
-        "num_experts": 256,
-        "topk": 8,
-        "unit_size": 32
-      },
-      "trigger": {
-        "host_path": [
-          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase"
-        ],
-        "launchers": [],
-        "scenario": "sorting.oneshot.unmasked"
       }
     },
     {
@@ -207,8 +122,7 @@
       "trigger": {
         "host_path": [
           "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.moe_sorting_flydsl",
-          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_oneshot",
           "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot"
         ],
         "launchers": [

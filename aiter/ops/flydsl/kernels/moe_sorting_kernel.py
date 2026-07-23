@@ -21,6 +21,7 @@ Packed token ID format: (topk_position << 24) | token_id
 """
 
 import functools
+from dataclasses import dataclass
 
 import torch
 
@@ -37,12 +38,168 @@ from .tensor_shim import _run_compiled
 
 BLOCK_SIZE = 256
 UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
-WARP_SIZE = get_warp_size()
 
 # P23 block-size policy: E in (256, 512] (e.g. DSV4 E=385) uses 512-thread blocks
 # when T <= threshold to avoid per-block serial prefix extension (E > K4_BLOCK).
 # Above threshold, 256-thread blocks match OPUS mesh-scan geometry at large T.
 P23_LARGE_T_THRESHOLD = 8192
+P0V2_MAX_TOKENS = 2048
+
+SORTING_PATH_ONESHOT = "oneshot"
+SORTING_PATH_P0V2_P23 = "p0v2_p23"
+SORTING_PATH_4K_FUSED = "4k_fused"
+_SORTING_PATHS = frozenset(
+    (SORTING_PATH_ONESHOT, SORTING_PATH_P0V2_P23, SORTING_PATH_4K_FUSED)
+)
+
+
+@dataclass(frozen=True)
+class MoeSortingSpecialization:
+    """CPU-only compile specialization selected from explicit sorting metadata."""
+
+    path: str
+    max_tokens: int
+    launcher_max_tokens: int
+    sub_tokens: int
+    oneshot_max_tokens: int
+    k4_block: int | None
+    has_mask: bool
+
+
+def _positive_int(name, value):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
+def _lds_capacity_bytes(arch: str) -> int:
+    """Return the documented per-workgroup LDS capacity for a canonical arch."""
+
+    if not isinstance(arch, str) or not arch:
+        raise ValueError(f"architecture must be explicit, got {arch!r}")
+    canonical = arch.lower().split(":", 1)[0]
+    if canonical.startswith("gfx95"):
+        return 163840
+    if canonical.startswith(("gfx90", "gfx94", "gfx10", "gfx11", "gfx12")):
+        return 65536
+    raise ValueError(f"unsupported MoE sorting architecture: {arch!r}")
+
+
+@functools.lru_cache(maxsize=64)
+def _compute_sub_tokens(num_experts: int, arch: str) -> int:
+    """Compute the maximum token rows fitting the oneshot LDS mesh."""
+
+    _positive_int("num_experts", num_experts)
+    lds_capacity_ints = _lds_capacity_bytes(arch) // 4
+    smem_cols = num_experts + 1
+    target_occupancy = 2
+    r = lds_capacity_ints // target_occupancy // smem_cols
+    sub_unroll = 8
+    cumsum_bufs = 2
+    if r < cumsum_bufs + sub_unroll:
+        return 0
+    return ((r - cumsum_bufs) // sub_unroll) * sub_unroll
+
+
+def _oneshot_token_threshold(
+    num_experts: int,
+    topk: int,
+    *,
+    arch: str,
+) -> tuple[int, int]:
+    """Return ``(sub_tokens, effective oneshot threshold)``."""
+
+    _positive_int("topk", topk)
+    sub_tokens = _compute_sub_tokens(num_experts, arch)
+    denominator = max(topk, num_experts // 8)
+    oneshot_max_tokens = min(
+        sub_tokens,
+        max(16, BLOCK_SIZE // denominator),
+    )
+    return sub_tokens, oneshot_max_tokens
+
+
+@functools.lru_cache(maxsize=64)
+def _p23_block_size(num_experts: int, tokens: int) -> int:
+    """Pure P23 specialization policy shared by runtime and direct AOT."""
+
+    _positive_int("num_experts", num_experts)
+    _positive_int("tokens", tokens)
+    if num_experts <= 256:
+        return 256
+    if tokens > P23_LARGE_T_THRESHOLD:
+        return 256
+    if num_experts <= 512:
+        return 512
+    return 256
+
+
+def resolve_moe_sorting_specialization(
+    *,
+    arch: str,
+    max_tokens: int,
+    num_experts: int,
+    topk: int,
+    unit_size: int,
+    has_mask: bool,
+    path: str | None = None,
+    k4_block: int | None = None,
+) -> MoeSortingSpecialization:
+    """Resolve one concrete sorting launcher without touching a device."""
+
+    _positive_int("max_tokens", max_tokens)
+    _positive_int("num_experts", num_experts)
+    _positive_int("topk", topk)
+    _positive_int("unit_size", unit_size)
+    if not isinstance(has_mask, bool):
+        raise TypeError(f"has_mask must be explicit bool metadata, got {has_mask!r}")
+    sub_tokens, oneshot_max_tokens = _oneshot_token_threshold(
+        num_experts,
+        topk,
+        arch=arch,
+    )
+    if max_tokens <= oneshot_max_tokens:
+        resolved_path = SORTING_PATH_ONESHOT
+    elif max_tokens <= P0V2_MAX_TOKENS:
+        resolved_path = SORTING_PATH_P0V2_P23
+    else:
+        resolved_path = SORTING_PATH_4K_FUSED
+
+    if path is not None:
+        if path not in _SORTING_PATHS:
+            raise ValueError(
+                f"sorting path must be one of {sorted(_SORTING_PATHS)}, got {path!r}"
+            )
+        if path != resolved_path:
+            raise ValueError(
+                "sorting path disagrees with token/target semantics: "
+                f"expected {resolved_path!r}, got {path!r}"
+            )
+
+    if resolved_path == SORTING_PATH_ONESHOT:
+        if k4_block is not None:
+            raise ValueError("k4_block is not valid for the oneshot sorting path")
+        launcher_max_tokens = max(8, ((max_tokens + 7) // 8) * 8)
+        resolved_k4_block = None
+    else:
+        launcher_max_tokens = max_tokens
+        resolved_k4_block = _p23_block_size(num_experts, max_tokens)
+        if k4_block is not None and k4_block != resolved_k4_block:
+            raise ValueError(
+                "k4_block disagrees with P23 specialization: "
+                f"expected {resolved_k4_block}, got {k4_block}"
+            )
+
+    return MoeSortingSpecialization(
+        path=resolved_path,
+        max_tokens=max_tokens,
+        launcher_max_tokens=launcher_max_tokens,
+        sub_tokens=sub_tokens,
+        oneshot_max_tokens=oneshot_max_tokens,
+        k4_block=resolved_k4_block,
+        has_mask=has_mask,
+    )
+
 
 # DPP constants for prefix sum (used by oneshot and multiphase)
 DPP_ROW_SHR_1 = 0x111
@@ -208,6 +365,7 @@ def _compile_moe_sorting_oneshot(
         GEMM tile-M for padding alignment (default 32).
     """
     arch = get_hip_arch()
+    WARP_SIZE = get_warp_size(arch)
     E = num_experts
     # CDNA (warp64): 512 threads = 8 waves, affordable cross-wave reduction.
     max_oneshot_block = 512 if WARP_SIZE == 64 else 256
@@ -217,26 +375,15 @@ def _compile_moe_sorting_oneshot(
 
     # LDS sizing: sub_tokens rows for the token×expert histogram
     # Match CK's sizing: total LDS / occupancy / smem_cols, rounded to 8
-    if arch in ("gfx942",) or str(arch).startswith("gfx94"):
-        lds_capacity_bytes = 65536
-    elif str(arch).startswith("gfx95"):
-        lds_capacity_bytes = 163840
-    else:
-        lds_capacity_bytes = 65536  # conservative default
-
-    lds_capacity_ints = lds_capacity_bytes // 4
-    target_occupancy = 2
-    r = lds_capacity_ints // target_occupancy // smem_cols
     sub_unroll = 8
     cumsum_bufs = 2
-    if r < (cumsum_bufs + sub_unroll):
+    capacity_sub_tokens = _compute_sub_tokens(E, str(arch))
+    if capacity_sub_tokens == 0:
         raise ValueError(
             f"LDS too small for E={E}: need at least {(cumsum_bufs + sub_unroll) * smem_cols * 4} bytes"
         )
-    r_for_sub = ((r - cumsum_bufs) // sub_unroll) * sub_unroll
     r_token_min = ((max_tokens + sub_unroll - 1) // sub_unroll) * sub_unroll
-    r_for_sub = min(r_for_sub, r_token_min)
-    sub_tokens = r_for_sub
+    sub_tokens = min(capacity_sub_tokens, r_token_min)
 
     # LDS regions for the oneshot kernel:
     #   cumsum[E+1]  exclusive prefix sums per expert
@@ -775,18 +922,6 @@ def _compile_moe_sorting_oneshot(
 # ---------------------------------------------------------------------------
 # FlyDSL GPU kernels — multiphase path (2 or 4 kernels, large T via HBM workspace)
 # ---------------------------------------------------------------------------
-@functools.lru_cache(maxsize=64)
-def _p23_block_size(num_experts: int, tokens: int) -> int:
-    """Runtime P23 block size: balance E>256 prefix path vs large-T mesh scan."""
-    if num_experts <= 256:
-        return 256
-    if tokens > P23_LARGE_T_THRESHOLD:
-        return 256
-    if num_experts <= 512:
-        return 512
-    return 256
-
-
 @functools.lru_cache(maxsize=256)
 def _compile_moe_sorting_multiphase(
     *,
@@ -819,6 +954,8 @@ def _compile_moe_sorting_multiphase(
     unit_size : int
         GEMM tile-M for padding alignment (default 32).
     """
+    arch = get_hip_arch()
+    WARP_SIZE = get_warp_size(arch)
     E = num_experts
 
     @flyc.jit
@@ -1731,47 +1868,100 @@ def _compile_moe_sorting_multiphase(
     )
 
 
-# Host-side entry point
+# Concrete host-side compiler entry points
 # ---------------------------------------------------------------------------
-@functools.lru_cache(maxsize=64)
-def _compute_sub_tokens(num_experts, arch=None):
-    """Compute the LDS-capacity threshold (sub_tokens) for oneshot vs multiphase decision.
-
-    Returns the max T that fits in LDS for the oneshot (single-kernel) path.
-    Same formula as _compile_moe_sorting_oneshot.
-    """
-    if arch is None:
-        arch = get_hip_arch()
-    E = num_experts
-    smem_cols = E + 1
-    if arch in ("gfx942",) or str(arch).startswith("gfx94"):
-        lds_capacity_bytes = 65536
-    elif str(arch).startswith("gfx95"):
-        lds_capacity_bytes = 163840
-    else:
-        lds_capacity_bytes = 65536
-    lds_capacity_ints = lds_capacity_bytes // 4
-    target_occupancy = 2
-    r = lds_capacity_ints // target_occupancy // smem_cols
-    sub_unroll = 8
-    cumsum_bufs = 2
-    if r < (cumsum_bufs + sub_unroll):
-        return 0  # LDS too small — always use multiphase
-    r_for_sub = ((r - cumsum_bufs) // sub_unroll) * sub_unroll
-    return r_for_sub
+def _target_aware_builder(builder, compile_target):
+    # ``compile_target`` is part of the public wrapper cache key. AotBackend
+    # installs the matching FlyDSL target environment before entering here, so
+    # bypass the old target-unaware private cache without adding another bridge.
+    if compile_target is None:
+        return builder
+    return getattr(builder, "__wrapped__", builder)
 
 
-def moe_sorting_get_workspace_size(M, num_experts, topk, unit_size=UNIT_SIZE):
-    """Return workspace size (in i32 elements) needed for the multiphase path.
-    Returns 0 if the oneshot path will be used."""
-    sub_tokens = _compute_sub_tokens(num_experts)
-    ONESHOT_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
-    if M <= min(sub_tokens, ONESHOT_MAX_T):
-        return 0
-    mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
-    ws_mesh_bytes = num_experts * mesh_stride
-    ws_mesh_i32 = (ws_mesh_bytes + 3) // 4
-    return ws_mesh_i32 + (num_experts + 1)
+@functools.lru_cache(maxsize=256)
+def compile_moe_sorting_oneshot(
+    *,
+    num_experts: int,
+    topk: int,
+    max_tokens: int = 128,
+    unit_size: int = UNIT_SIZE,
+    has_mask: bool = False,
+    compile_target=None,
+):
+    """Build exactly the oneshot launcher."""
+
+    builder = _target_aware_builder(_compile_moe_sorting_oneshot, compile_target)
+    return builder(
+        num_experts=num_experts,
+        topk=topk,
+        max_tokens=max_tokens,
+        unit_size=unit_size,
+        has_mask=has_mask,
+    )
+
+
+def _compile_multiphase_launchers(
+    *,
+    num_experts,
+    topk,
+    unit_size,
+    has_mask,
+    k4_block,
+    compile_target,
+):
+    builder = _target_aware_builder(_compile_moe_sorting_multiphase, compile_target)
+    return builder(
+        num_experts=num_experts,
+        topk=topk,
+        unit_size=unit_size,
+        has_mask=has_mask,
+        k4_block=k4_block,
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def compile_moe_sorting_p0v2_p23(
+    *,
+    num_experts: int,
+    topk: int,
+    unit_size: int = UNIT_SIZE,
+    has_mask: bool = False,
+    k4_block: int = 256,
+    compile_target=None,
+):
+    """Build exactly the combined P0v2 + P23 launcher."""
+
+    return _compile_multiphase_launchers(
+        num_experts=num_experts,
+        topk=topk,
+        unit_size=unit_size,
+        has_mask=has_mask,
+        k4_block=k4_block,
+        compile_target=compile_target,
+    )[5]
+
+
+@functools.lru_cache(maxsize=256)
+def compile_moe_sorting_4k_fused(
+    *,
+    num_experts: int,
+    topk: int,
+    unit_size: int = UNIT_SIZE,
+    has_mask: bool = False,
+    k4_block: int = 256,
+    compile_target=None,
+):
+    """Build exactly the ClearWS + P0 + P1 + P23 launcher."""
+
+    return _compile_multiphase_launchers(
+        num_experts=num_experts,
+        topk=topk,
+        unit_size=unit_size,
+        has_mask=has_mask,
+        k4_block=k4_block,
+        compile_target=compile_target,
+    )[6]
 
 
 def compile_moe_sorting(
@@ -1782,27 +1972,58 @@ def compile_moe_sorting(
     unit_size=UNIT_SIZE,
     has_mask=False,
     k4_block=256,
+    compile_target=None,
 ):
-    """Compile MoE sorting kernels for all paths (oneshot + multiphase).
+    """Compatibility factory returning all three concrete launchers."""
 
-    Returns (launch_oneshot, launch_p0v2_p23, launch_4k_fused) covering all T ranges.
-    Oneshot compilation depends on max_tokens (LDS sizing); multiphase is independent.
-    """
-    launch_oneshot = _compile_moe_sorting_oneshot(
+    launch_oneshot = compile_moe_sorting_oneshot(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
         unit_size=unit_size,
         has_mask=has_mask,
+        compile_target=compile_target,
     )
-    _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = _compile_moe_sorting_multiphase(
+    multiphase = _compile_multiphase_launchers(
         num_experts=num_experts,
         topk=topk,
         unit_size=unit_size,
         has_mask=has_mask,
         k4_block=k4_block,
+        compile_target=compile_target,
     )
-    return launch_oneshot, launch_p0v2_p23, launch_4k_fused
+    return launch_oneshot, multiphase[5], multiphase[6]
+
+
+def moe_sorting_get_workspace_size(
+    max_tokens,
+    num_experts,
+    topk,
+    unit_size=UNIT_SIZE,
+    *,
+    arch,
+    has_mask,
+    path=None,
+    k4_block=None,
+):
+    """Return the multiphase workspace size from explicit CPU metadata."""
+
+    specialization = resolve_moe_sorting_specialization(
+        arch=arch,
+        max_tokens=max_tokens,
+        num_experts=num_experts,
+        topk=topk,
+        unit_size=unit_size,
+        has_mask=has_mask,
+        path=path,
+        k4_block=k4_block,
+    )
+    if specialization.path == SORTING_PATH_ONESHOT:
+        return 0
+    mesh_stride = ((max_tokens + unit_size - 1) // unit_size) * unit_size
+    ws_mesh_bytes = num_experts * mesh_stride
+    ws_mesh_i32 = (ws_mesh_bytes + 3) // 4
+    return ws_mesh_i32 + (num_experts + 1)
 
 
 def moe_sorting_flydsl(
@@ -1818,15 +2039,22 @@ def moe_sorting_flydsl(
     expert_mask=None,
     num_local_tokens=None,
     workspace=None,
+    *,
+    launcher,
+    specialization,
+    cu_count,
+    launch_context,
 ):
-    """MoE sorting using FlyDSL kernel (oneshot + multiphase paths).
+    """Pack runtime sorting arguments and launch one pre-resolved artifact.
 
     API matches aiter.moe_sorting_fwd for drop-in replacement:
         moe_sorting_flydsl(topk_ids, topk_weights,
                            sorted_ids, sorted_weights, sorted_expert_ids,
                            num_valid_ids, moe_buf,
                            num_experts, unit_size, expert_mask,
-                           num_local_tokens, workspace)
+                           num_local_tokens, workspace,
+                           launcher=..., specialization=...,
+                           cu_count=..., launch_context=...)
 
     All output tensors (sorted_ids, sorted_weights, sorted_expert_ids,
     num_valid_ids, moe_buf) must be pre-allocated by the caller.
@@ -1835,7 +2063,13 @@ def moe_sorting_flydsl(
     -------
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
     """
-    topk = topk_ids.shape[1]
+    if not isinstance(specialization, MoeSortingSpecialization):
+        raise TypeError("specialization must be a MoeSortingSpecialization")
+    _positive_int("cu_count", cu_count)
+    if launch_context is None or not hasattr(launch_context, "stream"):
+        raise TypeError("launch_context with an explicit stream is required")
+
+    topk = int(topk_ids.shape[1])
     if num_local_tokens is not None:
         M = (
             num_local_tokens.item()
@@ -1843,9 +2077,13 @@ def moe_sorting_flydsl(
             else int(num_local_tokens)
         )
     else:
-        M = topk_ids.shape[0]
-
-    sub_tokens = _compute_sub_tokens(num_experts)
+        M = int(topk_ids.shape[0])
+    _positive_int("num_local_tokens", M)
+    if M > specialization.max_tokens:
+        raise ValueError(
+            "num_local_tokens exceeds the compiled sorting token bucket: "
+            f"{M} > {specialization.max_tokens}"
+        )
 
     device = topk_ids.device
     # An empty placeholder moe_buf (reduce-mode stage2: caller owns the
@@ -1854,7 +2092,12 @@ def moe_sorting_flydsl(
     # buffer would fail the stride-divisibility check, and a 1-D empty tensor
     # breaks the kernel arg's 2-D shape codec (pack_into expects 2 dims).
     if moe_buf.numel() == 0:
-        moe_buf_i32 = torch.empty((0, 0), dtype=torch.int32, device=device)
+        moe_buf_i32 = torch.empty_strided(
+            (0, 0),
+            (2, 1),
+            dtype=torch.int32,
+            device=device,
+        )
         moe_buf_elems = 0
     else:
         moe_buf_i32 = moe_buf.view(torch.int32)
@@ -1862,6 +2105,11 @@ def moe_sorting_flydsl(
 
     # EP: prepare mask tensor and flag.
     has_mask = expert_mask is not None
+    if has_mask != specialization.has_mask:
+        raise ValueError(
+            "runtime expert-mask state disagrees with sorting specialization: "
+            f"{has_mask} != {specialization.has_mask}"
+        )
     if not has_mask:
         mask_tensor = _dummy_mask_cache.get(device)
         if mask_tensor is None:
@@ -1870,27 +2118,15 @@ def moe_sorting_flydsl(
     else:
         mask_tensor = expert_mask
 
-    ONESHOT_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
-
     target_occupancy = 2
-    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
-
-    if M <= min(sub_tokens, ONESHOT_MAX_T):
-        max_tokens = max(M, 8)
-        max_tokens = ((max_tokens + 7) // 8) * 8
-
+    stream = fx.Stream(launch_context.stream)
+    if specialization.path == SORTING_PATH_ONESHOT:
         n_zero_blocks = min(
-            (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy
+            (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE,
+            cu_count * target_occupancy,
         )
         n_grid_blocks = 1 + n_zero_blocks
 
-        launch_oneshot, _, _ = compile_moe_sorting(
-            num_experts=num_experts,
-            topk=topk,
-            max_tokens=max_tokens,
-            unit_size=unit_size,
-            has_mask=has_mask,
-        )
         oneshot_args = (
             topk_ids,
             topk_weights,
@@ -1904,11 +2140,7 @@ def moe_sorting_flydsl(
             moe_buf_elems,
             n_grid_blocks,
         )
-        _run_compiled(
-            launch_oneshot,
-            *oneshot_args,
-            fx.Stream(torch.cuda.current_stream(device)),
-        )
+        _run_compiled(launcher, *oneshot_args, stream)
     else:
         mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
         ws_mesh_bytes = num_experts * mesh_stride
@@ -1921,20 +2153,12 @@ def moe_sorting_flydsl(
                 f"workspace too small: need {ws_total} i32 elements, got {workspace.numel()}"
             )
 
-        k4_block = _p23_block_size(num_experts, M)
-        _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
-            num_experts=num_experts,
-            topk=topk,
-            unit_size=unit_size,
-            has_mask=has_mask,
-            k4_block=k4_block,
-        )
-        stream = torch.cuda.current_stream(device)
         n_zero_blocks = min(
-            (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy
+            (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE,
+            cu_count * target_occupancy,
         )
         k4_grid = num_experts + n_zero_blocks
-        if M <= 2048:
+        if specialization.path == SORTING_PATH_P0V2_P23:
             p0v2_args = (
                 topk_ids,
                 workspace,
@@ -1951,10 +2175,10 @@ def moe_sorting_flydsl(
                 moe_buf_elems,
                 k4_grid,
             )
-            _run_compiled(launch_p0v2_p23, *p0v2_args, fx.Stream(stream))
-        else:
+            _run_compiled(launcher, *p0v2_args, stream)
+        elif specialization.path == SORTING_PATH_4K_FUSED:
             k1_grid = (ws_total + 1023) // 1024
-            k2_grid = num_cu * target_occupancy
+            k2_grid = cu_count * target_occupancy
             k2_total = M * topk
             k2_stride = k2_grid * 256
             k2_niters = (k2_total + k2_stride - 1) // k2_stride
@@ -1978,6 +2202,8 @@ def moe_sorting_flydsl(
                 k2_grid,
                 k4_grid,
             )
-            _run_compiled(launch_4k_fused, *k4_args, fx.Stream(stream))
+            _run_compiled(launcher, *k4_args, stream)
+        else:
+            raise RuntimeError(f"unsupported sorting path: {specialization.path!r}")
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
