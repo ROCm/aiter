@@ -274,6 +274,63 @@ DINLINE P packed_reduce(const P* ptrs[], int idx)
     return downcast<P>(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Expert weighted-sum folded into the all-reduce input stage.
+//
+// Reduces a routed-expert stack [m, topk, n] over the topk axis into [m, n],
+// writing the result directly into the registered IPC buffer. In eager mode
+// the all-reduce must copy its input into that buffer anyway, so folding the
+// sum into that copy removes the standalone reduction pass, its output tensor,
+// and one kernel launch relative to sum-then-all-reduce. Accumulation is done
+// in fp32 then downcast, matching the cross-rank reduce epilogue.
+// ---------------------------------------------------------------------------
+template <typename T, int pack_size>
+__global__ void __launch_bounds__(1024, 1)
+    moe_sum_rows_kernel(T* __restrict__ out, const T* __restrict__ input, int topk, int n_packs)
+{
+    using P             = typename opus::vector_t<T, pack_size>;
+    using A             = typename opus::vector_t<opus::fp32_t, pack_size>;
+    const int64_t token = blockIdx.x;
+    const P* in_tok     = reinterpret_cast<const P*>(input) + token * (int64_t)topk * n_packs;
+    P* out_tok          = reinterpret_cast<P*>(out) + token * (int64_t)n_packs;
+    for(int idx = threadIdx.x; idx < n_packs; idx += blockDim.x)
+    {
+        A acc;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = 0.0f;
+        for(int k = 0; k < topk; ++k)
+        {
+            P v = in_tok[(int64_t)k * n_packs + idx];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                acc[j] += upcast_s(v[j]);
+        }
+        P o;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            o[j] = downcast_s<T>(acc[j]);
+        out_tok[idx] = o;
+    }
+}
+
+template <typename T>
+void launch_moe_sum_rows(hipStream_t stream, T* out, const T* input, int m, int topk, int n)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    if(n % pack_size != 0)
+        throw std::runtime_error(
+            "fused_moe_sum_allreduce requires the hidden dim to be a multiple of " +
+            std::to_string(pack_size));
+    int n_packs   = n / pack_size;
+    int block_dim = n_packs < 1024 ? ((n_packs + 63) / 64) * 64 : 1024;
+    if(block_dim <= 0)
+        block_dim = 64;
+    dim3 grid(m);
+    dim3 block(block_dim);
+    moe_sum_rows_kernel<T, pack_size><<<grid, block, 0, stream>>>(out, input, topk, n_packs);
+}
+
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_naive(RankData* _input_dp,
                                                                            RankData* _output_dp,

@@ -1029,9 +1029,13 @@ class CustomAllreduce:
         self._pool.flush_graph_buffers(self._ptr)
 
     def _fits_custom_ar_size(self, inp: torch.Tensor, prefill_support: bool = False):
+        return self._fits_custom_ar_bytes(
+            inp.numel() * inp.element_size(), prefill_support
+        )
+
+    def _fits_custom_ar_bytes(self, inp_size: int, prefill_support: bool = False):
         if self.disabled:
             return False
-        inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
@@ -1142,6 +1146,60 @@ class CustomAllreduce:
                 open_fp8_quant=open_fp8_quant,
                 registered_input=False,
             )
+
+    def fused_moe_sum_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        use_new: bool = True,
+    ) -> torch.Tensor:
+        """Reduce the routed-expert stack ``inp`` [.., topk, hidden] over the
+        topk axis and all-reduce the [.., hidden] result across the group in a
+        single pass.
+
+        The topk weighted-sum is written into the registered IPC buffer in
+        place of the usual eager-mode input copy, so there is no standalone
+        moe_sum pass or intermediate [.., hidden] tensor.
+        """
+        assert inp.dim() >= 2, "expected input [.., topk, hidden]"
+        out_shape = inp.shape[:-2] + inp.shape[-1:]
+        if out is None:
+            out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
+        assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
+        ops.fused_moe_sum_allreduce(
+            self._ptr,
+            inp,
+            out,
+            use_new,
+            self._pool["input"].data_ptr,
+            self._pool["input"].max_size,
+        )
+        return out
+
+    def custom_fused_moe_sum_all_reduce(
+        self,
+        input: torch.Tensor,
+        use_new: bool = True,
+        prefill_support: bool = False,
+    ) -> Optional[torch.Tensor]:
+        # Returns None when the custom path is disabled/ineligible so the
+        # caller can fall back to moe_sum + all_reduce. Eligibility is governed
+        # by the reduced [.., hidden] output size (what actually gets reduced
+        # and copied into the registered buffer), not the larger input.
+        if self.disabled or not is_weak_contiguous(input):
+            return None
+        out_bytes = (input.numel() // input.shape[-2]) * input.element_size()
+        if not self._fits_custom_ar_bytes(out_bytes, prefill_support):
+            return None
+        out_shape = input.shape[:-2] + input.shape[-1:]
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_moe_sum_all_reduce(input, use_new=use_new)
+            else:
+                # warm-up: mimic the out-of-place allocation pattern.
+                return torch.zeros(out_shape, dtype=input.dtype, device=input.device)
+        return self.fused_moe_sum_all_reduce(input, use_new=use_new)
 
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.

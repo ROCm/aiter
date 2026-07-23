@@ -38,6 +38,15 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+// Expert weighted-sum folded into the all-reduce input stage: reduces
+// `inp` [.., topk, hidden] over the topk axis and all-reduces the result
+// across ranks in one pass, writing [.., hidden] into `out`.
+void fused_moe_sum_allreduce(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& out,
+                             bool use_new,
+                             int64_t reg_inp_ptr,
+                             int64_t reg_inp_bytes);
 // reduce_scatter dispatcher. (m, n, k, split_dim) describe the canonical
 // shape the Python wrapper collapsed the input to:
 //   split_dim = 0 (kFirst): only `k` (= numel) used

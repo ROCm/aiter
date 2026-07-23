@@ -149,6 +149,25 @@ def tensor_model_parallel_all_reduce(
     return get_tp_group().all_reduce(input_, use_new, open_fp8_quant, prefill_support)
 
 
+def tensor_model_parallel_fused_moe_sum_all_reduce(
+    input_: torch.Tensor,
+    use_new: bool = True,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    """Fold the routed-expert weighted-sum (moe_sum over the topk axis) into
+    the tensor-parallel all-reduce.
+
+    ``input_`` is the routed-expert stack ``[.., topk, hidden]``; returns the
+    reduced ``[.., hidden]``. Equivalent to ``all_reduce(moe_sum(input_))`` but
+    folds the expert-sum into the all-reduce input stage (one pass, no
+    standalone moe_sum kernel / intermediate tensor).
+    """
+    _assert_no_custom_group("tensor_model_parallel_fused_moe_sum_all_reduce")
+    return get_tp_group().fused_moe_sum_all_reduce(
+        input_, ca_use_new=use_new, prefill_support=prefill_support
+    )
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,

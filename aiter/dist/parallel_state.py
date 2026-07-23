@@ -124,6 +124,32 @@ def all_reduce_(
     )
 
 
+def fused_moe_sum_all_reduce_fake(
+    tensor: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool = True,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    out_shape = tensor.shape[:-2] + tensor.shape[-1:]
+    return torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+
+
+@torch_compile_guard(gen_fake=fused_moe_sum_all_reduce_fake)
+def fused_moe_sum_all_reduce_(
+    tensor: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool = True,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_moe_sum_all_reduce_out_place(
+        tensor, ca_use_new, prefill_support
+    )
+
+
 def fused_allreduce_rmsnorm_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -695,6 +721,46 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(
             input_, ca_use_new, ca_fp8_quant, prefill_support
+        )
+
+    def fused_moe_sum_all_reduce(
+        self,
+        input_: torch.Tensor,
+        ca_use_new: bool = True,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """Reduce the routed-expert stack ``input_`` [.., topk, hidden] over
+        the topk axis and all-reduce the [.., hidden] result across this group.
+        """
+        if self.world_size == 1:
+            # Single GPU: the cross-rank all-reduce is identity, so this is
+            # just the local expert weighted-sum over the topk axis.
+            import aiter
+
+            out_shape = input_.shape[:-2] + input_.shape[-1:]
+            summed = torch.empty(
+                out_shape, dtype=input_.dtype, device=input_.device
+            )
+            aiter.moe_sum(input_.contiguous(), summed)
+            return summed
+
+        return fused_moe_sum_all_reduce_(
+            input_,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            prefill_support=prefill_support,
+        )
+
+    def _fused_moe_sum_all_reduce_out_place(
+        self,
+        input_: torch.Tensor,
+        ca_use_new: bool,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_moe_sum_all_reduce(
+            input_, ca_use_new, prefill_support
         )
 
     def fused_allreduce_rmsnorm(

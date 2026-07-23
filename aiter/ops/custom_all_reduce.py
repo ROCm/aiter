@@ -37,6 +37,17 @@ def all_reduce(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def fused_moe_sum_allreduce(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    use_new: bool,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp: torch.Tensor,

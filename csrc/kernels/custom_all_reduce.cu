@@ -117,6 +117,55 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
     }
 }
 
+static void _fused_moe_sum_allreduce(fptr_t _fa, void* inp, void* reg_out, void* out,
+                                     int m, int topk, int n,
+                                     AiterDtype dtype, bool use_new)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int size           = m * n;
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        aiter::launch_moe_sum_rows<opus::fp32_t>(stream,
+                                                 reinterpret_cast<opus::fp32_t*>(reg_out),
+                                                 reinterpret_cast<const opus::fp32_t*>(inp),
+                                                 m, topk, n);
+        fa->allreduce<opus::fp32_t>(stream,
+                                    reinterpret_cast<opus::fp32_t*>(reg_out),
+                                    reinterpret_cast<opus::fp32_t*>(out),
+                                    size, use_new);
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        aiter::launch_moe_sum_rows<opus::fp16_t>(stream,
+                                                 reinterpret_cast<opus::fp16_t*>(reg_out),
+                                                 reinterpret_cast<const opus::fp16_t*>(inp),
+                                                 m, topk, n);
+        fa->allreduce<opus::fp16_t>(stream,
+                                    reinterpret_cast<opus::fp16_t*>(reg_out),
+                                    reinterpret_cast<opus::fp16_t*>(out),
+                                    size, use_new);
+        break;
+    }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        aiter::launch_moe_sum_rows<opus::bf16_t>(stream,
+                                                 reinterpret_cast<opus::bf16_t*>(reg_out),
+                                                 reinterpret_cast<const opus::bf16_t*>(inp),
+                                                 m, topk, n);
+        fa->allreduce<opus::bf16_t>(stream,
+                                    reinterpret_cast<opus::bf16_t*>(reg_out),
+                                    reinterpret_cast<opus::bf16_t*>(out),
+                                    size, use_new);
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+    }
+}
+
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
                             int m, int n, int k,
                             aiter::ReduceScatterSplitDim split_dim,
@@ -438,6 +487,36 @@ void all_reduce(fptr_t _fa,
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
+}
+
+void fused_moe_sum_allreduce(fptr_t _fa,
+                             const aiter_tensor_t& inp,
+                             const aiter_tensor_t& out,
+                             bool use_new,
+                             int64_t reg_inp_ptr,
+                             int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    auto dtype = inp.dtype();
+
+    int ndim = inp.dim();
+    if(ndim < 2)
+        throw std::runtime_error("fused_moe_sum_allreduce expects input [.., topk, hidden]");
+    int topk       = static_cast<int>(inp.size(ndim - 2));
+    int n          = static_cast<int>(inp.size(ndim - 1));
+    int64_t m      = inp.numel() / (static_cast<int64_t>(topk) * n);
+    int64_t out_bytes = m * n * inp.element_size();
+
+    // The fold reuses the eager-mode registered IPC buffer: the sum is written
+    // there in place of the usual input copy. A registered buffer is required.
+    if(reg_inp_ptr == 0)
+        throw std::runtime_error(
+            "fused_moe_sum_allreduce requires a registered input buffer (eager mode)");
+    if(out_bytes > reg_inp_bytes)
+        throw std::runtime_error("registered buffer is too small to contain the reduced output");
+
+    _fused_moe_sum_allreduce(_fa, inp.data_ptr(), (void*)reg_inp_ptr, out.data_ptr(),
+                             static_cast<int>(m), topk, n, dtype, use_new);
 }
 
 void reduce_scatter(fptr_t _fa,

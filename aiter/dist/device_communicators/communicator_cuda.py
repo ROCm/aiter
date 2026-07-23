@@ -202,6 +202,38 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def fused_moe_sum_all_reduce(
+        self,
+        input_,
+        use_new: bool = True,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """Fold the routed-expert weighted-sum (moe_sum over the topk axis)
+        into the TP all-reduce. ``input_`` is [.., topk, hidden]; returns
+        [.., hidden].
+
+        Uses the fused custom-AR path when eligible, otherwise falls back to a
+        standalone moe_sum followed by the regular all-reduce (the reference
+        sum-then-reduce path).
+        """
+        ca_comm = self.ca_comm
+        if ca_comm is not None and not ca_comm.disabled and self.use_custom_allreduce:
+            out = ca_comm.custom_fused_moe_sum_all_reduce(
+                input_, use_new, prefill_support
+            )
+            if out is not None:
+                return out
+
+        # Fallback: standalone moe_sum + all_reduce (numerically the reference).
+        import aiter
+
+        out_shape = input_.shape[:-2] + input_.shape[-1:]
+        summed = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        aiter.moe_sum(input_.contiguous(), summed)
+        return self.all_reduce(
+            summed, use_new=use_new, prefill_support=prefill_support
+        )
+
     def fused_allreduce_rmsnorm(
         self,
         input_,
