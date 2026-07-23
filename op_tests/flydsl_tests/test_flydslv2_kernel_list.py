@@ -16,11 +16,18 @@ def test_name_roundtrip():
         use_nt=True,
         sbm=32,
     )
-    assert name == "flydslv2_moe2_afp4_wfp4_bf16_t32x256x256_atomic_nt_sbm32"
+    assert name == "flydsl_moe2_layout_afp4_wfp4_bf16_t32x256x256_atomic_nt_sbm32"
     cfg = parse_flydsl_v2_gemm2_kernel(name)
     assert cfg["tile_m"] == 32 and cfg["tile_n"] == 256 and cfg["tile_k"] == 256
     assert cfg["epilog"] == "atomic" and cfg["use_nt"] and not cfg["persist"]
     assert cfg["sort_block_m"] == 32
+
+
+def test_legacy_v2_name_rejected():
+    legacy_name = (
+        "flydsl" "v2_moe2_afp4_wfp4_bf16_t32x256x256_atomic_nt_sbm32"
+    )
+    assert parse_flydsl_v2_gemm2_kernel(legacy_name) is None
 
 
 def test_stage2_v2_kernels_fp4_persist_only():

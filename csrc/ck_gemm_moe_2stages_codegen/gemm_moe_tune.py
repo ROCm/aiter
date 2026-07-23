@@ -4887,7 +4887,7 @@ class FmoeTuner(TunerCommon):
                     )
 
             # v2 is a transient tuning-time pairing marker; the persistent v2
-            # marker is kernelName2's ``flydslv2_`` prefix. Drop it before the
+            # marker is kernelName2's ``flydsl_moe2_layout_`` prefix. Drop it before the
             # best-row selection so it never reaches the tuned CSV. (It still
             # appears in the profile_fmoe.csv debug dump, since prorfiles
             # captured the pre-strip DataFrame by reference; that is fine -- the

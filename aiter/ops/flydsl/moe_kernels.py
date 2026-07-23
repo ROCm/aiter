@@ -223,9 +223,9 @@ def get_flydsl_stage2_kernels(
 def build_flydslv2_gemm2_name(
     a_dtype, b_dtype, out_dtype, *, tm, epilog, persist, use_nt, sbm=0
 ):
-    """反向拼 flydslv2 gemm2 kernel 名; tn/tk 固定 256 (非可 tune, 见 design 4.2)。
+    """反向拼 v2 layout gemm2 kernel 名; tn/tk 固定 256 (非可 tune, 见 design 4.2)。
     格式须与 mxfp4_kname._FLYDSL_V2_GEMM2_RE 一致。"""
-    name = f"flydslv2_moe2_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tm}x256x256_{epilog}"
+    name = f"flydsl_moe2_layout_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tm}x256x256_{epilog}"
     if persist:
         name += "_persist"
     if use_nt:
@@ -236,7 +236,7 @@ def build_flydslv2_gemm2_name(
 
 
 def get_flydsl_stage2_v2_kernels(a_dtype, b_dtype, out_dtype, block_m):
-    """flydslv2 gemm2 候选 (design 4.2). knob: tile_m(整除 block_m) x epilog x
+    """v2 layout gemm2 候选 (design 4.2). knob: tile_m(整除 block_m) x epilog x
     use_nt x persist(fp4:{F,T}, fp8:{F}); tn=tk=256 固定; sbm=block_m。"""
     kernels = {}
     bms = [b for b in (16, 32, 64, 128) if b <= block_m and block_m % b == 0]
