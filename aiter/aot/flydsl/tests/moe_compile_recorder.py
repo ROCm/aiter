@@ -308,7 +308,6 @@ def _isolated_host_imports() -> Iterator[_HostImports]:
 @contextmanager
 def _recording_environment() -> Iterator[None]:
     values = {
-        "AITER_FLYDSL_OPERATION_PLAN": "off",
         "ARCH": _ARCH,
         "COMPILE_ONLY": "1",
         "CUDA_VISIBLE_DEVICES": "",

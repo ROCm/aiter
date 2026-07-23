@@ -164,7 +164,7 @@ class TestStage1GoldenParity(unittest.TestCase):
                 planned["operation_resolver_calls"],
                 planned["backend_calls"],
             ),
-            (1, 0, 2),
+            (0, 1, 2),
         )
         self.assertEqual(
             planned["backend_op_ids"],
@@ -177,7 +177,13 @@ class TestStage1GoldenParity(unittest.TestCase):
             [request["builder"].rsplit(".", 1)[-1] for request in planned["requests"]],
             ["compile_mixed_moe_gemm1", "build_silu_and_mul_fq_module"],
         )
-        self.assertEqual(planned["adapter_roles"], [])
+        self.assertEqual(
+            planned["adapter_roles"],
+            [
+                "moe.stage1.gemm.mixed",
+                "moe.stage1.postprocess.fq",
+            ],
+        )
         self.assertTrue(planned["environment_restored"])
 
 
@@ -352,57 +358,30 @@ class TestStage1OperationPlan(unittest.TestCase):
                             self.assertFalse(primary_call["enable_bias"])
                 forbidden.assert_not_called()
 
-    def test_off_shadow_and_on_modes_have_explicit_migration_behavior(self) -> None:
+    def test_operation_plan_is_default_and_migration_flag_is_ignored(self) -> None:
         off = _exercise_runtime_branch("off")
         shadow = _exercise_runtime_branch("shadow")
         on = _exercise_runtime_branch("on")
 
-        self.assertEqual(
-            (
-                off["resolver_calls"],
-                off["operation_resolver_calls"],
-                off["adapter_roles"],
-            ),
-            (1, 0, []),
+        expected = (
+            0,
+            1,
+            ["moe.stage1.gemm.mixed", "moe.stage1.postprocess.fq"],
         )
-        self.assertEqual(
-            (
-                shadow["resolver_calls"],
-                shadow["operation_resolver_calls"],
-                shadow["adapter_roles"],
-            ),
-            (1, 1, []),
-        )
-        self.assertEqual(
-            (
-                on["resolver_calls"],
-                on["operation_resolver_calls"],
-                on["adapter_roles"],
-            ),
-            (
-                0,
-                1,
-                [
-                    "moe.stage1.gemm.mixed",
-                    "moe.stage1.postprocess.fq",
-                ],
-            ),
-        )
+        for result in (off, shadow, on):
+            self.assertEqual(
+                (
+                    result["resolver_calls"],
+                    result["operation_resolver_calls"],
+                    result["adapter_roles"],
+                ),
+                expected,
+            )
         self.assertEqual(off["backend_op_ids"], on["backend_op_ids"])
         self.assertEqual(off["backend_calls"], on["backend_calls"])
         self.assertTrue(off["environment_restored"])
         self.assertTrue(shadow["environment_restored"])
         self.assertTrue(on["environment_restored"])
-
-    def test_shadow_detects_an_intentionally_mismatched_runtime_plan(self) -> None:
-        def drop_postprocess(plan):
-            return type(plan)(plan.target, plan.case_id, plan.nodes[:-1])
-
-        with self.assertRaisesRegex(RuntimeError, "shadow mismatch"):
-            _exercise_runtime_branch(
-                "shadow",
-                plan_transform=drop_postprocess,
-            )
 
     def test_on_mode_executes_each_stage1_role_once_across_matrix(self) -> None:
         recorder = _RequestRecorder()

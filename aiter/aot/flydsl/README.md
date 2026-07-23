@@ -5,9 +5,11 @@ FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter'
 tuned CSV configs and compiles them into the cache up front, so that at runtime
 the JIT path hits the cache instead of compiling again.
 
-MoE sorting, Stage1, Stage2, and Stage2 reduction resolve shared `CompilePlan`
-objects and compile each `CompileUnit` directly from its declared ABI. They do
-not construct FakeTensors or enter the full runtime hosts. Sorting is explicit:
+MoE sorting, Stage1, Stage2, and Stage2 reduction resolve shared
+kernel-owned `OperationPlan` objects. AOT compiles their `CompilePlan`
+projection, while runtime executes the same ordered nodes through data-plane
+adapters. They do not construct FakeTensors or enter the full runtime hosts.
+Sorting is explicit:
 call `compile_moe_sorting_case(MoeSortingCompileCase(...), context=...)`.
 Ordinary tuned Stage1/Stage2 CSV rows never infer sorting inclusion.
 

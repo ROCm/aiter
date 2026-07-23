@@ -352,8 +352,9 @@ and FlyDSL sorting is an independent opt-in.
 
 ## ABI-driven AOT route and baseline contract
 
-[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) resolves explicit
-sorting, Stage1, Stage2, and reduction `CompileUnit` objects directly:
+[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) constructs the same
+explicit sorting, Stage1, and Stage2 `OperationCase` values as runtime and
+compiles each operation plan's `CompileUnit` projection:
 
 1. It enumerates CSV rows and resolves `flydsl_` kernel names through the
    current registry. It also emits CK-Tile epilogue jobs and both supported
@@ -376,10 +377,10 @@ than mirroring the `m_blocks > 256` decision. CSV reduce rows emit the plain
 reduction unit. Masked EP reduction remains an explicit provider operation
 case requiring top-k-ID semantics and a positive global expert count.
 
-`MoeCompilePlanCase` concatenates an explicitly optional sorting sub-plan,
-an already-bound Stage1 plan, and an already-bound Stage2/reduction plan. It is
-an ordered input to future Manifest generation, not a Manifest, persistence
-format, global deduplication policy, or packaged artifact source.
+`MoeOperationCase` composes explicitly optional sorting, Stage1, and
+Stage2/reduction nodes with ordered dependencies. `MoeCompilePlanCase` remains
+a compatibility projection. Neither is a Manifest, persistence format, global
+deduplication policy, or packaged artifact source.
 
 The CPU baseline recorder enters the runtime stage and sorting hosts with
 test-owned fake inputs while mocking compile/launch/CUDA boundaries. It

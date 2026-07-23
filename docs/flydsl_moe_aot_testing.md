@@ -2,8 +2,10 @@
 
 ## Scope
 
-This guide validates the CPU-only FlyDSL MoE `CompilePlan`: explicit sorting,
-Stage1, Stage2, and Stage2 reduction on `gfx950`.
+This guide validates the FlyDSL MoE `OperationPlan` compile projection and
+runtime execution: explicit sorting, Stage1, Stage2, and Stage2 reduction on
+`gfx950`. Providers own node selection/order and compile overrides; runtime
+adapters retain allocation, ABI packing, grids, and stream launch.
 
 The current Aiter compatibility backend:
 

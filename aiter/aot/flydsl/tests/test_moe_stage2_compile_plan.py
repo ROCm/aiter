@@ -237,7 +237,7 @@ class TestStage2GoldenParity(unittest.TestCase):
                         "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
                     )
 
-        self.assertEqual(resolver_spy.call_count, 1)
+        self.assertEqual(resolver_spy.call_count, 0)
         self.assertEqual(backend_spy.call_count, 2)
         self.assertEqual(
             [call.args[0].spec.op_id for call in backend_spy.call_args_list],
@@ -322,68 +322,6 @@ class TestStage2GoldenParity(unittest.TestCase):
                         "moe.stage2.reduction.plain",
                     ],
                 )
-
-    def test_runtime_rejects_duplicate_and_unconsumed_units(self) -> None:
-        recorder = _RequestRecorder()
-        fake_mode = FakeTensorMode()
-        with _recording_environment(), ExitStack() as stack:
-            _install_cuda_boundary_mocks(stack, recorder)
-            with _isolated_host_imports() as imports:
-                _install_boundary_mocks(stack, imports, recorder)
-                core = importlib.import_module("aiter.ops.flydsl.compile_plan")
-                plan_module = importlib.import_module(
-                    "aiter.ops.flydsl.moe_compile_plan"
-                )
-                atomic_config = _case_config(
-                    imports,
-                    "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2",
-                    False,
-                    {},
-                )
-                reduce_config = _case_config(
-                    imports,
-                    "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
-                    False,
-                    {},
-                )
-                atomic_plan = plan_module.resolve_moe_stage2_compile_plan(
-                    context=recorder.compile_context,
-                    **_provider_kwargs(atomic_config, masked=False),
-                )
-                reduce_plan = plan_module.resolve_moe_stage2_compile_plan(
-                    context=recorder.compile_context,
-                    **_provider_kwargs(reduce_config, masked=False),
-                )
-
-                duplicate = core.CompilePlan(
-                    (atomic_plan.units[0], atomic_plan.units[0])
-                )
-                _clear_scenario_caches(imports)
-                with recorder.scenario("runtime.stage2.duplicate"):
-                    with self.assertRaisesRegex(RuntimeError, "duplicate CompilePlan"):
-                        imports.moe._resolve_plan_launchers(
-                            duplicate,
-                            recorder.compile_context,
-                        )
-
-                extra_reduction = core.CompilePlan(
-                    (atomic_plan.units[0], reduce_plan.units[1])
-                )
-                _clear_scenario_caches(imports)
-                with (
-                    mock.patch.object(
-                        plan_module,
-                        "resolve_moe_stage2_compile_plan",
-                        return_value=extra_reduction,
-                    ),
-                    fake_mode,
-                    recorder.scenario("runtime.stage2.unconsumed"),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "unconsumed units"):
-                        _run_stage2(
-                            imports,
-                            "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2",
-                        )
 
 
 class TestStage2ResolverBoundaries(unittest.TestCase):

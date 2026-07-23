@@ -12,7 +12,6 @@ capture sees deterministic allocations.
 """
 
 from dataclasses import dataclass
-import os
 
 import torch
 
@@ -92,13 +91,6 @@ for _role in MoeSortingRole:
     _SORTING_RUNTIME_ADAPTERS.register(_role.value, _sorting_runtime_adapter)
 
 
-def _operation_plan_mode() -> str:
-    mode = os.environ.get("AITER_FLYDSL_OPERATION_PLAN", "off").strip().lower()
-    if mode not in ("off", "shadow", "on"):
-        raise ValueError("AITER_FLYDSL_OPERATION_PLAN must be off|shadow|on")
-    return mode
-
-
 def flydsl_moe_sorting_fwd(
     topk_ids,
     topk_weights,
@@ -117,12 +109,6 @@ def flydsl_moe_sorting_fwd(
 ):
     from .aot_backend import create_runtime_compile_context
     from .launch_context import LaunchContext
-    from .moe_compile_plan import resolve_moe_sorting_compile_plan
-    from .kernels.moe_sorting_kernel import (
-        moe_sorting_flydsl,
-        moe_sorting_get_workspace_size,
-        resolve_moe_sorting_specialization,
-    )
 
     max_tokens = int(topk_ids.shape[0])
     topk = int(topk_ids.shape[1])
@@ -139,102 +125,28 @@ def flydsl_moe_sorting_fwd(
         unit_size=int(unit_size),
         has_mask=expert_mask is not None,
     )
-    mode = _operation_plan_mode()
-    operation_plan = (
-        resolve_moe_sorting_operation_plan(case, context=compile_context)
-        if mode in ("shadow", "on")
-        else None
+    operation_plan = resolve_moe_sorting_operation_plan(case, context=compile_context)
+    state = _SortingExecutionState(
+        (
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            unit_size,
+            expert_mask,
+            num_local_tokens,
+        ),
+        case,
+        device,
     )
-    if mode == "on":
-        state = _SortingExecutionState(
-            (
-                topk_ids,
-                topk_weights,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                moe_buf,
-                num_experts,
-                unit_size,
-                expert_mask,
-                num_local_tokens,
-            ),
-            case,
-            device,
-        )
-        execute_operation_plan(
-            operation_plan,
-            state,
-            compile_context=compile_context,
-            launch_context=launch_context,
-            adapters=_SORTING_RUNTIME_ADAPTERS,
-        )
-        return
-
-    plan = resolve_moe_sorting_compile_plan(case, context=compile_context)
-    if len(plan.units) != 1:
-        raise RuntimeError(
-            f"sorting CompilePlan must contain one concrete unit, got {len(plan.units)}"
-        )
-    unit = plan.units[0]
-    artifact = compile_context.backend.resolve_aot(
-        unit,
-        context=compile_context,
-    )
-    launcher = getattr(artifact, "launcher", artifact)
-    specialization = resolve_moe_sorting_specialization(
-        arch=compile_context.target.arch,
-        max_tokens=case.max_tokens,
-        num_experts=case.num_experts,
-        topk=case.topk,
-        unit_size=case.unit_size,
-        has_mask=case.has_mask,
-        path=case.path,
-        k4_block=case.k4_block,
-    )
-
-    # Pre-allocate workspace (cached per device for CUDA graph compatibility).
-    # A larger workspace can satisfy smaller requests, so we keep the largest seen.
-    ws_size = moe_sorting_get_workspace_size(
-        max_tokens,
-        num_experts,
-        topk,
-        unit_size,
-        arch=compile_context.target.arch,
-        has_mask=case.has_mask,
-        path=specialization.path,
-        k4_block=specialization.k4_block,
-    )
-    workspace = None
-    if ws_size > 0:
-        workspace = _workspace_cache.get(device)
-        if workspace is None or workspace.numel() < ws_size:
-            workspace = torch.empty(ws_size, dtype=torch.int32, device=device)
-            _workspace_cache[device] = workspace
-
-    moe_sorting_flydsl(
-        topk_ids,
-        topk_weights,
-        sorted_ids,
-        sorted_weights,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_buf,
-        num_experts,
-        unit_size,
-        expert_mask,
-        num_local_tokens,
-        workspace,
-        launcher=launcher,
-        specialization=specialization,
-        cu_count=compile_context.target.cu_count,
+    execute_operation_plan(
+        operation_plan,
+        state,
+        compile_context=compile_context,
         launch_context=launch_context,
+        adapters=_SORTING_RUNTIME_ADAPTERS,
     )
-    if mode == "shadow":
-        expected = operation_plan.nodes[0]
-        if (
-            expected.binding.unit.spec.op_id != unit.spec.op_id
-            or expected.runtime_metadata != specialization
-        ):
-            raise RuntimeError("sorting OperationPlan shadow mismatch")

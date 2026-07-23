@@ -369,34 +369,6 @@ def _register_all_configs():
 _register_all_configs()
 
 
-def _resolve_plan_launchers(plan, compile_context):
-    """Resolve every unit once and return launchers keyed by stable op ID."""
-
-    by_op_id = {}
-    for unit in plan.units:
-        op_id = unit.spec.op_id
-        if op_id in by_op_id:
-            raise RuntimeError(f"duplicate CompilePlan op_id: {op_id}")
-        artifact = compile_context.backend.resolve_aot(
-            unit,
-            context=compile_context,
-        )
-        by_op_id[op_id] = getattr(artifact, "launcher", artifact)
-    return by_op_id
-
-
-def _resolve_stage1_plan_launchers(builder_kwargs, compile_context):
-    """Resolve Stage1 once and obtain every launcher through its backend."""
-
-    from .moe_compile_plan import resolve_moe_stage1_compile_plan
-
-    plan = resolve_moe_stage1_compile_plan(
-        context=compile_context,
-        **builder_kwargs,
-    )
-    return _resolve_plan_launchers(plan, compile_context)
-
-
 def _resolve_stage1_operation_plan(builder_kwargs, compile_context):
     """Resolve the canonical Stage1 graph for shadow or runtime execution."""
 
@@ -406,17 +378,6 @@ def _resolve_stage1_operation_plan(builder_kwargs, compile_context):
         MoeStage1OperationCase.from_kwargs(builder_kwargs),
         context=compile_context,
     )
-
-
-def _stage1_operation_plan_mode() -> str:
-    """Return the temporary Stage1 migration mode (default: ``off``)."""
-
-    mode = os.environ.get("AITER_FLYDSL_OPERATION_PLAN", "off").strip().lower()
-    if mode not in ("off", "shadow", "on"):
-        raise ValueError(
-            f"AITER_FLYDSL_OPERATION_PLAN must be one of off|shadow|on, got {mode!r}"
-        )
-    return mode
 
 
 def _resolve_stage2_operation_plan(case, compile_context):
@@ -1526,30 +1487,6 @@ _STAGE1_RUNTIME_ADAPTERS.register(
 )
 
 
-def _validate_stage1_shadow(
-    operation_plan,
-    legacy_roles: list[str],
-    legacy_compile_op_ids: list[str],
-) -> None:
-    expected_roles = tuple(node.role for node in operation_plan.nodes)
-    actual_roles = tuple(legacy_roles)
-    expected_compile_op_ids = tuple(
-        unit.spec.op_id for unit in operation_plan.compile_projection().units
-    )
-    actual_compile_op_ids = tuple(legacy_compile_op_ids)
-    if (
-        expected_roles != actual_roles
-        or expected_compile_op_ids != actual_compile_op_ids
-    ):
-        raise RuntimeError(
-            "Stage1 OperationPlan shadow mismatch: "
-            f"roles expected={expected_roles!r}, actual={actual_roles!r}; "
-            "compile op_ids "
-            f"expected={expected_compile_op_ids!r}, "
-            f"actual={actual_compile_op_ids!r}"
-        )
-
-
 # Public API
 
 
@@ -1637,19 +1574,14 @@ def flydsl_moe_stage1(
     else:
         torch_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
     _is_splitk = k_batch > 1
-    gate_up_interleave = gate_mode == "interleave"
-
     dev = a.device
-    _splitk_fp4 = _is_splitk and _need_fp4
-    _gui_sk = gate_up_interleave and _is_splitk
-    _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
-        if _need_fp4 or (_gui_sk_fused and _need_fp4):
+        if _need_fp4:
             out = torch.empty(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
-        elif _need_fp8 or (_gui_sk_fused and _need_fp8):
+        elif _need_fp8:
             out = torch.empty(
                 (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
             )
@@ -1678,7 +1610,7 @@ def flydsl_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    _need_quant = _fuse_any_quant or _splitk_fp4 or _gui_sk_fused
+    _need_quant = _fuse_any_quant
     _need_sort = _need_quant
 
     _sort_block_m = tile_m
@@ -1734,30 +1666,23 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
     )
-    operation_mode = _stage1_operation_plan_mode()
-    operation_plan = (
-        _resolve_stage1_operation_plan(stage1_builder_kwargs, compile_context)
-        if operation_mode in ("shadow", "on")
-        else None
+    operation_plan = _resolve_stage1_operation_plan(
+        stage1_builder_kwargs, compile_context
     )
 
     # Argument packing is still data-plane work. In on mode the primary role,
     # rather than a repeated dtype graph decision, selects the existing packer.
-    legacy_use_mx_gemm = b_dtype in ("fp4", "fp8")
-    if operation_mode == "on":
-        if not operation_plan.nodes:
-            raise RuntimeError("Stage1 OperationPlan must contain a primary node")
-        primary_role = operation_plan.nodes[0].role
-        if primary_role == MoeStage1Role.MIXED_GEMM.value:
-            use_mx_gemm = True
-        elif primary_role == MoeStage1Role.INT4_GEMM.value:
-            use_mx_gemm = False
-        else:
-            raise RuntimeError(
-                f"Stage1 OperationPlan has invalid primary role {primary_role!r}"
-            )
+    if not operation_plan.nodes:
+        raise RuntimeError("Stage1 OperationPlan must contain a primary node")
+    primary_role = operation_plan.nodes[0].role
+    if primary_role == MoeStage1Role.MIXED_GEMM.value:
+        use_mx_gemm = True
+    elif primary_role == MoeStage1Role.INT4_GEMM.value:
+        use_mx_gemm = False
     else:
-        use_mx_gemm = legacy_use_mx_gemm
+        raise RuntimeError(
+            f"Stage1 OperationPlan has invalid primary role {primary_role!r}"
+        )
 
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
@@ -1823,83 +1748,13 @@ def flydsl_moe_stage1(
         act=act,
     )
 
-    if operation_mode == "on":
-        execute_operation_plan(
-            operation_plan,
-            execution_state,
-            compile_context=compile_context,
-            launch_context=launch_context,
-            adapters=_STAGE1_RUNTIME_ADAPTERS,
-        )
-    else:
-        # Temporary legacy graph consumption for off/shadow rollback. The launch
-        # blocks themselves are shared with the new role adapters above.
-        plan_launchers = _resolve_stage1_plan_launchers(
-            stage1_builder_kwargs,
-            compile_context,
-        )
-        legacy_roles: list[str] = []
-        legacy_compile_op_ids: list[str] = []
-
-        def take_plan_launcher(op_id):
-            try:
-                launcher = plan_launchers.pop(op_id)
-            except KeyError as error:
-                raise RuntimeError(
-                    f"Stage1 CompilePlan did not resolve required unit {op_id}"
-                ) from error
-            legacy_compile_op_ids.append(op_id)
-            return launcher
-
-        from .moe_compile_plan import (
-            FQ_ACTIVATION_OP_ID,
-            INT4_STAGE1_GEMM_OP_ID,
-            MIXED_STAGE1_GEMM_OP_ID,
-        )
-
-        primary_op_id = (
-            MIXED_STAGE1_GEMM_OP_ID if legacy_use_mx_gemm else INT4_STAGE1_GEMM_OP_ID
-        )
-        legacy_roles.append(
-            (
-                MoeStage1Role.MIXED_GEMM.value
-                if legacy_use_mx_gemm
-                else MoeStage1Role.INT4_GEMM.value
-            )
-        )
-        _run_stage1_primary(
-            take_plan_launcher(primary_op_id),
-            execution_state,
-            launch_context,
-        )
-
-        if _gui_sk_fused or _gui_sk or _splitk_fp4:
-            legacy_roles.append(MoeStage1Role.FQ_POSTPROCESS.value)
-            _run_stage1_fq_postprocess(
-                take_plan_launcher(FQ_ACTIVATION_OP_ID),
-                execution_state,
-                launch_context,
-            )
-        elif _is_splitk:
-            legacy_roles.append(MoeStage1Role.EXTERNAL_POSTPROCESS.value)
-            _run_stage1_external_postprocess(
-                Stage1ExternalPostprocessMetadata(
-                    act=act,
-                    enable_bias=bias is not None,
-                ),
-                execution_state,
-            )
-
-        if plan_launchers:
-            raise RuntimeError(
-                f"Stage1 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
-            )
-        if operation_mode == "shadow":
-            _validate_stage1_shadow(
-                operation_plan,
-                legacy_roles,
-                legacy_compile_op_ids,
-            )
+    execute_operation_plan(
+        operation_plan,
+        execution_state,
+        compile_context=compile_context,
+        launch_context=launch_context,
+        adapters=_STAGE1_RUNTIME_ADAPTERS,
+    )
 
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
@@ -1980,19 +1835,6 @@ _STAGE2_RUNTIME_ADAPTERS.register(
 )
 
 
-def _validate_stage2_shadow(operation_plan, roles, op_ids) -> None:
-    expected_roles = tuple(node.role for node in operation_plan.nodes)
-    expected_op_ids = tuple(
-        unit.spec.op_id for unit in operation_plan.compile_projection().units
-    )
-    if expected_roles != tuple(roles) or expected_op_ids != tuple(op_ids):
-        raise RuntimeError(
-            "Stage2 OperationPlan shadow mismatch: "
-            f"roles expected={expected_roles!r}, actual={tuple(roles)!r}; "
-            f"op_ids expected={expected_op_ids!r}, actual={tuple(op_ids)!r}"
-        )
-
-
 def flydsl_moe_stage2(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
@@ -2069,7 +1911,6 @@ def flydsl_moe_stage2(
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
 
-    legacy_accumulate = mode != "reduce" and not return_per_slot
     stage2_builder_kwargs = dict(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -2104,20 +1945,12 @@ def flydsl_moe_stage2(
         topk_ids_available=use_mask and topk_ids is not None,
         num_experts=int(expert_mask.numel()) if use_mask else 0,
     )
-    operation_mode = _stage1_operation_plan_mode()
-    operation_plan = (
-        _resolve_stage2_operation_plan(stage2_case, compile_context)
-        if operation_mode in ("shadow", "on")
-        else None
-    )
-    if operation_mode == "on":
-        if not operation_plan.nodes or not isinstance(
-            operation_plan.nodes[0].runtime_metadata, Stage2GemmMetadata
-        ):
-            raise RuntimeError("Stage2 OperationPlan requires a GEMM primary node")
-        accumulate = operation_plan.nodes[0].runtime_metadata.accumulate
-    else:
-        accumulate = legacy_accumulate
+    operation_plan = _resolve_stage2_operation_plan(stage2_case, compile_context)
+    if not operation_plan.nodes or not isinstance(
+        operation_plan.nodes[0].runtime_metadata, Stage2GemmMetadata
+    ):
+        raise RuntimeError("Stage2 OperationPlan requires a GEMM primary node")
+    accumulate = operation_plan.nodes[0].runtime_metadata.accumulate
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
@@ -2164,17 +1997,13 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    legacy_use_mx_gemm = b_dtype in ("fp4", "fp8")
-    if operation_mode == "on":
-        primary_role = operation_plan.nodes[0].role
-        if primary_role == MoeStage2Role.MIXED_GEMM.value:
-            use_mx_gemm = True
-        elif primary_role == MoeStage2Role.INT4_GEMM.value:
-            use_mx_gemm = False
-        else:
-            raise RuntimeError(f"invalid Stage2 primary role {primary_role!r}")
+    primary_role = operation_plan.nodes[0].role
+    if primary_role == MoeStage2Role.MIXED_GEMM.value:
+        use_mx_gemm = True
+    elif primary_role == MoeStage2Role.INT4_GEMM.value:
+        use_mx_gemm = False
     else:
-        use_mx_gemm = legacy_use_mx_gemm
+        raise RuntimeError(f"invalid Stage2 primary role {primary_role!r}")
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -2236,86 +2065,13 @@ def flydsl_moe_stage2(
         expert_mask,
         topk_ids,
     )
-    if operation_mode == "on":
-        execute_operation_plan(
-            operation_plan,
-            state,
-            compile_context=compile_context,
-            launch_context=launch_context,
-            adapters=_STAGE2_RUNTIME_ADAPTERS,
-        )
-    else:
-        from .moe_compile_plan import (
-            INT4_STAGE2_GEMM_OP_ID,
-            MASKED_REDUCTION_OP_ID,
-            MIXED_STAGE2_GEMM_OP_ID,
-            PLAIN_REDUCTION_OP_ID,
-            resolve_moe_stage2_compile_plan,
-        )
-
-        dtype_str = "bf16" if out_dtype == "bf16" else "f16"
-        plan = resolve_moe_stage2_compile_plan(
-            context=compile_context,
-            mode=mode,
-            accumulate=legacy_accumulate,
-            return_per_slot=return_per_slot,
-            persist=persist,
-            token_num=token_num,
-            routing_block_count=int(sorted_expert_ids.shape[0]),
-            dtype_str=dtype_str,
-            use_mask=use_mask,
-            topk_ids_available=use_mask and topk_ids is not None,
-            num_experts=int(expert_mask.numel()) if use_mask else 0,
-            **stage2_builder_kwargs,
-        )
-        plan_launchers = _resolve_plan_launchers(plan, compile_context)
-        roles, op_ids = [], []
-
-        def take(op_id):
-            try:
-                launcher = plan_launchers.pop(op_id)
-            except KeyError as error:
-                raise RuntimeError(
-                    f"Stage2 CompilePlan did not resolve required unit {op_id}"
-                ) from error
-            op_ids.append(op_id)
-            return launcher
-
-        primary_op_id = (
-            MIXED_STAGE2_GEMM_OP_ID if legacy_use_mx_gemm else INT4_STAGE2_GEMM_OP_ID
-        )
-        roles.append(
-            MoeStage2Role.MIXED_GEMM.value
-            if legacy_use_mx_gemm
-            else MoeStage2Role.INT4_GEMM.value
-        )
-        _run_compiled(take(primary_op_id), args)
-        if not legacy_accumulate and not return_per_slot:
-            reduction_op_id = (
-                MASKED_REDUCTION_OP_ID if use_mask else PLAIN_REDUCTION_OP_ID
-            )
-            roles.append(
-                MoeStage2Role.MASKED_REDUCTION.value
-                if use_mask
-                else MoeStage2Role.PLAIN_REDUCTION.value
-            )
-            _run_moe_reduction(
-                take(reduction_op_id),
-                target,
-                out,
-                token_num,
-                topk,
-                model_dim,
-                expert_mask,
-                topk_ids,
-                launch_context,
-            )
-        if plan_launchers:
-            raise RuntimeError(
-                f"Stage2 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
-            )
-        if operation_mode == "shadow":
-            _validate_stage2_shadow(operation_plan, roles, op_ids)
+    execute_operation_plan(
+        operation_plan,
+        state,
+        compile_context=compile_context,
+        launch_context=launch_context,
+        adapters=_STAGE2_RUNTIME_ADAPTERS,
+    )
     return out
 
 
