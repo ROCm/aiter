@@ -7,7 +7,7 @@ Usage:
     rm -rf ~/.triton/cache
     export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
     FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-32k-aws" -v -s
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-64k-qwen-ptpc-ali" -v -s
     bash op_tests/flydsl_tests/run_test_flydsl_gdr_k5_prefill.sh
 """
 
@@ -404,8 +404,8 @@ _PREFILL_GROUPS = [
         Hv=64,
         tps=[8],
         full_prompt_lens=[8192],
-        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        # max_num_batched_tokens=[65536],
+        # max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
         model_name="varlen-16k-aws",

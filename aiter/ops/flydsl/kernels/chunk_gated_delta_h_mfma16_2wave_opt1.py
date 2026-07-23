@@ -139,14 +139,17 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
     # output column in BOTH GEMM1 and GEMM2, so splitting V across warps needs no
     # cross-warp reduction). Hence BV == NUM_WARPS * 16 and the WG size scales
     # with BV: BV=64->4 warps/256 thr, BV=32->2 warps/128 thr, BV=16->1 warp/64.
-    assert BV in (16, 32, 64), "VWARP KV fork supports BV in {16,32,64} (BV=NUM_WARPS*16)"
+    assert BV in (
+        16,
+        32,
+        64,
+    ), "VWARP KV fork supports BV in {16,32,64} (BV=NUM_WARPS*16)"
     assert not USE_GK, "naive KV fork does not support per-K gates (USE_GK)"
 
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
 
     WARP_SIZE = 64
     WMMA_N = 16
-    WMMA_K = 32  # ds_read_tr16 bt-row span granularity (2 x 16)
 
     NUM_WARPS = BV // WMMA_N  # one 16-wide V-tile per warp -> BV = NUM_WARPS*16
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -254,7 +257,7 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
     LDS_K_PAD = 8
-    LDS_K_STRIDE = BT + LDS_K_PAD   # EXPERIMENT (vn-direct): lds_k = [K, BT]
+    LDS_K_STRIDE = BT + LDS_K_PAD  # EXPERIMENT (vn-direct): lds_k = [K, BT]
     LDS_K_ELEMS = K * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
@@ -292,12 +295,15 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
     # The independent layout is a ~38us (+~8%) REGRESSION (occupancy 3->2); set
     # to True here for direct re-measurement / A/B comparison.
     LDS_HT_INDEPENDENT = True
-    assert (LDS_HT_INDEPENDENT or LDS_HT_ELEMS <= LDS_K_ELEMS), \
-        "aliased lds_ht must fit inside lds_k"
-    assert (not W_PF_INTERLEAVE_GEMM1 or W_PF_INTERLEAVE), \
-        "W_PF_INTERLEAVE_GEMM1 requires W_PF_INTERLEAVE"
-    assert (not HT_STORE_OVERLAP_GEMM2 or LDS_HT_INDEPENDENT), \
-        "HT_STORE_OVERLAP_GEMM2 requires LDS_HT_INDEPENDENT (lds_ht must survive step1->preGEMM2 unaliased)"
+    assert (
+        LDS_HT_INDEPENDENT or LDS_HT_ELEMS <= LDS_K_ELEMS
+    ), "aliased lds_ht must fit inside lds_k"
+    assert (
+        not W_PF_INTERLEAVE_GEMM1 or W_PF_INTERLEAVE
+    ), "W_PF_INTERLEAVE_GEMM1 requires W_PF_INTERLEAVE"
+    assert (
+        not HT_STORE_OVERLAP_GEMM2 or LDS_HT_INDEPENDENT
+    ), "HT_STORE_OVERLAP_GEMM2 requires LDS_HT_INDEPENDENT (lds_ht must survive step1->preGEMM2 unaliased)"
 
     # EXPERIMENT (vn-b128): transpose buffer for the v_new OUTPUT store. v_new is
     # [B,H,T,V] (V innermost); the MFMA-C layout makes a lane's 4 elems stride
@@ -447,7 +453,7 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
         u_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_U)
         u_load_col_base = (tid % fx.Int32(THREADS_PER_ROW_U)) * fx.Int32(LOAD_VEC_WIDTH)
 
-        v8bf16_type = T.vec(8, T.bf16)
+        T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
         lds_k_memref = lds_k_ptr.get()
         lds_u_memref = lds_u_ptr.get()
@@ -457,10 +463,14 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
         def _lds_vec_read_w_bf16x4(elem_idx):
             return vector.load_op(v4bf16_w_type, lds_w_memref, [elem_idx])
 
-        def _lds_vec_read_k_bf16x4(elem_idx):  # EXPERIMENT (vn-direct) std-A read from lds_k[K,BT]
+        def _lds_vec_read_k_bf16x4(
+            elem_idx,
+        ):  # EXPERIMENT (vn-direct) std-A read from lds_k[K,BT]
             return vector.load_op(v4bf16_w_type, lds_k_memref, [elem_idx])
 
-        def _lds_read_u_scalar(elem_idx):  # EXPERIMENT (u-prefetch) per-lane u read from lds_u[BT,BV]
+        def _lds_read_u_scalar(
+            elem_idx,
+        ):  # EXPERIMENT (u-prefetch) per-lane u read from lds_u[BT,BV]
             return vector.load_op(T.vec(1, T.bf16), lds_u_memref, [elem_idx])[0]
 
         v4bf16_type = T.vec(4, T.bf16)
@@ -472,8 +482,8 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
             raw = rocdl.ds_read_tr16_b64(v4bf16_type, ptr).result
             return fx.Vector(raw, (4,), fx.BFloat16)
 
-        tr_k_group = (lane % fx.Int32(16)) // fx.Int32(4)
-        tr_col_sub = lane % fx.Int32(4)
+        (lane % fx.Int32(16)) // fx.Int32(4)
+        lane % fx.Int32(4)
 
         # -- Prologue: bos, T_local, NT, boh --
         if const_expr(IS_VARLEN):
@@ -526,7 +536,7 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
         lane_n = lane % fx.Int32(16)
         lane_m_base = lane // fx.Int32(16)
 
-        wid_idx = fx.Index(wid)
+        fx.Index(wid)
         lane_n_idx = fx.Index(lane_n)
         lane_m_base_idx = fx.Index(lane_m_base)
 
@@ -557,7 +567,7 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
         NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
-        NUM_K_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+        NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
 
         # EXPERIMENT (w-prefetch-interleave, rev224): hoist the cooperative w HBM
         # load out of step-2 into a cross-chunk register prefetch carried via the
@@ -583,9 +593,9 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
 
         # k-load params hoisted out of step-3 so the prologue + k prefetch helpers
         # can reuse them (k is pre-transposed [B,Hg,K,T_flat], token innermost).
-        K_TOK_THREADS = BT // LOAD_VEC_WIDTH               # 8
+        K_TOK_THREADS = BT // LOAD_VEC_WIDTH  # 8
         K_ROWS_PER_BATCH = BLOCK_THREADS // K_TOK_THREADS  # 32
-        K_LOAD_BATCHES = K // K_ROWS_PER_BATCH             # 4
+        K_LOAD_BATCHES = K // K_ROWS_PER_BATCH  # 4
         k_load_krow = tid // fx.Int32(K_TOK_THREADS)
         k_load_tokbase = (tid % fx.Int32(K_TOK_THREADS)) * fx.Int32(LOAD_VEC_WIDTH)
 
@@ -635,11 +645,12 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
             h_accs_in = list(state[:NUM_H_ACCS])
             if const_expr(W_PF_INTERLEAVE):
-                w_pf = list(state[NUM_H_ACCS:NUM_H_ACCS + NUM_W_LOADS])
+                w_pf = list(state[NUM_H_ACCS : NUM_H_ACCS + NUM_W_LOADS])
                 if const_expr(K_PF_INTERLEAVE):
                     k_pf = list(
                         state[
-                            NUM_H_ACCS + NUM_W_LOADS : NUM_H_ACCS
+                            NUM_H_ACCS
+                            + NUM_W_LOADS : NUM_H_ACCS
                             + NUM_W_LOADS
                             + K_LOAD_BATCHES
                         ]
@@ -730,7 +741,9 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for batch in range_constexpr(NUM_LOAD_BATCHES_64):
                         lds_w.vec_store(
-                            (fx.Index(_w_lds_off(kb, batch)),), w_pf[i_wp], LOAD_VEC_WIDTH
+                            (fx.Index(_w_lds_off(kb, batch)),),
+                            w_pf[i_wp],
+                            LOAD_VEC_WIDTH,
                         )
                         i_wp += 1
             else:
@@ -740,7 +753,10 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                         abs_row = i_t_i32 * fx.Int32(BT) + row
                         safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
                         w_g_off = (
-                            w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                            w_base
+                            + safe_row * stride_w
+                            + fx.Int32(kb * 64)
+                            + load_col_base
                         )
                         w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
                         col = fx.Int32(kb * 64) + load_col_base
@@ -753,17 +769,19 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
             # buffer_load_ushort that were the #2 VMEM-wait hotspot. Published
             # on the SAME barrier below as w (no extra barrier).
             if const_expr(USE_LDS_U):
-              for batch in range_constexpr(NUM_LOAD_BATCHES_U):
-                row = fx.Int32(batch * ROWS_PER_BATCH_U) + u_load_row_in_batch
-                abs_row = i_t_i32 * fx.Int32(BT) + row
-                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                u_g_off = (
-                    v_base + safe_row * stride_v
-                    + i_v * fx.Int32(BV) + u_load_col_base
-                )
-                u_vec = v_.vec_load((fx.Index(u_g_off),), LOAD_VEC_WIDTH)
-                u_lds_off = row * fx.Int32(LDS_U_STRIDE) + u_load_col_base
-                lds_u.vec_store((fx.Index(u_lds_off),), u_vec, LOAD_VEC_WIDTH)
+                for batch in range_constexpr(NUM_LOAD_BATCHES_U):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_U) + u_load_row_in_batch
+                    abs_row = i_t_i32 * fx.Int32(BT) + row
+                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                    u_g_off = (
+                        v_base
+                        + safe_row * stride_v
+                        + i_v * fx.Int32(BV)
+                        + u_load_col_base
+                    )
+                    u_vec = v_.vec_load((fx.Index(u_g_off),), LOAD_VEC_WIDTH)
+                    u_lds_off = row * fx.Int32(LDS_U_STRIDE) + u_load_col_base
+                    lds_u.vec_store((fx.Index(u_lds_off),), u_vec, LOAD_VEC_WIDTH)
 
             # OPT-C(g) (PHASE-4): cooperatively stage this chunk's per-row g into
             # lds_g. BRANCHLESS: every thread maps to a row via ``tid % BT`` and
@@ -796,19 +814,19 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                         (fx.Index(_k_lds_off(batch)),), k_pf[batch], LOAD_VEC_WIDTH
                     )
             else:
-              for batch in range_constexpr(K_LOAD_BATCHES):
-                k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
-                abs_tok = i_t_i32 * fx.Int32(BT) + k_load_tokbase
-                in_b = abs_tok < T_local
-                # k is [B, Hg, K, T_flat] (token innermost); the absolute token
-                # within the sequence is i_t*BT + tokbase. The chunk offset
-                # i_t*BT MUST be in the address (previously only used for the
-                # bounds check -> chunks i_t>0 read chunk-0's k -> GEMM2 wrong).
-                k_off = k_base + k_row * T_flat + abs_tok
-                k_off = in_b.select(k_off, k_base)
-                k_vec = k_.vec_load((fx.Index(k_off),), LOAD_VEC_WIDTH)
-                k_lds_off = k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
-                lds_k.vec_store((fx.Index(k_lds_off),), k_vec, LOAD_VEC_WIDTH)
+                for batch in range_constexpr(K_LOAD_BATCHES):
+                    k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
+                    abs_tok = i_t_i32 * fx.Int32(BT) + k_load_tokbase
+                    in_b = abs_tok < T_local
+                    # k is [B, Hg, K, T_flat] (token innermost); the absolute token
+                    # within the sequence is i_t*BT + tokbase. The chunk offset
+                    # i_t*BT MUST be in the address (previously only used for the
+                    # bounds check -> chunks i_t>0 read chunk-0's k -> GEMM2 wrong).
+                    k_off = k_base + k_row * T_flat + abs_tok
+                    k_off = in_b.select(k_off, k_base)
+                    k_vec = k_.vec_load((fx.Index(k_off),), LOAD_VEC_WIDTH)
+                    k_lds_off = k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
+                    lds_k.vec_store((fx.Index(k_lds_off),), k_vec, LOAD_VEC_WIDTH)
 
             # NOTE (barrier-trim): removed the post-k-load barrier. It guarded
             # the lds_k RAW (step 3 cooperative write -> step 8 GEMM2 read), but
@@ -843,15 +861,19 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                     for slot in range_constexpr(K_SUB_PER_BLOCK):
                         if const_expr(W_PF_INTERLEAVE and W_PF_INTERLEAVE_GEMM1):
                             g1_slot = (
-                                (m_bt * NUM_K_BLOCKS + kb) * K_SUB_PER_BLOCK + slot
-                            )
+                                m_bt * NUM_K_BLOCKS + kb
+                            ) * K_SUB_PER_BLOCK + slot
                             # slots [0, NUM_W_LOADS) carry w; the next
                             # K_LOAD_BATCHES slots carry k.
                             if const_expr(g1_slot < NUM_W_LOADS):
                                 kb_w = g1_slot // NUM_LOAD_BATCHES_64
                                 batch_w = g1_slot % NUM_LOAD_BATCHES_64
                                 w_next_pf[g1_slot] = w_.vec_load(
-                                    (fx.Index(_w_load_off(next_i_t_i32, kb_w, batch_w)),),
+                                    (
+                                        fx.Index(
+                                            _w_load_off(next_i_t_i32, kb_w, batch_w)
+                                        ),
+                                    ),
                                     LOAD_VEC_WIDTH,
                                 )
                             elif const_expr(
@@ -966,8 +988,7 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                     vn_tile8 = lds_vn.vec_load((fx.Index(vn_read_idx),), 8)
                     abs_bt_row = i_t_i32 * fx.Int32(BT) + bt_row_local
                     vn_off = (
-                        vn_base + abs_bt_row * fx.Int32(V)
-                        + i_v * fx.Int32(BV) + v8
+                        vn_base + abs_bt_row * fx.Int32(V) + i_v * fx.Int32(BV) + v8
                     )
                     if (abs_bt_row < T_local).ir_value():
                         _emit_vn_vstore(vn_off, vn_tile8)
@@ -1119,8 +1140,7 @@ def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
                                 LOAD_VEC_WIDTH,
                             )
                         elif const_expr(
-                            K_PF_INTERLEAVE
-                            and g2_slot < NUM_W_LOADS + K_LOAD_BATCHES
+                            K_PF_INTERLEAVE and g2_slot < NUM_W_LOADS + K_LOAD_BATCHES
                         ):
                             batch_k = g2_slot - NUM_W_LOADS
                             k_next_pf[batch_k] = k_.vec_load(

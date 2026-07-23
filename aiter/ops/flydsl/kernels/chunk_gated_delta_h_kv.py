@@ -130,7 +130,6 @@ def compile_chunk_gated_delta_h_kv(
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
 
     WMMA_N = 16
-    WMMA_K = 32  # ds_read_tr16 bt-row span granularity (2 x 16)
     N_REPEAT = BV // WMMA_N  # 4
 
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT
@@ -158,7 +157,7 @@ def compile_chunk_gated_delta_h_kv(
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
     LDS_K_PAD = 8
-    LDS_K_STRIDE = BT + LDS_K_PAD   # EXPERIMENT (vn-direct): lds_k = [K, BT]
+    LDS_K_STRIDE = BT + LDS_K_PAD  # EXPERIMENT (vn-direct): lds_k = [K, BT]
     LDS_K_ELEMS = K * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
@@ -251,7 +250,7 @@ def compile_chunk_gated_delta_h_kv(
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
 
-        v8bf16_type = T.vec(8, T.bf16)
+        T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
         lds_k_memref = lds_k_ptr.get()
 
@@ -260,7 +259,9 @@ def compile_chunk_gated_delta_h_kv(
         def _lds_vec_read_w_bf16x4(elem_idx):
             return vector.load_op(v4bf16_w_type, lds_w_memref, [elem_idx])
 
-        def _lds_vec_read_k_bf16x4(elem_idx):  # EXPERIMENT (vn-direct) std-A read from lds_k[K,BT]
+        def _lds_vec_read_k_bf16x4(
+            elem_idx,
+        ):  # EXPERIMENT (vn-direct) std-A read from lds_k[K,BT]
             return vector.load_op(v4bf16_w_type, lds_k_memref, [elem_idx])
 
         v4bf16_type = T.vec(4, T.bf16)
@@ -272,8 +273,8 @@ def compile_chunk_gated_delta_h_kv(
             raw = rocdl.ds_read_tr16_b64(v4bf16_type, ptr).result
             return fx.Vector(raw, (4,), fx.BFloat16)
 
-        tr_k_group = (lane % fx.Int32(16)) // fx.Int32(4)
-        tr_col_sub = lane % fx.Int32(4)
+        (lane % fx.Int32(16)) // fx.Int32(4)
+        lane % fx.Int32(4)
 
         # -- Prologue: bos, T_local, NT, boh --
         if const_expr(IS_VARLEN):
@@ -326,7 +327,7 @@ def compile_chunk_gated_delta_h_kv(
         lane_n = lane % fx.Int32(16)
         lane_m_base = lane // fx.Int32(16)
 
-        wid_idx = fx.Index(wid)
+        fx.Index(wid)
         lane_n_idx = fx.Index(lane_n)
         lane_m_base_idx = fx.Index(lane_m_base)
 
@@ -356,8 +357,8 @@ def compile_chunk_gated_delta_h_kv(
                     acc_idx = kb * N_REPEAT + slot
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
-        NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
-        NUM_K_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+        NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+        NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
 
         c_zero = fx.Index(0)
         c_one = fx.Index(1)
@@ -437,9 +438,9 @@ def compile_chunk_gated_delta_h_kv(
             # Each thread loads 8 contiguous tokens (BT, row-contiguous) for
             # one K row, stores them contiguously into lds_k's [K, BT].
             # ============================================================
-            K_TOK_THREADS = BT // LOAD_VEC_WIDTH               # 8
+            K_TOK_THREADS = BT // LOAD_VEC_WIDTH  # 8
             K_ROWS_PER_BATCH = BLOCK_THREADS // K_TOK_THREADS  # 32
-            K_LOAD_BATCHES = K // K_ROWS_PER_BATCH             # 4
+            K_LOAD_BATCHES = K // K_ROWS_PER_BATCH  # 4
             k_load_krow = tid // fx.Int32(K_TOK_THREADS)
             k_load_tokbase = (tid % fx.Int32(K_TOK_THREADS)) * fx.Int32(LOAD_VEC_WIDTH)
             for batch in range_constexpr(K_LOAD_BATCHES):
@@ -512,6 +513,7 @@ def compile_chunk_gated_delta_h_kv(
             # 5b. Store v_new (pre-gating) for output
             # ============================================================
             if const_expr(SAVE_NEW_VALUE):
+
                 def _emit_vn_store(off, value):
                     vn_[fx.Index(off)] = value
 

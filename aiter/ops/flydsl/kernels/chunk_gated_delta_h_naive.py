@@ -418,8 +418,8 @@ def compile_chunk_gated_delta_h_naive(
                     acc_idx = kb * N_REPEAT + nr
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
-        NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
-        NUM_K_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+        NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
+        NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
 
         c_zero = fx.Index(0)
         c_one = fx.Index(1)
@@ -660,8 +660,8 @@ def compile_chunk_gated_delta_h_naive(
 
             # Per-K decay: h[v, k] *= exp(gk_last[k]) at chunk end.
             if const_expr(USE_GK):
-                gk_chunk_base = (
-                    (bos + last_idx_raw) * fx.Int32(H * K) + i_h * fx.Int32(K)
+                gk_chunk_base = (bos + last_idx_raw) * fx.Int32(H * K) + i_h * fx.Int32(
+                    K
                 )
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     gk_elems = []

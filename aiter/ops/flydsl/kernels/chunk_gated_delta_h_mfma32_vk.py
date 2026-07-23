@@ -16,7 +16,6 @@ import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -32,11 +31,15 @@ def _llvm_lds_ptr_ty():
 
 def _make_fast_exp(g_is_log2_scaled: bool):
     if g_is_log2_scaled:
+
         def _fast_exp(x):
             return rocdl.exp2(T.f32, x)
+
     else:
+
         def _fast_exp(x):
             return rocdl.exp2(T.f32, x * _LOG2E)
+
     return _fast_exp
 
 
@@ -75,8 +78,6 @@ def compile_chunk_gated_delta_h_mfma32_vk(
 
     # ===== 核心常量 =====
     WARP_SIZE = 64
-    WMMA_M = 32
-    WMMA_N = 32
     WMMA_K = 16
     MFMA_ACC_SIZE = 16
 
@@ -85,7 +86,7 @@ def compile_chunk_gated_delta_h_mfma32_vk(
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE  # 256
 
     # h[BV=64, K=128] 拆成 NUM_K_HALVES 个 64×64 K-half
-    NUM_K_HALVES = K // 64          # 2
+    NUM_K_HALVES = K // 64  # 2
     K_STEPS_PER_HALF = 64 // WMMA_K  # 4 (K-step per K-half for GEMM)
     # 4-warp 2×2 grid 里 warp_row 已经切了 BT (和 V)，所以不需要 BT_MTILES 循环
     # 每 warp 的 GEMM1 output 是单个 32×32 块
@@ -120,13 +121,14 @@ def compile_chunk_gated_delta_h_mfma32_vk(
     LDS_SCRATCH_PAD = 4
     LDS_SCRATCH_STRIDE = 64 + LDS_SCRATCH_PAD  # 68
     LDS_SCRATCH_ELEMS = 64 * LDS_SCRATCH_STRIDE
-    LDS_SCRATCH_BYTES = LDS_SCRATCH_ELEMS * 2   # ~8.7 KB
+    LDS_SCRATCH_BYTES = LDS_SCRATCH_ELEMS * 2  # ~8.7 KB
 
     _K5_KERNEL_REVISION = 2
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
-        None, arch=GPU_ARCH,
+        None,
+        arch=GPU_ARCH,
         global_sym_name=f"gdn_h_mfma32_vk_4w_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
@@ -143,30 +145,39 @@ def compile_chunk_gated_delta_h_mfma32_vk(
     # 协作 load 参数 (256 threads)
     LOAD_VEC_WIDTH = 8
 
-    W_THREADS_PER_ROW = 64 // LOAD_VEC_WIDTH      # 8
+    W_THREADS_PER_ROW = 64 // LOAD_VEC_WIDTH  # 8
     W_ROWS_PER_BATCH = BLOCK_THREADS // W_THREADS_PER_ROW  # 32
-    W_NUM_BATCHES = BT // W_ROWS_PER_BATCH         # 2
+    W_NUM_BATCHES = BT // W_ROWS_PER_BATCH  # 2
 
     # k load: token-major [B, T, Hg, K], K 连续 (stride=1)
     # 每线程读 8 连续 K → 写到 lds_k[K_row, BT_col] 的 K 方向
     # 分工: K/8 = 16 个 K-block, BT = 64 个 token → 16*64 = 1024 对
     # 256 线程 → 4 batch
-    K_BLOCKS_PER_TOK = K // LOAD_VEC_WIDTH          # 16
-    K_PAIRS_PER_BATCH = BLOCK_THREADS               # 256
-    K_TOTAL_PAIRS = BT * K_BLOCKS_PER_TOK           # 1024
-    K_LOAD_BATCHES = K_TOTAL_PAIRS // K_PAIRS_PER_BATCH  # 4
+    K_BLOCKS_PER_TOK = K // LOAD_VEC_WIDTH  # 16
+    K_PAIRS_PER_BATCH = BLOCK_THREADS  # 256
+    K_TOTAL_PAIRS = BT * K_BLOCKS_PER_TOK  # 1024
+    K_TOTAL_PAIRS // K_PAIRS_PER_BATCH  # 4
 
-    U_THREADS_PER_ROW = BV // LOAD_VEC_WIDTH        # 8
+    U_THREADS_PER_ROW = BV // LOAD_VEC_WIDTH  # 8
     U_ROWS_PER_BATCH = BLOCK_THREADS // U_THREADS_PER_ROW  # 32
-    U_NUM_BATCHES = BT // U_ROWS_PER_BATCH          # 2
+    U_NUM_BATCHES = BT // U_ROWS_PER_BATCH  # 2
 
     @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_mfma32_vk")
     def gdn_h_kernel(
-        k_tensor: fx.Pointer, v_tensor: fx.Pointer, w_tensor: fx.Pointer,
-        v_new_tensor: fx.Pointer, g_tensor: fx.Pointer, gk_tensor: fx.Pointer,
-        h_tensor: fx.Pointer, h0_tensor: fx.Pointer, ht_tensor: fx.Pointer,
-        cu_seqlens_tensor: fx.Pointer, chunk_offsets_tensor: fx.Pointer,
-        T_val: fx.Int32, T_flat: fx.Int32, N_val: fx.Int32,
+        k_tensor: fx.Pointer,
+        v_tensor: fx.Pointer,
+        w_tensor: fx.Pointer,
+        v_new_tensor: fx.Pointer,
+        g_tensor: fx.Pointer,
+        gk_tensor: fx.Pointer,
+        h_tensor: fx.Pointer,
+        h0_tensor: fx.Pointer,
+        ht_tensor: fx.Pointer,
+        cu_seqlens_tensor: fx.Pointer,
+        chunk_offsets_tensor: fx.Pointer,
+        T_val: fx.Int32,
+        T_flat: fx.Int32,
+        N_val: fx.Int32,
     ):
         i_v = fx.block_idx.x
         i_nh = fx.block_idx.y
@@ -181,8 +192,8 @@ def compile_chunk_gated_delta_h_mfma32_vk(
         lane_half = lane // fx.Int32(32)
 
         # 2×2 warp grid
-        warp_row = wid // fx.Int32(2)   # V split: 0 or 1
-        warp_col = wid % fx.Int32(2)    # K split within K-half: 0 or 1
+        warp_row = wid // fx.Int32(2)  # V split: 0 or 1
+        warp_col = wid % fx.Int32(2)  # K split within K-half: 0 or 1
 
         # tensor views
         k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
@@ -210,13 +221,16 @@ def compile_chunk_gated_delta_h_mfma32_vk(
         lds_u = STensor(lds_u_ptr, dtype=T.bf16, shape=(LDS_U_ELEMS,))
         lds_g_ptr = SmemPtr(lds_base_ptr, lds_g_offset, T.f32, shape=(LDS_G_ELEMS,))
         lds_g = STensor(lds_g_ptr, dtype=T.f32, shape=(LDS_G_ELEMS,))
-        lds_scratch_ptr = SmemPtr(lds_base_ptr, lds_scratch_offset, T.bf16, shape=(LDS_SCRATCH_ELEMS,))
+        lds_scratch_ptr = SmemPtr(
+            lds_base_ptr, lds_scratch_offset, T.bf16, shape=(LDS_SCRATCH_ELEMS,)
+        )
         lds_scratch = STensor(lds_scratch_ptr, dtype=T.bf16, shape=(LDS_SCRATCH_ELEMS,))
         lds_w_memref = lds_w_ptr.get()
         lds_k_memref = lds_k_ptr.get()
         lds_scratch_memref = lds_scratch_ptr.get()
 
         v8bf16_type = T.vec(8, T.bf16)
+
         def _lds_read_bf16x8(memref, idx):
             return vector.load_op(v8bf16_type, memref, [idx])
 
@@ -297,7 +311,11 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                 v_base_warp = i_v * fx.Int32(BV) + warp_row * fx.Int32(32)
                 vals = []
                 for ei in range_constexpr(MFMA_ACC_SIZE):
-                    v_local = fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)
+                    v_local = (
+                        fx.Int32((ei // 4) * 8)
+                        + lane_half * fx.Int32(4)
+                        + fx.Int32(ei % 4)
+                    )
                     v_global = v_base_warp + v_local
                     h0_off = h0_base + v_global * fx.Int32(K) + k_global
                     val = h0_[fx.Index(h0_off)]
@@ -315,13 +333,21 @@ def compile_chunk_gated_delta_h_mfma32_vk(
             # 整块 f32x16 → bf16x16 转换
             bf_vec = acc_val.truncf(T.vec(MFMA_ACC_SIZE, T.bf16))
             for ei in range_constexpr(MFMA_ACC_SIZE):
-                v_local = fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)
+                v_local = (
+                    fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)
+                )
                 k_local = lane_row
-                s_off = (v_off + v_local) * fx.Int32(LDS_SCRATCH_STRIDE) + k_off + k_local
-                bf_scalar = vector.extract(bf_vec, static_position=[ei], dynamic_position=[])
+                s_off = (
+                    (v_off + v_local) * fx.Int32(LDS_SCRATCH_STRIDE) + k_off + k_local
+                )
+                bf_scalar = vector.extract(
+                    bf_vec, static_position=[ei], dynamic_position=[]
+                )
                 lds_scratch[fx.Index(s_off)] = bf_scalar
 
-        for i_t, state in range(fx.Index(0), fx.Index(NT), fx.Index(1), init=init_state):
+        for i_t, state in range(
+            fx.Index(0), fx.Index(NT), fx.Index(1), init=init_state
+        ):
             h_accs_in = list(state[:NUM_H_ACCS])
             i_t_i32 = fx.Int32(i_t)
 
@@ -332,8 +358,8 @@ def compile_chunk_gated_delta_h_mfma32_vk(
             for kh in range_constexpr(NUM_H_ACCS):
                 _write_accs_to_scratch(
                     h_accs_in[kh],
-                    warp_row * fx.Int32(32),   # V offset
-                    warp_col * fx.Int32(32),   # K offset within 64
+                    warp_row * fx.Int32(32),  # V offset
+                    warp_col * fx.Int32(32),  # K offset within 64
                 )
                 gpu.barrier()
 
@@ -351,7 +377,9 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                     )
                     v_global = i_v * fx.Int32(BV) + v_loc
                     k_global = fx.Int32(kh * 64) + k8
-                    h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_global
+                    h_off = (
+                        h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_global
+                    )
                     h_.vec_store((fx.Index(h_off),), tile8, 8)
                 gpu.barrier()
 
@@ -363,9 +391,13 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                     row = fx.Int32(batch * W_ROWS_PER_BATCH) + w_load_row
                     abs_row = i_t_i32 * fx.Int32(BT) + row
                     safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    w_off = w_base + safe_row * stride_w + fx.Int32(kb * 64) + w_load_col
+                    w_off = (
+                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + w_load_col
+                    )
                     w_vec = w_.vec_load((fx.Index(w_off),), LOAD_VEC_WIDTH)
-                    w_lds = row * fx.Int32(LDS_W_STRIDE) + fx.Int32(kb * 64) + w_load_col
+                    w_lds = (
+                        row * fx.Int32(LDS_W_STRIDE) + fx.Int32(kb * 64) + w_load_col
+                    )
                     lds_w.vec_store((fx.Index(w_lds),), w_vec, LOAD_VEC_WIDTH)
 
             # k load: token-major [B, T, Hg, K] → lds_k[K, BT+pad]（BT innermost）
@@ -375,8 +407,8 @@ def compile_chunk_gated_delta_h_mfma32_vk(
             K_SCALAR_BATCHES = K_SCALAR_TOTAL // BLOCK_THREADS  # 32
             for batch in range_constexpr(K_SCALAR_BATCHES):
                 elem_idx = fx.Int32(batch * BLOCK_THREADS) + tid
-                ki = elem_idx % fx.Int32(K)     # K 维度
-                bt = elem_idx // fx.Int32(K)    # BT 维度
+                ki = elem_idx % fx.Int32(K)  # K 维度
+                bt = elem_idx // fx.Int32(K)  # BT 维度
                 abs_tok = i_t_i32 * fx.Int32(BT) + bt
                 in_b = abs_tok < T_local
                 safe_tok = in_b.select(abs_tok, fx.Int32(0))
@@ -430,7 +462,9 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                 for k_step in range_constexpr(K_STEPS_PER_HALF):
                     # A: w[warp_row*32 + lane%32, kh*64 + k_step*16 + (lane//32)*8 +0..7]
                     a_row = fx.Index(warp_row * 32) + fx.Index(lane_row)
-                    a_col = fx.Index(kh * 64 + k_step * 16) + fx.Index(lane_half) * fx.Index(8)
+                    a_col = fx.Index(kh * 64 + k_step * 16) + fx.Index(
+                        lane_half
+                    ) * fx.Index(8)
                     a_idx = a_row * fx.Index(LDS_W_STRIDE) + a_col
                     a_frag = _lds_read_bf16x8(lds_w_memref, a_idx)
 
@@ -456,7 +490,9 @@ def compile_chunk_gated_delta_h_mfma32_vk(
             u_vals = []
             for ei in range_constexpr(MFMA_ACC_SIZE):
                 bt_local = lane_row
-                bv_local = fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)
+                bv_local = (
+                    fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)
+                )
                 u_bt_global = warp_row * fx.Int32(32) + bt_local
                 u_v_global = warp_col * fx.Int32(32) + bv_local
                 u_lds_off = u_bt_global * fx.Int32(LDS_U_STRIDE) + u_v_global
@@ -481,12 +517,18 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                 vn_val = vn_frags[0]
                 vn_bf = vn_val.truncf(T.vec(MFMA_ACC_SIZE, T.bf16))
                 for ei in range_constexpr(MFMA_ACC_SIZE):
-                    bt_local = lane_row                    # M = BT 方向
-                    v_local = fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)  # N = V 方向
+                    bt_local = lane_row  # M = BT 方向
+                    v_local = (
+                        fx.Int32((ei // 4) * 8)
+                        + lane_half * fx.Int32(4)
+                        + fx.Int32(ei % 4)
+                    )  # N = V 方向
                     bt_global = warp_row * fx.Int32(32) + bt_local
                     v_global = warp_col * fx.Int32(32) + v_local
                     s_off = bt_global * fx.Int32(LDS_SCRATCH_STRIDE) + v_global
-                    lds_scratch[fx.Index(s_off)] = vector.extract(vn_bf, static_position=[ei], dynamic_position=[])
+                    lds_scratch[fx.Index(s_off)] = vector.extract(
+                        vn_bf, static_position=[ei], dynamic_position=[]
+                    )
                 gpu.barrier()
 
                 VN_V8 = 64 // 8
@@ -529,7 +571,9 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                         gate = _fast_exp(g_last_val - g_row_val)
                         gate = in_bounds.select(gate, fx.Float32(0.0))
                         gated_vals.append(vn_val[ei] * gate)
-                    vn_frags[bt_tile] = vector.from_elements(T.vec(MFMA_ACC_SIZE, T.f32), gated_vals)
+                    vn_frags[bt_tile] = vector.from_elements(
+                        T.vec(MFMA_ACC_SIZE, T.f32), gated_vals
+                    )
 
             # ========================================
             # Step 9: GEMM2 — h[V,K] += trans(k[K,BT] @ vn[BT,BV])
@@ -546,12 +590,18 @@ def compile_chunk_gated_delta_h_mfma32_vk(
                 vn_bf = vn_val.truncf(T.vec(MFMA_ACC_SIZE, T.bf16))
                 for ei in range_constexpr(MFMA_ACC_SIZE):
                     bt_local = lane_row  # BT 维度
-                    bv_local = fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)  # V 维度
+                    bv_local = (
+                        fx.Int32((ei // 4) * 8)
+                        + lane_half * fx.Int32(4)
+                        + fx.Int32(ei % 4)
+                    )  # V 维度
                     bt_global = warp_row * fx.Int32(32) + bt_local
                     bv_global = warp_col * fx.Int32(32) + bv_local
                     # scratch[V_row, BT_col]（BT innermost）
                     s_off = bv_global * fx.Int32(LDS_SCRATCH_STRIDE) + bt_global
-                    lds_scratch[fx.Index(s_off)] = vector.extract(vn_bf, static_position=[ei], dynamic_position=[])
+                    lds_scratch[fx.Index(s_off)] = vector.extract(
+                        vn_bf, static_position=[ei], dynamic_position=[]
+                    )
                 gpu.barrier()
 
                 # GEMM2 MFMA: D[K_sub, V_sub] = k @ vn
@@ -563,7 +613,9 @@ def compile_chunk_gated_delta_h_mfma32_vk(
 
                     # A: lds_k[K, BT+pad], K 行 BT 列 (BT innermost)
                     # lane%32 → M(=K), 8 连续 BT from lane//32
-                    a_k_row = fx.Index(kh * 64) + fx.Index(warp_col * 32) + fx.Index(lane_row)
+                    a_k_row = (
+                        fx.Index(kh * 64) + fx.Index(warp_col * 32) + fx.Index(lane_row)
+                    )
                     a_bt_col = fx.Index(k_step * 16) + fx.Index(lane_half) * fx.Index(8)
                     a_idx = a_k_row * fx.Index(LDS_K_STRIDE) + a_bt_col
                     a_frag = _lds_read_bf16x8(lds_k_memref, a_idx)
@@ -597,12 +649,18 @@ def compile_chunk_gated_delta_h_mfma32_vk(
             for kh in range_constexpr(NUM_H_ACCS):
                 acc_val = h_accs_final[kh]
                 for ei in range_constexpr(MFMA_ACC_SIZE):
-                    v_local = fx.Int32((ei // 4) * 8) + lane_half * fx.Int32(4) + fx.Int32(ei % 4)
+                    v_local = (
+                        fx.Int32((ei // 4) * 8)
+                        + lane_half * fx.Int32(4)
+                        + fx.Int32(ei % 4)
+                    )
                     k_local = lane_row
                     v_global = i_v * fx.Int32(BV) + warp_row * fx.Int32(32) + v_local
                     k_global = fx.Int32(kh * 64) + warp_col * fx.Int32(32) + k_local
                     ht_off = ht_base + v_global * fx.Int32(K) + k_global
-                    elem = vector.extract(acc_val, static_position=[ei], dynamic_position=[])
+                    elem = vector.extract(
+                        acc_val, static_position=[ei], dynamic_position=[]
+                    )
                     if const_expr(STATE_DTYPE_BF16):
                         ht_[fx.Index(ht_off)] = arith.truncf(T.bf16, elem)
                     else:
@@ -635,10 +693,20 @@ def compile_chunk_gated_delta_h_mfma32_vk(
             allocator.finalize()
 
         launcher = gdn_h_kernel(
-            k_tensor, v_tensor, w_tensor, v_new_tensor,
-            g_tensor, gk_tensor, h_tensor, h0_tensor, ht_tensor,
-            cu_seqlens_tensor, chunk_offsets_tensor,
-            T_val, T_flat, N_val,
+            k_tensor,
+            v_tensor,
+            w_tensor,
+            v_new_tensor,
+            g_tensor,
+            gk_tensor,
+            h_tensor,
+            h0_tensor,
+            ht_tensor,
+            cu_seqlens_tensor,
+            chunk_offsets_tensor,
+            T_val,
+            T_flat,
+            N_val,
         )
         launcher.launch(
             grid=(grid_v, grid_nh, 1),
