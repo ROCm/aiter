@@ -21,7 +21,6 @@ from __future__ import annotations
 import functools
 import math
 import os
-from pathlib import Path
 
 import torch
 import triton
@@ -79,62 +78,12 @@ __all__ = [
 ]
 
 
-# -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
+# -- K5 host wrapper (FlyDSL mfma16_hip kernel; BV via hip K5 select) -----
 
-_BV_CANDIDATES = [16, 32, 64]
-_DEFAULT_BV = 16
-
-# The trace-calibrated BV carve-outs in ``_target_bv_for_shape`` were swept
-# exclusively on gfx950 (V=128, BT=64, 256 CUs). They assume gfx950's CU
-# count and wave-occupancy behavior, so they are gated to gfx950 -- on any
-# other arch the carve-outs return ``None`` and the generic CU-fill default
-# applies instead (matches the pre-calibration behavior, no regression).
-# ``get_rocm_arch()`` may return a feature-suffixed string like
-# ``gfx950:sramecc+:xnack-``; normalize before matching.
-_IS_GFX950 = get_rocm_arch().split(":")[0].startswith("gfx950")
+# gfx942 gate: only the mfma16_hip fork toggles the gfx942 GEMM1 ds-scheduling
+# (SCHED_GFX942). ``get_rocm_arch()`` may return a feature-suffixed string like
+# ``gfx942:sramecc+:xnack-``; normalize before matching.
 _IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
-
-# gfx942 (MI30x, 80 CUs) CU-fill target for the mfma16_hip fork. Calibrated by
-# sweeping BV in {16,32,64} across the full K5 benchmark shape set on gfx942
-# (see op_tests/flydsl_tests/_bv_sweep_gfx942.py): a target of 64 CTAs (~0.8
-# wave over the 80 CUs) reproduces the measured-best BV for every swept shape.
-# mfma16_hip's larger-BV tiles are efficient enough that forcing a smaller BV
-# just to fill all 80 CUs is a net loss, so the target is intentionally BELOW
-# the live CU count. On gfx942 the baseline/naive forks abort (K=32 MFMA) and
-# every other fork pins its own BV, so mfma16_hip is the only consumer of this
-# heuristic BV -- this target is tuned specifically for it.
-_GFX942_MFMA16HIP_TARGET_CTAS = 64
-
-# gfx942 H=8/Hg=2 varlen carve-out（当前 K5 生产 shape：V=128, BT=64,
-# is_varlen, seqlen=8192）。20260721 在卡7（gfx942, GPU 空闲）实测按 T 强扫
-# BV∈{16,32,64} 得到的 best BV 随 batch 内序列数 N 单调递增：
-#   N=1 (T=8192) →16 · N=2 (T=16384) →32 · N>=3 (T>=24576) →64
-# 通用 target(64) 会在 N=3 时把 BV=64 的 grid(=N*H*ceil(V/BV)=48) 误判为
-# "不够一个 wave" 而降到 BV=32（实测 662us vs BV=64 的 498us，慢约 25%）。
-# 把该 shape family 的 grid-fill 目标下调到 48，N>=3 的 BV=64 grid 恰好达标，
-# 与实测 best BV 完全吻合；其它 gfx942 shape 不受影响（仍用 64 / csv 精确命中）。
-_GFX942_MFMA16HIP_H8HG2_TARGET_CTAS = 48
-
-# gfx950 has 256 CUs. Used as the fallback CU count when the live device
-# query is unavailable (e.g. CPU-only meta runs).
-_GFX950_CU_COUNT = 256
-
-# ---------------------------------------------------------------------------
-# Tuned-csv BV lookup (csv-best preferred, rule-based fallback)
-# ---------------------------------------------------------------------------
-# Offline-tuned table mapping a shape family to its measured-best BV. This is
-# the SAME csv the AOT path (``aiter/aot/flydsl/chunk_gdn_h.py``) uses as its
-# pre-compile seed list. At runtime we consult it FIRST for an exact-match
-# best BV; on a miss (the table is sparse -- a few dozen rows) we fall back to
-# the rule-based ``_target_bv_for_shape`` / CU-fill heuristic, so coverage is
-# never worse than the pure-rule path.
-#
-# Built once per process (mirrors ``GDR_GLOBAL_CONFIG_MAP`` in
-# ``linear_attention_kernels``): we keep, per key, the BV of the row with the
-# smallest measured ``duration``.
-_TUNED_BV_CSV = Path(__file__).resolve().parent / "chunk_gdn_h_tuned.csv"
-# key = (arch, dtype, K, V, BT, H, Hg, T_flat, N, is_varlen) -> (BV, duration)
-_TUNED_BV_MAP: dict[tuple, tuple[int, float]] | None = None
 
 
 _INT32_ATTR = "_flydsl_int32_view"
