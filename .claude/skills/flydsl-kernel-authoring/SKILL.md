@@ -289,7 +289,7 @@ if lane == c_zero:
     ...
 
 in_range = lane < c_limit
-val = fx.arith.select(in_range, good_val, zero_val)
+val = in_range.select(good_val, zero_val)
 
 # Avoid for simple integer comparisons
 in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_limit)
@@ -489,7 +489,7 @@ Use `Vec.filled(...)` for splats and `Vec.from_elements(...)` for vectors from s
 | Multiply | `a * b` | Yes | Use direct FOp only for explicit fastmath |
 | Negate | `-a` | Yes | |
 | Max | `a.maximumf(b)` | Yes | Good for ReLU |
-| Compare | `arith.cmpf(a, b, pred)` | Yes | Returns i1/vec<i1> |
+| Compare | `a < b`, `a == b`, `a > b` | Yes | Operators; keep `arith.cmpf(...)` only for fastmath/unordered predicates |
 | Select | `cond.select(t, f)` | Yes | |
 | Abs | no direct helper | Use `-v`, comparison, and `cond.select(...)` |
 | FMA | `a * b + c` | Yes | Use direct FOp only when explicit fastmath is needed |
@@ -724,11 +724,10 @@ The preshuffle GEMM pattern in `kernels/gemm/preshuffle_gemm.py`:
 ### Warp Reduction (AMD wave64)
 XOR-shuffle-based intra-wave reduction:
 ```python
-width_i32 = fx.Int32(64)
 val = fx.Float32(val)                                        # typed once, not per-iter
 for sh in [32, 16, 8, 4, 2, 1]:
-    peer = gpu.ShuffleOp(val.ir_value(), fx.Int32(sh), width_i32, mode="xor").shuffleResult
-    val = val + fx.Float32(peer)  # typed add; explicit FOp only for fastmath flags
+    peer = val.shuffle_xor(fx.Int32(sh), fx.Int32(64))       # typed numeric method
+    val = val + peer                                         # or val.addf(peer, fastmath=...) for fastmath
 ```
 
 ### Block Reduction
