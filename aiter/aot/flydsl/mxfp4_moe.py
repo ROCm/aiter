@@ -28,7 +28,7 @@ DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
 # V2 GEMM2 enables fp8 route-out by default; the legacy MoE AOT path keeps its
 # own default behavior in moe.py.
-_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "1") == "1"
+_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:

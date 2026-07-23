@@ -1709,7 +1709,7 @@ def _flydsl_v2_stage2_wrapper(
     model_dim_runtime = out.shape[1]
     target = out
     _s2_fp8_inter = (
-        epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "1") == "1"
+        epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
     if epilog == "reduce":
         if _s2_fp8_inter:
