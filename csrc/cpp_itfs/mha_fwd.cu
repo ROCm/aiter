@@ -9,6 +9,9 @@
 namespace aiter {
 #if FAV3_ON
 
+// gfx950 group: grid.z = Q tiles, max 65535 per launch (kernel adds s_q_tile_base).
+static constexpr int kFmhaV3GroupMaxGridZ = 65535;
+
 int get_cfg_mask_type(const mha_fwd_args& a)
 {
     if(a.mask_type == 0)
@@ -111,6 +114,7 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
     args.s_descale_k_Hs   = 0;
     args.s_descale_v_Bs   = 0;
     args.s_descale_v_Hs   = 0;
+    args.s_q_tile_base    = 0;
 
     int in_bpe = 2;
     int out_bpe = 2;
@@ -258,9 +262,37 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
+    // gfx950 varlen group only: split grid.z (Q tiles); gfx942 / batch unchanged.
+    if(a.is_group_mode && arch_id == "gfx950" && gdz > kFmhaV3GroupMaxGridZ)
+    {
+        float ret = 0.f;
+        for(int base = 0; base < gdz; base += kFmhaV3GroupMaxGridZ)
+        {
+            const int gdz_chunk =
+                (gdz - base > kFmhaV3GroupMaxGridZ) ? kFmhaV3GroupMaxGridZ : (gdz - base);
+            args.s_q_tile_base = static_cast<unsigned int>(base);
+            ret                = ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+                void* args_ptr       = &args;
+                size_t* arg_size_ptr = &arg_size;
+                impl_ptr->launch_kernel({args_ptr,
+                                         arg_size_ptr,
+                                         gdx,
+                                         gdy,
+                                         gdz_chunk,
+                                         bdx,
+                                         1,
+                                         1,
+                                         s_.stream_id_});
+            });
+            if(ret < 0.f)
+            {
+                return ret;
+            }
+        }
+        return ret;
+    }
+
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
-        // Explicit assignment forces evaluation order and prevents compiler from
-        // reordering operations that could lead to accessing uninitialized args
         void* args_ptr     = &args;
         size_t* arg_size_ptr = &arg_size;
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
