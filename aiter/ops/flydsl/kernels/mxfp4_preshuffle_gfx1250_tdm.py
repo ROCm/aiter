@@ -340,6 +340,10 @@ def launch_gemm_a8w4_tdm(
             return wt, sb_k, sa_k
 
         def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, prefetch_kt=None):
+            if const_expr(prefetch_kt is not None):
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % num_buffers, prefetch_kt)
+                rocdl.sched_barrier(0)
             act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
                 act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
@@ -347,10 +351,6 @@ def launch_gemm_a8w4_tdm(
             else:
                 rocdl.s_wait_dscnt(0)
             mma_rows(FRONT, act_f, wt, sa_k, sb_k)
-            if const_expr(prefetch_kt is not None):
-                rocdl.sched_barrier(0)
-                issue(prefetch_kt % num_buffers, prefetch_kt)
-                rocdl.sched_barrier(0)
             if const_expr(len(BACK) > 0):
                 rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
@@ -375,39 +375,43 @@ def launch_gemm_a8w4_tdm(
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
-            if const_expr(tile_m <= 64):
-                # Post-compute issue: better for decode (small tile_m).
-                for i in range_constexpr(num_buffers):
-                    issue(i, i)
-                n_steady = K_TILES - num_buffers
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
-                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                    workgroup_barrier()
-                    compute_ktile(buf, None)
-                    workgroup_barrier()
-                    issue(s, kt + num_buffers)
-                for j in range_constexpr(num_buffers):
-                    kt = n_steady + j
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                    compute_ktile(buf, None)
-            else:
+            # Post-compute issue (double-buffered) wins for decode (small tile_m)
+            # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
+            # prefetches only num_buffers-1==1 tile and under-overlaps, so it
+            # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
+            # if const_expr(tile_m <= 64 or num_buffers <= 2):
+            #     # Post-compute issue: better for decode (small tile_m).
+            #     for i in range_constexpr(num_buffers):
+            #         issue(i, i)
+            #     n_steady = K_TILES - num_buffers
+            #     for kt in range(n_steady):
+            #         s = kt % num_buffers
+            #         buf = ptr_to_idx(buf_ptr(s))
+            #         tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+            #         workgroup_barrier()
+            #         compute_ktile(buf, None)
+            #         workgroup_barrier()
+            #         issue(s, kt + num_buffers)
+            #     for j in range_constexpr(num_buffers):
+            #         kt = n_steady + j
+            #         buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+            #         pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
+            #         compute_ktile(buf, None)
+            # else:
                 # Mid-compute prefetch: better for prefill (large tile_m).
-                for i in range_constexpr(num_buffers - 1):
-                    issue(i, i)
-                n_steady = K_TILES - (num_buffers - 1)
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-                    compute_ktile(buf, kt + (num_buffers - 1))
-                for j in range_constexpr(num_buffers - 1):
-                    kt = n_steady + j
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
-                    compute_ktile(buf, None)
+            for i in range_constexpr(num_buffers - 1):
+                issue(i, i)
+            n_steady = K_TILES - (num_buffers - 1)
+            for kt in range(n_steady):
+                s = kt % num_buffers
+                buf = ptr_to_idx(buf_ptr(s))
+                pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                compute_ktile(buf, kt + (num_buffers - 1))
+            for j in range_constexpr(num_buffers - 1):
+                kt = n_steady + j
+                buf = ptr_to_idx(buf_ptr(kt % num_buffers))
+                pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+                compute_ktile(buf, None)
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
