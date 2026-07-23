@@ -69,6 +69,11 @@ AITER is the **default kernel backend for LLM inference on AMD GPUs**, integrate
 | AMD Instinct MI325X | gfx942 (CDNA3) | Fully supported |
 | AMD Instinct MI350 | gfx950 (CDNA4) | Supported |
 | AMD Instinct MI355X | gfx950 (CDNA4) | Supported |
+| AMD Pro W7900 | gfx1100 (RDNA3) | Experimental<sup>1</sup> |
+| AMD AI Max and Max Pro 400/300 Series | gfx1151 (RDNA3.5) | Experimental<sup>1</sup> |
+| AMD Radeon AI PRO R9700 | gfx1201 (RDNA4) | Experimental<sup>1</sup> |
+
+<sup>1</sup> On RDNA, Triton and most FlyDSL kernels run, as do most HIP kernels (norm, RoPE, quant, activation, plus some GEMM/attention). Most CK and ASM kernels are CDNA-only.
 
 ## Operators
 
@@ -99,15 +104,11 @@ If you happen to forget the `--recursive` during `clone`, you can use the follow
 git submodule sync && git submodule update --init --recursive
 ```
 
-### FlyDSL (Optional)
+### FlyDSL
 
-AITER's FusedMoE supports [FlyDSL](https://pypi.org/project/flydsl/)-based kernels for mixed-precision MOE (e.g., A4W4). FlyDSL is optional — when not installed, AITER automatically falls back to CK kernels.
+AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
 
-```bash
-pip install --pre flydsl
-```
-
-Or install all optional dependencies at once:
+To install it manually:
 
 ```bash
 pip install -r requirements.txt
@@ -117,7 +118,13 @@ pip install -r requirements.txt
 
 AITER includes Triton-based operators that require triton from AMD PyPI, with the correct version selected based on your ROCm installation.
 
-If you install with `python3 setup.py develop`, triton is installed automatically. If you use `pip install -e .`, run the install script manually:
+If you install with `python3 setup.py develop`, triton is installed automatically. To skip this and keep your existing triton, set:
+
+```bash
+AITER_USE_SYSTEM_TRITON=1 python3 setup.py develop
+```
+
+If you use `pip install -e .`, run the install script manually:
 
 ```bash
 ./.github/scripts/install_triton.sh

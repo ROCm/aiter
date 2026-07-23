@@ -48,13 +48,10 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
 from .kernels_common import dtype_to_elem_type
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from .tensor_shim import _run_compiled
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
-    fly as _fly,
     llvm as _llvm,
-    memref as _memref,
 )
 
 KERNEL_NAME = "flash_attn_func_gfx1201_c_exp_a_k_noswizzle_kernel"
@@ -72,9 +69,10 @@ def _llvm_ptr_ty():
     return ir.Type.parse("!llvm.ptr")
 
 
-def _extract_aligned_pointer(tensor) -> ir.Value:
-    """Extract the aligned LLVM pointer from a FlyDSL tensor/memref."""
-    return _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty(), _llvm_value(tensor))
+def _pointer_to_llvm_ptr(ptr) -> ir.Value:
+    """Convert a FlyDSL pointer argument to the LLVM pointer used by raw loads."""
+    ptr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
+    return _llvm.IntToPtrOp(_llvm_ptr_ty(), ptr_i64).result
 
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
@@ -101,7 +99,6 @@ def build_flash_attn_func_module_primary(
     path_tag="auto",
 ):
     """Build gfx1201 flash_attn_func (BN=32 + rocdl.exp2 + pipelined GEMM2 + overlapped V load)."""
-    gpu_arch = get_hip_arch()
 
     # ---- WMMA / wave32 constants ----
     WARP_SIZE = 32
@@ -130,7 +127,6 @@ def build_flash_attn_func_module_primary(
         flat_work_group_size = NUM_WAVES * WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
 
-    PATH_TAG = f"M{BLOCK_M}N{BLOCK_N}_combined"
     BLOCK_N_OUT = BLOCK_N
 
     NUM_PREFETCH_K = 1
@@ -182,14 +178,6 @@ def build_flash_attn_func_module_primary(
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
     LDS_KV_TOTAL_SIZE = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE
 
-    allocator = SmemAllocator(
-        None,
-        arch=gpu_arch,
-        global_sym_name=f"flash_attn_func_gfx1201c_exp_a_smem_{PATH_TAG}",
-    )
-    lds_kv_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_kv_offset + LDS_KV_TOTAL_SIZE * 2
-
     # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and `.to(...)`).
     # aiter's `dtype_to_elem_type` returns a raw MLIR `ir.Type`; the FlyDSL Vector
     # API requires a Numeric subclass instead. Both forms are kept available.
@@ -200,20 +188,24 @@ def build_flash_attn_func_module_primary(
     }
     elem_numeric_cls = _NUMERIC_MAP[dtype_str]
 
+    @fx.struct
+    class SharedStorage:
+        kv: fx.Array[elem_numeric_cls, LDS_KV_TOTAL_SIZE, 16]
+
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_func_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741
         seq_len: fx.Int32,
     ):
         elem_type = dtype_to_elem_type(dtype_str)
         elem_dtype = elem_numeric_cls
-        q_ptr = _extract_aligned_pointer(Q)
-        k_ptr = _extract_aligned_pointer(K)
-        v_ptr = _extract_aligned_pointer(V)
-        o_ptr = _extract_aligned_pointer(O)
+        q_ptr = _pointer_to_llvm_ptr(Q)
+        k_ptr = _pointer_to_llvm_ptr(K)
+        v_ptr = _pointer_to_llvm_ptr(V)
+        o_ptr = _pointer_to_llvm_ptr(O)
         fm_fast = arith.FastMathFlags.fast
 
         # Local fast-math arithmetic helpers — preserve fastmath flag while using
@@ -245,13 +237,8 @@ def build_flash_attn_func_module_primary(
 
         seq_len_v = fx.Index(seq_len)
 
-        base_ptr = allocator.get_base()
-        lds_kv = SmemPtr(
-            base_ptr,
-            lds_kv_offset,
-            elem_type,
-            shape=(LDS_KV_TOTAL_SIZE,),
-        ).get()
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_kv = lds.kv.ptr
 
         block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
@@ -341,11 +328,11 @@ def build_flash_attn_func_module_primary(
                     lds_row = load_row_in_batch + row_offset
                     lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                     vec = load_global_f16xN(k_ptr, g_idx)
-                    Vec(vec).store(lds_kv, [lds_idx])
+                    fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
 
         def _v_store_row_major(v_base, lds_row, vec):
             lds_idx = v_base + lds_row * V_STRIDE + load_col_base
-            Vec(vec).store(lds_kv, [lds_idx])
+            fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
 
         def coop_load_v_global(tile_start):
             vecs = []
@@ -443,11 +430,15 @@ def build_flash_attn_func_module_primary(
 
                     k_row_a = lane16 + fx.Index(st_base_row)
                     k_lds_a = k_base + k_row_a * K_STRIDE + k_col
-                    k_pack_a = Vec.load(v8f16_type, lds_kv, [k_lds_a])
+                    k_pack_a = fx.ptr_load(
+                        lds_kv + fx.Int32(k_lds_a), result_type=v8f16_type
+                    )
 
                     k_row_b = lane16 + fx.Index(st_base_row + 16)
                     k_lds_b = k_base + k_row_b * K_STRIDE + k_col
-                    k_pack_b = Vec.load(v8f16_type, lds_kv, [k_lds_b])
+                    k_pack_b = fx.ptr_load(
+                        lds_kv + fx.Int32(k_lds_b), result_type=v8f16_type
+                    )
 
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
@@ -618,9 +609,7 @@ def build_flash_attn_func_module_primary(
                         + fx.Index(k_sub)
                     )
                     v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
-                    # Kept as raw memref.load: scalar element load with no
-                    # direct Vec equivalent — Vec is for SIMD vectors.
-                    v_elems.append(_memref.load(lds_kv, [_raw(v_lds_idx)]))
+                    v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
                 return Vec.from_elements(v_elems, elem_dtype).ir_value()
 
             # Software pipeline: preload first V pack
@@ -682,18 +671,15 @@ def build_flash_attn_func_module_primary(
 
     @flyc.jit
     def launch_flash_attn_func(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
         ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
 
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
@@ -756,22 +742,45 @@ def build_flash_attn_func_module_primary(
         "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
     }
 
+    def _ptr_arg(t):
+        if hasattr(t, "data_ptr"):
+            type_name = type(t).__name__
+            module_name = type(t).__module__
+            ptr = (
+                0
+                if type_name == "FakeTensor" or "fake_tensor" in module_name
+                else t.data_ptr()
+            )
+            return flyc.from_c_void_p(fx.Uint8, ptr)
+        return t
+
+    def _wrap_qkvo(args, kwargs):
+        args = list(args)
+        for idx in range(min(4, len(args))):
+            args[idx] = _ptr_arg(args[idx])
+        for name in ("Q", "K", "V", "O"):
+            if name in kwargs:
+                kwargs[name] = _ptr_arg(kwargs[name])
+        return tuple(args), kwargs
+
+    launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
+
     def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_fmha_compile_hints):
-            return launch_flash_attn_func(*args, **kwargs)
+        args, kwargs = _wrap_qkvo(args, kwargs)
+        stream = kwargs.pop("stream", fx.Stream(None))
+        _run_compiled(launch_flash_attn_func, *args, stream)
 
     def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
-        with CompilationContext.compile_hints(_fmha_compile_hints):
-            return flyc.compile(
-                launch_flash_attn_func,
-                Q,
-                K,
-                V,
-                O,
-                batch_size,
-                seq_len,
-                fx.Stream(stream),
-            )
+        return flyc.compile(
+            launch_flash_attn_func,
+            _ptr_arg(Q),
+            _ptr_arg(K),
+            _ptr_arg(V),
+            _ptr_arg(O),
+            batch_size,
+            seq_len,
+            fx.Stream(stream),
+        )
 
     _launch.compile = _compile
     return _launch

@@ -30,3 +30,6 @@ def is_mx_scale_preshuffling_avail():
 
 def is_tdm_avail():
     return get_arch() in ("gfx1250",)
+
+
+_LDS_CAP_BYTES = {"gfx1250": 327680, "gfx950": 163840, "gfx942": 65536}
