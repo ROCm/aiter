@@ -21,7 +21,7 @@ from the referenced compiler itself.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 import inspect
@@ -42,10 +42,17 @@ __all__ = [
     "CompileUnit",
     "DEFAULT_COMPILE_OP_REGISTRY",
     "KernelSignature",
+    "OperationNode",
+    "OperationOutput",
+    "OperationOutputKind",
+    "OperationPlan",
+    "OperationWorkspace",
     "RocmTarget",
     "SignatureArg",
+    "WorkspaceLifetime",
     "PlanBuilder",
     "op",
+    "operation_plan_provider",
     "plan_provider",
     "register_compile_op",
 ]
@@ -53,6 +60,7 @@ __all__ = [
 _ARCH_RE = re.compile(r"gfx[0-9a-f]+")
 _OP_ID_RE = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.v[1-9][0-9]*")
 _ARG_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_NODE_ID_RE = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*")
 _RESERVED_BINDING_NAMES = frozenset(("signature", "target"))
 
 
@@ -280,6 +288,170 @@ class CompilePlan:
         if not all(isinstance(unit, CompileUnit) for unit in units):
             raise TypeError("units must contain only CompileUnit values")
         object.__setattr__(self, "units", units)
+
+
+class OperationOutputKind(str, Enum):
+    """Semantic ownership of an operation output."""
+
+    FINAL = "final"
+    INTERMEDIATE = "intermediate"
+
+
+class WorkspaceLifetime(str, Enum):
+    """Semantic lifetime of adapter-owned workspace."""
+
+    NODE = "node"
+    PLAN = "plan"
+
+
+@dataclass(frozen=True)
+class OperationOutput:
+    """A named output without tensor shape or allocation policy."""
+
+    name: str
+    kind: OperationOutputKind
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _NODE_ID_RE.fullmatch(self.name) is None:
+            raise ValueError(f"invalid operation output name: {self.name!r}")
+        if not isinstance(self.kind, OperationOutputKind):
+            raise TypeError("kind must be an OperationOutputKind")
+
+
+@dataclass(frozen=True)
+class OperationWorkspace:
+    """A named workspace whose layout remains owned by a runtime adapter."""
+
+    name: str
+    lifetime: WorkspaceLifetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _NODE_ID_RE.fullmatch(self.name) is None:
+            raise ValueError(f"invalid operation workspace name: {self.name!r}")
+        if not isinstance(self.lifetime, WorkspaceLifetime):
+            raise TypeError("lifetime must be a WorkspaceLifetime")
+
+
+@dataclass(frozen=True)
+class OperationNode:
+    """One ordered compile/runtime operation selected by a graph provider."""
+
+    node_id: str
+    role: str
+    dependencies: tuple[str, ...] = ()
+    binding: "BoundCompileOp | None" = None
+    outputs: tuple[OperationOutput, ...] = ()
+    workspaces: tuple[OperationWorkspace, ...] = ()
+    runtime_metadata: Hashable | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.node_id, str)
+            or _NODE_ID_RE.fullmatch(self.node_id) is None
+        ):
+            raise ValueError(f"invalid operation node_id: {self.node_id!r}")
+        if (
+            not isinstance(self.role, str)
+            or not self.role
+            or self.role != self.role.strip()
+        ):
+            raise ValueError("operation role must be a non-empty canonical string")
+
+        dependencies = tuple(self.dependencies)
+        if any(
+            not isinstance(dependency, str) or _NODE_ID_RE.fullmatch(dependency) is None
+            for dependency in dependencies
+        ):
+            raise ValueError(f"invalid dependencies for node {self.node_id!r}")
+        if len(dependencies) != len(set(dependencies)):
+            raise ValueError(f"duplicate dependencies for node {self.node_id!r}")
+        if self.node_id in dependencies:
+            raise ValueError(f"node {self.node_id!r} cannot depend on itself")
+        object.__setattr__(self, "dependencies", dependencies)
+
+        if self.binding is not None and not isinstance(self.binding, BoundCompileOp):
+            raise TypeError("binding must be a BoundCompileOp or None")
+
+        outputs = tuple(self.outputs)
+        workspaces = tuple(self.workspaces)
+        if not all(isinstance(output, OperationOutput) for output in outputs):
+            raise TypeError("outputs must contain only OperationOutput values")
+        if not all(
+            isinstance(workspace, OperationWorkspace) for workspace in workspaces
+        ):
+            raise TypeError("workspaces must contain only OperationWorkspace values")
+        if len({output.name for output in outputs}) != len(outputs):
+            raise ValueError(f"duplicate outputs for node {self.node_id!r}")
+        if len({workspace.name for workspace in workspaces}) != len(workspaces):
+            raise ValueError(f"duplicate workspaces for node {self.node_id!r}")
+        object.__setattr__(self, "outputs", outputs)
+        object.__setattr__(self, "workspaces", workspaces)
+
+        if self.runtime_metadata is not None:
+            try:
+                hash(self.runtime_metadata)
+            except TypeError as error:
+                raise TypeError(
+                    "runtime_metadata must be frozen and hashable"
+                ) from error
+
+
+@dataclass(frozen=True)
+class OperationPlan:
+    """A target-specific operation graph with compile and execution projections."""
+
+    target: RocmTarget
+    case_id: Hashable
+    nodes: tuple[OperationNode, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target, RocmTarget):
+            raise TypeError("target must be a RocmTarget")
+        try:
+            hash(self.case_id)
+        except TypeError as error:
+            raise TypeError("case_id must be frozen and hashable") from error
+
+        try:
+            nodes = tuple(self.nodes)
+        except TypeError as error:
+            raise TypeError("nodes must be an iterable of OperationNode") from error
+        if not all(isinstance(node, OperationNode) for node in nodes):
+            raise TypeError("nodes must contain only OperationNode values")
+
+        seen: set[str] = set()
+        for node in nodes:
+            if node.node_id in seen:
+                raise ValueError(f"duplicate operation node_id: {node.node_id!r}")
+            missing = tuple(
+                dependency for dependency in node.dependencies if dependency not in seen
+            )
+            if missing:
+                raise ValueError(
+                    f"node {node.node_id!r} dependencies must reference earlier "
+                    f"nodes; missing={missing!r}"
+                )
+            if (
+                node.binding is not None
+                and node.binding.unit.spec.target != self.target
+            ):
+                raise ValueError(
+                    f"node {node.node_id!r} targets "
+                    f"{node.binding.unit.spec.target!r}, expected {self.target!r}"
+                )
+            seen.add(node.node_id)
+        object.__setattr__(self, "nodes", nodes)
+
+    def compile_projection(self) -> CompilePlan:
+        """Project every compile-bound node in operation order."""
+
+        units = tuple(
+            node.binding.unit for node in self.nodes if node.binding is not None
+        )
+        bound_count = sum(node.binding is not None for node in self.nodes)
+        if len(units) != bound_count:
+            raise RuntimeError("operation plan silently lost a compile-bound node")
+        return CompilePlan(units)
 
 
 @dataclass(frozen=True)
@@ -511,6 +683,7 @@ class PlanBuilder:
         self.context = context
         self._sources = tuple(sources)
         self._units: list[CompileUnit] = []
+        self._nodes: list[OperationNode] = []
 
     def _prefix(self, operation: CompileOp) -> str:
         return (
@@ -592,6 +765,43 @@ class PlanBuilder:
         self._units.append(binding.unit)
         return binding
 
+    def emit_node(
+        self,
+        node_id: str,
+        role: str,
+        operation: CompileOp | BoundCompileOp | None = None,
+        *sources: object,
+        dependencies: tuple[str, ...] = (),
+        outputs: tuple[OperationOutput, ...] = (),
+        workspaces: tuple[OperationWorkspace, ...] = (),
+        runtime_metadata: Hashable | None = None,
+        compile_overrides: Mapping[str, Any] | None = None,
+    ) -> OperationNode:
+        """Emit one graph node, optionally backed by an existing compile op."""
+
+        overrides = {} if compile_overrides is None else dict(compile_overrides)
+        binding = None
+        if operation is None:
+            if sources or overrides:
+                raise TypeError(
+                    "runtime-only operation nodes cannot bind compile sources "
+                    "or overrides"
+                )
+        else:
+            binding = self.emit(operation, *sources, **overrides)
+
+        node = OperationNode(
+            node_id=node_id,
+            role=role,
+            dependencies=dependencies,
+            binding=binding,
+            outputs=outputs,
+            workspaces=workspaces,
+            runtime_metadata=runtime_metadata,
+        )
+        self._nodes.append(node)
+        return node
+
     def require(
         self,
         condition: bool,
@@ -605,6 +815,21 @@ class PlanBuilder:
 
     def build(self) -> CompilePlan:
         return CompilePlan(tuple(self._units))
+
+    def build_operation_plan(self, case_id: Hashable) -> OperationPlan:
+        """Build a graph and reject compile units not represented by a node."""
+
+        node_units = tuple(
+            node.binding.unit for node in self._nodes if node.binding is not None
+        )
+        units = tuple(self._units)
+        if node_units != units:
+            missing = tuple(unit for unit in units if unit not in node_units)
+            raise RuntimeError(
+                "compile units emitted outside OperationNode cannot be projected; "
+                f"missing={missing!r}"
+            )
+        return OperationPlan(self.target, case_id, tuple(self._nodes))
 
 
 def plan_provider(provider: Callable[..., Any]) -> Callable[..., CompilePlan]:
@@ -647,5 +872,52 @@ def plan_provider(provider: Callable[..., Any]) -> Callable[..., CompilePlan]:
     resolver.__signature__ = signature.replace(
         parameters=public,
         return_annotation=CompilePlan,
+    )
+    return resolver
+
+
+def operation_plan_provider(
+    provider: Callable[..., Any],
+) -> Callable[..., OperationPlan]:
+    """Turn ``provider(plan, case)`` into a CPU-only OperationPlan resolver."""
+
+    signature = inspect.signature(provider)
+
+    def resolver(
+        case: Hashable,
+        *args: Any,
+        context: CompileContext[Any],
+        **kwargs: Any,
+    ) -> OperationPlan:
+        plan = PlanBuilder(
+            context,
+            context=f"{provider.__name__}[target={context.target!r}]",
+        )
+        result = provider(plan, case, *args, **kwargs)
+        if result is not None:
+            raise TypeError(
+                f"{provider.__name__}: operation plan providers emit nodes "
+                "and return None"
+            )
+        return plan.build_operation_plan(case)
+
+    resolver.__name__ = provider.__name__
+    resolver.__doc__ = provider.__doc__
+    public = list(signature.parameters.values())[1:]
+    insertion = next(
+        (
+            index
+            for index, parameter in enumerate(public)
+            if parameter.kind
+            in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_KEYWORD)
+        ),
+        len(public),
+    )
+    public[insertion:insertion] = [
+        inspect.Parameter("context", inspect.Parameter.KEYWORD_ONLY),
+    ]
+    resolver.__signature__ = signature.replace(
+        parameters=public,
+        return_annotation=OperationPlan,
     )
     return resolver

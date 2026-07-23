@@ -6,12 +6,23 @@
 import functools
 import os
 import re
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.launch_context import LaunchContext
+from aiter.ops.flydsl.moe_plan.stage1 import (
+    MoeStage1OperationCase,
+    MoeStage1Role,
+    Stage1ExternalPostprocessMetadata,
+)
+from aiter.ops.flydsl.operation_runtime import (
+    ExecutionStep,
+    RuntimeAdapterRegistry,
+    execute_operation_plan,
+)
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
@@ -378,6 +389,28 @@ def _resolve_stage1_plan_launchers(builder_kwargs, compile_context):
         **builder_kwargs,
     )
     return _resolve_plan_launchers(plan, compile_context)
+
+
+def _resolve_stage1_operation_plan(builder_kwargs, compile_context):
+    """Resolve the canonical Stage1 graph for shadow or runtime execution."""
+
+    from .moe_compile_plan import resolve_moe_stage1_operation_plan
+
+    return resolve_moe_stage1_operation_plan(
+        MoeStage1OperationCase.from_kwargs(builder_kwargs),
+        context=compile_context,
+    )
+
+
+def _stage1_operation_plan_mode() -> str:
+    """Return the temporary Stage1 migration mode (default: ``off``)."""
+
+    mode = os.environ.get("AITER_FLYDSL_OPERATION_PLAN", "off").strip().lower()
+    if mode not in ("off", "shadow", "on"):
+        raise ValueError(
+            f"AITER_FLYDSL_OPERATION_PLAN must be one of off|shadow|on, got {mode!r}"
+        )
+    return mode
 
 
 @functools.lru_cache(maxsize=None)
@@ -1271,6 +1304,240 @@ def flydsl_silu_and_mul_interleaved(
     )
 
 
+@dataclass
+class _Stage1ExecutionState:
+    """Mutable tensor state consumed by provider-selected Stage1 role adapters."""
+
+    primary_args: tuple[Any, ...]
+    tmp_out: Any
+    out: Any
+    out_scale_sorted_flat: Any
+    sorted_token_ids: Any
+    num_valid_ids: Any
+    topk_ids: Any
+    bias: Any
+    token_num: int
+    topk: int
+    inter_dim: int
+    swiglu_limit: float
+    is_splitk: bool
+    act: str
+    topk_ids_arg: Any = None
+    bias_arg: Any = None
+
+
+def _stage1_artifact_launcher(step: ExecutionStep):
+    if step.artifact is None:
+        raise RuntimeError(
+            f"Stage1 role {step.node.role!r} requires a compiled artifact"
+        )
+    return getattr(step.artifact, "launcher", step.artifact)
+
+
+def _prepare_stage1_post_arguments(
+    state: _Stage1ExecutionState,
+    launch_context: LaunchContext,
+) -> None:
+    """Preserve the existing post-GEMM views/placeholders and validation."""
+
+    use_splitk_bias = state.is_splitk and state.bias is not None
+    if use_splitk_bias and state.topk_ids is None:
+        raise ValueError("topk_ids are required for split-K FlyDSL stage1 bias")
+
+    # sorted_token_ids only gives (token_id, slot_id). Bias is stored per expert,
+    # so the post-activation kernel needs topk_ids[token_id * topk + slot_id].
+    state.topk_ids_arg = (
+        state.topk_ids.to(torch.int32).contiguous().view(-1)
+        if use_splitk_bias
+        else state.sorted_token_ids.view(-1)
+    )
+    state.bias_arg = (
+        state.bias.contiguous().view(-1)
+        if use_splitk_bias
+        else (
+            state.bias.contiguous().view(-1)[:0]
+            if state.bias is not None
+            else torch.empty(
+                0,
+                device=state.sorted_token_ids.device,
+                dtype=torch.float32,
+            )
+        )
+    )
+    # Keep stream capture explicit at the public boundary. The FQ adapter uses
+    # this context directly rather than querying the current stream.
+    if launch_context is None:
+        raise TypeError("launch_context is required for Stage1 execution")
+
+
+def _run_stage1_primary(
+    launcher,
+    state: _Stage1ExecutionState,
+    launch_context: LaunchContext,
+) -> None:
+    _run_compiled(launcher, state.primary_args)
+    _prepare_stage1_post_arguments(state, launch_context)
+
+
+def _run_stage1_fq_postprocess(
+    launcher,
+    state: _Stage1ExecutionState,
+    launch_context: LaunchContext,
+) -> None:
+    if state.tmp_out is None:
+        raise RuntimeError("Stage1 FQ postprocess requires split-K partial output")
+    _run_compiled(
+        launcher,
+        (
+            ptr_arg(state.tmp_out.view(-1, state.inter_dim * 2)),
+            ptr_arg(state.out.view(-1).view(torch.uint8)),
+            ptr_arg(state.out_scale_sorted_flat),
+            ptr_arg(state.sorted_token_ids),
+            ptr_arg(state.num_valid_ids),
+            ptr_arg(state.topk_ids_arg),
+            ptr_arg(state.bias_arg),
+            state.token_num,
+            state.sorted_token_ids.shape[0],
+            state.swiglu_limit,
+            launch_context.stream,
+        ),
+    )
+
+
+def _run_stage1_external_postprocess(
+    metadata: Stage1ExternalPostprocessMetadata,
+    state: _Stage1ExecutionState,
+) -> None:
+    """Run the unchanged CK/HIP split-K activation data plane."""
+
+    if not isinstance(metadata, Stage1ExternalPostprocessMetadata):
+        raise TypeError(
+            "external Stage1 postprocess requires Stage1ExternalPostprocessMetadata"
+        )
+    if metadata.enable_bias != (state.bias is not None):
+        raise RuntimeError(
+            "Stage1 external postprocess metadata disagrees with runtime bias"
+        )
+    if state.tmp_out is None:
+        raise RuntimeError(
+            "external Stage1 postprocess requires split-K partial output"
+        )
+
+    from aiter.ops.activation import (
+        silu_and_mul,
+        silu_and_mul_bias,
+        swiglu_and_mul,
+        swiglu_and_mul_bias,
+    )
+
+    post_input = state.tmp_out.view(-1, state.inter_dim * 2)
+    post_out = state.out.view(-1, state.inter_dim)
+    post_bias = state.bias.contiguous() if state.bias is not None else None
+    if state.bias is not None and metadata.act == "swiglu":
+        swiglu_and_mul_bias(
+            post_out,
+            post_input,
+            state.topk_ids_arg,
+            post_bias,
+        )
+    elif state.bias is not None and metadata.act == "silu":
+        silu_and_mul_bias(
+            post_out,
+            post_input,
+            state.topk_ids_arg,
+            post_bias,
+        )
+    elif metadata.act == "swiglu":
+        swiglu_and_mul(post_out, post_input)
+    else:
+        if state.bias is not None:
+            post_input = post_input + state.bias[state.topk_ids.to(torch.long)].view(
+                -1,
+                state.inter_dim * 2,
+            )
+        silu_and_mul(post_out, post_input)
+
+
+def _stage1_primary_runtime_adapter(
+    step: ExecutionStep,
+    state: _Stage1ExecutionState,
+    *,
+    context: LaunchContext,
+) -> None:
+    _run_stage1_primary(
+        _stage1_artifact_launcher(step),
+        state,
+        context,
+    )
+
+
+def _stage1_fq_runtime_adapter(
+    step: ExecutionStep,
+    state: _Stage1ExecutionState,
+    *,
+    context: LaunchContext,
+) -> None:
+    _run_stage1_fq_postprocess(
+        _stage1_artifact_launcher(step),
+        state,
+        context,
+    )
+
+
+def _stage1_external_runtime_adapter(
+    step: ExecutionStep,
+    state: _Stage1ExecutionState,
+    *,
+    context: LaunchContext,
+) -> None:
+    if step.artifact is not None:
+        raise RuntimeError("runtime-only Stage1 postprocess cannot own an artifact")
+    _run_stage1_external_postprocess(step.node.runtime_metadata, state)
+
+
+_STAGE1_RUNTIME_ADAPTERS = RuntimeAdapterRegistry()
+_STAGE1_RUNTIME_ADAPTERS.register(
+    MoeStage1Role.MIXED_GEMM.value,
+    _stage1_primary_runtime_adapter,
+)
+_STAGE1_RUNTIME_ADAPTERS.register(
+    MoeStage1Role.INT4_GEMM.value,
+    _stage1_primary_runtime_adapter,
+)
+_STAGE1_RUNTIME_ADAPTERS.register(
+    MoeStage1Role.FQ_POSTPROCESS.value,
+    _stage1_fq_runtime_adapter,
+)
+_STAGE1_RUNTIME_ADAPTERS.register(
+    MoeStage1Role.EXTERNAL_POSTPROCESS.value,
+    _stage1_external_runtime_adapter,
+)
+
+
+def _validate_stage1_shadow(
+    operation_plan,
+    legacy_roles: list[str],
+    legacy_compile_op_ids: list[str],
+) -> None:
+    expected_roles = tuple(node.role for node in operation_plan.nodes)
+    actual_roles = tuple(legacy_roles)
+    expected_compile_op_ids = tuple(
+        unit.spec.op_id for unit in operation_plan.compile_projection().units
+    )
+    actual_compile_op_ids = tuple(legacy_compile_op_ids)
+    if (
+        expected_roles != actual_roles
+        or expected_compile_op_ids != actual_compile_op_ids
+    ):
+        raise RuntimeError(
+            "Stage1 OperationPlan shadow mismatch: "
+            f"roles expected={expected_roles!r}, actual={actual_roles!r}; "
+            "compile op_ids "
+            f"expected={expected_compile_op_ids!r}, "
+            f"actual={actual_compile_op_ids!r}"
+        )
+
+
 # Public API
 
 
@@ -1429,8 +1696,57 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    stage1_builder_kwargs = dict(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=(sorted_weights is not None),
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        persist_m=_persist_m,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_mode=gate_mode,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        enable_bias=(bias is not None),
+        a_scale_one=a_scale_one,
+        xcd_swizzle=xcd_swizzle,
+        k_wave=k_wave,
+    )
+    operation_mode = _stage1_operation_plan_mode()
+    operation_plan = (
+        _resolve_stage1_operation_plan(stage1_builder_kwargs, compile_context)
+        if operation_mode in ("shadow", "on")
+        else None
+    )
+
+    # Argument packing is still data-plane work. In on mode the primary role,
+    # rather than a repeated dtype graph decision, selects the existing packer.
+    legacy_use_mx_gemm = b_dtype in ("fp4", "fp8")
+    if operation_mode == "on":
+        if not operation_plan.nodes:
+            raise RuntimeError("Stage1 OperationPlan must contain a primary node")
+        primary_role = operation_plan.nodes[0].role
+        if primary_role == MoeStage1Role.MIXED_GEMM.value:
+            use_mx_gemm = True
+        elif primary_role == MoeStage1Role.INT4_GEMM.value:
+            use_mx_gemm = False
+        else:
+            raise RuntimeError(
+                f"Stage1 OperationPlan has invalid primary role {primary_role!r}"
+            )
+    else:
+        use_mx_gemm = legacy_use_mx_gemm
+
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
@@ -1478,165 +1794,100 @@ def flydsl_moe_stage1(
             launch_context,
         )
 
-    stage1_builder_kwargs = dict(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
+    execution_state = _Stage1ExecutionState(
+        primary_args=args,
+        tmp_out=tmp_out,
+        out=out,
+        out_scale_sorted_flat=out_scale_sorted_flat,
+        sorted_token_ids=sorted_token_ids,
+        num_valid_ids=num_valid_ids,
+        topk_ids=topk_ids,
+        bias=bias,
+        token_num=token_num,
         topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=(sorted_weights is not None),
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
+        inter_dim=inter_dim,
+        swiglu_limit=_swiglu_limit_val,
+        is_splitk=_is_splitk,
         act=act,
-        persist_m=_persist_m,
-        use_async_copy=use_async_copy,
-        k_batch=k_batch,
-        waves_per_eu=waves_per_eu,
-        b_nt=b_nt,
-        gate_mode=gate_mode,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        enable_bias=(bias is not None),
-        a_scale_one=a_scale_one,
-        xcd_swizzle=xcd_swizzle,
-        k_wave=k_wave,
-    )
-    plan_launchers = _resolve_stage1_plan_launchers(
-        stage1_builder_kwargs,
-        compile_context,
     )
 
-    def take_plan_launcher(op_id):
-        try:
-            return plan_launchers.pop(op_id)
-        except KeyError as error:
+    if operation_mode == "on":
+        execute_operation_plan(
+            operation_plan,
+            execution_state,
+            compile_context=compile_context,
+            launch_context=launch_context,
+            adapters=_STAGE1_RUNTIME_ADAPTERS,
+        )
+    else:
+        # Temporary legacy graph consumption for off/shadow rollback. The launch
+        # blocks themselves are shared with the new role adapters above.
+        plan_launchers = _resolve_stage1_plan_launchers(
+            stage1_builder_kwargs,
+            compile_context,
+        )
+        legacy_roles: list[str] = []
+        legacy_compile_op_ids: list[str] = []
+
+        def take_plan_launcher(op_id):
+            try:
+                launcher = plan_launchers.pop(op_id)
+            except KeyError as error:
+                raise RuntimeError(
+                    f"Stage1 CompilePlan did not resolve required unit {op_id}"
+                ) from error
+            legacy_compile_op_ids.append(op_id)
+            return launcher
+
+        from .moe_compile_plan import (
+            FQ_ACTIVATION_OP_ID,
+            INT4_STAGE1_GEMM_OP_ID,
+            MIXED_STAGE1_GEMM_OP_ID,
+        )
+
+        primary_op_id = (
+            MIXED_STAGE1_GEMM_OP_ID if legacy_use_mx_gemm else INT4_STAGE1_GEMM_OP_ID
+        )
+        legacy_roles.append(
+            (
+                MoeStage1Role.MIXED_GEMM.value
+                if legacy_use_mx_gemm
+                else MoeStage1Role.INT4_GEMM.value
+            )
+        )
+        _run_stage1_primary(
+            take_plan_launcher(primary_op_id),
+            execution_state,
+            launch_context,
+        )
+
+        if _gui_sk_fused or _gui_sk or _splitk_fp4:
+            legacy_roles.append(MoeStage1Role.FQ_POSTPROCESS.value)
+            _run_stage1_fq_postprocess(
+                take_plan_launcher(FQ_ACTIVATION_OP_ID),
+                execution_state,
+                launch_context,
+            )
+        elif _is_splitk:
+            legacy_roles.append(MoeStage1Role.EXTERNAL_POSTPROCESS.value)
+            _run_stage1_external_postprocess(
+                Stage1ExternalPostprocessMetadata(
+                    act=act,
+                    enable_bias=bias is not None,
+                ),
+                execution_state,
+            )
+
+        if plan_launchers:
             raise RuntimeError(
-                f"Stage1 CompilePlan did not resolve required unit {op_id}"
-            ) from error
-
-    from .moe_compile_plan import (
-        INT4_STAGE1_GEMM_OP_ID,
-        MIXED_STAGE1_GEMM_OP_ID,
-    )
-
-    primary_op_id = MIXED_STAGE1_GEMM_OP_ID if use_mx_gemm else INT4_STAGE1_GEMM_OP_ID
-    exe = take_plan_launcher(primary_op_id)
-    _run_compiled(exe, args)
-
-    num_sorted_rows = sorted_token_ids.shape[0]
-    use_splitk_bias = _is_splitk and bias is not None
-    if use_splitk_bias and topk_ids is None:
-        raise ValueError("topk_ids are required for split-K FlyDSL stage1 bias")
-    # sorted_token_ids only gives (token_id, slot_id). Bias is stored per expert,
-    # so the post-activation kernel needs topk_ids[token_id * topk + slot_id].
-    topk_ids_arg = (
-        topk_ids.to(torch.int32).contiguous().view(-1)
-        if use_splitk_bias
-        else sorted_token_ids.view(-1)
-    )
-    bias_arg = (
-        bias.contiguous().view(-1)
-        if use_splitk_bias
-        else (
-            bias.contiguous().view(-1)[:0]
-            if bias is not None
-            else torch.empty(0, device=sorted_token_ids.device, dtype=torch.float32)
-        )
-    )
-    if _gui_sk_fused:
-        from .moe_compile_plan import FQ_ACTIVATION_OP_ID
-
-        _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
-        _run_compiled(
-            _silu_fused_k,
-            (
-                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
-                ptr_arg(out.view(-1).view(torch.uint8)),
-                ptr_arg(out_scale_sorted_flat),
-                ptr_arg(sorted_token_ids),
-                ptr_arg(num_valid_ids),
-                ptr_arg(topk_ids_arg),
-                ptr_arg(bias_arg),
-                token_num,
-                num_sorted_rows,
-                _swiglu_limit_val,
-                launch_context.stream,
-            ),
-        )
-    elif _gui_sk:
-        from .moe_compile_plan import FQ_ACTIVATION_OP_ID
-
-        _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
-        _run_compiled(
-            _silu_fused_k,
-            (
-                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
-                ptr_arg(out.view(-1).view(torch.uint8)),
-                ptr_arg(out_scale_sorted_flat),
-                ptr_arg(sorted_token_ids),
-                ptr_arg(num_valid_ids),
-                ptr_arg(topk_ids_arg),
-                ptr_arg(bias_arg),
-                token_num,
-                num_sorted_rows,
-                _swiglu_limit_val,
-                launch_context.stream,
-            ),
-        )
-    elif _splitk_fp4:
-        from .moe_compile_plan import FQ_ACTIVATION_OP_ID
-
-        _silu_fused_k = take_plan_launcher(FQ_ACTIVATION_OP_ID)
-        _run_compiled(
-            _silu_fused_k,
-            (
-                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
-                ptr_arg(out.view(-1).view(torch.uint8)),
-                ptr_arg(out_scale_sorted_flat),
-                ptr_arg(sorted_token_ids),
-                ptr_arg(num_valid_ids),
-                ptr_arg(topk_ids_arg),
-                ptr_arg(bias_arg),
-                token_num,
-                num_sorted_rows,
-                _swiglu_limit_val,
-                launch_context.stream,
-            ),
-        )
-    elif _is_splitk:
-        # Plain split-K post-op is a CK activation kernel (not a FlyDSL kernel).
-        # Direct AOT resolves only the FlyDSL graph and never enters this host
-        # runtime branch.
-        from aiter.ops.activation import (
-            silu_and_mul,
-            silu_and_mul_bias,
-            swiglu_and_mul,
-            swiglu_and_mul_bias,
-        )
-
-        post_input = tmp_out.view(-1, inter_dim * 2)
-        post_out = out.view(-1, inter_dim)
-        post_bias = bias.contiguous() if bias is not None else None
-        if bias is not None and act == "swiglu":
-            swiglu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
-        elif bias is not None and act == "silu":
-            silu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
-        elif act == "swiglu":
-            swiglu_and_mul(post_out, post_input)
-        else:
-            if bias is not None:
-                post_input = post_input + bias[topk_ids.to(torch.long)].view(
-                    -1, inter_dim * 2
-                )
-            silu_and_mul(post_out, post_input)
-
-    if plan_launchers:
-        raise RuntimeError(
-            f"Stage1 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
-        )
+                f"Stage1 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
+            )
+        if operation_mode == "shadow":
+            _validate_stage1_shadow(
+                operation_plan,
+                legacy_roles,
+                legacy_compile_op_ids,
+            )
 
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0

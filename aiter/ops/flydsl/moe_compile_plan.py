@@ -33,10 +33,18 @@ from .compile_plan import (
     op,
     plan_provider,
 )
+from .moe_plan.stage1 import (
+    FQ_ACTIVATION_OP_ID,
+    INT4_STAGE1_GEMM_OP_ID,
+    MIXED_STAGE1_GEMM_OP_ID,
+    MoeStage1OperationCase,
+    MoeStage1Role,
+    Stage1ExternalPostprocessMetadata,
+    Stage1FqMetadata,
+    Stage1GemmMetadata,
+    resolve_moe_stage1_operation_plan,
+)
 
-MIXED_STAGE1_GEMM_OP_ID = "aiter.flydsl.moe.stage1.mixed_gemm.v1"
-INT4_STAGE1_GEMM_OP_ID = "aiter.flydsl.moe.stage1.int4_gemm.v1"
-FQ_ACTIVATION_OP_ID = "aiter.flydsl.moe.stage1.silu_and_mul_fq.v1"
 CKTILE_SWIGLU_AND_MUL_OP_ID = "aiter.flydsl.moe.stage1.cktile_swiglu_and_mul.v1"
 MIXED_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.mixed_gemm.v1"
 INT4_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.int4_gemm.v1"
@@ -55,6 +63,8 @@ __all__ = [
     "MIXED_STAGE1_GEMM_OP_ID",
     "MIXED_STAGE2_GEMM_OP_ID",
     "MoeCompilePlanCase",
+    "MoeStage1OperationCase",
+    "MoeStage1Role",
     "MoeSortingCompileCase",
     "PLAIN_REDUCTION_OP_ID",
     "SORTING_4K_FUSED_OP_ID",
@@ -67,8 +77,12 @@ __all__ = [
     "resolve_moe_compile_plan",
     "resolve_moe_sorting_compile_plan",
     "resolve_moe_stage1_compile_plan",
+    "resolve_moe_stage1_operation_plan",
     "resolve_moe_stage2_compile_plan",
     "sorting_abi",
+    "Stage1ExternalPostprocessMetadata",
+    "Stage1FqMetadata",
+    "Stage1GemmMetadata",
     "stage1_abi",
     "stage2_abi",
 ]
@@ -408,28 +422,6 @@ def register_moe_sorting_ops(
     return registry
 
 
-def _primary_op(
-    plan: PlanBuilder,
-    operations: dict[str, CompileOp],
-    builder_kwargs: dict[str, Any],
-) -> CompileOp:
-    try:
-        a_dtype = builder_kwargs["a_dtype"]
-        b_dtype = builder_kwargs["b_dtype"]
-    except KeyError as error:
-        raise TypeError(
-            f"{plan.context}: missing required Stage1 argument: {error.args[0]}"
-        ) from error
-    if b_dtype in ("fp4", "fp8"):
-        return operations[MIXED_STAGE1_GEMM_OP_ID]
-    if a_dtype == "bf16" and b_dtype == "int4":
-        return operations[INT4_STAGE1_GEMM_OP_ID]
-    raise ValueError(
-        f"{plan.context}: unsupported Stage1 dtype combination: "
-        f"a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
-    )
-
-
 def _stage2_primary_op(
     plan: PlanBuilder,
     operations: dict[str, CompileOp],
@@ -547,90 +539,23 @@ def resolve_moe_compile_plan(
     )
 
 
-@plan_provider
 def resolve_moe_stage1_compile_plan(
-    plan: PlanBuilder,
+    *,
+    context: CompileContext[Any],
     **builder_kwargs: Any,
-) -> None:
-    """Resolve a FlyDSL Stage1 GEMM and any split-K FlyDSL helper.
+) -> CompilePlan:
+    """Compatibility compile projection of the canonical Stage1 operation plan.
 
     ``builder_kwargs`` are bound directly to ``compile_flydsl_moe_stage1``.
     Adding a normal compile parameter therefore requires changing that existing
     wrapper signature/default and its real call site, not a parallel Spec type.
     """
 
-    operations = _operations()
-    primary = _primary_op(plan, operations, builder_kwargs)
-    # ``plan_provider`` installed the provider kwargs as a reflected source.
-    # Bind only fields accepted by the real compiler; AOT job metadata such as
-    # token counts and CSV labels must not become a mirrored callable schema.
-    requested = plan.bind(primary)
-
-    k_batch = requested["k_batch"]
-    plan.require(
-        not isinstance(k_batch, bool) and isinstance(k_batch, int) and k_batch > 0,
-        f"k_batch must be a positive integer, got {k_batch!r}",
-        operation=primary,
-    )
-    is_splitk = k_batch > 1
-
-    if primary.op_id == MIXED_STAGE1_GEMM_OP_ID:
-        gate_mode = requested["gate_mode"]
-        plan.require(
-            gate_mode != "gate_only",
-            "gate_only is reserved and unsupported",
-            operation=primary,
-        )
-        plan.require(
-            gate_mode != "mock_gate_only" or is_splitk,
-            "mock_gate_only requires split-K",
-            operation=primary,
-        )
-        plan.require(
-            not (
-                is_splitk
-                and requested["out_dtype"] == "fp8"
-                and gate_mode != "interleave"
-            ),
-            "split-K fp8 output requires an interleaved layout",
-            operation=primary,
-        )
-
-    requested_out_dtype = requested["out_dtype"]
-    if is_splitk:
-        plan.emit(
-            requested,
-            out_dtype=(
-                "bf16" if requested_out_dtype in ("fp4", "fp8") else requested_out_dtype
-            ),
-            enable_bias=False,
-        )
-    else:
-        plan.emit(requested)
-    if primary.op_id != MIXED_STAGE1_GEMM_OP_ID or not is_splitk:
-        return
-
-    helper = operations[FQ_ACTIVATION_OP_ID]
-    gate_mode = requested["gate_mode"]
-    if gate_mode == "interleave":
-        quant_mode = (
-            requested_out_dtype if requested_out_dtype in ("fp4", "fp8") else "none"
-        )
-        plan.emit(
-            helper,
-            requested,
-            quant_mode=quant_mode,
-            gui_layout=True,
-        )
-    elif requested_out_dtype == "fp4":
-        plan.emit(
-            helper,
-            requested,
-            quant_mode="fp4",
-            gui_layout=False,
-        )
-    # Other separated split-K paths use a CK/HIP activation and add no
-    # FlyDSL compile unit.
+    case = MoeStage1OperationCase.from_kwargs(builder_kwargs)
+    return resolve_moe_stage1_operation_plan(
+        case,
+        context=context,
+    ).compile_projection()
 
 
 @plan_provider
