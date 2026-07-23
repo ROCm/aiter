@@ -482,6 +482,16 @@ def _qk_field_perm() -> np.ndarray:
 
 if _HAVE_TRITON:
 
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_N": 16}, num_warps=1),
+            triton.Config({"BLOCK_N": 32}, num_warps=1),
+            triton.Config({"BLOCK_N": 64}, num_warps=1),
+            triton.Config({"BLOCK_N": 128}, num_warps=2),
+            triton.Config({"BLOCK_N": 256}, num_warps=4),
+        ],
+        key=["n_blocks", "D"],
+    )
     @triton.jit
     def _pack_qk_fp6_kernel(
         x_ptr,  # float [N, D] row-major (D % 32 == 0)
@@ -651,12 +661,12 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     scale = torch.empty(N, NB, dtype=torch.uint8, device=x.device)
     cperm = _qk_field_perm_dev(x.device)
     n_blocks = N * NB
-    # BLOCK_N=32 / num_warps=1 (many small 1-warp programs) measured ~17-19%
-    # faster than 128/4 across shapes for the arithmetic-encode kernel -- it is
-    # bandwidth/latency-bound (the permuted per-block gather), so more, smaller
-    # programs hide the load latency better than fewer wide ones.
-    BLOCK_N = 32
-    grid = (triton.cdiv(n_blocks, BLOCK_N),)
+    # BLOCK_N / num_warps are @triton.autotune'd (key = n_blocks, D): the encode is
+    # bandwidth/latency-bound (permuted per-block gather + strided byte stores), and the
+    # best tile varies with shape (e.g. 64/1 measured ~14% faster than 32/1 at the Wan
+    # 720p seq). The packers run eagerly inside the f6f4 custom_op, so autotune is a
+    # one-time eager warmup with no torch.compile interaction.
+    grid = lambda meta: (triton.cdiv(n_blocks, meta["BLOCK_N"]),)  # noqa: E731
     _pack_qk_fp6_kernel[grid](
         xflat,
         packed,
@@ -665,8 +675,6 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
         D,
         NB,
         n_blocks,
-        BLOCK_N=BLOCK_N,
-        num_warps=1,
     )
     return (
         packed.reshape(*lead, NB * 24),
@@ -800,6 +808,159 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
         return buf, sbuf
     scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
     return k_view, scale
+
+
+# ---------------------------------------------------------------------------
+# Torch (graph-friendly) Q/K packers -- inductor-schedulable counterparts of the
+# Triton packers above. Pure torch (pointwise / index_select / reshape / cat, no
+# host sync, no numpy, no data-dependent shapes), so under torch.compile they lower
+# to schedulable nodes and can overlap the Ulysses all-to-all. Byte-identical to the
+# Triton/numpy packers for bf16/fp16 Q/K (the scaled value v/2^E is an exact fp32
+# exponent shift); they reuse the exact same LDS gather / scale-tail index tables.
+# ---------------------------------------------------------------------------
+_QK_FIELD_PERM_PT_CACHE: dict = {}
+
+
+def _qk_field_perm_pt(device):
+    """Cached int64 field permutation [32] for the torch lastdim fp6 pack (same perm as the
+    Triton _qk_field_perm). Built once per device so it is not rebuilt in a capture region."""
+    p = _QK_FIELD_PERM_PT_CACHE.get(device)
+    if p is None:
+        p = torch.as_tensor(_qk_field_perm().astype(np.int64), device=device)
+        _QK_FIELD_PERM_PT_CACHE[device] = p
+    return p
+
+
+def _e2m3_encode_torch(y: "torch.Tensor") -> "torch.Tensor":
+    """Branchless round-half-even E2M3 encode (torch port of the _pack_qk_fp6_kernel encode).
+    y float32 [...] -> uint8 codes [...] (0..63; bit5 = sign). Same normal (fp32 RNE round to 3
+    mantissa bits) / subnormal (round(mag*8)) split + tie-to-even as the Triton kernel."""
+    mag = y.abs().clamp(max=7.5)
+    magbits = mag.contiguous().view(torch.int32)
+    bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
+    exp2 = ((bits_r >> 23) & 0xFF) - 126
+    m3n = (bits_r >> 20) & 7
+    code_norm = (exp2 << 3) | m3n
+    t8 = mag * 8.0
+    fl = torch.floor(t8)
+    fli = fl.to(torch.int32)
+    frac = t8 - fl
+    up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
+    code_sub = fli + up.to(torch.int32)
+    chosen = torch.where(mag >= 1.0, code_norm, code_sub).clamp(0, 31)
+    sign = (y.contiguous().view(torch.int32) < 0).to(torch.int32) * 32
+    return (chosen | sign).to(torch.uint8)
+
+
+def quantize_fp6_lastdim_torch(x: "torch.Tensor"):
+    """Graph-friendly (pure-torch, no host sync / numpy) port of quantize_fp6_lastdim_triton.
+
+    x float [..., D] (D % 32 == 0) -> (packed uint8 [..., (D//32)*24], scale uint8 [..., D//32]).
+    Traceable by Inductor (only pointwise / index_select / reshape ops) so it can be scheduled to
+    overlap the Ulysses all-to-all. Byte-identical to the Triton/numpy packers for bf16/fp16 Q/K."""
+    assert _HAVE_TRITON, "torch unavailable"
+    lead = list(x.shape[:-1])
+    D = x.shape[-1]
+    assert D % 32 == 0, D
+    NB = D // 32
+    xf = x.to(torch.float32).reshape(*lead, NB, 32)
+    amax = xf.abs().amax(dim=-1)  # [..., NB]
+    bits = amax.contiguous().view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    E = torch.where(amax == 0, torch.zeros_like(exp), exp - 129)  # frexp_exp - 3
+    inv_scale = torch.exp2((-E).to(torch.float32))  # 2^-E (exact dyadic)
+    cperm = _qk_field_perm_pt(x.device)
+    y = xf.index_select(-1, cperm) * inv_scale.unsqueeze(-1)  # field-order, scaled
+    codes = _e2m3_encode_torch(y)  # [..., NB, 32] uint8
+    # pack 32 six-bit fields -> 24 bytes (groups of 4 fields = 24 bits = 3 bytes).
+    c = codes.to(torch.int32).reshape(*lead, NB, 8, 4)
+    u = c[..., 0] | (c[..., 1] << 6) | (c[..., 2] << 12) | (c[..., 3] << 18)  # [..., NB, 8]
+    packed = (
+        torch.stack([u & 0xFF, (u >> 8) & 0xFF, (u >> 16) & 0xFF], dim=-1)
+        .to(torch.uint8)
+        .reshape(*lead, NB * 24)
+    )
+    scale = ((E + 127) & 0xFF).to(torch.uint8)
+    return packed, scale
+
+
+_K_SCALE_TAIL_IDX_CACHE: dict = {}
+
+
+def _k_scale_tail_index(nt: int, sk: int, h: int, device):
+    """Cached (sidx int64 [h, nt, 1024], valid bool [nt, 1024]) for the per-tile K-scale TAIL image
+    (torch port of _fill_k_scale_tail_kernel: Region A unshifted + Region B pre-shifted +1 byte).
+    sidx indexes the flat [sk*h*4] E8M0 scale (per batch) = tok*(h*4) + head*4 + byte; invalid
+    (pre-shift tail past sk) -> clamped to 0 and masked out."""
+    key = (nt, sk, h, device)
+    g = _K_SCALE_TAIL_IDX_CACHE.get(key)
+    if g is None:
+        offs = torch.arange(1024, device=device, dtype=torch.int64)
+        region_b = (offs >= 512).to(torch.int64)
+        region_off = offs - region_b * 512
+        inst = region_off >> 8
+        lane = (region_off & 255) >> 2
+        byte_in_dword = region_off & 3
+        src_shift = byte_in_dword + region_b
+        tok_local = ((lane & 3) << 5) + (lane >> 2) + inst * 16 + (src_shift >> 2)  # [1024]
+        src_byte = src_shift & 3  # [1024]
+        t = torch.arange(nt, device=device, dtype=torch.int64)
+        src_token = t[:, None] * 128 + tok_local[None, :]  # [nt, 1024]
+        valid = src_token < sk
+        hidx = torch.arange(h, device=device, dtype=torch.int64)
+        sidx = src_token[None] * (h * 4) + hidx[:, None, None] * 4 + src_byte[None, None, :]
+        sidx = torch.where(valid[None], sidx, torch.zeros_like(sidx))  # [h, nt, 1024]
+        g = (sidx, valid)
+        _K_SCALE_TAIL_IDX_CACHE[key] = g
+    return g
+
+
+def quantize_fp6_k_lds_order_torch(
+    k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False
+):
+    """Graph-friendly (pure-torch) port of quantize_fp6_k_lds_order_triton (identical 17408B/tile
+    layout: 16384B chunk-major fp6 K data + 1024B lane-major E8M0 K-scale tail). Traceable by
+    Inductor (torch pack + index-gathers + cat) so the K pack can overlap the Ulysses all-to-all.
+    Byte-identical to the Triton packer (reuses the exact LDS gather / scale-tail index tables).
+
+    k_thd float K [b, sk, h, 128] -> (k_view uint8 [b, sk, h, 96] strided (seq stride 136) over a
+    [b, h, nt*17408] buffer, scale uint8 [b, sk, h, 4] (ABI only; the kernel reads scales from the
+    K tail)). If return_raw: (buf, sbuf) contiguous backing buffers (for a torch.library.custom_op
+    caller that must rebuild the strided view outside the op)."""
+    assert _HAVE_TRITON, "torch unavailable"
+    b, sk, h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile  # ceil; the valid mask zeroes a partial tail tile
+    packed, scale = quantize_fp6_lastdim_torch(k_thd)  # [b,sk,h,96], [b,sk,h,4]
+    total = sk * 96
+
+    # DATA region: token-major per head, then the LDS-order gather (shared across heads), invalid->0.
+    km = packed.permute(0, 2, 1, 3).reshape(b, h, sk * 96).contiguous()
+    gc, dvalid = _k_lds_gather_index(nt, total, k_thd.device)  # ([nt*16384] long, bool)
+    data = km[:, :, gc]  # [b, h, nt*16384]
+    data = torch.where(dvalid[None, None, :], data, torch.zeros_like(data)).reshape(
+        b, h, nt, 16384
+    )
+
+    # SCALE-TAIL region (1024B/tile): gather the E8M0 scale into the lane-major tail image, invalid->0.
+    sidx, svalid = _k_scale_tail_index(nt, sk, h, k_thd.device)
+    sf = scale.reshape(b, sk * h * 4)
+    stail = sf[:, sidx.reshape(-1)].reshape(b, h, nt, 1024)
+    stail = torch.where(svalid[None, None], stail, torch.zeros_like(stail))
+
+    # Assemble per-tile 17408B buffer [b,h,nt,17408] = 16384 data + 1024 scale; flatten + slack.
+    buf_full = torch.cat([data, stail], dim=-1)  # [b, h, nt, 17408]
+    k_tile_bytes = 17408
+    k_hs = nt * k_tile_bytes
+    k_bs = h * k_hs
+    buf = torch.cat([buf_full.reshape(-1), buf_full.new_zeros(256)])
+    sflat = scale.reshape(-1)
+    sbuf = torch.cat([sflat, sflat.new_zeros(64)])
+    if return_raw:
+        return buf, sbuf
+    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 136, k_hs, 1))
+    scale_out = sbuf[: sflat.numel()].view(b, sk, h, 4)
+    return k_view, scale_out
 
 
 def pack_fp6_v_kernel_view(

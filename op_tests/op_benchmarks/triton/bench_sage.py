@@ -78,7 +78,6 @@ KernelName = Literal[
     "aiter_mxfp6",
     "aiter_f6f4",
     "aiter_f6f4_pv",
-    "aiter_f8f4",
     "aiter_f4f4",
     "aiter_bf16",
 ]
@@ -103,7 +102,6 @@ QUANT_KERNELS = {
     "aiter_mxfp6",
     "aiter_f6f4",
     "aiter_f6f4_pv",
-    "aiter_f8f4",
     "aiter_f4f4",
 }
 
@@ -1148,40 +1146,6 @@ def make_kernel_runner(
             v_descale=v_descale,
         )
 
-    if args.kernel == "aiter_f8f4":
-        # fp8 Q/K (per-tensor descale, as in aiter_fp8) + packed per-channel fp4 (E2M1) V
-        # (as in aiter_f6f4). The C++ dispatch detects fp8-QK + uint8-V -> "f8f4bf16" ->
-        # fwd_hd128_f8f4.co. flash_attn_mxfp4_func is a thin forwarder to fmha_v3_fwd (no dtype
-        # assert); pass softmax_scale explicitly (its uint8-packed default assumes fp4 QK).
-        _v_fp4_packer = _build_fp4_v_packer(q_bshd.device)
-
-        def _quantize_f8f4():
-            q_fp8, k_fp8, _v_fp8, q_ds, k_ds, _v_ds = fp8_quantize(
-                q_bshd, k_bshd, v_bshd
-            )
-            v_fp4, v_descale = _v_fp4_packer(v_bshd)
-            return q_fp8, k_fp8, v_fp4, q_ds, k_ds, v_descale
-
-        def _kernel_f8f4(q_fp8, k_fp8, v_fp4, q_ds, k_ds, v_ds):
-            return flash_attn_mxfp4_func(
-                q_fp8,
-                k_fp8,
-                v_fp4,
-                q_descale=q_ds,
-                k_descale=k_ds,
-                v_descale=v_ds,
-                softmax_scale=softmax_scale,
-            )
-
-        def _run_aiter_f8f4():
-            return _kernel_f8f4(*_quantize_f8f4())
-
-        if args.e2e:
-            return _run_aiter_f8f4
-
-        packed = _quantize_f8f4()
-        return lambda: _kernel_f8f4(*packed)
-
     if args.kernel == "aiter_i8fp8":
         q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
@@ -1283,7 +1247,7 @@ def make_kernel_runner(
             else None
         )
 
-        # f4f4: keep mxfp4's fp4 Q/K but re-pack V as per-channel fp4 (E2M1) like f6f4/f8f4, so the
+        # f4f4: keep mxfp4's fp4 Q/K but re-pack V as per-channel fp4 (E2M1) like f6f4, so the
         # PV MMA is fp4 V x fp8 P. The fwd_hd128_f4f4.co (redirected via AITER_FMHA_F4F4) reads V via
         # ds_read_b64_tr_b4 + a per-channel V descale in the epilogue.
         _f4f4_vpacker = (
@@ -2165,7 +2129,6 @@ def parse_args() -> argparse.Namespace:
             "aiter_mxfp6",
             "aiter_f6f4",
             "aiter_f6f4_pv",
-            "aiter_f8f4",
             "aiter_f4f4",
             "aiter_bf16",
             "all",

@@ -283,7 +283,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
             TORCH_CHECK(false, "For i8fp8 input, output must have dtype BF16 for now");
     } else if (is_qkv_fp8) {
         if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
-            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+            dtype_str = "fp8bf16"; // plain fp8 Q/K/V (bf16 out)
         else
             TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
     }
