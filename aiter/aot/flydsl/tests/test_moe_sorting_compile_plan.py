@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -195,6 +196,34 @@ class TestSortingGoldenParity(unittest.TestCase):
             backend_spy.call_args.args[0].spec.op_id,
             "aiter.flydsl.moe.sorting.oneshot.v1",
         )
+
+    def test_on_mode_executes_provider_selected_sorting_role(self) -> None:
+        recorder = _RequestRecorder()
+        fake_mode = FakeTensorMode()
+        with _recording_environment(), ExitStack() as stack:
+            _install_cuda_boundary_mocks(stack, recorder)
+            with _isolated_host_imports() as imports:
+                _install_boundary_mocks(stack, imports, recorder)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"AITER_FLYDSL_OPERATION_PLAN": "on"},
+                    ),
+                    mock.patch.object(
+                        imports.sorting_wrapper._SORTING_RUNTIME_ADAPTERS,
+                        "lookup",
+                        wraps=(
+                            imports.sorting_wrapper._SORTING_RUNTIME_ADAPTERS.lookup
+                        ),
+                    ) as lookup,
+                    fake_mode,
+                    recorder.scenario("sorting.oneshot.unmasked"),
+                ):
+                    _run_sorting(imports, tokens=8, masked=False)
+                self.assertEqual(
+                    [call.args[0] for call in lookup.call_args_list],
+                    ["moe.sorting.oneshot"],
+                )
 
 
 class TestSortingPureSemantics(unittest.TestCase):
