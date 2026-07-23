@@ -20,27 +20,42 @@ import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import setuptools
-from _cpp_extension_versioner import ExtensionVersioner
-from file_baton import FileBaton
-from hipify import hipify_python
-from hipify.hipify_python import GeneratedFileCleaner
+try:
+    from ._cpp_extension_versioner import ExtensionVersioner
+    from .file_baton import FileBaton
+    from .hipify import hipify_python
+    from .hipify.hipify_python import GeneratedFileCleaner
+except ImportError:
+    from _cpp_extension_versioner import ExtensionVersioner
+    from file_baton import FileBaton
+    from hipify import hipify_python
+    from hipify.hipify_python import GeneratedFileCleaner
 from packaging.version import Version
 from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
-LIB_EXT = ".so"
-EXEC_EXT = ""
-CLIB_PREFIX = "lib"
-CLIB_EXT = ".so"
+LIB_EXT = ".pyd" if IS_WINDOWS else ".so"
+EXEC_EXT = ".exe" if IS_WINDOWS else ""
+CLIB_PREFIX = "" if IS_WINDOWS else "lib"
+CLIB_EXT = ".dll" if IS_WINDOWS else ".so"
 SHARED_FLAG = "-shared"
 
-SUBPROCESS_DECODE_ARGS = ()
+SUBPROCESS_DECODE_ARGS = ("oem",) if IS_WINDOWS else ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
 
 VersionRange = Tuple[Tuple[int, ...], Tuple[int, ...]]
 VersionMap = Dict[str, VersionRange]
+
+
+def _nt_quote_args(args: Optional[List[str]]) -> List[str]:
+    """Quote command-line arguments using Windows command-line rules."""
+    if not args:
+        return []
+    return [f'"{arg}"' if " " in arg else arg for arg in args]
+
+
 # The following values were taken from the following GitHub gist that
 # summarizes the minimum valid major versions of g++/clang++ for each supported
 # CUDA version: https://gist.github.com/ax3l/9489132
@@ -155,7 +170,15 @@ def _find_rocm_home() -> Optional[str]:
             spec = None
         if spec is not None and spec.submodule_search_locations:
             candidate = spec.submodule_search_locations[0]
-            if os.path.exists(os.path.join(candidate, "bin", "hipconfig")):
+            hipconfig_names = (
+                ("hipconfig.exe", "hipconfig")
+                if IS_WINDOWS
+                else ("hipconfig",)
+            )
+            if any(
+                os.path.exists(os.path.join(candidate, "bin", name))
+                for name in hipconfig_names
+            ) and os.path.exists(os.path.join(candidate, "lib")):
                 rocm_home = candidate
     if rocm_home is None:
         # Guess #3
@@ -293,23 +316,32 @@ COMMON_NVCC_FLAGS = [
 ]
 
 COMMON_HIP_FLAGS = [
-    "-fPIC",
     "-D__HIP_PLATFORM_AMD__=1",
     "-DUSE_ROCM=1",
     "-DHIPBLAS_V2",
 ]
+if not IS_WINDOWS:
+    COMMON_HIP_FLAGS.append("-fPIC")
 
 COMMON_HIPCC_FLAGS = [
     "-DCUDA_HAS_FP16=1",
     "-D__HIP_NO_HALF_OPERATORS__=1",
     "-D__HIP_NO_HALF_CONVERSIONS__=1",
-    "-mcmodel=large",
-    "-fno-unique-section-names",
-    "-ffunction-sections",
-    "-fdata-sections",
 ]
 
-if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
+if IS_WINDOWS:
+    COMMON_HIPCC_FLAGS.extend(["-fms-extensions", "-Wno-ignored-attributes"])
+else:
+    COMMON_HIPCC_FLAGS.extend(
+        [
+            "-mcmodel=large",
+            "-fno-unique-section-names",
+            "-ffunction-sections",
+            "-fdata-sections",
+        ]
+    )
+
+if not IS_WINDOWS and not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
     COMMON_HIPCC_FLAGS.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
@@ -320,8 +352,19 @@ PLAT_TO_VCVARS = {
 }
 
 
+def _get_vc_env(vc_arch: str) -> Dict[str, str]:
+    try:
+        from setuptools._distutils import _msvccompiler
+
+        return _msvccompiler._get_vc_env(vc_arch)
+    except AttributeError:
+        from setuptools._distutils.compilers.C import msvc
+
+        return msvc._get_vc_env(vc_arch)
+
+
 def get_cxx_compiler():
-    return os.environ.get("CXX", "c++")
+    return os.environ.get("CXX", "cl" if IS_WINDOWS else "c++")
 
 
 def _is_binary_build() -> bool:
@@ -1475,29 +1518,54 @@ def verify_ninja_availability():
 
 
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
-    extra_ldflags.append("-mcmodel=large")
-    extra_ldflags.append("-ffunction-sections")
-    extra_ldflags.append("-fdata-sections ")
-    extra_ldflags.append("-Wl,--gc-sections")
-    extra_ldflags.append("-Wl,--cref")
+    if not IS_WINDOWS:
+        extra_ldflags.append("-mcmodel=large")
+        extra_ldflags.append("-ffunction-sections")
+        extra_ldflags.append("-fdata-sections")
+        extra_ldflags.append("-Wl,--gc-sections")
+        extra_ldflags.append("-Wl,--cref")
+
     if not torch_exclude:
         import torch
 
         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
         TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
-        extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
-        extra_ldflags.append("-lc10")
-        if with_cuda:
-            extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
-        extra_ldflags.append("-ltorch_cpu")
-        if with_cuda:
-            extra_ldflags.append("-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda")
-        extra_ldflags.append("-ltorch")
-        if not is_standalone:
-            extra_ldflags.append("-ltorch_python")
+        if IS_WINDOWS:
+            extra_ldflags.extend(
+                [
+                    f"-L{TORCH_LIB_PATH}",
+                    "-lc10",
+                    *(["-lc10_hip"] if with_cuda and IS_HIP_EXTENSION else []),
+                    "-ltorch_cpu",
+                    *(["-ltorch_hip"] if with_cuda and IS_HIP_EXTENSION else []),
+                    "-ltorch",
+                ]
+            )
+            if not is_standalone:
+                extra_ldflags.append("-ltorch_python")
+        else:
+            extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
+            extra_ldflags.append("-lc10")
+            if with_cuda:
+                extra_ldflags.append(
+                    "-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda"
+                )
+            extra_ldflags.append("-ltorch_cpu")
+            if with_cuda:
+                extra_ldflags.append(
+                    "-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda"
+                )
+            extra_ldflags.append("-ltorch")
+            if not is_standalone:
+                extra_ldflags.append("-ltorch_python")
 
-        if is_standalone:
-            extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
+            if is_standalone:
+                extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
+
+    if IS_WINDOWS and not is_standalone:
+        python_lib_path = os.path.join(sys.base_exec_prefix, "libs")
+        python_lib = f"-lpython{sys.version_info.major}{sys.version_info.minor}"
+        extra_ldflags.extend([f"-L{python_lib_path}", python_lib])
 
     if with_cuda and IS_HIP_EXTENSION:
         if verbose:
@@ -1536,8 +1604,7 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
 def _get_num_workers(verbose: bool) -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
-        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
-            max_jobs = int(max(1, os.cpu_count() * 0.8))
+        max_jobs = int(max_jobs)
         if verbose:
             print(
                 f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
@@ -1561,6 +1628,14 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
     if num_workers is not None:
         command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
+    if IS_WINDOWS and "VSCMD_ARG_TGT_ARCH" not in env:
+        from setuptools import distutils
+
+        plat_spec = PLAT_TO_VCVARS[distutils.util.get_platform()]
+        vc_env = {k.upper(): v for k, v in _get_vc_env(plat_spec).items()}
+        for key, value in env.items():
+            vc_env.setdefault(key.upper(), value)
+        env = vc_env
 
     try:
         sys.stdout.flush()
@@ -1580,6 +1655,7 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
         stdout_fileno = 1
         subprocess.run(
             command,
+            shell=IS_WINDOWS and IS_HIP_EXTENSION,
             stdout=stdout_fileno if verbose else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=build_directory,
@@ -1669,7 +1745,9 @@ def _write_ninja_file_to_build_library(
     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
     # installations where default `get_path` points to non-existing `/Library/Python/M.m/include` folder
     if is_python_module:
-        python_include_path = sysconfig.get_path("include", scheme="posix_prefix")
+        python_include_path = sysconfig.get_path(
+            "include", scheme="nt" if IS_WINDOWS else "posix_prefix"
+        )
         if python_include_path is not None:
             system_includes.append(python_include_path)
 
@@ -1683,16 +1761,33 @@ def _write_ninja_file_to_build_library(
         # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
         # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
-    # Windows does not understand `-isystem` and quotes flags later.
-    common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
-    common_cflags += [f"-isystem {shlex.quote(include)}" for include in system_includes]
-
-    cflags = common_cflags + ["-fPIC", "-std=c++20"] + extra_cflags
+    if IS_WINDOWS:
+        common_cflags += [f"-I{include}" for include in user_includes + system_includes]
+        cflags = common_cflags + ["/std:c++20"] + extra_cflags
+        cflags += COMMON_MSVC_FLAGS + (
+            COMMON_HIP_FLAGS if IS_HIP_EXTENSION else []
+        )
+        cflags = _nt_quote_args(cflags)
+    else:
+        common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
+        common_cflags += [
+            f"-isystem {shlex.quote(include)}" for include in system_includes
+        ]
+        cflags = common_cflags + ["-fPIC", "-std=c++20"] + extra_cflags
 
     if with_cuda and IS_HIP_EXTENSION:
-        cuda_flags = ["-DWITH_HIP"] + cflags + COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS
-        cuda_flags += extra_cuda_cflags
+        cuda_flags = (
+            ["-DWITH_HIP"]
+            + common_cflags
+            + extra_cflags
+            + COMMON_HIP_FLAGS
+            + COMMON_HIPCC_FLAGS
+            + ["-std=c++20"]
+        )
         cuda_flags += _get_rocm_arch_flags(cuda_flags)
+        cuda_flags += extra_cuda_cflags
+        if IS_WINDOWS:
+            cuda_flags = _nt_quote_args(cuda_flags)
 
     def object_file_path(source_file: str) -> str:
         # '/path/to/file.cpp' -> 'file'
@@ -1707,6 +1802,8 @@ def _write_ninja_file_to_build_library(
 
     objects = [object_file_path(src) for src in sources]
     ldflags = ([] if is_standalone else [SHARED_FLAG]) + extra_ldflags
+    if IS_WINDOWS:
+        ldflags = _nt_quote_args(ldflags)
 
     ext = EXEC_EXT if is_standalone else LIB_EXT
     library_target = f"{name}{ext}"
@@ -1785,8 +1882,14 @@ def _write_ninja_file(
     # Version 1.3 is required for the `deps` directive.
     config = ["ninja_required_version = 1.3"]
     config.append(f"cxx = {compiler}")
+    linker = executable_path("hipcc") if IS_WINDOWS and IS_HIP_EXTENSION else compiler
+    config.append(f"linker = {linker}")
     if with_cuda or cuda_dlink_post_cflags:
-        nvcc = _join_rocm_home("bin", "hipcc")
+        nvcc = (
+            executable_path("hipcc")
+            if IS_WINDOWS
+            else _join_rocm_home("bin", "hipcc")
+        )
         config.append(f"nvcc = {nvcc}")
 
     if IS_HIP_EXTENSION:
@@ -1804,11 +1907,16 @@ def _write_ninja_file(
 
     # See https://ninja-build.org/build.ninja.html for reference.
     compile_rule = ["rule compile"]
-    compile_rule.append(
-        "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags"
-    )
-    compile_rule.append("  depfile = $out.d")
-    compile_rule.append("  deps = gcc")
+    if IS_WINDOWS:
+        compile_rule.append(
+            "  command = $cxx /showIncludes $cflags -c $in /Fo$out $post_cflags"
+        )
+    else:
+        compile_rule.append(
+            "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags"
+        )
+        compile_rule.append("  depfile = $out.d")
+        compile_rule.append("  deps = gcc")
 
     if with_cuda:
         cuda_compile_rule = ["rule cuda_compile"]
@@ -1851,6 +1959,9 @@ def _write_ninja_file(
             _resolve_per_source_flags(source_file) if is_cuda_source else None
         )
 
+        if IS_WINDOWS:
+            source_file = source_file.replace(":", "$:")
+            object_file = object_file.replace(":", "$:")
         source_file_q = source_file.replace(" ", "$ ")
         object_file_q = object_file.replace(" ", "$ ")
         build.append(f"build {object_file_q}: {rule} {source_file_q}")
@@ -1875,9 +1986,10 @@ def _write_ninja_file(
 
     if library_target is not None:
         link_rule = ["rule link"]
-
         link_rule.append(
-            "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
+            "  command = $linker @$out.rsp $ldflags -o $out\n"
+            "  rspfile = $out.rsp\n"
+            "  rspfile_content = $in"
         )
 
         link = [f'build {library_target}: link {" ".join(objects)}']

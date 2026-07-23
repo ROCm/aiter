@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 import traceback
 import types
@@ -22,7 +23,12 @@ from packaging.version import Version, parse
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime  # noqa: E402
-from cpp_extension import _jit_compile, executable_path, get_hip_version  # noqa: E402
+from cpp_extension import (  # noqa: E402
+    LIB_EXT,
+    _jit_compile,
+    executable_path,
+    get_hip_version,
+)
 from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
@@ -331,7 +337,7 @@ class AITER_CONFIG(object):
             )
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        config_path = Path(tempfile.gettempdir()) / "aiter_configs"
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
         new_file_path = f"{config_path}/{merge_name}.csv"
@@ -492,14 +498,22 @@ def validate_and_update_archs():
 def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
+    null_device = "NUL" if sys.platform == "win32" else "/dev/null"
     cmd = (
         [executable_path("hipcc")]
         + flag_hip.split()
-        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+        + ["-x", "hip", "-E", "-P", "-", "-o", null_device]
     )
     try:
-        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+        subprocess.run(
+            cmd,
+            input="",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
         logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
@@ -516,16 +530,41 @@ def check_LLVM_MAIN_REVISION():
     import subprocess
 
     try:
-        hipcc = shlex.quote(executable_path("hipcc"))
-        cmd = f"""echo "#include <tuple>
-__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
-        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
-    except (subprocess.CalledProcessError, AssertionError):
+        source = """#include <tuple>
+__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}"""
+        null_device = "NUL" if sys.platform == "win32" else "/dev/null"
+        subprocess.run(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-P",
+                "-c",
+                "-Wno-unused-command-line-argument",
+                "-o",
+                null_device,
+                "-",
+            ],
+            input=source,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError, AssertionError):
         return 554785
     return 554785 - 1
 
 
 def check_and_set_ninja_worker():
+    max_jobs_env = os.environ.get("MAX_JOBS")
+    if max_jobs_env is not None:
+        try:
+            if int(max_jobs_env) > 0:
+                return
+        except ValueError:
+            pass
+
     max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
     import psutil
 
@@ -535,19 +574,7 @@ def check_and_set_ninja_worker():
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
     max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-    max_jobs_env = os.environ.get("MAX_JOBS")
-    if max_jobs_env is not None:
-        try:
-            max_processes = int(max_jobs_env)
-            # too large value
-            if max_processes > max_jobs:
-                os.environ["MAX_JOBS"] = str(max_jobs)
-        # error value
-        except ValueError:
-            os.environ["MAX_JOBS"] = str(max_jobs)
-    # none value
-    else:
-        os.environ["MAX_JOBS"] = str(max_jobs)
+    os.environ["MAX_JOBS"] = str(max_jobs)
 
 
 def rename_cpp_to_cu(els, dst, hipify, recursive=False):
@@ -583,6 +610,8 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
 
 @torch_compile_guard()
 def check_numa_custom_op() -> None:
+    if sys.platform == "win32":
+        return
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
     if numa_balance_set == "1":
         logger.warning(
@@ -640,7 +669,7 @@ def _needs_arch_rebuild(md_name):
     except Exception:
         # running arch undetectable (e.g. no GPU) -> keep normal behaviour
         return False
-    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{LIB_EXT}")
     built = _so_offload_archs(so_path)
     if not built or cur in built:
         return False
@@ -789,11 +818,13 @@ def clone_3rdparty(third_party: str) -> None:
 
 
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    module_path = os.path.join(get_user_jit_dir(), f"{md_name}{LIB_EXT}")
+    if os.path.isfile(module_path):
+        os.remove(module_path)
 
 
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/{md_name}")
+    shutil.rmtree(os.path.join(bd_dir, md_name), ignore_errors=True)
 
 
 def build_module(
@@ -815,7 +846,7 @@ def build_module(
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
-    target_name = f"{md_name}.so" if not is_standalone else md_name
+    target_name = f"{md_name}{LIB_EXT}" if not is_standalone else md_name
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -1255,7 +1286,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{LIB_EXT}")
         if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
             d_args = get_args_of_build(md_name)
             d_args["torch_exclude"] = True

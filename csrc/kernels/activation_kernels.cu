@@ -667,7 +667,7 @@ __device__ __forceinline__ float gelu_kernel(const T& x)
     // Refer to:
     // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
     const float f         = opus::cast<float>(x);
-    constexpr float ALPHA = M_SQRT1_2;
+    constexpr float ALPHA = 0.70710678118654752440f; // 1 / sqrt(2)
     return f * 0.5f * (1.0f + ::erf(f * ALPHA));
 }
 
@@ -678,7 +678,7 @@ __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
     // Refer to:
     // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L25-L30
     const float f         = opus::cast<float>(x);
-    constexpr float BETA  = M_SQRT2 * M_2_SQRTPI * 0.5f;
+    constexpr float BETA  = 0.79788456080286535588f; // sqrt(2 / pi)
     constexpr float KAPPA = 0.044715;
     float x_cube          = f * f * f;
     float inner           = BETA * (f + KAPPA * x_cube);

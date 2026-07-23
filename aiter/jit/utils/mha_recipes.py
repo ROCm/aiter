@@ -10,8 +10,11 @@ def _ck_targets_flag() -> str:
     keep the default (covers both gfx942 and gfx950 like before).
     """
     try:
+        from .chip_info import get_gfx
+    except ImportError:
         from chip_info import get_gfx
 
+    try:
         gfx = get_gfx()
     except Exception:
         return ""

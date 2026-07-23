@@ -11,6 +11,7 @@ from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
+    _ck_targets_flag,
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
@@ -97,7 +98,9 @@ def cmdGenFunc_mha_fwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 100 --filter {} --output_dir {{}}{}".format(
+            filter, _ck_targets_flag()
+        ),
     ]
     return {
         "md_name": md_name,
@@ -831,11 +834,15 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+            "--receipt 200 --filter {} --output_dir {{}}{}".format(
+                '" "', _ck_targets_flag()
+            )
         ]
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+            "--receipt 200 --filter {} --output_dir {{}}{}".format(
+                filter_fwd_splitkv, _ck_targets_flag()
+            )
         )
     return {
         "md_name": md_name,
@@ -1502,7 +1509,9 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_nsink*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
-        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        "--receipt 200 --filter {} --output_dir {{}}{}".format(
+            filter_fwd, _ck_targets_flag()
+        )
     ]
     return {
         "md_name": md_name,
