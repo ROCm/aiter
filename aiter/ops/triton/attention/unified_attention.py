@@ -394,6 +394,9 @@ def unified_attention(
         use_gluon_2d = is_2d_gluon_available(
             q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
+        # Gluon uses the logical head size as a block shape. Non-power-of-two
+        # Kimi heads must use the Triton path, which pads the block internally.
+        use_gluon_2d = use_gluon_2d and (head_size & (head_size - 1) == 0)
         if use_gluon_2d:
             _gfx1250_unified_attention_2d(
                 q,

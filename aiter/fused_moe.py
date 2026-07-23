@@ -617,11 +617,8 @@ def fused_moe_(
             else:
                 q_dtype_a = dtypes.fp8
         elif activation == ActivationType.Situv2:
-            # SiTUv2 + separated == a16w4 (bf16 activation x mxfp4 weight); keep
-            # the activation in bf16 (no fp4 quant). a4w4 SiTUv2 full 2-stage is
-            # unsupported (no CK situv2 stage2), so separated-mode SiTUv2 always
-            # maps to the mixed_moe a16w4 kernel.
-            q_dtype_a = dtypes.bf16
+            # Kimi-K3 uses the FlyDSL A4W4 path for SiTUv2.
+            q_dtype_a = dtypes.fp4x2
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -666,6 +663,8 @@ def fused_moe_(
                 bias2=bias2,
                 gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
+                situ_beta=1.0 if beta is None else float(beta),
+                situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             )
 
     if grouped_a8w4_out is not None:
@@ -1911,7 +1910,7 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 128 == 0)

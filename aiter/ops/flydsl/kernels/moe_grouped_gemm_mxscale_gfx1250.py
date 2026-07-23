@@ -66,6 +66,8 @@ class _GroupedA8W4Config:
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
+    situ_beta: float = 1.0
+    situ_linear_beta: float = 1.0
     swiglu_limit: float | None = None
     stage1_weight_layout: str = "gguu"
     stage1_quant_out: str | None = None
@@ -95,8 +97,17 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
         )
     if cfg.split_k < 1:
         raise ValueError(f"split_k must be >= 1, got {cfg.split_k}")
-    if cfg.act not in ("silu", "swiglu"):
-        raise ValueError(f"act must be 'silu' or 'swiglu', got {cfg.act!r}")
+    if cfg.act not in ("silu", "swiglu", "situv2"):
+        raise ValueError(
+            f"act must be 'silu', 'swiglu', or 'situv2', got {cfg.act!r}"
+        )
+    if cfg.act == "situv2":
+        if cfg.situ_beta <= 0.0:
+            raise ValueError(f"situ_beta must be > 0, got {cfg.situ_beta!r}")
+        if cfg.situ_linear_beta <= 0.0:
+            raise ValueError(
+                f"situ_linear_beta must be > 0, got {cfg.situ_linear_beta!r}"
+            )
     if cfg.stage1_weight_layout not in ("gguu", "gugu"):
         raise ValueError(
             f"stage1_weight_layout must be 'gguu' or 'gugu', got {cfg.stage1_weight_layout!r}"
@@ -344,12 +355,24 @@ def _apply_gate_up(
     up: torch.Tensor,
     act: str,
     swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ) -> torch.Tensor:
     _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
     if act == "swiglu":
         gate = gate.clamp(max=_lim)
         up = up.clamp(min=-_lim, max=_lim)
         return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    if act == "situv2":
+        situ_gate = (
+            float(situ_beta)
+            * torch.tanh(gate / float(situ_beta))
+            * torch.sigmoid(gate)
+        )
+        up_scaled = float(situ_linear_beta) * torch.tanh(
+            up / float(situ_linear_beta)
+        )
+        return situ_gate * up_scaled
     if swiglu_limit is not None:
         gate = gate.clamp(max=_lim)
         up = up.clamp(min=-_lim, max=_lim)
@@ -1024,6 +1047,8 @@ def _compile_base_a8w4_gemm(
         grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
+        stage1_situ_beta=cfg.situ_beta,
+        stage1_situ_linear_beta=cfg.situ_linear_beta,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         stage1_quant_out=stage1_quant_out,
@@ -1060,6 +1085,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
     stage1_quant_out: str | None = None,
@@ -1092,6 +1119,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         persistent_workers=persistent_workers,
         data_format=str(data_format),
         act=str(act),
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
         stage1_weight_layout=str(stage1_weight_layout),
         stage1_quant_out=(
             None if stage1_quant_out in (None, "", "none") else str(stage1_quant_out)
@@ -1104,6 +1133,13 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         fused_n = (
             2 * cfg.inter_dim if cfg.stage1_weight_layout == "gugu" else cfg.inter_dim
         )
+    act_kernel_tag = str(act)
+    if cfg.act == "situv2":
+        beta_tag = str(float(cfg.situ_beta)).replace(".", "p").replace("-", "m")
+        linear_beta_tag = (
+            str(float(cfg.situ_linear_beta)).replace(".", "p").replace("-", "m")
+        )
+        act_kernel_tag += f"_sb{beta_tag}_slb{linear_beta_tag}"
 
     # Lazy compilation: only build each variant on first use (~0.9s saved).
     _lazy = {}
@@ -1117,7 +1153,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     cfg=cfg,
                     stage1_act=cfg.act,
                     stage1_weight_layout=cfg.stage1_weight_layout,
-                    kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act}_mode{grouped_contiguous_m}",
+                    kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act_kernel_tag}_mode{grouped_contiguous_m}",
                 )
                 if cfg.split_k == 1
                 else None
@@ -1134,7 +1170,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     stage1_act=cfg.act,
                     epilogue_bias=True,
                     stage1_weight_layout=cfg.stage1_weight_layout,
-                    kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act}_mode{grouped_contiguous_m}",
+                    kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act_kernel_tag}_mode{grouped_contiguous_m}",
                 )
                 if cfg.split_k == 1
                 else None

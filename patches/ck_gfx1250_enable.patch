@@ -1,0 +1,123 @@
+diff --git a/include/ck/ck.hpp b/include/ck/ck.hpp
+index 7448c7a31..7d5bb6fd1 100644
+--- a/include/ck/ck.hpp
++++ b/include/ck/ck.hpp
+@@ -72,7 +72,8 @@
+     defined(__gfx1152__) || defined(__gfx1153__) || defined(__gfx11_generic__)
+ #define __gfx11__
+ #endif
+-#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx12_generic__)
++#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__) || \
++    defined(__gfx12_generic__)
+ #define __gfx12__
+ #endif
+
+diff --git a/include/ck/host_utility/device_prop.hpp b/include/ck/host_utility/device_prop.hpp
+index e20deb11e..67a214a16 100644
+--- a/include/ck/host_utility/device_prop.hpp
++++ b/include/ck/host_utility/device_prop.hpp
+@@ -56,7 +56,8 @@ inline bool is_gfx90a() { return ck::get_device_name() == "gfx90a"; }
+
+ inline bool is_gfx12_supported()
+ {
+-    return ck::get_device_name() == "gfx1200" || ck::get_device_name() == "gfx1201";
++    return ck::get_device_name() == "gfx1200" || ck::get_device_name() == "gfx1201" ||
++           ck::get_device_name() == "gfx1250";
+ }
+
+ inline bool is_gfx11_supported()
+diff --git a/include/ck/utility/amd_wmma.hpp b/include/ck/utility/amd_wmma.hpp
+index 057687985..8de02b151 100644
+--- a/include/ck/utility/amd_wmma.hpp
++++ b/include/ck/utility/amd_wmma.hpp
+@@ -15,7 +15,8 @@ namespace ck {
+ #define __gfx11__
+ #endif
+
+-#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx12_generic__)
++#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__) || \
++    defined(__gfx12_generic__)
+ #define __gfx12__
+ #endif
+
+diff --git a/include/ck_tile/core/arch/arch.hpp b/include/ck_tile/core/arch/arch.hpp
+index 417ec12c8..c1a45cf15 100644
+--- a/include/ck_tile/core/arch/arch.hpp
++++ b/include/ck_tile/core/arch/arch.hpp
+@@ -104,6 +104,7 @@ enum struct amdgcn_target_id
+     GFX11_GENERIC  = 0x11FF,
+     GFX1200        = 0x1200,
+     GFX1201        = 0x1201,
++    GFX1250        = 0x1250,
+     GFX12_GENERIC  = 0x12FF,
+     HOST           = 0x0000,
+ };
+@@ -301,6 +302,7 @@ constexpr auto get_compiler_target()
+     MAP_COMPILER_STATE_TO_GFX11_TARGET(CK_TILE_ARCH_GFX11_GENERIC, GFX11_GENERIC);
+     MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX1200, GFX1200);
+     MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX1201, GFX1201);
++    MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX1250, GFX1250);
+     MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX12_GENERIC, GFX12_GENERIC);
+
+     // Return HOST by default
+@@ -369,6 +371,7 @@ CK_TILE_HOST auto hip_device_prop_gcn_arch_name_to_amdgcn_target_id(char const*
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_TARGET_ID("gfx11_generic", GFX11_GENERIC);
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_TARGET_ID("gfx1200", GFX1200);
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_TARGET_ID("gfx1201", GFX1201);
++    MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_TARGET_ID("gfx1250", GFX1250);
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_TARGET_ID("gfx12_generic", GFX12_GENERIC);
+
+     // Default case: return HOST target if no match is found
+@@ -626,6 +629,7 @@ CK_TILE_HOST_DEVICE constexpr auto get_compiler_target()
+     MAP_COMPILER_STATE_TO_GFX11_TARGET(CK_TILE_ARCH_GFX11_GENERIC, GFX11_GENERIC);
+     MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX1200, GFX1200);
+     MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX1201, GFX1201);
++    MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX1250, GFX1250);
+     MAP_COMPILER_STATE_TO_GFX12_TARGET(CK_TILE_ARCH_GFX12_GENERIC, GFX12_GENERIC);
+
+     // Default to HOST
+@@ -708,6 +712,7 @@ CK_TILE_HOST auto hip_device_prop_gcn_arch_name_to_amdgcn_target(char const* tes
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_GFX11_TARGET("gfx11_generic", GFX11_GENERIC);
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_GFX12_TARGET("gfx1200", GFX1200);
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_GFX12_TARGET("gfx1201", GFX1201);
++    MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_GFX12_TARGET("gfx1250", GFX1250);
+     MAP_HIP_DEVICE_PROP_GCN_ARCH_NAME_STRING_TO_GFX12_TARGET("gfx12_generic", GFX12_GENERIC);
+
+     // Default case
+diff --git a/include/ck_tile/core/config.hpp b/include/ck_tile/core/config.hpp
+index ba195427b..9dad7650e 100644
+--- a/include/ck_tile/core/config.hpp
++++ b/include/ck_tile/core/config.hpp
+@@ -27,7 +27,8 @@
+ #if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__)
+ #define __gfx115__
+ #endif
+-#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx12_generic__)
++#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__) || \
++    defined(__gfx12_generic__)
+ #define __gfx12__
+ #endif
+
+@@ -520,6 +521,12 @@ struct amdgcn_compiler_target_state
+ #else
+     static constexpr bool CK_TILE_ARCH_GFX12_GENERIC = false;
+ #endif // __gfx12_generic__
++
++#if defined(__gfx1250__)
++    static constexpr bool CK_TILE_ARCH_GFX1250 = true;
++#else
++    static constexpr bool CK_TILE_ARCH_GFX1250 = false;
++#endif // __gfx1250__
+ };
+
+ /**
+@@ -571,7 +578,8 @@ CK_TILE_HOST_DEVICE static constexpr uint32_t count_values_of(T search, Ts... se
+         amdgcn_compiler_target_state::CK_TILE_ARCH_GFX11_GENERIC,   \
+         amdgcn_compiler_target_state::CK_TILE_ARCH_GFX1200,         \
+         amdgcn_compiler_target_state::CK_TILE_ARCH_GFX1201,         \
+-        amdgcn_compiler_target_state::CK_TILE_ARCH_GFX12_GENERIC
++        amdgcn_compiler_target_state::CK_TILE_ARCH_GFX12_GENERIC,   \
++        amdgcn_compiler_target_state::CK_TILE_ARCH_GFX1250
+
+ // Sanity check: make sure only one target architecture is defined during device compile
+ static_assert(!amdgcn_compiler_target_state::CK_TILE_DEVICE_COMPILE ||
