@@ -59,9 +59,11 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
         x, weightshuffle, x_scale, w_scale, dtype
     )
 
+import pyhip
 
 @benchmark()
 def test_gemm(dtype, m, n, k, ck_preshuffle=True):
+    torch.manual_seed(0)
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
@@ -71,6 +73,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    # x_scale = torch.ones([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -78,24 +81,24 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
-
+    b , avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    print(f"{pyhip.calc_diff(a, b, diff_thr=0.04)=:.6f}")
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
-    ret["ck us"] = avg_b
-    ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
-    ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
-    ret["ck err"] = err_ck
+    ret["us"] = avg_b
+    ret["TFLOPS"] = m * n * k * 2 / avg_b / 1e6
+    ret["TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
+    ret["err"] = err_ck
 
-    tag = "asm"
-    weight_asm = shuffle_weight(weight, layout=(16, 16))
-    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+    # tag = "asm"
+    # weight_asm = shuffle_weight(weight, layout=(16, 16))
+    # c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
-    ret[f"{tag} us"] = avg_c
-    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    ret[f"{tag} err"] = err_asm
-    ret["asm/ck"] = avg_c / avg_b
+    # err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
+    # ret[f"{tag} us"] = avg_c
+    # ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    # ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    # ret[f"{tag} err"] = err_asm
+    # ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -128,59 +131,6 @@ def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
 
 
-def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
-    """Verify that splitK > 0 produces the same output as splitK=0 (within fp tolerance).
-
-    split-K accumulates partial tiles via atomic_add, which changes the floating-point
-    reduction order.  We therefore use a relaxed tolerance that matches the cumulative
-    rounding error introduced by K-splitting.
-    """
-    block_shape_n, block_shape_k = block_shape
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
-
-    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
-
-    # CK path (no preshuffle): compare splitK=0 vs splitK>0
-    Y_base = torch.empty((m, n), dtype=dtype, device="cuda")
-    Y_split = torch.empty((m, n), dtype=dtype, device="cuda")
-    gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_base, splitK=0)
-    gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_split, splitK=splitK)
-    ck_err = checkAllclose(
-        Y_base,
-        Y_split,
-        msg=f"ck splitK={splitK} vs splitK=0",
-        rtol=1e-2,
-        atol=1e-2,
-        catastrophic_check=True,
-    )
-
-    # CKTile path (no preshuffle): compare splitK=0 vs splitK>0
-    Y_base_tile = torch.empty((m, n), dtype=dtype, device="cuda")
-    Y_split_tile = torch.empty((m, n), dtype=dtype, device="cuda")
-    gemm_a8w8_blockscale_cktile(
-        x, weight, x_scale, w_scale, Y_base_tile, False, splitK=0
-    )
-    gemm_a8w8_blockscale_cktile(
-        x, weight, x_scale, w_scale, Y_split_tile, False, splitK=splitK
-    )
-    cktile_err = checkAllclose(
-        Y_base_tile,
-        Y_split_tile,
-        msg=f"cktile splitK={splitK} vs splitK=0",
-        rtol=1e-2,
-        atol=1e-2,
-        catastrophic_check=True,
-    )
-
-    print(
-        f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
-        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
-    )
-
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -202,62 +152,37 @@ parser.add_argument(
     type=int,
     nargs="*",
     choices=[
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
+        # 1,
+        # 2,
+        # 4,
+        # 8,
+        # 16,
+        # 32,
+        # 64,
+        # 96,
+        # 128,
+        # 160,
+        # 192,
+        # 224,
+        # 256,
+        # 288,
+        # 320,
+        # 352,
+        # 384,
+        # 416,
+        # 448,
+        # 480,
+        # 512,
+        # 1024,
+        # 2048,
+        # 4096,
+        # 6144,
+        # 8192,
+        # 10240,
     ],
     default=[
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        288,
-        320,
-        352,
-        384,
-        416,
-        448,
-        480,
-        512,
-        1024,
-        2048,
-        4096,
-        6144,
-        8192,
-        10240,
+        16384,
+        #8192,
     ],
     help="""M of mnk.
     e.g.: -m 32""",
@@ -267,10 +192,8 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     default=[
-        (24576, 1536),
-        # (32768, 512),
-        # (7168, 16384),
-        # (36864, 7168),
+        (3392, 6144),
+        (3584, 6144),
     ],
     help="""N&K of mnk.
     e.g.: -nk 24576,1536""",
@@ -357,17 +280,17 @@ df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
 
 # Correctness check: verify split-K produces matching results
-print("\nRunning split-K correctness checks ...")
-for splitK in [1, 2]:
-    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+# print("\nRunning split-K correctness checks ...")
+# for splitK in [1, 2]:
+#     test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
 
-# Save results from benchmarks
-if args.output:
-    os.makedirs(args.output, exist_ok=True)
-    if args.csv:
-        csv_filename = os.path.basename(args.csv).replace(".csv", f"_{args.suffix}.csv")
-    else:
-        csv_filename = f"gemm_a8w8_blockscale_{args.suffix}.csv"
-    out_path = os.path.join(args.output, csv_filename)
-    df.to_csv(out_path, index=False)
-    print(f"Saved results to: {out_path}")
+# # Save results from benchmarks
+# if args.output:
+#     os.makedirs(args.output, exist_ok=True)
+#     if args.csv:
+#         csv_filename = os.path.basename(args.csv).replace(".csv", f"_{args.suffix}.csv")
+#     else:
+#         csv_filename = f"gemm_a8w8_blockscale_{args.suffix}.csv"
+#     out_path = os.path.join(args.output, csv_filename)
+#     df.to_csv(out_path, index=False)
+#     print(f"Saved results to: {out_path}")

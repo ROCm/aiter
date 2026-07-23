@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 from typing import Optional
 
 import pandas as pd
@@ -10,6 +11,8 @@ import torch.nn.functional as F
 from aiter import logger
 from torch import Tensor
 from torch.library import Library
+import pyhip
+from pyhip.contrib.gemm_fp8 import gemm_8wave_fp8bf16fp16
 
 from ..jit.core import (
     AITER_CONFIGS,
@@ -20,6 +23,8 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+
+
 
 
 def is_flydsl_available():
@@ -748,6 +753,7 @@ def gemm_a8w8_blockscale_fake(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return Y
 
+import os
 
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
@@ -789,6 +795,17 @@ def gemm_a8w8_blockscale(
             libtype = config["libtype"]
             splitK = int(config.get("splitK", 0))
             kernelName = str(config.get("kernelName", ""))
+            if libtype == "pyhip" and kernelName == "gemm_8wave_fp8bf16fp16":
+                wg_M, wg_N = 256, 256
+                num_block_M = pyhip.div_up(m, wg_M)
+                num_block_N = pyhip.div_up(n, wg_N)
+                
+                x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+
+                gemm_8wave_fp8bf16fp16([num_block_N * num_block_M],[64*8], "fp8", False, True,
+                                wg_M, wg_N, n, k, XQ.data_ptr(), WQ.data_ptr(), Y.data_ptr(),
+                                x_scale_t.data_ptr(), w_scale.data_ptr(), m)
+                return Y
             if libtype == "ck":
                 return gemm_a8w8_blockscale_ck(
                     XQ,
