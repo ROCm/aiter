@@ -406,18 +406,12 @@ def test_cdna4_swizzled_scales_with_padded_physical_dims(device="cuda"):
         x_physical.abs().max().float() / torch.finfo(torch.float8_e4m3fn).max
     )
     x_tri = downcast_to_static_fp8(x_physical, x_static_scale)
-    # CDNA4 N vs K asymmetry:
-    #   N: the kernel launches over the PHYSICAL padded N (the swizzle is baked
-    #      over it); unpadded_N is a dispatch key only. The extra N columns are
-    #      just sliced off the output (tri_y[:, :logical_n]) — no corruption.
-    #   K: unpadded_K IS the contraction bound the kernel uses (address-safe,
-    #      masked), so the kernel sums only the first logical_k. The reference
-    #      must therefore contract the SAME logical-K slice — physical_k here is
-    #      random (not zero-padded like real vLLM weights), so contracting the
-    #      full 1024 would diverge. logical_k=800 < physical_k=1024 exercises it.
+    # CDNA4: kernel launches over physical padded N (swizzle is baked over it),
+    # so unpadded_N is a dispatch key only; unpadded_K is address-safe (masked).
+    # logical_k=800 < physical_k=1024 exercises the K path.
     ref_y = moe_gemm_torch(
-        x_physical[:, :logical_k],
-        w_ref[:, :logical_k, :],
+        x_physical,
+        w_ref,
         bias_physical[:, :logical_n],
         rdata,
         gindx,
