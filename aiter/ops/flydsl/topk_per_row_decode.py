@@ -21,7 +21,6 @@ from .kernels.topk_per_row_decode_tiered import (
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
-
 ##################################
 
 # Independent of K: K only affects the final O(K) index scatter, negligible vs
@@ -42,6 +41,7 @@ _SHORT_MAX_PARAMS = {
 # envelope spills into a 2nd wave, so the batch cap switches to occ=1 (one true wave).
 _CDNA_OCCUPANCY = 2
 _COCAP_OCC2_MAX_ROWS = 32
+
 
 def _next_pow2(n: int) -> int:
     if n <= 1:
@@ -136,7 +136,6 @@ def _default_kernel_config(
     # (kernel validation requires it when force_single_wg lifts short_max to L).
     tiered_mid_max = _TIERED_MID_MAX
 
-
     # Dead-block trim (gfx950 only). The launch grid is (blocks_per_row, num_rows) but
     # the real workers per row = min(blocks_per_row, tier_cap); the excess workgroups
     # return immediately yet still occupy co-resident slots ("dead" blocks). Trimming
@@ -169,7 +168,9 @@ def _default_kernel_config(
     # rows into sequential waves. Env FLYDSL_TOPK_TIERED_BATCH_CAP (0/1) overrides; gfx942
     # frozen (default 0).
     force_single_wg = False
-    batch_cap_on = _env_int("FLYDSL_TOPK_TIERED_BATCH_CAP", 1 if arch == "gfx950" else 0)
+    batch_cap_on = _env_int(
+        "FLYDSL_TOPK_TIERED_BATCH_CAP", 1 if arch == "gfx950" else 0
+    )
     if batch_cap_on and num_rows > 1:
         # occ=2 co-resides for modest grids, but beyond _COCAP_OCC2_MAX_ROWS the envelope
         # spills into a 2nd wave, so occ=1 (one true wave) is faster. Env
@@ -215,7 +216,9 @@ def _default_kernel_config(
             (20, None, 6),
             (16, None, 8),
         ):
-            if num_rows > mb_min_rows and (mb_L_max is None or max_model_len <= mb_L_max):
+            if num_rows > mb_min_rows and (
+                mb_L_max is None or max_model_len <= mb_L_max
+            ):
                 mb_cap = mb_cap_val
                 break
         mb_env = _env_int("FLYDSL_TOPK_TIERED_MIDBATCH_CAP")

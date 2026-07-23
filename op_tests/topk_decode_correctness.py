@@ -105,8 +105,18 @@ def make_logits(num_rows, max_width, row_len, distribution, seed, device, poison
     return logits
 
 
-def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison,
-              seq_rand_min_frac=0.0):
+def check_one(
+    op,
+    k,
+    L,
+    num_rows,
+    max_width,
+    distribution,
+    next_n,
+    seed,
+    poison,
+    seq_rand_min_frac=0.0,
+):
     device = torch.device("cuda")
     batch = num_rows // next_n
     if seq_rand_min_frac and seq_rand_min_frac > 0.0:
@@ -128,7 +138,9 @@ def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison,
     row_lens_cpu = row_lens.cpu().tolist()
 
     # Base logits then poison each row's own tail [row_len:max_width).
-    base = make_logits(num_rows, max_width, max_width, distribution, seed, device, poison)
+    base = make_logits(
+        num_rows, max_width, max_width, distribution, seed, device, poison
+    )
     for r in range(num_rows):
         rl = row_lens_cpu[r]
         if rl < max_width:
@@ -161,7 +173,10 @@ def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison,
         e = ref
         bad = (a < 0) | (a >= rl)
         if bad.any():
-            return False, f"row {row}(len={rl}): out-of-range/poison indices {a[bad][:4].tolist()}"
+            return (
+                False,
+                f"row {row}(len={rl}): out-of-range/poison indices {a[bad][:4].tolist()}",
+            )
         a_set, e_set = set(a.tolist()), set(e.tolist())
         if len(a_set) != len(a.tolist()):
             return False, f"row {row}: duplicate indices"
@@ -170,7 +185,10 @@ def check_one(op, k, L, num_rows, max_width, distribution, next_n, seed, poison,
         a_only = sorted(a_set - e_set)
         e_only = sorted(e_set - a_set)
         if len(a_only) != len(e_only):
-            return False, f"row {row}: set size mismatch ({len(a_only)} vs {len(e_only)})"
+            return (
+                False,
+                f"row {row}: set size mismatch ({len(a_only)} vs {len(e_only)})",
+            )
         av = torch.tensor([logits_cpu[row, i].item() for i in a_only])
         ev = torch.tensor([logits_cpu[row, i].item() for i in e_only])
         if not torch.allclose(av.sort().values, ev.sort().values, rtol=0, atol=0):
@@ -185,18 +203,23 @@ def main() -> None:
     ap.add_argument("--num-rows", type=int, nargs="+", default=[1])
     ap.add_argument("--max-width", type=int, default=256000)
     ap.add_argument(
-        "--distribution", nargs="+", default=["random"],
+        "--distribution",
+        nargs="+",
+        default=["random"],
         choices=["random", "10LSBits", "ties"],
     )
     ap.add_argument("--next-n", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--poison", type=float, default=1e30)
     ap.add_argument(
-        "--unpadded", action="store_true",
+        "--unpadded",
+        action="store_true",
         help="Use max_width == L (no padded tail) instead of --max-width.",
     )
     ap.add_argument(
-        "--seq-rand-min-frac", type=float, default=0.0,
+        "--seq-rand-min-frac",
+        type=float,
+        default=0.0,
         help="Regime B: per-row seq_len random in [frac*L, L] (0 = uniform L = regime A).",
     )
     args = ap.parse_args()
@@ -210,8 +233,16 @@ def main() -> None:
                 for L in args.L:
                     mw = L if args.unpadded else max(args.max_width, L)
                     ok, msg = check_one(
-                        op, k, L, rows, mw, dist, args.next_n, args.seed,
-                        args.poison, args.seq_rand_min_frac,
+                        op,
+                        k,
+                        L,
+                        rows,
+                        mw,
+                        dist,
+                        args.next_n,
+                        args.seed,
+                        args.poison,
+                        args.seq_rand_min_frac,
                     )
                     total += 1
                     status = "PASS" if ok else "FAIL"

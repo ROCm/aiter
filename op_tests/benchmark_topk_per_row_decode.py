@@ -11,7 +11,6 @@ from typing import Callable, Iterable
 import numpy as np
 import torch
 
-
 TOPK_CO_PATH = Path("aiter/hsa/gfx942/topk_per_row_decode/asm_top_k_per_row_decode.co")
 
 

@@ -172,7 +172,9 @@ def create_topk_per_row_decode_tiered_kernel(
     # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
     # blocks hogging co-resident slots). Only valid when the short tier exists
     # (auto/short + bpp==11); mid/long forced modes still need >=2 cooperating parts.
-    _min_blocks_per_row = 1 if (tier_mode in ("auto", "short") and bits_per_pass == 11) else 2
+    _min_blocks_per_row = (
+        1 if (tier_mode in ("auto", "short") and bits_per_pass == 11) else 2
+    )
     if not _min_blocks_per_row <= blocks_per_row <= 32:
         raise ValueError(
             f"blocks_per_row must be in [{_min_blocks_per_row}, 32], got {blocks_per_row}"
