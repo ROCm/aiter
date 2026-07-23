@@ -36,6 +36,7 @@ def _expt_data_compute_stage1(
         # pid==0 must run the full loop: it reads TileStart[n_expts_tot-1]
         # below for the sentinel, so it must have written it first.
         # All other blocks can stop once they've written their own chunk.
+        store_pid = pid if pid < n_expts_tot else 0
         done = False
         for i in range(0, n_expts_tot, BLOCK):
             if not done:
@@ -46,13 +47,12 @@ def _expt_data_compute_stage1(
                 tile_starts = tl.cumsum(hist_tile, 0) - hist_tile + tile_acc
                 token_acc += tl.sum(hist_token, 0)
                 tile_acc += tl.sum(hist_tile, 0)
-                if pid == 0 or pid < i + BLOCK:
+                if store_pid == 0 or store_pid < i + BLOCK:
                     tl.store(TokenStart + offs_n, token_starts, mask=mask_n)
                     tl.store(TileStart + offs_n, tile_starts, mask=mask_n)
-                if pid != 0 and pid < i + BLOCK:
+                if store_pid != 0 and store_pid < i + BLOCK:
                     done = True
                 offs_n += BLOCK
-
     if pid == 0:
         tl.store(TokenStart + n_expts_tot, n_gates)
 
