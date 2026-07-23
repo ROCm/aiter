@@ -18,6 +18,12 @@ from aiter.ops.flydsl.moe_plan.stage1 import (
     MoeStage1Role,
     Stage1ExternalPostprocessMetadata,
 )
+from aiter.ops.flydsl.moe_plan.stage2 import (
+    MoeStage2OperationCase,
+    MoeStage2Role,
+    Stage2GemmMetadata,
+    Stage2ReductionMetadata,
+)
 from aiter.ops.flydsl.operation_runtime import (
     ExecutionStep,
     RuntimeAdapterRegistry,
@@ -411,6 +417,12 @@ def _stage1_operation_plan_mode() -> str:
             f"AITER_FLYDSL_OPERATION_PLAN must be one of off|shadow|on, got {mode!r}"
         )
     return mode
+
+
+def _resolve_stage2_operation_plan(case, compile_context):
+    from .moe_compile_plan import resolve_moe_stage2_operation_plan
+
+    return resolve_moe_stage2_operation_plan(case, context=compile_context)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1900,6 +1912,87 @@ def flydsl_moe_stage1(
     return out
 
 
+@dataclass
+class _Stage2ExecutionState:
+    primary_args: tuple[Any, ...]
+    target: Any
+    out: Any
+    token_num: int
+    topk: int
+    model_dim: int
+    expert_mask: Any
+    topk_ids: Any
+
+
+def _stage2_artifact_launcher(step: ExecutionStep):
+    if step.artifact is None:
+        raise RuntimeError(f"Stage2 role {step.node.role!r} requires an artifact")
+    return getattr(step.artifact, "launcher", step.artifact)
+
+
+def _stage2_gemm_runtime_adapter(
+    step: ExecutionStep,
+    state: _Stage2ExecutionState,
+    *,
+    context: LaunchContext,
+) -> None:
+    if not isinstance(step.node.runtime_metadata, Stage2GemmMetadata):
+        raise TypeError("Stage2 GEMM node requires Stage2GemmMetadata")
+    _run_compiled(_stage2_artifact_launcher(step), state.primary_args)
+
+
+def _stage2_reduction_runtime_adapter(
+    step: ExecutionStep,
+    state: _Stage2ExecutionState,
+    *,
+    context: LaunchContext,
+) -> None:
+    metadata = step.node.runtime_metadata
+    if not isinstance(metadata, Stage2ReductionMetadata):
+        raise TypeError("Stage2 reduction node requires Stage2ReductionMetadata")
+    if metadata.use_mask != (state.expert_mask is not None):
+        raise RuntimeError("Stage2 reduction metadata disagrees with runtime mask")
+    _run_moe_reduction(
+        _stage2_artifact_launcher(step),
+        state.target,
+        state.out,
+        state.token_num,
+        state.topk,
+        state.model_dim,
+        state.expert_mask,
+        state.topk_ids,
+        context,
+    )
+
+
+_STAGE2_RUNTIME_ADAPTERS = RuntimeAdapterRegistry()
+_STAGE2_RUNTIME_ADAPTERS.register(
+    MoeStage2Role.MIXED_GEMM.value, _stage2_gemm_runtime_adapter
+)
+_STAGE2_RUNTIME_ADAPTERS.register(
+    MoeStage2Role.INT4_GEMM.value, _stage2_gemm_runtime_adapter
+)
+_STAGE2_RUNTIME_ADAPTERS.register(
+    MoeStage2Role.PLAIN_REDUCTION.value, _stage2_reduction_runtime_adapter
+)
+_STAGE2_RUNTIME_ADAPTERS.register(
+    MoeStage2Role.MASKED_REDUCTION.value, _stage2_reduction_runtime_adapter
+)
+
+
+def _validate_stage2_shadow(operation_plan, roles, op_ids) -> None:
+    expected_roles = tuple(node.role for node in operation_plan.nodes)
+    expected_op_ids = tuple(
+        unit.spec.op_id for unit in operation_plan.compile_projection().units
+    )
+    if expected_roles != tuple(roles) or expected_op_ids != tuple(op_ids):
+        raise RuntimeError(
+            "Stage2 OperationPlan shadow mismatch: "
+            f"roles expected={expected_roles!r}, actual={tuple(roles)!r}; "
+            f"op_ids expected={expected_op_ids!r}, actual={tuple(op_ids)!r}"
+        )
+
+
 def flydsl_moe_stage2(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
@@ -1973,10 +2066,58 @@ def flydsl_moe_stage2(
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
 
-    accumulate = mode != "reduce" and not return_per_slot
-
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
+
+    legacy_accumulate = mode != "reduce" and not return_per_slot
+    stage2_builder_kwargs = dict(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage2=(sorted_weights is not None),
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        sort_block_m=sort_block_m,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        cu_num_mul=cu_num_mul,
+        b_nt=b_nt,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        xcd_swizzle=xcd_swizzle,
+        enable_bias=(bias is not None),
+    )
+    use_mask = expert_mask is not None
+    stage2_case = MoeStage2OperationCase.from_kwargs(
+        stage2_builder_kwargs,
+        mode=mode,
+        return_per_slot=return_per_slot,
+        persist=persist,
+        token_num=token_num,
+        routing_block_count=int(sorted_expert_ids.shape[0]),
+        use_mask=use_mask,
+        topk_ids_available=use_mask and topk_ids is not None,
+        num_experts=int(expert_mask.numel()) if use_mask else 0,
+    )
+    operation_mode = _stage1_operation_plan_mode()
+    operation_plan = (
+        _resolve_stage2_operation_plan(stage2_case, compile_context)
+        if operation_mode in ("shadow", "on")
+        else None
+    )
+    if operation_mode == "on":
+        if not operation_plan.nodes or not isinstance(
+            operation_plan.nodes[0].runtime_metadata, Stage2GemmMetadata
+        ):
+            raise RuntimeError("Stage2 OperationPlan requires a GEMM primary node")
+        accumulate = operation_plan.nodes[0].runtime_metadata.accumulate
+    else:
+        accumulate = legacy_accumulate
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
@@ -2023,8 +2164,17 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    legacy_use_mx_gemm = b_dtype in ("fp4", "fp8")
+    if operation_mode == "on":
+        primary_role = operation_plan.nodes[0].role
+        if primary_role == MoeStage2Role.MIXED_GEMM.value:
+            use_mx_gemm = True
+        elif primary_role == MoeStage2Role.INT4_GEMM.value:
+            use_mx_gemm = False
+        else:
+            raise RuntimeError(f"invalid Stage2 primary role {primary_role!r}")
+    else:
+        use_mx_gemm = legacy_use_mx_gemm
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -2076,85 +2226,96 @@ def flydsl_moe_stage2(
             launch_context,
         )
 
-    stage2_builder_kwargs = dict(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage2=(sorted_weights is not None),
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        accumulate=accumulate,
-        sort_block_m=sort_block_m,
-        waves_per_eu=waves_per_eu,
-        use_async_copy=use_async_copy,
-        cu_num_mul=cu_num_mul,
-        b_nt=b_nt,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        xcd_swizzle=xcd_swizzle,
-        enable_bias=(bias is not None),
+    state = _Stage2ExecutionState(
+        args,
+        target,
+        out,
+        token_num,
+        topk,
+        model_dim,
+        expert_mask,
+        topk_ids,
     )
-    from .moe_compile_plan import (
-        INT4_STAGE2_GEMM_OP_ID,
-        MASKED_REDUCTION_OP_ID,
-        MIXED_STAGE2_GEMM_OP_ID,
-        PLAIN_REDUCTION_OP_ID,
-        resolve_moe_stage2_compile_plan,
-    )
+    if operation_mode == "on":
+        execute_operation_plan(
+            operation_plan,
+            state,
+            compile_context=compile_context,
+            launch_context=launch_context,
+            adapters=_STAGE2_RUNTIME_ADAPTERS,
+        )
+    else:
+        from .moe_compile_plan import (
+            INT4_STAGE2_GEMM_OP_ID,
+            MASKED_REDUCTION_OP_ID,
+            MIXED_STAGE2_GEMM_OP_ID,
+            PLAIN_REDUCTION_OP_ID,
+            resolve_moe_stage2_compile_plan,
+        )
 
-    use_mask = expert_mask is not None
-    dtype_str = "bf16" if out_dtype == "bf16" else "f16"
-    plan = resolve_moe_stage2_compile_plan(
-        context=compile_context,
-        mode=mode,
-        return_per_slot=return_per_slot,
-        persist=persist,
-        token_num=token_num,
-        routing_block_count=int(sorted_expert_ids.shape[0]),
-        dtype_str=dtype_str,
-        use_mask=use_mask,
-        topk_ids_available=use_mask and topk_ids is not None,
-        num_experts=int(expert_mask.numel()) if use_mask else 0,
-        **stage2_builder_kwargs,
-    )
-    plan_launchers = _resolve_plan_launchers(plan, compile_context)
+        dtype_str = "bf16" if out_dtype == "bf16" else "f16"
+        plan = resolve_moe_stage2_compile_plan(
+            context=compile_context,
+            mode=mode,
+            accumulate=legacy_accumulate,
+            return_per_slot=return_per_slot,
+            persist=persist,
+            token_num=token_num,
+            routing_block_count=int(sorted_expert_ids.shape[0]),
+            dtype_str=dtype_str,
+            use_mask=use_mask,
+            topk_ids_available=use_mask and topk_ids is not None,
+            num_experts=int(expert_mask.numel()) if use_mask else 0,
+            **stage2_builder_kwargs,
+        )
+        plan_launchers = _resolve_plan_launchers(plan, compile_context)
+        roles, op_ids = [], []
 
-    def take_plan_launcher(op_id):
-        try:
-            return plan_launchers.pop(op_id)
-        except KeyError as error:
+        def take(op_id):
+            try:
+                launcher = plan_launchers.pop(op_id)
+            except KeyError as error:
+                raise RuntimeError(
+                    f"Stage2 CompilePlan did not resolve required unit {op_id}"
+                ) from error
+            op_ids.append(op_id)
+            return launcher
+
+        primary_op_id = (
+            MIXED_STAGE2_GEMM_OP_ID if legacy_use_mx_gemm else INT4_STAGE2_GEMM_OP_ID
+        )
+        roles.append(
+            MoeStage2Role.MIXED_GEMM.value
+            if legacy_use_mx_gemm
+            else MoeStage2Role.INT4_GEMM.value
+        )
+        _run_compiled(take(primary_op_id), args)
+        if not legacy_accumulate and not return_per_slot:
+            reduction_op_id = (
+                MASKED_REDUCTION_OP_ID if use_mask else PLAIN_REDUCTION_OP_ID
+            )
+            roles.append(
+                MoeStage2Role.MASKED_REDUCTION.value
+                if use_mask
+                else MoeStage2Role.PLAIN_REDUCTION.value
+            )
+            _run_moe_reduction(
+                take(reduction_op_id),
+                target,
+                out,
+                token_num,
+                topk,
+                model_dim,
+                expert_mask,
+                topk_ids,
+                launch_context,
+            )
+        if plan_launchers:
             raise RuntimeError(
-                f"Stage2 CompilePlan did not resolve required unit {op_id}"
-            ) from error
-
-    primary_op_id = MIXED_STAGE2_GEMM_OP_ID if use_mx_gemm else INT4_STAGE2_GEMM_OP_ID
-    exe = take_plan_launcher(primary_op_id)
-    _run_compiled(exe, args)
-
-    if not accumulate and not return_per_slot:
-        reduce_exe = take_plan_launcher(
-            MASKED_REDUCTION_OP_ID if use_mask else PLAIN_REDUCTION_OP_ID
-        )
-        _run_moe_reduction(
-            reduce_exe,
-            target,
-            out,
-            token_num,
-            topk,
-            model_dim,
-            expert_mask,
-            topk_ids,
-            launch_context,
-        )
-    if plan_launchers:
-        raise RuntimeError(
-            f"Stage2 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
-        )
+                f"Stage2 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
+            )
+        if operation_mode == "shadow":
+            _validate_stage2_shadow(operation_plan, roles, op_ids)
     return out
 
 

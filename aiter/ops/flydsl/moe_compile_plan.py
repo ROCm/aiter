@@ -44,12 +44,19 @@ from .moe_plan.stage1 import (
     Stage1GemmMetadata,
     resolve_moe_stage1_operation_plan,
 )
+from .moe_plan.stage2 import (
+    INT4_STAGE2_GEMM_OP_ID,
+    MASKED_REDUCTION_OP_ID,
+    MIXED_STAGE2_GEMM_OP_ID,
+    PLAIN_REDUCTION_OP_ID,
+    MoeStage2OperationCase,
+    MoeStage2Role,
+    Stage2GemmMetadata,
+    Stage2ReductionMetadata,
+    resolve_moe_stage2_operation_plan,
+)
 
 CKTILE_SWIGLU_AND_MUL_OP_ID = "aiter.flydsl.moe.stage1.cktile_swiglu_and_mul.v1"
-MIXED_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.mixed_gemm.v1"
-INT4_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.int4_gemm.v1"
-PLAIN_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.plain.v1"
-MASKED_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.masked.v1"
 SORTING_ONESHOT_OP_ID = "aiter.flydsl.moe.sorting.oneshot.v1"
 SORTING_P0V2_P23_OP_ID = "aiter.flydsl.moe.sorting.multiphase.p0v2_p23.v1"
 SORTING_4K_FUSED_OP_ID = "aiter.flydsl.moe.sorting.multiphase.k4_fused.v1"
@@ -65,6 +72,8 @@ __all__ = [
     "MoeCompilePlanCase",
     "MoeStage1OperationCase",
     "MoeStage1Role",
+    "MoeStage2OperationCase",
+    "MoeStage2Role",
     "MoeSortingCompileCase",
     "PLAIN_REDUCTION_OP_ID",
     "SORTING_4K_FUSED_OP_ID",
@@ -79,10 +88,13 @@ __all__ = [
     "resolve_moe_stage1_compile_plan",
     "resolve_moe_stage1_operation_plan",
     "resolve_moe_stage2_compile_plan",
+    "resolve_moe_stage2_operation_plan",
     "sorting_abi",
     "Stage1ExternalPostprocessMetadata",
     "Stage1FqMetadata",
     "Stage1GemmMetadata",
+    "Stage2GemmMetadata",
+    "Stage2ReductionMetadata",
     "stage1_abi",
     "stage2_abi",
 ]
@@ -422,28 +434,6 @@ def register_moe_sorting_ops(
     return registry
 
 
-def _stage2_primary_op(
-    plan: PlanBuilder,
-    operations: dict[str, CompileOp],
-    builder_kwargs: dict[str, Any],
-) -> CompileOp:
-    try:
-        a_dtype = builder_kwargs["a_dtype"]
-        b_dtype = builder_kwargs["b_dtype"]
-    except KeyError as error:
-        raise TypeError(
-            f"{plan.context}: missing required Stage2 argument: {error.args[0]}"
-        ) from error
-    if a_dtype in ("fp4", "fp8") and b_dtype in ("fp4", "fp8"):
-        return operations[MIXED_STAGE2_GEMM_OP_ID]
-    if a_dtype == "bf16" and b_dtype == "int4":
-        return operations[INT4_STAGE2_GEMM_OP_ID]
-    raise ValueError(
-        f"{plan.context}: unsupported Stage2 dtype combination: "
-        f"a_dtype={a_dtype!r}, b_dtype={b_dtype!r}"
-    )
-
-
 @plan_provider
 def resolve_moe_sorting_compile_plan(
     plan: PlanBuilder,
@@ -558,10 +548,9 @@ def resolve_moe_stage1_compile_plan(
     ).compile_projection()
 
 
-@plan_provider
 def resolve_moe_stage2_compile_plan(
-    plan: PlanBuilder,
     *,
+    context: CompileContext[Any],
     mode: str,
     accumulate: bool,
     return_per_slot: bool,
@@ -573,67 +562,17 @@ def resolve_moe_stage2_compile_plan(
     topk_ids_available: bool,
     num_experts: int,
     **builder_kwargs: Any,
-) -> None:
-    """Resolve one Stage2 GEMM and its optional top-k reduction.
-
-    Builder parameters bind directly to ``compile_flydsl_moe_stage2`` and
-    ``compile_flydsl_moe_reduction``. The explicit parameters above are graph
-    metadata that selects units or derives a builder value; they are not a
-    parallel copy of either callable schema.
-    """
-
+) -> CompilePlan:
+    """Compatibility compile projection of the Stage2 operation plan."""
     if "persist_m" in builder_kwargs:
-        raise TypeError(f"{plan.context}: persist_m is owned by the Stage2 provider")
-
-    operations = _operations()
-    primary = _stage2_primary_op(plan, operations, builder_kwargs)
-    requested = plan.bind(primary, persist_m=1)
-
-    for name in (
-        "model_dim",
-        "inter_dim",
-        "experts",
-        "topk",
-        "tile_m",
-        "tile_n",
-        "tile_k",
-    ):
-        value = requested[name]
-        plan.require(
-            not isinstance(value, bool) and isinstance(value, int) and value > 0,
-            f"{name} must be a positive integer, got {value!r}",
-            operation=primary,
-        )
-    plan.require(
-        isinstance(requested["doweight_stage2"], bool),
-        "doweight_stage2 must explicitly identify route-weight ownership",
-        operation=primary,
-    )
-    plan.require(
-        isinstance(requested["enable_bias"], bool),
-        f"enable_bias must be a bool, got {requested['enable_bias']!r}",
-        operation=primary,
-    )
-    plan.require(mode in ("atomic", "reduce"), f"unsupported Stage2 mode: {mode!r}")
-    plan.require(
-        isinstance(accumulate, bool),
-        f"accumulate must be a bool, got {accumulate!r}",
-        operation=primary,
-    )
-    plan.require(
-        isinstance(return_per_slot, bool),
-        f"return_per_slot must be a bool, got {return_per_slot!r}",
-        operation=primary,
-    )
+        raise TypeError("persist_m is owned by the Stage2 provider")
     expected_accumulate = mode != "reduce" and not return_per_slot
-    plan.require(
-        accumulate == expected_accumulate,
-        "accumulate disagrees with mode/return_per_slot: "
-        f"expected {expected_accumulate}, got {accumulate}",
-        operation=primary,
-    )
-
-    out_dtype = str(requested["out_dtype"]).lower()
+    if accumulate != expected_accumulate:
+        raise ValueError(
+            "accumulate disagrees with mode/return_per_slot: "
+            f"expected {expected_accumulate}, got {accumulate}"
+        )
+    out_dtype = str(builder_kwargs.get("out_dtype", "")).lower()
     expected_reduction_dtype = {
         "bf16": "bf16",
         "bfloat16": "bf16",
@@ -641,76 +580,26 @@ def resolve_moe_stage2_compile_plan(
         "fp16": "f16",
         "half": "f16",
     }.get(out_dtype)
-    plan.require(
-        expected_reduction_dtype is not None,
-        f"unsupported Stage2 output dtype: {requested['out_dtype']!r}",
-        operation=primary,
-    )
-    plan.require(
-        dtype_str == expected_reduction_dtype,
-        "reduction dtype must match Stage2 output dtype: "
-        f"expected {expected_reduction_dtype!r}, got {dtype_str!r}",
-        operation=primary,
-    )
-    plan.require(
-        not (primary.op_id == INT4_STAGE2_GEMM_OP_ID and requested["enable_bias"]),
-        "bf16×int4 Stage2 does not support bias",
-        operation=primary,
-    )
-
-    needs_reduction = not accumulate and not return_per_slot
-    plan.require(
-        isinstance(use_mask, bool),
-        f"use_mask must be a bool, got {use_mask!r}",
-    )
-    plan.require(
-        isinstance(topk_ids_available, bool),
-        f"topk_ids_available must be a bool, got {topk_ids_available!r}",
-    )
-    plan.require(
-        not isinstance(num_experts, bool) and isinstance(num_experts, int),
-        f"num_experts must be an integer, got {num_experts!r}",
-    )
-    if use_mask:
-        plan.require(needs_reduction, "masked reduction requires reduction output")
-        plan.require(
-            topk_ids_available,
-            "masked reduction requires top-k-id semantics",
+    if expected_reduction_dtype is not None and dtype_str != expected_reduction_dtype:
+        raise ValueError(
+            "reduction dtype must match Stage2 output dtype: "
+            f"expected {expected_reduction_dtype!r}, got {dtype_str!r}"
         )
-        plan.require(
-            num_experts > 0,
-            "masked reduction requires a positive global expert count",
-        )
-    else:
-        plan.require(
-            not topk_ids_available,
-            "top-k-id semantics are only valid for masked reduction",
-        )
-        plan.require(
-            num_experts == 0,
-            "plain reduction requires num_experts=0",
-        )
-
-    from .moe_kernels import resolve_stage2_persist_m
-
-    persist_m = resolve_stage2_persist_m(
-        token_num=token_num,
-        topk=requested["topk"],
-        experts=num_experts if use_mask else requested["experts"],
-        tile_m=requested["tile_m"],
-        sort_block_m=requested["sort_block_m"],
-        routing_block_count=routing_block_count,
+    case = MoeStage2OperationCase.from_kwargs(
+        builder_kwargs,
+        mode=mode,
+        return_per_slot=return_per_slot,
         persist=persist,
-        a_dtype=requested["a_dtype"],
+        token_num=token_num,
+        routing_block_count=routing_block_count,
+        use_mask=use_mask,
+        topk_ids_available=topk_ids_available,
+        num_experts=num_experts,
     )
-    plan.emit(requested, persist_m=persist_m)
-
-    if not needs_reduction:
-        return
-    reduction = operations[
-        MASKED_REDUCTION_OP_ID if use_mask else PLAIN_REDUCTION_OP_ID
-    ]
-    plan.emit(reduction)
+    return resolve_moe_stage2_operation_plan(
+        case,
+        context=context,
+    ).compile_projection()
 
 
 @plan_provider

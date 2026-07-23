@@ -8,11 +8,13 @@ from __future__ import annotations
 from contextlib import ExitStack
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
 from unittest import mock
 
+import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 _TEST_DIR = Path(__file__).resolve().parent
@@ -244,6 +246,82 @@ class TestStage2GoldenParity(unittest.TestCase):
                 "aiter.flydsl.moe.stage2.reduction.plain.v1",
             ],
         )
+
+    def test_operation_roles_drive_on_mode_once_and_provider_is_cpu_only(self) -> None:
+        recorder = _RequestRecorder()
+        fake_mode = FakeTensorMode()
+        with _recording_environment(), ExitStack() as stack:
+            _install_cuda_boundary_mocks(stack, recorder)
+            with _isolated_host_imports() as imports:
+                _install_boundary_mocks(stack, imports, recorder)
+                plan_module = importlib.import_module(
+                    "aiter.ops.flydsl.moe_compile_plan"
+                )
+                config = _case_config(
+                    imports,
+                    "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
+                    False,
+                    {},
+                )
+                values = _provider_kwargs(config, masked=False)
+                case = plan_module.MoeStage2OperationCase.from_kwargs(
+                    values,
+                    mode=values["mode"],
+                    return_per_slot=values["return_per_slot"],
+                    persist=values["persist"],
+                    token_num=values["token_num"],
+                    routing_block_count=values["routing_block_count"],
+                    use_mask=values["use_mask"],
+                    topk_ids_available=values["topk_ids_available"],
+                    num_experts=values["num_experts"],
+                )
+                forbidden = mock.Mock(side_effect=AssertionError("GPU boundary"))
+                with (
+                    mock.patch.object(torch.cuda, "current_stream", forbidden),
+                    mock.patch.object(torch.cuda, "get_device_properties", forbidden),
+                ):
+                    operation_plan = plan_module.resolve_moe_stage2_operation_plan(
+                        case,
+                        context=recorder.compile_context,
+                    )
+                    self.assertEqual(
+                        [node.role for node in operation_plan.nodes],
+                        [
+                            "moe.stage2.gemm.mixed",
+                            "moe.stage2.reduction.plain",
+                        ],
+                    )
+                    self.assertEqual(
+                        operation_plan.nodes[1].dependencies,
+                        ("gemm",),
+                    )
+                    forbidden.assert_not_called()
+
+                _clear_scenario_caches(imports)
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"AITER_FLYDSL_OPERATION_PLAN": "on"},
+                    ),
+                    mock.patch.object(
+                        imports.moe._STAGE2_RUNTIME_ADAPTERS,
+                        "lookup",
+                        wraps=imports.moe._STAGE2_RUNTIME_ADAPTERS.lookup,
+                    ) as lookup,
+                    fake_mode,
+                    recorder.scenario("runtime.stage2.operation_plan"),
+                ):
+                    _run_stage2(
+                        imports,
+                        "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
+                    )
+                self.assertEqual(
+                    [call.args[0] for call in lookup.call_args_list],
+                    [
+                        "moe.stage2.gemm.mixed",
+                        "moe.stage2.reduction.plain",
+                    ],
+                )
 
     def test_runtime_rejects_duplicate_and_unconsumed_units(self) -> None:
         recorder = _RequestRecorder()
