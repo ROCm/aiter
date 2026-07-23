@@ -552,7 +552,20 @@ class EpDispatchCombineOp:
             _bw = os.environ.get("SCATTER_COMB_BW")
             if _bw:
                 _b, _w = (int(x) for x in _bw.split(","))
-            combine_specs = [(_b, _w)]
+                combine_specs = [(_b, _w)]
+            elif cfg.is_fused:
+                # The fused combine is just an xdb cross-device barrier + a light
+                # per-(token,k) topk sum. At low token counts the barrier dominates
+                # and prefers FEW resident blocks (2x16); at high token counts the
+                # per-token sum wants more blocks (8x16). Precompile both and pick
+                # by token count at runtime (_combine_fused). Measured on EP4:
+                # bs16 2x16 beats 8x16 by ~1.7%, bs128 8x16 beats 2x16 by ~3.7%.
+                combine_specs = [(2, 16), (8, 16)]
+                self._fused_comb_lo = (2, 16)
+                self._fused_comb_hi = (8, 16)
+                self._fused_comb_thresh = 32
+            else:
+                combine_specs = [(_b, _w)]
         self._dispatch_specs = dispatch_specs
         self._combine_specs = combine_specs
 
@@ -1015,7 +1028,16 @@ class EpDispatchCombineOp:
         barrier (wait for peers' writes) + sum the topk slots per origin token."""
         stream = fx.Stream(torch.cuda.current_stream())
         count = routing.cur_rank_num_token
-        _, comb_spec = self._pick(count)
+        # Token-adaptive geometry: few blocks (barrier-bound) at low token counts,
+        # more blocks (sum-bound) at high token counts. Falls back to _pick when a
+        # single spec is compiled (e.g. SCATTER_COMB_BW pinned).
+        _thresh = getattr(self, "_fused_comb_thresh", None)
+        if _thresh is not None and self._fused_comb_lo in self._combine_variants:
+            comb_spec = (
+                self._fused_comb_lo if count <= _thresh else self._fused_comb_hi
+            )
+        else:
+            _, comb_spec = self._pick(count)
         self.combine_out.zero_()
         self._combine_variants[comb_spec](
             self.arena.handle,
