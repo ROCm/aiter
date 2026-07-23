@@ -317,13 +317,6 @@ if lane == c_zero:
     ...
 ```
 
-Keep explicit `arith.cmpi(...)` / `arith.unwrap(...)` for low-level manual MLIR construction, such as passing a raw condition to `scf.IfOp` directly:
-
-```python
-cond = arith.unwrap(partition_idx >= visible_tile_count)
-if_op = scf.IfOp(cond, has_else=False)
-```
-
 ### Frontend Semantic Restrictions
 When writing or reviewing `@flyc.kernel` / `@flyc.jit` code, proactively avoid these patterns because they can conflict with MLIR construction even if they look valid in plain Python.
 
