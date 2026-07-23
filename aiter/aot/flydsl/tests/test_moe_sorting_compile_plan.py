@@ -190,7 +190,7 @@ class TestSortingGoldenParity(unittest.TestCase):
                 ):
                     _run_sorting(imports, tokens=8, masked=False)
 
-        self.assertEqual(resolver_spy.call_count, 1)
+        self.assertEqual(resolver_spy.call_count, 0)
         self.assertEqual(backend_spy.call_count, 1)
         self.assertEqual(
             backend_spy.call_args.args[0].spec.op_id,

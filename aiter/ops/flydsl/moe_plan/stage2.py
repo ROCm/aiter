@@ -117,7 +117,12 @@ def _primary_op(
         raise TypeError(
             f"{plan.context}: missing required Stage2 argument: {error.args[0]}"
         ) from error
-    if a_dtype in ("fp4", "fp8") and b_dtype in ("fp4", "fp8"):
+    if (
+        a_dtype == "bf16"
+        and b_dtype in ("fp4", "mxfp4")
+        or a_dtype in ("fp4", "fp8")
+        and b_dtype in ("fp4", "mxfp4", "fp8")
+    ):
         return operations[MIXED_STAGE2_GEMM_OP_ID]
     if a_dtype == "bf16" and b_dtype == "int4":
         return operations[INT4_STAGE2_GEMM_OP_ID]
