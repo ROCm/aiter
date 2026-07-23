@@ -1,7 +1,6 @@
 """Tests for the FlyDSL HSTU attention backward kernel.
 
-Driven test-first per docs/2026-07-07_HSTU_backward_plan.md. The numerical
-oracle is torch.autograd.grad on the PyTorch reference torch_hstu_attention;
+The numerical oracle is torch.autograd.grad on the PyTorch reference torch_hstu_attention;
 dO is synthetic. The FlyDSL forward is only needed for the end-to-end autograd
 phase, so these tests do not depend on it.
 """
@@ -48,8 +47,7 @@ def hstu_bwd_reference(
 ):
     """Ground-truth (dq, dk, dv) via autograd on the torch reference.
 
-    Computed in fp32 for a clean oracle; the FlyDSL kernel runs in {f16,bf16}
-    and is compared with relaxed tolerances established in Phase 3.
+    Computed in fp32 for a clean oracle; the FlyDSL kernel runs in {f16,bf16}.
     """
     from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
 

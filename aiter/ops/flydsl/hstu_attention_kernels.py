@@ -9,7 +9,6 @@ from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
     build_hstu_attention_fwd,
 )
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
-    validate_hstu_attention_bwd,
     build_hstu_attention_bwd_dvdk,
     NUM_GRID_GROUPS,
 )
@@ -495,14 +494,10 @@ def _validate_bwd_inputs(
 # Backward tuned-config plumbing. The backward is two single-writer, fully
 # tile-parallel kernels: a fused dV+dK kernel (KV-owned, both reduce over the query
 # index and share one S recompute) and dQ (Q-owned, reduces over the key index).
-# dV and dK were once split into two single-family kernels to lift occupancy, but at
-# the deployment regime (d=64, N=16384) the fused kernel at a smaller occupancy-
-# preserving tile (num_waves=2, block_m=96) wins ~12-13% on dV+dK by paying one S
-# recompute instead of two (see docs/2026-07-13_more_ideas.md, Exp 5-7). The two
-# kernels have *different* optimal tile configs, so the tuned CSV carries a `kernel`
-# discriminator column ("dvdk" | "dq") and each resolves its own config
-# independently. There is no dQ read-modify-write to synchronize and thus no
-# sequence-parallel knob to tune.
+# The two kernels have *different* optimal tile configs, so the tuned CSV carries a `kernel`
+# discriminator column ("dvdk" | "dq") and each resolves its own config independently.
+# There is no dQ read-modify-write to synchronize and thus no sequence-parallel knob
+# to tune.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
 _BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
@@ -533,7 +528,7 @@ _BWD_TILE_COLUMNS = ("block_m", "block_n", "num_waves", "waves_per_eu")
 
 @functools.lru_cache()
 def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
-    def _parse_row(row: dict) -> Optional[tuple[tuple, float, dict]]:
+    def _parse_row(row: dict) -> tuple[tuple, float, dict]:
         required = set(_BWD_CSV_COLUMNS)
         if not required.issubset(row.keys()):
             raise KeyError(f"missing columns: {required - set(row.keys())}")
@@ -554,11 +549,9 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
         )
         kernel = row["kernel"].strip().lower()
         if kernel not in _BWD_KERNELS:
-            # A discriminator from a different kernel decomposition (e.g. the old
-            # split "dv"/"dk" rows now that dV+dK are fused into one "dvdk" kernel).
-            # Silently ignore rather than warn — the CSV can carry both while a
-            # retune is pending.
-            return None
+            raise ValueError(
+                f"unknown kernel discriminator {kernel!r} (expected one of {_BWD_KERNELS})"
+            )
         kernel_config = dict(
             block_m=int(row["block_m"]),
             block_n=int(row["block_n"]),
@@ -586,8 +579,6 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
                 )
                 continue
 
-            if parsed is None:  # row for a kernel discriminator this build doesn't use
-                continue
             problem_key, duration, kernel_config = parsed
 
             if duration <= 0.0:
@@ -670,12 +661,6 @@ def _get_bwd_default_config(kernel: str) -> dict:
     Per-kernel tuned CSV entries override them; the per-kernel win comes from the
     tuned CSV, whose entries are validated per shape.
 
-    The fused dV+dK kernel uses block_m=128 (vs dQ's 64): at block_m=64 the fused
-    kernel's two accumulator families collapse occupancy and it runs ~40% slower
-    than the old split kernels, whereas block_m=128 (same bn/num_waves, so same
-    divisibility contract — valid wherever block_m=64 is) is ~break-even. It is a
-    safe untuned default; the deployment win (num_waves=2, block_m=96) comes from
-    the tuned CSV.
     """
     if kernel == _BWD_KERNEL_DVDK:
         return dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=0)
