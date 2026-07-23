@@ -25,6 +25,14 @@ from .stage2 import (
     Stage2ReductionMetadata,
     resolve_moe_stage2_operation_plan,
 )
+from .sorting import (
+    SORTING_4K_FUSED_OP_ID,
+    SORTING_ONESHOT_OP_ID,
+    SORTING_P0V2_P23_OP_ID,
+    MoeSortingCompileCase,
+    MoeSortingRole,
+    resolve_moe_sorting_operation_plan,
+)
 
 __all__ = [
     "FQ_ACTIVATION_OP_ID",
@@ -38,6 +46,11 @@ __all__ = [
     "INT4_STAGE2_GEMM_OP_ID",
     "MASKED_REDUCTION_OP_ID",
     "PLAIN_REDUCTION_OP_ID",
+    "SORTING_4K_FUSED_OP_ID",
+    "SORTING_ONESHOT_OP_ID",
+    "SORTING_P0V2_P23_OP_ID",
+    "MoeSortingCompileCase",
+    "MoeSortingRole",
     "Stage1ExternalPostprocessMetadata",
     "Stage1FqMetadata",
     "Stage1GemmMetadata",
@@ -45,4 +58,5 @@ __all__ = [
     "Stage2ReductionMetadata",
     "resolve_moe_stage1_operation_plan",
     "resolve_moe_stage2_operation_plan",
+    "resolve_moe_sorting_operation_plan",
 ]

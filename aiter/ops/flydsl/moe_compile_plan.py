@@ -55,11 +55,16 @@ from .moe_plan.stage2 import (
     Stage2ReductionMetadata,
     resolve_moe_stage2_operation_plan,
 )
+from .moe_plan.sorting import (
+    SORTING_4K_FUSED_OP_ID,
+    SORTING_ONESHOT_OP_ID,
+    SORTING_P0V2_P23_OP_ID,
+    MoeSortingCompileCase,
+    MoeSortingRole,
+    resolve_moe_sorting_operation_plan,
+)
 
 CKTILE_SWIGLU_AND_MUL_OP_ID = "aiter.flydsl.moe.stage1.cktile_swiglu_and_mul.v1"
-SORTING_ONESHOT_OP_ID = "aiter.flydsl.moe.sorting.oneshot.v1"
-SORTING_P0V2_P23_OP_ID = "aiter.flydsl.moe.sorting.multiphase.p0v2_p23.v1"
-SORTING_4K_FUSED_OP_ID = "aiter.flydsl.moe.sorting.multiphase.k4_fused.v1"
 
 __all__ = [
     "CKTILE_SWIGLU_AND_MUL_OP_ID",
@@ -75,6 +80,7 @@ __all__ = [
     "MoeStage2OperationCase",
     "MoeStage2Role",
     "MoeSortingCompileCase",
+    "MoeSortingRole",
     "PLAIN_REDUCTION_OP_ID",
     "SORTING_4K_FUSED_OP_ID",
     "SORTING_ONESHOT_OP_ID",
@@ -85,6 +91,7 @@ __all__ = [
     "resolve_cktile_stage1_compile_plan",
     "resolve_moe_compile_plan",
     "resolve_moe_sorting_compile_plan",
+    "resolve_moe_sorting_operation_plan",
     "resolve_moe_stage1_compile_plan",
     "resolve_moe_stage1_operation_plan",
     "resolve_moe_stage2_compile_plan",
@@ -98,19 +105,6 @@ __all__ = [
     "stage1_abi",
     "stage2_abi",
 ]
-
-
-@dataclass(frozen=True)
-class MoeSortingCompileCase:
-    """Explicit CPU metadata for one independently cached sorting launcher."""
-
-    max_tokens: int
-    num_experts: int
-    topk: int
-    has_mask: bool
-    unit_size: int = 32
-    path: str | None = None
-    k4_block: int | None = None
 
 
 @dataclass(frozen=True)
@@ -434,58 +428,17 @@ def register_moe_sorting_ops(
     return registry
 
 
-@plan_provider
 def resolve_moe_sorting_compile_plan(
-    plan: PlanBuilder,
     case: MoeSortingCompileCase,
-) -> None:
-    """Resolve one explicit sorting case to exactly one concrete launcher."""
+    *,
+    context: CompileContext[Any],
+) -> CompilePlan:
+    """Compatibility compile projection of explicit sorting."""
 
-    if not isinstance(case, MoeSortingCompileCase):
-        raise TypeError(
-            f"{plan.context}: case must be a MoeSortingCompileCase, "
-            f"got {type(case).__name__}"
-        )
-    from .kernels.moe_sorting_kernel import (
-        SORTING_PATH_4K_FUSED,
-        SORTING_PATH_ONESHOT,
-        SORTING_PATH_P0V2_P23,
-        resolve_moe_sorting_specialization,
-    )
-
-    specialization = resolve_moe_sorting_specialization(
-        arch=plan.target.arch,
-        max_tokens=case.max_tokens,
-        num_experts=case.num_experts,
-        topk=case.topk,
-        unit_size=case.unit_size,
-        has_mask=case.has_mask,
-        path=case.path,
-        k4_block=case.k4_block,
-    )
-    operations = _sorting_operations()
-    if specialization.path == SORTING_PATH_ONESHOT:
-        plan.emit(
-            operations[SORTING_ONESHOT_OP_ID],
-            case,
-            max_tokens=specialization.launcher_max_tokens,
-        )
-    elif specialization.path == SORTING_PATH_P0V2_P23:
-        plan.emit(
-            operations[SORTING_P0V2_P23_OP_ID],
-            case,
-            k4_block=specialization.k4_block,
-        )
-    elif specialization.path == SORTING_PATH_4K_FUSED:
-        plan.emit(
-            operations[SORTING_4K_FUSED_OP_ID],
-            case,
-            k4_block=specialization.k4_block,
-        )
-    else:
-        raise RuntimeError(
-            f"{plan.context}: unhandled sorting path {specialization.path!r}"
-        )
+    return resolve_moe_sorting_operation_plan(
+        case,
+        context=context,
+    ).compile_projection()
 
 
 def resolve_moe_compile_plan(
