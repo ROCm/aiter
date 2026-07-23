@@ -74,7 +74,7 @@ def run_benchmark(args):
     x_vals_list = [tuple(args.shape)] if args.shape is not None else get_x_vals()
 
     benchmark = triton.testing.Benchmark(
-        x_names=["M", "N"],
+        x_names=["M", "n_half"],
         x_vals=x_vals_list,
         line_arg="unit",
         line_vals=[ylabel],
