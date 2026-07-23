@@ -30,6 +30,7 @@ Every sampler takes a ``torch.Generator`` so a fixed ``--seed`` reproduces the
 buffers bit-for-bit. ``constant`` init is operator-specific (fixed representable
 bytes) and stays in the individual test files.
 """
+
 import math
 
 import torch

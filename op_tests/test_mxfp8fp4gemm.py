@@ -77,8 +77,9 @@ def _const_mxfp8(rows: int, k: int, val: float) -> torch.Tensor:
     return torch.full((rows, k), val, dtype=torch.float32).to(torch.float8_e4m3fn)
 
 
-def _prep(intype: str, M: int, N: int, K: int, apre: int, data_init: str,
-          scale_init: str, gen):
+def _prep(
+    intype: str, M: int, N: int, K: int, apre: int, data_init: str, scale_init: str, gen
+):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
     DATA and SCALE are sampled *independently* (bench_init), selected by
@@ -122,8 +123,9 @@ def _prep(intype: str, M: int, N: int, K: int, apre: int, data_init: str,
 
 
 @benchmark()  # intype, M, N, K, apre, data_init, scale_init, ... -> table columns
-def test_gemm(intype, M, N, K, apre, data_init="uniform", scale_init="auto",
-              seed=0, mode="perf"):
+def test_gemm(
+    intype, M, N, K, apre, data_init="uniform", scale_init="auto", seed=0, mode="perf"
+):
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
 
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
@@ -287,8 +289,15 @@ def main():
     # (data_init,scale_init) within the single summary table.
     rows = [
         test_gemm(
-            intype, M, N, K, apre,
-            data_init=di, scale_init=si, seed=args.seed, mode=args.mode,
+            intype,
+            M,
+            N,
+            K,
+            apre,
+            data_init=di,
+            scale_init=si,
+            seed=args.seed,
+            mode=args.mode,
         )
         for (di, si), intype, (M, N, K), apre in itertools.product(
             init_pairs, args.intype, args.shape, args.apre
