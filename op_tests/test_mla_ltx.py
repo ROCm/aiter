@@ -153,7 +153,9 @@ def apply_config(
     decode_qlen: int = DECODE_QLEN,
 ) -> None:
     if q_dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
-        raise ValueError("fp8 Q with bf16 KV is not supported (see test_mla.py check_support)")
+        raise ValueError(
+            "fp8 Q with bf16 KV is not supported (see test_mla.py check_support)"
+        )
     global HARNESS
     HARNESS = Harness(q_dtype, kv_dtype, nhead, decode_qlen)
     _sync_module_aliases()
@@ -232,9 +234,7 @@ def co_name(persistent: bool, lse: bool, *, aiter_root: Path | None = None) -> s
             continue
         if row["ps"] == ps and row["lse"] == lse_flag and row["cprr"] == 0:
             return str(row["co_name"])
-    raise KeyError(
-        f"no csv row {HARNESS.summary()} ps={ps} lse={lse_flag} cprr=0"
-    )
+    raise KeyError(f"no csv row {HARNESS.summary()} ps={ps} lse={lse_flag} cprr=0")
 
 
 _co_name = co_name
@@ -385,9 +385,7 @@ def mla_decode_asm(
     kv_lens = torch.ones(BATCH_SIZE, dtype=torch.int, device="cuda")
     q = torch.randn((qlen, HARNESS.nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
     kv_bf16 = (
-        kv_buffer.to(torch.bfloat16)
-        if HARNESS.kv_dtype == dtypes.fp8
-        else kv_buffer
+        kv_buffer.to(torch.bfloat16) if HARNESS.kv_dtype == dtypes.fp8 else kv_buffer
     )
     ref = torch_mla_extend(
         q, kv_bf16, qo_indptr, kv_indptr, kv_indices, sm, torch.bfloat16, True
@@ -425,11 +423,19 @@ def mla_decode_asm(
 _decode = mla_decode_asm
 
 
-def run_point(kv_buffer, num_pages, page_base, ctx_len, *, persistent, return_lse, max_split):
+def run_point(
+    kv_buffer, num_pages, page_base, ctx_len, *, persistent, return_lse, max_split
+):
     qo, kv_i, kv_x = _make_indptr(ctx_len, page_base)
     ref, asm = mla_decode_asm(
-        kv_buffer, num_pages, qo, kv_i, kv_x,
-        persistent=persistent, return_lse=return_lse, max_split=max_split,
+        kv_buffer,
+        num_pages,
+        qo,
+        kv_i,
+        kv_x,
+        persistent=persistent,
+        return_lse=return_lse,
+        max_split=max_split,
     )
     return ref, asm, kv_x
 
@@ -440,14 +446,19 @@ _run_mla_decode_point = run_point
 def run_sequential(kv_buffer, num_pages, ctx_len, *, persistent, return_lse, max_split):
     qo, kv_i, kv_x = _make_indptr(ctx_len, None)
     ref, asm = mla_decode_asm(
-        kv_buffer, num_pages, qo, kv_i, kv_x,
-        persistent=persistent, return_lse=return_lse, max_split=max_split,
+        kv_buffer,
+        num_pages,
+        qo,
+        kv_i,
+        kv_x,
+        persistent=persistent,
+        return_lse=return_lse,
+        max_split=max_split,
     )
     return ref, asm, kv_x
 
 
 _run_mla_decode_sequential = run_sequential
-
 
 
 def _page_offset(page_id: int) -> int:
@@ -458,7 +469,9 @@ def _pool_bytes(num_pages: int) -> int:
     return num_pages * HARNESS.bytes_per_page
 
 
-def _need_num_pages(points: list[PointCase], seq: list[tuple[int, str]], ctx_override: int) -> int:
+def _need_num_pages(
+    points: list[PointCase], seq: list[tuple[int, str]], ctx_override: int
+) -> int:
     need = 10_000
     for c in points:
         ctx = ctx_override if ctx_override > 0 else c.ctx_len
@@ -468,7 +481,9 @@ def _need_num_pages(points: list[PointCase], seq: list[tuple[int, str]], ctx_ove
     return need + 1
 
 
-def _seed_ranges(points: list[PointCase], seq: list[tuple[int, str]], ctx_override: int):
+def _seed_ranges(
+    points: list[PointCase], seq: list[tuple[int, str]], ctx_override: int
+):
     ranges = []
     for c in points:
         ctx = ctx_override if ctx_override > 0 else c.ctx_len
@@ -490,12 +505,16 @@ def _filter_points(suite: str) -> list[PointCase]:
 
 
 # --- pytest ---
-_PYTEST_BOUNDARY = [(c.page_base, c.ctx_len, c.label) for c in _POINT_CASES if c.suite == "boundary"]
+_PYTEST_BOUNDARY = [
+    (c.page_base, c.ctx_len, c.label) for c in _POINT_CASES if c.suite == "boundary"
+]
 
 
 @pytest.fixture(scope="module")
 def kv_pool_boundary():
-    n = int(os.environ.get("MLA_PAGE_OOB_NUM_PAGES", str(PAGE_ID_FIRST_OVER_4G + 2_000)))
+    n = int(
+        os.environ.get("MLA_PAGE_OOB_NUM_PAGES", str(PAGE_ID_FIRST_OVER_4G + 2_000))
+    )
     ranges = _seed_ranges(
         [PointCase(b, c, l, "boundary") for b, c, l in _PYTEST_BOUNDARY], [], 0
     )
@@ -512,10 +531,18 @@ def kv_pool_boundary():
 @pytest.mark.parametrize("page_base,ctx_len,label", _PYTEST_BOUNDARY)
 @pytest.mark.parametrize("persistent", [True, False], ids=["ps", "nps"])
 @pytest.mark.parametrize("return_lse", [False, True], ids=["nolse", "lse"])
-def test_mla_qh64_co_boundary(kv_pool_boundary, page_base, ctx_len, label, persistent, return_lse):
+def test_mla_qh64_co_boundary(
+    kv_pool_boundary, page_base, ctx_len, label, persistent, return_lse
+):
     pool, n = kv_pool_boundary
     ref, asm, _ = run_point(
-        pool, n, page_base, ctx_len, persistent=persistent, return_lse=return_lse, max_split=1
+        pool,
+        n,
+        page_base,
+        ctx_len,
+        persistent=persistent,
+        return_lse=return_lse,
+        max_split=1,
     )
     tag = f"{label}_{co_name(persistent, return_lse)}"
     assert checkAllclose(ref, asm, msg=tag, rtol=3e-2, atol=3e-2) == 0, tag
@@ -535,7 +562,9 @@ def _select_cases(args) -> tuple[list[PointCase], list[tuple[int, str]]]:
         seq = []
     if args.page_base > 0:
         ctx = args.ctx if args.ctx > 0 else 1
-        points = [PointCase(args.page_base, ctx, f"page_id_{args.page_base}", "page16m")]
+        points = [
+            PointCase(args.page_base, ctx, f"page_id_{args.page_base}", "page16m")
+        ]
         seq = []
     if args.cases:
         want = {x.strip() for x in args.cases.split(",")}
@@ -545,8 +574,14 @@ def _select_cases(args) -> tuple[list[PointCase], list[tuple[int, str]]]:
 
 
 def _main():
-    p = argparse.ArgumentParser(description="MLA decode: large page_id / >4GB KV pool tests")
-    p.add_argument("--suite", choices=["boundary", "over4g", "pa_window", "mega", "page16m", "all"], default="all")
+    p = argparse.ArgumentParser(
+        description="MLA decode: large page_id / >4GB KV pool tests"
+    )
+    p.add_argument(
+        "--suite",
+        choices=["boundary", "over4g", "pa_window", "mega", "page16m", "all"],
+        default="all",
+    )
     p.add_argument(
         "-d",
         "--dtype",
@@ -605,7 +640,9 @@ def _main():
     points, seq = _select_cases(args)
 
     num_pages = int(
-        os.environ.get("MLA_PAGE_OOB_NUM_PAGES", str(_need_num_pages(points, seq, args.ctx)))
+        os.environ.get(
+            "MLA_PAGE_OOB_NUM_PAGES", str(_need_num_pages(points, seq, args.ctx))
+        )
     )
     print(
         f"config={HARNESS.summary()} suite={args.suite} pages={num_pages} "
@@ -654,14 +691,23 @@ def _main():
             for c in points:
                 ctx = args.ctx or c.ctx_len
                 ref, asm, kv_idx = run_point(
-                    kv, num_pages, c.page_base, ctx,
-                    persistent=persistent, return_lse=lse, max_split=args.num_kv_splits,
+                    kv,
+                    num_pages,
+                    c.page_base,
+                    ctx,
+                    persistent=persistent,
+                    return_lse=lse,
+                    max_split=args.num_kv_splits,
                 )
                 report_point(c.label, c.page_base, ctx, ref, asm, kv_idx)
             for ctx, label in seq:
                 ref, asm, kv_idx = run_sequential(
-                    kv, num_pages, ctx,
-                    persistent=persistent, return_lse=lse, max_split=args.num_kv_splits,
+                    kv,
+                    num_pages,
+                    ctx,
+                    persistent=persistent,
+                    return_lse=lse,
+                    max_split=args.num_kv_splits,
                 )
                 report_seq(label, ctx, ref, asm, kv_idx)
 
@@ -672,4 +718,4 @@ def _main():
 if __name__ == "__main__":
     raise SystemExit(_main())
 
-#test command:python op_tests/test_mla_ltx.py   --page-base 16999216 --ctx 1   -d fp8 -kvd fp8 -n 16,1   --ps ps --lse off
+# test command:python op_tests/test_mla_ltx.py   --page-base 16999216 --ctx 1   -d fp8 -kvd fp8 -n 16,1   --ps ps --lse off
