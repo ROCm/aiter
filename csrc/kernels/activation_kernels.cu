@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+#if defined(_WIN32)
+// hipcc pre-includes <cmath>, so include UCRT <math.h> after enabling its M_* constants.
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#include <math.h>
+#endif
 #include <cmath>
 
 #include "aiter_hip_common.h"
@@ -667,11 +674,7 @@ __device__ __forceinline__ float gelu_kernel(const T& x)
     // Refer to:
     // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
     const float f         = opus::cast<float>(x);
-#if defined(_WIN32)
-    constexpr float ALPHA = 0.70710678118654752440f; // 1 / sqrt(2)
-#else
     constexpr float ALPHA = M_SQRT1_2;
-#endif
     return f * 0.5f * (1.0f + ::erf(f * ALPHA));
 }
 
@@ -682,11 +685,7 @@ __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
     // Refer to:
     // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L25-L30
     const float f         = opus::cast<float>(x);
-#if defined(_WIN32)
-    constexpr float BETA  = 0.79788456080286535588f; // sqrt(2 / pi)
-#else
     constexpr float BETA  = M_SQRT2 * M_2_SQRTPI * 0.5f;
-#endif
     constexpr float KAPPA = 0.044715;
     float x_cube          = f * f * f;
     float inner           = BETA * (f + KAPPA * x_cube);
