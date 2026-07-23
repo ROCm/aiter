@@ -29,8 +29,6 @@ __global__ void gqa_d128_kernel(opus_gqa_kargs kargs);
 template <class Traits>
 __global__ void gqa_d128_kernel(opus_gqa_kargs) {}
 #else
-// Pulls in opus + the full kernel template (le2 fast path, runtime OddTail
-// dispatch, arbitrary seqlen via OOB buffer bounds + post-QK -inf masking).
 #include "fmha_fwd_hd128_bf16_opus_kernel.hpp"
 #endif
 
