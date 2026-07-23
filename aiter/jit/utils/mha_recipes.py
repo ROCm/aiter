@@ -1,13 +1,19 @@
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
+
+
+def _ck_targets_flag_for_arch(gfx: str) -> str:
+    if gfx.startswith("gfx9"):
+        return ""
+    return f" --targets {gfx}"
 
 
 def _ck_targets_flag() -> str:
     """Return ``--targets <runtime arch>`` when the runtime GPU is not gfx9.
 
     ck-tile's ``generate.py`` defaults to ``--targets gfx9,gfx950``, so any
-    non-gfx9 host (gfx10/11/12) ends up with an empty kernel set and ``mha_fwd``
-    fails at dispatch with "invalid argument for fmha_fwd". For gfx9 hosts we
-    keep the default (covers both gfx942 and gfx950 like before).
+    RDNA host (gfx11/12) ends up with an empty kernel set and ``mha_fwd`` fails
+    at dispatch with "invalid argument for fmha_fwd". For gfx9 hosts we keep
+    the default (covers both gfx942 and gfx950 like before).
     """
     try:
         from .chip_info import get_gfx
@@ -18,9 +24,7 @@ def _ck_targets_flag() -> str:
         gfx = get_gfx()
     except Exception:
         return ""
-    if gfx.startswith("gfx9"):
-        return ""
-    return f" --targets {gfx}"
+    return _ck_targets_flag_for_arch(gfx)
 
 
 def compose_mha_fwd_variant_suffix_and_filter(

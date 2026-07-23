@@ -39,7 +39,12 @@ GFX_MAP = {
 GFX_CU_NUM_MAP = {
     "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
     "gfx950": 256,  # MI350
+    "gfx1100": 96,  # Radeon RX 7900 XTX
+    "gfx1101": 60,  # Radeon RX 7800 XT
+    "gfx1102": 32,  # Radeon RX 7600
+    "gfx1103": 12,  # Radeon 780M
     "gfx1151": 20,  # Strix Halo / Radeon 8060S
+    "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
 }
 

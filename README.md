@@ -104,6 +104,23 @@ If you happen to forget the `--recursive` during `clone`, you can use the follow
 git submodule sync && git submodule update --init --recursive
 ```
 
+### Native Windows ROCm (experimental)
+
+Windows keeps the Triton-only installation mode by default. To build the HIP
+and Composable Kernel extensions, opt in with `AITER_ENABLE_HIP=1`. Native GPU
+detection supports gfx1100 through gfx1103, gfx1151, and gfx1201; `GPU_ARCHS`
+can be set explicitly for an offline or cross build.
+
+```powershell
+$env:AITER_ENABLE_HIP = "1"
+$env:GPU_ARCHS = "gfx1100" # optional when building on the target GPU
+python -m pip install --no-build-isolation .
+```
+
+GPU models sharing an architecture can expose different CU counts. When
+cross-building for a binned model, set `CU_NUM` to the target device's actual
+compute-unit count.
+
 ### FlyDSL
 
 AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
