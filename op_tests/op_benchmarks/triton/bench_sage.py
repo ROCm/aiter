@@ -17,7 +17,11 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
+from aiter.ops.mha import (
+    flash_attn_func,
+    flash_attn_fp8_pertensor_func,
+    flash_attn_i8fp8_pertensor_func,
+)
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
@@ -63,16 +67,25 @@ KernelName = Literal[
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_fp8",
+    "aiter_i8fp8",
     "aiter_bf16",
 ]
 
 ALL_KERNELS: List[str] = [
     "sage_fp8",
     "sage_mxfp4",
-    "fav3_fp8",
     "aiter_fp8",
+    "aiter_i8fp8",
     "aiter_bf16",
 ]
+
+FP8_CHECK_KERNELS = {
+    "sage_fp8",
+    "sage_mxfp4",
+    "fav3_fp8",
+    "aiter_fp8",
+    "aiter_i8fp8",
+}
 
 
 @dataclass
@@ -92,6 +105,21 @@ class LoadedMask:
     batch: int
     num_q_blocks: int
     num_kv_blocks: int
+
+
+@dataclass
+class AccuracyMetrics:
+    mae: float
+    maxe: float
+    cosine: float
+
+
+@dataclass
+class AllKernelRow:
+    kernel: str
+    ms: float
+    tflops: float
+    accuracy: Optional[AccuracyMetrics] = None
 
 
 def layout_preprocess(
@@ -114,6 +142,70 @@ def primary_output(result: Any) -> Any:
     if isinstance(result, (tuple, list)) and len(result) > 0:
         return result[0]
     return result
+
+
+def generate_test_tensors(
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    d_head: int,
+    d_head_v: int,
+    dtype: torch.dtype,
+    device: str,
+    distribution: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if distribution == "normal":
+        q = torch.randn((batch, hq, sq, d_head), device=device, dtype=dtype)
+        k = torch.randn((batch, hk, sk, d_head), device=device, dtype=dtype)
+        v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=dtype)
+        return q, k, v
+
+    if distribution != "transformer":
+        raise ValueError(f"Unsupported input distribution: {distribution}")
+
+    q = torch.randn((batch, hq, sq, d_head), device=device, dtype=torch.float32)
+    k = torch.randn((batch, hk, sk, d_head), device=device, dtype=torch.float32)
+    v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=torch.float32)
+
+    q = q / q.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    k = k / k.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+    v = v / v.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
+
+    q_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hq, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    k_channel_scale = torch.exp(
+        0.35 * torch.randn((1, hk, 1, d_head), device=device)
+    ).clamp(0.35, 2.5)
+    v_channel_scale = torch.exp(
+        0.45 * torch.randn((1, hk, 1, d_head_v), device=device)
+    ).clamp(0.25, 3.5)
+    q = q * q_channel_scale
+    k = k * k_channel_scale
+    v = v * v_channel_scale
+
+    shared_heads = min(hq, hk)
+    shared_seq = min(sq, sk)
+    shared_d = min(d_head, d_head_v)
+    if shared_heads > 0 and shared_seq > 0:
+        shared = torch.randn(
+            (batch, shared_heads, shared_seq, shared_d),
+            device=device,
+            dtype=torch.float32,
+        )
+        q[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+        k[:, :shared_heads, :shared_seq, :shared_d] += 0.35 * shared
+
+    num_v_outlier_dims = max(1, d_head_v // 16)
+    v_outlier_dims = torch.randperm(d_head_v, device=device)[:num_v_outlier_dims]
+    v[..., v_outlier_dims] *= 4.0
+    num_v_outlier_tokens = max(1, sk // 128)
+    v_outlier_tokens = torch.randperm(sk, device=device)[:num_v_outlier_tokens]
+    v[:, :, v_outlier_tokens, :] *= 2.5
+
+    return q.to(dtype), k.to(dtype), v.to(dtype)
 
 
 def infer_shape_spec(
@@ -342,6 +434,37 @@ def fp8_quantize(
         dtypeMax=torch.finfo(quant_dtype).max,
     )
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
+
+
+def i8fp8_quantize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_clip: float = 0.8,
+    k_clip: float = 0.8,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Quantize Q/K to int8, V to fp8 (Sage-style)."""
+    # Q -> int8
+    q_amax = torch.abs(q).max() * q_clip
+    q_scale = q_amax / 127.0
+    q_int8 = torch.clamp(torch.round(q / q_scale), -128, 127).to(torch.int8)
+    q_descale = q_scale.reshape(1).to(torch.float32)
+    # K -> int8
+    k_amax = torch.abs(k).max() * k_clip
+    k_scale = k_amax / 127.0
+    k_int8 = torch.clamp(torch.round(k / k_scale), -128, 127).to(torch.int8)
+    k_descale = k_scale.reshape(1).to(torch.float32)
+    # V -> fp8
+    quant_dtype = aiter.dtypes.fp8
+    v_quant, v_descale = aiter.per_tensor_quant(
+        v,
+        scale=torch.abs(v).max(),
+        quant_dtype=quant_dtype,
+        dtypeMax=torch.finfo(quant_dtype).max,
+    )
+    return q_int8, k_int8, v_quant, q_descale, k_descale, v_descale
 
 
 def _unpack_block_lut(
@@ -621,7 +744,11 @@ def make_kernel_runner(
     if args.kernel == "aiter_fp8":
 
         def _run_aiter_fp8():
-            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(q_bshd, k_bshd, v_bshd)
+            q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+            )
             return flash_attn_fp8_pertensor_func(
                 q_fp8,
                 k_fp8,
@@ -635,11 +762,53 @@ def make_kernel_runner(
             return _run_aiter_fp8
 
         q_fp8, k_fp8, v_fp8, q_descale, k_descale, v_descale = fp8_quantize(
-            q_bshd, k_bshd, v_bshd
+            q_bshd,
+            k_bshd,
+            v_bshd,
         )
         return lambda: flash_attn_fp8_pertensor_func(
             q_fp8,
             k_fp8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+
+    if args.kernel == "aiter_i8fp8":
+        q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
+        k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
+
+        def _run_aiter_i8fp8():
+            q_i8, k_i8, v_fp8, q_ds, k_ds, v_ds = i8fp8_quantize(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                q_clip=q_clip,
+                k_clip=k_clip,
+            )
+            return flash_attn_i8fp8_pertensor_func(
+                q_i8,
+                k_i8,
+                v_fp8,
+                q_descale=q_ds,
+                k_descale=k_ds,
+                v_descale=v_ds,
+            )
+
+        if args.e2e:
+            return _run_aiter_i8fp8
+
+        q_i8, k_i8, v_fp8, q_descale, k_descale, v_descale = i8fp8_quantize(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            q_clip=q_clip,
+            k_clip=k_clip,
+        )
+        return lambda: flash_attn_i8fp8_pertensor_func(
+            q_i8,
+            k_i8,
             v_fp8,
             q_descale=q_descale,
             k_descale=k_descale,
@@ -668,6 +837,46 @@ def to_bshd_output_if_needed(
     return out
 
 
+def compute_accuracy_metrics(
+    current: torch.Tensor,
+    reference: torch.Tensor,
+) -> AccuracyMetrics:
+    current_f = current.float()
+    reference_f = reference.float()
+    abs_diff = (current_f - reference_f).abs()
+    cosine = torch.nn.functional.cosine_similarity(
+        current_f.flatten(), reference_f.flatten(), dim=0
+    ).item()
+    return AccuracyMetrics(
+        mae=abs_diff.mean().item(),
+        maxe=abs_diff.max().item(),
+        cosine=cosine,
+    )
+
+
+def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
+    if args.input_distribution == "transformer":
+        return 2.0
+    return 0.5
+
+
+def check_output_against_reference(
+    args: argparse.Namespace,
+    current: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    compare_accuracy(current, reference)
+    if args.kernel in FP8_CHECK_KERNELS:
+        check_attention_outputs(
+            current,
+            reference,
+            fp8=True,
+            max_diff_percentage=fp8_max_diff_percentage(args),
+        )
+    else:
+        check_attention_outputs(current, reference, fp8=False)
+
+
 def make_reference_output(
     args: argparse.Namespace,
     q: torch.Tensor,
@@ -678,7 +887,7 @@ def make_reference_output(
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
     )
-    ref = args.ref or "torch"
+    ref = args.ref
 
     if block_attn_mask is not None:
         if ref != "torch":
@@ -758,14 +967,7 @@ def benchmark_single_case(
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
-        compare_accuracy(current_primary, ref_primary)
-        if args.kernel == "sage_mxfp4":
-            # MXFP4 is numerically noisier than BF16/FP32 and needs looser checks.
-            check_attention_outputs(
-                current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1
-            )
-        else:
-            check_attention_outputs(current_primary, ref_primary, fp8=False)
+        check_output_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
         2.0
@@ -776,14 +978,24 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in ("fav3_fp8", "aiter_fp8", "sage_fp8", "sage_mxfp4"):
+    if args.kernel in (
+        "fav3_fp8",
+        "aiter_fp8",
+        "aiter_i8fp8",
+        "sage_fp8",
+        "sage_mxfp4",
+    ):
         q_elem_size = 1
         k_elem_size = 1
     else:
         q_elem_size = q.element_size()
         k_elem_size = k.element_size()
 
-    v_elem_size = 1 if args.kernel in ("fav3_fp8", "aiter_fp8") else v.element_size()
+    v_elem_size = (
+        1
+        if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8")
+        else v.element_size()
+    )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
 
     sparse_flops = None
@@ -961,18 +1173,22 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
 
-    if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
+    if args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel == "all":
         if args.block_sparsity is not None or args.block_mask_file:
             raise ValueError("--kernel=all does not support block-sparse mode")
-        if args.compare_to_ref:
-            raise ValueError("--kernel=all does not support --compare-to-ref")
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
 
-    _quantized_kernels = ("sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8")
+    _quantized_kernels = (
+        "sage_fp8",
+        "sage_mxfp4",
+        "fav3_fp8",
+        "aiter_fp8",
+        "aiter_i8fp8",
+    )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
@@ -1006,9 +1222,18 @@ def run_benchmark_generated(
         provider,
         device="cuda",
     ):
-        q = torch.randn((BATCH, HQ, N_CTX_Q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, HK, N_CTX_K, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
+        q, k, v = generate_test_tensors(
+            BATCH,
+            HQ,
+            HK,
+            N_CTX_Q,
+            N_CTX_K,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            device,
+            args.input_distribution,
+        )
 
         q.requires_grad = False
         k.requires_grad = False
@@ -1077,10 +1302,17 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
         n_ctx_q = loaded.num_q_blocks * block_m
         n_ctx_k = loaded.num_kv_blocks * block_n
 
-        q = torch.randn((loaded.batch, HQ, n_ctx_q, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((loaded.batch, HK, n_ctx_k, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn(
-            (loaded.batch, HK, n_ctx_k, D_HEAD_V), device=device, dtype=dtype
+        q, k, v = generate_test_tensors(
+            loaded.batch,
+            HQ,
+            HK,
+            n_ctx_q,
+            n_ctx_k,
+            D_HEAD,
+            D_HEAD_V,
+            dtype,
+            device,
+            args.input_distribution,
         )
         q.requires_grad = False
         k.requires_grad = False
@@ -1117,9 +1349,18 @@ def run_block_sparse_repetitions(
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
 
-    q = torch.randn((args.b, args.hq, args.sq, args.d), device=device, dtype=dtype)
-    k = torch.randn((args.b, args.hk, args.sk, args.d), device=device, dtype=dtype)
-    v = torch.randn((args.b, args.hk, args.sk, args.dv), device=device, dtype=dtype)
+    q, k, v = generate_test_tensors(
+        args.b,
+        args.hq,
+        args.hk,
+        args.sq,
+        args.sk,
+        args.d,
+        args.dv,
+        dtype,
+        device,
+        args.input_distribution,
+    )
     q.requires_grad = False
     k.requires_grad = False
     v.requires_grad = False
@@ -1276,6 +1517,7 @@ def parse_args() -> argparse.Namespace:
             "sage_mxfp4",
             "fav3_fp8",
             "aiter_fp8",
+            "aiter_i8fp8",
             "aiter_bf16",
             "all",
         ],
@@ -1295,7 +1537,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--layout", type=str, default="bshd", choices=["bshd", "bhsd"])
     parser.add_argument("--causal", action="store_true", help="Enable causal attention")
-
+    parser.add_argument(
+        "--input-distribution",
+        type=str,
+        default="transformer",
+        choices=["normal", "transformer"],
+        help="Distribution used for generated Q/K/V tensors",
+    )
+    parser.add_argument(
+        "--qk-clip",
+        type=float,
+        default=1.0,
+        help="Clip factor applied to Q and K absmax before int8 quantization for aiter_i8fp8",
+    )
+    parser.add_argument(
+        "--q-clip",
+        type=float,
+        default=None,
+        help="Optional Q-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for Q",
+    )
+    parser.add_argument(
+        "--k-clip",
+        type=float,
+        default=None,
+        help="Optional K-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for K",
+    )
     parser.add_argument(
         "--metric",
         type=str,
@@ -1317,14 +1583,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--compare-to-ref", action="store_true", help="Compare against reference"
-    )
-    parser.add_argument(
         "--ref",
         type=str,
-        default="torch",
+        default="aiter_bf16",
         choices=["torch", "aiter_bf16"],
-        help="Reference kernel for --compare-to-ref",
+        help="Reference kernel for accuracy metrics/checks. --kernel=all reports MAE/MaxE/Cosine against this reference.",
+    )
+    parser.add_argument(
+        "--compare-to-ref",
+        action="store_true",
+        help="Run correctness checks against the selected --ref",
     )
 
     parser.add_argument(
@@ -1394,7 +1662,16 @@ def parse_args() -> argparse.Namespace:
         help="do_bench warmup time in ms",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    for name in (
+        "qk_clip",
+        "q_clip",
+        "k_clip",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be > 0")
+    return args
 
 
 def print_vgpr_from_bench(runner: Any) -> None:
@@ -1460,6 +1737,66 @@ def print_vgpr_from_bench(runner: Any) -> None:
         print("No VGPR metadata found in Triton dump output.")
 
 
+def benchmark_all_kernel_row(
+    args: argparse.Namespace,
+    kernel_name: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    total_flops: float,
+    ref_primary: Optional[torch.Tensor],
+) -> AllKernelRow:
+    saved_kernel = args.kernel
+    args.kernel = kernel_name
+    try:
+        fn = make_kernel_runner(args, q, k, v, block_lut=None)
+        ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
+        tflops = total_flops / ms * 1e-9
+        accuracy = None
+        if ref_primary is not None:
+            current_primary = primary_output(fn())
+            current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+            accuracy = compute_accuracy_metrics(current_primary, ref_primary)
+        return AllKernelRow(kernel_name, ms, tflops, accuracy)
+    finally:
+        args.kernel = saved_kernel
+
+
+def skipped_all_kernel_row(kernel_name: str) -> AllKernelRow:
+    return AllKernelRow(kernel_name, float("nan"), float("nan"), None)
+
+
+def print_all_kernel_table(
+    rows: List[AllKernelRow],
+    include_accuracy: bool,
+) -> None:
+    if not include_accuracy:
+        print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
+        print("-" * 38)
+        for row in rows:
+            if row.ms != row.ms:  # nan
+                print(f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10}")
+            else:
+                print(f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f}")
+        return
+
+    print(
+        f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10} {'MAE':>12} {'MaxE':>12} {'Cosine':>12}"
+    )
+    print("-" * 78)
+    for row in rows:
+        if row.ms != row.ms or row.accuracy is None:  # nan or failed accuracy run
+            print(
+                f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10} {'SKIP':>12} {'SKIP':>12} {'SKIP':>12}"
+            )
+        else:
+            print(
+                f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f} "
+                f"{row.accuracy.mae:>12.3e} {row.accuracy.maxe:>12.3e} "
+                f"{row.accuracy.cosine:>12.6f}"
+            )
+
+
 def run_all_kernels(args: argparse.Namespace) -> None:
     """Run all backends on the same QKV inputs and print a comparison table."""
     dtype = arg_to_torch_dtype[args.dtype]
@@ -1469,15 +1806,25 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     d_head = args.d if args.d else 128
     d_head_v = args.dv if args.dv else d_head
 
-    q = torch.randn((args.b, args.hq, args.sq, d_head), device=device, dtype=dtype)
-    k = torch.randn((args.b, hk, sk, d_head), device=device, dtype=dtype)
-    v = torch.randn((args.b, hk, sk, d_head_v), device=device, dtype=dtype)
+    q, k, v = generate_test_tensors(
+        args.b,
+        args.hq,
+        hk,
+        args.sq,
+        sk,
+        d_head,
+        d_head_v,
+        dtype,
+        device,
+        args.input_distribution,
+    )
     q.requires_grad = False
     k.requires_grad = False
     v.requires_grad = False
     q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=args.layout)
 
     shape = infer_shape_spec(q, v, args.layout)
+    ref_primary = make_reference_output(args, q, k, v, block_attn_mask=None).float()
     total_flops = (
         2.0
         * shape.batch
@@ -1487,32 +1834,29 @@ def run_all_kernels(args: argparse.Namespace) -> None:
         * (shape.d_head + shape.d_head_v)
     )
 
-    saved_kernel = args.kernel
-    rows: List[Tuple[str, float, float]] = []
+    rows: List[AllKernelRow] = []
 
     for kernel_name in ALL_KERNELS:
-        args.kernel = kernel_name
         try:
-            fn = make_kernel_runner(args, q, k, v, block_lut=None)
-            ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
-            tflops = total_flops / ms * 1e-9
-            rows.append((kernel_name, ms, tflops))
+            rows.append(
+                benchmark_all_kernel_row(
+                    args,
+                    kernel_name,
+                    q,
+                    k,
+                    v,
+                    total_flops,
+                    ref_primary,
+                )
+            )
         except Exception as e:
             logger.warning("Skipping %s: %s", kernel_name, e)
-            rows.append((kernel_name, float("nan"), float("nan")))
-
-    args.kernel = saved_kernel
+            rows.append(skipped_all_kernel_row(kernel_name))
 
     print(
-        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head}):"
+        f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head} input={args.input_distribution}):"
     )
-    print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
-    print("-" * 38)
-    for name, ms, tflops in rows:
-        if ms != ms:  # nan
-            print(f"{name:<16} {'SKIP':>10} {'SKIP':>10}")
-        else:
-            print(f"{name:<16} {ms:>10.4f} {tflops:>10.2f}")
+    print_all_kernel_table(rows, include_accuracy=True)
 
 
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
