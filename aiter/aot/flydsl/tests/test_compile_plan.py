@@ -27,10 +27,17 @@ ArgumentKind = compile_plan.ArgumentKind
 CompileContext = compile_plan.CompileContext
 CompileOpRegistry = compile_plan.CompileOpRegistry
 KernelSignature = compile_plan.KernelSignature
+OperationNode = compile_plan.OperationNode
+OperationOutput = compile_plan.OperationOutput
+OperationOutputKind = compile_plan.OperationOutputKind
+OperationPlan = compile_plan.OperationPlan
+OperationWorkspace = compile_plan.OperationWorkspace
 PlanBuilder = compile_plan.PlanBuilder
 RocmTarget = compile_plan.RocmTarget
 SignatureArg = compile_plan.SignatureArg
+WorkspaceLifetime = compile_plan.WorkspaceLifetime
 op = compile_plan.op
+operation_plan_provider = compile_plan.operation_plan_provider
 plan_provider = compile_plan.plan_provider
 
 _OP_ID = "aiter.flydsl.test.builder.v1"
@@ -322,6 +329,102 @@ class TestDeclarationsAndRegistry(unittest.TestCase):
             (("rows", 1024), ("tile", 64), ("compile_target", _target())),
         )
         self.assertEqual(registry.compile_plan(first), ((1024, 64, _target()),))
+
+
+class TestOperationPlanCore(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registry = CompileOpRegistry()
+
+        def compiler(rows: int, compile_target=None):
+            return rows, compile_target
+
+        self.operation = op(
+            _OP_ID,
+            compiler,
+            abi=KernelSignature(()),
+            target_kw="compile_target",
+        )
+
+    def test_projection_preserves_bound_nodes_and_runtime_only_nodes(self) -> None:
+        builder = PlanBuilder(_context(self.registry))
+        gemm = builder.emit_node(
+            "gemm",
+            "test.gemm",
+            self.operation,
+            outputs=(OperationOutput("partial", OperationOutputKind.INTERMEDIATE),),
+            workspaces=(OperationWorkspace("scratch", WorkspaceLifetime.PLAN),),
+            compile_overrides={"rows": 32},
+        )
+        post = builder.emit_node(
+            "post",
+            "test.external_post",
+            dependencies=(gemm.node_id,),
+            outputs=(OperationOutput("result", OperationOutputKind.FINAL),),
+            runtime_metadata=("silu", False),
+        )
+
+        plan = builder.build_operation_plan(("synthetic", 32))
+
+        self.assertEqual(plan.nodes, (gemm, post))
+        self.assertEqual(plan.compile_projection().units, (gemm.binding.unit,))
+        self.assertIsNone(post.binding)
+        hash(plan)
+        with self.assertRaises(FrozenInstanceError):
+            plan.nodes = ()
+
+    def test_rejects_duplicate_or_forward_dependencies(self) -> None:
+        node = OperationNode("gemm", "test.gemm")
+        invalid = (
+            (
+                lambda: OperationPlan(_target(), "case", (node, node)),
+                "duplicate operation node_id",
+            ),
+            (
+                lambda: OperationPlan(
+                    _target(),
+                    "case",
+                    (
+                        OperationNode(
+                            "post",
+                            "test.post",
+                            dependencies=("gemm",),
+                        ),
+                        node,
+                    ),
+                ),
+                "earlier nodes",
+            ),
+        )
+        for construct, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    construct()
+
+    def test_rejects_compile_units_emitted_outside_nodes(self) -> None:
+        builder = PlanBuilder(_context(self.registry))
+        builder.emit(self.operation, rows=32)
+        builder.emit_node("post", "test.post")
+
+        with self.assertRaisesRegex(RuntimeError, "outside OperationNode"):
+            builder.build_operation_plan("case")
+
+    def test_operation_provider_has_explicit_case_identity(self) -> None:
+        @operation_plan_provider
+        def provider(plan: PlanBuilder, case: tuple[str, int]) -> None:
+            plan.emit_node(
+                "kernel",
+                "test.kernel",
+                self.operation,
+                compile_overrides={"rows": case[1]},
+            )
+
+        resolved = provider(("rows", 64), context=_context(self.registry))
+
+        self.assertEqual(resolved.case_id, ("rows", 64))
+        self.assertEqual(
+            dict(resolved.compile_projection().units[0].spec.call.arguments)["rows"],
+            64,
+        )
 
 
 if __name__ == "__main__":
