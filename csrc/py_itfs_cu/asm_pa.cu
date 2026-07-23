@@ -181,6 +181,10 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
             hipStream_t stream)
 {
     int batch            = context_lens->size(0);
+    if(max_qlen > 1)
+    {
+        batch = block_tables->size(0);
+    }
     std::string arch_id = get_gpu_arch();
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);

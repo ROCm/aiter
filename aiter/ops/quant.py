@@ -129,6 +129,31 @@ def per_1x32_f4_quant(
         ``(quantized_tensor, scale_tensor)``.
     """
     assert quant_dtype == dtypes.fp4x2
+
+    # For large (>4 GiB) >=3D inputs, iterate the outermost dim so peak memory
+    # scales with a single slice instead of the whole tensor. Quantization is
+    # per-block along the last dim, so slicing leading dims is exact; ``shuffle``
+    # is applied once on the assembled scale to preserve its cross-row layout.
+    if x.dim() >= 3 and x.numel() * x.element_size() > 4 * 1024**3:
+        assert pack_dim == -1, "pack_dim=0 requires a 2D input tensor (K, N)"
+        parts = [
+            per_1x32_f4_quant(
+                x[i],
+                scale=scale,
+                quant_dtype=quant_dtype,
+                shuffle=False,
+                pack_dim=-1,
+                round_mode=round_mode,
+            )
+            for i in range(x.shape[0])
+        ]
+        y = torch.stack([p[0] for p in parts], dim=0)
+        scale = torch.cat([p[1].view(torch.uint8) for p in parts], dim=0)
+        if shuffle:
+            scale = fp4_utils.e8m0_shuffle(scale)
+        scale = scale.view(dtypes.fp8_e8m0)
+        return y, scale
+
     block_size = 32
 
     # Internally we always pack along the last dim. For RHS layout
@@ -1233,6 +1258,16 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
+    out_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate.
+
+    When ``out_scale`` is given, the rotated activation is additionally
+    fp8-quantized in-kernel (fusing what ``get_hip_quant(per_1x128)`` would do):
+    ``out`` must be fp8 and receives ``round(rotated / scale)``, while
+    ``out_scale`` (``[m, dim // group_size]`` fp32) receives the per-(row,
+    ``1 x group_size``) block scales ``scale = absMax / fp8_max``. Without
+    ``out_scale`` it is the bf16/fp16 in-place path (``out`` shares dtype with
+    ``input``)."""
     ...

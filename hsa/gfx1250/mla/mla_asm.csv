@@ -1,4 +1,8 @@
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
+fp8,fp8,8,0,1,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx1_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx1_32nx4_np_3p.co
+fp8,fp8,8,0,2,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx2_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx2_32nx4_np_3p.co
+fp8,fp8,8,0,3,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx3_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx3_32nx4_np_3p.co
+fp8,fp8,8,0,4,0,0,0,_ZN5aiter32mla_a8w8_qh8_1tg_8mx4_32nx4_np_3pE,mla_a8w8_qh8_1tg_8mx4_32nx4_np_3p.co
 fp8,fp8,16,0,1,0,0,0,_ZN5aiter34mla_a8w8_qh16_1tg_16mx1_32nx4_np_3pE,mla_a8w8_qh16_1tg_16mx1_32nx4_np_3p.co
 fp8,fp8,16,0,2,0,0,0,_ZN5aiter34mla_a8w8_qh16_1tg_16mx2_32nx4_np_3pE,mla_a8w8_qh16_1tg_16mx2_32nx4_np_3p.co
 fp8,fp8,32,0,1,0,0,0,_ZN5aiter34mla_a8w8_qh32_1tg_32mx1_32nx4_np_3pE,mla_a8w8_qh32_1tg_32mx1_32nx4_np_3p.co
