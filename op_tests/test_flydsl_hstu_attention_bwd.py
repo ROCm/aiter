@@ -43,7 +43,7 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 # Realistic jagged length distribution for perf (uniform[1,N]*SPARSITY). The pytest
 # suite's generator applies aggressive length sampling that collapses sequences to
 # ~2 tokens (great for mask edge-cases, useless for a perf table), so we build our
-# own realistic lengths here — matching the perf benches / mvonstra harness.
+# own realistic lengths here — matching the perf benches.
 SPARSITY = 0.5
 
 # label -> (max_attn_len, contextual_seq_len, target_size)
