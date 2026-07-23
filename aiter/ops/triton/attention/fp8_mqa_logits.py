@@ -155,7 +155,6 @@ def _autotune_gfx942_mqa_tile(head_size: int, seq_len: int, launch):
     return best
 
 
-
 def fp8_mqa_logits(
     Q,
     KV,
