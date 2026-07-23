@@ -358,6 +358,7 @@ class _RequestRecorder:
                 if module_name in _HOST_MODULES:
                     item = f"{module_name}.{frame.f_code.co_name}"
                     if frame.f_code.co_name in {
+                        "_resolve_plan_launchers",
                         "_resolve_stage1_plan_launchers",
                         "_compile_cktile_epilogue_plan",
                     }:
@@ -655,6 +656,8 @@ def _install_cuda_boundary_mocks(stack: ExitStack, recorder: _RequestRecorder) -
 def _clear_scenario_caches(imports: _HostImports) -> None:
     imports.moe._get_compiled_silu_fused.cache_clear()
     imports.moe._get_compiled_swiglu.cache_clear()
+    imports.moe.compile_flydsl_moe_reduction.cache_clear()
+    imports.moe.compile_flydsl_moe_stage2.cache_clear()
     imports.sorting_kernel._compute_sub_tokens.cache_clear()
     imports.sorting_kernel._p23_block_size.cache_clear()
     imports.sorting_wrapper._workspace_cache.clear()
@@ -683,6 +686,132 @@ def _kernel_params(
     return params
 
 
+def _storage_dtype(dtype: str):
+    if dtype in ("fp4", "fp8", "int4"):
+        return torch.uint8
+    if dtype in ("fp16", "f16"):
+        return torch.float16
+    if dtype == "bf16":
+        return torch.bfloat16
+    raise AssertionError(f"unsupported recorder dtype: {dtype}")
+
+
+def _runtime_kwargs(function: Any, config: dict[str, Any]) -> dict[str, Any]:
+    parameters = inspect.signature(function).parameters
+    return {name: config[name] for name in parameters if name in config}
+
+
+def _stage1_runtime_inputs(
+    imports: _HostImports,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    tokens = config["token_num"]
+    topk = config["topk"]
+    model_dim = config["model_dim"]
+    inter_dim = config["inter_dim"]
+    experts = config["experts"]
+    a_dtype = config["a_dtype"]
+    b_dtype = config["b_dtype"]
+    tile_m = config["tile_m"]
+    route_capacity = max(tokens * topk, tile_m)
+
+    a_shape = (tokens, model_dim // 2) if a_dtype == "fp4" else (tokens, model_dim)
+    w1_k = model_dim // 2 if b_dtype in ("fp4", "int4") else model_dim
+    values = {
+        "a": torch.empty(a_shape, dtype=_storage_dtype(a_dtype)),
+        "w1": torch.empty(
+            (experts, 2 * inter_dim, w1_k),
+            dtype=_storage_dtype(b_dtype),
+        ),
+        "sorted_token_ids": torch.empty(route_capacity, dtype=torch.int32),
+        "sorted_expert_ids": torch.empty(route_capacity, dtype=torch.int32),
+        "num_valid_ids": torch.empty(2, dtype=torch.int32),
+        "out": None,
+        "topk": topk,
+        "w1_scale": None,
+        "a1_scale": None,
+        "sorted_weights": (
+            torch.empty(route_capacity, dtype=torch.float32)
+            if config.get("doweight_stage1", False)
+            else None
+        ),
+        "bias": (
+            torch.empty((experts, 2 * inter_dim), dtype=torch.float32)
+            if config.get("enable_bias", False)
+            else None
+        ),
+        "topk_ids": (
+            torch.empty((tokens, topk), dtype=torch.int32)
+            if config.get("enable_bias", False)
+            else None
+        ),
+    }
+    values.update(
+        _runtime_kwargs(
+            imports.moe.flydsl_moe_stage1,
+            {"use_async_copy": True, **config},
+        )
+    )
+    return values
+
+
+def _stage2_runtime_inputs(
+    imports: _HostImports,
+    config: dict[str, Any],
+    *,
+    masked: bool,
+) -> dict[str, Any]:
+    tokens = config["token_num"]
+    topk = config["topk"]
+    model_dim = config["model_dim"]
+    inter_dim = config["inter_dim"]
+    experts = config["experts"]
+    a_dtype = config["a_dtype"]
+    b_dtype = config["b_dtype"]
+    tile_m = config["tile_m"]
+    sort_block_m = config.get("sort_block_m", 0) or tile_m
+    routing_blocks = max(1, tokens * topk)
+    route_capacity = routing_blocks * sort_block_m
+
+    a_k = inter_dim // 2 if a_dtype == "fp4" else inter_dim
+    w2_k = inter_dim // 2 if b_dtype in ("fp4", "int4") else inter_dim
+    values = {
+        "inter_states": torch.empty(
+            (tokens, topk, a_k),
+            dtype=_storage_dtype(a_dtype),
+        ),
+        "w2": torch.empty(
+            (experts, model_dim, w2_k),
+            dtype=_storage_dtype(b_dtype),
+        ),
+        "sorted_token_ids": torch.empty(route_capacity, dtype=torch.int32),
+        "sorted_expert_ids": torch.empty(routing_blocks, dtype=torch.int32),
+        "num_valid_ids": torch.empty(2, dtype=torch.int32),
+        "out": None,
+        "topk": topk,
+        "w2_scale": None,
+        "a2_scale": None,
+        "sorted_weights": (
+            torch.empty(route_capacity, dtype=torch.float32)
+            if config.get(
+                "doweight_stage2",
+                not config.get("doweight_stage1", False),
+            )
+            else None
+        ),
+        "bias": (
+            torch.empty((experts, model_dim), dtype=torch.float32)
+            if config.get("enable_bias", False)
+            else None
+        ),
+    }
+    values.update(_runtime_kwargs(imports.moe.flydsl_moe_stage2, config))
+    if masked:
+        values["expert_mask"] = torch.ones(256, dtype=torch.int32)
+        values["topk_ids"] = torch.zeros((tokens, topk), dtype=torch.int32)
+    return values
+
+
 def _run_stage1(
     imports: _HostImports,
     kernel_name: str,
@@ -693,7 +822,7 @@ def _run_stage1(
         **_kernel_params(imports, kernel_name, expected_stage=1),
         **options,
     }
-    inputs = imports.moe.build_stage1_compile_inputs(**config)
+    inputs = _stage1_runtime_inputs(imports, config)
     inputs["compile_context"] = imports.aot_backend.create_runtime_compile_context()
     inputs["launch_context"] = imports.moe.LaunchContext(0)
     imports.moe.flydsl_moe_stage1(**inputs)
@@ -711,12 +840,8 @@ def _run_stage2(
         **_kernel_params(imports, kernel_name, expected_stage=2),
         **options,
     }
-    inputs = imports.moe.build_stage2_compile_inputs(**config)
-    if masked:
-        inputs["expert_mask"] = torch.ones(256, dtype=torch.int32)
-        inputs["topk_ids"] = torch.zeros(
-            (config["token_num"], config["topk"]), dtype=torch.int32
-        )
+    inputs = _stage2_runtime_inputs(imports, config, masked=masked)
+    inputs["compile_context"] = imports.aot_backend.create_runtime_compile_context()
     inputs["launch_context"] = imports.moe.LaunchContext(0)
     imports.moe.flydsl_moe_stage2(**inputs)
 

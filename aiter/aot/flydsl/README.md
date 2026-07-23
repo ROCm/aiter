@@ -5,14 +5,13 @@ FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter'
 tuned CSV configs and compiles them into the cache up front, so that at runtime
 the JIT path hits the cache instead of compiling again.
 
-MoE Stage1 resolves the shared `CompilePlan` and compiles each `CompileUnit`
-directly from its declared ABI. It does not construct FakeTensors or enter the
-full Stage1 host. MoE Stage2 remains on the transitional FakeTensor/full-host
-path until its later migration.
+MoE Stage1, Stage2, and Stage2 reduction resolve shared `CompilePlan` objects
+and compile each `CompileUnit` directly from its declared ABI. They do not
+construct FakeTensors or enter the full stage runtime hosts.
 
 For a complete CPU and isolated gfx950 validation procedure, including strict
 positive/negative controls, see the
-**[Stage1 ABI-driven AOT testing guide](../../../docs/flydsl_stage1_aot_testing.md)**.
+**[MoE ABI-driven AOT testing guide](../../../docs/flydsl_moe_aot_testing.md)**.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
