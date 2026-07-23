@@ -27,7 +27,6 @@ Constraints:
 
 import functools
 import math as host_math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -86,27 +85,7 @@ def lds_cap_bytes(arch: str | None = None) -> int:
 
 _LOG2E = host_math.log2(host_math.e)
 
-# Two ways to publish Q and dO to LDS each q-tile:
-#   - SINGLE barrier: DMA dO directly global->LDS (like Q) so one barrier publishes
-#     both. Removes the dO register round-trip + `store_do_regs_to_lds` ds_write.
-#   - TWO barriers: stage dO global->registers, take barrier #1 (Q), compute S while
-#     the dO loads land, then store dO->LDS and take barrier #2. The extra barrier
-#     buys a dO-load / S-GEMM *overlap* whose value scales with the dO tile size
-#     (BLOCK_N * hidden_dim).
-# It is a tunable per-shape param (`single_barrier`, carried in the tuned CSV like
-# block_m); when unspecified it falls back to a shape heuristic (single barrier for
-# small dO tiles, hidden_dim <= 64). Numerically identical either way (bf16 reorder
-# noise ~3e-6). Precedence: env override > explicit param (from CSV/caller) >
-# heuristic. `HSTU_BWD_SINGLE_BARRIER=0/1` forces one path.
-_SB_ENV = os.environ.get("HSTU_BWD_SINGLE_BARRIER")  # None unless explicitly set
 
-
-def _resolve_single_barrier(hidden_dim: int, param) -> bool:
-    if _SB_ENV is not None:
-        return _SB_ENV == "1"
-    if param is not None:
-        return bool(param)
-    return hidden_dim <= 64
 
 
 def _waitcnt_vm_n(n: int):
@@ -241,7 +220,6 @@ def build_hstu_attention_bwd_dvdk(
     num_waves: int = 4,
     waves_per_eu: int = 0,
     has_perm: bool = False,
-    single_barrier: bool | None = None,
 ):
     validate_hstu_attention_bwd(
         num_heads,
@@ -299,23 +277,10 @@ def build_hstu_attention_bwd_dvdk(
 
     do_tile_elems = BLOCK_N * hidden_dim
     assert do_tile_elems % elems_per_dma_pass == 0
-    # Direct dO global->LDS DMA path (single-barrier variant): row-major [q, d], no
-    # swizzle (matches the dO LDS read layout). Mirrors the Q DMA sans swizzle.
+    # dO global->LDS DMA: row-major [q, d], no swizzle (matches the dO LDS read
+    # layout). Mirrors the Q DMA sans swizzle.
     NUM_DMA_DO = do_tile_elems // elems_per_dma_pass
     PAIRS_PER_ROW_DO = DO_STRIDE // DMA_ELEMS
-    SINGLE_BARRIER = _resolve_single_barrier(hidden_dim, single_barrier)
-
-    VEC_DO = (
-        8
-        if (hidden_dim % 8 == 0 and (BLOCK_N * hidden_dim) % (BLOCK_THREADS * 8) == 0)
-        else DMA_ELEMS
-    )
-    THREADS_PER_ROW_DO = hidden_dim // VEC_DO
-    assert BLOCK_THREADS % THREADS_PER_ROW_DO == 0
-    ROWS_PER_BATCH_DO = BLOCK_THREADS // THREADS_PER_ROW_DO
-    assert BLOCK_N % ROWS_PER_BATCH_DO == 0 or ROWS_PER_BATCH_DO > BLOCK_N
-    NUM_BATCHES_DO = max(1, BLOCK_N // ROWS_PER_BATCH_DO)
-    DO_NEEDS_GUARD = ROWS_PER_BATCH_DO > BLOCK_N
 
     N_ACC_DV = D_CHUNKS * KV_OWNED_SUBTILES
     N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES
@@ -395,7 +360,6 @@ def build_hstu_attention_bwd_dvdk(
 
         k_load = grouped_loader(k, head_dim, MFMA_LANE_K)
         v_load = grouped_loader(v, hidden_dim, MFMA_LANE_K)
-        do_load = grouped_loader(do, hidden_dim, VEC_DO)
 
         q_head_offset = head_idx * fx.Int32(head_dim)
         q_base_byte_offset = (
@@ -405,9 +369,7 @@ def build_hstu_attention_bwd_dvdk(
         # Shape-carried LDS views (no manual row*stride+col; the trailing group axis
         # carries the stride). Q is grouped by MFMA_LANE_K for the swizzled GEMM1
         # pack read + the dK scalar gather; dO is grouped by MFMA_LANE_K for the dA
-        # A-operand pack read + the dV scalar gather. The dO register-publish store
-        # (two-barrier path) writes VEC_DO-wide, so it takes a VEC_DO-grouped view of
-        # the same buffer.
+        # A-operand pack read + the dV scalar gather.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         q_view = lds.q.view(
             fx.make_layout(
@@ -419,11 +381,6 @@ def build_hstu_attention_bwd_dvdk(
             fx.make_layout(
                 (BLOCK_N, DO_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
                 (DO_STRIDE, MFMA_LANE_K, 1),
-            )
-        )
-        do_store_view = lds.do.view(
-            fx.make_layout(
-                (BLOCK_N, DO_STRIDE // VEC_DO, VEC_DO), (DO_STRIDE, VEC_DO, 1)
             )
         )
         q_lds_byte_base = buffer_ops.extract_base_index(q_view, address_space=3)
@@ -664,36 +621,6 @@ def build_hstu_attention_bwd_dvdk(
                 src = fx.slice(do_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
-        do_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_DO)
-        do_load_lane_in_row = tid % fx.Int32(THREADS_PER_ROW_DO)
-        do_load_col = do_load_lane_in_row * fx.Int32(VEC_DO)
-
-        def async_load_do_regs(q_start):
-            vecs = []
-            for b in range_constexpr(NUM_BATCHES_DO):
-                row = do_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_DO)
-                tok = q_start + row
-                in_bounds = tok < seq_len
-                if DO_NEEDS_GUARD:
-                    in_bounds = in_bounds & (row < fx.Int32(BLOCK_N))
-                safe_tok = in_bounds.select(seq_start + tok, seq_start)
-                raw = do_load(
-                    fx.Int64(safe_tok), head_idx, do_load_col // fx.Int32(VEC_DO)
-                ).ir_value()
-                vecs.append(
-                    in_bounds.select(
-                        raw, Vec.filled(VEC_DO, 0.0, elem_dtype).ir_value()
-                    )
-                )
-            return vecs
-
-        def store_do_regs_to_lds(vecs):
-            for b in range_constexpr(NUM_BATCHES_DO):
-                row = do_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_DO)
-                do_store_view[row, do_load_col // fx.Int32(VEC_DO), None].store(
-                    Vec(vecs[b])
-                )
-
         def read_q_packs(ng):
             q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
             packs = []
@@ -867,38 +794,14 @@ def build_hstu_attention_bwd_dvdk(
                     qb_cur = qb_next
             return dk_acc
 
-        do_reg_outstanding = NUM_BATCHES_DO
-
         def run_q_tile(acc, q_start):
-            if const_expr(SINGLE_BARRIER):
-                # Single-barrier variant: DMA both Q and dO global->LDS, then one
-                # workgroup barrier publishes both. Removes the 2nd barrier and the
-                # dO register round-trip (frees the dO staging VGPRs), at the cost of
-                # the dO-load/S-compute overlap the register path provided.
-                async_load_q(q_start)
-                async_load_do_lds(q_start)
-                _waitcnt_vm_n(0)
-                gpu.barrier()
-                q_packs = [
-                    read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)
-                ]
-                p_packs, s_meta = compute_s_tile(q_start, q_packs)
-                dv_acc = [acc[i] for i in range(N_ACC_DV)]
-                dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
-                dv_acc = accum_dv_tile(dv_acc, p_packs)
-                dk_acc = accum_dk_tile(dk_acc, compute_ds_packs(s_meta))
-                return dv_acc + dk_acc
-
+            # DMA both Q and dO global->LDS, then one workgroup barrier publishes both.
             async_load_q(q_start)
-            do_vecs = async_load_do_regs(q_start)
-            _waitcnt_vm_n(do_reg_outstanding)
+            async_load_do_lds(q_start)
+            _waitcnt_vm_n(0)
             gpu.barrier()
             q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
             p_packs, s_meta = compute_s_tile(q_start, q_packs)
-            _waitcnt_vm_n(0)
-            store_do_regs_to_lds(do_vecs)
-            rocdl.sched_group_barrier(rocdl.mask_dswr, NUM_BATCHES_DO, 0)
-            gpu.barrier()  # dO published; Q still resident for dK's B-operand
             dv_acc = [acc[i] for i in range(N_ACC_DV)]
             dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
             dv_acc = accum_dv_tile(dv_acc, p_packs)
