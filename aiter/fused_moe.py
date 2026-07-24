@@ -1414,8 +1414,12 @@ def _mxfp4_a4w4_stage2(
     if atomic:
         out_buf = out_dst
     else:
+        # 7168: DeepSeek-V3-class; 6144: GLM-5.2 (256 routed + 1 shared -> NE 257).
         _mx_shape_ok = (
-            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
+            BM == 128
+            and D_HIDDEN in (7168, 6144)
+            and D_INTER == 512
+            and NE in (257, 385)
         )
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
