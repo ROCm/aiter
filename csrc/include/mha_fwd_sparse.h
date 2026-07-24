@@ -122,6 +122,14 @@ float fmha_fwd_v3_mxfp4_sparse_sorted(mha_fwd_sparse_args a, const ck_tile::stre
 // (which fills the dense 656-byte prefix) and copies only those bytes.
 float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// DENSE (non-sparse) f4f4 sibling of fmha_fwd_v3_mxfp4. Identical launch (same
+// kernel symbol _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E, same dense 656-byte
+// kernarg) but loads fwd_hd128_f4f4.co instead of fwd_hd128_mxfp4.co. Used when V
+// is packed as per-channel fp4 (uint8) rather than fp8; the caller's V byte strides
+// carry the layout difference, so the host kernarg is unchanged. Cache-keyed on the
+// .co name so it coexists with mxfp4 (same symbol, different .co) in one process.
+float fmha_fwd_v3_f4f4(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 // Sparse fp8 sibling. Same kernarg layout, different .co
 // (fwd_hd128_fp8_sparse.co) generated from
 // /workspace/mi350_fmha_hd128_fp8_sparse.py. Q/K/V are all fp8 (E4M3)

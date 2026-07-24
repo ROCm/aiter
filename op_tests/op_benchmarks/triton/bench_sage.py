@@ -25,7 +25,7 @@ from aiter.ops.mha import (
     flash_attn_i8fp8_sparse_vfa_pertensor_func,
     flash_attn_mxfp4_sparse_pertensor_func,
     flash_attn_mxfp4_pertensor_func,
-    flash_attn_mxfp4_func,
+    flash_attn_f4f4_pertensor_func,
     flash_attn_fp8_sparse_pertensor_func,
     flash_attn_fp8_sparse_vfa_pertensor_func,
 )
@@ -588,8 +588,13 @@ def make_f4f4_runner(
 
     Mirrors ``make_dense_mxfp4_runner`` but uses ``sage_quant_f4f4`` (in-tree fp4-V
     col-major LDS pack -- no dependency on the research host packer) and dispatches
-    through ``flash_attn_mxfp4_func`` (-> ``fmha_v3_fwd`` -> .co launch) with
-    ``AITER_FMHA_F4F4=1``, which redirects the mxfp4 .co slot to ``fwd_hd128_f4f4.co``.
+    through the dedicated ``flash_attn_f4f4_pertensor_func`` ->
+    ``aiter.ops.mha.fmha_v3_fwd_f4f4`` -> ``aiter::fmha_fwd_v3_f4f4`` -> .co launch
+    (``fwd_hd128_f4f4.co``, kernel symbol _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E).
+    This is the first-class f4f4 launch path (mirrors ``flash_attn_mxfp4_pertensor_func``
+    exactly); it does NOT go through the general ``fmha_v3_fwd`` op and needs no
+    ``AITER_FMHA_F4F4`` env var -- f4f4 and mxfp4 coexist in one process (separate
+    kernel-cache slots keyed on the .co name).
     """
     if args.causal:
         raise NotImplementedError("aiter_f4f4 does not support causal masking yet.")
@@ -603,8 +608,6 @@ def make_f4f4_runner(
             f"aiter_f4f4 is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
             f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
         )
-
-    os.environ["AITER_FMHA_F4F4"] = "1"  # redirect mxfp4 .co slot -> fwd_hd128_f4f4.co
 
     cfg = get_sage_fwd_configs_mxfp4()
     fp8_type = aiter.dtypes.fp8
@@ -650,13 +653,13 @@ def make_f4f4_runner(
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
     def _run() -> torch.Tensor:
-        return flash_attn_mxfp4_func(
+        return flash_attn_f4f4_pertensor_func(
             q_quant,
             k_quant,
             v_quant,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
+            q_descale,
+            k_descale,
+            v_descale,
             softmax_scale=softmax_scale,
         )
 

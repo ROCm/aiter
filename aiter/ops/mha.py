@@ -459,6 +459,42 @@ def fmha_v3_fwd_mxfp4(
 ) -> Tuple[Tensor]: ...
 
 
+def _gen_fmha_v3_fwd_f4f4_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]:
+    if out is not None:
+        return (out,)
+    b, sq, hq, _ = q.shape
+    # V is a col-major fp4 view whose logical last dim is the full head_dim (128).
+    head_dim_v = v.shape[-1]
+    return (q.new_empty((b, sq, hq, head_dim_v), dtype=dtypes.bf16),)
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_f4f4",
+    gen_fake=_gen_fmha_v3_fwd_f4f4_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_f4f4(
+    q: Tensor,                    # [b, sq, hq, hd/2 = 64], int8/uint8 (fp4-packed)
+    k: Tensor,                    # [b, sk, hk, 64], int8/uint8
+    v: Tensor,                    # [b, sk, hk, 128], int8/uint8 (per-channel fp4, col-major)
+    q_descale: Tensor,            # E8M0 per-block bytes, [b, sq, hq, hd/32 = 4]
+    k_descale: Tensor,            # E8M0 per-block bytes
+    v_descale: Tensor,            # fp32 per output channel, [b*hk, 128]
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
 def _gen_fmha_v3_fwd_fp8_sparse_fake_tensors(
     q: Tensor,
     k: Tensor,
@@ -3943,6 +3979,56 @@ def flash_attn_mxfp4_pertensor_func(
         head_dim_logical = q.shape[-1] * 2
         softmax_scale = head_dim_logical ** (-0.5)
     outs = fmha_v3_fwd_mxfp4(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        float(softmax_scale),
+        None,
+    )
+    return outs[0]
+
+
+def flash_attn_f4f4_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+):
+    """Dense f4f4 FMHA forward (hd=128, gfx950).
+
+    First-class f4f4 sibling of ``flash_attn_mxfp4_pertensor_func``: identical launch
+    path (dedicated ``@compile_ops`` op ``fmha_v3_fwd_f4f4`` -> dense C++ dispatcher
+    ``aiter::fmha_fwd_v3_f4f4``), only the kernel binary differs -- it loads
+    ``fwd_hd128_f4f4.co`` instead of ``fwd_hd128_mxfp4.co``. Does NOT route through the
+    general ``fmha_v3_fwd`` op and needs no ``AITER_FMHA_F4F4`` env var; f4f4 and mxfp4
+    coexist in one process (separate kernel-cache slots keyed on the .co name).
+
+    Args:
+        q: int8/uint8 tensor [b, sq, hq, hd/2 = 64], fp4-packed (bshd).
+        k: int8/uint8 tensor [b, sk, hk, 64], fp4-packed (bshd).
+        v: int8/uint8 tensor [b, sk, hk, 128], per-channel fp4 col-major view (bshd).
+        q_descale, k_descale: int8/uint8 E8M0 per-block scales.
+        v_descale: fp32 per output channel.
+        softmax_scale: if None, defaults to hd_logical**-0.5 where
+            hd_logical = q.shape[-1] * 2 (fp4-packed).
+
+    Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::fmha_v3_fwd_f4f4):
+    hd (logical) == 128, hq % hk == 0, (hq/hk) a power of 2, batch mode, non-causal,
+    gfx950.
+
+    Returns:
+        out: bf16 tensor [b, sq, hq, 128], bshd.
+    """
+    if softmax_scale is None:
+        head_dim_logical = q.shape[-1] * 2
+        softmax_scale = head_dim_logical ** (-0.5)
+    outs = fmha_v3_fwd_f4f4(
         q,
         k,
         v,
