@@ -480,6 +480,12 @@ str2dtype_dict = {
     "b16": dtypes.bf16,
 }
 
+act2str_dict = {
+    ActivationType.Silu: "silu",
+    ActivationType.Gelu: "gelu",
+    ActivationType.GeluTanh: "gelu_tanh",
+}
+
 
 @functools.lru_cache(maxsize=1024)
 def get_moe_stage_module(
@@ -509,7 +515,7 @@ def get_moe_stage_module(
     quant_type = (
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
-    act = str(activation).split(".")[-1].lower()
+    act = act2str_dict[activation]
     quant_type = str(quant_type).split(".")[-1].lower()
 
     parts = [
