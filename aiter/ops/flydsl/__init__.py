@@ -52,6 +52,11 @@ if is_flydsl_available():
         KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
+    from .kernels.fp8_paged_mqa_logits import (
+        flydsl_fp8_paged_mqa_logits,
+        KERNEL_VARIANTS as FP8_PAGED_MQA_LOGITS_VARIANTS,
+        DEFAULT_VARIANT as FP8_PAGED_MQA_LOGITS_DEFAULT_VARIANT,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -67,5 +72,8 @@ if is_flydsl_available():
         "flydsl_fp8_mqa_logits",
         "FP8_MQA_LOGITS_VARIANTS",
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
+        "flydsl_fp8_paged_mqa_logits",
+        "FP8_PAGED_MQA_LOGITS_VARIANTS",
+        "FP8_PAGED_MQA_LOGITS_DEFAULT_VARIANT",
         # "flydsl_gdr_decode",
     ]
