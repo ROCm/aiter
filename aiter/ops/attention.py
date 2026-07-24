@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple  # noqa: UP035
 
 import torch
 import triton
