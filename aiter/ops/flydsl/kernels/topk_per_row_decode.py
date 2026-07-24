@@ -113,14 +113,14 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
         c_sixteen = arith.constant(RED_SLOTS, type=T.i32)
         c_last_wave = arith.constant(RED_SLOTS - 1, type=T.i32)
         c_last_lane = arith.constant(WARP_SIZE - 1, type=T.i32)
-        c_warp_i32 = arith.constant(WARP_SIZE, type=T.i32)
+        arith.constant(WARP_SIZE, type=T.i32)
         c_six = arith.constant(6, type=T.i32)
         c_seven = arith.constant(7, type=T.i32)
         c_neg_one = arith.constant(-1, type=T.i32)
         c_vec = arith.constant(LOAD_VEC, type=T.i32)
         c_block_idx = fx.Index(BLOCK_THREADS)
-        c_block_i32 = arith.constant(BLOCK_THREADS, type=T.i32)
-        c_bins_i32 = arith.constant(RADIX_BINS, type=T.i32)
+        arith.constant(BLOCK_THREADS, type=T.i32)
+        arith.constant(RADIX_BINS, type=T.i32)
         c_top_k = arith.constant(top_k, type=T.i32)
         c_top_k_idx = fx.Index(top_k)
         c_bins_idx = fx.Index(RADIX_BINS)
@@ -130,7 +130,7 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
         c_low_mask = arith.constant((1 << 10) - 1, type=T.i32)
         c_sign_bit = arith.constant(-2147483648, type=T.i32)
         c_zero_f32 = fx.Float32(0.0)
-        c_neg_inf = fx.Float32(float("-inf"))
+        fx.Float32(float("-inf"))
 
         hist_base = fx.ptrtoint(lds.s_hist.ptr)
         meta_base = fx.ptrtoint(lds.s_meta.ptr)
@@ -331,7 +331,7 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
                     bucket = ordered_bucket(val)
                     atomic_add_i32(hist_base, bucket, c_one)
-            pass_results = yield [pass_state[0]]
+            yield [pass_state[0]]
         gpu.barrier()
 
         choose_threshold_parallel(c_top_k, 0, 1)
@@ -356,7 +356,7 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
                     if ArithValue(bucket) == ArithValue(first_threshold):
                         mid_bucket = radix_bucket(val, c_mid_shift, c_bin_mask)
                         atomic_add_i32(hist_base, mid_bucket, c_one)
-            pass_results = yield [pass_state[0]]
+            yield [pass_state[0]]
         gpu.barrier()
 
         first_above = fx.memref_load(s_meta, 0)
@@ -387,7 +387,7 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
                     if matches_refine:
                         low_bucket = radix_bucket(val, c_zero, c_low_mask)
                         atomic_add_i32(hist_base, low_bucket, c_one)
-            pass_results = yield [pass_state[0]]
+            yield [pass_state[0]]
         gpu.barrier()
 
         second_above = fx.memref_load(s_meta, 2)
@@ -441,7 +441,7 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
                             buffer_ops.buffer_store(
                                 col_i32, indices_rsrc, row_out + ArithValue(out_pos)
                             )
-            write_results = yield [write_state[0]]
+            yield [write_state[0]]
 
     @flyc.jit
     def launch_topk_per_row_decode_radix_unordered(
