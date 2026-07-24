@@ -130,11 +130,16 @@ def compute_roofline(
 
 
 def check_and_shuffle_scales(scale, N, K):
-    if N % 32 == 0 and K % (32 * 8) == 0:
+    if get_arch() == "gfx950" and N % 32 == 0 and K % (32 * 8) == 0:
         scale = shuffle_scale_moe(
             scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
         )
         return scale, "CDNA4_SCALE"
+    elif get_arch() == "gfx1250" and N % 32 == 0 and K % (32 * 8) == 0:
+        scale = shuffle_scale_moe(
+            scale, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+        )
+        return scale, "GFX1250_SCALE"
     else:
         return scale, None
 
@@ -193,7 +198,6 @@ def bench_mlp_single_weight_init(
 
     # -- benchmark --
     x_dtype_str = x_dtype
-    x_dtype = torch.float8_e4m3fn
 
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
@@ -216,7 +220,7 @@ def bench_mlp_single_weight_init(
             b1,
             rdata,
             gather_indx=gather_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
+            swizzle_mx_scale=swizzle_mx_scale1,
             apply_swiglu=True,
         )
         x, x_scale = mxfp4_quant(x)
@@ -230,7 +234,7 @@ def bench_mlp_single_weight_init(
             b2,
             rdata,
             scatter_indx=scatter_indx,
-            swizzle_mx_scale="CDNA4_SCALE",
+            swizzle_mx_scale=swizzle_mx_scale2,
         )
     proton.finalize()
     return parse_profile(

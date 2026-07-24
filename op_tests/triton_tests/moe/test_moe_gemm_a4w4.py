@@ -10,11 +10,12 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    is_gluon_supported,
     mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe, shuffle_weight
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -68,7 +69,8 @@ def init_compute_data(
     has_y_gammas,
     device="cuda",
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
     x = alloc_rand(shape_x, device=device, dtype=act_dtype)
@@ -174,6 +176,7 @@ class Case:
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
+    preshuffle_weights: bool = False
 
 
 @pytest.mark.parametrize(
@@ -212,7 +215,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -221,23 +224,40 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
-    fused_quant,
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    preshuffle_weights,
+    backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
     if hbm_swizzling:
-        if n % 32 != 0 or k % (32 * 8) != 0:
+        if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
+            pytest.skip(
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+            )
+        elif get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
 
-    torch.manual_seed(0)
+    if preshuffle_weights:
+        if get_arch() != "gfx1250":
+            pytest.skip("Preshuffling weights is only supported on gfx1250")
+        if backend != "gluon":
+            pytest.skip("Preshuffling weights is only supported on gluon backend")
+        if n % 16 != 0 or k % 32 != 0:
+            pytest.skip(
+                "Preshuffling weights requires n divisible by 16 and k divisible by 32"
+            )
 
-    act_mxfp4 = "mxfloat4_e2m1"
+    # skip gluon backend if not supported
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
+
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
+
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
 
@@ -264,12 +284,27 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = shuffle_scale_moe(
-            w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        )
+        if get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+            )
+        elif get_arch() == "gfx950":
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
+        else:
+            assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
+    if preshuffle_weights:
+        E, K, N = w_tri.shape
+        w_tri = (
+            shuffle_weight(w_tri, arch="gfx1250")
+            .view(E, N // 16, K * 16)
+            .transpose(-1, -2)
+        )
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
@@ -281,26 +316,24 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    if not act_mxfp4 and fused_quant:
-        quant_static_scale = ref_y.abs().max().float() / 448.0
-    else:
-        quant_static_scale = None
+
+    # run kernel
     tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
         x_mx_scales_tri,
         w_scale_tri,
         x_static_scale,
-        quant_static_scale,
+        None,
         bias_tri,
         rdata,
         gindx,
         sindx,
         gammas,
         swizzle_mx_scale,
+        preshuffle_weights,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
-    if not act_mxfp4 and fused_quant:
-        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
