@@ -30,7 +30,7 @@ def get_default_shapes() -> list[list[int]]:
 def model_benchmark_shapes(args) -> list[tuple[str, int, int]]:
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [args.M] if args.model == "all" else [2**i for i in range(15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
