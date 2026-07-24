@@ -2014,7 +2014,7 @@ def gemm_a8w8_blockscale(
     m_warp: int = 2,
     n_warp: int = 4,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 0,
     variant: str = "compute_bound",
     use_tdm_store: bool = False,
