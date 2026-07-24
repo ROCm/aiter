@@ -1,48 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple
 
-import torch
 import triton
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx950,
-)
+import torch
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
-    _dynamic_mxfp4_quant_kernel,
-    _dynamic_mxfp8_quant_kernel,
-    _dynamic_nvfp4_quant_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
     _dynamic_mxfp4_quant_kernel,
-    _fp8_legacy_to_mxfp8_kernel,
     _mxfp4_quant_op,
     _dynamic_mxfp8_quant_kernel,
     _mxfp8_quant_op,
     _fp8_legacy_to_mxfp8_kernel,
     _dynamic_nvfp4_quant_kernel,
     _nvfp4_quant_op,
-    _static_per_tensor_quant_fp8_i8_kernel,
 )
-from aiter.ops.triton.utils._triton import arch_info
+
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx950,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
+    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils._triton import arch_info
 
 __all__ = [
-    "_mxfp4_quant_op",
-    "_mxfp8_quant_op",
-    "_nvfp4_quant_op",
-    "dynamic_mxfp4_quant",
-    "dynamic_mxfp8_quant",
-    "dynamic_nvfp4_quant",
+    "static_per_tensor_quant_fp8_i8",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
+    "dynamic_mxfp4_quant",
+    "_mxfp4_quant_op",
+    "dynamic_mxfp8_quant",
     "fp8_legacy_to_mxfp8",
-    "static_per_tensor_quant_fp8_i8",
+    "_mxfp8_quant_op",
+    "dynamic_nvfp4_quant",
+    "_nvfp4_quant_op",
 ]
 
 _MXFP8_QUANT_BLOCK_SIZE = 32
@@ -290,7 +286,7 @@ def dynamic_mxfp8_quant(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
 
@@ -355,7 +351,7 @@ def fp8_legacy_to_mxfp8(
     x_scale_fp32: torch.Tensor,
     y_fn: Optional[torch.Tensor] = None,
     y_scale: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Transcode (FP8 e4m3fnuz, fp32 1x128 scale) -> (FP8 e4m3fn, e8m0 1x32 scale)
     in a single Triton launch. Replaces the Python dequant+requant cascade
