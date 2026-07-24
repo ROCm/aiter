@@ -17,21 +17,24 @@ uniform fp8 / bf16 pool (2D). The vLLM DSv4 backend's packed entry is kept as a
 thin shim (``_rocm_sparse_attn_decode_ragged_triton``).
 """
 
-from typing import Optional
-
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse as gluon_pa_decode_sparse,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
+)
+from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse as gluon_pa_decode_sparse,
-    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
-)
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -49,16 +52,16 @@ def pa_decode_sparse(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: Optional[torch.Tensor] = None,
-    block_h: Optional[int] = None,
-    kv_splits: Optional[int] = None,
-    has_invalid: Optional[bool] = True,
-    skip_reduce: Optional[bool] = False,
-    USE_EXP2: Optional[bool] = None,
+    kv_scales: torch.Tensor | None = None,
+    block_h: int | None = None,
+    kv_splits: int | None = None,
+    has_invalid: bool | None = True,
+    skip_reduce: bool | None = False,
+    USE_EXP2: bool | None = None,
     *,
-    extra_cache: Optional[torch.Tensor] = None,
-    extra_indices: Optional[torch.Tensor] = None,
-    extra_indptr: Optional[torch.Tensor] = None,
+    extra_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -89,7 +92,7 @@ def pa_decode_sparse(
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
     packed fp8_ds_mla / bf16 block cache (``extra_*`` = the two-loop), a 2D one the
     uniform pool (``kv_scales`` present = fp8). ``kv_splits``/``skip_reduce`` are
-    honored; ``block_h`` and fnuz-fp8 fall through to the triton path.
+    honored; ``block_h`` and fp16 ``q`` fall through to the triton path.
 
     Returns:
         ``[N, H, D]`` attention output, same dtype as ``q``. When
@@ -113,9 +116,9 @@ def pa_decode_sparse(
     # gfx950: route to the merged DSv4 sparse-MLA gluon driver. Format is inferred
     # from the cache: 3D -> packed fp8_ds_mla / bf16 block cache (optional SWA+top-k
     # two-loop via extra_*); 2D -> uniform pool (OCP fp8 + fp32 kv_scales, or bf16).
-    # kv_splits and skip_reduce are honored here; block_h and fnuz-fp8 fall through to
-    # the triton path below.
-    if DEVICE_ARCH == "gfx950" and block_h is None:
+    # kv_splits and skip_reduce are honored here; block_h and fp16 q fall through to
+    # the triton path below (the gluon kernel is bf16-only: bf16 LDS + bf16 MFMA).
+    if DEVICE_ARCH == "gfx950" and block_h is None and q.dtype == torch.bfloat16:
         if unified_kv.ndim == 3:
             _ok = kv_scales is None and (
                 unified_kv.dtype == torch.uint8 or unified_kv.dtype == q.dtype
@@ -384,16 +387,9 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
-def _decode_cu_count() -> int:
-    try:
-        return torch.cuda.get_device_properties(0).multi_processor_count
-    except Exception:
-        return 256
-
-
 def _decode_num_splits(num_queries, heads_blocks, avg_len=0.0, block_k=64):
     base = max(1, num_queries * heads_blocks)
-    cu = max(1, _decode_cu_count())
+    cu = max(1, get_num_sms())
     mu = 0.04
     best_splits, best_cost = 1, None
     for splits in range(1, 17):
