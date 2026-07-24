@@ -343,11 +343,6 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     else:
         gk_arg = torch.empty(0, device=k.device, dtype=torch.float32)
 
-    h = torch.empty(
-        (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
-        device=k.device,
-        dtype=torch.bfloat16,
-    )
     v_new = (
         torch.empty((B, H, T_flat, V), device=k.device, dtype=torch.bfloat16)
         if save_new_value
@@ -379,6 +374,12 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         state_tensor = state.tensor
         has_initial_state = state.has_initial_state
         resolved_state_dtype = state_tensor.dtype
+
+    h = torch.empty(
+        (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
+        device=k.device,
+        dtype=resolved_state_dtype,
+    )
 
     if not output_final_state:
         final_state = torch.empty(0, device=k.device, dtype=resolved_state_dtype)

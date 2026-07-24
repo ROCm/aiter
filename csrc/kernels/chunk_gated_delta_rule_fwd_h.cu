@@ -846,7 +846,31 @@ __device__ __forceinline__ void coalesced_vk_store_from_transpose(
     }
 }
 
-template <int BV_P, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool HAS_GK = false, bool G_HEAD_MAJOR = false>
+template <int BV_P, bool STATE_BF16>
+__device__ __forceinline__ void store_chunk_hstate(
+    int chunk_idx, int H, int i_h, int global_v_base,
+    int wave_id, int lane_id, int v_idx,
+    int h_row_base_lo, int h_row_base_hi,
+    const float* __restrict__ h_reg,
+    const bf16_t* __restrict__ h_transpose_buf,
+    void* __restrict__ h_state_out)
+{
+    if constexpr (STATE_BF16) {
+        coalesced_vk_store_from_transpose<BV_P>(
+            chunk_idx, H, i_h, global_v_base,
+            wave_id, lane_id, h_transpose_buf,
+            reinterpret_cast<bf16_t*>(h_state_out));
+    } else {
+        void* h_chunk_base = reinterpret_cast<char*>(h_state_out)
+            + (static_cast<int64_t>(chunk_idx) * H + i_h) * V_DIM * K_DIM
+                * static_cast<int64_t>(sizeof(float));
+        store_vk_hreg_to_global<BV_P, false>(
+            h_reg, h_chunk_base, global_v_base, v_idx,
+            h_row_base_lo, h_row_base_hi);
+    }
+}
+
+template <int BV_P, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool HAS_GK = false, bool G_HEAD_MAJOR = false, bool STATE_BF16 = true>
 __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     int token_base, int global_token_base, int actual_bt, int chunk_idx,
     int T_flat, int H, int Hg, int i_n, int i_h, int i_hg,
@@ -857,7 +881,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     const bf16_t* __restrict__ w_bf16,
     const bf16_t* __restrict__ u_bf16,
     const float* __restrict__ g,
-    bf16_t* __restrict__ h_bf16,
+    void* __restrict__ h_state_out,
     bf16_t* __restrict__ v_new_bf16,
     float* __restrict__ h_reg,
     bf16_t* __restrict__ w_panel0, bf16_t* __restrict__ w_panel1,
@@ -888,9 +912,10 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
             wave_id, lane_id, v_idx,
             h_reg, h_state_panel0, h_state_panel1, h_transpose_buf);
 
-        coalesced_vk_store_from_transpose<BV_P>(
+        store_chunk_hstate<BV_P, STATE_BF16>(
             chunk_idx, H, i_h, global_v_base,
-            wave_id, lane_id, h_transpose_buf, h_bf16);
+            wave_id, lane_id, v_idx, h_row_base_lo, h_row_base_hi,
+            h_reg, h_transpose_buf, h_state_out);
 
         const WPanelLoadData w_cur = load_w_panels_from_global(w_chunk, actual_bt, wave_id, lane_id);
         write_w_panels_to_lds(w_cur, w_panel0, w_panel1);
@@ -1019,7 +1044,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const float* __restrict__ gk,
     const void* h0,
     const int32_t* __restrict__ initial_state_indices,
-    hip_bfloat16* __restrict__ h,
+    void* __restrict__ h,
     hip_bfloat16* __restrict__ v_new,
     void* ht,
     const int32_t* __restrict__ cu_seqlens,
@@ -1067,7 +1092,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const bf16_t* __restrict__ k_bf16 = reinterpret_cast<const bf16_t*>(k);
     const bf16_t* __restrict__ w_bf16 = reinterpret_cast<const bf16_t*>(w);
     const bf16_t* __restrict__ u_bf16 = reinterpret_cast<const bf16_t*>(u);
-    bf16_t* __restrict__ h_bf16 = reinterpret_cast<bf16_t*>(h);
+    void* __restrict__ h_state_out = h;
     bf16_t* __restrict__ v_new_bf16 = reinterpret_cast<bf16_t*>(v_new);
 
     __shared__ bf16_t w_panel0[BT * 64];
@@ -1149,9 +1174,10 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
             has_next_full, w_next_chunk, k_next_chunk,
             w_next_data, k_next_data, USE_EXP2, k_stride_t, g_stride_b, g_stride_h, g_stride_t);
 
-        coalesced_vk_store_from_transpose<BV_P>(
+        store_chunk_hstate<BV_P, STATE_BF16>(
             chunk_idx, H, i_h, global_v_base,
-            wave_id, lane_id, h_transpose_buf, h_bf16);
+            wave_id, lane_id, v_idx, h_row_base_lo, h_row_base_hi,
+            h_reg, h_transpose_buf, h_state_out);
 
         {
             int64_t gk_off = 0;
@@ -1176,12 +1202,12 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         } else {
             tail_token_base = tail_token_base_local;
         }
-        process_tail_chunk_bvp_vk_lds_v<BV_P, SAVE_NEW_VALUE, IS_VARLEN, HAS_GK, G_HEAD_MAJOR>(
+        process_tail_chunk_bvp_vk_lds_v<BV_P, SAVE_NEW_VALUE, IS_VARLEN, HAS_GK, G_HEAD_MAJOR, STATE_BF16>(
             tail_token_base, tail_global_token_base, tail_bt, chunk_base + full_chunks,
             T_flat, H, Hg, i_n, i_h, i_hg, global_v_base,
             lane_id, wave_id,
             h_row_base_lo, h_row_base_hi,
-            k_bf16, w_bf16, u_bf16, g, h_bf16, v_new_bf16,
+            k_bf16, w_bf16, u_bf16, g, h_state_out, v_new_bf16,
             h_reg, w_panel0, w_panel1, k_panel0, k_panel1,
             h_state_panel0, h_state_panel1, gated_v_panel,
             h_transpose_buf, USE_EXP2, gk, k_stride_t, g_stride_b, g_stride_h, g_stride_t);
@@ -1209,7 +1235,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         has_gk ? reinterpret_cast<const float*>(gk.data_ptr()) : nullptr,                                                            \
         has_initial_state ? initial_state.data_ptr() : nullptr,                                                                       \
         has_initial_state_indices ? reinterpret_cast<const int32_t*>(initial_state_indices.data_ptr()) : nullptr,                     \
-        reinterpret_cast<hip_bfloat16*>(h.data_ptr()),                                                                                \
+        h.data_ptr(),                                                                                                                  \
         save_new_value ? reinterpret_cast<hip_bfloat16*>(v_new.data_ptr()) : nullptr,                                                 \
         output_final_state ? final_state.data_ptr() : nullptr,                                                                        \
         reinterpret_cast<const int32_t*>(cu_seqlens.data_ptr()),                                                                      \
@@ -1313,7 +1339,8 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
     AITER_CHECK(g.dtype() == AITER_DTYPE_fp32, "`g` must be float32, got ", AiterDtype_to_str(g.dtype()));
     AITER_CHECK(cu_seqlens.dtype() == AITER_DTYPE_i32, "`cu_seqlens` must be int32, got ", AiterDtype_to_str(cu_seqlens.dtype()));
     AITER_CHECK(chunk_offsets.dtype() == AITER_DTYPE_i32, "`chunk_offsets` must be int32, got ", AiterDtype_to_str(chunk_offsets.dtype()));
-    AITER_CHECK(h.dtype() == AITER_DTYPE_bf16, "`h` must be bfloat16, got ", AiterDtype_to_str(h.dtype()));
+    AITER_CHECK(h.dtype() == AITER_DTYPE_fp32 || h.dtype() == AITER_DTYPE_bf16,
+                "`h` must be float32 or bfloat16, got ", AiterDtype_to_str(h.dtype()));
     AITER_CHECK(k.dim() == 4, "`k` must have shape [B, T, Hg, K].");
     AITER_CHECK(w.dim() == 4, "`w` must have shape [B, H, T, K].");
     AITER_CHECK(u.dim() == 4, "`u` must have shape [B, H, T, V].");
@@ -1386,6 +1413,9 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
         state_dtype == AITER_DTYPE_fp32 || state_dtype == AITER_DTYPE_bf16,
         "`initial_state` must be float32 or bfloat16, got ", AiterDtype_to_str(state_dtype));
     const bool state_is_bf16 = state_dtype == AITER_DTYPE_bf16;
+    AITER_CHECK(h.dtype() == state_dtype,
+                "`h` dtype must match `initial_state`, got ",
+                AiterDtype_to_str(h.dtype()));
 
     if (has_initial_state) {
         AITER_CHECK(initial_state.is_gpu(), "`initial_state` must be a CUDA/HIP tensor.");
