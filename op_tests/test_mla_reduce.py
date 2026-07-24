@@ -311,6 +311,133 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
     return ok, ret
 
 
+def run_case_fast_path(splits_per_tile, num_heads=16, head_dim=512):
+    """Exercise the uniform-decode fast path (kn_mla_reduce_v1_fast in
+    reduce.cu), not just the general kernel `run_case` above covers.
+
+    The fast path additionally requires max_seqlen_q==1, no LSE output,
+    reduce_final_map present, and (h, dv, out_dtype) == (16, 512, bf16) (the
+    constexpr gate in dispatch_mla_reduce_v1). With qo_len=1,
+    build_reduce_problem already produces exactly the identity metadata the
+    fast path assumes: reduce_final_map[t] == [t, t+1] and reduce_partial_map
+    == arange(P) — see invariants (A)/(B) documented at their use site in
+    reduce.cu (kn_mla_reduce_v1_fast) and asserted host-side under ASM_DEBUG.
+
+    Checks, per split config:
+      - fast (final_lse=None) output vs the torch reference
+      - fast vs slow (a real final_lse forces fast_eligible=False, routing to
+        the general kernel) output parity
+      - nosplit tiles (1 split) are left untouched by both paths, mirroring
+        the real pipeline where stage1 already wrote that row
+    """
+    out_dtype = dtypes.bf16
+    p = build_reduce_problem(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1)
+
+    ref_out = torch.empty_like(p["final_output"])
+    torch_mla_reduce_v1(
+        p["partial_output"],
+        p["partial_lse"],
+        p["reduce_indptr"],
+        p["reduce_final_map"],
+        p["reduce_partial_map"],
+        p["max_seqlen_q"],
+        ref_out,
+        None,
+    )
+
+    # nosplit tiles: both kernels skip them (stage1's job in the real
+    # pipeline, not the reduce's), so seed final_output and treat the seed as
+    # the expected value there instead of the reference's single-split combine.
+    seed = torch.randn_like(p["final_output"])
+    for t, s in enumerate(splits_per_tile):
+        if s < 2:
+            q0, q1 = (
+                p["reduce_final_map"][t, 0].item(),
+                p["reduce_final_map"][t, 1].item(),
+            )
+            ref_out[q0:q1] = seed[q0:q1]
+
+    num_kv_splits = max(splits_per_tile)
+
+    fast_out = seed.clone()
+    _, us_fast = run_perftest(
+        aiter.mla_reduce_v1,
+        p["partial_output"],
+        p["partial_lse"],
+        p["reduce_indptr"],
+        p["reduce_final_map"],
+        p["reduce_partial_map"],
+        p["max_seqlen_q"],
+        num_kv_splits,
+        fast_out,
+        None,
+    )
+
+    slow_out = seed.clone()
+    slow_lse = torch.empty(
+        p["num_out_rows"], num_heads, dtype=dtypes.fp32, device="cuda"
+    )
+    run_perftest(
+        aiter.mla_reduce_v1,
+        p["partial_output"],
+        p["partial_lse"],
+        p["reduce_indptr"],
+        p["reduce_final_map"],
+        p["reduce_partial_map"],
+        p["max_seqlen_q"],
+        num_kv_splits,
+        slow_out,
+        slow_lse,
+    )
+
+    tag = (
+        f"splits={splits_per_tile if len(splits_per_tile) <= 4 else f'{len(splits_per_tile)}x[{splits_per_tile[0]}]'}"
+        f" h={num_heads} dv={head_dim} bf16 FASTPATH"
+    )
+    err_ref = checkAllclose(
+        ref_out.float(),
+        fast_out.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"[{tag}] fast vs ref  ",
+    )
+    err_parity = checkAllclose(
+        slow_out.float(),
+        fast_out.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"[{tag}] fast vs slow",
+    )
+    ok = (err_ref == 0) and (err_parity == 0)
+    print(f"{'PASS' if ok else 'FAIL'}  {tag}  {us_fast:>8.2f} us")
+
+    read_bytes = (
+        sum(splits_per_tile) * num_heads * head_dim * 4  # partial_output f32
+        + sum(splits_per_tile) * num_heads * 4  # partial_lse f32
+    )
+    write_bytes = (
+        p["num_out_rows"] * num_heads * head_dim * (torch.finfo(out_dtype).bits // 8)
+    )
+    bytes_total = read_bytes + write_bytes
+
+    ret = {
+        "splits": (
+            str(splits_per_tile)
+            if len(splits_per_tile) <= 4
+            else f"{len(splits_per_tile)}x[{splits_per_tile[0]}]"
+        )
+        + " (fast)",
+        "nhead": num_heads,
+        "dv": head_dim,
+        "dtype": "bf16",
+        "qo_len": 1,
+        "us": round(us_fast, 2),
+        "GB/s": round(bytes_total / us_fast / 1e3, 1),
+        "pass": ok,
+    }
+    return ok, ret
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test mla_reduce_v1 kernel")
     parser.add_argument("-d", "--dtype", default="bf16", choices=["bf16", "fp16"])
@@ -364,6 +491,26 @@ def main():
         ok, ret = run_case([8, 4], 16, head_dim, out_dtype, qo_len=3)
         all_ok &= ok
         df.append(ret)
+
+    # Uniform-decode fast path (kn_mla_reduce_v1_fast) — only eligible for
+    # h=16, dv=512, bf16, qo_len=1. [1, ...] (nosplit) is the config the
+    # general split_configs above never exercises but the fast path has
+    # explicit skip logic for; see run_case_fast_path.
+    if out_dtype == dtypes.bf16:
+        fast_split_configs = [
+            [1],  # nosplit: fast kernel must leave the row untouched
+            [1, 2, 1, 4],  # nosplit mixed with split tiles
+            [2],  # simple, single tile
+            [3, 2],  # simple, multi tile
+            [4],  # massive, exactly threshold
+            [8, 5, 7],  # massive, ragged tiles
+            [33],  # massive, single large tile
+            [2, 4, 16, 64],  # mixed: simple + massive tiles
+        ]
+        for splits in fast_split_configs:
+            ok, ret = run_case_fast_path(splits)
+            all_ok &= ok
+            df.append(ret)
 
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
