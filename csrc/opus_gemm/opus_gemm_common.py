@@ -238,6 +238,55 @@ def _a16w16_flatmm(bm, bn, bk, wg_per_cu):
 # --- per-pipeline kernel instance lists ---
 a8w8_scale_kernels_list = {
     1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
+    # 128x256 variant used by the fp8 block-scale BMM mmajor path
+    # (opus_bmm_a8w8_scale_mmajor). 128 B_M -> 2x the output tiles -> fills more
+    # CUs on the batched wo_a shape; B_N stays 256 (GROUP_N=128 requires
+    # HALF_B_N>=128). bf16 + fp32 outputs (direct-store BMM writes bf16 Y).
+    720: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["bf16_t", "fp32_t"]),
+}
+
+a8w8_mxscale_kernels_list = {
+    710: OpusGemmInstance(512, 128, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_mxscale", ["bf16_t", "fp32_t"]),
+}
+for _inst in a8w8_mxscale_kernels_list.values():
+    _inst.name_tag = "a8w8_mxscale"
+
+
+def _a8w8_uniform_scale(bm, bn, bk, wg_per_cu=2, has_oob=True):
+    """fp8 block-scale uniform (Route B fp8): 4-wave full-tile, MFMA 16x16x128,
+    128x128 blockscale, PGR1 + sched_group_barrier, DIRECT store to Y."""
+    vec = 16  # VEC_A = VEC_B = 16 for fp8 (16 bytes / 1 byte)
+    inst = OpusGemmInstance(
+        256,
+        bm,
+        bn,
+        bk,
+        2,
+        2,  # T_M, T_N (4-wave)
+        16,
+        16,
+        128,  # MFMA 16x16x128 (fp8)
+        vec,
+        vec,
+        4,  # VEC
+        1,
+        128,
+        128,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        "a8w8_uniform_scale",
+        ["bf16_t", "fp32_t"],  # direct store: Y bf16 or fp32 (v_c fp32 -> D_C)
+        wg_per_cu,
+        has_oob=has_oob,
+    )
+    inst.name_tag = "a8w8_uniform_scale"
+    return inst
+
+
+# fp8 block-scale uniform family. B_N must equal GROUP_N (=128) so one sfb value
+# covers the whole tile-N; B_K must equal GROUP_K (=128). Direct store to Y (no
+# split-K workspace/reduce). kid 700 = 128x128x128, kid 701 = 256x128x128.
+a8w8_uniform_scale_kernels_list = {
+    700: _a8w8_uniform_scale(128, 128, 128, 2),
+    701: _a8w8_uniform_scale(256, 128, 128, 1),
 }
 
 a8w8_kernels_list = {
@@ -1016,6 +1065,8 @@ GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys()
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
     **a8w8_scale_kernels_list,
+    **a8w8_mxscale_kernels_list,
+    **a8w8_uniform_scale_kernels_list,
     **a8w8_kernels_list,
     **a16w16_kernels_list,
     **a16w16_kernels_list_nooob,
