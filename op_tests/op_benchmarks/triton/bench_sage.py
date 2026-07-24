@@ -25,6 +25,7 @@ from aiter.ops.mha import (
     flash_attn_i8fp8_sparse_vfa_pertensor_func,
     flash_attn_mxfp4_sparse_pertensor_func,
     flash_attn_mxfp4_pertensor_func,
+    flash_attn_mxfp4_func,
     flash_attn_fp8_sparse_pertensor_func,
     flash_attn_fp8_sparse_vfa_pertensor_func,
 )
@@ -76,6 +77,7 @@ KernelName = Literal[
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_mxfp4",
+    "aiter_f4f4",
     "aiter_bf16",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
@@ -100,6 +102,7 @@ FP8_CHECK_KERNELS = {
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_mxfp4",
+    "aiter_f4f4",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
     "aiter_asm_sparse_fp8",
@@ -567,6 +570,170 @@ def make_asm_sparse_mxfp4_runner(
             kv_block_indices,
             lut_start,
             lut_count,
+            softmax_scale=softmax_scale,
+        )
+
+    return _run
+
+
+# ---------------------------------------------------------------------------
+# f4f4 (fp4 Q/K + per-channel fp4 V) operand support. The per-channel fp4 V
+# packer lives in the research asm module (host_fp6_pack.py) alongside the proven
+# .co byte layout; loaded by path (cached). Override with AITER_F6F4_PACK_MOD.
+# ---------------------------------------------------------------------------
+_F6F4_V_PACK_PATH = os.environ.get(
+    "AITER_F6F4_PACK_MOD",
+    "/app/external/diffusion-models-inference-private/asm/fmha_sage_fwd/gfx950/fp6/host_fp6_pack.py",
+)
+_fp4_v_pack_mod = None
+
+
+def _load_fp4_v_pack_mod():
+    global _fp4_v_pack_mod
+    if _fp4_v_pack_mod is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("f6f4_host_pack", _F6F4_V_PACK_PATH)
+        if spec is None or spec.loader is None:
+            raise FileNotFoundError(f"fp4-V host packer not found at {_F6F4_V_PACK_PATH}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _fp4_v_pack_mod = mod
+    return _fp4_v_pack_mod
+
+
+def _build_fp4_v_packer(device):
+    """Per-channel fp4 (E2M1) V packer for aiter_f4f4 -- the analogue of the Q/K fp6
+    packers. Returns the kernel-ready strided col-major LDS view + per-channel descale.
+    V [b, sk, h_kv, 128] float -> (uint8 view [b, sk, h_kv, 128] over a [b,h_kv,sk*64]
+    buffer with seq stride 64, descale f32 [b, h_kv, 128]).
+
+    Fused TRITON pack by default (quantize_fp4_v_colmajor_lds_triton): reads the permuted view
+    through strides (no copy) and gives the best a2a overlap. Set AITER_VFP4_TRITON=0 for the
+    on-device torch pack (CUDA-graph / inductor friendly, cosine-equivalent)."""
+    hp = _load_fp4_v_pack_mod()
+    _use_triton = (
+        os.environ.get("AITER_VFP4_TRITON", "1") != "0"
+        and getattr(hp, "_HP_HAVE_TRITON", False)
+        and hasattr(hp, "quantize_fp4_v_colmajor_lds_triton")
+    )
+
+    _mxfp4 = os.environ.get("AITER_MXFP4_V", "1") != "0"
+
+    def _packer(v: torch.Tensor):
+        b_, sk_, h_kv_, d_ = v.shape
+        assert d_ == 128 and sk_ % 128 == 0, (d_, sk_)
+        v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, 128], non-contiguous (read via strides)
+        if _mxfp4:
+            # MXFP4-V: block-scaled codes + per-(dv,32-kv-block) E8M0 image. The kernel reads the
+            # E8M0 from the v_descale buffer TAIL (after the 128-f32 per-channel descale), so return a
+            # combined [b, h_kv, 128 + nT*128] f32 descale = [per-channel descale | E8M0-as-f32]. This
+            # is contiguous, giving a per-(b,h) stride of (512 + nT*512) B = 512 + kv_seq_len*4, which
+            # matches the kernel's MXFP4-V v_descale slice stride.
+            packed, descale, eimg = hp.quantize_fp4_v_mxfp4_colmajor_lds_torch(v_tok)
+            eimg_f32 = eimg.contiguous().view(torch.float32).reshape(b_, h_kv_, -1)  # [.., nT*128]
+            descale = torch.cat([descale.reshape(b_, h_kv_, 128), eimg_f32], dim=-1).contiguous()
+        elif _use_triton:
+            packed, descale = hp.quantize_fp4_v_colmajor_lds_triton(v_tok)
+        else:
+            packed, descale = hp.quantize_fp4_v_colmajor_lds_torch(v_tok)
+        # +64B slack so the last-token strided window (stride 64 < 128) stays in storage bounds.
+        packed = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
+        v_view = torch.as_strided(
+            packed, (b_, sk_, h_kv_, 128), (h_kv_ * sk_ * 64, 64, sk_ * 64, 1)
+        )
+        return v_view, descale
+
+    return _packer
+
+
+def make_f4f4_runner(
+    args: argparse.Namespace,
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+) -> Any:
+    """Runner for the f4f4 kernel (fp4 Q/K + per-channel fp4 V) on the CK-tile asm
+    fmha_v3 path.
+
+    Mirrors ``make_dense_mxfp4_runner``'s mxfp4 Q/K quantization (same
+    ``sage_quant_mxfp4`` contract), but repacks V as per-channel fp4 (E2M1) and
+    dispatches through ``flash_attn_mxfp4_func`` (-> ``fmha_v3_fwd`` -> .co launch)
+    with ``AITER_FMHA_F4F4=1``, which redirects the mxfp4 .co slot to
+    ``fwd_hd128_f4f4.co``. The per-channel fp4 V packer comes from the research asm
+    module (see ``_build_fp4_v_packer``)."""
+    if args.causal:
+        raise NotImplementedError("aiter_f4f4 does not support causal masking yet.")
+    if args.layout != "bshd":
+        raise ValueError("aiter_f4f4 expects --layout=bshd inputs.")
+    if (
+        q_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+        or v_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+    ):
+        raise ValueError(
+            f"aiter_f4f4 is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
+            f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
+        )
+
+    os.environ["AITER_FMHA_F4F4"] = "1"  # redirect mxfp4 .co slot -> fwd_hd128_f4f4.co
+    # f4f4 ships PLAIN per-channel fp4-V (no E8M0 tail) by default. This MUST match the
+    # deployed .co's _MXFP4_V toggle: a .co built with _MXFP4_V=True needs AITER_MXFP4_V=1.
+    os.environ.setdefault("AITER_MXFP4_V", "0")
+
+    cfg = get_sage_fwd_configs_mxfp4()
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+
+    block_r = args.block_r
+    if block_r > q_bshd.shape[-1]:
+        raise ValueError(
+            f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+        )
+    r = create_hadamard_matrix(block_r, device=q_bshd.device, dtype=q_bshd.dtype) / (
+        block_r**0.5
+    )
+
+    (
+        q_quant,
+        q_descale,
+        k_quant,
+        k_descale,
+        _v_quant,  # ignored: f4f4 repacks V as per-channel fp4 below
+        _v_descale,
+        _delta_s,  # ignored: ASM kernel has no smoothing-bias slot
+    ) = sage_quant_mxfp4(
+        q_bshd,
+        k_bshd,
+        v_bshd,
+        fp8_type,
+        fp8_max,
+        BLKQ=cfg["BLOCK_M"],
+        BLKK=64,
+        layout=args.layout,
+        R=r,
+        BLOCK_R=block_r,
+        q_smoothing=False,
+    )
+
+    q_quant = q_quant.contiguous()
+    k_quant = k_quant.contiguous()
+    q_descale = q_descale.contiguous()
+    k_descale = k_descale.contiguous()
+
+    # Repack V as per-channel fp4 (E2M1) in the kernel's col-major LDS layout.
+    v_fp4, v_descale = _build_fp4_v_packer(q_bshd.device)(v_bshd)
+    v_descale = v_descale.to(torch.float32).contiguous()
+
+    softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
+
+    def _run() -> torch.Tensor:
+        return flash_attn_mxfp4_func(
+            q_quant,
+            k_quant,
+            v_fp4,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             softmax_scale=softmax_scale,
         )
 
@@ -1424,6 +1591,9 @@ def make_kernel_runner(
     if args.kernel == "aiter_mxfp4":
         return make_dense_mxfp4_runner(args, q_bshd, k_bshd, v_bshd)
 
+    if args.kernel == "aiter_f4f4":
+        return make_f4f4_runner(args, q_bshd, k_bshd, v_bshd)
+
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
             q_bshd,
@@ -1645,6 +1815,7 @@ def benchmark_single_case(
         "aiter_fp8",
         "aiter_i8fp8",
         "aiter_mxfp4",
+        "aiter_f4f4",
         "sage_fp8",
         "sage_mxfp4",
         "aiter_asm_sparse",
@@ -1672,6 +1843,7 @@ def benchmark_single_case(
             "aiter_fp8",
             "aiter_i8fp8",
             "aiter_mxfp4",
+            "aiter_f4f4",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
             "aiter_asm_sparse_fp8",
@@ -2247,6 +2419,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_fp8",
             "aiter_i8fp8",
             "aiter_mxfp4",
+            "aiter_f4f4",
             "aiter_bf16",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",

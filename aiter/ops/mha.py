@@ -3739,6 +3739,55 @@ def flash_attn_mxfp4_pertensor_func(
     return outs[0]
 
 
+def flash_attn_mxfp4_func(
+    q,
+    k,
+    v,
+    q_descale,
+    k_descale,
+    v_descale,
+    causal=False,
+    window_size=(-1, -1, 0),
+    softmax_scale=None,
+    how_v3_bf16_cvt: int = 1,
+):
+    """Flash attention with mxfp4 Q/K and fp8/fp4 V via the CK-tile asm fmha_v3 path.
+
+    Routes through ``fmha_v3_fwd`` (mha_fwd.cu), which selects the mxfp4 config
+    (fwd_hd128_mxfp4.co) from the uint8-packed Q/K dtype. Distinct from
+    ``flash_attn_mxfp4_pertensor_func`` (the hand-written ``fmha_v3_fwd_mxfp4``
+    kernel): this path honors the ``AITER_FMHA_F4F4`` .co redirect, so the f4f4
+    kernel (fwd_hd128_f4f4.co) can be A/B'd against the mxfp4 baseline.
+
+    Q/K are uint8-packed mxfp4 (physical head_dim is half the logical) with E8M0
+    per-block descales; V is fp8 (per-channel descale) or packed per-channel fp4.
+    """
+    if softmax_scale is None:
+        # q is uint8-packed fp4; logical head_dim is 2x physical.
+        softmax_scale = (q.shape[-1] * 2) ** (-0.5)
+    out, _, _, _ = fmha_v3_fwd(
+        q,
+        k,
+        v,
+        0.0,
+        softmax_scale,
+        causal,
+        int(window_size[0]),
+        int(window_size[1]),
+        False,  # return_softmax_lse
+        False,  # return_dropout_randval
+        how_v3_bf16_cvt,
+        None,  # out
+        None,  # bias
+        None,  # alibi_slopes
+        q_descale,
+        k_descale,
+        v_descale,
+        None,  # gen
+    )
+    return out
+
+
 def flash_attn_varlen_fp8_pertensor_func(
     q,
     k,

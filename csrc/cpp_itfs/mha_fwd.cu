@@ -75,6 +75,27 @@ std::string get_kernel_co_name(const std::string& cfg_co_name, const std::string
             co_name = cfg_co_name.substr(0, pos + 1) + "MI300/" + cfg_co_name.substr(pos + 1);
         }
     }
+    // MXFP4-PV (fp4-P) variant of f6f4: identical input dtypes as f6f4, so the dispatch cannot
+    // distinguish it. AITER_FMHA_F6F4_PV=1 redirects the f6f4 slot to its dedicated pv .co so the
+    // fp8-P baseline (aiter_f6f4) and the fp4-P kernel (aiter_f6f4_pv) coexist in separate slots.
+    if(getenv("AITER_FMHA_F6F4_PV") != nullptr)
+    {
+        auto pos = co_name.rfind("fwd_hd128_f6f4.co");
+        if(pos != std::string::npos)
+        {
+            co_name = co_name.substr(0, pos) + "fwd_hd128_f6f4_pv.co";
+        }
+    }
+    // f4f4 (fp4 Q/K + fp4 V) shares the mxfp4 input dtypes/dispatch, so AITER_FMHA_F4F4=1 redirects
+    // the mxfp4 slot to its dedicated .co (baseline copy of mxfp4, then the exp/V-fp4 experiments).
+    if(getenv("AITER_FMHA_F4F4") != nullptr)
+    {
+        auto pos = co_name.rfind("fwd_hd128_mxfp4.co");
+        if(pos != std::string::npos)
+        {
+            co_name = co_name.substr(0, pos) + "fwd_hd128_f4f4.co";
+        }
+    }
     return co_name;
 }
 
@@ -114,7 +135,8 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
 
     int in_bpe = 2;
     int out_bpe = 2;
-    if(a.data_type == "fp8bf16" || a.data_type == "i8fp8bf16")
+    if(a.data_type == "fp8bf16" || a.data_type == "i8fp8bf16" ||
+        a.data_type == "mxfp4bf16" || a.data_type == "mxfp6bf16" || a.data_type == "f6f4bf16")
     {
         in_bpe = 1;
         args.ptr_q_descale = a.q_descale_ptr;
@@ -213,7 +235,9 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     std::string arch_id = get_gpu_arch();
 
     if((a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
-       (a.data_type != "bf16" && a.data_type != "fp8bf16" && a.data_type != "i8fp8bf16") ||
+       (a.data_type != "bf16" && a.data_type != "fp8bf16" && 
+        a.data_type != "i8fp8bf16" && a.data_type != "mxfp4bf16" &&
+        a.data_type != "mxfp6bf16" && a.data_type != "f6f4bf16") ||
        (a.bias_type != 0) || (a.p_drop > 0.f) || ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
@@ -242,14 +266,18 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     };
 
     AiterAsmKernel* impl_ptr = nullptr;
-    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    // Key by (symbol | .co path): variants can share the kernel symbol but live in
+    // different .co slots (e.g. f6f8 in fwd_hd128_mxfp6.co and f6f4 in fwd_hd128_f6f4.co),
+    // so keying by symbol alone would collide and return the wrong binary.
+    static SynchronizedCache<std::string, AiterAsmKernel> impl_ptr_map;
 
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
+    std::string cache_key = std::string(name) + "|" + co_name;
 
     impl_ptr =
-        &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
+        &impl_ptr_map.get_or_create(cache_key, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);
