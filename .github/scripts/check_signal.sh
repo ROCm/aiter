@@ -7,7 +7,7 @@
 set -euo pipefail
 
 CHECKS_WORKFLOW_NAME="${CHECKS_WORKFLOW_NAME:-Checks}"
-MAX_RETRIES="${MAX_RETRIES:-5}"
+MAX_RETRIES="${MAX_RETRIES:-60}"
 RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-30}"
 REPO="${GITHUB_REPOSITORY:-}"
 
@@ -135,8 +135,10 @@ for i in $(seq 1 "${MAX_RETRIES}"); do
     fi
   fi
 
-  echo "Pre-checks not ready yet, retrying in ${RETRY_INTERVAL_SECONDS}s..."
-  sleep "${RETRY_INTERVAL_SECONDS}"
+  if [ "${i}" -lt "${MAX_RETRIES}" ]; then
+    echo "Pre-checks not ready yet, retrying in ${RETRY_INTERVAL_SECONDS}s..."
+    sleep "${RETRY_INTERVAL_SECONDS}"
+  fi
 done
 
 echo "Failed to read pre-checks status after ${MAX_RETRIES} attempts. Exiting workflow."
