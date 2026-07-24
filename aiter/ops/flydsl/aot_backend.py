@@ -127,8 +127,8 @@ def _flydsl_environment(
     run_only: bool,
 ) -> Iterator[None]:
     # ARCH is the 0.2.x compiler override, while FLYDSL_GPU_ARCH is consumed
-    # by target-aware kernel helpers.  Both are required for deterministic
-    # cross-compilation with the current FlyDSL release.
+    # by kernel builders. Both identify the architecture assigned to this
+    # single-target build process.
     values = {
         "ARCH": target.arch,
         "FLYDSL_GPU_ARCH": target.arch,

@@ -6,28 +6,15 @@
 import functools
 import os
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.launch_context import LaunchContext
-from aiter.ops.flydsl.moe_plan.stage1 import (
-    MoeStage1OperationCase,
-    MoeStage1Role,
-    Stage1ExternalPostprocessMetadata,
-)
-from aiter.ops.flydsl.moe_plan.stage2 import (
-    MoeStage2OperationCase,
-    MoeStage2Role,
-    Stage2GemmMetadata,
-    Stage2ReductionMetadata,
-)
-from aiter.ops.flydsl.operation_runtime import (
-    ExecutionStep,
-    RuntimeAdapterRegistry,
-    execute_operation_plan,
+from aiter.ops.flydsl.moe_compile_decisions import (
+    resolve_stage1_compile_decision,
+    resolve_stage2_compile_decision,
 )
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
@@ -369,21 +356,20 @@ def _register_all_configs():
 _register_all_configs()
 
 
-def _resolve_stage1_operation_plan(builder_kwargs, compile_context):
-    """Resolve the canonical Stage1 graph for shadow or runtime execution."""
+def _resolve_plan_launchers(plan, compile_context):
+    """Resolve every CompileUnit once, keyed by its stable op ID."""
 
-    from .moe_compile_plan import resolve_moe_stage1_operation_plan
-
-    return resolve_moe_stage1_operation_plan(
-        MoeStage1OperationCase.from_kwargs(builder_kwargs),
-        context=compile_context,
-    )
-
-
-def _resolve_stage2_operation_plan(case, compile_context):
-    from .moe_compile_plan import resolve_moe_stage2_operation_plan
-
-    return resolve_moe_stage2_operation_plan(case, context=compile_context)
+    by_op_id = {}
+    for unit in plan.units:
+        op_id = unit.spec.op_id
+        if op_id in by_op_id:
+            raise RuntimeError(f"duplicate CompilePlan op_id: {op_id}")
+        artifact = compile_context.backend.resolve_aot(
+            unit,
+            context=compile_context,
+        )
+        by_op_id[op_id] = getattr(artifact, "launcher", artifact)
+    return by_op_id
 
 
 @functools.lru_cache(maxsize=None)
@@ -412,24 +398,14 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
-    compile_target=None,
 ):
-    """Compile Stage1, with explicit targets included in the wrapper cache.
+    """Compile the selected Stage1 builder."""
 
-    Legacy calls omit ``compile_target`` and retain the underlying builder
-    caches. CompilePlan calls provide it and bypass those target-unaware caches;
-    this wrapper's cache then owns reuse with the target in its public key.
-    """
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
-        builder = (
-            getattr(compile_mixed_moe_gemm1, "__wrapped__", compile_mixed_moe_gemm1)
-            if compile_target is not None
-            else compile_mixed_moe_gemm1
-        )
-        return builder(
+        return compile_mixed_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -461,12 +437,7 @@ def compile_flydsl_moe_stage1(
 
         # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
         _use_cshuffle = None if k_batch > 1 else False
-        builder = (
-            getattr(compile_moe_gemm1, "__wrapped__", compile_moe_gemm1)
-            if compile_target is not None
-            else compile_moe_gemm1
-        )
-        return builder(
+        return compile_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -512,19 +483,13 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
-    compile_target=None,
 ):
-    """Compile Stage2 with explicit targets included in the wrapper cache."""
+    """Compile the selected Stage2 builder."""
 
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
-        builder = (
-            getattr(compile_mixed_moe_gemm2, "__wrapped__", compile_mixed_moe_gemm2)
-            if compile_target is not None
-            else compile_mixed_moe_gemm2
-        )
-        return builder(
+        return compile_mixed_moe_gemm2(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -557,12 +522,7 @@ def compile_flydsl_moe_stage2(
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
 
-        builder = (
-            getattr(compile_moe_gemm2, "__wrapped__", compile_moe_gemm2)
-            if compile_target is not None
-            else compile_moe_gemm2
-        )
-        return builder(
+        return compile_moe_gemm2(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -590,91 +550,18 @@ def compile_flydsl_moe_reduction(
     dtype_str: str = "f16",
     use_mask: bool = False,
     num_experts: int = 0,
-    compile_target=None,
 ):
-    """Compile a top-k reduction with target-aware wrapper caching."""
+    """Compile a top-k reduction."""
 
     from .kernels.moe_gemm_2stage import compile_moe_reduction
 
-    builder = (
-        getattr(compile_moe_reduction, "__wrapped__", compile_moe_reduction)
-        if compile_target is not None
-        else compile_moe_reduction
-    )
-    return builder(
+    return compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
         dtype_str=dtype_str,
         use_mask=use_mask,
         num_experts=num_experts,
     )
-
-
-def resolve_stage2_persist_m(
-    *,
-    token_num: int,
-    topk: int,
-    experts: int,
-    tile_m: int,
-    sort_block_m: int,
-    routing_block_count: int | None,
-    persist: bool | None,
-    a_dtype: str,
-) -> int:
-    """Resolve Stage2 persistence from CPU-only routing metadata.
-
-    Runtime supplies the allocated routing-block count. Direct AOT may omit it;
-    in that case this helper derives the standard routing capacity from the
-    explicit token bucket, expert count, top-k, and sorting block size.
-    """
-
-    positive = {
-        "token_num": token_num,
-        "topk": topk,
-        "experts": experts,
-        "tile_m": tile_m,
-    }
-    for name, value in positive.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    if isinstance(sort_block_m, bool) or not isinstance(sort_block_m, int):
-        raise TypeError(f"sort_block_m must be an integer, got {sort_block_m!r}")
-    if sort_block_m < 0:
-        raise ValueError(f"sort_block_m must be non-negative, got {sort_block_m}")
-    if persist is not None and not isinstance(persist, bool):
-        raise TypeError(f"persist must be bool or None, got {persist!r}")
-    if a_dtype not in ("fp4", "fp8", "bf16"):
-        raise ValueError(f"unsupported Stage2 activation dtype: {a_dtype!r}")
-
-    sorting_block_m = sort_block_m if sort_block_m > 0 else tile_m
-    if routing_block_count is None:
-        route_capacity = token_num * topk + experts * sorting_block_m - topk
-        routing_block_count = (route_capacity + sorting_block_m - 1) // sorting_block_m
-    elif (
-        isinstance(routing_block_count, bool)
-        or not isinstance(routing_block_count, int)
-        or routing_block_count <= 0
-    ):
-        raise ValueError(
-            "routing_block_count must be a positive integer or None, "
-            f"got {routing_block_count!r}"
-        )
-
-    if sorting_block_m == tile_m:
-        m_blocks = min(routing_block_count, token_num * topk)
-    else:
-        total_sorted = routing_block_count * sorting_block_m
-        m_blocks = (total_sorted + tile_m - 1) // tile_m
-
-    if persist is True:
-        persist_m = -1
-    elif persist is False:
-        persist_m = 4 if m_blocks > 256 else 1
-    else:
-        persist_m = -1 if m_blocks > 256 else 1
-
-    # The fp8 activation path intentionally disables persistent scheduling.
-    return 1 if a_dtype == "fp8" else persist_m
 
 
 # Private helpers
@@ -1132,9 +1019,9 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    compile_target=None,
 ):
-    """Compile the fused activation helper; explicit targets enter its cache key."""
+    """Compile the fused activation helper."""
+
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(
@@ -1148,8 +1035,9 @@ def _get_compiled_silu_fused(
 
 
 @functools.cache
-def _get_compiled_swiglu(inter_dim: int, compile_target=None):
-    """Compile interleaved SwiGLU; explicit targets enter its cache key."""
+def _get_compiled_swiglu(inter_dim: int):
+    """Compile interleaved SwiGLU."""
+
     from aiter.ops.flydsl.kernels.swiglu_and_mul import build_swiglu_and_mul_module
 
     return build_swiglu_and_mul_module(inter_dim)
@@ -1277,216 +1165,6 @@ def flydsl_silu_and_mul_interleaved(
     )
 
 
-@dataclass
-class _Stage1ExecutionState:
-    """Mutable tensor state consumed by provider-selected Stage1 role adapters."""
-
-    primary_args: tuple[Any, ...]
-    tmp_out: Any
-    out: Any
-    out_scale_sorted_flat: Any
-    sorted_token_ids: Any
-    num_valid_ids: Any
-    topk_ids: Any
-    bias: Any
-    token_num: int
-    topk: int
-    inter_dim: int
-    swiglu_limit: float
-    is_splitk: bool
-    act: str
-    topk_ids_arg: Any = None
-    bias_arg: Any = None
-
-
-def _stage1_artifact_launcher(step: ExecutionStep):
-    if step.artifact is None:
-        raise RuntimeError(
-            f"Stage1 role {step.node.role!r} requires a compiled artifact"
-        )
-    return getattr(step.artifact, "launcher", step.artifact)
-
-
-def _prepare_stage1_post_arguments(
-    state: _Stage1ExecutionState,
-    launch_context: LaunchContext,
-) -> None:
-    """Preserve the existing post-GEMM views/placeholders and validation."""
-
-    use_splitk_bias = state.is_splitk and state.bias is not None
-    if use_splitk_bias and state.topk_ids is None:
-        raise ValueError("topk_ids are required for split-K FlyDSL stage1 bias")
-
-    # sorted_token_ids only gives (token_id, slot_id). Bias is stored per expert,
-    # so the post-activation kernel needs topk_ids[token_id * topk + slot_id].
-    state.topk_ids_arg = (
-        state.topk_ids.to(torch.int32).contiguous().view(-1)
-        if use_splitk_bias
-        else state.sorted_token_ids.view(-1)
-    )
-    state.bias_arg = (
-        state.bias.contiguous().view(-1)
-        if use_splitk_bias
-        else (
-            state.bias.contiguous().view(-1)[:0]
-            if state.bias is not None
-            else torch.empty(
-                0,
-                device=state.sorted_token_ids.device,
-                dtype=torch.float32,
-            )
-        )
-    )
-    # Keep stream capture explicit at the public boundary. The FQ adapter uses
-    # this context directly rather than querying the current stream.
-    if launch_context is None:
-        raise TypeError("launch_context is required for Stage1 execution")
-
-
-def _run_stage1_primary(
-    launcher,
-    state: _Stage1ExecutionState,
-    launch_context: LaunchContext,
-) -> None:
-    _run_compiled(launcher, state.primary_args)
-    _prepare_stage1_post_arguments(state, launch_context)
-
-
-def _run_stage1_fq_postprocess(
-    launcher,
-    state: _Stage1ExecutionState,
-    launch_context: LaunchContext,
-) -> None:
-    if state.tmp_out is None:
-        raise RuntimeError("Stage1 FQ postprocess requires split-K partial output")
-    _run_compiled(
-        launcher,
-        (
-            ptr_arg(state.tmp_out.view(-1, state.inter_dim * 2)),
-            ptr_arg(state.out.view(-1).view(torch.uint8)),
-            ptr_arg(state.out_scale_sorted_flat),
-            ptr_arg(state.sorted_token_ids),
-            ptr_arg(state.num_valid_ids),
-            ptr_arg(state.topk_ids_arg),
-            ptr_arg(state.bias_arg),
-            state.token_num,
-            state.sorted_token_ids.shape[0],
-            state.swiglu_limit,
-            launch_context.stream,
-        ),
-    )
-
-
-def _run_stage1_external_postprocess(
-    metadata: Stage1ExternalPostprocessMetadata,
-    state: _Stage1ExecutionState,
-) -> None:
-    """Run the unchanged CK/HIP split-K activation data plane."""
-
-    if not isinstance(metadata, Stage1ExternalPostprocessMetadata):
-        raise TypeError(
-            "external Stage1 postprocess requires Stage1ExternalPostprocessMetadata"
-        )
-    if metadata.enable_bias != (state.bias is not None):
-        raise RuntimeError(
-            "Stage1 external postprocess metadata disagrees with runtime bias"
-        )
-    if state.tmp_out is None:
-        raise RuntimeError(
-            "external Stage1 postprocess requires split-K partial output"
-        )
-
-    from aiter.ops.activation import (
-        silu_and_mul,
-        silu_and_mul_bias,
-        swiglu_and_mul,
-        swiglu_and_mul_bias,
-    )
-
-    post_input = state.tmp_out.view(-1, state.inter_dim * 2)
-    post_out = state.out.view(-1, state.inter_dim)
-    post_bias = state.bias.contiguous() if state.bias is not None else None
-    if state.bias is not None and metadata.act == "swiglu":
-        swiglu_and_mul_bias(
-            post_out,
-            post_input,
-            state.topk_ids_arg,
-            post_bias,
-        )
-    elif state.bias is not None and metadata.act == "silu":
-        silu_and_mul_bias(
-            post_out,
-            post_input,
-            state.topk_ids_arg,
-            post_bias,
-        )
-    elif metadata.act == "swiglu":
-        swiglu_and_mul(post_out, post_input)
-    else:
-        if state.bias is not None:
-            post_input = post_input + state.bias[state.topk_ids.to(torch.long)].view(
-                -1,
-                state.inter_dim * 2,
-            )
-        silu_and_mul(post_out, post_input)
-
-
-def _stage1_primary_runtime_adapter(
-    step: ExecutionStep,
-    state: _Stage1ExecutionState,
-    *,
-    context: LaunchContext,
-) -> None:
-    _run_stage1_primary(
-        _stage1_artifact_launcher(step),
-        state,
-        context,
-    )
-
-
-def _stage1_fq_runtime_adapter(
-    step: ExecutionStep,
-    state: _Stage1ExecutionState,
-    *,
-    context: LaunchContext,
-) -> None:
-    _run_stage1_fq_postprocess(
-        _stage1_artifact_launcher(step),
-        state,
-        context,
-    )
-
-
-def _stage1_external_runtime_adapter(
-    step: ExecutionStep,
-    state: _Stage1ExecutionState,
-    *,
-    context: LaunchContext,
-) -> None:
-    if step.artifact is not None:
-        raise RuntimeError("runtime-only Stage1 postprocess cannot own an artifact")
-    _run_stage1_external_postprocess(step.node.runtime_metadata, state)
-
-
-_STAGE1_RUNTIME_ADAPTERS = RuntimeAdapterRegistry()
-_STAGE1_RUNTIME_ADAPTERS.register(
-    MoeStage1Role.MIXED_GEMM.value,
-    _stage1_primary_runtime_adapter,
-)
-_STAGE1_RUNTIME_ADAPTERS.register(
-    MoeStage1Role.INT4_GEMM.value,
-    _stage1_primary_runtime_adapter,
-)
-_STAGE1_RUNTIME_ADAPTERS.register(
-    MoeStage1Role.FQ_POSTPROCESS.value,
-    _stage1_fq_runtime_adapter,
-)
-_STAGE1_RUNTIME_ADAPTERS.register(
-    MoeStage1Role.EXTERNAL_POSTPROCESS.value,
-    _stage1_external_runtime_adapter,
-)
-
-
 # Public API
 
 
@@ -1561,10 +1239,39 @@ def flydsl_moe_stage1(
     if a_dtype == "fp4":
         model_dim = model_dim * 2
 
-    _need_fp4 = out_dtype == "fp4"
-    _need_fp8 = out_dtype == "fp8"
+    _persist_m = persist_m if persist_m > 0 else 1
+    stage1_builder_kwargs = dict(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=(sorted_weights is not None),
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        persist_m=_persist_m,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_mode=gate_mode,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        enable_bias=(bias is not None),
+        a_scale_one=a_scale_one,
+        xcd_swizzle=xcd_swizzle,
+        k_wave=k_wave,
+    )
+    decision = resolve_stage1_compile_decision(stage1_builder_kwargs)
+
+    _need_fp4 = decision.requested_out_dtype == "fp4"
+    _need_fp8 = decision.requested_out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
-    _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
+    _base_out_dtype = decision.main_out_dtype
     dtypes = _get_dtypes()
 
     if _need_fp4:
@@ -1573,7 +1280,7 @@ def flydsl_moe_stage1(
         torch_out_dtype = dtypes.fp8
     else:
         torch_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
-    _is_splitk = k_batch > 1
+    _is_splitk = decision.split_k
     dev = a.device
 
     if out is None:
@@ -1621,8 +1328,6 @@ def flydsl_moe_stage1(
     )
     _grid_y = min(_dense_blks, _all_blks)
 
-    _persist_m = persist_m if persist_m > 0 else 1
-
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
     sorted_size = max(
@@ -1639,50 +1344,8 @@ def flydsl_moe_stage1(
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
-    kernel_bias = None if _is_splitk else bias
-    stage1_builder_kwargs = dict(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=(sorted_weights is not None),
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        act=act,
-        persist_m=_persist_m,
-        use_async_copy=use_async_copy,
-        k_batch=k_batch,
-        waves_per_eu=waves_per_eu,
-        b_nt=b_nt,
-        gate_mode=gate_mode,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        enable_bias=(bias is not None),
-        a_scale_one=a_scale_one,
-        xcd_swizzle=xcd_swizzle,
-        k_wave=k_wave,
-    )
-    operation_plan = _resolve_stage1_operation_plan(
-        stage1_builder_kwargs, compile_context
-    )
-
-    # Argument packing is still data-plane work. In on mode the primary role,
-    # rather than a repeated dtype graph decision, selects the existing packer.
-    if not operation_plan.nodes:
-        raise RuntimeError("Stage1 OperationPlan must contain a primary node")
-    primary_role = operation_plan.nodes[0].role
-    if primary_role == MoeStage1Role.MIXED_GEMM.value:
-        use_mx_gemm = True
-    elif primary_role == MoeStage1Role.INT4_GEMM.value:
-        use_mx_gemm = False
-    else:
-        raise RuntimeError(
-            f"Stage1 OperationPlan has invalid primary role {primary_role!r}"
-        )
+    kernel_bias = bias if decision.main_enable_bias else None
+    use_mx_gemm = decision.primary_family == "mixed"
 
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
@@ -1731,30 +1394,105 @@ def flydsl_moe_stage1(
             launch_context,
         )
 
-    execution_state = _Stage1ExecutionState(
-        primary_args=args,
-        tmp_out=tmp_out,
-        out=out,
-        out_scale_sorted_flat=out_scale_sorted_flat,
-        sorted_token_ids=sorted_token_ids,
-        num_valid_ids=num_valid_ids,
-        topk_ids=topk_ids,
-        bias=bias,
-        token_num=token_num,
-        topk=topk,
-        inter_dim=inter_dim,
-        swiglu_limit=_swiglu_limit_val,
-        is_splitk=_is_splitk,
-        act=act,
+    from .moe_compile_plan import (
+        FQ_ACTIVATION_OP_ID,
+        INT4_STAGE1_GEMM_OP_ID,
+        MIXED_STAGE1_GEMM_OP_ID,
+        resolve_moe_stage1_compile_plan,
     )
 
-    execute_operation_plan(
-        operation_plan,
-        execution_state,
-        compile_context=compile_context,
-        launch_context=launch_context,
-        adapters=_STAGE1_RUNTIME_ADAPTERS,
+    plan = resolve_moe_stage1_compile_plan(
+        context=compile_context,
+        decision=decision,
+        **stage1_builder_kwargs,
     )
+    plan_launchers = _resolve_plan_launchers(plan, compile_context)
+
+    def take_plan_launcher(op_id):
+        try:
+            return plan_launchers.pop(op_id)
+        except KeyError as error:
+            raise RuntimeError(
+                f"Stage1 CompilePlan did not resolve required unit {op_id}"
+            ) from error
+
+    primary_op_id = (
+        MIXED_STAGE1_GEMM_OP_ID
+        if decision.primary_family == "mixed"
+        else INT4_STAGE1_GEMM_OP_ID
+    )
+    _run_compiled(take_plan_launcher(primary_op_id), args)
+
+    use_splitk_bias = decision.split_k and bias is not None
+    if use_splitk_bias and topk_ids is None:
+        raise ValueError("topk_ids are required for split-K FlyDSL stage1 bias")
+    # sorted_token_ids only gives (token_id, slot_id). Bias is stored per expert,
+    # so the post-activation kernel needs topk_ids[token_id * topk + slot_id].
+    topk_ids_arg = (
+        topk_ids.to(torch.int32).contiguous().view(-1)
+        if use_splitk_bias
+        else sorted_token_ids.view(-1)
+    )
+    bias_arg = (
+        bias.contiguous().view(-1)
+        if use_splitk_bias
+        else (
+            bias.contiguous().view(-1)[:0]
+            if bias is not None
+            else torch.empty(
+                0,
+                device=sorted_token_ids.device,
+                dtype=torch.float32,
+            )
+        )
+    )
+
+    if decision.postprocess_kind == "fq":
+        _run_compiled(
+            take_plan_launcher(FQ_ACTIVATION_OP_ID),
+            (
+                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
+                ptr_arg(out.view(-1).view(torch.uint8)),
+                ptr_arg(out_scale_sorted_flat),
+                ptr_arg(sorted_token_ids),
+                ptr_arg(num_valid_ids),
+                ptr_arg(topk_ids_arg),
+                ptr_arg(bias_arg),
+                token_num,
+                sorted_token_ids.shape[0],
+                _swiglu_limit_val,
+                launch_context.stream,
+            ),
+        )
+    elif decision.postprocess_kind == "external":
+        from aiter.ops.activation import (
+            silu_and_mul,
+            silu_and_mul_bias,
+            swiglu_and_mul,
+            swiglu_and_mul_bias,
+        )
+
+        post_input = tmp_out.view(-1, inter_dim * 2)
+        post_out = out.view(-1, inter_dim)
+        post_bias = bias.contiguous() if bias is not None else None
+        if bias is not None and act == "swiglu":
+            swiglu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
+        elif bias is not None and act == "silu":
+            silu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
+        elif act == "swiglu":
+            swiglu_and_mul(post_out, post_input)
+        else:
+            if bias is not None:
+                post_input = post_input + bias[topk_ids.to(torch.long)].view(
+                    -1,
+                    inter_dim * 2,
+                )
+            silu_and_mul(post_out, post_input)
+
+    if plan_launchers:
+        raise RuntimeError(
+            f"Stage1 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
+        )
 
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
@@ -1765,74 +1503,6 @@ def flydsl_moe_stage1(
         return out, out_scale_sorted
 
     return out
-
-
-@dataclass
-class _Stage2ExecutionState:
-    primary_args: tuple[Any, ...]
-    target: Any
-    out: Any
-    token_num: int
-    topk: int
-    model_dim: int
-    expert_mask: Any
-    topk_ids: Any
-
-
-def _stage2_artifact_launcher(step: ExecutionStep):
-    if step.artifact is None:
-        raise RuntimeError(f"Stage2 role {step.node.role!r} requires an artifact")
-    return getattr(step.artifact, "launcher", step.artifact)
-
-
-def _stage2_gemm_runtime_adapter(
-    step: ExecutionStep,
-    state: _Stage2ExecutionState,
-    *,
-    context: LaunchContext,
-) -> None:
-    if not isinstance(step.node.runtime_metadata, Stage2GemmMetadata):
-        raise TypeError("Stage2 GEMM node requires Stage2GemmMetadata")
-    _run_compiled(_stage2_artifact_launcher(step), state.primary_args)
-
-
-def _stage2_reduction_runtime_adapter(
-    step: ExecutionStep,
-    state: _Stage2ExecutionState,
-    *,
-    context: LaunchContext,
-) -> None:
-    metadata = step.node.runtime_metadata
-    if not isinstance(metadata, Stage2ReductionMetadata):
-        raise TypeError("Stage2 reduction node requires Stage2ReductionMetadata")
-    if metadata.use_mask != (state.expert_mask is not None):
-        raise RuntimeError("Stage2 reduction metadata disagrees with runtime mask")
-    _run_moe_reduction(
-        _stage2_artifact_launcher(step),
-        state.target,
-        state.out,
-        state.token_num,
-        state.topk,
-        state.model_dim,
-        state.expert_mask,
-        state.topk_ids,
-        context,
-    )
-
-
-_STAGE2_RUNTIME_ADAPTERS = RuntimeAdapterRegistry()
-_STAGE2_RUNTIME_ADAPTERS.register(
-    MoeStage2Role.MIXED_GEMM.value, _stage2_gemm_runtime_adapter
-)
-_STAGE2_RUNTIME_ADAPTERS.register(
-    MoeStage2Role.INT4_GEMM.value, _stage2_gemm_runtime_adapter
-)
-_STAGE2_RUNTIME_ADAPTERS.register(
-    MoeStage2Role.PLAIN_REDUCTION.value, _stage2_reduction_runtime_adapter
-)
-_STAGE2_RUNTIME_ADAPTERS.register(
-    MoeStage2Role.MASKED_REDUCTION.value, _stage2_reduction_runtime_adapter
-)
 
 
 def flydsl_moe_stage2(
@@ -1934,28 +1604,26 @@ def flydsl_moe_stage2(
         enable_bias=(bias is not None),
     )
     use_mask = expert_mask is not None
-    stage2_case = MoeStage2OperationCase.from_kwargs(
+    routing_block_count = int(sorted_expert_ids.shape[0])
+    topk_ids_available = use_mask and topk_ids is not None
+    num_experts = int(expert_mask.numel()) if use_mask else 0
+    decision = resolve_stage2_compile_decision(
         stage2_builder_kwargs,
         mode=mode,
         return_per_slot=return_per_slot,
         persist=persist,
         token_num=token_num,
-        routing_block_count=int(sorted_expert_ids.shape[0]),
+        routing_block_count=routing_block_count,
         use_mask=use_mask,
-        topk_ids_available=use_mask and topk_ids is not None,
-        num_experts=int(expert_mask.numel()) if use_mask else 0,
+        topk_ids_available=topk_ids_available,
+        num_experts=num_experts,
     )
-    operation_plan = _resolve_stage2_operation_plan(stage2_case, compile_context)
-    if not operation_plan.nodes or not isinstance(
-        operation_plan.nodes[0].runtime_metadata, Stage2GemmMetadata
-    ):
-        raise RuntimeError("Stage2 OperationPlan requires a GEMM primary node")
-    accumulate = operation_plan.nodes[0].runtime_metadata.accumulate
+    accumulate = decision.accumulate
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
 
     if out is None:
-        if return_per_slot:
+        if decision.target_layout == "per_slot":
             out = torch.empty(
                 (token_num, topk, model_dim),
                 dtype=torch_out_dtype,
@@ -1988,35 +1656,23 @@ def flydsl_moe_stage2(
         else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
     )
 
-    _sbm = sort_block_m if sort_block_m > 0 else tile_m
-    m_blocks = (
-        min(sorted_expert_ids.shape[0], token_num * topk)
-        if _sbm == tile_m
-        else (sorted_expert_ids.shape[0] * _sbm + tile_m - 1) // tile_m
-    )
+    m_blocks = decision.m_blocks
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    primary_role = operation_plan.nodes[0].role
-    if primary_role == MoeStage2Role.MIXED_GEMM.value:
-        use_mx_gemm = True
-    elif primary_role == MoeStage2Role.INT4_GEMM.value:
-        use_mx_gemm = False
-    else:
-        raise RuntimeError(f"invalid Stage2 primary role {primary_role!r}")
+    use_mx_gemm = decision.primary_family == "mixed"
     _n_in = model_dim
     _k_in = inter_dim
 
     target = out
-    if not accumulate:
-        if return_per_slot:
-            target = out.view(-1)
-        else:
-            target = torch.empty(
-                (token_num * topk * model_dim,),
-                device=out.device,
-                dtype=out.dtype,
-            )
+    if decision.target_layout == "per_slot":
+        target = out.view(-1)
+    elif decision.target_layout == "reduction":
+        target = torch.empty(
+            (token_num * topk * model_dim,),
+            device=out.device,
+            dtype=out.dtype,
+        )
 
     if use_mx_gemm:
         args = _s2_args_fp4(
@@ -2055,23 +1711,67 @@ def flydsl_moe_stage2(
             launch_context,
         )
 
-    state = _Stage2ExecutionState(
-        args,
-        target,
-        out,
-        token_num,
-        topk,
-        model_dim,
-        expert_mask,
-        topk_ids,
+    from .moe_compile_plan import (
+        INT4_STAGE2_GEMM_OP_ID,
+        MASKED_REDUCTION_OP_ID,
+        MIXED_STAGE2_GEMM_OP_ID,
+        PLAIN_REDUCTION_OP_ID,
+        resolve_moe_stage2_compile_plan,
     )
-    execute_operation_plan(
-        operation_plan,
-        state,
-        compile_context=compile_context,
-        launch_context=launch_context,
-        adapters=_STAGE2_RUNTIME_ADAPTERS,
+
+    plan = resolve_moe_stage2_compile_plan(
+        context=compile_context,
+        mode=mode,
+        accumulate=decision.accumulate,
+        return_per_slot=return_per_slot,
+        persist=persist,
+        token_num=token_num,
+        routing_block_count=routing_block_count,
+        dtype_str=decision.reduction_dtype,
+        use_mask=use_mask,
+        topk_ids_available=topk_ids_available,
+        num_experts=num_experts,
+        decision=decision,
+        **stage2_builder_kwargs,
     )
+    plan_launchers = _resolve_plan_launchers(plan, compile_context)
+
+    def take_plan_launcher(op_id):
+        try:
+            return plan_launchers.pop(op_id)
+        except KeyError as error:
+            raise RuntimeError(
+                f"Stage2 CompilePlan did not resolve required unit {op_id}"
+            ) from error
+
+    primary_op_id = (
+        MIXED_STAGE2_GEMM_OP_ID
+        if decision.primary_family == "mixed"
+        else INT4_STAGE2_GEMM_OP_ID
+    )
+    _run_compiled(take_plan_launcher(primary_op_id), args)
+
+    if decision.reduction_kind != "none":
+        reduction_op_id = (
+            MASKED_REDUCTION_OP_ID
+            if decision.reduction_kind == "masked"
+            else PLAIN_REDUCTION_OP_ID
+        )
+        _run_moe_reduction(
+            take_plan_launcher(reduction_op_id),
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim,
+            expert_mask,
+            topk_ids,
+            launch_context,
+        )
+    if plan_launchers:
+        raise RuntimeError(
+            f"Stage2 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
+        )
     return out
 
 

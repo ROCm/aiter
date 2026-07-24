@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE FlyDSL graph resolution using existing compiler signatures.
+"""MoE FlyDSL CompilePlan resolution using existing compiler signatures.
 
 There is deliberately no typed mirror of MoE builder parameters here.
 ``CompileOpRegistry.make_unit`` binds directly to the existing compiler
 wrappers, so their signatures and defaults remain the only callable schema.
-This module owns only graph semantics and the launch ABI that FlyDSL cannot
+This module owns only compile-unit ordering and the launch ABI that FlyDSL cannot
 currently expose.
 
 Importing this module does not compile or launch anything. The existing
@@ -33,40 +33,24 @@ from .compile_plan import (
     op,
     plan_provider,
 )
-from .moe_plan.aggregate import MoeOperationCase, resolve_moe_operation_plan
-from .moe_plan.stage1 import (
-    FQ_ACTIVATION_OP_ID,
-    INT4_STAGE1_GEMM_OP_ID,
-    MIXED_STAGE1_GEMM_OP_ID,
-    MoeStage1OperationCase,
-    MoeStage1Role,
-    Stage1ExternalPostprocessMetadata,
-    Stage1FqMetadata,
-    Stage1GemmMetadata,
-    resolve_moe_stage1_operation_plan,
-)
-from .moe_plan.stage2 import (
-    INT4_STAGE2_GEMM_OP_ID,
-    MASKED_REDUCTION_OP_ID,
-    MIXED_STAGE2_GEMM_OP_ID,
-    PLAIN_REDUCTION_OP_ID,
-    MoeStage2OperationCase,
-    MoeStage2Role,
-    Stage2GemmMetadata,
-    Stage2ReductionMetadata,
-    normalize_moe_stage2_operation_case,
-    resolve_moe_stage2_operation_plan,
-)
-from .moe_plan.sorting import (
-    SORTING_4K_FUSED_OP_ID,
-    SORTING_ONESHOT_OP_ID,
-    SORTING_P0V2_P23_OP_ID,
-    MoeSortingCompileCase,
-    MoeSortingRole,
-    resolve_moe_sorting_operation_plan,
+from .moe_compile_decisions import (
+    Stage1CompileDecision,
+    Stage2CompileDecision,
+    resolve_stage1_compile_decision,
+    resolve_stage2_compile_decision,
 )
 
+MIXED_STAGE1_GEMM_OP_ID = "aiter.flydsl.moe.stage1.mixed_gemm.v1"
+INT4_STAGE1_GEMM_OP_ID = "aiter.flydsl.moe.stage1.int4_gemm.v1"
+FQ_ACTIVATION_OP_ID = "aiter.flydsl.moe.stage1.silu_and_mul_fq.v1"
 CKTILE_SWIGLU_AND_MUL_OP_ID = "aiter.flydsl.moe.stage1.cktile_swiglu_and_mul.v1"
+MIXED_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.mixed_gemm.v1"
+INT4_STAGE2_GEMM_OP_ID = "aiter.flydsl.moe.stage2.int4_gemm.v1"
+PLAIN_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.plain.v1"
+MASKED_REDUCTION_OP_ID = "aiter.flydsl.moe.stage2.reduction.masked.v1"
+SORTING_ONESHOT_OP_ID = "aiter.flydsl.moe.sorting.oneshot.v1"
+SORTING_P0V2_P23_OP_ID = "aiter.flydsl.moe.sorting.multiphase.p0v2_p23.v1"
+SORTING_4K_FUSED_OP_ID = "aiter.flydsl.moe.sorting.multiphase.k4_fused.v1"
 
 __all__ = [
     "CKTILE_SWIGLU_AND_MUL_OP_ID",
@@ -77,13 +61,7 @@ __all__ = [
     "MIXED_STAGE1_GEMM_OP_ID",
     "MIXED_STAGE2_GEMM_OP_ID",
     "MoeCompilePlanCase",
-    "MoeOperationCase",
-    "MoeStage1OperationCase",
-    "MoeStage1Role",
-    "MoeStage2OperationCase",
-    "MoeStage2Role",
     "MoeSortingCompileCase",
-    "MoeSortingRole",
     "PLAIN_REDUCTION_OP_ID",
     "SORTING_4K_FUSED_OP_ID",
     "SORTING_ONESHOT_OP_ID",
@@ -92,24 +70,27 @@ __all__ = [
     "register_moe_stage2_ops",
     "register_moe_sorting_ops",
     "resolve_cktile_stage1_compile_plan",
-    "normalize_moe_stage2_operation_case",
     "resolve_moe_compile_plan",
-    "resolve_moe_operation_plan",
     "resolve_moe_sorting_compile_plan",
-    "resolve_moe_sorting_operation_plan",
     "resolve_moe_stage1_compile_plan",
-    "resolve_moe_stage1_operation_plan",
     "resolve_moe_stage2_compile_plan",
-    "resolve_moe_stage2_operation_plan",
     "sorting_abi",
-    "Stage1ExternalPostprocessMetadata",
-    "Stage1FqMetadata",
-    "Stage1GemmMetadata",
-    "Stage2GemmMetadata",
-    "Stage2ReductionMetadata",
     "stage1_abi",
     "stage2_abi",
 ]
+
+
+@dataclass(frozen=True)
+class MoeSortingCompileCase:
+    """Explicit CPU metadata for one independently cached sorting launcher."""
+
+    max_tokens: int
+    num_experts: int
+    topk: int
+    has_mask: bool
+    unit_size: int = 32
+    path: str | None = None
+    k4_block: int | None = None
 
 
 @dataclass(frozen=True)
@@ -342,10 +323,7 @@ def _declared_ops() -> tuple[CompileOp, ...]:
             _REDUCTION_ABI,
         ),
     )
-    return tuple(
-        op(op_id, compiler, abi=abi, target_kw="compile_target")
-        for op_id, compiler, abi in declarations
-    )
+    return tuple(op(op_id, compiler, abi=abi) for op_id, compiler, abi in declarations)
 
 
 def _operations() -> dict[str, CompileOp]:
@@ -379,10 +357,7 @@ def _declared_sorting_ops() -> tuple[CompileOp, ...]:
             _SORTING_4K_FUSED_ABI,
         ),
     )
-    return tuple(
-        op(op_id, compiler, abi=abi, target_kw="compile_target")
-        for op_id, compiler, abi in declarations
-    )
+    return tuple(op(op_id, compiler, abi=abi) for op_id, compiler, abi in declarations)
 
 
 def _sorting_operations() -> dict[str, CompileOp]:
@@ -433,17 +408,80 @@ def register_moe_sorting_ops(
     return registry
 
 
+@plan_provider
+def _resolve_moe_sorting_compile_plan(
+    plan: PlanBuilder,
+    case: MoeSortingCompileCase,
+    *,
+    specialization: Any,
+) -> None:
+    from .kernels.moe_sorting_kernel import (
+        SORTING_PATH_4K_FUSED,
+        SORTING_PATH_ONESHOT,
+        SORTING_PATH_P0V2_P23,
+        MoeSortingSpecialization,
+    )
+
+    if not isinstance(case, MoeSortingCompileCase):
+        raise TypeError(
+            f"{plan.context}: case must be a MoeSortingCompileCase, "
+            f"got {type(case).__name__}"
+        )
+    if not isinstance(specialization, MoeSortingSpecialization):
+        raise TypeError("specialization must be a MoeSortingSpecialization")
+    if (
+        specialization.max_tokens != case.max_tokens
+        or specialization.has_mask != case.has_mask
+    ):
+        raise ValueError("sorting specialization disagrees with compile case")
+
+    operations = _sorting_operations()
+    if specialization.path == SORTING_PATH_ONESHOT:
+        operation = operations[SORTING_ONESHOT_OP_ID]
+        overrides = {"max_tokens": specialization.launcher_max_tokens}
+    elif specialization.path == SORTING_PATH_P0V2_P23:
+        operation = operations[SORTING_P0V2_P23_OP_ID]
+        overrides = {"k4_block": specialization.k4_block}
+    elif specialization.path == SORTING_PATH_4K_FUSED:
+        operation = operations[SORTING_4K_FUSED_OP_ID]
+        overrides = {"k4_block": specialization.k4_block}
+    else:
+        raise RuntimeError(
+            f"{plan.context}: unhandled sorting path {specialization.path!r}"
+        )
+    plan.emit(operation, case, **overrides)
+
+
 def resolve_moe_sorting_compile_plan(
     case: MoeSortingCompileCase,
     *,
     context: CompileContext[Any],
+    specialization: Any = None,
 ) -> CompilePlan:
-    """Compatibility compile projection of explicit sorting."""
+    """Resolve one explicit sorting specialization into one CompileUnit."""
 
-    return resolve_moe_sorting_operation_plan(
+    if not isinstance(case, MoeSortingCompileCase):
+        raise TypeError(
+            f"case must be a MoeSortingCompileCase, got {type(case).__name__}"
+        )
+    if specialization is None:
+        from .kernels.moe_sorting_kernel import resolve_moe_sorting_specialization
+
+        specialization = resolve_moe_sorting_specialization(
+            arch=context.target.arch,
+            max_tokens=case.max_tokens,
+            num_experts=case.num_experts,
+            topk=case.topk,
+            unit_size=case.unit_size,
+            has_mask=case.has_mask,
+            path=case.path,
+            k4_block=case.k4_block,
+        )
+    return _resolve_moe_sorting_compile_plan(
         case,
         context=context,
-    ).compile_projection()
+        specialization=specialization,
+    )
 
 
 def resolve_moe_compile_plan(
@@ -487,23 +525,97 @@ def resolve_moe_compile_plan(
     )
 
 
+@plan_provider
+def _resolve_moe_stage1_compile_plan(
+    plan: PlanBuilder,
+    *,
+    decision: Stage1CompileDecision,
+    **builder_kwargs: Any,
+) -> None:
+    if not isinstance(decision, Stage1CompileDecision):
+        raise TypeError("decision must be a Stage1CompileDecision")
+
+    operations = _operations()
+    primary = operations[
+        (
+            MIXED_STAGE1_GEMM_OP_ID
+            if decision.primary_family == "mixed"
+            else INT4_STAGE1_GEMM_OP_ID
+        )
+    ]
+    requested = plan.bind(primary)
+    plan.emit(
+        requested,
+        out_dtype=decision.main_out_dtype,
+        enable_bias=decision.main_enable_bias,
+    )
+    if decision.postprocess_kind != "fq":
+        return
+    plan.emit(
+        operations[FQ_ACTIVATION_OP_ID],
+        requested,
+        quant_mode=decision.fq_quant_mode,
+        gui_layout=decision.fq_gui_layout,
+        enable_bias=decision.fq_enable_bias,
+    )
+
+
 def resolve_moe_stage1_compile_plan(
     *,
     context: CompileContext[Any],
+    decision: Stage1CompileDecision | None = None,
     **builder_kwargs: Any,
 ) -> CompilePlan:
-    """Compatibility compile projection of the canonical Stage1 operation plan.
+    """Resolve a Stage1 GEMM and its optional FlyDSL split-K helper.
 
     ``builder_kwargs`` are bound directly to ``compile_flydsl_moe_stage1``.
     Adding a normal compile parameter therefore requires changing that existing
     wrapper signature/default and its real call site, not a parallel Spec type.
     """
 
-    case = MoeStage1OperationCase.from_kwargs(builder_kwargs)
-    return resolve_moe_stage1_operation_plan(
-        case,
+    if decision is None:
+        decision = resolve_stage1_compile_decision(builder_kwargs)
+    return _resolve_moe_stage1_compile_plan(
         context=context,
-    ).compile_projection()
+        decision=decision,
+        **builder_kwargs,
+    )
+
+
+@plan_provider
+def _resolve_moe_stage2_compile_plan(
+    plan: PlanBuilder,
+    *,
+    decision: Stage2CompileDecision,
+    **builder_kwargs: Any,
+) -> None:
+    if not isinstance(decision, Stage2CompileDecision):
+        raise TypeError("decision must be a Stage2CompileDecision")
+
+    operations = _operations()
+    primary = operations[
+        (
+            MIXED_STAGE2_GEMM_OP_ID
+            if decision.primary_family == "mixed"
+            else INT4_STAGE2_GEMM_OP_ID
+        )
+    ]
+    requested = plan.bind(primary, persist_m=1)
+    plan.emit(
+        requested,
+        accumulate=decision.accumulate,
+        persist_m=decision.persist_m,
+    )
+    if decision.reduction_kind == "none":
+        return
+    masked = decision.reduction_kind == "masked"
+    plan.emit(
+        operations[MASKED_REDUCTION_OP_ID if masked else PLAIN_REDUCTION_OP_ID],
+        requested,
+        dtype_str=decision.reduction_dtype,
+        use_mask=masked,
+        num_experts=decision.reduction_num_experts,
+    )
 
 
 def resolve_moe_stage2_compile_plan(
@@ -519,49 +631,32 @@ def resolve_moe_stage2_compile_plan(
     use_mask: bool,
     topk_ids_available: bool,
     num_experts: int,
+    decision: Stage2CompileDecision | None = None,
     **builder_kwargs: Any,
 ) -> CompilePlan:
-    """Compatibility compile projection of the Stage2 operation plan."""
+    """Resolve one Stage2 GEMM and its optional top-k reduction."""
+
     if "persist_m" in builder_kwargs:
         raise TypeError("persist_m is owned by the Stage2 provider")
-    expected_accumulate = mode != "reduce" and not return_per_slot
-    if accumulate != expected_accumulate:
-        raise ValueError(
-            "accumulate disagrees with mode/return_per_slot: "
-            f"expected {expected_accumulate}, got {accumulate}"
+    if decision is None:
+        decision = resolve_stage2_compile_decision(
+            builder_kwargs,
+            mode=mode,
+            accumulate=accumulate,
+            return_per_slot=return_per_slot,
+            persist=persist,
+            token_num=token_num,
+            routing_block_count=routing_block_count,
+            dtype_str=dtype_str,
+            use_mask=use_mask,
+            topk_ids_available=topk_ids_available,
+            num_experts=num_experts,
         )
-    out_dtype = str(builder_kwargs.get("out_dtype", "")).lower()
-    expected_reduction_dtype = {
-        "bf16": "bf16",
-        "bfloat16": "bf16",
-        "f16": "f16",
-        "fp16": "f16",
-        "half": "f16",
-    }.get(out_dtype)
-    if expected_reduction_dtype is not None and dtype_str != expected_reduction_dtype:
-        raise ValueError(
-            "reduction dtype must match Stage2 output dtype: "
-            f"expected {expected_reduction_dtype!r}, got {dtype_str!r}"
-        )
-    case = normalize_moe_stage2_operation_case(
-        {
-            **builder_kwargs,
-            "accumulate": accumulate,
-            "dtype_str": dtype_str,
-            "mode": mode,
-            "return_per_slot": return_per_slot,
-            "persist": persist,
-            "token_num": token_num,
-            "routing_block_count": routing_block_count,
-            "use_mask": use_mask,
-            "topk_ids_available": topk_ids_available,
-            "num_experts": num_experts,
-        }
-    )
-    return resolve_moe_stage2_operation_plan(
-        case,
+    return _resolve_moe_stage2_compile_plan(
         context=context,
-    ).compile_projection()
+        decision=decision,
+        **builder_kwargs,
+    )
 
 
 @plan_provider

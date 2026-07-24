@@ -1870,15 +1870,6 @@ def _compile_moe_sorting_multiphase(
 
 # Concrete host-side compiler entry points
 # ---------------------------------------------------------------------------
-def _target_aware_builder(builder, compile_target):
-    # ``compile_target`` is part of the public wrapper cache key. AotBackend
-    # installs the matching FlyDSL target environment before entering here, so
-    # bypass the old target-unaware private cache without adding another bridge.
-    if compile_target is None:
-        return builder
-    return getattr(builder, "__wrapped__", builder)
-
-
 @functools.lru_cache(maxsize=256)
 def compile_moe_sorting_oneshot(
     *,
@@ -1887,12 +1878,10 @@ def compile_moe_sorting_oneshot(
     max_tokens: int = 128,
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
-    compile_target=None,
 ):
     """Build exactly the oneshot launcher."""
 
-    builder = _target_aware_builder(_compile_moe_sorting_oneshot, compile_target)
-    return builder(
+    return _compile_moe_sorting_oneshot(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
@@ -1908,10 +1897,8 @@ def _compile_multiphase_launchers(
     unit_size,
     has_mask,
     k4_block,
-    compile_target,
 ):
-    builder = _target_aware_builder(_compile_moe_sorting_multiphase, compile_target)
-    return builder(
+    return _compile_moe_sorting_multiphase(
         num_experts=num_experts,
         topk=topk,
         unit_size=unit_size,
@@ -1928,7 +1915,6 @@ def compile_moe_sorting_p0v2_p23(
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
     k4_block: int = 256,
-    compile_target=None,
 ):
     """Build exactly the combined P0v2 + P23 launcher."""
 
@@ -1938,7 +1924,6 @@ def compile_moe_sorting_p0v2_p23(
         unit_size=unit_size,
         has_mask=has_mask,
         k4_block=k4_block,
-        compile_target=compile_target,
     )[5]
 
 
@@ -1950,7 +1935,6 @@ def compile_moe_sorting_4k_fused(
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
     k4_block: int = 256,
-    compile_target=None,
 ):
     """Build exactly the ClearWS + P0 + P1 + P23 launcher."""
 
@@ -1960,7 +1944,6 @@ def compile_moe_sorting_4k_fused(
         unit_size=unit_size,
         has_mask=has_mask,
         k4_block=k4_block,
-        compile_target=compile_target,
     )[6]
 
 
@@ -1972,7 +1955,6 @@ def compile_moe_sorting(
     unit_size=UNIT_SIZE,
     has_mask=False,
     k4_block=256,
-    compile_target=None,
 ):
     """Compatibility factory returning all three concrete launchers."""
 
@@ -1982,7 +1964,6 @@ def compile_moe_sorting(
         max_tokens=max_tokens,
         unit_size=unit_size,
         has_mask=has_mask,
-        compile_target=compile_target,
     )
     multiphase = _compile_multiphase_launchers(
         num_experts=num_experts,
@@ -1990,7 +1971,6 @@ def compile_moe_sorting(
         unit_size=unit_size,
         has_mask=has_mask,
         k4_block=k4_block,
-        compile_target=compile_target,
     )
     return launch_oneshot, multiphase[5], multiphase[6]
 

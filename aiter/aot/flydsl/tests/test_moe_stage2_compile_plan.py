@@ -8,13 +8,11 @@ from __future__ import annotations
 from contextlib import ExitStack
 import importlib
 import json
-import os
 from pathlib import Path
 import sys
 import unittest
 from unittest import mock
 
-import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 _TEST_DIR = Path(__file__).resolve().parent
@@ -162,6 +160,10 @@ class TestStage2GoldenParity(unittest.TestCase):
                             for unit in plan.units
                         )
                         for unit in plan.units:
+                            self.assertNotIn(
+                                "compile_target",
+                                dict(unit.spec.call.arguments),
+                            )
                             recorder.backend.compile_aot(
                                 unit,
                                 context=recorder.compile_context,
@@ -207,9 +209,10 @@ class TestStage2GoldenParity(unittest.TestCase):
                 for op_id, _ in units:
                     hash(plan_module.stage2_abi(op_id))
 
-    def test_runtime_uses_provider_and_backend_for_both_units(self) -> None:
+    def test_runtime_passes_one_shared_decision_to_compile_plan(self) -> None:
         recorder = _RequestRecorder()
         fake_mode = FakeTensorMode()
+        decisions = []
         with _recording_environment(), ExitStack() as stack:
             _install_cuda_boundary_mocks(stack, recorder)
             with _isolated_host_imports() as imports:
@@ -218,7 +221,19 @@ class TestStage2GoldenParity(unittest.TestCase):
                     "aiter.ops.flydsl.moe_compile_plan"
                 )
                 _clear_scenario_caches(imports)
+                original_decision = imports.moe.resolve_stage2_compile_decision
+
+                def record_decision(*args, **kwargs):
+                    decision = original_decision(*args, **kwargs)
+                    decisions.append(decision)
+                    return decision
+
                 with (
+                    mock.patch.object(
+                        imports.moe,
+                        "resolve_stage2_compile_decision",
+                        side_effect=record_decision,
+                    ) as decision_spy,
                     mock.patch.object(
                         plan_module,
                         "resolve_moe_stage2_compile_plan",
@@ -237,7 +252,9 @@ class TestStage2GoldenParity(unittest.TestCase):
                         "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
                     )
 
-        self.assertEqual(resolver_spy.call_count, 0)
+        self.assertEqual(decision_spy.call_count, 1)
+        self.assertEqual(resolver_spy.call_count, 1)
+        self.assertIs(resolver_spy.call_args.kwargs["decision"], decisions[0])
         self.assertEqual(backend_spy.call_count, 2)
         self.assertEqual(
             [call.args[0].spec.op_id for call in backend_spy.call_args_list],
@@ -246,82 +263,6 @@ class TestStage2GoldenParity(unittest.TestCase):
                 "aiter.flydsl.moe.stage2.reduction.plain.v1",
             ],
         )
-
-    def test_operation_roles_drive_on_mode_once_and_provider_is_cpu_only(self) -> None:
-        recorder = _RequestRecorder()
-        fake_mode = FakeTensorMode()
-        with _recording_environment(), ExitStack() as stack:
-            _install_cuda_boundary_mocks(stack, recorder)
-            with _isolated_host_imports() as imports:
-                _install_boundary_mocks(stack, imports, recorder)
-                plan_module = importlib.import_module(
-                    "aiter.ops.flydsl.moe_compile_plan"
-                )
-                config = _case_config(
-                    imports,
-                    "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
-                    False,
-                    {},
-                )
-                values = _provider_kwargs(config, masked=False)
-                case = plan_module.MoeStage2OperationCase.from_kwargs(
-                    values,
-                    mode=values["mode"],
-                    return_per_slot=values["return_per_slot"],
-                    persist=values["persist"],
-                    token_num=values["token_num"],
-                    routing_block_count=values["routing_block_count"],
-                    use_mask=values["use_mask"],
-                    topk_ids_available=values["topk_ids_available"],
-                    num_experts=values["num_experts"],
-                )
-                forbidden = mock.Mock(side_effect=AssertionError("GPU boundary"))
-                with (
-                    mock.patch.object(torch.cuda, "current_stream", forbidden),
-                    mock.patch.object(torch.cuda, "get_device_properties", forbidden),
-                ):
-                    operation_plan = plan_module.resolve_moe_stage2_operation_plan(
-                        case,
-                        context=recorder.compile_context,
-                    )
-                    self.assertEqual(
-                        [node.role for node in operation_plan.nodes],
-                        [
-                            "moe.stage2.gemm.mixed",
-                            "moe.stage2.reduction.plain",
-                        ],
-                    )
-                    self.assertEqual(
-                        operation_plan.nodes[1].dependencies,
-                        ("gemm",),
-                    )
-                    forbidden.assert_not_called()
-
-                _clear_scenario_caches(imports)
-                with (
-                    mock.patch.dict(
-                        os.environ,
-                        {"AITER_FLYDSL_OPERATION_PLAN": "on"},
-                    ),
-                    mock.patch.object(
-                        imports.moe._STAGE2_RUNTIME_ADAPTERS,
-                        "lookup",
-                        wraps=imports.moe._STAGE2_RUNTIME_ADAPTERS.lookup,
-                    ) as lookup,
-                    fake_mode,
-                    recorder.scenario("runtime.stage2.operation_plan"),
-                ):
-                    _run_stage2(
-                        imports,
-                        "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_reduce_bnt2",
-                    )
-                self.assertEqual(
-                    [call.args[0] for call in lookup.call_args_list],
-                    [
-                        "moe.stage2.gemm.mixed",
-                        "moe.stage2.reduction.plain",
-                    ],
-                )
 
 
 class TestStage2ResolverBoundaries(unittest.TestCase):
@@ -364,6 +305,157 @@ class TestStage2ResolverBoundaries(unittest.TestCase):
         }
         values.update(overrides)
         return values
+
+    def test_decisions_cover_atomic_per_slot_plain_and_masked_layouts(self) -> None:
+        with _isolated_host_imports() as imports:
+            decisions = importlib.import_module(
+                "aiter.ops.flydsl.moe_compile_decisions"
+            )
+            plans = importlib.import_module("aiter.ops.flydsl.moe_compile_plan")
+            context = self._context(imports)
+            cases = (
+                (
+                    "atomic",
+                    self._base(mode="atomic", accumulate=True),
+                    ("mixed", "accumulate", "none"),
+                    (plans.MIXED_STAGE2_GEMM_OP_ID,),
+                ),
+                (
+                    "return-per-slot",
+                    self._base(
+                        mode="atomic",
+                        accumulate=False,
+                        return_per_slot=True,
+                    ),
+                    ("mixed", "per_slot", "none"),
+                    (plans.MIXED_STAGE2_GEMM_OP_ID,),
+                ),
+                (
+                    "plain-reduction",
+                    self._base(),
+                    ("mixed", "reduction", "plain"),
+                    (
+                        plans.MIXED_STAGE2_GEMM_OP_ID,
+                        plans.PLAIN_REDUCTION_OP_ID,
+                    ),
+                ),
+                (
+                    "masked-reduction",
+                    self._base(
+                        experts=32,
+                        use_mask=True,
+                        topk_ids_available=True,
+                        num_experts=256,
+                    ),
+                    ("mixed", "reduction", "masked"),
+                    (
+                        plans.MIXED_STAGE2_GEMM_OP_ID,
+                        plans.MASKED_REDUCTION_OP_ID,
+                    ),
+                ),
+            )
+            for name, values, expected, op_ids in cases:
+                with self.subTest(name=name):
+                    builder_kwargs = {
+                        key: value
+                        for key, value in values.items()
+                        if key
+                        not in {
+                            "mode",
+                            "accumulate",
+                            "return_per_slot",
+                            "persist",
+                            "token_num",
+                            "routing_block_count",
+                            "dtype_str",
+                            "use_mask",
+                            "topk_ids_available",
+                            "num_experts",
+                        }
+                    }
+                    decision = decisions.resolve_stage2_compile_decision(
+                        builder_kwargs,
+                        mode=values["mode"],
+                        accumulate=values["accumulate"],
+                        return_per_slot=values["return_per_slot"],
+                        persist=values["persist"],
+                        token_num=values["token_num"],
+                        routing_block_count=values["routing_block_count"],
+                        dtype_str=values["dtype_str"],
+                        use_mask=values["use_mask"],
+                        topk_ids_available=values["topk_ids_available"],
+                        num_experts=values["num_experts"],
+                    )
+                    self.assertEqual(
+                        (
+                            decision.primary_family,
+                            decision.target_layout,
+                            decision.reduction_kind,
+                        ),
+                        expected,
+                    )
+                    plan = plans.resolve_moe_stage2_compile_plan(
+                        context=context,
+                        decision=decision,
+                        **values,
+                    )
+                    self.assertEqual(
+                        tuple(unit.spec.op_id for unit in plan.units),
+                        op_ids,
+                    )
+                    main = dict(plan.units[0].spec.call.arguments)
+                    self.assertEqual(main["accumulate"], decision.accumulate)
+                    self.assertEqual(main["persist_m"], decision.persist_m)
+                    if decision.reduction_kind != "none":
+                        reduction = dict(plan.units[1].spec.call.arguments)
+                        self.assertEqual(
+                            reduction["dtype_str"],
+                            decision.reduction_dtype,
+                        )
+                        self.assertEqual(
+                            reduction["use_mask"],
+                            decision.reduction_kind == "masked",
+                        )
+
+            self.assertEqual(
+                decisions.resolve_stage2_m_blocks(
+                    token_num=16,
+                    topk=8,
+                    experts=256,
+                    tile_m=32,
+                    sort_block_m=64,
+                    routing_block_count=10,
+                ),
+                20,
+            )
+
+    def test_persist_m_threshold_is_exact_at_256_blocks(self) -> None:
+        with _isolated_host_imports():
+            decisions = importlib.import_module(
+                "aiter.ops.flydsl.moe_compile_decisions"
+            )
+            cases = (
+                (256, None, "fp4", 1),
+                (257, None, "fp4", -1),
+                (256, False, "fp4", 1),
+                (257, False, "fp4", 4),
+                (16, True, "fp4", -1),
+                (257, True, "fp8", 1),
+            )
+            for m_blocks, persist, a_dtype, expected in cases:
+                with self.subTest(
+                    m_blocks=m_blocks,
+                    persist=persist,
+                    a_dtype=a_dtype,
+                ):
+                    self.assertEqual(
+                        decisions.resolve_stage2_persist_m(
+                            m_blocks=m_blocks,
+                            persist=persist,
+                            a_dtype=a_dtype,
+                        ),
+                        expected,
+                    )
 
     def test_persistence_threshold_explicit_modes_and_fp8_override(self) -> None:
         with _isolated_host_imports() as imports:
