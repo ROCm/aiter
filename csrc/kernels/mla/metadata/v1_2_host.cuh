@@ -28,8 +28,6 @@ void generate_reduce_info(int32_t num_work,
     for(int32_t i = 0; i < num_work; ++i)
     {
         auto work = work_info[i];
-        if(work.partial_o_loc == -1)
-            continue;
         std::tie(q_head_start, q_head_end) = unpack_dword(work.q_head_range);
 
         auto final_loc   = std::vector<int32_t>({work.qo_start, work.qo_end});
@@ -178,11 +176,10 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     {
                         consuming_blocks = remaining_blocks;
                         // This TG can process all of this qo_tile's remaining_blocks to the causal
-                        // boundary
-                        const int32_t partial_o_loc =
-                            (current_block_idx == 0)
-                                ? -1
-                                : (qlen_granularity * partial_tile_idx++); // -1 - no split
+                        // boundary.
+                        // Always emit a partial slot (partial_o_loc) so the mla_reduce_v1 runs and
+                        // populates the final LSE. We must do this even when the number of splits is 1.	
+                        const int32_t partial_o_loc = qlen_granularity * partial_tile_idx++;
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
                                      pages_kv_indptr[current_tile.batch_idx + 1]);

@@ -763,9 +763,8 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   p_lds);
             }
         }
-        // In theory, we can handle the case that #split = 1. However, it is meaningless and
-        // metadata should be in charge of getting rid of this kind of scenario.
-        else if(num_splits > 1)
+        // Single splits must also run through reduce so final_lse is always written
+        else if(num_splits >= 1)
         {
             mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
                 params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
@@ -861,9 +860,8 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 p_lds);
         }
     }
-    // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
-    // should be in charge of getting rid of this kind of scenario.
-    else if(num_splits > 1)
+      // Single splits must also run through reduce so final_lse is always written
+    else if(num_splits >= 1)
     {
         mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
             params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
