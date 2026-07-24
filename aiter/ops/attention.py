@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 from typing import Optional, Tuple
 
 from aiter.ops.enum import QuantType, Enum, MlaVersion
@@ -1401,6 +1402,38 @@ def get_mla_metadata_v1(
             dtype_kv_nope = dtype_kv
         if dtype_kv_rope is None:
             dtype_kv_rope = dtype_kv
+
+    # Deterministic-serving workaround (issue #4364). The MLA decode split-KV
+    # reduce is fp-non-associative, so a request's output depends on how many KV
+    # splits it is given -- and that split count is chosen from the *global*
+    # budget min(cu_num, max_split_per_batch * batch_size), which varies with
+    # batch composition. Two identical requests at temperature 0 can therefore
+    # land on different split counts across steps and produce slightly different
+    # logits (observed as +/-1-2 NIAH needles at mid context). Forcing a single
+    # split per request makes the reduce a no-op, so the result is independent of
+    # batch composition and reproducible run-to-run. Opt-in (costs decode
+    # parallelism at long context); the durable fix is an order-stable reduce.
+    # AITER_MLA_DECODE_MAX_SPLIT_PER_BATCH=<n> pins the cap to n (n>=1);
+    # AITER_MLA_DECODE_DETERMINISTIC=1 is shorthand for n=1. Clamping down is
+    # always buffer-safe (it can only reduce the number of partials vs the size
+    # the caller allocated).
+    _det_cap = os.getenv("AITER_MLA_DECODE_MAX_SPLIT_PER_BATCH")
+    if _det_cap is None and os.getenv("AITER_MLA_DECODE_DETERMINISTIC", "0") not in (
+        "0",
+        "",
+    ):
+        _det_cap = "1"
+    if _det_cap is not None:
+        try:
+            _det_cap_i = int(_det_cap)
+        except ValueError:
+            _det_cap_i = 1
+        if _det_cap_i >= 1:
+            max_split_per_batch = (
+                _det_cap_i
+                if max_split_per_batch <= 0
+                else min(max_split_per_batch, _det_cap_i)
+            )
 
     return _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
