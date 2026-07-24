@@ -55,3 +55,26 @@ def update_dpp_i32(
         [],
         **kw,
     )
+
+
+def dpp_xor_f32(src, offset: int, **kw):
+    """Return ``src`` from the lane selected by a 16-lane XOR DPP pattern."""
+    from flydsl._mlir.dialects import arith as _arith_dialect
+    from flydsl.expr.typing import T
+
+    src_i32 = _to_ir(src).bitcast(T.i32)
+    if offset == 8:
+        out_i32 = update_dpp_i32(src_i32, src_i32, 280, 0xF, 0xC, False, **kw)
+        out_i32 = update_dpp_i32(out_i32, src_i32, 264, 0xF, 0x3, False, **kw)
+    elif offset == 4:
+        out_i32 = update_dpp_i32(src_i32, src_i32, 276, 0xF, 0xA, False, **kw)
+        out_i32 = update_dpp_i32(out_i32, src_i32, 260, 0xF, 0x5, False, **kw)
+    elif offset == 2:
+        out_i32 = update_dpp_i32(src_i32, src_i32, 78, 0xF, 0xF, False, **kw)
+    elif offset == 1:
+        out_i32 = update_dpp_i32(src_i32, src_i32, 177, 0xF, 0xF, False, **kw)
+    else:
+        raise ValueError(
+            f"dpp_xor_f32 only supports 16-lane offsets 1, 2, 4, 8; got {offset}"
+        )
+    return _arith_dialect.BitcastOp(T.f32, out_i32).result
