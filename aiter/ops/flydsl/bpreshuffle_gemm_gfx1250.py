@@ -1,18 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 (WMMA) backend for the FlyDSL a8w8 bpreshuffle GEMM.
-
-aiter.gemm_a8w8_bpreshuffle's FlyDSL path runs here on gfx1250 (no MFMA preshuffle
-kernel); the tuned kernelName (prefix ``flydsl_bpreshuffle_wmma_``) encodes the tile
-config. Computes C = (A*sa) @ (B*sb)^T via the vendored gemm_fp8fp4_gfx1250 WMMA
-kernel, fp32 per-token sa[M] / per-channel sb[N] applied in the epilogue.
-
-N/K must divide the tile; M may be ragged (no host padding) — the kernel clips
-loads/stores to the runtime M via hardware OOB, predicating split-k's atomic add
-per-lane on row < M. A/C may be strided (lda/ldc passed at runtime, no copy) when
-the inner dim is unit-stride; B is preshuffled into its own contiguous buffer.
-"""
+"""gfx1250 (WMMA) backend for the FlyDSL a8w8 bpreshuffle GEMM."""
 
 from __future__ import annotations
 
@@ -22,27 +11,27 @@ import torch
 from torch import Tensor
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
-_compile_ptpc_gemm = None
-_run_compiled = None
+_launch_gemm_a8w8_ptpc = None
+_ptr_arg = None
 _fx = None
 
 _WMMA_K = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
-_MAX_SPLIT_K = 4
+_MAX_SPLIT_K = 1
 
 
 def _lazy_import():
-    global _compile_ptpc_gemm, _run_compiled, _fx
-    if _compile_ptpc_gemm is not None:
+    global _launch_gemm_a8w8_ptpc, _ptr_arg, _fx
+    if _launch_gemm_a8w8_ptpc is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_fp8fp4_gfx1250 import compile_ptpc_gemm
-    from .kernels.tensor_shim import _run_compiled as runner
+    from .kernels.gemm_a8w8_ptpc_gfx1250 import launch_gemm_a8w8_ptpc
+    from .kernels.tensor_shim import ptr_arg
 
-    _compile_ptpc_gemm = compile_ptpc_gemm
-    _run_compiled = runner
+    _launch_gemm_a8w8_ptpc = launch_gemm_a8w8_ptpc
+    _ptr_arg = ptr_arg
     _fx = fx_mod
 
 
@@ -131,7 +120,6 @@ def run_preshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250] K={K} must be divisible by split_k*tile_k="
             f"{split_k}*{tile_k}={split_k * tile_k}"
         )
-    # Each split-k chunk must hold >= num_buffers K-tiles to fill the pipeline.
     num_k_tiles = (K // split_k) // tile_k
     if num_k_tiles < nb:
         raise RuntimeError(
@@ -142,41 +130,34 @@ def run_preshuffle_gemm_a8_gfx1250(
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
 
-    exe = _compile_ptpc_gemm(
-        N=N,
-        K=K,
-        data_format="fp8",
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        m_warp=m_warp,
-        n_warp=n_warp,
-        num_buffers=nb,
-        waves_per_eu=(None if waves_per_eu <= 0 else waves_per_eu),
-        cluster_m=cluster_m,
-        cluster_n=cluster_n,
-        out_dtype=out_dtype,
-        split_k=split_k,
-    )
-
     lda = XQ.stride(0)
     ldc = Out.stride(0)
+    out_is_f16 = 1 if out_dtype == "f16" else 0
     if split_k > 1:
         Out.zero_()  # split-k atomic-accumulates into Out
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _run_compiled(
-        exe,
+    _launch_gemm_a8w8_ptpc(
         Out,
-        XQ.view(torch.uint8),
-        WQ.view(torch.uint8),
-        sa.view(-1),
-        sb.view(-1),
+        _ptr_arg(XQ),
+        _ptr_arg(WQ),
+        sa,
+        sb,
         M,
+        stream,
         N,
+        K,
         lda,
         ldc,
-        stream,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        nb,
+        cluster_m,
+        cluster_n,
     )
     return Out
 
@@ -189,25 +170,6 @@ _KERNEL_NAME_RE = re.compile(
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
 )
-
-
-def wmma_kernel_name(
-    *,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    num_buffers: int,
-    split_k: int,
-    cluster_m: int,
-    cluster_n: int,
-    m_warp: int,
-    n_warp: int,
-) -> str:
-    return (
-        f"flydsl_bpreshuffle_wmma_t{tile_m}x{tile_n}x{tile_k}_"
-        f"mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}_"
-        f"cm{cluster_m}_cn{cluster_n}"
-    )
 
 
 def parse_wmma_kernel_name(name: str):

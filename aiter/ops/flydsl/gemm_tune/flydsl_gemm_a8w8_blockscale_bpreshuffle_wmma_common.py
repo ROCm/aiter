@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Full-style gfx1250 WMMA candidates for a8w8 (ptpc) bpreshuffle GEMM."""
+"""Full-style gfx1250 WMMA candidates for a8w8 blockscale bpreshuffle GEMM."""
 
 from __future__ import annotations
 
@@ -9,19 +9,26 @@ from dataclasses import dataclass
 
 from aiter.ops.flydsl.utils import get_shared_memory_per_block
 
-NAME_PREFIX = "flydsl_bpreshuffle_wmma"
+NAME_PREFIX = "flydsl_blockscale_bpreshuffle_wmma"
 
 WMMA = 16  # WMMA M/N tile granularity
 LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
-_MAX_WARP_TILE = 128
-_MAX_BLOCK_THREADS = 1024  # m_warp * n_warp * WAVE(32)
+_MAX_WARP_TILE = 256
+_MAX_TUNE_WARPS = 4
+_MAX_ACC_FRAGMENTS = 64
+_MAX_TILE_ELEMENTS = 64 * 1024
 
 _LDS_PAD_A_BYTES = 16
 _LDS_PAD_D_BYTES = 16
 _ELEM_BYTES_D = 2  # bf16 / f16 output
 
+_BLOCK_N = 128
+_BLOCK_K = 128
+_SCALE_BYTES = 1  # gfx1250 blockscale scales are fp8/e8m0 storage
+_SCALE_GUARD_BYTES = 16
+
 _TILE_M_OPTS = (16, 32, 64, 128, 256)
-_TILE_N_OPTS = (64, 96, 128, 192, 256, 384, 512)
+_TILE_N_OPTS = (32, 64, 128, 256, 512, 1024)
 _TILE_K_OPTS = (128, 256, 512, 1024)
 _NUM_BUFFERS_OPTS = (2, 3, 4)
 _WARP_OPTS = ((1, 4), (2, 2), (4, 1))
@@ -66,28 +73,55 @@ def _ceil_div(a: int, b: int) -> int:
 def _tile_valid(tm: int, tn: int, tk: int, mw: int, nw: int) -> bool:
     if mw < 1 or nw < 1:
         return False
+    if tm > tn and mw < nw:
+        return False
+    if tm < tn and mw > nw:
+        return False
+    if tm == tn and mw != nw:
+        return False
     if tm % (mw * WMMA) != 0 or tn % (nw * WMMA) != 0:
         return False
     warp_tile_m = tm // mw
     warp_tile_n = tn // nw
     if warp_tile_m > _MAX_WARP_TILE or warp_tile_n > _MAX_WARP_TILE:
         return False
-    if tk % 128 != 0:
+    if tk % _BLOCK_K != 0:
         return False
-    return not mw * nw * 32 > _MAX_BLOCK_THREADS
+    tune_warps = mw * nw
+    if tune_warps < 2 or tune_warps > _MAX_TUNE_WARPS:
+        return False
+    acc_fragments = (warp_tile_m // WMMA) * (warp_tile_n // WMMA)
+    if acc_fragments > _MAX_ACC_FRAGMENTS:
+        return False
+    return tm * tn <= _MAX_TILE_ELEMENTS
 
 
 def _cluster_valid(cm: int, cn: int) -> bool:
     return cm >= 1 and cn >= 1 and cm * cn <= 16
 
 
+def _blockscale_stage_scale_bytes(ki: WmmaKernelInstance) -> tuple[int, int]:
+    k_blocks = _ceil_div(ki.tile_k, _BLOCK_K)
+    a_scale_bytes = ki.tile_m * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
+    n_blocks = _ceil_div(ki.tile_n, _BLOCK_N) + 1
+    b_scale_bytes = n_blocks * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
+    return a_scale_bytes, b_scale_bytes
+
+
 def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
-    """Conservative LDS upper bound for ptpc FP8 WMMA candidates."""
+    """Conservative LDS upper bound for blockscale FP8 WMMA candidates."""
+
+    a_scale_bytes, b_scale_bytes = _blockscale_stage_scale_bytes(ki)
 
     lds_a_data = ki.tile_m * (ki.tile_k + _LDS_PAD_A_BYTES)
     lds_b_data = ki.tile_n * ki.tile_k
-    stage_bytes = _align_up(lds_a_data, 16) + _align_up(lds_b_data, 16)
-    stage_pitch = _align_up(stage_bytes, 1024)
+    stage_bytes = (
+        _align_up(lds_a_data, 16)
+        + _align_up(lds_b_data, 16)
+        + _align_up(a_scale_bytes, 16)
+        + _align_up(b_scale_bytes, 16)
+    )
+    stage_pitch = _align_up(_align_up(stage_bytes, 128), 1024)
     arena_bytes = stage_pitch * ki.num_buffers
 
     if ki.split_k == 1:  # split_k>1 uses the buffer/atomic store, no LDS D buffer
@@ -129,6 +163,8 @@ kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
 
+    if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
+        return False
     if not _tile_valid(ki.tile_m, ki.tile_n, ki.tile_k, ki.m_warp, ki.n_warp):
         return False
     if not _cluster_valid(ki.cluster_m, ki.cluster_n):
