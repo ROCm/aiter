@@ -17,6 +17,7 @@
  */
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
+#include "hip_reduce.h"
 #include "opus/opus.hpp"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -1257,13 +1258,8 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     int input_hidden_dim)
 {
     constexpr int pack_size = 16 / sizeof(T);
-    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-    int tid     = blockIdx.x * tnum_gpu + lane_id;
     int valid_pack_count = hidden_dim / pack_size;
     int input_pack_count = input_hidden_dim / pack_size;
     const P* ptrs[ngpus];
@@ -1277,48 +1273,29 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     start_sync<ngpus>(sg, self_sg, rank);
 
     int part = m * valid_pack_count / ngpus;
-    for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+    for(int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < part;
+        idx += gridDim.x * blockDim.x)
     {
         int flat_idx = rank * part + idx;
         int row      = flat_idx / valid_pack_count;
         int col      = flat_idx % valid_pack_count;
         int input_idx = row * input_pack_count + col;
-        // cross device read by all warp
-        P input_reg                                         = ptrs[warp_id][input_idx];
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = input_reg;
-        __syncthreads();
-        // calculate and save in first warp
-        if(warp_id == 0)
+        A acc{};
+#pragma unroll
+        for(int r = 0; r < ngpus; ++r)
         {
-            A add_reg;
+            P v = ptrs[r][input_idx];
 #pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
-            }
-#pragma unroll
-            for(int i = 1; i < ngpus; ++i)
-            {
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                {
-                    add_reg[j] +=
-                        upcast_s(tmp_smem[i * pack_size * tnum_gpu + pack_size * threadIdx.x + j]);
-                }
-            }
-            P add_rslt;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-            {
-                add_rslt[i] = downcast_s<T>(add_reg[i]);
-            }
-            *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id) = add_rslt;
+            for(int e = 0; e < pack_size; ++e)
+                acc[e] += upcast_s(v[e]);
         }
-        __syncthreads();
-
-        // cross device store
-        P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-        tmps[warp_id][rank * part + idx] = rslt;
+        P s;
+#pragma unroll
+        for(int e = 0; e < pack_size; ++e)
+            s[e] = downcast_s<T>(acc[e]);
+#pragma unroll
+        for(int w = 0; w < ngpus; ++w)
+            tmps[w][flat_idx] = s;
     }
     // NOTE: must use final_sync=false (RELEASE/ACQUIRE) here. Stage 2
     // (local_device_load_rmsnorm*) on each rank reads `tmps` on the
@@ -1564,7 +1541,7 @@ __global__ void __launch_bounds__(256, 1)
             float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
             square_sum += tmp_sum;
         }
-        square_sum  = warpReduce<AddFunctor, float, 64>(square_sum);
+        square_sum  = wave_reduce<float, AddFunctor<float>, 64, true>(square_sum, AddFunctor<float>{});
         float denom = rsqrtf(square_sum / n + eps);
 #pragma unroll
         for(int n_iter = 0; n_iter < n_loop; ++n_iter)
@@ -1600,7 +1577,7 @@ __device__ __forceinline__ T ar_fusion_epilogue_block_reduce(T val, int block_si
     int reduce_width    = 1;
     while(reduce_width < num_warps)
         reduce_width <<= 1;
-    val                 = warpReduce<functor, T, WARP_SIZE>(val);
+    val                 = multithread_reduce<T, functor<T>, WARP_SIZE>(val, functor<T>{}, WARP_SIZE);
     if(w_tid == 0)
     {
         shared[wid] = val;
@@ -4159,22 +4136,25 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     dim3 block(512);
     int block_num = ((size / world_size_) + 512 - 1) / 512;
     dim3 grid(std::min(block_num, 80));
+    int rs_packs = size / (pack_size * world_size_);
+    dim3 rs_block(256);
+    dim3 rs_grid(std::min((rs_packs + 255) / 256, 80));
     switch(world_size_)
     {
     case 8:
         MAYBE_DISPATCH_1S_KERNEL(8);
         reduce_scatter_cross_device_store<T, 8>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+            <<<rs_grid, rs_block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     case 4:
         MAYBE_DISPATCH_1S_KERNEL(4);
         reduce_scatter_cross_device_store<T, 4>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+            <<<rs_grid, rs_block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     case 2:
         MAYBE_DISPATCH_1S_KERNEL(2);
         reduce_scatter_cross_device_store<T, 2>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+            <<<rs_grid, rs_block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     default: throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" + std::to_string(world_size_));
     }
