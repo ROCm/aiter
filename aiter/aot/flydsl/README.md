@@ -5,6 +5,18 @@ FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter'
 tuned CSV configs and compiles them into the cache up front, so that at runtime
 the JIT path hits the cache instead of compiling again.
 
+MoE sorting, Stage1, Stage2, and Stage2 reduction resolve shared
+kernel-owned `OperationPlan` objects. AOT compiles their `CompilePlan`
+projection, while runtime executes the same ordered nodes through data-plane
+adapters. They do not construct FakeTensors or enter the full runtime hosts.
+Sorting is explicit:
+call `compile_moe_sorting_case(MoeSortingCompileCase(...), context=...)`.
+Ordinary tuned Stage1/Stage2 CSV rows never infer sorting inclusion.
+
+For a complete CPU and isolated gfx950 validation procedure, including strict
+positive/negative controls, see the
+**[MoE ABI-driven AOT testing guide](../../../docs/flydsl_moe_aot_testing.md)**.
+
 | Module | OpKind | Description |
 | --- | --- | --- |
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
@@ -25,6 +37,92 @@ source /path/to/venv/bin/activate
 
 All commands below assume you run them from the repo root (the top-level `aiter`
 directory of your checkout).
+
+---
+
+## CPU compile-request baseline
+
+The standard two-stage MoE call graph and backend boundaries are
+documented in
+[`docs/flydsl_moe_compile_inventory.md`](../../../docs/flydsl_moe_compile_inventory.md).
+This inventory and its golden are regression baselines, not a Manifest or a new
+source of dispatch truth.
+
+Run the baseline without a GPU:
+
+```bash
+source /opt/venv/bin/activate
+AITER_AOT_IMPORT=1 \
+  python -m pytest -q aiter/aot/flydsl/tests/test_moe_compile_baseline.py
+```
+
+The test mocks FlyDSL compile/launch and CUDA access, then compares complete
+normalized builder requests with
+`aiter/aot/flydsl/tests/data/moe_compile_requests_gfx950.json`.
+Update that golden only for an intentional, reviewed old-host-path semantic
+change. Regenerate it with the recorder, never by hand or from FlyDSL-private
+cache keys:
+
+```bash
+python aiter/aot/flydsl/tests/moe_compile_recorder.py \
+  --write aiter/aot/flydsl/tests/data/moe_compile_requests_gfx950.json
+AITER_AOT_IMPORT=1 \
+  python -m pytest -q aiter/aot/flydsl/tests/test_moe_compile_baseline.py
+```
+
+Use the recorder's direct script entry above. For pytest,
+`AITER_AOT_IMPORT=1` keeps its parent-package collection lightweight until the
+test installs the CPU-only isolation.
+Review the semantic golden diff before committing.
+
+The sorting golden now records only the concrete launcher selected by each
+trigger. A multiphase factory may construct several Python launchers, but each
+sorting `CompileUnit` and AOT cache operation owns exactly one of oneshot,
+P0v2+P23, or ClearWS+P0+P1+P23.
+
+## Explicit sorting smoke test
+
+Ordinary `moe.py --csv ...` jobs intentionally exclude sorting. Compile a
+sorting case explicitly, then run its strict numerical check:
+
+```bash
+source /opt/venv/bin/activate
+
+export GPU_INDEX="${GPU_INDEX:-0}"
+export SORTING_CACHE
+SORTING_CACHE="$(mktemp -d "${TMPDIR:-/tmp}/aiter-sorting-aot.XXXXXX")"
+
+AITER_AOT_IMPORT=1 \
+HIP_VISIBLE_DEVICES="$GPU_INDEX" CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
+FLYDSL_RUNTIME_CACHE_DIR="$SORTING_CACHE" \
+  python - <<'PY'
+from aiter.aot.flydsl.moe import compile_moe_sorting_case
+from aiter.ops.flydsl.aot_backend import create_compile_context
+from aiter.ops.flydsl.compile_plan import RocmTarget
+from aiter.ops.flydsl.moe_compile_plan import MoeSortingCompileCase
+
+context = create_compile_context(RocmTarget("gfx950", 256))
+artifact, = compile_moe_sorting_case(
+    MoeSortingCompileCase(8, 256, 8, False),
+    context=context,
+)
+print("SORTING_AOT_COMPILE_PASS", artifact.unit.spec.op_id)
+PY
+
+unset AITER_AOT_IMPORT COMPILE_ONLY ARCH FLYDSL_GPU_ARCH
+HIP_VISIBLE_DEVICES="$GPU_INDEX" CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
+GPU_ARCHS=gfx950 CU_NUM=256 \
+FLYDSL_RUNTIME_CACHE_DIR="$SORTING_CACHE" FLYDSL_RUNTIME_RUN_ONLY=1 \
+  python op_tests/test_moe_sorting.py \
+    -m 8 -e 256 -t 8 -em f -p 0 -dp 0 -md 64 -id 64
+
+rm -rf -- "$SORTING_CACHE"
+unset SORTING_CACHE GPU_INDEX FLYDSL_RUNTIME_RUN_ONLY
+```
+
+The complete oneshot/multiphase/masked matrix, empty-cache negative control,
+and full sorting+Stage1+Stage2 gate are in
+[`docs/flydsl_moe_aot_testing.md`](../../../docs/flydsl_moe_aot_testing.md).
 
 ---
 
@@ -74,9 +172,10 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
-> for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, use
+> and carried by an explicit `CompileContext`. The compatibility backend applies
+> FlyDSL 0.2.x's `ARCH` and `FLYDSL_GPU_ARCH` plus `CU_NUM` for each unit, then
+> restores the prior environment. Shell target variables therefore do **not**
+> override a CSV target. To cross-compile, use
 > `chunk_gdn_h --target-arch <arch>` (the only module that exposes an override),
 > or edit the `cu_num` column in the CSV.
 
@@ -92,9 +191,9 @@ AITER_FLYDSL_AOT_WORKERS=16 python -m aiter.aot.flydsl.moe
 
 Compiling successfully is not enough — you also want to verify that the **runtime
 actually hits the AOT cache** (no cache miss). That is done by
-`op_tests/test_moe_2stage.py`, which wraps test cases with
-`aiter.aot.flydsl.common.fail_on_aot_cache_miss`: if the runtime falls back to
-JIT compilation, the case fails.
+`op_tests/test_moe_2stage.py`, which runs selected cases under FlyDSL run-only
+mode. A missing artifact raises with the op ID, target, signature, and cache
+directory; it cannot fall back to JIT compilation.
 
 Full flow:
 

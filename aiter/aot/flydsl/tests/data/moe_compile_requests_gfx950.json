@@ -1,0 +1,665 @@
+{
+  "requests": [
+    {
+      "builder": "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module",
+      "id": "cktile.epilogue.silu/post_activation",
+      "kwargs": {
+        "act": "silu",
+        "enable_bias": false,
+        "gui_layout": true,
+        "inter_dim": 2048,
+        "quant_mode": "none",
+        "topk": 8
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.aot.flydsl.moe._precompile_epilogue_to_cache",
+          "aiter.ops.flydsl.moe_kernels._get_compiled_silu_fused",
+          "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module"
+        ],
+        "launchers": [
+          "post_activation.silu_and_mul_fq"
+        ],
+        "scenario": "cktile.epilogue.silu"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.swiglu_and_mul.build_swiglu_and_mul_module",
+      "id": "cktile.epilogue.swiglu/post_activation",
+      "kwargs": {
+        "inter_dim": 2048
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.aot.flydsl.moe._precompile_epilogue_to_cache",
+          "aiter.ops.flydsl.moe_kernels._get_compiled_swiglu",
+          "aiter.ops.flydsl.kernels.swiglu_and_mul.build_swiglu_and_mul_module"
+        ],
+        "launchers": [
+          "post_activation.swiglu_and_mul"
+        ],
+        "scenario": "cktile.epilogue.swiglu"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase",
+      "id": "sorting.multiphase.4k.masked/multiphase_builder",
+      "kwargs": {
+        "has_mask": true,
+        "k4_block": 256,
+        "num_experts": 256,
+        "topk": 8,
+        "unit_size": 32
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_4k_fused",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_multiphase_launchers",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase"
+        ],
+        "launchers": [
+          "sorting.multiphase.4k_fused"
+        ],
+        "scenario": "sorting.multiphase.4k.masked"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase",
+      "id": "sorting.multiphase.p0v2.unmasked.e384/multiphase_builder",
+      "kwargs": {
+        "has_mask": false,
+        "k4_block": 512,
+        "num_experts": 384,
+        "topk": 8,
+        "unit_size": 32
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_p0v2_p23",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_multiphase_launchers",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase"
+        ],
+        "launchers": [
+          "sorting.multiphase.p0v2_p23"
+        ],
+        "scenario": "sorting.multiphase.p0v2.unmasked.e384"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot",
+      "id": "sorting.oneshot.masked/oneshot_builder",
+      "kwargs": {
+        "has_mask": true,
+        "max_tokens": 8,
+        "num_experts": 256,
+        "topk": 8,
+        "unit_size": 32
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_oneshot",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot"
+        ],
+        "launchers": [
+          "sorting.oneshot"
+        ],
+        "scenario": "sorting.oneshot.masked"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot",
+      "id": "sorting.oneshot.unmasked/oneshot_builder",
+      "kwargs": {
+        "has_mask": false,
+        "max_tokens": 8,
+        "num_experts": 256,
+        "topk": 8,
+        "unit_size": 32
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_sorting.flydsl_moe_sorting_fwd",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel.compile_moe_sorting_oneshot",
+          "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot"
+        ],
+        "launchers": [
+          "sorting.oneshot"
+        ],
+        "scenario": "sorting.oneshot.unmasked"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_gemm1",
+      "id": "stage1.int4.splitk/gemm",
+      "kwargs": {
+        "doweight_stage1": false,
+        "experts": 384,
+        "group_size": 32,
+        "in_dtype": "int4_bf16",
+        "inter_dim": 256,
+        "k_batch": 4,
+        "model_dim": 7168,
+        "out_dtype": "bf16",
+        "scale_is_bf16": true,
+        "tile_k": 128,
+        "tile_m": 16,
+        "tile_n": 64,
+        "topk": 8,
+        "use_cshuffle_epilog": null
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage1",
+          "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_gemm1"
+        ],
+        "launchers": [
+          "stage1.gemm"
+        ],
+        "scenario": "stage1.int4.splitk"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1",
+      "id": "stage1.main.non_split.bias.route_weighted/gemm",
+      "kwargs": {
+        "a_dtype": "fp4",
+        "a_scale_one": false,
+        "act": "silu",
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "doweight_stage1": true,
+        "enable_bias": true,
+        "experts": 256,
+        "gate_mode": "separated",
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "k_batch": 1,
+        "k_wave": 1,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": true,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": 1,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage1",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1"
+        ],
+        "launchers": [
+          "stage1.gemm"
+        ],
+        "scenario": "stage1.main.non_split.bias.route_weighted"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1",
+      "id": "stage1.splitk.fp4.silu.separated/gemm",
+      "kwargs": {
+        "a_dtype": "fp4",
+        "a_scale_one": false,
+        "act": "silu",
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "doweight_stage1": false,
+        "enable_bias": false,
+        "experts": 256,
+        "gate_mode": "separated",
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "k_batch": 4,
+        "k_wave": 1,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": true,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": 3,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage1",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1"
+        ],
+        "launchers": [
+          "stage1.gemm"
+        ],
+        "scenario": "stage1.splitk.fp4.silu.separated"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module",
+      "id": "stage1.splitk.fp4.silu.separated/post_activation",
+      "kwargs": {
+        "act": "silu",
+        "enable_bias": false,
+        "gui_layout": false,
+        "inter_dim": 2048,
+        "quant_mode": "fp4",
+        "topk": 8
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels._get_compiled_silu_fused",
+          "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module"
+        ],
+        "launchers": [
+          "post_activation.silu_and_mul_fq"
+        ],
+        "scenario": "stage1.splitk.fp4.silu.separated"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1",
+      "id": "stage1.splitk.fp8.swiglu.interleaved.bias/gemm",
+      "kwargs": {
+        "a_dtype": "fp8",
+        "a_scale_one": false,
+        "act": "swiglu",
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "doweight_stage1": false,
+        "enable_bias": false,
+        "experts": 256,
+        "gate_mode": "interleave",
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "k_batch": 4,
+        "k_wave": 1,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": true,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": 3,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage1",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1"
+        ],
+        "launchers": [
+          "stage1.gemm"
+        ],
+        "scenario": "stage1.splitk.fp8.swiglu.interleaved.bias"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module",
+      "id": "stage1.splitk.fp8.swiglu.interleaved.bias/post_activation",
+      "kwargs": {
+        "act": "swiglu",
+        "enable_bias": true,
+        "gui_layout": true,
+        "inter_dim": 2048,
+        "quant_mode": "fp8",
+        "topk": 8
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels._get_compiled_silu_fused",
+          "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module"
+        ],
+        "launchers": [
+          "post_activation.silu_and_mul_fq"
+        ],
+        "scenario": "stage1.splitk.fp8.swiglu.interleaved.bias"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1",
+      "id": "stage1.splitk.none.silu.interleaved/gemm",
+      "kwargs": {
+        "a_dtype": "fp8",
+        "a_scale_one": false,
+        "act": "silu",
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "doweight_stage1": false,
+        "enable_bias": false,
+        "experts": 256,
+        "gate_mode": "interleave",
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "k_batch": 4,
+        "k_wave": 1,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": true,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": 3,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage1",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm1"
+        ],
+        "launchers": [
+          "stage1.gemm"
+        ],
+        "scenario": "stage1.splitk.none.silu.interleaved"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module",
+      "id": "stage1.splitk.none.silu.interleaved/post_activation",
+      "kwargs": {
+        "act": "silu",
+        "enable_bias": false,
+        "gui_layout": true,
+        "inter_dim": 2048,
+        "quant_mode": "none",
+        "topk": 8
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage1",
+          "aiter.ops.flydsl.moe_kernels._get_compiled_silu_fused",
+          "aiter.ops.flydsl.kernels.silu_and_mul_fq.build_silu_and_mul_fq_module"
+        ],
+        "launchers": [
+          "post_activation.silu_and_mul_fq"
+        ],
+        "scenario": "stage1.splitk.none.silu.interleaved"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2",
+      "id": "stage2.atomic.bias/gemm",
+      "kwargs": {
+        "a_dtype": "fp4",
+        "accumulate": true,
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "cu_num_mul": 1,
+        "doweight_stage2": true,
+        "enable_bias": true,
+        "experts": 256,
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "sort_block_m": 0,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": false,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": null,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage2",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2"
+        ],
+        "launchers": [
+          "stage2.gemm"
+        ],
+        "scenario": "stage2.atomic.bias"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_gemm2",
+      "id": "stage2.int4.atomic/gemm",
+      "kwargs": {
+        "accumulate": true,
+        "doweight_stage2": true,
+        "experts": 384,
+        "group_size": 32,
+        "in_dtype": "int4_bf16",
+        "inter_dim": 256,
+        "model_dim": 7168,
+        "out_dtype": "bf16",
+        "scale_is_bf16": true,
+        "tile_k": 128,
+        "tile_m": 16,
+        "tile_n": 128,
+        "topk": 8,
+        "use_cshuffle_epilog": null
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage2",
+          "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_gemm2"
+        ],
+        "launchers": [
+          "stage2.gemm"
+        ],
+        "scenario": "stage2.int4.atomic"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2",
+      "id": "stage2.reduce.masked_ep/gemm",
+      "kwargs": {
+        "a_dtype": "fp4",
+        "accumulate": false,
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "cu_num_mul": 1,
+        "doweight_stage2": true,
+        "enable_bias": false,
+        "experts": 32,
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "sort_block_m": 0,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": false,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": null,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage2",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2"
+        ],
+        "launchers": [
+          "stage2.gemm"
+        ],
+        "scenario": "stage2.reduce.masked_ep"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction",
+      "id": "stage2.reduce.masked_ep/reduction",
+      "kwargs": {
+        "dtype_str": "bf16",
+        "model_dim": 7168,
+        "num_experts": 256,
+        "topk": 8,
+        "use_mask": true
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_reduction",
+          "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction"
+        ],
+        "launchers": [
+          "stage2.reduction"
+        ],
+        "scenario": "stage2.reduce.masked_ep"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2",
+      "id": "stage2.reduce.plain.large_auto_persist/gemm",
+      "kwargs": {
+        "a_dtype": "fp4",
+        "accumulate": false,
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "cu_num_mul": 1,
+        "doweight_stage2": true,
+        "enable_bias": false,
+        "experts": 256,
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": -1,
+        "sort_block_m": 0,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": false,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": null,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage2",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2"
+        ],
+        "launchers": [
+          "stage2.gemm"
+        ],
+        "scenario": "stage2.reduce.plain.large_auto_persist"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction",
+      "id": "stage2.reduce.plain.large_auto_persist/reduction",
+      "kwargs": {
+        "dtype_str": "bf16",
+        "model_dim": 7168,
+        "num_experts": 0,
+        "topk": 8,
+        "use_mask": false
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_reduction",
+          "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction"
+        ],
+        "launchers": [
+          "stage2.reduction"
+        ],
+        "scenario": "stage2.reduce.plain.large_auto_persist"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2",
+      "id": "stage2.reduce.plain/gemm",
+      "kwargs": {
+        "a_dtype": "fp4",
+        "accumulate": false,
+        "b_dtype": "fp4",
+        "b_nt": 2,
+        "cu_num_mul": 1,
+        "doweight_stage2": true,
+        "enable_bias": false,
+        "experts": 256,
+        "inter_dim": 2048,
+        "inter_dim_pad": 0,
+        "model_dim": 7168,
+        "model_dim_pad": 0,
+        "out_dtype": "bf16",
+        "persist_m": 1,
+        "sort_block_m": 0,
+        "tile_k": 256,
+        "tile_m": 32,
+        "tile_n": 128,
+        "topk": 8,
+        "use_async_copy": false,
+        "use_cshuffle_epilog": null,
+        "waves_per_eu": null,
+        "xcd_swizzle": 0
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_stage2",
+          "aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage.compile_mixed_moe_gemm2"
+        ],
+        "launchers": [
+          "stage2.gemm"
+        ],
+        "scenario": "stage2.reduce.plain"
+      }
+    },
+    {
+      "builder": "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction",
+      "id": "stage2.reduce.plain/reduction",
+      "kwargs": {
+        "dtype_str": "bf16",
+        "model_dim": 7168,
+        "num_experts": 0,
+        "topk": 8,
+        "use_mask": false
+      },
+      "trigger": {
+        "host_path": [
+          "aiter.ops.flydsl.moe_kernels.flydsl_moe_stage2",
+          "aiter.ops.flydsl.moe_kernels.compile_flydsl_moe_reduction",
+          "aiter.ops.flydsl.kernels.moe_gemm_2stage.compile_moe_reduction"
+        ],
+        "launchers": [
+          "stage2.reduction"
+        ],
+        "scenario": "stage2.reduce.plain"
+      }
+    }
+  ],
+  "schema_version": 1,
+  "target": {
+    "arch": "gfx950",
+    "cu_count": 256
+  }
+}

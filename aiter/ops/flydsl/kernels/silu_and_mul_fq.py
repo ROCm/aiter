@@ -169,7 +169,15 @@ def build_silu_and_mul_fq_module(
         scale_rsrc = _ptr_buffer_resource(out_scale_sorted)
         tid_rsrc = _ptr_buffer_resource(sorted_ids)
         nv_rsrc = _ptr_buffer_resource(num_valid_ids)
-        if enable_bias:
+        # `enable_bias` is a compile-time Python flag, so gate on it with
+        # `const_expr` (as with `gui_layout` / `_need_quant` below). A bare
+        # `if enable_bias:` is rewritten by FlyDSL into a runtime scf dispatch
+        # whose branch body becomes a separate function; names assigned there
+        # (topk_rsrc, bias_rsrc, bias_row) then do NOT propagate to sibling
+        # `if enable_bias:` blocks, raising `NameError: topk_rsrc` / `bias_row`
+        # at trace time (hit by the split-K fp4 + bias AOT variants). const_expr
+        # keeps it a compile-time branch with normal Python name scoping.
+        if const_expr(enable_bias):
             topk_rsrc = _ptr_buffer_resource(topk_ids)
             bias_rsrc = _ptr_buffer_resource(bias)
 
@@ -209,11 +217,10 @@ def build_silu_and_mul_fq_module(
             col_valid = arith.cmpi(CmpIPredicate.ult, col0, inter_dim_i32)
             _if_col = scf.IfOp(col_valid)
             with ir.InsertionPoint(_if_col.then_block):
-
                 _if_valid = scf.IfOp(is_valid, has_else=True)
                 with ir.InsertionPoint(_if_valid.then_block):
                     in_row = token_id * topk_i32 + slot_id
-                    if enable_bias:
+                    if const_expr(enable_bias):
                         # sorted_ids encodes token and slot, not expert. Use topk_ids
                         # to recover the expert-specific bias row for this token slot.
                         expert_id = buffer_ops.buffer_load(
@@ -303,7 +310,7 @@ def build_silu_and_mul_fq_module(
                             up_f32, static_position=[vi], dynamic_position=[]
                         )
 
-                        if enable_bias:
+                        if const_expr(enable_bias):
                             bias_col = col0 + arith.constant(vi, type=i32)
                             g = g + _load_bias_scalar(bias_row + bias_col)
                             u = u + _load_bias_scalar(
