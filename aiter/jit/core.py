@@ -137,6 +137,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/mxscale_preshuffle_tuned_gemm.csv",
+)
+
 
 class AITER_CONFIG(object):
     @property
@@ -159,6 +164,14 @@ class AITER_CONFIG(object):
             "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
             "a8w8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE",
+            AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE,
+            "mxscale_preshuffle_tuned_gemm",
         )
 
     @property
