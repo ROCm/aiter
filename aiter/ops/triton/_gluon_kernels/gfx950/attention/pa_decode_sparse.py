@@ -35,6 +35,16 @@ def _cache_load(ptr, off, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
 
 
 @gluon.jit
+def _fp8_to_f32(x_u8, FP8_FNUZ: gl.constexpr):
+    # gfx950's native e4m3 cvt is OCP (float8e4nv). fnuz (float8e4b8) -> f32 has no
+    # native cvt and lowers to a ~5x software unpack that spills; but fnuz -> bf16 is
+    # cheap and fp8 -> bf16 is exact (3 mantissa bits), so route fnuz through bf16.
+    if FP8_FNUZ:
+        return x_u8.to(gl.float8e4b8, bitcast=True).to(gl.bfloat16).to(gl.float32)
+    return x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
+
+
+@gluon.jit
 def _decode_tile(
     q_dot,
     cache_ptr,
@@ -73,6 +83,7 @@ def _decode_tile(
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    FP8_FNUZ: gl.constexpr,
 ):
     """One KV tile -> online-softmax update. MASKED=False (peeled full tiles) drops
     the in-range / gather / score masking; MASKED=True (the tail) keeps it. When
@@ -120,9 +131,7 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
             sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
-        kv_smem.store(
-            (x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32) * sc).to(gl.bfloat16)
-        )
+        kv_smem.store((_fp8_to_f32(x_u8, FP8_FNUZ) * sc).to(gl.bfloat16))
     elif IS_FP8:
         # DSv4 packed fp8_ds_mla: NoPE fp8 + embedded UE8M0 + separate RoPE-bf16.
         nope_off = (block_idx_g * cs0 + pos_g * 576)[:, None] + offs_full[None, :]
@@ -226,6 +235,7 @@ def _gd_fp8(
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    FP8_FNUZ: gl.constexpr,
 ):
     """Gather + dequant one full fp8 tile to bf16 regs (k_nope, k_rope). Split from
     the LDS-write/MFMA so the pipeline runs this tile's gather+dequant while the
@@ -250,9 +260,7 @@ def _gd_fp8(
         scl_off = (bg * NGRP)[:, None] + (offs_full[None, :] // 64)
         x_u8 = _cache_load(cache_ptr, kv_off, USE_BUFFER_LOAD)
         sc = _cache_load(cache_bf16_ptr, scl_off, USE_BUFFER_LOAD)
-        k_nope = (x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32) * sc).to(
-            gl.bfloat16
-        )
+        k_nope = (_fp8_to_f32(x_u8, FP8_FNUZ) * sc).to(gl.bfloat16)
         k_rope = k_nope  # unused for UNIFORM (rope slice-store skipped) -> DCE'd
     else:
         nope_off = (bg * cs0 + pg * 576)[:, None] + offs_full[None, :]
@@ -374,6 +382,7 @@ def _process_segment(
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    FP8_FNUZ: gl.constexpr,
 ):
     offs_full = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, gather_l))
     offs_rope = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, gather_rope_l))
@@ -407,6 +416,7 @@ def _process_segment(
                 UNIFORM,
                 USE_BUFFER_LOAD,
                 HAS_INVALID,
+                FP8_FNUZ,
             )
             for i in range(1, n_full):
                 kn2, kr2, vld2 = _gd_fp8(
@@ -426,6 +436,7 @@ def _process_segment(
                     UNIFORM,
                     USE_BUFFER_LOAD,
                     HAS_INVALID,
+                    FP8_FNUZ,
                 )
                 m_i, l_i, acc = _qkpv_fp8(
                     kn,
@@ -518,6 +529,7 @@ def _process_segment(
                 UNIFORM,
                 USE_BUFFER_LOAD,
                 HAS_INVALID,
+                FP8_FNUZ,
             )
 
     if hi_full < hi:
@@ -559,6 +571,7 @@ def _process_segment(
             UNIFORM,
             USE_BUFFER_LOAD,
             HAS_INVALID,
+            FP8_FNUZ,
         )
     return m_i, l_i, acc
 
@@ -617,6 +630,7 @@ def _pa_decode_sparse(
     UNIFORM: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    FP8_FNUZ: gl.constexpr,
 ):
     """One program = (query t, split, head-block). Two-loop: main (SWA) then
     extra (top-k). NUM_SPLITS==1 writes the output directly; NUM_SPLITS>1 stores
@@ -747,6 +761,7 @@ def _pa_decode_sparse(
         UNIFORM,
         USE_BUFFER_LOAD,
         HAS_INVALID,
+        FP8_FNUZ,
     )
 
     if HAS_EXTRA:
@@ -791,6 +806,7 @@ def _pa_decode_sparse(
             UNIFORM,
             USE_BUFFER_LOAD,
             HAS_INVALID,
+            FP8_FNUZ,
         )
 
     # m_i/l_i are in SliceLayout(1, qk_layout); acc in pv_layout. Move the row

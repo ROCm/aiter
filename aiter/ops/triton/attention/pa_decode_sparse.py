@@ -121,10 +121,16 @@ def pa_decode_sparse(
                 unified_kv.dtype == torch.uint8 or unified_kv.dtype == q.dtype
             )
         else:
-            _fp8_ocp = unified_kv.dtype in (torch.float8_e4m3fn, torch.uint8)
-            _ok = (kv_scales is not None and _fp8_ocp) or (
+            _fp8 = unified_kv.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.uint8,
+            )
+            _ok = (kv_scales is not None and _fp8) or (
                 kv_scales is None and unified_kv.dtype == q.dtype
             )
+        # fnuz vs OCP e4m3 (2D fp8 only) selects the in-kernel dequant bias.
+        fp8_fnuz = unified_kv.ndim == 2 and unified_kv.dtype == torch.float8_e4m3fnuz
         if _ok:
             cache = (
                 unified_kv.view(torch.uint8)
@@ -145,6 +151,7 @@ def pa_decode_sparse(
                 kv_splits=kv_splits,
                 skip_reduce=skip_reduce,
                 has_invalid=bool(has_invalid),
+                fp8_fnuz=fp8_fnuz,
             )
 
     assert (
@@ -411,6 +418,7 @@ def _pa_decode_sparse_gfx950_gluon(
     kv_splits=None,
     skip_reduce=False,
     has_invalid=False,
+    fp8_fnuz=False,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from ``cache.ndim``:
       3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -426,7 +434,9 @@ def _pa_decode_sparse_gfx950_gluon(
     * log2e) and ``l``/``acc`` are per-split un-normalized -- same convention as the
     triton skip_reduce partials -- instead of the final ``[N, H, D]`` output.
     ``has_invalid`` (default False): when True, -1 sentinels anywhere in a token's
-    index range are clamped in-bounds for the gather and masked out of the softmax
+    index range are clamped in-bounds for the gather and masked out of the softmax.
+    ``fp8_fnuz`` (uniform-pool fp8 only): fp8 e4m3 flavor -- False = OCP (bias 7),
+    True = fnuz (bias 8); selects the in-kernel dequant. Packed fp8_ds_mla is OCP.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
@@ -584,6 +594,7 @@ def _pa_decode_sparse_gfx950_gluon(
         UNIFORM=UNIFORM,
         USE_BUFFER_LOAD=use_buffer_load,
         HAS_INVALID=has_invalid,
+        FP8_FNUZ=fp8_fnuz,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
