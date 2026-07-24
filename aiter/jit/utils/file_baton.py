@@ -114,6 +114,12 @@ class FileBaton:
             return False
         except PermissionError:
             return True  # exists but owned by another user
+        except OSError:
+            # Windows reports a dead or otherwise invalid PID as WinError 87
+            # rather than ProcessLookupError.
+            if os.name == "nt":
+                return False
+            raise
         return True
 
     def _is_stale(self):

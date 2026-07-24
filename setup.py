@@ -20,8 +20,12 @@ PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
-# Single skip-C++/HIP-build gate; Windows enables it automatically.
-AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or IS_WINDOWS
+# Native Windows ROCm builds are opt-in while the default wheel remains the
+# lightweight Triton-only package published by upstream.
+AITER_ENABLE_HIP = os.environ.get("AITER_ENABLE_HIP", "0") == "1"
+AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or (
+    IS_WINDOWS and not AITER_ENABLE_HIP
+)
 if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
@@ -56,7 +60,7 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and is_develop_mode():
+if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
         from packaging.version import Version
@@ -161,7 +165,10 @@ def prepare_packaging():
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
-    if not AITER_TRITON_ONLY:
+    # The precompiled HSA code objects are Linux/CDNA-specific.  Bundling them
+    # in a Windows wheel adds over 100 MiB but cannot provide gfx115x kernels;
+    # those architectures use the CK/JIT sources packaged above instead.
+    if not AITER_TRITON_ONLY and not IS_WINDOWS:
         shutil.copytree("hsa", "aiter_meta/hsa")
     else:
         os.makedirs("aiter_meta/hsa", exist_ok=True)
@@ -389,18 +396,22 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import run_aot
+        # FlyDSL does not publish Windows wheels; native Windows builds use CK.
+        if not IS_WINDOWS:
+            _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+            os.environ["AITER_AOT_IMPORT"] = "1"
+            try:
+                from aiter.aot.flydsl.common import run_aot
 
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            run_aot(flydsl_cache_dir)
-        finally:
-            if _prev_aot_import is None:
-                os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+                flydsl_cache_dir = os.path.join(
+                    this_dir, "aiter", "jit", "flydsl_cache"
+                )
+                run_aot(flydsl_cache_dir)
+            finally:
+                if _prev_aot_import is None:
+                    os.environ.pop("AITER_AOT_IMPORT", None)
+                else:
+                    os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
@@ -470,8 +481,9 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
     ]
+    if not IS_WINDOWS:
+        install_requires.append(FLYDSL_VERSION)
 
 setup(
     name=PACKAGE_NAME,
@@ -480,10 +492,12 @@ setup(
     include_package_data=True,
     package_data={
         "": ["*"],
+        "aiter": ["jit/*.pyd"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
+        "Operating System :: Microsoft :: Windows",
         "Operating System :: Unix",
     ],
     cmdclass={"build_ext": NinjaBuildExtension},

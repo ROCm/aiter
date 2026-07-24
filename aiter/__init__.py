@@ -58,11 +58,18 @@ def getLogger():
 
 logger = getLogger()
 AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
+from .utility import dtypes as dtypes  # noqa: E402
+
 # Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
-# JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
-# env var, e.g. Triton-backend users with no C++ toolchain or CK.
+# JIT build. Native Windows ROCm support is opt-in so existing Windows installs
+# keep the upstream Triton-only default unless AITER_ENABLE_HIP=1 is set.
+AITER_ENABLE_HIP = os.getenv("AITER_ENABLE_HIP", "0") == "1" or (
+    sys.platform == "win32"
+    and os.path.isfile(os.path.join(os.path.dirname(__file__), "jit", "module_aiter_core.pyd"))
+)
 AITER_TRITON_ONLY = (
-    os.getenv("AITER_TRITON_ONLY", "0") == "1" or sys.platform == "win32"
+    os.getenv("AITER_TRITON_ONLY", "0") == "1"
+    or (sys.platform == "win32" and not AITER_ENABLE_HIP)
 )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
@@ -85,7 +92,6 @@ else:
     # non-gfx950) inside aiter/ops/opus/__init__.py, so its import line
     # is safe to put at top-level without try/except.
     from .jit import core as core  # noqa: E402
-    from .utility import dtypes as dtypes  # noqa: E402
     from .ops.enum import *  # noqa: F403,E402
     from .ops.norm import *  # noqa: F403,E402
     from .ops.quant import *  # noqa: F403,E402
@@ -111,7 +117,8 @@ else:
     from .ops.pos_encoding import *  # noqa: F403,E402
     from .ops.cache import *  # noqa: F403,E402
     from .ops.rmsnorm import *  # noqa: F403,E402
-    from .ops.communication import *  # noqa: F403,E402
+    if sys.platform != "win32" or torch.distributed.is_available():
+        from .ops.communication import *  # noqa: F403,E402
     from .ops.rope import *  # noqa: F403,E402
     from .ops.topk import *  # noqa: F403,E402
     from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402

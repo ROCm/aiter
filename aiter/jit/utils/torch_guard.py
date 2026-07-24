@@ -342,10 +342,10 @@ def torch_compile_guard(
                 tags = ()
             else:
                 tags = (torch.Tag.needs_fixed_stride_order,)
-            op_schema = f"aiter::{loadName}" + schema
+            op_schema = f"{loadName}" + schema
             aiter_lib.define(op_schema, tags=tags)
-            aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CUDA")
-            aiter_lib.impl(f"aiter::{loadName}", custom_func, dispatch_key="CPU")
+            aiter_lib.impl(loadName, custom_func, dispatch_key="CUDA")
+            aiter_lib.impl(loadName, custom_func, dispatch_key="CPU")
             aiter_lib._register_fake(f"{loadName}", fake_func)
 
         return wrapper_custom

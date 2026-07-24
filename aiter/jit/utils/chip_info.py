@@ -5,22 +5,44 @@ import logging
 import os
 import re
 import subprocess
+import sys
 
-from cpp_extension import executable_path
-from torch_guard import torch_compile_guard
-
-from build_targets import (  # noqa: F401 -- re-exported for callers
-    GFX_MAP,
-    _parse_gpu_archs_env,
-    filter_tune_df,
-    get_build_targets_env,
-)
+try:
+    from .cpp_extension import executable_path
+    from .torch_guard import torch_compile_guard
+    from .build_targets import (  # noqa: F401 -- re-exported for callers
+        GFX_MAP,
+        _parse_gpu_archs_env,
+        filter_tune_df,
+        get_build_targets_env,
+    )
+except ImportError:
+    # core.py also imports this module directly after adding utils/ to sys.path.
+    from cpp_extension import executable_path
+    from torch_guard import torch_compile_guard
+    from build_targets import (  # noqa: F401 -- re-exported for callers
+        GFX_MAP,
+        _parse_gpu_archs_env,
+        filter_tune_df,
+        get_build_targets_env,
+    )
 
 logger = logging.getLogger("aiter")
 
 
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
+    if sys.platform == "win32":
+        try:
+            import torch
+
+            props = torch.cuda.get_device_properties(0)
+            arch = props.gcnArchName.split(":", 1)[0].lower()
+            if arch.startswith("gfx"):
+                return [arch]
+        except Exception as e:
+            raise RuntimeError(f"Get GPU arch from PyTorch failed: {e}") from e
+
     try:
         rocminfo = executable_path("rocminfo")
         result = subprocess.run(
@@ -141,6 +163,10 @@ def get_gfx_list() -> list[str]:
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
+        if sys.platform == "win32":
+            import torch
+
+            return int(torch.cuda.get_device_properties(0).multi_processor_count)
         try:
             rocminfo = executable_path("rocminfo")
             result = subprocess.run(
