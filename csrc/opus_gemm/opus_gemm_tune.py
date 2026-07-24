@@ -422,7 +422,6 @@ def kid_rejects_shape(k_inst, M, N, K):
         "a16w16_quad_mfma32_kbuf1",
         "a16w16_kbuf2v",
         "a16w16_kbuf2v_bk128",
-        "a16w16_kbuf1",
     ):
         # Non-splitK a16w16 family all share the same K-dbuf parity +
         # MFMA layout constraints as a16w16 (10000).
@@ -433,6 +432,14 @@ def kid_rejects_shape(k_inst, M, N, K):
         if not k_inst.has_oob:
             if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
                 return True
+        return False
+
+    if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
+        waves_per_wg = k_inst.BLOCK_SIZE // 64
+        t_k = waves_per_wg // (k_inst.T_M * k_inst.T_N)
+        k_tile_full = k_inst.B_K * t_k
+        if K < k_tile_full or K % k_tile_full != 0:
+            return True
         return False
 
     if k_inst.kernel_tag == "a16w16_flatmm":
@@ -583,7 +590,7 @@ def kid_rejects_bias(k_inst, bias):
       * persistent / flatmm-non-splitk (HAS_BIAS=false hardcoded in pipelines)
       * gfx942 SB kid 10000 (HAS_BIAS path removed 2026-06-02; was dead code)
       * gfx942 splitk family (kid 10200+): silently ignored bias
-      * gfx942 non-splitK siblings (10002/03/11): no bias path
+      * gfx942 P1 non-splitK variants: no bias path
     """
     if not bias:
         return False
