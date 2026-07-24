@@ -198,9 +198,22 @@ jobs:
           # CMD of /bin/bash, which exits immediately for `docker run -d`.
           # Force a long-lived `sleep infinity` so subsequent `docker exec`
           # invocations succeed for both legacy and manylinux images.
+          # Pass GPU devices into the build container when the runner has them:
+          # setup.py start_aot() JIT-loads HIP modules and fails with
+          # hipErrorNoDevice if the container cannot reach a GPU. On GPU-less
+          # runners (build-only-aiter) /dev/kfd is absent, so the flags are
+          # omitted and the container starts as before.
+          GPU_FLAGS=""
+          if [ -e /dev/kfd ]; then
+            GPU_FLAGS="--device=/dev/kfd --device=/dev/dri --group-add video"
+            echo "GPU devices detected; passing ${GPU_FLAGS} to build container"
+          else
+            echo "No /dev/kfd on runner; starting build container without GPU access"
+          fi
           docker run -dt \
           --shm-size=16G \
           --network=host \
+          ${GPU_FLAGS} \
           --entrypoint="" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -309,11 +322,16 @@ jobs:
           else
             TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_NUM}"
           fi
-          # Optional torch version pin (e.g. 2.10.0+rocm7.1). Empty = latest.
+          # Optional torch version pin (e.g. 2.10.0+rocm7.1). Empty = default
+          # constraint torch<2.13. torch 2.13.0 breaks the build: its
+          # torch.library._clear_torch_ops_cache() does qualname.split("::")
+          # expecting exactly one "::", which raises on aiter custom-op names
+          # during interpreter teardown of setup.py start_aot(). Pin below 2.13
+          # until the op-name incompatibility is resolved.
           if [ -n "${TORCH_PIN}" ]; then
             TORCH_SPEC="torch==${TORCH_PIN}"
           else
-            TORCH_SPEC="torch"
+            TORCH_SPEC="torch<2.13"
           fi
           echo "Torch index: ${TORCH_INDEX}"
           echo "Torch spec:  ${TORCH_SPEC}"

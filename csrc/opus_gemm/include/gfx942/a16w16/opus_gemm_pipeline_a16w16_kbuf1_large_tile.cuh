@@ -6,7 +6,7 @@
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-#include "opus_gemm_asm_mma16x16x16.cuh"
+#include "opus_gemm_mfma16x16x16_gfx942.cuh"
 #include "opus_gemm_helpers_a16w16.cuh"
 
 
@@ -130,14 +130,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kbuf1_large
     v_b[0] = load<T::VEC_B>(s_b[0], u_rb);
     v_a[0] = load<T::VEC_A>(s_a[0], u_ra);
 
-    // MAIN LOOP -- inline asm enforced ds_read/MMA interleaving.
+    // MAIN LOOP -- ds_read/MFMA interleaving.
     for (int tile = 0; tile < loops - 2; tile++) {
 
-        // -- Phase 1: MMA[0][0] + asm ds_read v_b[1] --
+        // -- Phase 1: MMA[0][0] + ds_read v_b[1] --
         // 6 pending from Phase 4 (brd0..ard3), partial waits inside function
         phase_b_prefetch<T, 6>(v_a[0], v_b[0], acc_00, v_b[1], lds_b1);
 
-        // -- Phase 2: MMA[0][1] + asm ds_read v_a[1] --
+        // -- Phase 2: MMA[0][1] + ds_read v_a[1] --
         // 2 pending from Phase 1 (rd0,rd1 for v_b[1]), partial waits inside
         phase_a_prefetch<T>(v_a[0], v_b[1], acc_01, v_a[1], lds_a1);
 
@@ -168,7 +168,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kbuf1_large
 
         __builtin_amdgcn_s_barrier();
 
-        // -- Phase 4: asm ds_read v_b[0]+v_a[0] interleaved with MMA[1][1] --
+        // -- Phase 4: ds_read v_b[0]+v_a[0] interleaved with MMA[1][1] --
         phase_ab_prefetch<T>(v_a[1], v_b[1], acc_11,
                               v_b[0], lds_b0, v_a[0], lds_a0);
     }

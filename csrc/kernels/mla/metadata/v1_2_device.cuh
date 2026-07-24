@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "v1_comm.cuh"
 #include "mla_metadata.h"
+#include "v1_comm.cuh"
 
 template <int32_t kPackedQoLenPerWg_,
           bool kQoSplits_,
@@ -25,8 +25,9 @@ struct MlaMetadataV12Traits
 static constexpr int32_t MLA_V12_FILL_WARPS = 8;
 
 template <typename Traits>
-__device__ __forceinline__ int32_t mla_v12_num_qo_tiles(
-    const MlaMetadataV1KernelParameter& params, QoState<Traits>& qo_state, const int32_t batch_idx)
+__device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1KernelParameter& params,
+                                                        QoState<Traits>& qo_state,
+                                                        const int32_t batch_idx)
 {
     if constexpr(Traits::kQoSplits)
     {
@@ -95,7 +96,7 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
 {
     using QoState = QoState<Traits>;
 
-    const int32_t num_batches = params.num_batches;
+    const int32_t num_batches   = params.num_batches;
     const int32_t ori_seqlen_qo = params.ori_seqlen_qo;
 
     extern __shared__ uint8_t p_smem[];
@@ -135,8 +136,7 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                                                                       num_batches,
                                                                       lane_idx);
 
-        const int32_t payload =
-            integer_divide_ceil(sum_blocks, params.num_splits) + overhead;
+        const int32_t payload       = integer_divide_ceil(sum_blocks, params.num_splits) + overhead;
         const int32_t blocks_per_cu = payload - overhead;
 
         if(lane_idx == 0)
@@ -237,7 +237,8 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
         const int32_t kv_indptr0 = params.p_seqlens_kv_indptr[0];
         const int32_t kv_begin   = params.p_seqlens_kv_indptr[bid] - kv_indptr0;
         const int32_t kv_end     = params.p_seqlens_kv_indptr[bid + 1] - kv_indptr0;
-        const int32_t seqlen_kv  = Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
+        const int32_t seqlen_kv =
+            Traits::kLdsBatchInfo ? p_lds_seqlens_kv[bid] : (kv_end - kv_begin);
         const int32_t num_kv_blocks =
             integer_divide_ceil_power2(seqlen_kv, kv_gran, params.kv_granularity_log2);
         const int32_t qo_tile_size = qo_state.get_seqlen(bid);
@@ -256,9 +257,9 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
         else if(remain_payload > overhead)
         {
             const int32_t remain_blocks = num_kv_blocks - (remain_payload - overhead);
-            num_fresh_frags = integer_divide_ceil(remain_blocks, blocks_per_cu);
-            num_frags       = num_fresh_frags + 1;
-            waste_start_cu  = false;
+            num_fresh_frags             = integer_divide_ceil(remain_blocks, blocks_per_cu);
+            num_frags                   = num_fresh_frags + 1;
+            waste_start_cu              = false;
         }
         else
         {
@@ -301,12 +302,12 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
             }
             else if(!waste_start_cu)
             {
-                block_begin = (frag_idx == 0) ? 0
-                                              : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
-                block_end   = (frag_idx < num_fresh_frags)
-                                  ? (first_frag_blocks + frag_idx * blocks_per_cu)
-                                  : num_kv_blocks;
-                frag_cu     = start_cu + frag_idx;
+                block_begin =
+                    (frag_idx == 0) ? 0 : (first_frag_blocks + (frag_idx - 1) * blocks_per_cu);
+                block_end = (frag_idx < num_fresh_frags)
+                                ? (first_frag_blocks + frag_idx * blocks_per_cu)
+                                : num_kv_blocks;
+                frag_cu   = start_cu + frag_idx;
             }
             else
             {
@@ -316,20 +317,20 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                 frag_cu     = start_cu + 1 + frag_idx;
             }
 
-            const int32_t frag_kv_start  = kv_begin + block_begin * kv_gran;
-            const int32_t frag_kv_end    = opus::min(kv_begin + block_end * kv_gran, kv_end);
-            const int32_t work_idx       = num_works_before + frag_idx;
+            const int32_t frag_kv_start = kv_begin + block_begin * kv_gran;
+            const int32_t frag_kv_end   = opus::min(kv_begin + block_end * kv_gran, kv_end);
+            const int32_t work_idx      = num_works_before + frag_idx;
             const int32_t partial_qo_loc =
                 is_split ? (partial_idx_before + frag_idx * qo_tile_size) : -1;
 
             MlaWorkInfo work_info{};
-            work_info.batch_idx      = bid;
-            work_info.qo_start       = qo_start;
-            work_info.qo_end         = qo_end;
-            work_info.kv_start       = frag_kv_start;
-            work_info.kv_end         = frag_kv_end;
-            work_info.kv_offset      = kv_end - frag_kv_end;
-            work_info.partial_qo_loc = partial_qo_loc;
+            work_info.batch_idx       = bid;
+            work_info.qo_start        = qo_start;
+            work_info.qo_end          = qo_end;
+            work_info.kv_start        = frag_kv_start;
+            work_info.kv_end          = frag_kv_end;
+            work_info.kv_offset       = kv_end - frag_kv_end;
+            work_info.partial_qo_loc  = partial_qo_loc;
             p_work_info_set[work_idx] = work_info;
 
             if(is_split)
@@ -705,7 +706,7 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
 
     using DummyTraits =
         MlaMetadataV12Traits<kPackedQoLenPerWg, kQoSplits, kUniSeqlenQo, true, kIsSparse>;
-    const bool is_unique = QoState<DummyTraits>::is_unique();
+    const bool is_unique              = QoState<DummyTraits>::is_unique();
     const int32_t lds_bytes_per_batch = sizeof(int32_t) * (is_unique ? 1 : 2);
     const int32_t max_qo_tiles =
         kQoSplits ? (integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
@@ -713,13 +714,13 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
 
     const char* parallel_env   = std::getenv("AITER_MLA_META_USE_PARALLEL");
     const bool parallel_wanted = (parallel_env == nullptr) || (std::atoi(parallel_env) != 0);
-    const bool use_parallel    = parallel_wanted && (max_seqlen_qo == 1) && !kQoSplits &&
-                                 !kIsSparse && (params.page_size == 1) &&
-                                 (params.qk_batch_ratio == 1);
+    const bool use_parallel = parallel_wanted && (max_seqlen_qo == 1) && !kQoSplits && !kIsSparse &&
+                              (params.page_size == 1) && (params.qk_batch_ratio == 1);
     const int32_t scratch_bytes =
         static_cast<int32_t>(sizeof(int32_t)) * (3 + 5 * params.num_batches);
-    const int32_t qo_bytes = is_unique ? 0 : static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
-    const int32_t kv_bytes = static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
+    const int32_t qo_bytes =
+        is_unique ? 0 : static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
+    const int32_t kv_bytes   = static_cast<int32_t>(sizeof(int32_t)) * params.num_batches;
     const int32_t fill_block = warp_size * MLA_V12_FILL_WARPS;
 
     if(use_parallel && (scratch_bytes + qo_bytes + kv_bytes <= lds_size))
@@ -756,14 +757,14 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
 // == 64) and uses ORIGINAL num_heads/max_seqlen_qo (pre-fold). V32 uses fp8 across
 // nope+rope; V40 uses fp8 nope + bf16 rope.
 static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id,
-                                                       const bool enable_experimental,
-                                                       const int32_t num_heads,
-                                                       const int32_t max_seqlen_qo,
-                                                       const MlaVersion mla_version,
-                                                       const at::ScalarType q_nope_dtype,
-                                                       const at::ScalarType q_rope_dtype,
-                                                       const at::ScalarType kv_nope_dtype,
-                                                       const at::ScalarType kv_rope_dtype)
+                                                      const bool enable_experimental,
+                                                      const int32_t num_heads,
+                                                      const int32_t max_seqlen_qo,
+                                                      const MlaVersion mla_version,
+                                                      const at::ScalarType q_nope_dtype,
+                                                      const at::ScalarType q_rope_dtype,
+                                                      const at::ScalarType kv_nope_dtype,
+                                                      const at::ScalarType kv_rope_dtype)
 {
     auto is_fp8 = [](const at::ScalarType dtype) {
         return dtype == at::ScalarType::Float8_e4m3fnuz || dtype == at::ScalarType::Float8_e4m3fn;
@@ -835,14 +836,14 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                      std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
 
     const int32_t cluster_multiplier = mla_metadata_cluster_multiplier(arch_id,
-                                                                        enable_experimental,
-                                                                        num_heads,
-                                                                        max_seqlen_qo,
-                                                                        mla_version,
-                                                                        q_dtype,
-                                                                        q_rope_dtype,
-                                                                        kv_dtype,
-                                                                        kv_rope_dtype);
+                                                                       enable_experimental,
+                                                                       num_heads,
+                                                                       max_seqlen_qo,
+                                                                       mla_version,
+                                                                       q_dtype,
+                                                                       q_rope_dtype,
+                                                                       kv_dtype,
+                                                                       kv_rope_dtype);
     const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
 
     // Gate on arch_id consistent with hk_mla_v32_decode_fwd dispatch (gfx942/gfx950).
@@ -863,12 +864,12 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
          (max_seqlen_qo == 2)) ||
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 4)) ||
-        ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 1)) ||
+        ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 &&
+         kv_is_fp8 && (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-         (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) ||
+         (((num_heads == 32) && (max_seqlen_qo >= 4)) || (num_heads == 64) ||
           (num_heads == 128))) ||
         hk_mtp_experimental;
 
@@ -880,8 +881,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     }
 
     TORCH_CHECK(
-        natively_supported ||
-            (num_heads == 16) || (num_heads == 128) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
+        natively_supported || (num_heads == 16) || (num_heads == 128) ||
+            ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
             ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
             ((arch_id == "gfx950") && (num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 &&
              kv_is_fp8) ||

@@ -153,6 +153,7 @@ def validate_and_update_archs():
         "gfx941",
         "gfx942",
         "gfx950",
+        "gfx1151",
     ]
 
     # Validate if each element in archs is in allowed_archs
@@ -278,7 +279,7 @@ def run_lib(func_name, folder=None):
 
 
 def hash_signature(signature: str):
-    return hashlib.md5(signature.encode("utf-8")).hexdigest()
+    return hashlib.md5(signature.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 @lru_cache(maxsize=None)
