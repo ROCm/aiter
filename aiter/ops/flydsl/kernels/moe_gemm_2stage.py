@@ -554,6 +554,16 @@ def compile_moe_gemm1(
                 inter2_idx = arith.index(2 * inter_dim)
                 expert_off_idx = expert_idx * inter2_idx  # index
 
+                if const_expr(is_f16_or_bf16 and not w_is_int4):
+                    _w_base_addr = fx.ptrtoint(arg_w)
+                    _w_expert_byte = expert_off_idx * k_in * w_elem_bytes
+                    w_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                        _w_base_addr + arith.index_cast(T.i64, _w_expert_byte)
+                    )
+                    w_row_off = arith.index(0)
+                else:
+                    w_row_off = expert_off_idx
+
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
                 # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16/bf16 we require 16B.
@@ -725,7 +735,7 @@ def compile_moe_gemm1(
                     col_g = col_g + lane_mod_16
                     col_g_list.append(col_g)
 
-                    row_gate = expert_off_idx + col_g
+                    row_gate = w_row_off + col_g
                     row_up = row_gate + inter_idx
 
                     coord_gate = fx.idx2crd(fx.Int32(row_gate), layout_n_blk_intra)
@@ -1147,7 +1157,7 @@ def compile_moe_gemm1(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -2436,6 +2446,20 @@ def compile_moe_gemm2(
                 n_idx = fx.Index(model_dim)
                 expert_off_idx = expert_idx * n_idx  # index
 
+                if const_expr(is_f16_or_bf16 and not w_is_int4):
+                    _w_base_addr = fx.ptrtoint(arg_w)
+                    _w_expert_byte = expert_off_idx * k_in * w_elem_bytes
+                    w_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                        _w_base_addr + arith.index_cast(T.i64, _w_expert_byte)
+                    )
+                    w_row_off = arith.index(0)
+                else:
+                    # Re-bind w_rsrc in this closure's scope (the assignment above makes
+                    # it a local of _moe_gemm2_then_body); packed int4 keeps the
+                    # whole-tensor resource with the per-expert row offset.
+                    w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
+                    w_row_off = expert_off_idx
+
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
                 # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16/bf16 we require 16B.
@@ -2588,7 +2612,7 @@ def compile_moe_gemm2(
                     col_g = by_n + n_tile_base + offset + lane_mod_16
                     col_g_list.append(col_g)
 
-                    row_w = expert_off_idx + col_g
+                    row_w = w_row_off + col_g
                     coord_w = fx.idx2crd(fx.Int32(row_w), layout_n_blk_intra)
                     n_blk_list.append(fx.get(coord_w, 0))
                     n_intra_list.append(fx.get(coord_w, 1))
@@ -2967,7 +2991,7 @@ def compile_moe_gemm2(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
