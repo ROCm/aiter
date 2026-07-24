@@ -1,0 +1,87 @@
+[
+    {
+        "test_name": "aiter-grouped-quant",
+        "test_cmd": "pytest -v -s tests/rocm/aiter/test_grouped_quant.py",
+        "runner": "linux-aiter-mi300x-1",
+        "timeout": 30
+    },
+    {
+        "test_name": "aiter-mla-fp8-check",
+        "test_cmd": "pytest -v -s tests/rocm/aiter/test_mla_fp8_support_check.py",
+        "runner": "linux-aiter-mi300x-1",
+        "timeout": 15
+    },
+    {
+        "test_name": "aiter-flash-attn",
+        "test_cmd": "pytest -v -s tests/kernels/attention/test_aiter_flash_attn.py",
+        "runner": "linux-aiter-mi300x-1",
+        "timeout": 30
+    },
+    {
+        "test_name": "aiter-topk-ops",
+        "test_cmd": "pytest -v -s tests/kernels/moe/test_rocm_aiter_topk.py",
+        "runner": "linux-aiter-mi300x-1",
+        "timeout": 15
+    },
+    {
+        "test_name": "rocm-attention-selector",
+        "test_cmd": "pytest -v -s tests/kernels/attention/test_rocm_attention_selector.py",
+        "runner": "linux-aiter-mi300x-1",
+        "timeout": 15
+    },
+    {
+        "test_name": "v1-rocm-attention-backends",
+        "test_cmd": "pytest -v -s tests/v1/attention/test_rocm_attention_backends_selection.py",
+        "runner": "linux-aiter-mi300x-1",
+        "timeout": 15
+    },
+    {
+        "test_name": "aiter-grouped-quant-mi35x",
+        "test_cmd": "pytest -v -s tests/rocm/aiter/test_grouped_quant.py",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 35
+    },
+    {
+        "test_name": "aiter-mla-fp8-check-mi35x",
+        "test_cmd": "pytest -v -s tests/rocm/aiter/test_mla_fp8_support_check.py",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 20
+    },
+    {
+        "test_name": "aiter-flash-attn-mi35x",
+        "test_cmd": "pytest -v -s tests/kernels/attention/test_aiter_flash_attn.py",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 35
+    },
+    {
+        "test_name": "aiter-topk-ops-mi35x",
+        "test_cmd": "pytest -v -s tests/kernels/moe/test_rocm_aiter_topk.py",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 20
+    },
+    {
+        "test_name": "rocm-attention-selector-mi35x",
+        "test_cmd": "pytest -v -s tests/kernels/attention/test_rocm_attention_selector.py",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 20
+    },
+    {
+        "test_name": "v1-rocm-attention-backends-mi35x",
+        "test_cmd": "pytest -v -s tests/v1/attention/test_rocm_attention_backends_selection.py",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 20
+    },
+    {
+        "test_name": "compile-stock-torch",
+        "test_cmd": "pytest -v -s tests/compile/test_config.py::test_stock_torch_compile",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 40,
+        "install_mode": "wheel"
+    },
+    {
+        "test_name": "compile-aot-save-load",
+        "test_cmd": "pytest -v -s tests/compile/test_aot_compile.py::test_save_and_load",
+        "runner": "linux-aiter-mi35x-1",
+        "timeout": 45
+    }
+]
