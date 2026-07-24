@@ -143,7 +143,8 @@ def launch_gemm_a8w4_tdm(
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
     ):
-        rocdl.disable_xdl_arb_stall()
+        # DEBUG: disabled to test WMMA accumulator hazard hypothesis.
+        # rocdl.disable_xdl_arb_stall()
 
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
@@ -195,25 +196,15 @@ def launch_gemm_a8w4_tdm(
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
-        # Per-expert A-data OOB: bound to the owning expert's valid-row 
+        # Per-expert A-data OOB: bound to the owning expert's valid-row
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
-        # tile_m<=64: load_sa's A-scale index can over-read past a row's super-row
-        # into an unpopulated LDS slot; a stale 0xFF there is a NaN e8m0 scale that
-        # poisons valid rows via 0*NaN. Zero the arena so such slots read a finite 0.
-        _zblk = 16 * block
-        _arena = ((ARENA_B + _zblk - 1) // _zblk) * _zblk if tile_m <= 64 else ARENA_B
-        base_ptr = fx.SharedAllocator(static=False).allocate(_arena)._ptr
+        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
-        if const_expr(tile_m <= 64):
-            _zv = fx.constant_vector(0, T.vec(4, T.i32))
-            for _zi in range_constexpr(_arena // _zblk):
-                lds_store_b128_raw(stC_idx, (tid + _zi * block) * 16, _zv)
-            workgroup_barrier()
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
@@ -244,6 +235,7 @@ def launch_gemm_a8w4_tdm(
             nw = 1
         else:
             waves, nw = [(None,)] * 4, num_waves
+            print(waves, nw)
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
         Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
@@ -297,7 +289,7 @@ def launch_gemm_a8w4_tdm(
 
         def load_sa(buf, wm, ksl):
             warp_lds_row = wmb // wmma_m_rep + lane16
-            byte = warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
+            byte = warp_lds_row * (AS_INNER * 4) + ksl * wmma_m_rep * 4 + wm * 4
             return lds_load_b32_raw(buf, SA_OFF + byte)
 
         def load_sb(buf, wn, ksl):
@@ -374,6 +366,19 @@ def launch_gemm_a8w4_tdm(
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
+            # DEBUG: poison the entire LDS arena (A/B/SA/SB + all padding) with
+            # 0xFF bytes so ANY uninitialized or over-read LDS read becomes a
+            # deterministic NaN (fp8-e4m3 0xFF = NaN, e8m0 0xFF = NaN). Turns the
+            # intermittent y-NaN into a stable repro. Runs before any TDM issue;
+            # valid regions are then overwritten by TDM, padding stays poisoned.
+            _POISON_NDW = ARENA_B // 4
+            _poison_val = fx.Int32(-1)  # 0xFFFFFFFF
+            for _pi in range_constexpr((_POISON_NDW + block - 1) // block):
+                _pdw = tid + _pi * block
+                _pdw = (_pdw < _POISON_NDW).select(_pdw, _POISON_NDW - 1)
+                lds_store_b32_raw(stC_idx, _pdw * 4, _poison_val)
+            workgroup_barrier()
+
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
             if const_expr(tile_m <= 64):
                 # Post-compute issue: better for decode (small tile_m).
@@ -383,15 +388,14 @@ def launch_gemm_a8w4_tdm(
                 for kt in range(n_steady):
                     s = kt % num_buffers
                     buf = ptr_to_idx(buf_ptr(s))
-                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                    workgroup_barrier()
+                    pipeline_fence(TDM_PER * (num_buffers - 1) * 0)
                     compute_ktile(buf, None)
                     workgroup_barrier()
                     issue(s, kt + num_buffers)
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j) * 0)
                     compute_ktile(buf, None)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m).
@@ -409,12 +413,15 @@ def launch_gemm_a8w4_tdm(
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
                     compute_ktile(buf, None)
 
+            # DEBUG: 32 nops to perturb K-loop -> epilogue scheduling.
+            [rocdl.s_nop(0) for _ in range(32)]
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
             STORE_N = (tile_n // 2) if stage1_act else tile_n
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
+            print(f"stage1_quant_out = {stage1_quant_out}")
 
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
@@ -475,6 +482,7 @@ def launch_gemm_a8w4_tdm(
                             acc = acc + Vec(fx.ptr_load(bias_map + expert * i32_n + col_rel, result_type=T.vec(8, out_elem))).to(fx.Float32)
                         if const_expr(stage1_act):
                             hv = Vec.from_elements([fused_silu_swiglu_elem(acc[2 * p], acc[2 * p + 1], swiglu=is_swiglu, limit_f32=f32_swiglu_limit, neg_limit_f32=neg_limit) for p in range_constexpr(4)], fx.Float32).to(oc)
+                            [rocdl.s_nop(0) for _ in range(32)]
                             lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
                         else:
                             hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
