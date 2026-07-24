@@ -106,8 +106,11 @@ def _batched_gemm_a16wfp4_kernel(
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
-    pid_batch = tl.program_id(axis=0)
-    pid_unified = tl.program_id(axis=1)
+    # Use flattened 1D grid: pid_flat encodes batch + MN + ksplit
+    pid_flat = tl.program_id(axis=0)
+    grid_mn_ksplit = GRID_MN * NUM_KSPLIT
+    pid_batch = pid_flat // grid_mn_ksplit
+    pid_unified = pid_flat % grid_mn_ksplit
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
