@@ -14,14 +14,189 @@ from csrc.cpp_itfs.pa.pa_ragged import (
 )
 from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    pa_decode_gluon as _pa_decode_gluon_fallback,
+)
+
+try:
+    from aiter.ops.flydsl import pa_decode as _pa_decode_flydsl
+except (ImportError, AttributeError, RuntimeError, OSError):
+    _pa_decode_flydsl = None
 
 from aiter import dtypes
 
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..jit.core import compile_ops, is_experimental_enabled
 
 MD_NAME = "module_attention"
+
+
+def _can_use_flydsl_pa_decode(
+    output,
+    query,
+    key_cache,
+    value_cache,
+    context_lengths,
+    block_tables,
+    query_length,
+    max_context_partition_num,
+    context_partition_size,
+    compute_type,
+    query_scale,
+    key_scale,
+    value_scale,
+    exp_sums,
+    max_logits,
+    temporary_output,
+    alibi_slopes,
+    sinks,
+    sliding_window,
+):
+    runtime_gfx = get_gfx_runtime()
+    runtime_fp8_dtype = {
+        "gfx942": torch.float8_e4m3fnuz,
+        "gfx950": torch.float8_e4m3fn,
+    }.get(runtime_gfx)
+
+    def scratch_buffers_match():
+        if max_context_partition_num == 1:
+            return True
+        query_group_size = query.shape[1] // key_cache.shape[1]
+        total_rows = query_length * query_group_size
+        scalar_shape = (
+            context_lengths.shape[0],
+            key_cache.shape[1],
+            max_context_partition_num,
+            total_rows,
+        )
+        output_shape = (*scalar_shape, query.shape[-1])
+        scalar_buffers_match = all(
+            tensor is None
+            or (
+                tensor.shape == scalar_shape
+                and tensor.dtype == torch.float32
+                and tensor.device == query.device
+                and tensor.is_contiguous()
+            )
+            for tensor in (exp_sums, max_logits)
+        )
+        return scalar_buffers_match and (
+            temporary_output is None
+            or (
+                temporary_output.shape == output_shape
+                and temporary_output.dtype == output.dtype
+                and temporary_output.device == query.device
+                and temporary_output.is_contiguous()
+            )
+        )
+
+    return (
+        _pa_decode_flydsl is not None
+        and runtime_fp8_dtype is not None
+        and query.dim() == 3
+        and output.shape == query.shape
+        and output.dtype == query.dtype
+        and query.dtype in (torch.bfloat16, torch.float16)
+        and query.stride(-1) == 1
+        and key_cache.dim() == 5
+        and key_cache.dtype == runtime_fp8_dtype
+        and key_cache.shape[-2] in (16, 64)
+        and key_cache.is_contiguous()
+        and value_cache.dim() in (4, 5)
+        and value_cache.dtype == runtime_fp8_dtype
+        and value_cache.is_contiguous()
+        and query.shape[-1] % 64 == 0
+        and key_cache.shape[1] > 0
+        and query.shape[1] % key_cache.shape[1] == 0
+        and context_lengths.dim() == 1
+        and context_lengths.is_contiguous()
+        and block_tables.dim() == 2
+        and block_tables.is_contiguous()
+        and query.shape[0] == context_lengths.shape[0] * query_length
+        and 1 <= max_context_partition_num <= 64
+        and context_partition_size == 256
+        and compute_type == runtime_fp8_dtype
+        and query_scale is None
+        and (key_scale is None) == (value_scale is None)
+        and scratch_buffers_match()
+        and alibi_slopes is None
+        and sinks is None
+        and sliding_window == 0
+    )
+
+
+def pa_decode_gluon(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    query_length: int,
+    max_context_partition_num: int,
+    context_partition_size: int = 256,
+    compute_type: torch.dtype = torch.bfloat16,
+    query_scale: torch.Tensor = None,
+    key_scale: torch.Tensor = None,
+    value_scale: torch.Tensor = None,
+    exp_sums: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    temporary_output: torch.Tensor = None,
+    alibi_slopes: torch.Tensor = None,
+    sinks: torch.Tensor = None,
+    sliding_window: int = 0,
+    ps: bool = True,
+) -> None:
+    implementation = (
+        _pa_decode_flydsl
+        if _can_use_flydsl_pa_decode(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            context_lengths,
+            block_tables,
+            query_length,
+            max_context_partition_num,
+            context_partition_size,
+            compute_type,
+            query_scale,
+            key_scale,
+            value_scale,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            alibi_slopes,
+            sinks,
+            sliding_window,
+        )
+        else _pa_decode_gluon_fallback
+    )
+    implementation(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        query_length,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        query_scale,
+        key_scale,
+        value_scale,
+        exp_sums,
+        max_logits,
+        temporary_output,
+        alibi_slopes,
+        sinks,
+        sliding_window,
+        ps,
+    )
+
 
 direct_register_custom_op(
     "pa_decode_gluon",
@@ -850,7 +1025,7 @@ def mla_decode_v4_asm(
     kv_page_indices: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
     # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
     # tensor; there is no nullable-sink convention on the C ABI. Pass
     # torch.full((num_heads,), float("-inf")) for "no sink" math.
@@ -1511,7 +1686,7 @@ def mla_reduce_v1(
         max_seqlen_q: max query length (tokens) per decode step.
         num_kv_splits: sizing hint for the reducer's per-split LDS scratch
             (``max_splits = max(device_cu_count, num_kv_splits)``).
-            **``0`` means auto** — size to the device CU count. Pass a value
+            **``0`` means auto** -- size to the device CU count. Pass a value
             larger than the CU count only to force a bigger split budget;
             values <= CU count (incl. 0) are clamped up to it.
         final_output: [bs, h, dv]. Combined, normalized output (written
