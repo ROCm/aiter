@@ -1044,6 +1044,7 @@ def test_chunk_opt_vk_indice(
         state_dtype=state_dtype,
         **extra_kwargs,
     )
+    assert h_ref.dtype == state_dtype
 
     # --- indexed pool: scatter the N states into a larger pool at unique,
     # non-identity slots to prove the gather honours initial_state_indices ---
@@ -1068,6 +1069,7 @@ def test_chunk_opt_vk_indice(
         state_dtype=state_dtype,
         **extra_kwargs,
     )
+    assert h_idx.dtype == state_dtype
     assert ht_idx is pool  # in-place: final state aliases the pool buffer
 
     # 1. snapshots + recomputed values are bit-identical to the dense path
