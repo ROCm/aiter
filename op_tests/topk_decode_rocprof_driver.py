@@ -115,7 +115,6 @@ def run_cell(
         cmd += ["--max-width", str(max_width)]
     env = os.environ.copy()
     env.update(KERNEL_ENV.get(kernel, {}))
-    print(f"\n\n{cmd}\n\n")
     print(f"\n\n{' '.join(cmd)}\n\n")
     log = subprocess.run(cmd, capture_output=True, text=True, env=env)
     csvs = glob.glob(str(out_file) + "*kernel_trace.csv")
@@ -127,7 +126,8 @@ def run_cell(
             f"no trace ({log.returncode}): {log.stderr[-200:]}",
         )
 
-    rows = list(csv.DictReader(open(csvs[0])))
+    with open(csvs[0]) as f:
+        rows = list(csv.DictReader(f))
     pat = KERNEL_MATCH[kernel]
     matched = [r for r in rows if pat.search(r["Kernel_Name"])]
     if not matched:
@@ -183,7 +183,8 @@ def run_cell(
         if not pmc_csvs:
             note = f"{note}; no counter CSV".strip("; ")
         else:
-            counter_rows = list(csv.DictReader(open(pmc_csvs[0])))
+            with open(pmc_csvs[0]) as f:
+                counter_rows = list(csv.DictReader(f))
             counter_matched = [r for r in counter_rows if pat.search(r["Kernel_Name"])]
             if not counter_matched:
                 names = {r["Kernel_Name"][:60] for r in counter_rows}
