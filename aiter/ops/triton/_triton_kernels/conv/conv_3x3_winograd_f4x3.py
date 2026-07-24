@@ -1100,16 +1100,36 @@ AUTOTUNE_WINO_GEMM_CONFIGS = [
         num_warps=4,
         num_stages=1,
     ),
+    # gfx1100 (RDNA3): smaller tiles / fewer warps for small-T buckets.
+    triton.Config(
+        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=4,
+        num_stages=1,
+    ),
+    triton.Config(
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        num_warps=2,
+        num_stages=1,
+    ),
 ]
 
 AUTOTUNE_WINO4_INPUT_CONFIGS = [
     triton.Config({"BLOCK_C": 64}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_C": 32}, num_warps=4, num_stages=1),
+    # gfx1100 (RDNA3): wider channel tile + a warp-8 option.
+    triton.Config({"BLOCK_C": 128}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_C": 64}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_C": 16}, num_warps=4, num_stages=1),
 ]
 
 AUTOTUNE_WINO4_OUTPUT_CONFIGS = [
     triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=1),
+    # gfx1100 (RDNA3): BLOCK_K=128 pegged the old ceiling on 17/19 shapes —
+    # probe larger, plus warp-8 options.
+    triton.Config({"BLOCK_K": 256}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=1),
+    triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=1),
 ]
 
 
