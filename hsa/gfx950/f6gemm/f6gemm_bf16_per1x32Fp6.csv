@@ -1,0 +1,2 @@
+tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name
+256,256,0,0,f6gemm_dmabig_kernel_func,gemm_mxfp6_dmabig.co

@@ -965,6 +965,20 @@ namespace py = pybind11;
           py::arg("lut_count"),                                                   \
           py::arg("softmax_scale"),                                               \
           py::arg("out") = std::nullopt);                                         \
+    m.def("fmha_v3_fwd_mxfp4_sparse_sorted",                                      \
+          &aiter::torch_itfs::fmha_v3_fwd_mxfp4_sparse_sorted,                    \
+          py::arg("q"),                                                           \
+          py::arg("k"),                                                           \
+          py::arg("v"),                                                           \
+          py::arg("q_descale"),                                                   \
+          py::arg("k_descale"),                                                   \
+          py::arg("v_descale"),                                                   \
+          py::arg("kv_block_indices"),                                            \
+          py::arg("lut_start"),                                                   \
+          py::arg("lut_count"),                                                   \
+          py::arg("work_table"),                                                  \
+          py::arg("softmax_scale"),                                               \
+          py::arg("out") = std::nullopt);                                         \
     m.def("fmha_v3_fwd_fp8_sparse",                                               \
           &aiter::torch_itfs::fmha_v3_fwd_fp8_sparse,                             \
           py::arg("q"),                                                           \
@@ -1001,7 +1015,24 @@ namespace py = pybind11;
           py::arg("k_descale"),                                                   \
           py::arg("v_descale"),                                                   \
           py::arg("softmax_scale"),                                               \
-          py::arg("out") = std::nullopt);
+          py::arg("out") = std::nullopt);                                         \
+    m.def("fmha_v3_fwd_fp8_sparse_persistent",                                    \
+          &aiter::torch_itfs::fmha_v3_fwd_fp8_sparse_persistent,                  \
+          py::arg("q"),                                                           \
+          py::arg("k"),                                                           \
+          py::arg("v"),                                                           \
+          py::arg("q_descale"),                                                   \
+          py::arg("k_descale"),                                                   \
+          py::arg("v_descale"),                                                   \
+          py::arg("kv_block_indices"),                                            \
+          py::arg("lut_start"),                                                   \
+          py::arg("lut_count"),                                                   \
+          py::arg("work_table"),                                                  \
+          py::arg("softmax_scale"),                                               \
+          py::arg("sorted") = false,                                             \
+          py::arg("lut_freeze") = std::nullopt,                                   \
+          py::arg("out") = std::nullopt,                                          \
+          py::arg("affine") = false);
 
 #define MHA_FWD_PYBIND                             \
     m.def("mha_fwd",                               \
