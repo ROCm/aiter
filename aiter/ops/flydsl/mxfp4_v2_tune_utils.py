@@ -198,7 +198,7 @@ def _u8v(t):
 
 
 # --- shared input build ------------------------------------------------------
-def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
+def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8", activation=ActivationType.Silu):
     torch.manual_seed(0)
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
@@ -222,7 +222,7 @@ def gen(token, model_dim, inter_dim, E, topk, block_m, adtype="fp8"):
     ).view(E, model_dim, inter_dim).to(dtypes.bf16)
     ref1 = torch_moe_stage1(
         a_deq, w1_deq, w2_deq, topk_weights, topk_ids, dtype=dtypes.bf16,
-        activation=ActivationType.Silu, quant_type=QuantType.No, doweight=False,
+        activation=activation, quant_type=QuantType.No, doweight=False,
     )  # [token, topk, inter]
     ref2 = torch_moe_stage2(
         ref1, w1_deq, w2_deq, topk_weights, topk_ids, dtype=dtypes.bf16,
@@ -348,7 +348,9 @@ def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
     return sum(cos_all) / len(cos_all) * 100 if cos_all else float("nan")
 
 
-def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
+def populate_baseline_v2_intermediate(
+    d, v, token, topk, params, BM_S1, activation=ActivationType.Silu
+):
     """Run baseline gemm1 into v2's sorted-row fp8/fp4 buffers.
 
     flydslv2_* GEMM2 consumes the v2 sorted-row payload. This path lets
@@ -392,6 +394,7 @@ def populate_baseline_v2_intermediate(d, v, token, topk, params, BM_S1):
         a_dtype=adtype,
         b_dtype="fp4",
         out_dtype=stage2_adtype,
+        act="swiglu" if activation == ActivationType.Swiglu else "silu",
         w1_scale=d["base"]["w1_scale_shuf"],
         a1_scale=a1_scale_sort,
         sorted_weights=None,
