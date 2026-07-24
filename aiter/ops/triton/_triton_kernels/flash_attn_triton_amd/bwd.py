@@ -39,6 +39,40 @@ NONCAUSAL_AUTOTUNE_KEYS = [
 ]
 
 
+def _get_gfx1151_bwd_configs():
+    preprocess_configs = [
+        triton.Config({"PRE_BLOCK": 128}, num_stages=1, num_warps=4),
+    ]
+    noncausal_configs = [
+        triton.Config(
+            {
+                "BLOCK_M1": 16,
+                "BLOCK_N1": 64,
+                "BLOCK_M2": 64,
+                "BLOCK_N2": 16,
+                "BLK_SLICE_FACTOR": 2,
+                "waves_per_eu": 1,
+            },
+            num_stages=2,
+            num_warps=4,
+        ),
+    ]
+    causal_configs = [
+        triton.Config(
+            {
+                "BLOCK_M1": 32,
+                "BLOCK_N1": 32,
+                "BLOCK_M2": 32,
+                "BLOCK_N2": 32,
+                "BLK_SLICE_FACTOR": 2,
+            },
+            num_stages=1,
+            num_warps=4,
+        ),
+    ]
+    return (preprocess_configs, causal_configs, noncausal_configs)
+
+
 def get_bwd_configs(mode: AutotuneMode):
 
     if mode == "off":
@@ -180,6 +214,12 @@ def get_bwd_configs(mode: AutotuneMode):
                     num_warps=4,
                 ),
             ]
+            if arch.name == "gfx1151":
+                (
+                    preprocess_configs,
+                    causal_configs,
+                    noncausal_configs,
+                ) = _get_gfx1151_bwd_configs()
         else:
             preprocess_configs = [
                 triton.Config(
@@ -609,6 +649,12 @@ def get_bwd_configs(mode: AutotuneMode):
                     num_warps=4,
                 ),
             ]
+            if arch.name == "gfx1151":
+                (
+                    preprocess_configs,
+                    causal_configs,
+                    noncausal_configs,
+                ) = _get_gfx1151_bwd_configs()
         else:
             preprocess_configs = [
                 triton.Config(
