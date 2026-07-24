@@ -3751,12 +3751,24 @@ def compile_mxscale_gemm(
                         store_valid = arith.andi(store_valid, _lane_ok)
                     origin_pe = dst_packed // ep_slot_stride
                     slot = dst_packed % ep_slot_stride
-                    _col = _col0 + _chunk * arith.index(8)
-                    dest = (
+                    # Bake the warp-uniform column origin (_col0) into the buffer
+                    # descriptor BASE so every lane of a row shares ONE descriptor;
+                    # the per-lane column (_chunk) rides in the VGPR byte offset.
+                    # buffer_store needs a scalar (SGPR) descriptor, so a per-lane
+                    # full address forces a hardware address waterfall (readfirstlane
+                    # loop) that serializes to WAVE_SIZE stores. A per-ROW base makes
+                    # the descriptor vary only by dst row (a few distinct values per
+                    # wave), collapsing the waterfall and letting the row's lanes
+                    # coalesce into one 128B store. Effective address is identical:
+                    # base + _chunk*8*elem == lsa_ptr + slot*wire + (_col0+_chunk*8)*elem.
+                    row_base = (
                         fx.Int64(_win.lsa_ptr(origin_pe, ep_off_comb_inp))
                         + fx.Int64(slot) * fx.Int64(ep_wire_nbytes)
-                        + fx.Int64(arith.index_cast(T.i64, _col))
+                        + fx.Int64(arith.index_cast(T.i64, _col0))
                         * fx.Int64(elem_bytes_d)
+                    )
+                    _voff_bytes = arith.index_cast(
+                        T.i32, _chunk * arith.index(8 * elem_bytes_d)
                     )
                     _elem_off = (
                         warp_lds_off
@@ -3768,8 +3780,9 @@ def compile_mxscale_gemm(
                         _v = lds_load_b128(d_lds_buffer, _elem_off)
                         buffer_ops.buffer_store(
                             _v,
-                            buffer_ops.create_buffer_resource_from_addr(dest),
-                            0,
+                            buffer_ops.create_buffer_resource_from_addr(row_base),
+                            _voff_bytes,
+                            offset_is_bytes=True,
                         )
                         scf.YieldOp([])
                 # No per-CTA release fence (see per-lane branch): stores drain in
