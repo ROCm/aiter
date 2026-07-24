@@ -61,16 +61,19 @@ def compile_pa_decode_tile(
     per_token_kv: bool = False,
     query_length: int = 1,
     trans_v: bool = True,
+    device_index: int | None = None,
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
     ``block_size``, ``head_dim``, and ``query_dtype`` are compile-time
-    constants (lru_cache keys). ``query_length`` (MTP) and ``query_group_size``
-    flatten into ``TOTAL_ROWS = query_length * query_group_size``, tiled into
+    constants. ``device_index`` keeps the cached launch/compiled function
+    device-local. ``query_length`` (MTP) and ``query_group_size`` flatten into
+    ``TOTAL_ROWS = query_length * query_group_size``, tiled into
     ``M_TILES = ceil(TOTAL_ROWS / 16)`` independent 16-row MFMA tiles; each
     extra M-tile duplicates loop-carried state, so VGPR/LDS/occupancy scale
     roughly linearly with ``M_TILES``.
     """
+    del device_index
     is_gfx950 = "gfx95" in get_rocm_arch()
     FP8 = fx.Float8E4M3FN if is_gfx950 else fx.Float8E4M3FNUZ
     FP8_MAX = (

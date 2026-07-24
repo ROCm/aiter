@@ -4,13 +4,18 @@
 """Correctness and performance sweep for FlyDSL paged-attention Tile."""
 
 import argparse
+import importlib
+import inspect
 import itertools
 
 import aiter
 import pandas as pd
+import pytest
 import torch
 from aiter import dtypes, per_tensor_quant
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.attention import pa_decode_gluon as public_pa_decode
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -36,13 +41,185 @@ try:
         get_recommended_splits,
         pa_decode,
     )
-except ImportError:
+except (ImportError, AttributeError, RuntimeError, OSError):
     get_recommended_splits = None
     pa_decode = None
 
 
 def _quant_dtype() -> torch.dtype:
-    return torch.float8_e4m3fn if get_gfx() == "gfx950" else torch.float8_e4m3fnuz
+    return (
+        torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
+    )
+
+
+def test_pa_decode_api_matches_gluon():
+    if pa_decode is None:
+        pytest.skip("FlyDSL is not available")
+
+    flydsl_parameters = inspect.signature(pa_decode).parameters
+    gluon_parameters = inspect.signature(pa_decode_gluon).parameters
+    public_parameters = inspect.signature(public_pa_decode).parameters
+
+    assert tuple(flydsl_parameters) == tuple(gluon_parameters)
+    assert tuple(public_parameters) == tuple(gluon_parameters)
+    for name, parameter in flydsl_parameters.items():
+        gluon_parameter = gluon_parameters[name]
+        assert parameter.kind == gluon_parameter.kind
+        assert parameter.default == gluon_parameter.default
+        assert public_parameters[name].kind == gluon_parameter.kind
+        assert public_parameters[name].default == gluon_parameter.default
+
+
+def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm is not available")
+    if pa_decode is None:
+        pytest.skip("FlyDSL is not available")
+
+    pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    attention_module = importlib.import_module("aiter.ops.attention")
+    captured = {}
+
+    monkeypatch.setattr(
+        pa_decode_module,
+        "compile_pa_decode_tile",
+        lambda **kwargs: {"launch": object()},
+    )
+
+    def capture_launch(
+        launch,
+        output,
+        max_logits,
+        exp_sums,
+        temporary_output,
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        key_scale,
+        value_scale,
+        *args,
+    ):
+        captured.update(
+            max_logits=max_logits,
+            exp_sums=exp_sums,
+            temporary_output=temporary_output,
+            key_scale=key_scale,
+            value_scale=value_scale,
+        )
+
+    monkeypatch.setattr(pa_decode_module, "_run_compiled", capture_launch)
+    pa_ps_module = importlib.import_module("csrc.cpp_itfs.pa.pa_ps")
+    monkeypatch.setattr(
+        pa_ps_module,
+        "launch_pa_decode_ps_reduce",
+        lambda *args, **kwargs: None,
+    )
+
+    query = torch.empty(1, 8, 128, dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    key_cache = torch.empty(1, 1, 8, 16, 16, dtype=_quant_dtype())
+    value_cache = torch.empty(1, 1, 128, 16, dtype=_quant_dtype())
+    context_lengths = torch.tensor([16], dtype=torch.int32)
+    block_tables = torch.tensor([[0]], dtype=torch.int32)
+    key_scale = torch.ones(1, 1, 16, 1, dtype=torch.float32)
+    value_scale = torch.ones_like(key_scale)
+    max_logits = torch.empty(1, 1, 2, 8, dtype=torch.float32)
+    exp_sums = torch.empty_like(max_logits)
+    temporary_output = torch.empty(1, 1, 2, 8, 128, dtype=query.dtype)
+
+    assert attention_module._can_use_flydsl_pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        1,
+        2,
+        256,
+        key_cache.dtype,
+        None,
+        key_scale,
+        value_scale,
+        exp_sums,
+        max_logits,
+        temporary_output,
+        None,
+        None,
+        0,
+    )
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        128**-0.5,
+        1,
+        2,
+        compute_type=key_cache.dtype,
+        key_scale=key_scale,
+        value_scale=value_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+    )
+
+    assert captured["key_scale"].shape == (1, 1, 16)
+    assert captured["value_scale"].shape == (1, 1, 16)
+    assert captured["max_logits"].data_ptr() == max_logits.data_ptr()
+    assert captured["exp_sums"].data_ptr() == exp_sums.data_ptr()
+    assert captured["temporary_output"].data_ptr() == temporary_output.data_ptr()
+
+    dispatches = []
+    monkeypatch.setattr(
+        attention_module,
+        "_pa_decode_flydsl",
+        lambda *args, **kwargs: dispatches.append("flydsl"),
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "_pa_decode_gluon_fallback",
+        lambda *args, **kwargs: dispatches.append("gluon"),
+    )
+    common_kwargs = {
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "exp_sums": exp_sums,
+        "max_logits": max_logits,
+        "temporary_output": temporary_output,
+    }
+    public_pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        128**-0.5,
+        1,
+        2,
+        compute_type=key_cache.dtype,
+        **common_kwargs,
+    )
+    public_pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        128**-0.5,
+        1,
+        2,
+        compute_type=key_cache.dtype,
+        query_scale=torch.ones(1, dtype=torch.float32),
+        **common_kwargs,
+    )
+    assert dispatches == ["flydsl", "gluon"]
 
 
 def run_torch(
@@ -95,29 +272,36 @@ def _run_flydsl(
     key_scale,
     value_scale,
     num_partitions,
+    softmax_scale,
     pmax,
     psum,
     pout,
 ):
-    pa_decode(
+    torch.ops.aiter.pa_decode_gluon(
         output,
         query,
         key_cache,
         value_cache,
-        block_tables,
         context_lengths,
+        block_tables,
+        softmax_scale,
+        query.shape[0] // context_lengths.shape[0],
+        num_partitions,
+        256,
+        key_cache.dtype,
+        None,
         key_scale,
         value_scale,
-        num_partitions=num_partitions,
-        pmax=pmax,
-        psum=psum,
-        pout=pout,
+        exp_sums=psum,
+        max_logits=pmax,
+        temporary_output=pout,
+        ps=True,
     )
     return output
 
 
 @benchmark()
-def test_pa_decode_tile(
+def run_pa_decode_tile_case(
     batch_size,
     num_query_heads,
     num_kv_heads,
@@ -204,6 +388,7 @@ def test_pa_decode_tile(
     pmax = torch.empty(partial_shape, dtype=dtypes.fp32)
     psum = torch.empty_like(pmax)
     pout = torch.empty(*partial_shape, head_dim, dtype=dtype)
+    softmax_scale = head_dim**-0.5
 
     candidates = {
         "flydsl": lambda: _run_flydsl(
@@ -216,6 +401,7 @@ def test_pa_decode_tile(
             key_scale,
             value_scale,
             num_partitions,
+            softmax_scale,
             pmax,
             psum,
             pout,
@@ -239,7 +425,7 @@ def test_pa_decode_tile(
         + value_scale.numel() * value_scale.element_size()
     )
 
-    ret = {"gfx": get_gfx(), "partitions": num_partitions}
+    ret = {"gfx": get_gfx_runtime(), "partitions": num_partitions}
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
         err = checkAllclose(
@@ -257,12 +443,33 @@ def test_pa_decode_tile(
     return ret
 
 
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_pa_decode_tile(block_size):
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm is not available")
+    if pa_decode is None:
+        pytest.skip("FlyDSL is not available")
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
+
+    result = run_pa_decode_tile_case(
+        batch_size=3,
+        num_query_heads=8,
+        num_kv_heads=1,
+        head_dim=128,
+        context_length=257,
+        block_size=block_size,
+        dtype=dtypes.bf16,
+    )
+    assert result["flydsl err"] == 0
+
+
 def main():
     if not torch.cuda.is_available():
         aiter.logger.warning("ROCm is not available; skipping pa_decode")
         return
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("pa_decode unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        aiter.logger.warning("pa_decode unsupported on %s; skipping", get_gfx_runtime())
         return
     if pa_decode is None:
         aiter.logger.warning("flydsl is unavailable; skipping pa_decode")
@@ -315,7 +522,7 @@ def main():
     ):
         num_query_heads, num_kv_heads, head_dim, context_length = shape
         rows.append(
-            test_pa_decode_tile(
+            run_pa_decode_tile_case(
                 batch_size,
                 num_query_heads,
                 num_kv_heads,
