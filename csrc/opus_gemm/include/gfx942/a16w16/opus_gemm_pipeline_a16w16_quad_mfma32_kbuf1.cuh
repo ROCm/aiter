@@ -8,7 +8,187 @@
 #ifdef __HIP_DEVICE_COMPILE__
 
 #include "opus_gemm_helpers_a16w16.cuh"
-#include "opus_gemm_asm_mma32x32x8.cuh"
+
+namespace opus_quad_mfma32_gfx942 {
+
+using float16_acc = float __attribute__((ext_vector_type(16)));
+using short4_ab   = short __attribute__((ext_vector_type(4)));
+using i32x4_t     = int __attribute__((ext_vector_type(4)));
+
+template<int N>
+struct frag_b128 {
+    i32x4_t chunk[N];
+};
+
+template<int N>
+__device__ __forceinline__
+short4_ab mfma32_operand(const frag_b128<N>& v, int idx) {
+    return reinterpret_cast<const short4_ab*>(v.chunk)[idx];
+}
+
+template<typename V>
+__device__ __forceinline__
+short4_ab mfma32_operand(const V& v, int idx) {
+    return reinterpret_cast<const short4_ab*>(&v)[idx];
+}
+
+template<typename Smem, int N, int STRIDE_ELEM = 512>
+__device__ __forceinline__
+void compute_lds_addrs_x1b(unsigned* addrs, const Smem& s,
+                           const opus::array<opus::index_t, N>& offsets) {
+    const unsigned base = static_cast<unsigned>(
+        reinterpret_cast<__UINTPTR_TYPE__>(s.ptr));
+    using scalar = typename Smem::scalar_type;
+    #pragma unroll
+    for (int i = 0; i < N; i++) {
+        unsigned uv = static_cast<unsigned>(offsets[i]);
+        unsigned row = uv / STRIDE_ELEM;
+        unsigned col = uv - row * STRIDE_ELEM;
+        unsigned xor_col = ((row ^ (col >> 5)) & 7u) << 3;
+        unsigned sw = row * STRIDE_ELEM + (col ^ xor_col);
+        addrs[i] = base + sw * static_cast<unsigned>(sizeof(scalar));
+    }
+}
+
+template<int N>
+__device__ __forceinline__
+void ds_read_b128_frag(frag_b128<N>& dst, const unsigned* lds_addrs, int idx) {
+    using lds_i32x4_ptr = const volatile i32x4_t __attribute__((address_space(3)))*;
+    dst.chunk[idx] = *reinterpret_cast<lds_i32x4_ptr>(lds_addrs[idx]);
+}
+
+template<typename T, int I_M, int I_N, int I_K, typename VA, typename VB>
+__device__ __forceinline__
+void mfma32_accumulate_one(const VA& v_a, const VB& v_b, float16_acc& acc) {
+    static_assert(T::E_M == 2 && T::E_N == 2 && T::E_K == 4);
+    auto b = mfma32_operand(v_b, I_N * T::E_K + I_K);
+    auto a = mfma32_operand(v_a, I_M * T::E_K + I_K);
+    asm volatile(
+        "v_mfma_f32_32x32x8_bf16 %[c0], %[b], %[a], %[c0]\n"
+        : [c0]"+a"(acc)
+        : [b]"v"(b), [a]"v"(a)
+    );
+}
+
+template<typename T, int I_K, typename VA, typename VB>
+__device__ __forceinline__
+void kstep_compute_2x2(const VA& v_a, const VB& v_b, float16_acc* acc) {
+    static_assert(T::E_M == 2 && T::E_N == 2 && T::E_K == 4);
+    mfma32_accumulate_one<T, 0, 0, I_K>(v_a, v_b, acc[0]);
+    mfma32_accumulate_one<T, 0, 1, I_K>(v_a, v_b, acc[1]);
+    mfma32_accumulate_one<T, 1, 0, I_K>(v_a, v_b, acc[2]);
+    mfma32_accumulate_one<T, 1, 1, I_K>(v_a, v_b, acc[3]);
+}
+
+template<typename T, typename VA, typename VB>
+__device__ __forceinline__
+void phase_compute_2x2(const VA& v_a, const VB& v_b, float16_acc* acc) {
+    kstep_compute_2x2<T, 0>(v_a, v_b, acc);
+    kstep_compute_2x2<T, 1>(v_a, v_b, acc);
+    kstep_compute_2x2<T, 2>(v_a, v_b, acc);
+    kstep_compute_2x2<T, 3>(v_a, v_b, acc);
+}
+
+template<typename T, int I_K, typename VA, typename VB>
+__device__ __forceinline__
+void mfma32_prefetch_step_2x2(
+    const VA& v_a, const VB& v_b, float16_acc* acc,
+    frag_b128<T::b_ds_read_insts>& v_b0_out, const unsigned* lds_b0_addrs,
+    frag_b128<T::a_ds_read_insts>& v_a0_out, const unsigned* lds_a0_addrs,
+    frag_b128<T::b_ds_read_insts>& v_b1_out, const unsigned* lds_b1_addrs,
+    frag_b128<T::a_ds_read_insts>& v_a1_out, const unsigned* lds_a1_addrs)
+{
+    kstep_compute_2x2<T, I_K>(v_a, v_b, acc);
+    ds_read_b128_frag(v_b0_out, lds_b0_addrs, I_K);
+    ds_read_b128_frag(v_a0_out, lds_a0_addrs, I_K);
+    ds_read_b128_frag(v_b1_out, lds_b1_addrs, I_K);
+    ds_read_b128_frag(v_a1_out, lds_a1_addrs, I_K);
+}
+
+template<typename T, typename VA, typename VB>
+__device__ __forceinline__
+void phase_ab_prefetch_all_quadrants_2x2_ordered_nowait(
+    const VA& v_a, const VB& v_b, float16_acc* acc,
+    frag_b128<T::b_ds_read_insts>& v_b0_out, const unsigned* lds_b0_addrs,
+    frag_b128<T::a_ds_read_insts>& v_a0_out, const unsigned* lds_a0_addrs,
+    frag_b128<T::b_ds_read_insts>& v_b1_out, const unsigned* lds_b1_addrs,
+    frag_b128<T::a_ds_read_insts>& v_a1_out, const unsigned* lds_a1_addrs)
+{
+    static_assert(T::E_M == 2 && T::E_N == 2 && T::E_K == 4);
+    mfma32_accumulate_one<T, 0, 0, 0>(v_a, v_b, acc[0]);
+    ds_read_b128_frag(v_b0_out, lds_b0_addrs, 0);
+    mfma32_accumulate_one<T, 0, 1, 0>(v_a, v_b, acc[1]);
+    ds_read_b128_frag(v_a0_out, lds_a0_addrs, 0);
+    mfma32_accumulate_one<T, 1, 0, 0>(v_a, v_b, acc[2]);
+    ds_read_b128_frag(v_b0_out, lds_b0_addrs, 1);
+    mfma32_accumulate_one<T, 1, 1, 0>(v_a, v_b, acc[3]);
+    ds_read_b128_frag(v_a0_out, lds_a0_addrs, 1);
+
+    mfma32_accumulate_one<T, 0, 0, 1>(v_a, v_b, acc[0]);
+    ds_read_b128_frag(v_b0_out, lds_b0_addrs, 2);
+    mfma32_accumulate_one<T, 0, 1, 1>(v_a, v_b, acc[1]);
+    ds_read_b128_frag(v_a0_out, lds_a0_addrs, 2);
+    mfma32_accumulate_one<T, 1, 0, 1>(v_a, v_b, acc[2]);
+    ds_read_b128_frag(v_b0_out, lds_b0_addrs, 3);
+    mfma32_accumulate_one<T, 1, 1, 1>(v_a, v_b, acc[3]);
+    ds_read_b128_frag(v_a0_out, lds_a0_addrs, 3);
+
+    mfma32_accumulate_one<T, 0, 0, 2>(v_a, v_b, acc[0]);
+    ds_read_b128_frag(v_b1_out, lds_b1_addrs, 0);
+    mfma32_accumulate_one<T, 0, 1, 2>(v_a, v_b, acc[1]);
+    ds_read_b128_frag(v_a1_out, lds_a1_addrs, 0);
+    mfma32_accumulate_one<T, 1, 0, 2>(v_a, v_b, acc[2]);
+    ds_read_b128_frag(v_b1_out, lds_b1_addrs, 1);
+    mfma32_accumulate_one<T, 1, 1, 2>(v_a, v_b, acc[3]);
+    ds_read_b128_frag(v_a1_out, lds_a1_addrs, 1);
+
+    mfma32_accumulate_one<T, 0, 0, 3>(v_a, v_b, acc[0]);
+    ds_read_b128_frag(v_b1_out, lds_b1_addrs, 2);
+    mfma32_accumulate_one<T, 0, 1, 3>(v_a, v_b, acc[1]);
+    ds_read_b128_frag(v_a1_out, lds_a1_addrs, 2);
+    mfma32_accumulate_one<T, 1, 0, 3>(v_a, v_b, acc[2]);
+    ds_read_b128_frag(v_b1_out, lds_b1_addrs, 3);
+    mfma32_accumulate_one<T, 1, 1, 3>(v_a, v_b, acc[3]);
+    ds_read_b128_frag(v_a1_out, lds_a1_addrs, 3);
+}
+
+template<int N_SUB>
+__device__ __forceinline__
+auto agpr_to_vgpr(const float16_acc* acc) {
+    using VC = float __attribute__((ext_vector_type(N_SUB * 16)));
+    VC result;
+    float* p = reinterpret_cast<float*>(&result);
+    #pragma unroll
+    for (int i = 0; i < N_SUB; i++) {
+        float16_acc tmp = acc[i];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            p[i * 16 + j] = tmp[j];
+        }
+    }
+    return result;
+}
+
+template<int N_SUB>
+__device__ __forceinline__
+auto agpr_to_bf16_vgpr_trunc(const float16_acc* acc) {
+    using VC = __bf16 __attribute__((ext_vector_type(N_SUB * 16)));
+    VC result;
+    __bf16* p = reinterpret_cast<__bf16*>(&result);
+    #pragma unroll
+    for (int i = 0; i < N_SUB; i++) {
+        float16_acc tmp = acc[i];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            float f = tmp[j];
+            unsigned bits = __builtin_bit_cast(unsigned, f);
+            p[i * 16 + j] = __builtin_bit_cast(__bf16, static_cast<unsigned short>(bits >> 16));
+        }
+    }
+    return result;
+}
+
+} // namespace opus_quad_mfma32_gfx942
 
 #endif // __HIP_DEVICE_COMPILE__
 
@@ -469,7 +649,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a16w16_quad_mfma32
                     const int linear = ((si + li) * T::BLOCK_SIZE + tid) * STORE_VEC;
                     const int rd_row = linear / T::HALF_B_N;
                     const int rd_col = linear % T::HALF_B_N;
-                    const int gmem_v_off = rd_row * kargs.stride_c + rd_col;
+                    const int gmem_v_off = rd_row * stride_out + rd_col;
                     if (li == 0) {
                         g_c.template store<STORE_VEC>(coal0, gmem_v_off,
                             c_offset(hm, hn), opus::number<4>{});
