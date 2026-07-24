@@ -1,3 +1,6 @@
-tile_m,tile_n,intype,a_preshuffle,cluster_x,cluster_y,knl_name,co_name
-256,256,8,1,4,4,_ZN5aiter45f4gemm_bf16_nvfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_bf16_nvfp4_ABpreShuffle_256x256_4x4_ps.co
-256,256,7,1,4,4,_ZN5aiter45f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_ps.co
+tile_m,tile_n,intype,a_preshuffle,cluster_x,cluster_y,scale,outtype,knl_name,co_name
+256,256,mxfp4,1,4,4,1,bf16,_ZN5aiter45f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_bf16_mxfp4_ABpreShuffle_256x256_4x4_ps.co
+256,256,mxfp4,1,4,4,1,fp8,_ZN5aiter44f4gemm_fp8_mxfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_fp8_mxfp4_ABpreShuffle_256x256_4x4_ps.co
+256,256,mxfp4,1,4,4,0,fp4,_ZN5aiter52f4gemm_fp4_mxfp4_ABpreShuffle_256x256_4x4_ps_noscaleE,f4gemm_fp4_mxfp4_ABpreShuffle_256x256_4x4_ps_noscale.co
+256,256,nvfp4,1,4,4,1,bf16,_ZN5aiter45f4gemm_bf16_nvfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_bf16_nvfp4_ABpreShuffle_256x256_4x4_ps.co
+256,256,nvfp4,1,4,4,1,fp8,_ZN5aiter44f4gemm_fp8_nvfp4_ABpreShuffle_256x256_4x4_psE,f4gemm_fp8_nvfp4_ABpreShuffle_256x256_4x4_ps.co
