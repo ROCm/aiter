@@ -49,7 +49,7 @@ LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_pa_decode_tile(
     *,
     head_dim: int,
@@ -239,7 +239,7 @@ def compile_pa_decode_tile(
         )
         # Per-lane Q chunk (QCHUNK 16-bit elems) fetched in QLOAD_UNIT-wide
         # pieces (128b max per buffer load): head_dim=256 needs 2 pieces.
-        QLOAD_UNIT = QCHUNK if QCHUNK < 8 else 8
+        QLOAD_UNIT = min(8, QCHUNK)
         N_QLOADS = QCHUNK // QLOAD_UNIT
         _q_copy_op = (
             fx.rocdl.BufferCopy128b() if QLOAD_UNIT == 8 else fx.rocdl.BufferCopy64b()
@@ -579,7 +579,7 @@ def compile_pa_decode_tile(
             # possibly on the last M-tile (only it can be a partial tile), so
             # skip the runtime branch (and its EXEC-mask overhead) entirely
             # for every other M-tile.
-            if const_expr((m + 1) * MFMA_MNK <= TOTAL_ROWS):
+            if const_expr((m + 1) * MFMA_MNK <= TOTAL_ROWS):  # noqa: SIM114
                 _quant_q_row(m, qi, gs_head, q_row_off)
             elif flat_idx < TOTAL_ROWS:
                 _quant_q_row(m, qi, gs_head, q_row_off)
@@ -1154,14 +1154,18 @@ def compile_pa_decode_tile(
 
             def _emit(o_norm, sub):
                 if const_expr(NP == 1):
-                    out_row = output_ptr[seq * query_length + qi_e, qh, None]
+                    out_row = output_ptr[
+                        seq * query_length + qi_e, qh, None  # noqa: B023
+                    ]
                     out_chunk = fx.slice(
                         fx.logical_divide(out_row, fx.make_layout(OP_ELEMS, 1)),
                         (None, sub),
                     )
                     out_chunk.store(o_norm)
                 else:
-                    base = ((seq * n_kv + kv_h) * NP + part) * TOTAL_ROWS + row
+                    base = (
+                        (seq * n_kv + kv_h) * NP + part
+                    ) * TOTAL_ROWS + row  # noqa: B023
                     pout_div = fx.logical_divide(pout_ptr, fx.make_layout(OP_ELEMS, 1))
                     pout_chunk = fx.slice(
                         pout_div, (None, base * (head_dim // OP_ELEMS) + sub)
@@ -1179,7 +1183,7 @@ def compile_pa_decode_tile(
                 if row < TOTAL_ROWS:
                     _emit(o_norm, sub)
 
-            if const_expr(NP > 1):
+            if const_expr(NP > 1):  # noqa: SIM102
                 if warp == 0 and rgroup == 0:
                     base = ((seq * n_kv + kv_h) * NP + part) * TOTAL_ROWS + row
                     if row < TOTAL_ROWS:
@@ -1209,7 +1213,7 @@ def compile_pa_decode_tile(
         stride_ks_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         pa_decode_tile_kernel(
             output,
