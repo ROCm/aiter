@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import inspect
 import math
-from typing import Union
 
 from flydsl.expr.rocdl import tdm_ops as _tdm
 
@@ -70,7 +69,7 @@ else:
         num_warps: int = 1,
         cache_policy: int = 0,
         pred: int = 1,
-        workgroup_mask: Union[int, ir.Value] = 0,
+        workgroup_mask: int | ir.Value = 0,
         lds_byte_offset=None,
         for_store: bool = False,
         atomic_barrier_enable: bool = False,

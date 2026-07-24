@@ -28,6 +28,7 @@ from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
+
 from aiter.ops.flydsl.kernels import tdm_oob as tdm_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
@@ -3574,11 +3575,11 @@ def compile_ptpc_gemm(
 
 
 __all__ = [
-    "compile_fp8fp4_gemm",
-    "compile_mxscale_gemm",
-    "compile_mxfp4_gemm",
-    "compile_mxfp8_gemm",
     "compile_a8w4_gemm",
     "compile_blockscale_gemm",
+    "compile_fp8fp4_gemm",
+    "compile_mxfp4_gemm",
+    "compile_mxfp8_gemm",
+    "compile_mxscale_gemm",
     "compile_ptpc_gemm",
 ]

@@ -14,6 +14,7 @@ from torch import Tensor
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -23,7 +24,6 @@ from ..utility.mx_types import (
 )
 from . import triton
 from .enum import ActivationType, QuantType
-from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 # Type alias for round-mode parameters; Union keeps int interop without
 # triggering the JIT build that loading MxScaleRoundMode would cause.
@@ -443,10 +443,10 @@ def per_group_quant_hip(
     quant_dtype: torch.dtype = dtypes.i8,
     group_size: int = 128,
     transpose_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
     scale_type: torch.dtype = dtypes.fp32,
-) -> Tuple[Tensor, Tensor]:
+) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
     if scale is None:
@@ -789,7 +789,6 @@ def dynamic_per_group_scaled_quant(
 
     Only ``group_size`` in {32, 64, 128} is supported.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
