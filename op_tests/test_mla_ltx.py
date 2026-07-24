@@ -646,8 +646,10 @@ def _main():
     _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
 
     if get_gfx() != "gfx950":
+        # gfx950 (MI350)-only asm kernels: cleanly skip on other archs (e.g.
+        # gfx942/MI300) with exit code 0 so CI does not mark this as a failure.
         print(f"skip: gfx={get_gfx()} (need gfx950)")
-        return 1
+        return 0
 
     aiter_root = Path(args.aiter_root or _aiter_root())
 
