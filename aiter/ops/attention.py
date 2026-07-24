@@ -4,19 +4,20 @@
 import math
 from typing import Optional, Tuple
 
-from aiter.ops.enum import QuantType, Enum, MlaVersion
 import torch
 import triton
 import triton.language as tl
+
+from aiter.ops.enum import Enum, MlaVersion, QuantType
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    pa_decode_gluon as _pa_decode_gluon_fallback,
+)
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
 from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon as _pa_decode_gluon_fallback,
-)
 
 try:
     from aiter.ops.flydsl import pa_decode as _pa_decode_flydsl
@@ -25,8 +26,8 @@ except (ImportError, AttributeError, RuntimeError, OSError):
 
 from aiter import dtypes
 
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from ..jit.core import compile_ops, is_experimental_enabled
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
 MD_NAME = "module_attention"
 
