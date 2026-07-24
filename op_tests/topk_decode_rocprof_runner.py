@@ -42,19 +42,37 @@ def add_path_if_present(path: str | Path | None) -> None:
     sys.path.insert(0, path_str)
 
 
+def _has_built_flydsl(path) -> bool:
+    """True only if `path` holds a *built* flydsl (with the generated _mlir ext)."""
+    if not path:
+        return False
+    p = Path(path).expanduser().resolve()
+    if not (p / "flydsl").exists():
+        return False
+    return (p / "flydsl" / "_mlir").exists() or bool(
+        list((p / "flydsl").glob("_mlir*"))
+    )
+
+
 def add_flydsl_package_path() -> None:
     configured = os.environ.get("FLYDSL_PATH")
-    # Prefer the packaged runtime when present; the source tree alone does not
-    # include the generated MLIR extension modules used by local benchmark runs.
-    add_path_if_present(REPO_ROOT.parent / "FlyDSL" / "python")
-    if configured:
-        add_path_if_present(Path(configured) / "python")
-        add_path_if_present(configured)
-    add_path_if_present(REPO_ROOT.parent / ".r1_flydsl_pkgs")
+    # Only prepend a candidate that actually contains the compiled MLIR extension;
+    # a source-only checkout must not shadow the installed/built runtime.
+    for cand in (
+        REPO_ROOT.parent / "FlyDSL" / "python",
+        (Path(configured) / "python") if configured else None,
+        Path(configured) if configured else None,
+        REPO_ROOT.parent / ".r1_flydsl_pkgs",
+    ):
+        if _has_built_flydsl(cand):
+            add_path_if_present(cand)
 
 
 # Reuse the harness data generators for parity with the benchmark.
-from op_tests.benchmark_topk_per_row_decode import make_logits, make_row_ends  # noqa: E402
+from op_tests.benchmark_topk_per_row_decode import (  # noqa: E402
+    make_logits,
+    make_row_ends,
+)
 
 VLLM_SO = "/home/AMD/samremes/dev/vllm/vllm/_C_stable_libtorch.abi3.so"
 
