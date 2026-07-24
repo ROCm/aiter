@@ -373,8 +373,8 @@ def compile_gemm2_a4w4_port(
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
     ):
-        # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks; num_n_blocks = N_OUT//256 runtime.
-        num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(256)
+        # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks.
+        num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         grid_x = i32_grid_blocks * num_n_blocks
         gemm2_kernel(
             arg_aq,
@@ -404,6 +404,7 @@ G2_CACHE = {}
 
 def get_g2(
     BM,
+    BN,
     use_nt,
     HIDDEN_MAX,
     epilog,
@@ -429,6 +430,7 @@ def get_g2(
     g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and epilog == "reduce"
     key = (
         BM,
+        BN,
         use_nt,
         HIDDEN_MAX,
         epilog,
@@ -449,6 +451,7 @@ def get_g2(
     if launch is None:
         launch = compile_gemm2_a4w4_port(
             BM=BM,
+            BN=BN,
             use_nt=use_nt,
             HIDDEN_MAX=HIDDEN_MAX,
             epilog=epilog,
@@ -487,6 +490,7 @@ def mxfp4_moe_gemm2(
     D_INTER,
     topk,
     BM=32,
+    BN=256,
     use_nt=False,
     a_dtype="fp4",
     epilog="atomic",
@@ -508,9 +512,9 @@ def mxfp4_moe_gemm2(
         cu_num = get_cu_num()
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
-    if D_HIDDEN % 256 != 0:
+    if D_HIDDEN % BN != 0:
         raise AssertionError(
-            f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}"
+            f"D_HIDDEN (N_OUT) must be a multiple of BN ({BN}), got {D_HIDDEN}"
         )
     if D_HIDDEN > HIDDEN_MAX:
         raise AssertionError(
@@ -522,6 +526,7 @@ def mxfp4_moe_gemm2(
         )
     launch = get_g2(
         BM,
+        BN,
         use_nt,
         HIDDEN_MAX,
         epilog,
