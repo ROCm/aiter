@@ -199,7 +199,7 @@ jobs:
     name: Accuracy (${{ matrix.display_name }}, ${{ matrix.runner }})
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}
