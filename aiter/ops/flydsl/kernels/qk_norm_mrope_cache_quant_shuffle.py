@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused RMSNorm + 3D-mrope RoPE + optional per-tensor FP8 quant, with a hybrid
+"""Fused RMSNorm + 3D-MRoPE + optional per-tensor FP8 quant, with a hybrid
 coalesced/scatter write into a shuffle-layout paged KV cache (FlyDSL, wave64).
 
-This is the production counterpart of
-``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`` (the HIP kernel in
-``module_fused_qk_norm_mrope_cache_quant_shuffle``): same call signature and
-semantics for the configuration this FlyDSL implementation supports, so it
-can be dropped in wherever that op is called.
+Not yet fully feature-complete with the hip version
+(``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`);
+Unsupported combinations raise ``ValueError``/``NotImplementedError``.
 
 Two kernel launches, not one -- see the design note below for why.
 
@@ -43,21 +41,6 @@ Why two launches instead of one: Q's output is a plain contiguous
 ``[T, H_q, D]`` tensor with no write-amplification concern, so forcing it
 through the KV kernel's page-block grid would only add complexity with no
 HBM-traffic benefit. See ``op_tests/flydsl-best-practices.md`` S6.
-
-Scope of this implementation (validated against the Qwen3-VL worst-case
-config: ``H_q=64, H_k=H_v=4, D=128, mrope_section=[24,20,20]``): NEOX-style
-interleaved or blocked 3D-mrope, FP8 or bf16 shuffle-layout cache, full
-(non-partial) rotary, standard or Gemma RMSNorm, wave64 (gfx942/gfx950).
-Unsupported
-combinations raise ``ValueError``/``NotImplementedError`` with a clear
-message rather than silently producing wrong results -- see
-``flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``'s validation.
-
-``num_tokens`` need not be a multiple of ``block_size``: the KV kernel grids
-``ceil_div(num_tokens, block_size)`` page-blocks and guards every per-token
-read/write in the last (possibly ragged) block behind ``tok < num_tokens``.
-Ragged blocks use the scatter path, so unused physical cache slots are
-preserved exactly as in the HIP implementation.
 """
 
 import math
