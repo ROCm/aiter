@@ -186,11 +186,15 @@ def paged_attention_v1(
         key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     )
     gqa_ratio = int(num_heads / num_kv_heads)
-    max_num_partitions = int(math.ceil(max_context_len / partition_size))
-    npar_loops = int(math.ceil(max_num_partitions / warpSize))
     logits_soft_cap_enabled = logits_soft_cap > 0
     alibi_enabled = alibi_slopes is not None
     sliding_window_enabled = sliding_window > 0
+
+    if sliding_window_enabled and max_context_len > sliding_window:
+        max_num_partitions = int(math.ceil(sliding_window / partition_size)) + 1
+    else:
+        max_num_partitions = int(math.ceil(max_context_len / partition_size))
+    npar_loops = int(math.ceil(max_num_partitions / warpSize))
     func = compile(
         gqa_ratio,
         head_size,
