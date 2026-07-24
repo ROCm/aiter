@@ -15,7 +15,6 @@ self-hosted-runner:
     - linux-aiter-mi300x-4
     - linux-aiter-mi300x-8
     - linux-aiter-mi35x-1
-    - linux-aiter-mi35x-4
     - linux-aiter-mi35x-8
     - linux-aiter-mi355-1
     - linux-aiter-mi355-8

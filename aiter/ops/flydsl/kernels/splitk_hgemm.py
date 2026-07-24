@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from __future__ import annotations
-
 import functools
 from abc import ABC, abstractmethod
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, memref, scf
-from flydsl.compiler.kernel_function import CompilationContext
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import (
     arith,
     buffer_ops,
@@ -22,9 +19,8 @@ from flydsl.expr import (
 )
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
 
-from .tensor_shim import GTensor, STensor, get_dtype_in_kernel
+from .tensor_shim import GTensor, get_dtype_in_kernel
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
@@ -197,19 +193,34 @@ def compile_hgemm_kernel(
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
     # LDS parameters:
-    allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
-    smem_a_offset = allocator._align(allocator.ptr, 16)
-    AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    allocator.ptr = smem_a_offset + AS_BYTES
-    SMEM_USE = AS_BYTES
+    # C output reuses A's LDS region (aliasing the A tile). When C overflows the
+    # A field it continues into the B field, which is why B is sized to hold the
+    # larger of the B tile or the C-tile overflow. Static shared leaves are laid
+    # out consecutively, so the A and B fields form one contiguous C region.
+    AS_ELEMS = STAGES * BLOCK_M * BLOCK_K
+    BS_ELEMS = STAGES * BLOCK_N * BLOCK_K
+    CMN_ELEMS = BLOCK_K_WARPS * BLOCK_M * BLOCK_N
     if B_TO_LDS:
-        smem_b_offset = allocator._align(allocator.ptr, 16)
-        allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-        SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
+        A_FIELD_ELEMS = AS_ELEMS
+        B_FIELD_ELEMS = max(BS_ELEMS, CMN_ELEMS - AS_ELEMS)
         assert ASYNC_COPY
-    SMEM_USE_ = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * DTYPE_BYTES)
-    allocator.ptr += SMEM_USE_ - SMEM_USE
-    assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
+    else:
+        A_FIELD_ELEMS = max(AS_ELEMS, CMN_ELEMS)
+        B_FIELD_ELEMS = 0
+    fx_dtype = fx.Float16 if dtype == "f16" else fx.BFloat16
+    if B_TO_LDS:
+
+        @fx.struct
+        class SharedStorage:
+            a_lds: fx.Array[fx_dtype, A_FIELD_ELEMS, 16]
+            b_lds: fx.Array[fx_dtype, B_FIELD_ELEMS, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            a_lds: fx.Array[fx_dtype, A_FIELD_ELEMS, 16]
+
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
@@ -259,20 +270,82 @@ def compile_hgemm_kernel(
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
-        base_ptr = allocator.get_base()
-        smem_a_ptr = SmemPtr(
-            base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,)
-        )
-        as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        a_lds_ptr = lds.a_lds.ptr
+        a_lds_i64 = fx.Int64(fx.ptrtoint(a_lds_ptr))
         if const_expr(B_TO_LDS):
-            smem_b_ptr = SmemPtr(
-                base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,)
+            b_lds_ptr = lds.b_lds.ptr
+            b_lds_i64 = fx.Int64(fx.ptrtoint(b_lds_ptr))
+
+        def _lds_a3_ptr(base_i64, elem_off):
+            off_i64 = arith.index_cast(
+                T.i64, fx.Index(elem_off) * fx.Index(DTYPE_BYTES)
             )
-            bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
-        smem_c_ptr = SmemPtr(
-            base_ptr, smem_a_offset, dtype_, shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,)
-        )
-        cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
+            return buffer_ops.create_llvm_ptr(
+                base_i64 + fx.Int64(off_i64), address_space=3
+            )
+
+        # LDS accessors: linear element offsets mirroring the old STensor shapes
+        # as_/bs_ = (stage, row, col) over (STAGES, BLOCK*, BLOCK_K);
+        # cs_ = (k_slice, row, col) over (BLOCK_K_WARPS, BLOCK_M, BLOCK_N),
+        # aliasing the A field.
+        def as_store(stage, row, col, value):
+            elem_off = (
+                fx.Int64(stage) * (BLOCK_M * BLOCK_K)
+                + fx.Int64(row) * BLOCK_K
+                + fx.Int64(col)
+            )
+            fx.ptr_store(value, a_lds_ptr + elem_off)
+
+        def as_load(stage, row, col, vec_size):
+            elem_off = (
+                fx.Int64(stage) * (BLOCK_M * BLOCK_K)
+                + fx.Int64(row) * BLOCK_K
+                + fx.Int64(col)
+            )
+            return fx.ptr_load(
+                a_lds_ptr + elem_off,
+                result_type=fx.Vector.make_type(vec_size, fx_dtype),
+            )
+
+        def bs_store(stage, row, col, value):
+            elem_off = (
+                fx.Int64(stage) * (BLOCK_N * BLOCK_K)
+                + fx.Int64(row) * BLOCK_K
+                + fx.Int64(col)
+            )
+            fx.ptr_store(value, b_lds_ptr + elem_off)
+
+        def bs_load(stage, row, col, vec_size):
+            elem_off = (
+                fx.Int64(stage) * (BLOCK_N * BLOCK_K)
+                + fx.Int64(row) * BLOCK_K
+                + fx.Int64(col)
+            )
+            return fx.ptr_load(
+                b_lds_ptr + elem_off,
+                result_type=fx.Vector.make_type(vec_size, fx_dtype),
+            )
+
+        def cs_store_scalar(k_slice, row, col, value):
+            elem_off = (
+                fx.Int64(k_slice) * (BLOCK_M * BLOCK_N)
+                + fx.Int64(row) * BLOCK_N
+                + fx.Int64(col)
+            )
+            fx.ptr_store(value, a_lds_ptr + elem_off)
+
+        def cs_load_vec(k_slice, row, col, vec_size):
+            elem_off = (
+                fx.Int64(k_slice) * (BLOCK_M * BLOCK_N)
+                + fx.Int64(row) * BLOCK_N
+                + fx.Int64(col)
+            )
+            return fx.ptr_load(
+                a_lds_ptr + elem_off,
+                result_type=fx.Vector.make_type(vec_size, fx_dtype),
+            )
+
         if const_expr(IS_SPLIT_K):
             semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
             signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
@@ -458,11 +531,7 @@ def compile_hgemm_kernel(
                 k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
                 col_in_bytes = k_local_idx * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-                as_.vec_store(
-                    (fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES),
-                    vecs[i],
-                    LDG_VEC_SIZE,
-                )
+                as_store(lds_stage, m_local_idx, col_in_bytes // DTYPE_BYTES, vecs[i])
 
         def get_dma_copy_warp_offset():
             warp_offset = rocdl.readfirstlane(
@@ -507,14 +576,8 @@ def compile_hgemm_kernel(
             global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             if const_expr(lds_ptr is None):
-                lds_offset = (
-                    as_.linear_offset((fx.Index(write_stage), 0, 0)) * DTYPE_BYTES
-                )
-                lds_base = (
-                    memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                )
-                lds_ptr_base = buffer_ops.create_llvm_ptr(
-                    arith.index_cast(T.i64, lds_base), address_space=3
+                lds_ptr_base = _lds_a3_ptr(
+                    a_lds_i64, fx.Index(write_stage) * (BLOCK_M * BLOCK_K)
                 )
                 lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
             else:
@@ -547,14 +610,8 @@ def compile_hgemm_kernel(
             global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             if const_expr(lds_ptr is None):
-                lds_offset = (
-                    bs_.linear_offset((fx.Index(write_stage), 0, 0)) * DTYPE_BYTES
-                )
-                lds_base = (
-                    memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                )
-                lds_ptr_base = buffer_ops.create_llvm_ptr(
-                    arith.index_cast(T.i64, lds_base), address_space=3
+                lds_ptr_base = _lds_a3_ptr(
+                    b_lds_i64, fx.Index(write_stage) * (BLOCK_N * BLOCK_K)
                 )
                 lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
             else:
@@ -599,8 +656,10 @@ def compile_hgemm_kernel(
                             warp_atom_k_idx + ldmatrix_b_k_vec_idx
                         ) * DTYPE_BYTES
                         col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                        vec = bs_.vec_load(
-                            (s, row, col_in_bytes // DTYPE_BYTES),
+                        vec = bs_load(
+                            s,
+                            row,
+                            col_in_bytes // DTYPE_BYTES,
                             WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K,
                         )
                         b_frags[ii] = vec
@@ -619,8 +678,10 @@ def compile_hgemm_kernel(
                         warp_atom_k_idx + ldmatrix_a_k_vec_idx
                     ) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = as_.vec_load(
-                        (s, row, col_in_bytes // DTYPE_BYTES),
+                    vec = as_load(
+                        s,
+                        row,
+                        col_in_bytes // DTYPE_BYTES,
                         WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K,
                     )
                     a_frags[ii] = vec
@@ -699,8 +760,10 @@ def compile_hgemm_kernel(
                 row = warp_atom_n_idx + ldmatrix_b_n_idx
                 col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                return bs_.vec_load(
-                    (s, row, col_in_bytes // DTYPE_BYTES),
+                return bs_load(
+                    s,
+                    row,
+                    col_in_bytes // DTYPE_BYTES,
                     WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K,
                 )
 
@@ -709,8 +772,10 @@ def compile_hgemm_kernel(
                 row = warp_atom_m_idx + ldmatrix_a_m_idx
                 col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                return as_.vec_load(
-                    (s, row, col_in_bytes // DTYPE_BYTES),
+                return as_load(
+                    s,
+                    row,
+                    col_in_bytes // DTYPE_BYTES,
                     WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K,
                 )
 
@@ -953,9 +1018,9 @@ def compile_hgemm_kernel(
                     )
                     val = val.truncf(dtype_)
                     if const_expr(IS_SLICE_K):
-                        cs_[wid_k, lds_m_idx, lds_n_idx] = val
+                        cs_store_scalar(wid_k, lds_m_idx, lds_n_idx, val)
                     else:
-                        cs_[0, lds_m_idx, lds_n_idx] = val
+                        cs_store_scalar(0, lds_m_idx, lds_n_idx, val)
 
         # write back to global
         if const_expr(IS_SPLIT_K):
@@ -971,10 +1036,10 @@ def compile_hgemm_kernel(
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    pk_val = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    pk_val = cs_load_vec(0, m_local_idx, n_local_idx, LDG_VEC_SIZE)
                     for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                        pk_val += cs_.vec_load(
-                            (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
+                        pk_val += cs_load_vec(
+                            ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE
                         )
                     linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
                     # split to vec2s
@@ -1016,11 +1081,9 @@ def compile_hgemm_kernel(
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    vec = cs_load_vec(0, m_local_idx, n_local_idx, LDG_VEC_SIZE)
                     for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                        vec += cs_.vec_load(
-                            (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
-                        )
+                        vec += cs_load_vec(ksi, m_local_idx, n_local_idx, LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
                         bias_vec = BIAS_.vec_load(
                             (n_offset + n_local_idx,), LDG_VEC_SIZE
@@ -1043,11 +1106,6 @@ def compile_hgemm_kernel(
         signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_kernel._func.__name__ = KERNEL_NAME
         value_attrs = (
