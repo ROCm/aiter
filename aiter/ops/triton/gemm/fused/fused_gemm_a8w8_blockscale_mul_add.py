@@ -128,7 +128,9 @@ def fused_gemm_a8w8_blockscale_mul_add(
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
-        config, _ = _get_config(M, N, K)
+        # fuse_type is passed so gfx950 can route fuse_type=1 to the base config
+        # (the dedicated fast 64x64 tile is miscompiled for fuse_type=1 on Triton 3.8).
+        config, _ = _get_config(M, N, K, fuse_type)
 
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
         K, config["NUM_KSPLIT"]
