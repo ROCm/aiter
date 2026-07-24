@@ -6,27 +6,60 @@
 import functools
 import os
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
+
+_FLYDSL_MLA_REDUCE_TARGET_GFX = "gfx942"
+_FLYDSL_MLA_REDUCE_TARGET_H = 16
+_FLYDSL_MLA_REDUCE_TARGET_DV = 512
 
 
 @functools.lru_cache(maxsize=1)
 def _flydsl_mla_reduce_available() -> bool:
-    """Whether FlyDSL is importable and supports this device's arch. Cached
-    for the process lifetime (install/arch are fixed at runtime)."""
+    """Whether the optional FlyDSL package is available on this device."""
     try:
         from aiter.ops.flydsl import is_flydsl_available
 
         return is_flydsl_available()
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         return False
+
+
+def _flydsl_mla_reduce_supported(
+    partial_output: torch.Tensor,
+    final_output: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+) -> bool:
+    """Whether this production call is within the validated FlyDSL scope."""
+    if get_gfx() != _FLYDSL_MLA_REDUCE_TARGET_GFX or max_seqlen_q != 1:
+        return False
+    if not isinstance(partial_output, torch.Tensor) or not isinstance(
+        final_output, torch.Tensor
+    ):
+        return False
+    if partial_output.ndim != 3 or final_output.ndim != 3:
+        return False
+    if (
+        partial_output.size(-2) != _FLYDSL_MLA_REDUCE_TARGET_H
+        or final_output.size(-2) != _FLYDSL_MLA_REDUCE_TARGET_H
+        or final_output.size(-1) != _FLYDSL_MLA_REDUCE_TARGET_DV
+        or partial_output.size(-1) != _FLYDSL_MLA_REDUCE_TARGET_DV
+    ):
+        return False
+    if final_output.dtype not in (dtypes.bf16, dtypes.fp16):
+        return False
+    return isinstance(num_kv_splits, int) and (
+        num_kv_splits == 0 or num_kv_splits <= get_cu_num()
+    )
 
 
 def _flydsl_mla_reduce_enabled() -> bool:
@@ -34,9 +67,9 @@ def _flydsl_mla_reduce_enabled() -> bool:
 
     Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
     Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
-    Falls back silently to HIP if FlyDSL is not installed/compatible. Not
-    memoized, so the env var can be toggled at runtime; only the availability
-    probe above is cached.
+    Calls outside the validated gfx942 GLM decode scope retain the HIP path.
+    Not memoized, so the env var can be toggled at runtime; only the optional
+    package availability probe above is cached.
     """
     try:
         from flydsl.utils.env import EnvManager, OptBool
@@ -47,7 +80,7 @@ def _flydsl_mla_reduce_enabled() -> bool:
         if not _Env().enabled:
             return False
         return _flydsl_mla_reduce_available()
-    except Exception:
+    except (ImportError, OSError, RuntimeError, ValueError):
         return False
 
 
@@ -75,7 +108,9 @@ def _mla_reduce_v1_dispatch(
     from ``reduce_indptr`` via a capture-safe warmup cache, so this seam does not
     thread it. The HIP path ignores it entirely.
     """
-    if _flydsl_mla_reduce_enabled():
+    if _flydsl_mla_reduce_enabled() and _flydsl_mla_reduce_supported(
+        partial_output, final_output, max_seqlen_q, num_kv_splits
+    ):
         from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
         flydsl_mla_reduce_v1(
