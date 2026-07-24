@@ -327,14 +327,8 @@ def main() -> None:
 
     # Markdown table: rows = (k, L), columns = kernels.
     print(
-        "\n## Kernel-only %s latency (us), distribution=%s, num_rows=%d, max_width=%s, iters=%d"
-        % (
-            args.stat,
-            args.distribution,
-            args.num_rows,
-            args.max_width or "L",
-            args.iters,
-        )
+        f"\n## Kernel-only {args.stat} latency (us), distribution={args.distribution}, "
+        f"num_rows={args.num_rows}, max_width={args.max_width or 'L'}, iters={args.iters}"
     )
     header = "| k | num_rows | L | " + " | ".join(args.kernels) + " |"
     sep = "|" + "---|" * (3 + len(args.kernels))
