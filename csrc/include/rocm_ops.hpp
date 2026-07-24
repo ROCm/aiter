@@ -2447,7 +2447,8 @@ namespace py = pybind11;
           py::arg("NE"),                                                  \
           py::arg("TOPK"),                                                \
           py::arg("D_HIDDEN"),                                            \
-          py::arg("MB"));                                                 \
+          py::arg("MB"),                                                  \
+          py::arg("bf16_out_init") = std::nullopt);                           \
     m.def("mxfp4_moe_sort",                                               \
           &mxfp4_moe_sort_kernel,                                         \
           py::arg("topk_ids"),                                            \
@@ -2466,7 +2467,8 @@ namespace py = pybind11;
           py::arg("D_HIDDEN"),                                            \
           py::arg("D_INTER"),                                            \
           py::arg("MB"),                                                  \
-          py::arg("prologue"));                                           \
+          py::arg("prologue"),                                            \
+          py::arg("bf16_out_init") = std::nullopt);                           \
     m.def("mxfp4_moe_quant",                                              \
           &mxfp4_moe_quant_kernel,                                        \
           py::arg("a_input"),                                             \
@@ -2476,7 +2478,8 @@ namespace py = pybind11;
           py::arg("NE"),                                                  \
           py::arg("TOPK"),                                                \
           py::arg("D_HIDDEN"),                                            \
-          py::arg("MB"));                                                 \
+          py::arg("MB"),                                                  \
+          py::arg("bf16_out_init") = std::nullopt);                           \
     m.def("mxfp4_moe_sort_scales",                                        \
           &mxfp4_moe_sort_scales_kernel,                                  \
           py::arg("a_scale"),                                             \

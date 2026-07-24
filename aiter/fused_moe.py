@@ -80,6 +80,30 @@ kernel_bench_callable = None
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
 
 
+def _moe_buf_or_alloc(out_buf, M, model_dim, moebuf_dtype, device):
+    """Return the caller-provided output buffer as the combined [M, model_dim]
+    ``moe_buf`` when supplied (stage2 writes the topk-combined result straight into the target buffer, e.g. the AllReduce registered IPC
+    buffer, avoiding an extra copy pass), else allocate a fresh one.
+
+    ``out_buf is None`` reproduces the previous allocation exactly, so every
+    existing caller is byte-for-byte unchanged.
+    """
+    if out_buf is None:
+        return torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    assert tuple(out_buf.shape) == (
+        M,
+        model_dim,
+    ), f"out buffer shape {tuple(out_buf.shape)} != expected {(M, model_dim)}"
+    assert (
+        out_buf.dtype == moebuf_dtype
+    ), f"out buffer dtype {out_buf.dtype} != expected {moebuf_dtype}"
+    assert (
+        out_buf.device == device
+    ), f"out buffer device {out_buf.device} != expected {device}"
+    assert out_buf.is_contiguous(), "out buffer must be contiguous"
+    return out_buf
+
+
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -120,6 +144,8 @@ def _adaptive_moe_sort(
     atomic=False,
     emit_aux=False,
     moebuf_dtype=dtypes.bf16,
+    out_buf=None,
+    out_init_buf=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -134,12 +160,18 @@ def _adaptive_moe_sort(
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
     moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        _moe_buf_or_alloc(out_buf, M, model_dim, moebuf_dtype, device)
         if atomic
         else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     )
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
+    # initialise the inline (BM==16) zero-init with the shared-expert output so the atomic combine folds the shared add. Only meaningful when the
+    # sort owns the zero-init (BM==16); for BM!=16 the sort skips zeroing and the
+    # separate quant kernel initialises instead, so pass None here.
+    bf16_out_init = (
+        out_init_buf if (atomic and BM == 16 and out_init_buf is not None) else None
+    )
 
     aiter.mxfp4_moe_sort(
         topk_ids=topk_ids,
@@ -159,6 +191,7 @@ def _adaptive_moe_sort(
         D_INTER=1,  # (void)D_INTER in the sort path; unused
         MB=BM,
         prologue=0 if BM == 16 else 1,
+        bf16_out_init=bf16_out_init,
     )
     std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if emit_aux:
@@ -180,6 +213,8 @@ def _moe_sorting_impl(
     return_local_topk_ids=False,
     accumulate=True,
     output_aux=False,
+    out_buf=None,
+    out_init_buf=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -197,6 +232,8 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            out_buf=out_buf,
+            out_init_buf=out_init_buf,
         )
 
     # -- Opus / CK standard path --
@@ -213,7 +250,7 @@ def _moe_sorting_impl(
     #  - else (FlyDSL stage2 reduce mode without mask): caller owns the
     #    [M, topk, model_dim] intermediate; allocate a placeholder here.
     if (expert_mask is not None) or accumulate:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        moe_buf = _moe_buf_or_alloc(out_buf, M, model_dim, moebuf_dtype, device)
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
@@ -292,6 +329,7 @@ def _flydsl_moe_sorting(
     expert_mask,
     num_local_tokens,
     accumulate=True,
+    out_buf=None,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
@@ -312,7 +350,7 @@ def _flydsl_moe_sorting(
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
     # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
     if (expert_mask is not None) or accumulate:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        moe_buf = _moe_buf_or_alloc(out_buf, M, model_dim, moebuf_dtype, device)
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
 
@@ -346,6 +384,8 @@ def moe_sorting(
     accumulate=True,
     flat=False,
     output_aux=False,
+    out_buf=None,
+    out_init_buf=None,
 ):
     if (
         not _USE_CK_MOE_SORTING
@@ -366,6 +406,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             accumulate=accumulate,
+            out_buf=out_buf,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
@@ -387,6 +428,8 @@ def moe_sorting(
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
+            out_buf=out_buf,
+            out_init_buf=out_init_buf,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -466,10 +509,21 @@ def fused_moe(
     splitk=0,
     swiglu_limit=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    out: Optional[torch.tensor] = None,
+    residual: Optional[torch.tensor] = None,
 ):
     if not block_size_M:
         block_size_M = -1
-    return fused_moe_(
+    # Validate the caller buffer up front (before it is threaded down as the
+    # stage2 moe_buf) so shape/dtype errors surface here with a stable message
+    # rather than deep in the sort/stage2 dispatch.
+    if out is not None:
+        _exp_shape = (topk_ids.shape[0], w2.shape[1])
+        _exp_dtype = hidden_states.dtype if dtype is None else dtype
+        assert (
+            tuple(out.shape) == _exp_shape and out.dtype == _exp_dtype
+        ), f"out buffer mismatch: {tuple(out.shape)}/{out.dtype} vs {_exp_shape}/{_exp_dtype}"
+    result = fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -493,7 +547,30 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        out=out,
+        residual=residual,
     )
+
+    # plumbing: optional caller-provided output buffer (`out`) so the combined [tokens, model_dim] result lands directly in a target
+    # buffer (e.g. the CustomAllreduce registered IPC buffer), and optional
+    # shared-expert add (`residual`) folded into the down-GEMM topk-combine.
+    #
+    # `out` is threaded down as the stage2 `moe_buf` (one-pass: stage2 writes it
+    # in place, no extra copy) for the atomic/reduce paths. Paths that cannot
+    # honor a caller buffer (e.g. FLAT, which owns a byte buffer with a trailing
+    # flag region) fall back to a copy so semantics stay identical everywhere.
+    #
+    # `residual` is threaded down into `fused_moe_`, where the MXFP4 a4w4 atomic
+    # path folds it into the combine by initialising the atomic zero-init with it;
+    # every other path applies an equivalent post-add. No residual handling here.
+    if out is not None:
+        assert (
+            out.shape == result.shape and out.dtype == result.dtype
+        ), f"out buffer mismatch: {tuple(out.shape)}/{out.dtype} vs {tuple(result.shape)}/{result.dtype}"
+        if result.data_ptr() != out.data_ptr():
+            out.copy_(result)
+        result = out
+    return result
 
 
 def fused_moe_fake(
@@ -522,11 +599,15 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    out: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
     model_dim = w2.shape[1]
+    if out is not None:
+        return out
     moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
     return moe_buf
 
@@ -558,6 +639,8 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    out: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -567,6 +650,23 @@ def fused_moe_(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
+
+    # shared-expert add (`residual`) is folded into the MXFP4 a4w4 atomic combine by initialising the down-GEMM's atomic target with it
+    # (see the `out_init_buf`/`bf16_out_init` threading below). Only that path folds; all
+    # other paths get an equivalent post-add here. `_folded` is flipped True only
+    # when the atomic path actually consumed `residual` as its init value, so
+    # exactly one add happens regardless of which kernel path runs.
+    _folded = False
+
+    def _finalize(result):
+        if residual is not None and not _folded:
+            assert residual.shape == result.shape, (
+                f"residual shape {tuple(residual.shape)} != output "
+                f"{tuple(result.shape)}"
+            )
+            result.add_(residual.to(result.dtype))
+        return result
+
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     assert w1.shape[1] in [
@@ -657,7 +757,7 @@ def fused_moe_(
             )
 
     if grouped_a8w4_out is not None:
-        return grouped_a8w4_out
+        return _finalize(grouped_a8w4_out)
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -701,6 +801,9 @@ def fused_moe_(
 
     sort_m_indices = None
     sort_reverse_sorted = None
+    # Only the MXFP4 a4w4 output_aux atomic path supports the shared-add fold (residual used as the atomic zero-init value). All other
+    # paths leave this False so the caller applies a post-add fallback.
+    _atomic = False
     if metadata.output_aux:
         # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
         # not thread expert_mask into moe_sorting below -- EP masking would be
@@ -730,6 +833,8 @@ def fused_moe_(
             block_size_M,
             accumulate=_atomic,
             output_aux=True,
+            out_buf=out if _atomic else None,
+            out_init_buf=residual if _atomic else None,
         )
         local_topk_ids = None
     else:
@@ -746,6 +851,11 @@ def fused_moe_(
             return_local_topk_ids=need_local_topk_ids,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
+            out_buf=(
+                out
+                if not stage2_uses_route_reduce(metadata.stage2) and not metadata.flat
+                else None
+            ),
         )
         if need_local_topk_ids:
             (
@@ -790,43 +900,51 @@ def fused_moe_(
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
-        return _stage1_call()
+        return _finalize(_stage1_call())
     else:
-        return fused_moe_2stages(
-            hidden_states,
-            w1,
-            w2,
-            topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            isG1U1,
-            block_size_M,
-            activation=activation,
-            quant_type=quant_type,
-            doweight_stage1=doweight_stage1,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=q_dtype_w,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            num_local_tokens=num_local_tokens,
-            # following for cktile support
-            hidden_pad=hidden_pad,
-            intermediate_pad=intermediate_pad,
-            bias1=bias1,
-            bias2=bias2,
-            topk_ids=local_topk_ids if local_topk_ids is not None else topk_ids,
-            topk_weights=topk_weight,
-            # only for flydsl dsv4
-            swiglu_limit=swiglu_limit,
-            gate_mode=gate_mode,
-            expert_mask=expert_mask,
-            m_indices=sort_m_indices,
-            reverse_sorted=sort_reverse_sorted,
+        # The out-init fold only lands when the MXFP4 a4w4 atomic path consumed
+        # `residual` (threaded as out_init_buf/bf16_out_init above); mark it folded so
+        # `_finalize` skips the post-add and we don't double-count the shared add.
+        _folded = _atomic and residual is not None
+        return _finalize(
+            fused_moe_2stages(
+                hidden_states,
+                w1,
+                w2,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                isG1U1,
+                block_size_M,
+                activation=activation,
+                quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                num_local_tokens=num_local_tokens,
+                # following for cktile support
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                topk_ids=local_topk_ids if local_topk_ids is not None else topk_ids,
+                topk_weights=topk_weight,
+                # only for flydsl dsv4
+                swiglu_limit=swiglu_limit,
+                gate_mode=gate_mode,
+                expert_mask=expert_mask,
+                m_indices=sort_m_indices,
+                reverse_sorted=sort_reverse_sorted,
+                out=out,
+                bf16_out_init=residual if _atomic else None,
+            )
         )
 
 
@@ -1309,6 +1427,7 @@ def _mxfp4_a4w4_stage1(
     device,
     use_nt=False,
     interleave=False,
+    out_init=None,
 ):
     if not inline_quant:
         aiter.mxfp4_moe_quant(
@@ -1320,6 +1439,9 @@ def _mxfp4_a4w4_stage1(
             TOPK=topk,
             D_HIDDEN=D_HIDDEN,
             MB=BM,
+            # Initialise the atomic target with the shared-expert output so the down-GEMM combine folds the shared add (BM!=16 path,
+            # where the separate quant kernel owns the zero-init).
+            bf16_out_init=out_init,
         )
         padded_rows = ((max_sorted + 31) // 32) * 32
         cols = D_HIDDEN // 32
@@ -1541,6 +1663,7 @@ def _mxfp4_a4w4_stage1_fw(
     m_indices=None,
     moe_buf=None,
     interleave=False,
+    bf16_out_init=None,
     **_kwargs,
 ):
     device = hidden_states.device
@@ -1585,6 +1708,7 @@ def _mxfp4_a4w4_stage1_fw(
         device=device,
         use_nt=p1["use_nt"],
         interleave=interleave,
+        out_init=bf16_out_init,
     )
 
 
@@ -2452,6 +2576,8 @@ def fused_moe_2stages(
     expert_mask=None,
     m_indices=None,
     reverse_sorted=None,
+    out=None,
+    bf16_out_init=None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2461,7 +2587,9 @@ def fused_moe_2stages(
     device = hidden_states.device
     _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
-        moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        # Reduce-mode: the [M, model_dim] combined output is produced here (the
+        # sort emitted a (0,0) placeholder). Write straight into the caller buffer when provided instead of a throwaway allocation.
+        moe_out = _moe_buf_or_alloc(out, token_num, model_dim, dtype, device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
@@ -2605,6 +2733,10 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
+        # Forward the shared-expert out-init to the stage1 quant kernel (BM!=16 separate-quant path) so it initialises the atomic target
+        # with the shared output instead of zero (folds the shared add).
+        if bf16_out_init is not None:
+            extra_stage1_args["bf16_out_init"] = bf16_out_init
     _stage1_call = functools.partial(
         metadata.stage1,
         a1,

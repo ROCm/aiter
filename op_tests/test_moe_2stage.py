@@ -491,6 +491,53 @@ def test_fmoe(
         num_warmup=2,
         **_fused_moe_kwargs,
     )
+
+    # Validate that threading a caller `out` buffer and a `residual` (shared-expert add) through fused_moe
+    # matches the plain output plus residual. On the MXFP4 a4w4 atomic path this
+    # exercises the one-pass fold (residual initialises the atomic zero-init); other
+    # paths apply an equivalent post-add. The identity holds regardless of path.
+    #
+    # a4w4 stage2 accumulates atomically, so two fused_moe calls differ run-to-run
+    # by the atomic-ordering noise floor (same reason the base out2_ref/out2_ck
+    # elementwise check is loose and we trust logits_diff instead). We therefore
+    # (a) use a residual scaled to the output magnitude so a *dropped* residual
+    # would shift the result far beyond that noise floor, and (b) score with the
+    # same cosine-similarity metric (calc_diff) the base comparison trusts.
+    if os.environ.get("AITER_TEST_MOE_RESIDUAL", "0") == "1":
+        out_rms = out2_ck.float().pow(2).mean().sqrt().clamp_min(1e-6)
+        residual = torch.randn_like(out2_ck) * out_rms
+        ref_fold = out2_ck.float() + residual.float()
+        out_buf = torch.empty_like(out2_ck)
+        ret_fold = fused_moe(
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            out=out_buf,
+            residual=residual,
+            **_fused_moe_kwargs,
+        )
+        assert (
+            ret_fold.data_ptr() == out_buf.data_ptr()
+        ), "fused_moe(out=) must return the caller buffer"
+
+        def _cos_diff(x, y):
+            x, y = x.double(), y.double()
+            return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+        fold_diff = _cos_diff(ref_fold, ret_fold.float())
+        # cosine 1-sim: routed noise is ~base logits_diff (1e-5); a dropped
+        # residual (missing an O(out_rms) addend on every element) would push
+        # this to O(0.1+). Gate well below that but above the atomic noise.
+        assert fold_diff < 1e-2, (
+            f"route-B residual fold logits_diff too high: {fold_diff:.3e} "
+            f"(quant:{AQDType}) -- residual likely dropped/double-counted"
+        )
+        print(
+            f"[aiter] route-B out=+residual fold OK (quant:{AQDType}) "
+            f"logits_diff={fold_diff:.3e}"
+        )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
     # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be

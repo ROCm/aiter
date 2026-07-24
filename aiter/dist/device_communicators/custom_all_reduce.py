@@ -1143,6 +1143,85 @@ class CustomAllreduce:
                 registered_input=False,
             )
 
+    # fused MoE weighted-sum + shared-add already folded into the down-GEMM epilogue (aiter.fused_moe(out=, residual=)); here we
+    # only retarget that combined per-rank output into the registered IPC buffer
+    # and run the cross-rank reduce. No dedicated kernel: the producer writes the
+    # already-combined [tokens, hidden] straight into the registered input buffer
+    # and we reduce it with the existing registered-input all-reduce (copy-in
+    # skipped). Contrast route A (custom_fused_moe_sum_all_reduce), which folds
+    # the topk moe_sum into the all-reduce copy and needs its own kernel.
+
+    def moe_out_registered_buffer(
+        self, num_tokens: int, hidden_dim: int, dtype: torch.dtype
+    ) -> Optional[torch.Tensor]:
+        """Return a ``[num_tokens, hidden_dim]`` tensor that aliases the
+        pre-registered IPC input buffer, so a producer (e.g.
+        ``aiter.fused_moe(out=...)``) can write this rank's combined
+        (routed + shared) result directly into the AR buffer — no separate
+        copy-in before the cross-rank reduce.
+
+        Reduce the result with :meth:`fused_moe_out_all_reduce`. Returns
+        ``None`` when the fused registered path is unavailable (custom AR
+        disabled, VMM transport with no backing tensor, or the shape does not
+        fit / is not custom-AR-eligible), so callers fall back to
+        ``fused_moe(...)`` + a regular all-reduce.
+        """
+        if self.disabled:
+            return None
+        # VMM (gfx1250 on old ROCm) has no host-visible backing tensor for the
+        # registered input buffer, so we cannot hand out an aliasing view.
+        if self._use_vmm:
+            return None
+        element_size = torch.empty((), dtype=dtype).element_size()
+        nbytes = num_tokens * hidden_dim * element_size
+        # Must satisfy the same eligibility the reduce will check: 16B multiple,
+        # fits the registered pool, and inside the (min, max] custom-AR window.
+        if nbytes % 16 != 0:
+            return None
+        pool_input = self._pool["input"]
+        if nbytes > pool_input.max_size:
+            return None
+        if self._car_max_size <= 0 or nbytes > self._car_max_size:
+            return None
+        if nbytes <= self._car_min_size:
+            return None
+        if not (self.world_size == 2 or self.fully_connected):
+            return None
+        base = pool_input.tensor  # uint8 [max_size]
+        return base[:nbytes].view(dtype).view(num_tokens, hidden_dim)
+
+    def fused_moe_out_all_reduce(
+        self, moe_out: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Cross-rank all-reduce of a per-rank combined MoE output that already
+        lives in the registered IPC input buffer (see
+        :meth:`moe_out_registered_buffer`). The copy-in stage is skipped because
+        the input is the registered buffer itself. Returns the reduced
+        ``[tokens, hidden]`` (out-of-place)."""
+        return self.all_reduce(moe_out, out=out, registered_input=True)
+
+    def custom_fused_moe_out_all_reduce(
+        self, moe_out: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """Graph/disabled-aware entry for the route-B fused MoE epilogue reduce.
+
+        ``moe_out`` must be the buffer returned by
+        :meth:`moe_out_registered_buffer` (already holding this rank's combined
+        routed+shared result). Returns ``None`` when custom AR is unavailable so
+        the caller can fall back to a regular all-reduce.
+
+        The registered input buffer is exchanged at init and address-stable
+        across CUDA-graph replays, so the registered path is graph-safe (same
+        mechanism as ``enable_register_for_capturing``); no copy-in warm-up
+        dance is needed here."""
+        if self.disabled or not self.should_custom_ar_bytes(moe_out):
+            return None
+        if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
+            # Warm-up forward (pre-capture): return a correctly-shaped zero so
+            # the allocation pattern matches the captured out-of-place reduce.
+            return torch.zeros_like(moe_out) if out is None else out.zero_()
+        return self.fused_moe_out_all_reduce(moe_out, out=out)
+
     # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.
     _RS_SPLIT_FIRST = 0

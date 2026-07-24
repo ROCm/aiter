@@ -12,7 +12,7 @@ constexpr int WARP_SIZE = opus::get_warp_size();
 
 template <int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
 __device__ __forceinline__ void zero_init_bf16_out_impl(
-    int M_actual, __hip_bfloat16 *out)
+    int M_actual, __hip_bfloat16 *out, const __hip_bfloat16 *out_init = nullptr)
 {
     using vec_t = int4;
     constexpr int VEC_BYTES = sizeof(vec_t);
@@ -25,6 +25,16 @@ __device__ __forceinline__ void zero_init_bf16_out_impl(
     const int gtid = blockIdx.x * THREADS_PER_CTA + threadIdx.x;
 
     vec_t *__restrict__ out_v = reinterpret_cast<vec_t *>(out);
+    // When an out_init buffer (the shared-expert output) is provided, initialise the atomic-accumulate target with it instead of zero, so the
+    // routed-expert combine folds the shared add for free (one pass, no
+    // separate add). out_init==nullptr reproduces the plain zero-init exactly.
+    if (out_init != nullptr) {
+        const vec_t *__restrict__ out_init_v = reinterpret_cast<const vec_t *>(out_init);
+        for (long long i = (long long)gtid; i < total_vecs; i += total_threads) {
+            out_v[i] = out_init_v[i];
+        }
+        return;
+    }
     const vec_t zero = {0, 0, 0, 0};
     for (long long i = (long long)gtid; i < total_vecs; i += total_threads) {
         out_v[i] = zero;
@@ -302,10 +312,11 @@ __global__ void quant_kernel_impl(
     int M,
     const __hip_bfloat16 *__restrict__ hidden_states,
     uint8_t *__restrict__ a_quant, uint8_t *__restrict__ a_scale,
-    __hip_bfloat16 *__restrict__ bf16_zero_out) {
+    __hip_bfloat16 *__restrict__ bf16_zero_out,
+    const __hip_bfloat16 *__restrict__ bf16_out_init = nullptr) {
     quant_impl<N_CTAS, THREADS_PER_CTA, D_HIDDEN>(blockIdx.x, M, hidden_states, a_quant, a_scale);
     if (bf16_zero_out != nullptr) {
-        zero_init_bf16_out_impl<D_HIDDEN, N_CTAS, THREADS_PER_CTA>(M, bf16_zero_out);
+        zero_init_bf16_out_impl<D_HIDDEN, N_CTAS, THREADS_PER_CTA>(M, bf16_zero_out, bf16_out_init);
     }
 }
 
@@ -322,7 +333,8 @@ __global__ void sort_quant_kernel_impl(
     int32_t *__restrict__ m_indices,
     __hip_bfloat16 *__restrict__ bf16_zero_out = nullptr,
     void *__restrict__ bf16_zero_workspace = nullptr,
-    long long workspace_bytes = 0) {
+    long long workspace_bytes = 0,
+    const __hip_bfloat16 *__restrict__ bf16_out_init = nullptr) {
     if (blockIdx.x == 0) {
         if constexpr (!kSkipSort) {
             sort_subkernel<NUM_EXPERTS, TOPK, M_PER_BLOCK, THREADS_PER_CTA>(topk_ids, topk_weight, sorted_token_ids,
@@ -334,7 +346,7 @@ __global__ void sort_quant_kernel_impl(
         quant_subkernel<N_CTAS - 1, THREADS_PER_CTA, D_HIDDEN>(hidden_states, a_quant, a_scale, M);
     }
     if (bf16_zero_out != nullptr) {
-        zero_init_bf16_out_impl<D_HIDDEN, N_CTAS, THREADS_PER_CTA>(M, bf16_zero_out);
+        zero_init_bf16_out_impl<D_HIDDEN, N_CTAS, THREADS_PER_CTA>(M, bf16_zero_out, bf16_out_init);
     }
     if (bf16_zero_workspace != nullptr && workspace_bytes > 0) {
         zero_init_bytes_impl<N_CTAS, THREADS_PER_CTA>(workspace_bytes, bf16_zero_workspace);
@@ -349,14 +361,15 @@ inline void launch(
     int32_t *reverse_sorted, float *sorted_weights,
     uint8_t *a_quant, uint8_t *a_scale,
     int32_t *m_indices,
-    __hip_bfloat16 *bf16_zero_out)
+    __hip_bfloat16 *bf16_zero_out,
+    const __hip_bfloat16 *bf16_out_init = nullptr)
 {
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA>
         <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
             M, hidden, topk_ids, topk_w,
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             a_quant, a_scale, m_indices,
-            bf16_zero_out);
+            bf16_zero_out, /*bf16_zero_workspace=*/nullptr, /*workspace_bytes=*/0, bf16_out_init);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA, bool FullGrid>
@@ -399,7 +412,8 @@ inline void launch_sort_only_with_zero_init(
     int32_t *m_indices,
     __hip_bfloat16 *bf16_zero_out,
     void *bf16_zero_workspace,
-    long long workspace_bytes)
+    long long workspace_bytes,
+    const __hip_bfloat16 *bf16_out_init = nullptr)
 {
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA, /*kSkipQuant=*/true>
         <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
@@ -407,7 +421,7 @@ inline void launch_sort_only_with_zero_init(
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             /*a_quant=*/nullptr, /*a_scale=*/nullptr,
             m_indices, bf16_zero_out,
-            bf16_zero_workspace, workspace_bytes);
+            bf16_zero_workspace, workspace_bytes, bf16_out_init);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int THREADS_PER_CTA>
@@ -460,10 +474,11 @@ inline void launch_quant(
     hipStream_t stream, int M,
     const __hip_bfloat16 *hidden,
     uint8_t *a_quant, uint8_t *a_scale,
-    __hip_bfloat16 *bf16_zero_out)
+    __hip_bfloat16 *bf16_zero_out,
+    const __hip_bfloat16 *bf16_out_init = nullptr)
 {
     quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA>
-        <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(M, hidden, a_quant, a_scale, bf16_zero_out);
+        <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(M, hidden, a_quant, a_scale, bf16_zero_out, bf16_out_init);
 }
 
 } // namespace aiter::mxfp4_moe::moe_sort_quant

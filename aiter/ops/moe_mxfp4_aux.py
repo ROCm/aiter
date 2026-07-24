@@ -18,6 +18,8 @@
 #              `inter_dim` convention. Not the expert count.)
 #   MB       = block_m (sort/gemm block size, ∈ {16, 32, 64, 128})
 
+from typing import Optional
+
 from torch import Tensor
 
 from ..jit.core import compile_ops
@@ -41,6 +43,7 @@ def mxfp4_moe_sort_quant(
     TOPK: int,
     D_HIDDEN: int,
     MB: int,
+    bf16_out_init: Optional[Tensor] = None,
 ) -> None: ...
 
 
@@ -63,6 +66,7 @@ def mxfp4_moe_sort(
     D_INTER: int,
     MB: int,
     prologue: int,
+    bf16_out_init: Optional[Tensor] = None,
 ) -> None: ...
 
 
@@ -76,6 +80,7 @@ def mxfp4_moe_quant(
     TOPK: int,
     D_HIDDEN: int,
     MB: int,
+    bf16_out_init: Optional[Tensor] = None,
 ) -> None: ...
 
 

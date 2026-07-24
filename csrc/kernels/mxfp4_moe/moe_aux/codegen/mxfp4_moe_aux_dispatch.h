@@ -38,7 +38,8 @@ using SortQuantFn = void (*)(
     void*          a_quant,
     void*          a_scale,
     int32_t*       m_indices,
-    void*          bf16_zero_ptr);
+    void*          bf16_zero_ptr,
+    const void*    bf16_out_init_ptr);
 
 using Sort3StageFn = void (*)(
     hipStream_t stream,
@@ -67,7 +68,8 @@ using SortOnlyZiFn = void (*)(
     int32_t*       m_indices,
     void*          bf16_zero_ptr,
     void*          bf16_zero_ws_ptr,
-    long long      workspace_bytes);
+    long long      workspace_bytes,
+    const void*    bf16_out_init_ptr);
 
 using SortOnlyFn = void (*)(
     hipStream_t stream,
@@ -87,7 +89,8 @@ using QuantFn = void (*)(
     const void*    a_input,
     void*          a_quant,
     void*          a_scale,
-    void*          bf16_zero_ptr);
+    void*          bf16_zero_ptr,
+    const void*    bf16_out_init_ptr);
 
 using SortScalesFn = void (*)(
     hipStream_t stream,
