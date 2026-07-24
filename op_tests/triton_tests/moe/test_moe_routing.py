@@ -10,7 +10,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
@@ -895,6 +895,141 @@ def test_routing_score_mode_grouped(
     assert tri_routing_data.n_expts_tot == n_expts_tot
     assert tri_routing_data.n_expts_act == n_expts_act
     assert tri_routing_data.block_m == block_m
+
+
+def _expert_map_reference(expt_scal, expt_indx, expert_map, n_local):
+    """Torch reference for the global->local remap: non-local experts (map < 0)
+    are dropped (zero weight) and redirected to local bucket 0; histogram sized
+    to n_local. Mirrors fused_routing_from_topk's expert_map semantics."""
+    local_ids = expert_map[expt_indx.long()]
+    invalid = local_ids < 0
+    ref_w = torch.where(invalid, torch.zeros_like(expt_scal), expt_scal).reshape(-1)
+    ref_l = (
+        torch.where(invalid, torch.zeros_like(local_ids), local_ids)
+        .reshape(-1)
+        .to(torch.int64)
+    )
+    ref_hist = torch.bincount(ref_l, minlength=n_local)[:n_local].to(torch.int32)
+    return ref_w, ref_l, ref_hist
+
+
+@pytest.mark.parametrize(
+    # n_tokens covers: tiny fused (<=16), decode fused (<=4096 NK), prefill
+    # torch fallback (>4096 NK). n_expts_act=8, n_expts_tot=256 -> DeepSeek-V4.
+    "n_tokens",
+    [8, 64, 1024],
+)
+@pytest.mark.parametrize("mode", ["flat", "sqrtsoftplus", "grouped"])
+def test_routing_expert_map(n_tokens, mode):
+    """Expert-parallel routing: expert_map remaps global->local ids, drops
+    non-local selections, and sizes the histogram to the local expert count."""
+    torch.manual_seed(0)
+    dev = "cuda"
+    n_expts_tot, n_expts_act = 256, 8
+    n_local = 32
+
+    logits = torch.randn(n_tokens, n_expts_tot, device=dev, dtype=torch.bfloat16)
+    bias = torch.randn(n_expts_tot, device=dev, dtype=torch.float32)
+
+    # global->local map over a shuffled subset (non-identity); rest -> -1.
+    expert_map = torch.full((n_expts_tot,), -1, dtype=torch.int32, device=dev)
+    perm = torch.randperm(n_expts_tot, device=dev)[:n_local]
+    expert_map[perm] = torch.arange(n_local, dtype=torch.int32, device=dev)
+
+    if mode == "flat":
+        gt_scal, gt_indx, _ = topk(
+            logits, n_expts_act, apply_softmax=True, HIST_BLOCK_M=32
+        )
+        routing_kw = {}
+    elif mode == "sqrtsoftplus":
+        gt_scal, gt_indx, _ = topk(
+            logits,
+            n_expts_act,
+            apply_softmax=False,
+            score_mode="sqrtsoftplus",
+            bias=bias,
+            renorm=True,
+            routed_scaling_factor=2.5,
+            HIST_BLOCK_M=32,
+        )
+        routing_kw = dict(
+            score_mode="sqrtsoftplus", bias=bias, renorm=True, routed_scaling_factor=2.5
+        )
+    else:  # grouped (DeepSeek-V4)
+        num_expert_group, topk_group = 8, 4
+        gt_scal, gt_indx, _ = grouped_topk(
+            logits,
+            n_expts_act,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            apply_softmax=False,
+            score_mode="sqrtsoftplus",
+            bias=bias,
+            renorm=True,
+            routed_scaling_factor=2.5,
+            HIST_BLOCK_M=32,
+        )
+        routing_kw = dict(
+            score_mode="sqrtsoftplus",
+            use_grouped_topk=True,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            bias=bias,
+            renorm=True,
+            routed_scaling_factor=2.5,
+        )
+
+    ref_w, ref_l, ref_hist = _expert_map_reference(
+        gt_scal, gt_indx, expert_map, n_local
+    )
+    n_gates = ref_w.numel()
+
+    rdata, gather, scatter = routing(
+        logits,
+        n_expts_act,
+        expert_map=expert_map,
+        local_num_experts=n_local,
+        **routing_kw,
+    )
+    gather, scatter = gather.long(), scatter.long()
+
+    # local sizing
+    assert rdata.n_expts_tot == n_local
+    assert int(rdata.expt_hist.sum()) == n_gates
+    assert_equal(ref_hist, rdata.expt_hist)
+
+    # gather/scatter form a valid inverse permutation pair
+    ar = torch.arange(n_gates, device=dev)
+    assert torch.equal(gather.sort().values, ar)
+    assert torch.equal(scatter[gather], ar)
+
+    # gate_scal is the reference weights in expert-sorted (gather) order
+    assert_close(ref_w[gather], rdata.gate_scal, maxtol=1e-3, rmstol=1e-3)
+
+    # gathered tokens are grouped by local expert id
+    sorted_local = ref_l[gather]
+    assert torch.equal(sorted_local, sorted_local.sort().values)
+
+    # token_offs_raw is the exclusive prefix-sum of the local histogram
+    exp_raw = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64, device=dev),
+            rdata.expt_hist.to(torch.int64).cumsum(0),
+        ]
+    )
+    assert torch.equal(rdata.expt_data.token_offs_raw.to(torch.int64), exp_raw)
+
+
+def test_routing_expert_map_derives_local_count():
+    """When local_num_experts is omitted it is derived from expert_map.max()+1."""
+    torch.manual_seed(0)
+    dev = "cuda"
+    n_expts_tot, n_expts_act, n_local = 256, 8, 32
+    logits = torch.randn(64, n_expts_tot, device=dev, dtype=torch.bfloat16)
+    expert_map = torch.full((n_expts_tot,), -1, dtype=torch.int32, device=dev)
+    expert_map[:n_local] = torch.arange(n_local, dtype=torch.int32, device=dev)
+    rdata, _, _ = routing(logits, n_expts_act, expert_map=expert_map)
+    assert rdata.n_expts_tot == n_local
 
 
 def bench_routing():
