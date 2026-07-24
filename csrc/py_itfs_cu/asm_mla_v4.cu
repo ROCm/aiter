@@ -42,10 +42,6 @@
 // RuntimeError in Python instead of aborting the worker process.
 AITER_CTYPES_ERROR_DEF
 
-#ifndef EN_MLA_V4_KERNARG_PRELOAD
-#define EN_MLA_V4_KERNARG_PRELOAD 1
-#endif
-
 struct __attribute__((packed)) MlaV4KernelArgsLegacy
 {
     void* ptr_R;
@@ -91,30 +87,6 @@ struct __attribute__((packed)) MlaV4KernelArgsLegacy
     unsigned int s_use_valid_split;
     p3 _p_uvs; // 20 (0x140)
 };
-
-#if EN_MLA_V4_KERNARG_PRELOAD
-struct __attribute__((packed)) MlaV4KernelArgsPreload
-{
-    void* ptr_R;                    // 0x00  preload  splitData (logits) [FP32] (rw)
-    void* ptr_Q;                    // 0x08  preload  Q packed FP8 + e8m0 scale
-    void* ptr_KV;                   // 0x10  preload  KV packed FP8
-    void* ptr_LTP;                  // 0x18  preload  kv_indptr
-    void* ptr_LTL;                  // 0x20  preload  kv_last_page_lens
-    void* ptr_QTP;                  // 0x28  preload  qo_indptr
-    void* ptr_QROPE;                // 0x30  preload  Q rope BF16
-    void* ptr_KVROPE;               // 0x38  preload  KV rope BF16
-    float scalar_f;                 // 0x40  preload  1.0f/sqrtf(kV4DimNope+kV4DimRope)
-    unsigned int s_gqa_ratio;       // 0x44  preload  q_seq_lens (MQA = gqa*max_seqlen_q)
-    unsigned int s_kv_split;        // 0x48  preload  num_kv_splits == passes
-    unsigned int s_total_kv;        // 0x4C  preload  kv_seq_lens * num_seqs
-    unsigned int out_16_nosplit;    // 0x50  preload  0 = fp32 split, 1 = bf16 nosplit
-    void* ptr_LSE;                  // 0x54  tail     splitLse (attn_lse) [FP32] (rw)
-    void* ptr_LTD;                  // 0x5C  tail     kv_page_indices
-    void* ptr_valid_split;          // 0x64  tail     [num_seqs] i32 scratch (rw)
-    unsigned int s_use_valid_split; // 0x6C  tail     gates the valid_split write
-    void* ptr_sink;                 // 0x70  tail     [num_heads] FP32 attention sink logit
-};
-#endif
 
 // ----------------------------------------------------------------------------
 // kV4DimNope + kV4DimRope = 448 + 64 = 512. The kernel hardcodes
@@ -290,42 +262,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         a.scalar_f    = scalar_f;
         a.s_gqa_ratio = static_cast<unsigned int>(gqa_ratio);
         a.s_kv_split  = static_cast<unsigned int>(num_kv_splits);
-        // a.s_total_kv     left as 0 here — set per-arch in fill_gfx1250_kargs below.
+        // a.s_total_kv left as 0 here (default zero-init); the non-gfx1250
+        // legacy .co derives its KV extent from the indptr tables instead.
         a.ptr_QTP        = qo_indptr->data_ptr();
         a.out_16_nosplit = out_16_nosplit_derived;
         a.ptr_QROPE      = qrope->data_ptr();
         a.ptr_KVROPE     = kvrope->data_ptr();
         a.ptr_sink       = sink->data_ptr();
-    };
-
-    // gfx1250-specific overrides (shared by both legacy-on-gfx1250 and the
-    // compact preload ABI): s_gqa_ratio carries the flattened MQA, s_total_kv
-    // is real, and the valid_split scratch (slot 19/20) is validated+forwarded.
-    auto fill_gfx1250_kargs = [&](auto& a) {
-        a.s_gqa_ratio = static_cast<unsigned int>(gqa_ratio * max_seqlen_q);
-        a.s_total_kv  = static_cast<unsigned int>(KV->size(0) * page_size);
-        if(use_valid_split_count_reduce != 0)
-        {
-            AITER_CHECK(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr,
-                        __func__,
-                        ": gfx1250 requires valid_split_count scratch tensor when "
-                        "use_valid_split_count_reduce!=0");
-        }
-        if(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr)
-        {
-            AITER_CHECK(valid_split_count->dtype() == AITER_DTYPE_i32,
-                        __func__,
-                        ": valid_split_count must be int32");
-            AITER_CHECK(valid_split_count->size(0) >= num_seqs,
-                        __func__,
-                        ": valid_split_count must have at least num_seqs entries");
-            a.ptr_valid_split = valid_split_count->data_ptr();
-        }
-        else
-        {
-            a.ptr_valid_split = nullptr;
-        }
-        a.s_use_valid_split = (use_valid_split_count_reduce != 0) ? 1u : 0u;
     };
 
     // dtype dispatch
@@ -407,90 +350,54 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     // the heuristic above — this remap only picks which CSV row (== which .co)
     // to load.
     const std::string arch_id = get_gpu_arch();
-    const bool is_gfx1250     = (arch_id == "gfx1250");
-    int csv_gqa               = gqa_ratio;
-    int csv_qseqlen           = config_max_seqlen_q;
-    if(!is_gfx1250)
+    // gfx1250 v4 nm is launched directly from Python via the .co launcher
+    // (aiter/ops/asm/mla_decode_v4.py, routed by aiter/mla.py); this C++
+    // dispatcher intentionally no longer supports it. Fail loudly rather than
+    // silently packing the wrong (legacy) kernarg ABI for a gfx1250 caller.
+    AITER_CHECK(arch_id != "gfx1250",
+                __func__,
+                ": gfx1250 v4 nm is handled by the Python .co launcher "
+                "(aiter/ops/asm/mla_decode_v4.py); this C++ dispatcher does not "
+                "support gfx1250");
+    int csv_gqa     = gqa_ratio;
+    int csv_qseqlen = config_max_seqlen_q;
+    // `supported` (fp8-gated, set in the sub_Q block above) drives BOTH the
+    // (sub_Q, config) setup AND this CSV lookup-key normalization, so the two
+    // can never disagree -- every whitelisted (gqa, msq) pair maps to the
+    // single shipped (Gqa=64, qSeqLen=1) row. NOTE: an intermediate change
+    // had narrowed this to only (gqa16,msq4)/(gqa64|128,msq1), which dropped
+    // the gqa16+msq{1,2} and gqa32+msq1 entry points -- they hit "cannot find
+    // suitable kernel" even though the qh64 .co serves them and the sub_Q
+    // block still whitelists them (see test_v4_nm_gqa16_qseqlen1_*).
+    if(supported)
     {
-        // `supported` (fp8-gated, set in the sub_Q block above) drives BOTH the
-        // (sub_Q, config) setup AND this CSV lookup-key normalization, so the two
-        // can never disagree -- every whitelisted (gqa, msq) pair maps to the
-        // single shipped (Gqa=64, qSeqLen=1) row. NOTE: an intermediate change
-        // had narrowed this to only (gqa16,msq4)/(gqa64|128,msq1), which dropped
-        // the gqa16+msq{1,2} and gqa32+msq1 entry points -- they hit "cannot find
-        // suitable kernel" even though the qh64 .co serves them and the sub_Q
-        // block still whitelists them (see test_v4_nm_gqa16_qseqlen1_*).
-        if(supported)
-        {
-            csv_gqa     = 64;
-            csv_qseqlen = 1;
-        }
-    }
-    else
-    {
-        // shared kernel mla_a8w8_qh64_1tg_16mx4_64nx1_sparse
-        if(q_type == "fp8" && kv_type == "fp8" &&
-           ((gqa_ratio == 64 || gqa_ratio == 128) && config_max_seqlen_q == 1))
-        {
-            csv_gqa     = 64;
-            csv_qseqlen = 1;
-        }
+        csv_gqa     = 64;
+        csv_qseqlen = 1;
     }
 
     const int block_dim = 4 * static_cast<int>(get_warp_size_func());
 
-#if EN_MLA_V4_KERNARG_PRELOAD
-    const bool use_preload = is_gfx1250;
-#else
-    const bool use_preload = false;
-#endif
-
     MlaV4KernelArgsLegacy args_legacy = {};
-#if EN_MLA_V4_KERNARG_PRELOAD
-    MlaV4KernelArgsPreload args_preload = {};
-#endif
-    void* arg_buf   = nullptr;
-    size_t arg_size = 0;
-
-    if(use_preload)
+    fill_common_kargs(args_legacy);
+    args_legacy.s_log2_page = log2_page;
+    args_legacy.ptr_STP     = split_indptr->data_ptr();
+    if(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr)
     {
-#if EN_MLA_V4_KERNARG_PRELOAD
-        fill_common_kargs(args_preload);
-        fill_gfx1250_kargs(args_preload);
-        arg_buf  = &args_preload;
-        arg_size = sizeof(args_preload);
-#endif
+        AITER_CHECK(valid_split_count->dtype() == AITER_DTYPE_i32,
+                    __func__,
+                    ": valid_split_count must be int32");
+        AITER_CHECK(valid_split_count->size(0) >= num_seqs,
+                    __func__,
+                    ": valid_split_count must have at least num_seqs entries");
+        args_legacy.ptr_valid_split = valid_split_count->data_ptr();
     }
     else
     {
-        fill_common_kargs(args_legacy);
-        args_legacy.s_log2_page = log2_page;
-        args_legacy.ptr_STP     = split_indptr->data_ptr();
-        if(is_gfx1250)
-        {
-            fill_gfx1250_kargs(args_legacy);
-        }
-        else
-        {
-            if(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr)
-            {
-                AITER_CHECK(valid_split_count->dtype() == AITER_DTYPE_i32,
-                            __func__,
-                            ": valid_split_count must be int32");
-                AITER_CHECK(valid_split_count->size(0) >= num_seqs,
-                            __func__,
-                            ": valid_split_count must have at least num_seqs entries");
-                args_legacy.ptr_valid_split = valid_split_count->data_ptr();
-            }
-            else
-            {
-                args_legacy.ptr_valid_split = nullptr;
-            }
-            args_legacy.s_use_valid_split = (use_valid_split_count_reduce != 0) ? 1u : 0u;
-        }
-        arg_buf  = &args_legacy;
-        arg_size = sizeof(args_legacy);
+        args_legacy.ptr_valid_split = nullptr;
     }
+    args_legacy.s_use_valid_split = (use_valid_split_count_reduce != 0) ? 1u : 0u;
+    void* arg_buf                 = &args_legacy;
+    size_t arg_size               = sizeof(args_legacy);
 
     CFG* config_map = &cfg_mla_v4_asm;
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
