@@ -182,7 +182,7 @@ def compile_gemm_a8w8_blockscale(
     variant: str = "compute_bound",
     N: int = 0,
     use_tdm_store: bool = False,
-    loop_carried_load_percent: Optional[int] = None,
+    loop_carried_load_percent: int | None = None,
     kernarg_preload: bool = False,
     split_k: int = 1,
 ):
