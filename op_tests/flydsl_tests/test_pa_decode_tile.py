@@ -8,10 +8,11 @@ import importlib
 import inspect
 import itertools
 
-import aiter
 import pandas as pd
 import pytest
 import torch
+
+import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.attention import pa_decode_gluon as public_pa_decode
