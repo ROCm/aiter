@@ -165,7 +165,6 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
         )
 
 
-@functools.lru_cache(maxsize=32)
 def _get_opus_workspace(device: torch.device, ws_elems: int) -> torch.Tensor:
     """Cached workspace allocation for opus split-K.
 
