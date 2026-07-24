@@ -105,7 +105,7 @@ def _gemm_afp4wfp4_kernel(
 
     blocked_scales: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[4, 1],
-        threads_per_warp=[8, 8],
+        threads_per_warp=[64, 1],
         warps_per_cta=[1, num_warps],
         order=[0, 1],
     )
