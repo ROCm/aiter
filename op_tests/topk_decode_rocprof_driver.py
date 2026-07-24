@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Drive kernel-only rocprofv3 traces for current decode top-k kernels.
 
 For every (kernel, k, L) cell this launches a fresh process under

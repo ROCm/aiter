@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 r"""Poison-tail correctness checker for the FlyDSL K=512 decode TopK kernel.
 
 Runs the FlyDSL unordered (set-output) path for one or more shapes and compares

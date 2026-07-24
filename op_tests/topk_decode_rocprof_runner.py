@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Standalone single-kernel runner for kernel-only rocprofv3 tracing.
 
 Runs exactly ONE top_k_per_row_decode implementation for ONE shape so that a
