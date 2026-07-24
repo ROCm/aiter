@@ -32,6 +32,10 @@ namespace py = pybind11;
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .export_values();                                                                   \
+    pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
+        .value("V32", MlaVersion::V32)                                                      \
+        .value("V40", MlaVersion::V40)                                                      \
+        .export_values();                                                                   \
     pybind11::enum_<aiter::MxScaleRoundMode>(m, "MxScaleRoundMode")                         \
         .value("RoundDown", aiter::MxScaleRoundMode::RoundDown)                             \
         .value("RoundUp", aiter::MxScaleRoundMode::RoundUp)                                 \
@@ -45,6 +49,7 @@ namespace py = pybind11;
         .export_values();                                                                   \
     pybind11::implicitly_convertible<int, QuantType>();                                     \
     pybind11::implicitly_convertible<int, ActivationType>();                                \
+    pybind11::implicitly_convertible<int, MlaVersion>();                                    \
     pybind11::implicitly_convertible<int, aiter::MxScaleRoundMode>();                       \
     pybind11::implicitly_convertible<int, aiter::MxDtype>();                                \
     m.attr("kDefaultMxScaleRoundMode") = static_cast<int>(aiter::kDefaultMxScaleRoundMode); \
@@ -1441,15 +1446,21 @@ namespace py = pybind11;
           py::arg("out"),                              \
           py::arg("softmax_scale"));
 
-#define FMHA_FWD_HD128_BF16_OPUS_PYBIND                             \
-    m.def("fmha_fwd_hd128_bf16_opus_fwd",                          \
-          &fmha_fwd_hd128_bf16_opus_fwd,                           \
-          py::arg("q"),                            \
-          py::arg("k"),                            \
-          py::arg("v"),                            \
-          py::arg("out"),                          \
-          py::arg("causal"),                       \
-          py::arg("softmax_scale"));
+#define FMHA_FWD_BF16_OPUS_PYBIND                                  \
+    m.def("fmha_fwd_bf16_opus_fwd",                                \
+          &fmha_fwd_bf16_opus_fwd,                                 \
+          py::arg("q"),                                            \
+          py::arg("k"),                                            \
+          py::arg("v"),                                            \
+          py::arg("out"),                                          \
+          py::arg("causal"),                                       \
+          py::arg("softmax_scale"),                                \
+          py::arg("seqstart_q")     = std::nullopt,                \
+          py::arg("seqstart_k")     = std::nullopt,                \
+          py::arg("seqstart_q_pad") = std::nullopt,                \
+          py::arg("seqstart_k_pad") = std::nullopt,                \
+          py::arg("max_seqlen_q")   = 0,                           \
+          py::arg("max_seqlen_k")   = 0);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
@@ -1924,7 +1935,8 @@ namespace py = pybind11;
             py::arg("q_rope_buff")       = std::nullopt,                                \
             py::arg("swa_nope_scale_buff") = std::nullopt,                              \
             py::arg("swa_rope_buff")     = std::nullopt,                                \
-            py::arg("state_slot_mapping") = std::nullopt,                               \
+            py::arg("swa_block_tables")   = std::nullopt,                               \
+            py::arg("swa_block_size")     = 0,                                          \
             py::arg("batch_id_per_token") = std::nullopt);                              \
     m.def("fused_kv_norm_rope_group_quant",                                             \
             &aiter::fused_kv_norm_rope_group_quant,                                     \
@@ -2088,11 +2100,6 @@ namespace py = pybind11;
           py::arg("stride0"));
 
 #define MLA_METADATA_PYBIND                               \
-    pybind11::enum_<MlaVersion>(m, "MlaVersion")          \
-        .value("V32", MlaVersion::V32)                    \
-        .value("V40", MlaVersion::V40)                    \
-        .export_values();                                 \
-    pybind11::implicitly_convertible<int, MlaVersion>();  \
     m.def("get_mla_metadata_v1",                          \
           &get_mla_metadata_v1,                           \
           "get_mla_metadata_v1",                          \
@@ -2236,18 +2243,27 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND               \
-    m.def("gated_rmsnorm_fp8_group_quant",       \
-          &aiter::gated_rmsnorm_fp8_group_quant, \
-          py::arg("out"),                        \
-          py::arg("scale"),                      \
-          py::arg("x"),                          \
-          py::arg("z"),                          \
-          py::arg("weight"),                     \
-          py::arg("epsilon"),                    \
-          py::arg("group_size"),                 \
-          py::arg("transpose_scale") = false,    \
-          "Fused Gated RMSNorm + FP8 Group Quantization");
+#define GATED_RMSNORM_QUANT_PYBIND                   \
+    m.def("gated_rmsnorm_fp8_group_quant",           \
+          &aiter::gated_rmsnorm_fp8_group_quant,     \
+          py::arg("out"),                            \
+          py::arg("scale"),                          \
+          py::arg("x"),                              \
+          py::arg("z"),                              \
+          py::arg("weight"),                         \
+          py::arg("epsilon"),                        \
+          py::arg("group_size"),                     \
+          py::arg("transpose_scale") = false,        \
+          "Fused Gated RMSNorm + FP8 Group Quantization"); \
+    m.def("gated_rmsnorm_fp8_per_token_quant",       \
+          &aiter::gated_rmsnorm_fp8_per_token_quant, \
+          py::arg("out"),                            \
+          py::arg("scale"),                          \
+          py::arg("x"),                              \
+          py::arg("z"),                              \
+          py::arg("weight"),                         \
+          py::arg("epsilon"),                        \
+          "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                              \
     m.def("mhc_pre_gemm_sqrsum",                \
@@ -2341,6 +2357,7 @@ namespace py = pybind11;
           py::arg("g"),                             \
           py::arg("gk"),                            \
           py::arg("initial_state"),                 \
+          py::arg("initial_state_indices"),         \
           py::arg("cu_seqlens"),                    \
           py::arg("chunk_offsets"),                 \
           py::arg("h"),                             \

@@ -327,3 +327,217 @@ if __name__ == "__main__":
         aiter.logger.info(
             "gated_rmsnorm_fp8_group_quant summary (markdown):\n%s", df_md
         )
+
+
+# ---------------------------------------------------------------------------
+# Appended: FP8 PER-TOKEN quantization variant.
+#
+# Same fused gated-RMSNorm math as the group path above, but produces ONE scale
+# per token across the full flattened row (pairs with a per-output-channel
+# weight-scale a8w8 GEMM). Reuses the `silu` helper defined above.
+# ---------------------------------------------------------------------------
+
+
+def gated_rmsnorm_fp8_per_token_quant_reference_impl(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    quant_dtype,
+):
+    """Reference that matches the fused HIP kernel math and per-token quant path."""
+    if quant_dtype == torch.float8_e4m3fnuz:
+        fp8_max = 240.0
+    elif quant_dtype == torch.float8_e4m3fn:
+        fp8_max = 448.0
+    else:
+        raise ValueError(f"Unsupported FP8 dtype for this test: {quant_dtype}")
+
+    num_tokens = x.shape[0]
+
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    inv_std = torch.rsqrt(variance + eps)
+    normed = x.float() * inv_std
+    normed = normed * weight.float().view(1, 1, -1)
+
+    gated = normed * silu(z.float())  # [num_tokens, num_heads, head_dim]
+    flat = gated.reshape(num_tokens, -1)  # [num_tokens, num_heads*head_dim]
+
+    # One scale per token across the whole row.
+    scales = flat.abs().amax(dim=-1) / fp8_max  # [num_tokens]
+    scales = torch.maximum(scales, torch.full_like(scales, 1e-10))
+
+    out_quant = torch.clamp(flat / scales.unsqueeze(-1), -fp8_max, fp8_max).to(
+        quant_dtype
+    )
+    return out_quant, scales
+
+
+@perftest()
+def run_reference(x, z, weight, eps, quant_dtype):
+    return gated_rmsnorm_fp8_per_token_quant_reference_impl(
+        x, z, weight, eps, quant_dtype
+    )
+
+
+@perftest()
+def run_hip(x, z, weight, eps, quant_dtype):
+    from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
+        gated_rmsnorm_fp8_per_token_quant,
+    )
+
+    num_tokens, num_heads, head_dim = x.shape
+    out_quant = torch.empty(
+        num_tokens, num_heads * head_dim, dtype=quant_dtype, device=x.device
+    )
+    scales = torch.empty((num_tokens,), dtype=torch.float32, device=x.device)
+
+    gated_rmsnorm_fp8_per_token_quant(out_quant, scales, x, z, weight, eps)
+    return out_quant, scales
+
+
+def calculate_bandwidth_per_token(num_tokens, num_heads, head_dim, time_us):
+    read_x = num_tokens * num_heads * head_dim * 2  # bf16
+    read_z = num_tokens * num_heads * head_dim * 2  # bf16
+    read_weight = head_dim * 2  # bf16 (broadcast)
+    write_out = num_tokens * num_heads * head_dim * 1  # fp8
+    write_scales = num_tokens * 4  # fp32, one per token
+    total_bytes = read_x + read_z + read_weight + write_out + write_scales
+    return (total_bytes / (time_us * 1e-6)) / 1e9
+
+
+def test_gated_rmsnorm_fp8_per_token_quant(
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    eps: float = 1e-6,
+    quant_dtype=dtypes.fp8,
+):
+    torch.manual_seed(42)
+    device = "cuda"
+
+    assert head_dim == 128, f"ONLY head_dim=128 is supported, got {head_dim}"
+    assert num_heads <= 128, f"ONLY num_heads <= 128 is supported, got {num_heads}"
+
+    x = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    z = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype, device=device)
+    weight = torch.randn(head_dim, dtype=dtype, device=device)
+
+    print(f"\n{'='*80}")
+    print("Test Configuration:")
+    print(f"  Shape: [{num_tokens}, {num_heads}, {head_dim}]")
+    print(f"  dtype: {dtype}, quant_dtype: {quant_dtype}, eps: {eps}")
+    print(f"{'='*80}")
+
+    (ref_quant, ref_scales), ref_time = run_reference(
+        x.clone(), z.clone(), weight, eps, quant_dtype
+    )
+    (hip_quant, hip_scales), hip_time = run_hip(
+        x.clone(), z.clone(), weight, eps, quant_dtype
+    )
+
+    ref_bw = calculate_bandwidth_per_token(num_tokens, num_heads, head_dim, ref_time)
+    hip_bw = calculate_bandwidth_per_token(num_tokens, num_heads, head_dim, hip_time)
+
+    print("\nPerformance:")
+    print(f"  Reference time: {ref_time:.2f} us  ({ref_bw:.2f} GB/s)")
+    print(f"  HIP kernel time: {hip_time:.2f} us  ({hip_bw:.2f} GB/s)")
+    print(f"  Speedup: {ref_time / hip_time:.2f}x")
+
+    assert (
+        ref_quant.shape == hip_quant.shape
+    ), f"Shape mismatch: ref={ref_quant.shape} vs hip={hip_quant.shape}"
+    assert (
+        ref_scales.shape == hip_scales.shape
+    ), f"Scale shape mismatch: ref={ref_scales.shape} vs hip={hip_scales.shape}"
+
+    # Dequantized comparison (scale broadcast per token across the whole row).
+    ref_dequant = ref_quant.float() * ref_scales[:, None]
+    hip_dequant = hip_quant.float() * hip_scales[:, None]
+    checkAllclose(
+        ref_dequant, hip_dequant, rtol=1e-2, atol=1e-2, msg="Dequantized values"
+    )
+
+    print("\nScale comparison:")
+    checkAllclose(
+        ref_scales.float(), hip_scales.float(), rtol=1e-3, atol=1e-3, msg="Scales"
+    )
+
+    print(f"\n{'='*80}\nTest PASSED!\n{'='*80}\n")
+
+    return {
+        "num_tokens": num_tokens,
+        "num_heads": num_heads,
+        "ref_time_us": ref_time,
+        "hip_time_us": hip_time,
+        "ref_bw_gbs": ref_bw,
+        "hip_bw_gbs": hip_bw,
+        "speedup": ref_time / hip_time,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Test HIP kernel for gated RMSNorm + FP8 per-token quant"
+    )
+    parser.add_argument("--num_tokens", type=int, default=None)
+    parser.add_argument("--num_heads", type=int, default=None)
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
+    args = parser.parse_args()
+
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+    # Match the rest of aiter's op_tests (test_quant / test_gemm_a8w8 /
+    # test_fused_qk_rmsnorm_per_token_quant): the FP8 format is always the
+    # GPU-native one (dtypes.fp8 -> gfx942 e4m3fnuz, otherwise OCP e4m3fn),
+    # which is exactly what the kernel quantizes against via opus::fp8_t.
+    quant_dtypes = [dtypes.fp8]
+
+    if args.num_tokens is not None and args.num_heads is not None:
+        test_configs = [(args.num_tokens, args.num_heads, 128)]
+    else:
+        test_configs = [
+            # (num_tokens, num_heads, head_dim) -- num_heads spans TP/DP variants
+            (128, 32, 128),
+            (256, 32, 128),
+            (512, 32, 128),
+            (1024, 32, 128),
+            (2048, 32, 128),
+            (4096, 32, 128),
+            (8192, 32, 128),
+            (1024, 16, 128),
+            (1024, 64, 128),
+            (2048, 16, 128),
+            (2048, 64, 128),
+            # --- edge cases the original matrix missed ---
+            (1, 32, 128),  # single token (decode min)
+            (3, 32, 128),  # tiny odd token count
+            (1024, 1, 128),  # single head
+            (1024, 12, 128),  # partial warp (12 heads, groups_per_warp=8)
+            (1024, 40, 128),  # partial warp spanning >1 warp/token
+            (2048, 128, 128),  # max heads (16 warps/token)
+        ]
+
+    print("\n" + "=" * 80)
+    print("BENCHMARK - Gated RMSNorm + FP8 Per-Token Quantization HIP Kernel")
+    print(f"  quant_dtypes: {[str(q) for q in quant_dtypes]}")
+    print("=" * 80)
+
+    results = []
+    for quant_dtype in quant_dtypes:
+        for num_tokens, num_heads, head_dim in test_configs:
+            r = test_gated_rmsnorm_fp8_per_token_quant(
+                num_tokens=num_tokens,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                quant_dtype=quant_dtype,
+            )
+            r["quant_dtype"] = str(quant_dtype)
+            results.append(r)
+
+    df = pd.DataFrame(results)
+    aiter.logger.info(
+        "gated_rmsnorm_fp8_per_token_quant summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )

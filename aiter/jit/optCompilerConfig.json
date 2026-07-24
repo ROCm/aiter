@@ -612,10 +612,10 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py --working_path {{}}'"
     },
-    "module_fmha_fwd_hd128_bf16_opus": {
+    "module_fmha_fwd_bf16_opus": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_fwd_hd128_bf16_opus_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/fmha_fwd_hd128_bf16_opus_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_fwd_bf16_opus_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/fmha_fwd_bf16_opus_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
