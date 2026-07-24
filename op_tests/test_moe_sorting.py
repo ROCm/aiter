@@ -201,7 +201,14 @@ def test_moe_sorting(
     has_expert_mask=False,
     padding_extra=0,
     dispatch_policy=0,
+    accumulate=True,
 ):
+    """accumulate=False (with has_expert_mask=False) makes moe_sorting allocate
+    a (0,0) moe_buf placeholder instead of the full [M, model_dim] buffer --
+    useful for isolating moe_buf-zeroing cost (which scales with the static
+    padded capacity M) from the mesh-scan work (which should NOT scale with M
+    once tokens_ correctly bounds it) when comparing padding_extra=0 vs >0.
+    """
     topk_ids, topk_weights, expert_mask, num_local_tokens = _build_moe_sorting_inputs(
         token,
         model_dim,
@@ -232,6 +239,7 @@ def test_moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
+            accumulate=accumulate,
         ),
         "ck": lambda: moe_sorting(
             topk_ids,
@@ -243,6 +251,7 @@ def test_moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
+            accumulate=accumulate,
         ),
     }
     # FlyDSL kernel only supports dispatch_policy=0 today.
@@ -257,6 +266,7 @@ def test_moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
+            accumulate=accumulate,
         )
 
     flops, nbytes = _moe_sorting_roofline(token, topk, E, model_dim, dtype)
@@ -288,6 +298,189 @@ def test_moe_sorting(
             f"padding_extra={padding_extra}, dispatch_policy={dispatch_policy}: "
             f"{failures}"
         )
+    return ret
+
+
+def test_moe_sorting_flydsl_cuda_graph_capture(
+    dtype,
+    token,
+    model_dim,
+    E,
+    topk,
+    has_expert_mask=False,
+):
+    """Capture moe_sorting (FlyDSL backend) under a real torch.cuda.graph(),
+    then replay with a DIFFERENT num_local_tokens tensor value than was
+    captured. Regression test for the .item() capture-safety fix: reading
+    num_local_tokens on the host during capture used to raise
+    'operation not permitted when stream is capturing'; and even a naive
+    host-side guard would still bake a stale capture-time count into the
+    graph. This asserts real dynamic behavior survives across replay.
+    """
+    if not is_flydsl_available():
+        aiter.logger.warning("flydsl unavailable; skipping cuda-graph capture test")
+        return
+
+    set_moe_sorting_backend("flydsl")
+
+    capture_tokens = token
+    replay_tokens = max(1, token // 2)  # a different dynamic count at replay time
+    padding_extra = token  # topk_ids capacity must cover the larger of the two
+
+    topk_ids, topk_weights, expert_mask, num_local_tokens = _build_moe_sorting_inputs(
+        capture_tokens,
+        model_dim,
+        E,
+        topk,
+        dtype,
+        has_expert_mask,
+        padding_extra,
+    )
+    assert isinstance(num_local_tokens, torch.Tensor)
+
+    def run():
+        return moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+            BLOCK_SIZE_M,
+            expert_mask,
+            num_local_tokens,
+        )
+
+    # Warm-up on a side stream (standard torch.cuda.graph() prerequisite):
+    # populates the FlyDSL JIT cache before capture, since compiling a new
+    # kernel variant mid-capture is itself capture-unsafe.
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    num_local_tokens.fill_(capture_tokens)
+    with torch.cuda.graph(graph):
+        out = run()
+    torch.cuda.synchronize()
+
+    # Replay with a different dynamic token count -- the num_local_tokens
+    # buffer is captured by reference, so mutating its contents (not the
+    # tensor object) is what a real decode step would do between replays.
+    num_local_tokens.fill_(replay_tokens)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref = run_torch_moe_sorting(
+        topk_ids,
+        topk_weights,
+        E,
+        BLOCK_SIZE_M,
+        expert_mask,
+        num_local_tokens,
+    )
+    # num_rows here must be the static padded capacity (topk_ids.shape[0]),
+    # matching run_torch_moe_sorting's sentinel (topk << 24 | m) -- NOT the
+    # dynamic replay_tokens count.
+    errs = _compare_moe_sorting_outputs(ref, out, topk, topk_ids.shape[0])
+    bad = {k: v for k, v in errs.items() if v}
+    assert not bad, (
+        f"moe_sorting cuda-graph replay mismatch (captured token={capture_tokens}, "
+        f"replayed token={replay_tokens}, E={E}, topk={topk}, "
+        f"has_expert_mask={has_expert_mask}): {bad}"
+    )
+
+
+def test_moe_sorting_decode_graph_perf(
+    dtype,
+    capture_capacity,
+    model_dim,
+    E,
+    topk,
+    real_tokens,
+    has_expert_mask=False,
+    num_iters=50,
+):
+    """Benchmark steady-state torch.cuda.graph() REPLAY latency
+
+    This is what actual decode looks like: the graph is captured once per
+    bucket, then replayed every step with whatever the real dynamic count
+    happens to be that step
+    """
+    real_tokens = min(real_tokens, capture_capacity)
+    topk_ids, topk_weights, expert_mask, num_local_tokens = _build_moe_sorting_inputs(
+        capture_capacity,
+        model_dim,
+        E,
+        topk,
+        dtype,
+        has_expert_mask,
+        padding_extra=0,  # capture_capacity IS the static M; no extra slack
+    )
+    if num_local_tokens is None:
+        num_local_tokens = torch.tensor(
+            [capture_capacity], dtype=topk_ids.dtype, device="cuda"
+        )
+
+    ret = {
+        "gfx": get_gfx(),
+        "E": E,
+        "topk": topk,
+        "has_expert_mask": has_expert_mask,
+        "capture_capacity": capture_capacity,
+        "real_tokens": real_tokens,
+    }
+    backends = ["opus", "ck"] + (["flydsl"] if is_flydsl_available() else [])
+    for name in backends:
+        set_moe_sorting_backend(name)
+
+        def run():
+            return moe_sorting(
+                topk_ids,
+                topk_weights,
+                E,
+                model_dim,
+                dtype,
+                BLOCK_SIZE_M,
+                expert_mask,
+                num_local_tokens,
+            )
+
+        # Warm-up on a side stream: populates any JIT cache before capture,
+        # since compiling mid-capture is itself capture-unsafe.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        torch.cuda.synchronize()
+
+        # Set the REAL per-step token count, then time steady-state replay.
+        num_local_tokens.fill_(real_tokens)
+        for _ in range(5):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(num_iters):
+            graph.replay()
+        end_event.record()
+        end_event.synchronize()
+        us = start_event.elapsed_time(end_event) * 1000 / num_iters
+
+        ret[f"{name} us"] = us
+
     return ret
 
 
@@ -371,6 +564,28 @@ def main():
         default=[True, False],
         help="Expert mask.\n    e.g.: -em f",
     )
+    parser.add_argument(
+        "-accum",
+        "--accumulate",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[True],
+        help="Stage2 accumulate mode (False + no expert_mask allocates a (0,0) "
+        "moe_buf placeholder instead of the full [M, model_dim] buffer -- "
+        "isolates moe_buf-zeroing cost from mesh-scan work).\n    e.g.: -accum f",
+    )
+    parser.add_argument(
+        "-dg",
+        "--decode_graph",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Real per-step token counts for a cuda-graph capture/replay decode "
+        "benchmark (typical decode batch sizes: 1 2 4 8 16 32 64 128). Each is "
+        "run against every -m value as the captured static capacity (real "
+        "tokens capped to the capacity). Omit to skip this benchmark.\n"
+        "    e.g.: -dg 1 2 4 8 16 32 64 128",
+    )
     args = parser.parse_args()
 
     if len(args.expert) != len(args.topk):
@@ -380,11 +595,14 @@ def main():
 
     for dtype in args.dtype:
         df = []
-        for padding_extra, expert_mask, dispatch_policy, m in itertools.product(
-            args.padding,
-            args.expert_mask,
-            args.dispatch_policy,
-            args.m,
+        for padding_extra, expert_mask, dispatch_policy, accumulate, m in (
+            itertools.product(
+                args.padding,
+                args.expert_mask,
+                args.dispatch_policy,
+                args.accumulate,
+                args.m,
+            )
         ):
             for E, topk in model_configs:
                 df.append(
@@ -398,12 +616,52 @@ def main():
                         has_expert_mask=expert_mask,
                         padding_extra=padding_extra,
                         dispatch_policy=dispatch_policy,
+                        accumulate=accumulate,
                     )
                 )
         df = pd.DataFrame(df)
         aiter.logger.info(
             "moe_sorting summary (markdown):\n%s", df.to_markdown(index=False)
         )
+
+        if is_flydsl_available():
+            for expert_mask, m in itertools.product(args.expert_mask, args.m):
+                if m < 2:
+                    continue  # need capture/replay token counts to differ
+                for E, topk in model_configs:
+                    test_moe_sorting_flydsl_cuda_graph_capture(
+                        dtype,
+                        m,
+                        args.model_dim,
+                        E,
+                        topk,
+                        has_expert_mask=expert_mask,
+                    )
+            aiter.logger.info("moe_sorting FlyDSL cuda-graph capture/replay: all passed")
+
+        if args.decode_graph:
+            decode_rows = []
+            for expert_mask, capacity, real_tokens in itertools.product(
+                args.expert_mask, args.m, args.decode_graph
+            ):
+                for E, topk in model_configs:
+                    decode_rows.append(
+                        test_moe_sorting_decode_graph_perf(
+                            dtype,
+                            capacity,
+                            args.model_dim,
+                            E,
+                            topk,
+                            real_tokens,
+                            has_expert_mask=expert_mask,
+                        )
+                    )
+            decode_df = pd.DataFrame(decode_rows)
+            aiter.logger.info(
+                "moe_sorting decode graph-replay summary (us, capture_capacity=static M, "
+                "real_tokens=actual per-step count):\n%s",
+                decode_df.to_markdown(index=False),
+            )
 
 
 if __name__ == "__main__":
