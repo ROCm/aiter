@@ -40,6 +40,13 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                // Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
                                // Mutually exclusive with k_descale/v_descale
                                std::optional<const at::Tensor>& kv_block_descale, // [num_block, num_kv_head, 2]
+                               // PER_TOKEN_HEAD mode descales.
+                               std::optional<const at::Tensor>& q_descale_per_token,
+                               std::optional<const at::Tensor>& k_descale_per_token,
+                               std::optional<const at::Tensor>& v_descale_per_head,
+                               // PER_TOKEN_HEAD optional per-q-head P scale.
+                               std::optional<const at::Tensor>& p_scale,
+                               std::optional<const at::Tensor>& p_scale_inv,
                                at::Tensor out,
                                at::Tensor softmax_lse,
                                at::Tensor dropout_randval,
@@ -139,6 +146,70 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         TORCH_CHECK(v_stride_batch % k_vector_size == 0,
                     "V batch stride must be a multiple of vector size");
     }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT)
+    {
+        // Decode-aligned: K is 5D vectorized, V is 4D ColumnMajor.
+        TORCH_CHECK(k.dim() == 5,
+                    "K tensor must be 5D [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, "
+                    "kVectorSize] for VEC_K_COL_V layout");
+        TORCH_CHECK(v.dim() == 4,
+                    "V tensor must be 4D [NumBlocks, NumHeads, HeadDim, PageSize] for "
+                    "VEC_K_COL_V layout");
+
+        // K strides: identical to VECTORIZED branch above; stride_k carries the PageSize
+        // stride (= kVectorSize for vectorized K).
+        stride_k = k.stride(-2);
+        TORCH_CHECK(stride_k == k_vector_size,
+                    "stride_k (PageSize stride) must be ",
+                    k_vector_size,
+                    " in 5D vectorized K");
+        TORCH_CHECK(k.stride(4) == 1 && k.size(-1) == k_vector_size,
+                    "K last dim must be ",
+                    k_vector_size,
+                    " and contiguous");
+        TORCH_CHECK(k.stride(3) == k_vector_size,
+                    "K page stride must be ",
+                    k_vector_size,
+                    " in 5D vectorized layout");
+        TORCH_CHECK(k.stride(2) == static_cast<int64_t>(page_block_size) * k_vector_size,
+                    "K head-dim stride must be page_size * vector_size");
+        TORCH_CHECK(k.stride(1) >= static_cast<int64_t>(d) * page_block_size,
+                    "K head stride must be >= head_dim * page_size");
+        TORCH_CHECK(k.stride(0) >= static_cast<int64_t>(h_k) * k.stride(1),
+                    "K batch stride must be >= num_heads * head_stride");
+        TORCH_CHECK(k.stride(1) % k_vector_size == 0,
+                    "K head stride must be a multiple of vector size");
+        TORCH_CHECK(k.stride(0) % k_vector_size == 0,
+                    "K batch stride must be a multiple of vector size");
+
+        // V strides for [NumBlocks, NumHeads, HeadDim, PageSize]:
+        // - dim 3 (PageSize) is contiguous (stride 1)
+        // - dim 2 (HeadDim) stride = page_block_size — the kernel uses this directly via
+        //   make_naive_tensor_view (see fmha_batch_prefill_kernel.hpp)
+        // - dim 1 (NumHeads) is folded into v_ptr per-head (nhead_stride_v = HeadDim*PageSize)
+        // - dim 0 (NumBlocks) stride is the per-page stride (batch_stride_v)
+        // We pass `stride_v = 1` (the per-token stride for the kernel's V offset transform).
+        const int64_t v_stride_batch = v.stride(0);
+        const int64_t v_stride_head  = v.stride(1);
+        const int64_t v_stride_dim   = v.stride(2);
+        const int64_t v_stride_tok   = v.stride(3);
+
+        TORCH_CHECK(v_stride_tok == 1,
+                    "V innermost (PageSize) stride must be 1 in VEC_K_COL_V layout");
+        TORCH_CHECK(v_stride_dim == static_cast<int64_t>(page_block_size),
+                    "V HeadDim stride must equal page_block_size in VEC_K_COL_V layout");
+        TORCH_CHECK(v_stride_head >= static_cast<int64_t>(d_v) * page_block_size,
+                    "V head stride must be >= head_dim * page_size");
+        TORCH_CHECK(v_stride_batch >= static_cast<int64_t>(h_k) * v_stride_head,
+                    "V batch stride must be >= num_heads * head_stride");
+        TORCH_CHECK(v_stride_head % k_vector_size == 0,
+                    "V head stride must be a multiple of vector size");
+        TORCH_CHECK(v_stride_batch % k_vector_size == 0,
+                    "V batch stride must be a multiple of vector size");
+
+        stride_v = 1;
+    }
     else
     {
         if(k.dim() == 4)
@@ -235,13 +306,15 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     ck_tile::index_t stride_o       = out.stride(-3);
     ck_tile::index_t stride_randval = has_dropout_randval ? dropout_randval.stride(1) : 0;
 
-    ck_tile::index_t nhead_stride_q       = q.stride(-2);
+    ck_tile::index_t nhead_stride_q = q.stride(-2);
     const bool is_vectorized_layout =
         kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
-    // Vectorized: head dim at index 1. Linear: head dim at index 2.
+    const bool is_vec_k_col_v_layout =
+        kv_memory_layout == ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT;
+    // Vectorized / VEC_K_COL_V: K head dim at index 1. Linear: head dim at index 2 (4D) or 1 (3D).
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
-    if(is_vectorized_layout)
+    if(is_vectorized_layout || is_vec_k_col_v_layout)
     {
         nhead_stride_k = k.stride(1);
         nhead_stride_v = v.stride(1);
@@ -333,6 +406,10 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.page_block_size   = page_block_size;
     args.kv_memory_layout  = kv_memory_layout;
     args.kv_lookup_table   = ck_tile::BlockAttentionKVCacheLookupTableEnum::SGLANG_PAGE_TABLE_1D;
+    // VEC_K_COL_V is the only layout in which V is logically transposed (ColumnMajor);
+    // every other layout keeps V as RowMajor.
+    args.is_v_rowmajor =
+        (kv_memory_layout != ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT);
     args.kv_indptr         = kv_indptr.data_ptr();
     args.kv_page_indices   = kv_page_indices.data_ptr();
     args.kv_last_page_lens = kv_last_page_lens_ptr;
@@ -401,6 +478,81 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         args.nhead_stride_kv_block_descale  = k_descale_view.stride(1);
     }
 
+    // PER_TOKEN_HEAD: Q/K per-token per-head, V per-head. All three tensors required.
+    // Reuses args.q_descale_ptr / args.k_descale_ptr / args.v_descale_ptr; layout & strides
+    // disambiguated by the kernel via qscale_type.
+    if(q_descale_per_token.has_value())
+    {
+        TORCH_CHECK(k_descale_per_token.has_value() && v_descale_per_head.has_value(),
+                    "PER_TOKEN_HEAD mode requires q_descale_per_token, k_descale_per_token, "
+                    "and v_descale_per_head to all be provided.");
+
+        auto q_sc = q_descale_per_token.value();
+        auto k_sc = k_descale_per_token.value();
+        auto v_sc = v_descale_per_head.value();
+        CHECK_DEVICE(q_sc);
+        CHECK_DEVICE(k_sc);
+        CHECK_DEVICE(v_sc);
+        TORCH_CHECK(q_sc.scalar_type() == at::kFloat, "q_descale_per_token must be float32");
+        TORCH_CHECK(k_sc.scalar_type() == at::kFloat, "k_descale_per_token must be float32");
+        TORCH_CHECK(v_sc.scalar_type() == at::kFloat, "v_descale_per_head must be float32");
+
+        TORCH_CHECK(q_sc.dim() == 2,
+                    "q_descale_per_token must be 2D [total_q, nhead_q]");
+        TORCH_CHECK(q_sc.size(0) == total_q && q_sc.size(1) == h,
+                    "q_descale_per_token must have shape [total_q, nhead_q]");
+
+        TORCH_CHECK(k_sc.dim() == 3,
+                    "k_descale_per_token must be 3D [num_total_pages, page_block_size, nhead_k]");
+        TORCH_CHECK(k_sc.size(0) == num_total_pages && k_sc.size(1) == page_block_size &&
+                        k_sc.size(2) == h_k,
+                    "k_descale_per_token must have shape [num_total_pages, page_block_size, nhead_k]");
+
+        TORCH_CHECK(v_sc.dim() == 1 && v_sc.size(0) == h_k,
+                    "v_descale_per_head must be 1D with shape [nhead_k]");
+
+        args.q_descale_ptr             = q_sc.data_ptr();
+        args.k_descale_ptr             = k_sc.data_ptr();
+        args.v_descale_ptr             = v_sc.data_ptr();
+        args.stride_q_descale_token    = q_sc.stride(0);
+        args.nhead_stride_q_descale    = q_sc.stride(1);
+        args.nblock_stride_k_descale_page = k_sc.stride(0);
+        args.stride_k_descale_token    = k_sc.stride(1);
+        args.nhead_stride_k_descale    = k_sc.stride(2);
+        args.nhead_stride_v_descale    = v_sc.stride(0);
+
+        // Optional per-q-head P scale. We fold log2(p_scale) into the exp2
+        // row-max shift in the kernel; p_scale_inv is accepted for API parity
+        // but unused (the shift-fold doesn't need a reciprocal).
+        if(p_scale.has_value())
+        {
+            auto p_sc = p_scale.value();
+            CHECK_DEVICE(p_sc);
+            TORCH_CHECK(p_sc.scalar_type() == at::kFloat,
+                        "p_scale must be float32");
+            TORCH_CHECK(p_sc.dim() == 1 && p_sc.size(0) == h,
+                        "p_scale must be 1D with shape [num_head_q]");
+            TORCH_CHECK(p_sc.stride(0) == 1,
+                        "p_scale must be contiguous along its head dim");
+            args.p_scale_ptr = p_sc.data_ptr();
+
+            if(p_scale_inv.has_value())
+            {
+                auto p_sc_inv = p_scale_inv.value();
+                CHECK_DEVICE(p_sc_inv);
+                TORCH_CHECK(p_sc_inv.scalar_type() == at::kFloat,
+                            "p_scale_inv must be float32");
+                TORCH_CHECK(p_sc_inv.dim() == 1 && p_sc_inv.size(0) == h,
+                            "p_scale_inv must be 1D with shape [num_head_q]");
+            }
+        }
+        else
+        {
+            TORCH_CHECK(!p_scale_inv.has_value(),
+                        "p_scale_inv may only be supplied together with p_scale.");
+        }
+    }
+
     return args;
 }
 
@@ -430,11 +582,18 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> k_descale,     // [1]
                   std::optional<const at::Tensor> v_descale,     // [1]
                   std::optional<const at::Tensor> kv_block_descale,      // [num_block, num_kv_head, 2] for KV_BLOCKSCALE
+                  // PER_TOKEN_HEAD: Q/K per-token per-head, V per-head. See header for layouts.
+                  std::optional<const at::Tensor> q_descale_per_token,
+                  std::optional<const at::Tensor> k_descale_per_token,
+                  std::optional<const at::Tensor> v_descale_per_head,
                   std::optional<const at::Tensor> kv_last_page_lens_,
                   std::optional<const at::Tensor> block_table_,
                   std::optional<const at::Tensor> seqlen_k_,
                   std::optional<const at::Tensor> sink_ptr,      // [hq]
-                  std::optional<at::Generator> gen_
+                  std::optional<at::Generator> gen_,
+                  // PER_TOKEN_HEAD optional per-q-head P scale (see header).
+                  std::optional<const at::Tensor> p_scale,
+                  std::optional<const at::Tensor> p_scale_inv
                 )
 {
     auto q_dtype = q.scalar_type();
@@ -462,9 +621,24 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     // Validate descale tensor combinations:
     // - PERTENSOR mode: q_descale, k_descale, v_descale all provided
     // - KV_BLOCKSCALE mode: q_descale + kv_block_descale provided, k_descale/v_descale NOT provided
+    // - PER_TOKEN_HEAD mode: q/k_descale_per_token + v_descale_per_head provided, all
+    //   per-tensor and kv_block_descale tensors NOT provided
     // - NO_SCALE mode: none provided
     quant_scale_enum qscale_type;
-    if(kv_block_descale.has_value())
+    if(q_descale_per_token.has_value() || k_descale_per_token.has_value() ||
+       v_descale_per_head.has_value())
+    {
+        TORCH_CHECK(q_descale_per_token.has_value() && k_descale_per_token.has_value() &&
+                        v_descale_per_head.has_value(),
+                    "PER_TOKEN_HEAD mode requires q_descale_per_token, k_descale_per_token, "
+                    "and v_descale_per_head to all be provided.");
+        TORCH_CHECK(!q_descale.has_value() && !k_descale.has_value() && !v_descale.has_value() &&
+                        !kv_block_descale.has_value(),
+                    "PER_TOKEN_HEAD descales are mutually exclusive with q/k/v_descale and "
+                    "kv_block_descale.");
+        qscale_type = quant_scale_enum::per_token_head;
+    }
+    else if(kv_block_descale.has_value())
     {
         // KV_BLOCKSCALE: Q per-tensor, K/V per-page
         TORCH_CHECK(q_descale.has_value(),
@@ -521,12 +695,9 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     int head_size_v     = 0;
     int num_blocks      = 0;
 
-    if(k.dim() == 5)
+    if(k.dim() == 5 && v.dim() == 5)
     {
         kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT;
-        TORCH_CHECK(
-            v.dim() == 5,
-            "V tensor must be 5D [NumBlocks, NumHeads, PageSize/kVectorSize, HeadDim, kVectorSize]");
 
         // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
         num_heads_k     = k.size(1);
@@ -537,6 +708,32 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
 
         // V: [NumBlocks, NumHeads, PageSize/kVector_size, HeadDim, kVector_size]
         head_size_v = v.size(3);
+        num_blocks  = k.size(0);
+    }
+    else if(k.dim() == 5 && v.dim() == 4)
+    {
+        // Decode-aligned VEC_K_COL_V_LAYOUT: K is 5D vectorized (same as VECTORIZED_LAYOUT)
+        // and V is 4D ColumnMajor [NumBlocks, NumHeads, HeadDim, PageSize] — produced by
+        // aiter's reshape_and_cache_kernel and consumed by the decode paged-attention
+        // kernel without an intermediate reshape.
+        kv_memory_layout = ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT;
+
+        // K: [NumBlocks, NumHeads, HeadDim/kVectorSize, PageSize, kVectorSize]
+        num_heads_k     = k.size(1);
+        page_block_size = k.size(3);
+        TORCH_CHECK(page_block_size % k_vector_size == 0,
+                    "Vectorized KV requires page size divisible by ",
+                    k_vector_size);
+
+        // V: [NumBlocks, NumHeads, HeadDim, PageSize]; PageSize must match K.size(3).
+        TORCH_CHECK(v.size(0) == k.size(0),
+                    "V num_blocks must match K num_blocks for VEC_K_COL_V layout");
+        TORCH_CHECK(v.size(1) == num_heads_k,
+                    "V num_heads must match K num_heads for VEC_K_COL_V layout");
+        TORCH_CHECK(v.size(3) == page_block_size,
+                    "V innermost (PageSize) dim must equal K.size(3) (page_block_size) for "
+                    "VEC_K_COL_V layout");
+        head_size_v = v.size(2);
         num_blocks  = k.size(0);
     }
     else if(k.dim() == 4)
@@ -647,6 +844,18 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                     page_block_size / k_vector_size,
                     head_size_v,
                     k_vector_size);
+    }
+    else if(kv_memory_layout ==
+            ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VEC_K_COL_V_LAYOUT)
+    {
+        // K: 5D vectorized (same as VECTORIZED); V: 4D ColumnMajor.
+        CHECK_SHAPE(k,
+                    num_blocks,
+                    num_heads_k,
+                    head_size_q / k_vector_size,
+                    page_block_size,
+                    k_vector_size);
+        CHECK_SHAPE(v, num_blocks, num_heads_k, head_size_v, page_block_size);
     }
     else
     {
@@ -775,6 +984,11 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    k_descale,
                                                    v_descale,
                                                    kv_block_descale,
+                                                   q_descale_per_token,
+                                                   k_descale_per_token,
+                                                   v_descale_per_head,
+                                                   p_scale,
+                                                   p_scale_inv,
                                                    out,
                                                    softmax_lse,
                                                    p,
