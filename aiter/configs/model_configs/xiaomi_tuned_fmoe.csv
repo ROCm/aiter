@@ -1,0 +1,2 @@
+cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us1,kernelName1,err1,us2,kernelName2,err2,us,run_1stage,xbf16,flat,tflops,bw,_tag
+256,16384,6144,256,384,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float8_e4m3fn,QuantType.per_1x128,1,0,256,0,509.1764,pyhip_stage1,0.0%,600.0,pyhip_stage2,0.0%,1540.1764,0,1,1,2.16,55202.8,

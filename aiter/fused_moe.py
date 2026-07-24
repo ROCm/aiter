@@ -1387,6 +1387,96 @@ def get_2stage_cfgs(
             run_1stage,
             flat=cfg_flat,
         )
+
+    #assert 0, f"{kernelName1=} {kernelName2=}"
+    if bool(kernelName1) and kernelName1.startswith("pyhip_"):
+        from pyhip.contrib.moe_gemm_8wave import moe_gemm_8wave_g1u1, moe_gemm_8wave_down
+        wg_M, wg_N = 256, 256
+        assert block_m == wg_M
+        def stage1_func(a1,
+                        w1,
+                        w2,
+                        sorted_ids,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        a2, # target None if metadata.fuse_quant else a2,
+                        topk,
+                        block_m,
+                        a1_scale,
+                        w1_scale,
+                        sorted_weights,
+                        **extra_stage1_args):
+            token_num = a1.shape[0]
+            num_oc_blocks = inter_dim*2//wg_N
+            num_e_blocks = sorted_expert_ids.shape[0]
+            w1_is_shuffled = getattr(w1, "is_shuffled", False)
+            assert w1_is_shuffled
+            moe_gemm_8wave_g1u1([num_oc_blocks * num_e_blocks], [8*64],
+                    a1.element_size() * a1.numel() > (1<<32),
+                    "fp8", wg_M, wg_N,
+                    expert, inter_dim*2, model_dim, 
+                    True, w1_is_shuffled, topk,
+                    sorted_ids,
+                    sorted_weights,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    w1, None if w1_scale is None else w1_scale,
+                    a1, None if a1_scale is None else a1_scale,
+                    a2,
+                    token_num, num_oc_blocks * num_e_blocks) # num_local_tokens.data_ptr() ?
+            return a2
+
+        def stage2_func(a2,
+                        w1,
+                        w2,
+                        sorted_ids,
+                        sorted_expert_ids,
+                        num_valid_ids,
+                        moe_out,
+                        topk,
+                        w2_scale,
+                        a2_scale,
+                        block_m,
+                        sorted_weights,
+                        **extra_stage2_args):
+            token_num = a2.shape[0]
+            num_e_blocks = sorted_expert_ids.shape[0]
+            w2_is_shuffled = getattr(w2, "is_shuffled", False)
+            assert w2_is_shuffled
+            stage2_out = torch.empty(
+                (token_num, topk, model_dim),
+                dtype=torch.bfloat16,
+                device=a2.device,
+            )            
+            moe_gemm_8wave_down([1, num_e_blocks], [8*64],
+                            moe_out.element_size() * moe_out.numel() > (1<<32),
+                            "fp8", wg_M, 64,
+                            expert, model_dim, inter_dim, 
+                            False, w2_is_shuffled, topk,
+                            sorted_ids,
+                            sorted_weights,
+                            sorted_expert_ids,
+                            num_valid_ids,
+                            w2, None if w2_scale is None else w2_scale,
+                            a2, None if a2_scale is None else a2_scale,
+                            stage2_out,
+                            token_num)
+            #moe_out = stage2_out.sum(dim=1)
+            torch.sum(stage2_out, dim=1, out=moe_out)
+
+            return moe_out
+
+        stage1_func.func=None
+        stage2_func.func=None
+        stage1_func.transpose_quant = True
+        stage2_func.transpose_quant = True
+        return MOEMetadata(
+            stage1_func,
+            stage2_func,
+            block_m,
+            int(ksplit),
+        )
+
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
@@ -1863,7 +1953,7 @@ def fused_moe_2stages(
                 sorted_weights=sorted_weights,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+        if quant_type == QuantType.per_1x128 and (metadata.stage1.func is asm_stage1 or getattr(metadata.stage1, "transpose_quant", False)):
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,

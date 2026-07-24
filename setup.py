@@ -460,6 +460,9 @@ class ForcePlatlibDistribution(Distribution):
     def has_ext_modules(self):
         return True
 
+PYHIP_VERSION = (
+    "pyhip @ git+https://github.com/tingqli/pyhip.git@xiaomi-355-opt"
+)
 
 if AITER_TRITON_ONLY:
     install_requires = ["einops", "packaging", "psutil"]
@@ -472,6 +475,7 @@ else:
         "psutil",
         "packaging",
         FLYDSL_VERSION,
+        PYHIP_VERSION,
     ]
 
 setup(
