@@ -74,3 +74,189 @@ def test_v2_stage1_task_selects_activation_input_by_dtype(q_dtype_a, expected_ke
     stage1_task = next(task for task in tasks if task[0][1] == "stage1")
 
     assert stage1_task[4][0][0] == expected_key
+
+
+def test_v2_tasks_propagate_swiglu():
+    from aiter import ActivationType, QuantType, dtypes
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+    activation = ActivationType.Swiglu
+    info = (
+        "gfx950",
+        304,
+        4,
+        7168,
+        768,
+        384,
+        6,
+        activation,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        False,
+    )
+    tasks = FmoeTuner.gen_flydsl_v2_2stages_task(None, info, [32])
+    stage1_task = next(task for task in tasks if task[0][1] == "stage1")
+    stage2_task = next(task for task in tasks if task[0][1] == "stage2")
+
+    assert stage1_task[2][-1] == activation
+    assert stage1_task[4][-2] == activation
+    assert stage2_task[2][-1] == activation
+
+
+@pytest.mark.parametrize(
+    ("activation_name", "expected"),
+    [("Silu", "silu"), ("Swiglu", "swiglu")],
+)
+def test_v2_stage1_launch_uses_activation(monkeypatch, activation_name, expected):
+    from aiter import ActivationType
+    from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+    activation = getattr(ActivationType, activation_name)
+    called = {}
+    dummy = torch.zeros(1, dtype=torch.uint8, device="cpu")
+
+    def fake_flydsl_moe_stage1(**kwargs):
+        called.update(kwargs)
+        return kwargs["out"], dummy
+
+    monkeypatch.setattr(gemm_moe_tune, "flydsl_moe_stage1", fake_flydsl_moe_stage1)
+    params = {
+        "tile_m": 32,
+        "tile_n": 64,
+        "tile_k": 256,
+        "a_dtype": "fp4",
+        "b_dtype": "fp4",
+        "out_dtype": "fp4",
+    }
+    gemm_moe_tune.FmoeTuner.run_flydsl_v2_stage1_out(
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        1,
+        256,
+        256,
+        1,
+        1,
+        32,
+        "fp4",
+        activation,
+        params,
+    )
+
+    assert called["act"] == expected
+
+
+@pytest.mark.parametrize(
+    "generator_name",
+    ["generate_v2_stage1_data", "generate_v2_stage2_data"],
+)
+def test_v2_data_generator_forwards_activation(monkeypatch, generator_name):
+    from aiter import ActivationType
+    from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+    class StopGeneration(Exception):
+        pass
+
+    captured = {}
+
+    def fake_gen(*args, **kwargs):
+        captured.update(kwargs)
+        raise StopGeneration
+
+    monkeypatch.setattr(gemm_moe_tune, "_v2_gen", fake_gen)
+    generator = getattr(gemm_moe_tune.FmoeTuner, generator_name)
+
+    with pytest.raises(StopGeneration):
+        generator(4, 256, 256, 1, 1, 32, "fp4", ActivationType.Swiglu)
+
+    assert captured["activation"] == ActivationType.Swiglu
+
+
+def test_v2_gen_uses_activation_in_reference(monkeypatch):
+    from aiter import ActivationType
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils
+
+    torch.set_default_device("cuda")
+    captured = {}
+    original = mxfp4_v2_tune_utils.torch_moe_stage1
+
+    def capture_activation(*args, **kwargs):
+        captured["activation"] = kwargs["activation"]
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mxfp4_v2_tune_utils, "torch_moe_stage1", capture_activation)
+    mxfp4_v2_tune_utils.gen(
+        1,
+        256,
+        256,
+        1,
+        1,
+        32,
+        adtype="fp4",
+        activation=ActivationType.Swiglu,
+    )
+
+    assert captured["activation"] == ActivationType.Swiglu
+
+
+def test_v2_stage2_producer_uses_activation(monkeypatch):
+    from aiter import ActivationType
+    from aiter.ops.flydsl import mxfp4_v2_tune_utils
+
+    called = {}
+    data = torch.zeros(1, dtype=torch.uint8, device="cpu")
+    scale = torch.zeros((1, 1), dtype=torch.uint8, device="cpu")
+    indices = torch.zeros(1, dtype=torch.int32, device="cpu")
+    d = {
+        "a1_qt": data,
+        "a1_scale": scale,
+        "base": {
+            "adtype": "fp4",
+            "a2_dtype": "fp4",
+            "w1_qt_shuf": data,
+            "w1_scale_shuf": data,
+        },
+    }
+    v = {
+        "sti": indices,
+        "sei": indices,
+        "cumsum": indices,
+        "isq": data,
+    }
+    params = {
+        "tile_m": 32,
+        "tile_n": 64,
+        "tile_k": 256,
+    }
+
+    def fake_flydsl_moe_stage1(**kwargs):
+        called.update(kwargs)
+        return kwargs["out"], data
+
+    monkeypatch.setattr(
+        mxfp4_v2_tune_utils, "moe_mxfp4_sort", lambda *args, **kwargs: data
+    )
+    monkeypatch.setattr(
+        mxfp4_v2_tune_utils, "flydsl_moe_stage1", fake_flydsl_moe_stage1
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    mxfp4_v2_tune_utils.populate_baseline_v2_intermediate(
+        d,
+        v,
+        1,
+        1,
+        params,
+        32,
+        activation=ActivationType.Swiglu,
+    )
+
+    assert called["act"] == "swiglu"
