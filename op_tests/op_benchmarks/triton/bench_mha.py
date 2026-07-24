@@ -13,6 +13,7 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_with_kvcache,
     mha_set_use_fused_bwd_kernel,
     mha_set_impl,
+    gluon_forward_unsupported_reason,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
@@ -43,6 +44,7 @@ class BenchRun:
     print_vgpr: bool
     bench_torch: bool
     window_size_left: int = -1
+    backend: str = "triton"
 
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
@@ -150,6 +152,7 @@ def _make_attn_fn(q, k, v, **kw):
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
+        backend=kw.get("backend"),
     )
 
 
@@ -169,6 +172,7 @@ def _make_varlen_fn(q, k, v, **kw):
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
+        backend=kw.get("backend"),
     )
 
 
@@ -241,7 +245,7 @@ def make_workloads(
 ) -> tuple[list[tuple], list[tuple]]:
     """Generate realistic workloads from vLLM scheduler parameters.
 
-    Prefill: batch × sq = num_tokens (token budget per step).
+    Prefill: batch x sq = num_tokens (token budget per step).
     Decode: batch = min(num_tokens, max_num_seqs), sq=1.
     Returns (prefill_workloads, decode_workloads).
     Each entry is (batch, sq, sk, causal, functions).
@@ -454,7 +458,7 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     for c in configs:
         if c.estimated_memory > limit:
             print(
-                f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
+                f"[SKIP] {c} -- {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
                 flush=True,
             )
         else:
@@ -558,8 +562,10 @@ def run_benchmark(run: BenchRun):
         is_bwd = function.startswith("bwd")
         is_varlen = "varlen" in function
         is_decode = function == "fwd_kvcache"
+        is_gluon = run.backend == "gluon"
         requires_grad = is_bwd
-        return_lse = True
+        # The Gluon backend is forward-only and returns just the output tensor.
+        return_lse = not is_gluon
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
         window_size = (run.window_size_left, -1)
@@ -571,6 +577,28 @@ def run_benchmark(run: BenchRun):
                 "Skipping: PE, sink, or sliding window not supported with fused bwd / fp8."
             )
             return 0
+        if is_gluon:
+            # Forward-only gfx950 kernel: no backward, KV cache, fp8, PE, sink or
+            # sliding window (see aiter.ops.triton.attention.mha gluon backend).
+            if is_bwd or is_decode:
+                warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
+                return 0
+            if dtype == "fp8":
+                warnings.warn("Skipping: Gluon backend does not support fp8.")
+                return 0
+            if has_pe or run.sink or has_sliding_window:
+                warnings.warn(
+                    "Skipping: Gluon backend does not support PE, sink, or sliding window."
+                )
+                return 0
+            # Catch shape configs the kernel can't compile (e.g. a padded head_dim
+            # with a non-16-element-aligned KV stride) before launching
+            gluon_reason = gluon_forward_unsupported_reason(
+                head_dim=D_HEAD, num_k_heads=HK
+            )
+            if gluon_reason:
+                warnings.warn(f"Skipping: {gluon_reason}")
+                return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype)
 
@@ -680,6 +708,7 @@ def run_benchmark(run: BenchRun):
                 window_size=window_size,
                 has_pe=has_pe,
                 has_sink=run.sink,
+                backend=run.backend,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
@@ -709,6 +738,7 @@ def run_benchmark(run: BenchRun):
                 window_size=window_size,
                 has_pe=has_pe,
                 has_sink=run.sink,
+                backend=run.backend,
             )
             fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
             if fn is None:
@@ -914,6 +944,14 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         default=-1,
         help="left sliding window size (-1 disables sliding window attention)",
     )
+    parser.add_argument(
+        "-backend",
+        type=str,
+        default="triton",
+        choices=["triton", "gluon"],
+        help="Attention backend: 'triton' (default) or 'gluon' "
+        "(forward-only gfx950 kernel; only fwd / fwd_varlen).",
+    )
     parsed = parser.parse_args(args=args)
 
     # Validate dtypes
@@ -1007,6 +1045,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
         window_size_left=parsed.window_size_left,
+        backend=parsed.backend,
     )
 
 
