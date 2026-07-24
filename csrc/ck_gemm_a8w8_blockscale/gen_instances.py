@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
 import sys
@@ -70,50 +70,6 @@ class gemm_a8w8_blockscale_codegen:
 
 #include "gemm_a8w8_blockscale_common.cuh"
 
-enum class GemmSpecialization {{
-    Default    = 0,
-    MPadding   = 1,
-    NPadding   = 2,
-    KPadding   = 3,
-    MNPadding  = 4,
-    MKPadding  = 5,
-    NKPadding  = 6,
-    MNKPadding = 7
-}};
-
-static const std::unordered_map<std::string, GemmSpecialization> g_gemm_spec_names{{
-    {{"", GemmSpecialization::Default}},
-    {{"M", GemmSpecialization::MPadding}},
-    {{"N", GemmSpecialization::NPadding}},
-    {{"K", GemmSpecialization::KPadding}},
-    {{"MN", GemmSpecialization::MNPadding}},
-    {{"MK", GemmSpecialization::MKPadding}},
-    {{"NK", GemmSpecialization::NKPadding}},
-    {{"MNK", GemmSpecialization::MNKPadding}}
-}};
-
-static GemmSpecialization GetGemmSpec(const int64_t m,
-                               const int64_t n,
-                               const int64_t k,
-                               const int64_t m_per_block,
-                               const int64_t n_per_block,
-                               const int64_t k_per_block)
-{{
-    auto IntegerDivideCeil = [](int x, int y) {{
-        return (x + y - size_t{{1}}) / y;
-    }};
-
-    std::string spec = "";
-    if (IntegerDivideCeil(m, m_per_block) * m_per_block - m != 0)
-        spec += "M";
-    if (IntegerDivideCeil(n, n_per_block) * n_per_block - n != 0)
-        spec += "N";
-    if (IntegerDivideCeil(k, k_per_block) * k_per_block - k != 0)
-        spec += "K";
-
-    return g_gemm_spec_names.at(spec);
-}}
-
 template <typename DDataType, typename EDataType>
 torch::Tensor
 {k.name}(
@@ -133,105 +89,64 @@ torch::Tensor
     // Get whether this input needs to be padded.
     auto gemm_spec = GetGemmSpec(M, N, K, {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK});
 
+    using CKGemmSpec = ck::tensor_operation::device::GemmSpecialization;
+
+    // Run kernel instance.
+    auto run_kernel = [&]<CKGemmSpec spec> [[clang::always_inline]] (std::integral_constant<CKGemmSpec, spec>) {{
+        using LegacyGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
+                    DDataType, EDataType,
+                    {k.BLOCK_SIZE},
+                    {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
+                    {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
+                    {k.AK1}, {k.BK1},
+                    {k.MPerXDL}, {k.NPerXDL},
+                    {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
+                    S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
+                    S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+                    {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+                    {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+                    S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+                    S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+                    ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
+                    ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+                    spec>;
+
+        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
+    }};
 
     if(gemm_spec == GemmSpecialization::Default)
     {{
-        // Default
-        __INSTANCE_CONTENT_DEFAULT__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::Default>{{}});
     }} else if(gemm_spec == GemmSpecialization::MPadding)
     {{
-        // MNK Padding
-        __INSTANCE_CONTENT_MPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::MPadding>{{}});
     }} else if(gemm_spec == GemmSpecialization::NPadding)
     {{
-        // N Padding
-        __INSTANCE_CONTENT_NPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::NPadding>{{}});
     }} else if(gemm_spec == GemmSpecialization::KPadding)
     {{
-        // K Padding
-        __INSTANCE_CONTENT_KPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::KPadding>{{}});
     }} else if(gemm_spec == GemmSpecialization::MNPadding)
     {{
-        // MN Padding
-        __INSTANCE_CONTENT_MNPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::MNPadding>{{}});
     }} else if(gemm_spec == GemmSpecialization::MKPadding)
     {{
-        // MK Padding
-        __INSTANCE_CONTENT_MKPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::MKPadding>{{}});
     }} else if(gemm_spec == GemmSpecialization::NKPadding)
     {{
-        // NK Padding
-        __INSTANCE_CONTENT_NKPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::NKPadding>{{}});
     }} else if(gemm_spec == GemmSpecialization::MNKPadding)
     {{
-        // MNK Padding
-        __INSTANCE_CONTENT_MNKPAD__
+        return run_kernel(std::integral_constant<CKGemmSpec, CKGemmSpec::MNKPadding>{{}});
     }} else
     {{
         throw std::runtime_error("Unsupported GemmSpecialization!");
     }}
 }}
-
 """
-
-        LEGACY_INSTANCE = f"""using LegacyGemmInstance = DeviceLegacyGemmHelperF8BlockScale<
-            DDataType, EDataType,
-            {k.BLOCK_SIZE},
-            {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
-            {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
-            {k.AK1}, {k.BK1},
-            {k.MPerXDL}, {k.NPerXDL},
-            {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-            {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-            {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
-            ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
-            ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-            ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-
-        // Run kernel instance.
-        return gemm_a8w8_blockscale_impl<DDataType, EDataType, LegacyGemmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
-"""
-        INSTANCE_IMPL_str = (
-            LEGACY_INSTANCE_IMPL.replace(
-                "__INSTANCE_CONTENT_DEFAULT__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "Default"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_NPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "NPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_KPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "KPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MNPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MNPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MKPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MKPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_NKPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "NKPadding"),
-            )
-            .replace(
-                "__INSTANCE_CONTENT_MNKPAD__",
-                LEGACY_INSTANCE.replace("{GemmSpec}", "MNKPadding"),
-            )
-        )
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-            INSTANCE_IMPL_str
+            LEGACY_INSTANCE_IMPL
         )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
