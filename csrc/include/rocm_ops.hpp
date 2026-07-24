@@ -208,6 +208,23 @@ namespace py = pybind11;
           py::arg("kernelName")     = std::nullopt, \
           py::arg("quant_type")     = QuantType::per_Token);
 
+#define PA_OPUS_PYBIND                           \
+    m.def("pa_fwd_opus",                           \
+          &pa_opus_fwd,                            \
+          "pa_fwd_opus",                           \
+          py::arg("Q"),                            \
+          py::arg("K"),                            \
+          py::arg("V"),                            \
+          py::arg("block_tables"),                 \
+          py::arg("context_lens"),                 \
+          py::arg("block_tables_stride0"),         \
+          py::arg("max_qlen")       = 1,           \
+          py::arg("K_QScale")       = std::nullopt,\
+          py::arg("V_QScale")       = std::nullopt,\
+          py::arg("out_")           = std::nullopt,\
+          py::arg("qo_indptr")      = std::nullopt,\
+          py::arg("high_precision") = 1);
+
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
           &pa_fwd_naive,               \
