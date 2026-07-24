@@ -915,7 +915,9 @@ def chunk_fwd_kernel_o_opt_vk(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        b_o = tl.dot(b_q, tl.trans(b_h), acc=b_o)
+        # FP32 state is narrowed in registers for the BF16 MFMA. This does not
+        # materialize a cast tensor or launch a separate conversion kernel.
+        b_o = tl.dot(b_q, tl.trans(b_h.to(b_q.dtype)), acc=b_o)
         b_A = tl.dot(b_q, b_k, acc=b_A)
 
     if USE_G:
