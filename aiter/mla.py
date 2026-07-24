@@ -558,11 +558,26 @@ def mla_decode_fwd(
                 and max_seqlen_q == 2
             )
             or (
-                get_gfx() in ("gfx942", "gfx950")
+                get_gfx() == "gfx950"
                 and nhead == 64
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 1
+            )
+            or (
+                # gfx942 native qh64 fp8 persistent decode (PR #3188) was only
+                # validated at page_size=64. At page_size=1 (the layout vLLM MLA
+                # uses) mla_a8w8_qh64_qseqlen1_gqaratio64_v3_ps.co does an
+                # out-of-bounds GPU access and faults on the first decode. Gate
+                # the native path to the validated page_size=64; other page sizes
+                # fall through to the qh16 fold (pre-#3188 path, runs correctly).
+                # Repro: op_tests/test_mla_qh64_gfx942_pagesize1.py
+                get_gfx() == "gfx942"
+                and nhead == 64
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
+                and page_size == 64
             )
             or (
                 get_gfx() == "gfx950"
