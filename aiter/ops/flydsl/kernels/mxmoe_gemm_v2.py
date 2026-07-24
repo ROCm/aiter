@@ -27,6 +27,7 @@ from .mxfp4_gemm_common import _gep1 as gep1
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 
+
 def bq_view(
     arg_bq,
     row_elems,
@@ -100,23 +101,24 @@ def mma_one_j(
     i0=0,
     single_rg=False,
     rg_off=0,
+    k_halves=2,
 ):
     """One J-cluster of scaled MFMAs over a 32-row A-scale group (row-groups i0, i0+1); each is
     an fx.gemm on i32 A/B frags (fp8 A = i32<8:1>, fp4 A = i32<4:1>), e8m0 words on scale_a/scale_b.
-    sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte, 2 MFMAs.
+    sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte.
     """
-    bJ0, bJ1 = bq_frags_kt[J][0], bq_frags_kt[J][1]
     if const_expr(single_rg):
-        steps = ((0 + rg_off, 0, i0, bJ0), (2 + rg_off, 1, i0, bJ1))
+        steps = tuple(
+            (2 * k + rg_off, k, i0, bq_frags_kt[J][k]) for k in range(k_halves)
+        )
     else:
-        steps = (
-            (0, 0, i0, bJ0),
-            (1, 0, i0 + 1, bJ0),
-            (2, 1, i0, bJ1),
-            (3, 1, i0 + 1, bJ1),
+        steps = tuple(
+            (2 * k + im, k, i0 + im, bq_frags_kt[J][k])
+            for k in range(k_halves)
+            for im in range(2)
         )
     for osa, k, i, bJ in steps:
-        osb = (0 if k == 0 else 2) + in_b
+        osb = 2 * k + in_b
         fx.gemm(
             atoms[(osa, osb)],
             c_frags[i][J],
@@ -227,6 +229,7 @@ def gemm2_body_v2(
         SBM = BM
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
+    tilesPerScaleChunk = 256 // BK  # K-tiles sharing one 256-K E8M0 word
     numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
     nPairs = max(1, numAccN // 2)  # one B-scale per two 16-column subblocks
     # BM16: single 16-row block owning a 32-row scale chunk (chunk==m_block_idx, rg0-only).
@@ -252,6 +255,7 @@ def gemm2_body_v2(
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
     K_TILES_MAX = INTER_MAX // BK
+    K_SCALE_CHUNKS_MAX = INTER_MAX // 256
 
     # has_pad OOB pad-skip (const_expr-gated): K-skip sizes 16N B-weight buffer to REAL K; N-skip zeros fully-pad-N w2 tiles (col >= N_real=N_OUT-npad; PERF-ONLY). B-scale NOT shrunk.
     bq_num_records = None
@@ -361,7 +365,11 @@ def gemm2_body_v2(
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
         nrec = asc_num - fx.Int64(base_dw) * fx.Int64(4)
         return scale_view(
-            arg_ascale, base_dw, K_TILES_MAX, k0_stride_dw=64, num_records_bytes=nrec
+            arg_ascale,
+            base_dw,
+            K_SCALE_CHUNKS_MAX,
+            k0_stride_dw=64,
+            num_records_bytes=nrec,
         )
 
     ascale_views = [make_ascale_view(sub) for sub in range_constexpr(kScaleSubBlocks)]
@@ -369,12 +377,17 @@ def gemm2_body_v2(
 
     def load_a_scale_tile(kt):
         # One i32 A-scale register per 32-row chunk (kScaleSubBlocks).
+        chunk_kt = (
+            kt
+            if const_expr(tilesPerScaleChunk == 1)
+            else kt // fx.Int32(tilesPerScaleChunk)
+        )
         out = []
         for sub in range_constexpr(kScaleSubBlocks):
             saf = fx.make_fragment_like(sc_frag_tmpl)
             fx.copy(
                 sc_copy_atom,
-                ascale_views[sub][lane_div_16, lane_mod_16, kt, None],
+                ascale_views[sub][lane_div_16, lane_mod_16, chunk_kt, None],
                 saf,
             )
             out.append(_raw(Vec(saf.load())[0]))
@@ -406,7 +419,7 @@ def gemm2_body_v2(
         scale_view(
             arg_bscale,
             e * kbs_per_expert_dw + (mni_base + mw) * kBS_stride_n0_dw,
-            K_TILES_MAX,
+            K_SCALE_CHUNKS_MAX,
             k0_stride_dw=kBS_stride_k0_dw,
         )
         for mw in range_constexpr(nPairs)
@@ -424,10 +437,15 @@ def gemm2_body_v2(
                     bq_views[j][lane_div_16, lane_mod_16, kt_rt, half, None],
                     bqf[j][half],
                 )
+        chunk_kt = (
+            kt_rt
+            if const_expr(tilesPerScaleChunk == 1)
+            else kt_rt // fx.Int32(tilesPerScaleChunk)
+        )
         for mw in range_constexpr(nPairs):
             fx.copy(
                 sc_copy_atom,
-                bscale_views[mw][lane_div_16, lane_mod_16, kt_rt, None],
+                bscale_views[mw][lane_div_16, lane_mod_16, chunk_kt, None],
                 bsf[mw],
             )
 
@@ -442,11 +460,24 @@ def gemm2_body_v2(
         return bqf, bsf
 
     # Scaled-MFMA clusters over the loaded A / B / scale fragments.
-    def mfma_cluster(bqf, bsf, sa):
+    def shift_scale_word(scale, kt_rt):
+        if const_expr(tilesPerScaleChunk == 1):
+            return scale
+        scale_shift = (kt_rt % fx.Int32(tilesPerScaleChunk)) * fx.Int32(16)
+        return _raw(fx.Int32(scale).shrui(scale_shift))
+
+    def mfma_cluster(bqf, bsf, sa, kt_rt):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
+        sa = [
+            shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
+        ]
+        sb_words = [
+            shift_scale_word(_raw(Vec(bsf[mni].load())[0]), kt_rt)
+            for mni in range_constexpr(nPairs)
+        ]
         for J in range_constexpr(numAccN):
             mni, in_b = J // 2, J % 2
-            sb = _raw(Vec(bsf[mni].load())[0])
+            sb = sb_words[mni]
             if const_expr(is_bm16):
                 mma_one_j(
                     J,
@@ -460,6 +491,7 @@ def gemm2_body_v2(
                     i0=0,
                     single_rg=True,
                     rg_off=rg_off,
+                    k_halves=kHalves,
                 )
                 continue
             for sub in range_constexpr(kScaleSubBlocks):
@@ -473,6 +505,7 @@ def gemm2_body_v2(
                     c_frags,
                     mma_atoms,
                     i0=2 * sub,
+                    k_halves=kHalves,
                 )
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
@@ -486,11 +519,7 @@ def gemm2_body_v2(
             c_frags[i][J].store(zero4)
 
     def load_c_carry():
-        return [
-            c_frags[i][J].load()
-            for i in range(kMChunks)
-            for J in range(numAccN)
-        ]
+        return [c_frags[i][J].load() for i in range(kMChunks) for J in range(numAccN)]
 
     def store_c_carry(state):
         n = 0
@@ -517,7 +546,7 @@ def gemm2_body_v2(
                 issue_a_load_lds(nxt % fx.Int32(aStages), nxt)
             bqf, bsf = stream_b_tile(kt_rt)
             sa = load_a_scale_tile(kt_rt)
-            mfma_cluster(bqf, bsf, sa)
+            mfma_cluster(bqf, bsf, sa, kt_rt)
             results = yield load_c_carry()
         store_c_carry(results)
     else:
@@ -652,7 +681,7 @@ def gemm2_body_v2(
             # Fence the MFMA chain from the B vmem loads (next-tile loads ride ahead of compute).
             rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
-            mfma_cluster(cur_bqf, cur_bsf, sa)
+            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             results = yield yield_carry()
@@ -660,8 +689,7 @@ def gemm2_body_v2(
 
     # epilog: atomic bf16. Load the C fragments (fp8/fp4 unified onto the same fx.gemm path).
     accm_vecs = [
-        [c_frags[i][J].load() for J in range(numAccN)]
-        for i in range(kMChunks)
+        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
     ]
     atomic_bf16_epilog(
         lds_acc_base,

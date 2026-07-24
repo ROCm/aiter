@@ -191,8 +191,8 @@ def compile_gemm2_a4w4_port(
     ):
         # Shared body for both has_pad variants (@flyc.jit -> rewriter recurses scf if / grid-stride); default passes i32_kpad/i32_npad=0 (no kernarg), folding pad math away.
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(
-            256
-        )  # N_OUT//256 runtime (i32_hidden = model_dim)
+            BN
+        )  # N_OUT//BN runtime (i32_hidden = model_dim)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(
             1 if is_f8 else 2
         )  # A row stride bytes (runtime)
