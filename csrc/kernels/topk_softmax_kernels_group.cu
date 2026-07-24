@@ -321,6 +321,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                     const DTYPE_I* __restrict__ correction_bias, // [num_expert]
                     float* __restrict__ topk_weights,            // [num_tokens, topk]
                     int* __restrict__ topk_ids,                  // [num_tokens, topk]
+                    const size_t stride_gating,
                     const size_t stride_tk,
                     const int num_experts,
                     const int topk,
@@ -368,7 +369,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 
     if constexpr(!isSoftmax)
     {
-        auto const* input_ptr = gating_output + token_idx * num_experts;
+        auto const* input_ptr = gating_output + token_idx * stride_gating;
         for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         {
             vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
@@ -402,7 +403,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
 
-            float gating = gating_output[token_idx * num_experts + e];
+            float gating = gating_output[token_idx * stride_gating + e];
             scores[e]    = gating;
             if(gating > max_val)
             {
@@ -1165,6 +1166,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             correction_bias.data_ptr<scalar_t>(),                                                  \
             topk_weights.data_ptr<float>(),                                                        \
             topk_ids.data_ptr<int>(),                                                              \
+            stride_gating,                                                                         \
             stride_tk,                                                                             \
             num_experts,                                                                           \
             topk,                                                                                  \
@@ -1186,6 +1188,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             nullptr,                                                                               \
             topk_weights.data_ptr<float>(),                                                        \
             topk_ids.data_ptr<int>(),                                                              \
+            stride_gating,                                                                         \
             stride_tk,                                                                             \
             num_experts,                                                                           \
             topk,                                                                                  \
@@ -1234,7 +1237,9 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     int num_tokens      = gating_output.size(0);
     int num_experts     = gating_output.size(1);
     int topk            = topk_ids.size(1);
+    size_t stride_gating = gating_output.stride(0);
     size_t stride_tk    = topk_ids.stride(0);
+    TORCH_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
@@ -1244,7 +1249,8 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
-                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
+                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64) &&
+                        (stride_gating == static_cast<size_t>(num_experts));
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
@@ -1281,8 +1287,10 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
     int num_tokens       = gating_output.size(0);
     int num_experts      = gating_output.size(1);
     int topk             = topk_ids.size(1);
+    size_t stride_gating = gating_output.stride(0);
     size_t stride_tk     = topk_ids.stride(0);
     auto correction_bias = topk_ids;
+    TORCH_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
