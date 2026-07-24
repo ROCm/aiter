@@ -23,6 +23,10 @@ if TRITON_GE_36:
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
+        elif arch == "gfx942":
+            from aiter.ops.triton._gluon_kernels.gfx942.attention.fp8_mqa_logits import (
+                _gluon_fp8_mqa_logits_kernel,
+            )
     except Exception:
         _gluon_fp8_mqa_logits_kernel = None
 
@@ -203,6 +207,33 @@ def fp8_mqa_logits(
             num_warps = 1
             block_kv = 32
             other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
+            grid = (seq_len,)
+        elif arch == "gfx942":
+            # CDNA3 register-load kernel (no async copy / LDS double-buffer); see the
+            # gfx942 kernel docstring for the design and perf numbers.
+            # CHUNK: 2D grid (seq_len, n_chunks) tile-level load balancing -- each
+            # work item does <= CHUNK tiles of one row, so triangular (causal
+            # prefill) windows don't leave a long-pole tail (+30% at CHUNK=16).
+            num_buffers = 1  # unused: register-only kernel, no LDS double-buffer
+            # waves_per_eu=4 targets the AMDGPU scheduler at 4 waves/SIMD (the VGPR
+            # already gives 4): same 118 VGPR / 0 spills as 2, but the occupancy hint
+            # reorders for better latency hiding -> +6-8% causal/dense on MI300X.
+            waves_per_eu = 4
+            # Folded-FMA head reduction (see _score_tile), enabled when the Triton
+            # build supports the constexpr-tuple permute (USE_FOLDED_REDUCTION probes
+            # for Triton #9751); otherwise 0 -> naive gl.sum (bit-identical). The fold
+            # was validated bit-exact vs the einsum oracle across H {32,64} / D {64,128}
+            # (causal/dense/sliding) with the actual #9751 change (_unwrap_if_constexpr)
+            # applied to Triton 3.6.0; test_fp8_mqa_logits exercises it on any real
+            # #9751 CI runner (num_chains>0 auto-selected there).
+            num_chains = 4 if USE_FOLDED_REDUCTION else 0
+            num_warps = 1
+            block_kv = 64
+            chunk = 16  # KV tiles per work item (2D-grid load balancing)
+            other = {"CHUNK": chunk}
+            # 2D (row, chunk) grid for tile-level load balancing (each work item
+            # scores <= CHUNK tiles of one row); other arches use one WG per row.
+            grid = (seq_len, triton.cdiv(seq_len_kv, chunk * block_kv))
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -210,13 +241,14 @@ def fp8_mqa_logits(
             num_warps = 4
             block_kv = 128
             other = {"LOOP_VARIANT": loop_variant}
+            grid = (seq_len,)
 
         # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
         # Fall back to plain global load/store when a tensor exceeds that.
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[(seq_len,)](
+        _gluon_fp8_mqa_logits_kernel[grid](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
