@@ -27,12 +27,6 @@ from .mxfp4_gemm_common import _gep1 as gep1
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 
-# Compile-time caps for the runtime inter_dim / model_dim (gemm2 B-view + LDS bounds).
-# Imported and applied by mxmoe_dispatcher.
-INTER_MAX_DEFAULT = 8192
-HIDDEN_MAX_DEFAULT = 8192
-
-
 def bq_view(arg_bq, row_elems, KH4, K_TILES_TOTAL, num_records_bytes=None):
     """Layout view over preshuffled B for one N-row tile; slice -> i32<4:1> (16B=32 fp4). num_records_bytes (has_pad pad-skip) sizes to REAL K; None -> max_size=False byte-identical default."""
     col_base = rocdl.readfirstlane(T.i32, _raw(row_elems) * fx.Int32(KH4))

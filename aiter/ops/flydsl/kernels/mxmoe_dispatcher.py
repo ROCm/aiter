@@ -12,8 +12,6 @@ from flydsl.expr.typing import Int8, T
 from aiter.jit.utils.chip_info import get_cu_num
 
 from .mxmoe_gemm_v2 import (
-    HIDDEN_MAX_DEFAULT,
-    INTER_MAX_DEFAULT,
     gemm2_body_v2,
     global_typed_ptr,
     issue_a_load_lds_dt,
@@ -77,9 +75,9 @@ def compile_gemm2_a4w4_port(
     BN=256,
     BK=256,
     use_nt=False,
-    HIDDEN_MAX=HIDDEN_MAX_DEFAULT,
+    HIDDEN_MAX=8192,
     epilog="atomic",
-    INTER_MAX=INTER_MAX_DEFAULT,
+    INTER_MAX=8192,
     a_dtype="fp4",
     topk=1,
     SBM=None,
@@ -136,10 +134,11 @@ def compile_gemm2_a4w4_port(
     aStages = 2 if g2_bf16_lds else 3
     c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
-    # N_OUT = model_dim/hidden is a runtime arg (i32_hidden); num_n_blocks = N_OUT//256 is computed runtime in the body/launch (HIDDEN_MAX only caps host checks).
+    # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
+    # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
-        HIDDEN_MAX % BK == 0
-    ), f"HIDDEN_MAX must be a multiple of {BK}, got {HIDDEN_MAX}"
+        HIDDEN_MAX % BN == 0
+    ), f"HIDDEN_MAX must be a multiple of {BN}, got {HIDDEN_MAX}"
 
     # Kernel-name tags empty on the default so its name/IR stays byte-identical (each variant distinct).
     atag = "_a8" if is_f8 else ""
@@ -417,7 +416,8 @@ def get_g2(
     has_pad=False,
     out_dtype="bf16",
 ):
-    # Cache key = compile-time dims; inter_dim + model_dim/hidden runtime (INTER_MAX/HIDDEN_MAX cap them), topk keyed only for reduce.
+    # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
+    # launcher while remaining within their respective caps.
     SBM = _norm_sbm(SBM, BM)
     out_dtype = str(out_dtype).strip().lower()
     topk_key = topk if epilog == "reduce" else 1
@@ -497,6 +497,8 @@ def mxfp4_moe_gemm2(
     inter_dim_pad=0,
     model_dim_pad=0,
     out_dtype="bf16",
+    HIDDEN_MAX=8192,
+    INTER_MAX=8192,
     stream=None,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
@@ -510,17 +512,20 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN (N_OUT) must be a multiple of 256, got {D_HIDDEN}"
         )
-    if D_HIDDEN > HIDDEN_MAX_DEFAULT:
+    if D_HIDDEN > HIDDEN_MAX:
         raise AssertionError(
-            f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX_DEFAULT})"
+            f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
         )
-    inter_max = 512 if D_INTER == 512 else INTER_MAX_DEFAULT
+    if D_INTER > INTER_MAX:
+        raise AssertionError(
+            f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
+        )
     launch = get_g2(
         BM,
         use_nt,
-        HIDDEN_MAX_DEFAULT,
+        HIDDEN_MAX,
         epilog,
-        inter_max,
+        INTER_MAX,
         a_dtype,
         topk=topk,
         SBM=SBM,
@@ -529,10 +534,6 @@ def mxfp4_moe_gemm2(
         has_pad=has_pad,
         out_dtype=out_dtype,
     )
-    if D_INTER > inter_max:
-        raise AssertionError(
-            f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({inter_max})"
-        )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
