@@ -401,10 +401,19 @@ def _attn_fwd_inner(
                     causal_offset = seqlen_k - seqlen_q
                     causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
 
-                    if WINDOW_SIZE_LEFT < 0:
+                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                        # both edges unbounded: only the causal cap constrains cols
+                        window_mask = causal_mask
+                    elif WINDOW_SIZE_LEFT < 0:
+                        # unbounded left, finite right
                         window_mask = col_idx_expanded > (
                             row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
                         )
+                    elif WINDOW_SIZE_RIGHT < 0:
+                        # unbounded right: the causal cap already bounds the right,
+                        # so only the finite left edge masks (mirror of infinite-left)
+                        left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
+                        window_mask = col_idx_expanded < left_bound
                     else:
                         left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
                         right_bound = (
@@ -425,9 +434,18 @@ def _attn_fwd_inner(
                     row_idx_expanded = row_idx[:, None]
                     col_idx_expanded = col_idx[None, :]
 
-                    if WINDOW_SIZE_LEFT < 0:
+                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                        # both edges unbounded: full (non-causal) attention
+                        mask = (row_idx_expanded < 0) | (col_idx_expanded < 0)
+                    elif WINDOW_SIZE_LEFT < 0:
+                        # unbounded left, finite right
                         mask = col_idx_expanded > (
                             row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
+                        )
+                    elif WINDOW_SIZE_RIGHT < 0:
+                        # unbounded right, finite left (mirror of infinite-left)
+                        mask = col_idx_expanded < (
+                            row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
                         )
                     else:
                         sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
@@ -505,10 +523,17 @@ def _attn_fwd_inner(
                     sd_store_mask = sd_store_mask & causal_constraint
 
                 if APPLY_MASK and USE_SLIDING_WINDOW:
-                    if WINDOW_SIZE_LEFT < 0:
+                    if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                        window_constraint = offs_m[:, None] >= 0
+                    elif WINDOW_SIZE_LEFT < 0:
                         window_constraint = kv_offs_n[None, :] <= (
                             offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                         )
+                    elif WINDOW_SIZE_RIGHT < 0:
+                        left_bound = (
+                            offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                        )
+                        window_constraint = kv_offs_n[None, :] >= left_bound
                     else:
                         left_bound = (
                             offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
@@ -544,10 +569,15 @@ def _attn_fwd_inner(
                 sd_store_mask = sd_store_mask & causal_constraint
 
             if APPLY_MASK and USE_SLIDING_WINDOW:
-                if WINDOW_SIZE_LEFT < 0:
+                if WINDOW_SIZE_LEFT < 0 and WINDOW_SIZE_RIGHT < 0:
+                    window_constraint = offs_m[:, None] >= 0
+                elif WINDOW_SIZE_LEFT < 0:
                     window_constraint = kv_offs_n[None, :] <= (
                         offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
                     )
+                elif WINDOW_SIZE_RIGHT < 0:
+                    left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
+                    window_constraint = kv_offs_n[None, :] >= left_bound
                 else:
                     left_bound = offs_m[:, None] + seqlen_delta_qk - WINDOW_SIZE_LEFT
                     right_bound = offs_m[:, None] + seqlen_delta_qk + WINDOW_SIZE_RIGHT
@@ -626,8 +656,12 @@ def compute_window_bounds(
         right_max = tl.minimum(seqlen_k - 1, q_end + diag)
     else:
         if WINDOW_SIZE_RIGHT < 0:
-            right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
-            right_max = tl.minimum(seqlen_k - 1, q_end + diag + WINDOW_SIZE_RIGHT)
+            # Unbounded right edge: mirror the infinite-left collapse
+            # (WINDOW_SIZE_LEFT < 0 -> left bound collapses to 0). Here the right
+            # bound saturates at the last K index so classify_window_blocks
+            # produces no back-skip / back-masked blocks.
+            right_min = seqlen_k - 1
+            right_max = seqlen_k - 1
         else:
             # Non-causal doesn't have the diagonal constraint
             right_min = tl.minimum(seqlen_k - 1, q_start + diag + WINDOW_SIZE_RIGHT)
@@ -1766,20 +1800,11 @@ def attention_forward_prefill_triton_impl(
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
-    # The kernel only special-cases an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
-    # WINDOW_SIZE_RIGHT is consumed as a literal finite offset everywhere (the
-    # per-element right_bound and the block-classification bounds), so a negative
-    # right does not mean "unbounded" -- it collapses right_bound to (anchor - 1)
-    # and silently over-masks. Reject it rather than return a wrong result.
-    # (window_size_right == -1 is only valid as the "off" sentinel, i.e. together
-    # with window_size_left == -1, which leaves use_sliding_window False.) This
-    # matches the backward guard in attention_backward_triton_impl.
-    if use_sliding_window and window_size_right < 0:
-        raise NotImplementedError(
-            "Sliding-window attention requires window_size_right >= 0 "
-            f"(got window_size_right={window_size_right}). An unbounded right edge "
-            "is not supported; use window_size_right=0 for a causal window."
-        )
+    # Either edge may be unbounded and is handled uniformly: WINDOW_SIZE_LEFT < 0
+    # collapses the left bound to 0, WINDOW_SIZE_RIGHT < 0 saturates the right bound
+    # at the last K index (compute_window_bounds + the per-element masks mirror the
+    # two edges). (-1, -1) is the only "off" sentinel (leaves use_sliding_window
+    # False), so no negative-right guard is needed.
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )

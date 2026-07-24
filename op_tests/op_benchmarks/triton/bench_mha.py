@@ -42,10 +42,14 @@ class BenchRun:
     profile_dir: str | None
     print_vgpr: bool
     bench_torch: bool
-    window_size_left: int = -1
 
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
+
+# The (left, right) window variants the default sweep benches: dense + a representative
+# causal sliding window. A swept axis like the default function/dtype sets; override with
+# --window-size-left/right to bench one specific window instead.
+DEFAULT_WINDOWS = [(-1, -1), (1024, 0)]
 
 
 @dataclass(frozen=True)
@@ -63,13 +67,27 @@ class BenchConfig:
     impl: str = "default"  # "default" or "dao_ai"
     fused: bool = False
     model: str | None = None
+    # Sliding window (left, right) for THIS config. (-1, -1) is dense (off); either
+    # bound >= 0 makes it a window (-1 on a side means unbounded that side).
+    window_size_left: int = -1
+    window_size_right: int = -1
+
+    @property
+    def has_sliding_window(self) -> bool:
+        # dense iff BOTH bounds are off (-1); either set = a window (kernel semantics).
+        return self.window_size_left >= 0 or self.window_size_right >= 0
 
     def __str__(self) -> str:
         label = self.model or "custom"
+        window = (
+            f" window=({self.window_size_left},{self.window_size_right})"
+            if self.has_sliding_window
+            else ""
+        )
         return (
             f"{label} B={self.batch} HQ={self.hq} HK={self.hk} "
             f"sq={self.sq} sk={self.sk} d={self.d_head} "
-            f"{self.function} {self.dtype_str} causal={self.causal}"
+            f"{self.function} {self.dtype_str} causal={self.causal}{window}"
         )
 
     @property
@@ -97,22 +115,29 @@ class BenchConfig:
             total *= 2  # grads are same size as inputs
         return total
 
-    def to_tuple(self) -> tuple:
-        return (
-            self.model,
-            self.batch,
-            self.hq,
-            self.hk,
-            self.sq,
-            self.sk,
-            self.d_head,
-            self.d_head_v,
-            self.causal,
-            self.function,
-            self.dtype_str,
-            self.impl,
-            self.fused,
-        )
+    def to_dict(self) -> dict:
+        """The row's key columns as {csv_column: value}, in CSV order: the single
+        source of truth for the CSV header, the triton x-axis, and each written row
+        (the metric is appended separately by the writer, being the measurement, not
+        a key). CSV names differ from the field names as they are the boundary contract.
+        """
+        return {
+            "model": self.model,
+            "BATCH": self.batch,
+            "HQ": self.hq,
+            "HK": self.hk,
+            "N_CTX_Q": self.sq,
+            "N_CTX_K": self.sk,
+            "D_HEAD": self.d_head,
+            "D_HEAD_V": self.d_head_v,
+            "causal": self.causal,
+            "function": self.function,
+            "dtype": self.dtype_str,
+            "impl": self.impl,
+            "fused": self.fused,
+            "window_left": self.window_size_left,
+            "window_right": self.window_size_right,
+        }
 
 
 def _count_valid_attention_elements(
@@ -121,7 +146,7 @@ def _count_valid_attention_elements(
     causal: bool,
     window_size: tuple[int, int],
 ) -> int:
-    window_size_left, _ = window_size
+    window_size_left, window_size_right = window_size
     shift = seqlen_k - seqlen_q
     total = 0
 
@@ -129,6 +154,11 @@ def _count_valid_attention_elements(
         right = seqlen_k - 1
         if causal:
             right = min(right, q_idx + shift)
+        # A finite right edge caps how far ahead a query attends; honor it so the
+        # FLOP count is correct for symmetric / right-bounded windows, not just the
+        # causal (right=0) case. A negative right is the "off" sentinel -> no cap.
+        if window_size_right >= 0:
+            right = min(right, q_idx + shift + window_size_right)
         left = 0
         if window_size_left >= 0:
             left = max(left, q_idx + shift - window_size_left)
@@ -206,6 +236,7 @@ def _make_kvcache_fn(q, k_cache, v_cache, **kw):
         cache_seqlens=kw["cache_seqlens"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
     )
 
 
@@ -262,6 +293,7 @@ def model_benchmark_configs(
     *,
     dtypes: list[str],
     functions: list[str],
+    windows: list[tuple[int, int]],
     impl: str,
     fused: bool,
     model: str | None = None,
@@ -305,23 +337,26 @@ def model_benchmark_configs(
             for fn in workload_fns:
                 if fn not in functions:
                     continue
-                fa_configs.append(
-                    BenchConfig(
-                        model=model_name,
-                        batch=b,
-                        hq=HQ,
-                        hk=HK,
-                        sq=sq,
-                        sk=sk,
-                        d_head=HEAD_DIM,
-                        d_head_v=HEAD_DIM,
-                        causal=causal,
-                        function=fn,
-                        dtype_str=d,
-                        impl=impl,
-                        fused=fused and d != "fp8",
+                for wl, wr in windows:
+                    fa_configs.append(
+                        BenchConfig(
+                            model=model_name,
+                            batch=b,
+                            hq=HQ,
+                            hk=HK,
+                            sq=sq,
+                            sk=sk,
+                            d_head=HEAD_DIM,
+                            d_head_v=HEAD_DIM,
+                            causal=causal,
+                            function=fn,
+                            dtype_str=d,
+                            impl=impl,
+                            fused=fused and d != "fp8",
+                            window_size_left=wl,
+                            window_size_right=wr,
+                        )
                     )
-                )
 
     return fa_configs
 
@@ -358,25 +393,13 @@ def pad_rearrange_dropout_mask(
 
 
 def _make_triton_benchmark(run: BenchRun) -> list:
-    x_names = [
-        "model",
-        "BATCH",
-        "HQ",
-        "HK",
-        "N_CTX_Q",
-        "N_CTX_K",
-        "D_HEAD",
-        "D_HEAD_V",
-        "causal",
-        "function",
-        "dtype",
-        "impl",
-        "fused",
-    ]
+    # Row schema (names + order) comes from BenchConfig.to_dict(); configs are
+    # non-empty here (run_benchmark returns early otherwise).
+    x_names = list(run.configs[0].to_dict())
     return [
         triton.testing.Benchmark(
             x_names=x_names,
-            x_vals=[c.to_tuple() for c in run.configs],
+            x_vals=[tuple(c.to_dict().values()) for c in run.configs],
             line_arg="provider",
             line_vals=[run.unit],
             line_names=[run.unit],
@@ -404,22 +427,8 @@ class _CsvWriter:
 
         os.makedirs(run.save_path, exist_ok=True)
         self._path = os.path.join(run.save_path, f"{run.plot_name}.csv")
-        header = [
-            "model",
-            "BATCH",
-            "HQ",
-            "HK",
-            "N_CTX_Q",
-            "N_CTX_K",
-            "D_HEAD",
-            "D_HEAD_V",
-            "causal",
-            "function",
-            "dtype",
-            "impl",
-            "fused",
-            run.unit,
-        ]
+        # Header = the row's key columns (from to_dict) + the metric (the unit).
+        header = [*run.configs[0].to_dict(), run.unit]
         with open(self._path, "w") as f:
             f.write(",".join(header) + "\n")
 
@@ -430,8 +439,8 @@ class _CsvWriter:
             self._skipped += 1
             return
         with open(self._path, "a") as f:
-            row = ",".join(str(x) for x in config.to_tuple()) + f",{value}\n"
-            f.write(row)
+            cells = [*config.to_dict().values(), value]
+            f.write(",".join(str(x) for x in cells) + "\n")
         self._written += 1
 
     def summary(self) -> None:
@@ -467,6 +476,9 @@ def run_benchmark(run: BenchRun):
     filtered = _filter_by_memory(run.configs)
     if len(filtered) < len(run.configs):
         run = dataclasses.replace(run, configs=filtered)
+    if not run.configs:
+        print("[bench] no configs to run (all filtered by memory).", flush=True)
+        return
     total = len(run.configs)
     counter = 0
     csv = _CsvWriter(run)
@@ -486,6 +498,8 @@ def run_benchmark(run: BenchRun):
         dtype,
         impl,
         fused,
+        window_left,
+        window_right,
         torch_dtype,
         unit,
         provider,
@@ -498,9 +512,15 @@ def run_benchmark(run: BenchRun):
         config = run.configs[counter - 1]
         label = model or "custom"
         mem_gb = config.estimated_memory / 1e9
+        window_str = (
+            f" window=({window_left},{window_right})"
+            if window_left >= 0 or window_right >= 0
+            else ""
+        )
         print(
             f"[{counter}/{total}] {label} B={BATCH} HQ={HQ} HK={HK} "
-            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} causal={causal} ({mem_gb:.1f}GB)",
+            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} "
+            f"causal={causal}{window_str} ({mem_gb:.1f}GB)",
             flush=True,
         )
         try:
@@ -518,6 +538,8 @@ def run_benchmark(run: BenchRun):
                 dtype,
                 impl,
                 fused,
+                window_left,
+                window_right,
                 torch_dtype,
                 unit,
                 dropout,
@@ -547,6 +569,8 @@ def run_benchmark(run: BenchRun):
         dtype,
         impl,
         fused,
+        window_size_left,
+        window_size_right,
         torch_dtype,
         unit,
         dropout,
@@ -562,14 +586,22 @@ def run_benchmark(run: BenchRun):
         return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
-        window_size = (run.window_size_left, -1)
-        has_sliding_window = run.window_size_left >= 0
+        # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
+        # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
+        has_sliding_window = window_size_left >= 0 or window_size_right >= 0
+        window_size = (window_size_left, window_size_right)
         if impl != "default":
             mha_set_impl(impl)
-        if (fused or dtype == "fp8") and (has_pe or run.sink or has_sliding_window):
+        # SWA runs on the dao_ai path (any dtype) and the fp8 path (routes to FA3, which
+        # has it); only native non-fp8 lacks it (left-only, right rejected). Skip that
+        # combo cleanly rather than hard-error mid-sweep.
+        if has_sliding_window and impl != "dao_ai" and dtype != "fp8":
             warnings.warn(
-                "Skipping: PE, sink, or sliding window not supported with fused bwd / fp8."
+                "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
+            return 0
+        if (fused or dtype == "fp8") and (has_pe or run.sink):
+            warnings.warn("Skipping: PE or sink not supported with fused bwd / fp8.")
             return 0
         mha_set_use_fused_bwd_kernel(fused)
         make_fn = get_make_fn(function, dtype)
@@ -912,7 +944,13 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         "--window-size-left",
         type=int,
         default=-1,
-        help="left sliding window size (-1 disables sliding window attention)",
+        help="left sliding window size (-1 = no left bound; dense only when both -1)",
+    )
+    parser.add_argument(
+        "--window-size-right",
+        type=int,
+        default=-1,
+        help="right sliding window size (-1 = no right bound)",
     )
     parsed = parser.parse_args(args=args)
 
@@ -952,6 +990,11 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     impl = parsed.impl
     fused = parsed.fused_bwd
     functions = [parsed.fn] if parsed.fn else sorted(VALID_FUNCTIONS)
+    windows = (
+        [(parsed.window_size_left, parsed.window_size_right)]
+        if parsed.window_size_left >= 0 or parsed.window_size_right >= 0
+        else DEFAULT_WINDOWS
+    )
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 
@@ -974,14 +1017,18 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
+                window_size_left=wl,
+                window_size_right=wr,
             )
             for c, fn, d in itertools.product(causals, functions, dtypes)
+            for wl, wr in windows
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
             functions=functions,
+            windows=windows,
             impl=impl,
             fused=fused,
             model=parsed.model,
@@ -991,6 +1038,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             parsed,
             dtypes=dtypes,
             functions=functions,
+            windows=windows,
             impl=impl,
             fused=fused,
         )
@@ -1006,7 +1054,6 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         profile_dir=parsed.profile,
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
-        window_size_left=parsed.window_size_left,
     )
 
 

@@ -12,6 +12,7 @@ from aiter.ops.triton.attention.mha import (
 )
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_with_tol,
     generate_random_padding_mask,
     generate_qkv,
 )
@@ -60,10 +61,30 @@ def dao_ai_impl():
         (1, 128, 128, 8, 8, 64, False, False, True, (16, 16)),  # symmetric window
         (1, 128, 128, 8, 8, 64, False, True, True, (16, 16)),  # symmetric win varlen
         (1, 128, 128, 8, 8, 64, False, False, True, (-1, 32)),  # infinite-left window
+        # Infinite-RIGHT window (L, -1): the mirror of the infinite-left row above.
+        # MUST be non-causal -- under causal the right edge is capped to the diagonal
+        # (attention_ref forces window=(L, 0)), so (L, -1) would collapse to (L, 0)
+        # and never exercise the new unbounded-right path.
+        (1, 128, 128, 8, 8, 64, False, False, True, (32, -1)),  # infinite-right window
+        (1, 128, 128, 8, 8, 64, False, True, True, (32, -1)),  # infinite-right varlen
         # seqlen_q != seqlen_k exercises the causal_offset / delta_qk arithmetic
         (1, 128, 256, 8, 8, 64, True, False, True, (32, 0)),  # causal, sq != sk
         (1, 128, 256, 8, 8, 64, True, True, True, (32, 0)),  # causal varlen, sq != sk
         (1, 128, 256, 8, 8, 64, False, False, True, (16, 16)),  # symmetric, sq != sk
+        # infinite-right with sq != sk: exercises the sk-sq offset in the
+        # unbounded-right per-element mask and the _sliding_window bounds.
+        (
+            1,
+            128,
+            256,
+            8,
+            8,
+            64,
+            False,
+            False,
+            True,
+            (32, -1),
+        ),  # infinite-right sq != sk
         # GQA (num_q_heads != num_k_heads) combined with sliding-window backward
         (2, 128, 128, 16, 4, 64, True, False, True, (32, 0)),  # GQA causal window
         (2, 128, 128, 16, 4, 64, False, True, True, (16, 16)),  # GQA symmetric varlen
@@ -79,6 +100,18 @@ def dao_ai_impl():
         # seqlen_q != seqlen_k at production size exercises the causal_offset /
         # delta_qk arithmetic with a window spanning many blocks.
         (1, 4096, 8192, 8, 8, 64, True, False, True, (256, 0)),  # large causal sq != sk
+        # Padded last block: seqlen NOT a multiple of the block size, with an active
+        # window -> exercises handle_padded_last_block (the last partial-K-block bucket
+        # move). Every multiple-of-block case above skips this branch. sq == sk keeps
+        # every query row with at least the diagonal key (no fully-masked rows).
+        (1, 1023, 1023, 8, 8, 64, True, False, True, (128, 0)),  # causal
+        (1, 1025, 1025, 8, 8, 64, False, False, True, (64, 64)),  # symmetric
+        (1, 4097, 4097, 8, 8, 64, True, False, True, (256, 0)),  # production size
+        (1, 1024, 1024, 8, 8, 64, False, False, True, (0, 0)),  # (0,0) band
+        # Broaden the production block-skip regime past hd64 / MHA: block sizes are
+        # head-dim dependent and MQA changes the block-classification arithmetic.
+        (1, 4096, 4096, 8, 8, 128, True, False, True, (256, 0)),  # hd128
+        (2, 4096, 4096, 8, 1, 64, True, False, True, (256, 0)),  # MQA
     ],
 )
 def test_mha_dao_ai(
@@ -93,7 +126,7 @@ def test_mha_dao_ai(
     VARLEN: bool,
     BWD: bool,
     WINDOW_SIZE: tuple[int, int],
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     """Test dao_ai impl dispatch for fwd/bwd x varlen against PyTorch reference."""
     torch.cuda.empty_cache()
@@ -173,28 +206,43 @@ def test_mha_dao_ai(
                 q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
             )
 
-    # Forward check against PyTorch reference
-    q_ref = q.detach().clone().requires_grad_(BWD)
-    k_ref = k.detach().clone().requires_grad_(BWD)
-    v_ref = v.detach().clone().requires_grad_(BWD)
-    torch_out, _, _ = attention_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        causal=CAUSAL,
-        window_size=WINDOW_SIZE,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-    )
-    if VARLEN:
-        triton_out_padded = output_pad_fn(triton_out)
-        torch.testing.assert_close(triton_out_padded, torch_out, atol=1e-2, rtol=1e-2)
+    # Reference + tolerances. For backward, attention_ref_with_tol derives each
+    # tensor's atol from the fp32-vs-bf16 reference gap (upstream FA pattern, as in
+    # test_mha_v3): bf16 gradient reductions -- largest under MQA / long seqlen --
+    # outrun a fixed 1e-2 atol.
+    do = torch.randn_like(q) if BWD else None
+    if BWD:
+        torch_out, (torch_dq, torch_dk, torch_dv), fwd_tol, bwd_tols = (
+            attention_ref_with_tol(
+                q,
+                k,
+                v,
+                do,
+                causal=CAUSAL,
+                window_size=WINDOW_SIZE,
+                query_padding_mask=query_padding_mask,
+                key_padding_mask=key_padding_mask,
+            )
+        )
     else:
-        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+        torch_out, _, _ = attention_ref(
+            q,
+            k,
+            v,
+            causal=CAUSAL,
+            window_size=WINDOW_SIZE,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+        )
+        fwd_tol = (1e-2, 1e-2)
+
+    # Forward check against PyTorch reference
+    fwd_atol, fwd_rtol = fwd_tol
+    triton_out_fwd = output_pad_fn(triton_out) if VARLEN else triton_out
+    torch.testing.assert_close(triton_out_fwd, torch_out, atol=fwd_atol, rtol=fwd_rtol)
 
     # Backward check against PyTorch reference
     if BWD:
-        do = torch.randn_like(q)
         if VARLEN:
             triton_out = output_pad_fn(triton_out)
             triton_dq, triton_dk, triton_dv = torch.autograd.grad(
@@ -208,64 +256,19 @@ def test_mha_dao_ai(
                 triton_out, (q, k, v), do
             )
 
-        torch_dq, torch_dk, torch_dv = torch.autograd.grad(
-            torch_out, (q_ref, k_ref, v_ref), do
-        )
-
-        torch.testing.assert_close(
-            triton_dq,
-            torch_dq,
-            atol=1e-2,
-            rtol=1e-2,
-            msg=lambda msg: f"dao_ai bwd dq mismatch\n\n{msg}\n",
-        )
-        torch.testing.assert_close(
-            triton_dk,
-            torch_dk,
-            atol=1e-2,
-            rtol=1e-2,
-            msg=lambda msg: f"dao_ai bwd dk mismatch\n\n{msg}\n",
-        )
-        torch.testing.assert_close(
-            triton_dv,
-            torch_dv,
-            atol=1e-2,
-            rtol=1e-2,
-            msg=lambda msg: f"dao_ai bwd dv mismatch\n\n{msg}\n",
-        )
-
-
-def test_mha_dao_ai_negative_right_window_raises(dao_ai_impl):
-    """A negative right edge (window_size_right < 0) must be rejected.
-
-    Neither fwd nor bwd has an infinite-right code path: WINDOW_SIZE_RIGHT is used
-    as a literal finite offset everywhere (the per-element right_bound, the forward
-    block-classification bounds, and the m_lo/n_hi bounds in
-    _sliding_window_q_bounds/_k_bounds), so a value of -1 collapses right_bound to
-    "anchor - 1" -- over-masking per element AND skipping blocks that should
-    contribute. Both forward and backward guard against it instead of silently
-    returning a wrong result.
-
-    Forward is the reachable guard via the public API (it fires before grad can
-    run); the matching backward guard in attention_backward_triton_impl remains as
-    defense-in-depth. (window_size_right == -1 is only valid as the off sentinel,
-    paired with window_size_left == -1.)
-    """
-    torch.manual_seed(20)
-    q = torch.randn(
-        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-    k = torch.randn(
-        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-    v = torch.randn(
-        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
-    )
-
-    # window_size=(32, -1): finite left, negative right -> sliding window active
-    # with window_size_right < 0. Forward must raise before any backward runs.
-    with pytest.raises(NotImplementedError):
-        flash_attn_func(q, k, v, causal=False, window_size=(32, -1))
+        for tri, ref, (atol, rtol), name in zip(
+            (triton_dq, triton_dk, triton_dv),
+            (torch_dq, torch_dk, torch_dv),
+            bwd_tols,
+            ("dq", "dk", "dv"),
+        ):
+            torch.testing.assert_close(
+                tri,
+                ref,
+                atol=atol,
+                rtol=rtol,
+                msg=lambda m, name=name: f"dao_ai bwd {name} mismatch\n\n{m}\n",
+            )
 
 
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
@@ -279,7 +282,7 @@ def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
     seqlen = 128
     nheads = 8
     nheads_k = nheads if mha_type == "mha" else 2
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
     k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
@@ -329,7 +332,7 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     seqlen = 128
     nheads = 8
     nheads_k = nheads if mha_type == "mha" else 2
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
     k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
