@@ -2018,7 +2018,7 @@ def gemm_a8w8_blockscale(
     l2_prefetch_distance: int = 0,
     variant: str = "compute_bound",
     use_tdm_store: bool = False,
-    loop_carried_load_percent: Optional[int] = None,
+    loop_carried_load_percent: int | None = None,
     kernarg_preload: bool = False,
     split_k: int = 1,
 ):
