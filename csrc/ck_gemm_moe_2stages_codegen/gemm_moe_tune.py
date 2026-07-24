@@ -145,7 +145,8 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
         else:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
-    return cos_diff if cos_diff >= COS_DIFF_THRESHOLD else 0.0
+    # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
+    return cos_diff
 
 
 def tensor_compare_diagnostics(
@@ -293,7 +294,8 @@ class FmoeTuner(TunerCommon):
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_fmoe.csv",
-        "errRatio": 0.5,
+        # max accepted cosine_diff; 0.1 rejects broken kernels
+        "errRatio": 0.1,
         "batch": 100,
         "profile_file": "",  # for all results
         "config_env_name": "AITER_CONFIG_FMOE",
@@ -4182,8 +4184,18 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
-            profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m", "flat"], keep="first"
+            # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
+            # penalty below is applied only to non-fused, so dedup must not drop the
+            # fused kernel by raw us before that penalty runs.
+            profileDF["_is_fused"] = (
+                profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
+            )
+            profileDF = (
+                profileDF.sort_values("us")
+                .drop_duplicates(
+                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
+                )
+                .drop(columns=["_is_fused"])
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
