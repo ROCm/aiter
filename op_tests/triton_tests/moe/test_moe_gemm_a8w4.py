@@ -361,3 +361,79 @@ def test_op(
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
+
+
+def test_cdna4_swizzled_scales_with_padded_physical_dims(device="cuda"):
+    if get_arch() != "gfx950":
+        pytest.skip("CDNA4 scale swizzle is only used on gfx950.")
+
+    torch.manual_seed(0)
+
+    m = 16
+    logical_n = 704
+    logical_k = 800
+    physical_n = 1024
+    physical_k = 1024
+    n_expts_tot = 8
+    n_expts_act = 1
+
+    m, rdata, gindx, sindx = init_routing_data(
+        m, n_expts_tot, n_expts_act, False, False, device=device
+    )
+    assert rdata.block_m == 16
+
+    x_physical, w_physical, bias_physical, _ = init_compute_data(
+        m,
+        physical_n,
+        physical_k,
+        gindx,
+        sindx,
+        n_expts_tot,
+        n_expts_act,
+        torch.bfloat16,
+        torch.bfloat16,
+        False,
+        device=device,
+    )
+
+    w_tri, w_scale = downcast_to_mxfp(w_physical, torch.uint8, axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale, torch.bfloat16, axis=1)[:, :, :logical_n]
+    w_scale_tri = shuffle_scale_moe(
+        w_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+    )
+
+    x_static_scale = (
+        x_physical.abs().max().float() / torch.finfo(torch.float8_e4m3fn).max
+    )
+    x_tri = downcast_to_static_fp8(x_physical, x_static_scale)
+    # unpadded_N/K are dispatch keys only for CDNA4 swizzle; the kernel must
+    # still launch over the physical padded tensor dimensions.
+    ref_y = moe_gemm_torch(
+        x_physical,
+        w_ref,
+        bias_physical[:, :logical_n],
+        rdata,
+        gindx,
+        sindx,
+        None,
+        False,
+    )
+    tri_y = moe_gemm_a8w4(
+        x_tri,
+        w_tri,
+        None,
+        w_scale_tri,
+        x_static_scale,
+        None,
+        bias_physical,
+        rdata,
+        gindx,
+        sindx,
+        None,
+        "CDNA4_SCALE",
+        torch.bfloat16,
+        False,
+        unpadded_N=logical_n,
+        unpadded_K=logical_k,
+    )
+    assert_close(ref_y, tri_y[:, :logical_n], maxtol=4e-1, rmstol=4e-2)
