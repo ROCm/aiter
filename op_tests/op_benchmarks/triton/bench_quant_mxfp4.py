@@ -15,15 +15,65 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 def get_default_shapes() -> list[list[int]]:
     return [
-        [1, 4],
-        [1, 32],
-        [1, 64],
-        [2, 32],
-        [128, 32],
-        [128, 64],
-        [256, 32],
-        [4096, 4096],
-        [4096, 8192],
+    # [1, 4],
+    # [1, 32],
+    # [1, 64],
+    # [2, 32],
+    # [128, 32],
+    # [128, 64],
+    # [256, 32],
+    # [1024, 1024],
+    # [4096, 4096],
+    # [4096, 8192],
+    # [8192, 16384],
+    [16384, 16384],
+    # [131072, 16384],
+    # [8192, 53248],
+    # [16384, 53248],
+    # [131072, 53248],
+    # [8192, 8192],
+    # [16384, 8192],
+    # [131072, 8192],
+    # [8192, 28672],
+    # [16384, 28672],
+    # [131072, 28672],
+    # [8192, 1536],
+    # [16384, 1536],
+    # [131072, 1536],
+    # [8192, 512],
+    # [16384, 512],
+    # [131072, 512],
+    # [8192, 128],
+    # [16384, 128],
+    # [131072, 128],
+    # [8, 16384],
+    # [32, 16384],
+    # [128, 16384],
+    # [256, 16384],
+    # [8, 53248],
+    # [32, 53248],
+    # [128, 53248],
+    # [256, 53248],
+    # [8, 8192],
+    # [32, 8192],
+    # [128, 8192],
+    # [256, 8192],
+    # [8, 28672],
+    # [32, 28672],
+    # [128, 28672],
+    # [256, 28672],
+    # [8, 1536],
+    # [32, 1536],
+    # [128, 1536],
+    # [256, 1536],
+    # [8, 512],
+    # [32, 512],
+    # [128, 512],
+    # [256, 512],
+    # [8, 128],
+    # [32, 128],
+    # [128, 128],
+    # [256, 128],
     ]
 
 
@@ -100,9 +150,12 @@ def run_benchmark(args):
         quant_fn = get_provider(provider)
 
         def fn():
-            quant_fn(x)
+            if provider == "triton":
+                quant_fn(x, use_hw_cvt=args.use_hw_cvt)
+            else:
+                quant_fn(x)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
 
         # Read x and write quantized output + block scales.
         x_bytes = x.numel() * x.element_size()
@@ -174,6 +227,12 @@ def parse_args(args: list[str] | None = None):
         "-o",
         action="store_true",
         help="Write performance results to CSV file.",
+    )
+    parser.add_argument(
+        "--use-hw-cvt",
+        action="store_true",
+        help="Use the native gfx950 hardware conversion instruction in the "
+        "triton provider (ignored by other providers). Requires bf16 input.",
     )
     return parser.parse_args(args=args)
 

@@ -140,14 +140,17 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
     stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    # N (dim 1) is memory-contiguous; vectorize 8 elements/thread there for dwordx4 loads.
     layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1],
+        size_per_thread=[1, 8],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, num_warps],
-        order=[0, 1],
+        order=[1, 0],
     )
 
-    for pid_n in range(start_n, min(start_n + NUM_ITER, N)):
+    end_n = min(start_n + NUM_ITER, N)
+
+    for pid_n in range(start_n, end_n):
         x_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
             0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout)
         )
@@ -155,7 +158,6 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
             0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, layout)
         )
         x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
-
         if EVEN_M_N:
             x = gl.load(x_ptr + x_offs, cache_modifier=".cg").to(gl.float32)
         else:
