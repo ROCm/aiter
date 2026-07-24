@@ -180,7 +180,9 @@ def _lds_store_raw(raw_ptr, val, idx):
 
 
 _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
-_dummy_local_tokens_cache = {}  # device -> torch.Tensor(1, dtype=i32); unused placeholder
+_dummy_local_tokens_cache = (
+    {}
+)  # device -> torch.Tensor(1, dtype=i32); dummy placeholder when has_local_tokens=False
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +207,18 @@ def _compile_moe_sorting_oneshot(
     topk : int
         Experts per token (e.g. 8 for DeepSeek R1).
     max_tokens : int
-        Upper bound on T for LDS sizing 
+        Upper bound on T for LDS sizing (always the static padded capacity,
+        never the dynamic per-call count -- keeps LDS size, grid/workspace
+        sizing, and kernel-variant selection identical across CUDA graph
+        capture and replay).
     unit_size : int
         GEMM tile-M for padding alignment (default 32).
     has_local_tokens : bool
         When True, an extra ``p_local_tokens`` [1]-element i32 tensor arg is
-        read on-device 
+        read on-device for the *exact* per-call token count, used for data-dependent loop bounds and the
+        ``num_valid_ids[1]`` output. Never synced to host -- CUDA-graph-safe.
+        The sentinel value written into padding rows always uses the static
+        ``max_tokens``-scale ``i32_tokens`` arg.
     """
     arch = get_hip_arch()
     E = num_experts
@@ -1127,7 +1135,7 @@ def _compile_moe_sorting_multiphase(
 
         reduce_mr = fx.SharedAllocator().allocate(P1SharedStorage).peek().reduce.ptr
 
-        # Data-dependent scan 
+        # Data-dependent scan
         tokens_ = i32_tokens
         if has_local_tokens:
             ltok_rsrc = buffer_ops.create_buffer_resource(
@@ -1139,9 +1147,9 @@ def _compile_moe_sorting_multiphase(
 
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
         i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
-        n_iters = (i32_scan_words_per_row + fx.Int32(K3_WORDS_PER_ITER - 1)) >> fx.Int32(
-            K3_WORDS_PER_ITER_LOG2
-        )
+        n_iters = (
+            i32_scan_words_per_row + fx.Int32(K3_WORDS_PER_ITER - 1)
+        ) >> fx.Int32(K3_WORDS_PER_ITER_LOG2)
 
         if has_mask:
             mask_rsrc = buffer_ops.create_buffer_resource(
@@ -1175,7 +1183,9 @@ def _compile_moe_sorting_multiphase(
             iter_cnt = c_zero
             for _wi in range_constexpr(K3_VEC_WIDTH):
                 word = Vec(vec4)[_wi]
-                word_valid = valid & ((word_base + fx.Int32(_wi)) < i32_scan_words_per_row)
+                word_valid = valid & (
+                    (word_base + fx.Int32(_wi)) < i32_scan_words_per_row
+                )
                 b0 = word & c_ff
                 b1 = (word >> fx.Int32(8)) & c_ff
                 b2 = (word >> fx.Int32(16)) & c_ff
@@ -1939,18 +1949,37 @@ def moe_sorting_flydsl(
     All output tensors (sorted_ids, sorted_weights, sorted_expert_ids,
     num_valid_ids, moe_buf) must be pre-allocated by the caller.
 
+    ``num_local_tokens``, when a CUDA tensor, is never read on the host (no
+    ``.item()``/sync -- this is what makes the whole path safe to call from
+    inside ``torch.cuda.graph()`` capture, e.g. under DP-attention + EP). Host
+    -side sizing (LDS, workspace, grid dims, which kernel variant to launch)
+    always uses the static padded capacity ``topk_ids.shape[0]`` instead, so
+    kernel selection is identical across capture and replay regardless of the
+    real per-call token count. The exact count is read **on-device** inside
+    the compiled kernel (mirroring Opus's ``p_local_tokens`` pattern) and used
+    only for data-dependent loop bounds / the ``num_valid_ids[1]`` output.
+
     Returns
     -------
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
     """
     topk = topk_ids.shape[1]
-    has_local_tokens = isinstance(num_local_tokens, torch.Tensor)
+    has_local_tokens = (
+        isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda
+    )
     if has_local_tokens:
         local_tokens_tensor = num_local_tokens
         M = topk_ids.shape[0]
     else:
         local_tokens_tensor = None
-        M = int(num_local_tokens) if num_local_tokens is not None else topk_ids.shape[0]
+        if isinstance(num_local_tokens, torch.Tensor):
+            M = int(num_local_tokens.item())
+        else:
+            M = (
+                int(num_local_tokens)
+                if num_local_tokens is not None
+                else topk_ids.shape[0]
+            )
 
     if local_tokens_tensor is None:
         local_tokens_tensor = _dummy_local_tokens_cache.get(topk_ids.device)

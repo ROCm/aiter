@@ -461,7 +461,14 @@ def test_moe_sorting_decode_graph_perf(
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            run()
+            # moe_sorting() allocates fresh output tensors on every call
+            # (torch.empty(...) inside _flydsl_moe_sorting / _moe_sorting_impl).
+            # Keep a live Python reference to what's captured -- CUDA graph
+            # semantics require capture-time allocations to stay referenced
+            # for the graph's lifetime, or the allocator can reclaim that
+            # memory (e.g. for a later unrelated allocation) while replay
+            # still writes into it.
+            captured_out = run()
         torch.cuda.synchronize()
 
         # Set the REAL per-step token count, then time steady-state replay.
@@ -478,6 +485,7 @@ def test_moe_sorting_decode_graph_perf(
         end_event.record()
         end_event.synchronize()
         us = start_event.elapsed_time(end_event) * 1000 / num_iters
+        del captured_out
 
         ret[f"{name} us"] = us
 
@@ -595,14 +603,18 @@ def main():
 
     for dtype in args.dtype:
         df = []
-        for padding_extra, expert_mask, dispatch_policy, accumulate, m in (
-            itertools.product(
-                args.padding,
-                args.expert_mask,
-                args.dispatch_policy,
-                args.accumulate,
-                args.m,
-            )
+        for (
+            padding_extra,
+            expert_mask,
+            dispatch_policy,
+            accumulate,
+            m,
+        ) in itertools.product(
+            args.padding,
+            args.expert_mask,
+            args.dispatch_policy,
+            args.accumulate,
+            args.m,
         ):
             for E, topk in model_configs:
                 df.append(
@@ -637,7 +649,9 @@ def main():
                         topk,
                         has_expert_mask=expert_mask,
                     )
-            aiter.logger.info("moe_sorting FlyDSL cuda-graph capture/replay: all passed")
+            aiter.logger.info(
+                "moe_sorting FlyDSL cuda-graph capture/replay: all passed"
+            )
 
         if args.decode_graph:
             decode_rows = []
