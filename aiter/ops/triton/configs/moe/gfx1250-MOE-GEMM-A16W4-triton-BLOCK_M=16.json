@@ -1,0 +1,28 @@
+{
+    "N_LEQ_6144": {
+        "K_LEQ_3072": {
+            "block_n": 128,
+            "block_k": 256,
+            "num_warps": 4,
+            "num_stages": 1,
+            "group_m": 4,
+            "xcd_swizzle": 8,
+            "w_cache_modifier": ".cg",
+            "split_k": 1,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16
+        },
+        "K_LEQ_6144": {
+            "block_n": 128,
+            "block_k": 512,
+            "num_warps": 4,
+            "num_stages": 1,
+            "group_m": 4,
+            "xcd_swizzle": 8,
+            "w_cache_modifier": ".cg",
+            "split_k": 1,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16
+        }
+    }
+}

@@ -1,66 +1,13 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs_details/_matmul_ogs.py
 
-import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
-
-
-def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
-    M, N, K = None, args["N"], args["K"]
-    Y, X, W = args["Y"], args["X"], args["W"]
-    hist = args["ExptHist"]
-    if hist is not None:
-        n_rows = int(hist.float().mean())
-        n_tokens = float(hist.sum())
-        n_w_bytes = (W.numel() * W.element_size() // hist.numel()) * (hist > 0).sum()
-    else:
-        n_tokens = None
-        n_w_bytes = W.numel() * W.element_size()
-
-    def repr(s, x):
-        return f"{s}={x}" if x is not None else f"E_{len(hist)}({s})={n_rows}"
-
-    nbits = X.dtype.itemsize * 8
-    ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
-    gindx = args.get("GatherIndx", None)
-    if gindx is not None:
-        gindx = gindx.to(torch.int32)
-        ret["name"] += "_layer1"
-    else:
-        ret["name"] += "_layer2"
-    if args["B"] is not None:
-        ret["name"] += "_bias"
-    if args["APPLY_SWIGLU"]:
-        ret["name"] += "_swiglu"
-
-    fM = n_tokens
-    fK = K if K is not None else n_tokens
-    ret[f"flops{nbits}"] = 2.0 * fM * N * fK
-
-    n_x_bytes = X.numel() * X.element_size()
-    n_y_bytes = Y.numel() * Y.element_size()
-    if hist is not None:
-        assert n_tokens is not None
-        n_expts_act = args["N_EXPTS_ACT"]
-
-        if gindx is not None:
-            # recreate inverse GatherIndx.
-            dst = torch.full_like(gindx, -1)
-            idx = torch.arange(len(gindx), device=gindx.device, dtype=torch.int32)
-            mask = gindx != -1
-            dst[gindx[mask]] = idx[mask]
-            n_read_rows = (dst.view((-1, n_expts_act)) != -1).any(dim=1).sum()
-        else:
-            n_read_rows = n_tokens
-        n_x_bytes = n_read_rows * X.shape[-1] * X.element_size()
-        n_y_bytes = n_tokens * Y.shape[-1] * Y.element_size()
-    ret["bytes"] = int(n_x_bytes + n_y_bytes + n_w_bytes)
-
-    return ret
+from aiter.ops.triton._triton_kernels.moe.launch_metadata import (
+    matmul_launch_metadata,
+)
 
 
 # TODO: using aiter swizzle instead can lead to perf degradation in rare cases
@@ -100,8 +47,31 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
+@triton.jit
+def unswizzle_mx_scale_gfx1250(
+    x,
+    BLOCK_N: tl.constexpr,
+    MX_SCALE_BLOCK_K: tl.constexpr,
+    PRESHUFFLE_FACTOR: tl.constexpr = 32,
+    SCALE_KWIDTH: tl.constexpr = 8,
+):
+    # Inverse of aiter shuffle._shuffle_scale_tile_gfx1250 (permute(0,1,3,2,4)):
+    # the physical tile is [N//PF, K_groups] laid out as [num_stripes, num_kchunks,
+    # PF, KW]; swap PF <-> num_kchunks back to logical [N, K_groups]. Mirrors the
+    # gluon unswizzle_mx_scale_gfx1250 in the a8w4 kernel, in plain triton.
+    x = x.reshape(
+        BLOCK_N // PRESHUFFLE_FACTOR,
+        MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+        PRESHUFFLE_FACTOR,
+        SCALE_KWIDTH,
+    )
+    x = x.permute(0, 2, 1, 3)
+    x = x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
+    return x
+
+
 @triton.jit(launch_metadata=matmul_launch_metadata)
-def _moe_gemm_a16w4(
+def _moe_gemm_a16w4_triton(
     Y,
     stride_y_k,
     stride_y_m,
@@ -247,7 +217,10 @@ def _moe_gemm_a16w4(
     MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
     WMxScale += expt_id * stride_w_mx_e
-    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+    if SWIZZLE_MX_SCALE == "CDNA4_SCALE" or SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        # CDNA4 (gfx950) and GFX1250 both preshuffle N by 32 into the K axis, so
+        # the physical scale tile shape [N//32, K_groups*32] and its addressing
+        # are identical; only the in-register unswizzle permute differs (below).
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
         NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
@@ -298,6 +271,12 @@ def _moe_gemm_a16w4(
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,
             )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+            )
         else:
             w_scales = tl.load(WMxScalePtrs)
 
@@ -324,6 +303,12 @@ def _moe_gemm_a16w4(
         x_scales: tl.constexpr = None
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = unswizzle_mx_scale_cdna4(
+                tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+            )
+        elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scales = unswizzle_mx_scale_gfx1250(
                 tl.load(WMxScalePtrs, cache_modifier=W_CACHE_MODIFIER),
                 BLOCK_N,
                 MX_SCALE_BLOCK_K,

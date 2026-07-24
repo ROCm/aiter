@@ -1,14 +1,25 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
+import functools
 import itertools
+import json
+import os
+from typing import Optional
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4,
+    _moe_gemm_a16w4_triton,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_gluon_stage1,
+    _moe_gemm_a16w4_gluon_stage2,
+    _moe_gemm_a16w4_gluon_stage3,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -63,59 +74,189 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data):
-    block_m = routing_data.block_m
-    group_m = 4
-    num_xcds = 8
-    xcd_swizzle = num_xcds
-    w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
-    split_k = 1
-    block_k = 256
-
-    if block_m == 16:
-        block_n = 128
-        num_warps = 4
-
-        grid_m = routing_data.n_blocks(m, block_m)
-        grid_n = triton.cdiv(n, block_n)
-        grid = grid_m * grid_n * split_k
-        while block_n >= 64 and grid < 256:
-            block_n = block_n // 2
-            grid_m = routing_data.n_blocks(m, block_m)
-            grid_n = triton.cdiv(n, block_n)
-            grid = grid_m * grid_n * split_k
-
-    elif block_m == 32:
-        if n <= 1024:
-            block_n = 128
-            num_warps = 4
-        elif n <= 4096:
-            block_n = 256
-            num_warps = 8
-        else:
-            block_n = 512
-            num_warps = 8
-
-    else:
-        block_n = 512
-        num_warps = 8
-
-    ret = {
-        "block_m": block_m,
-        "block_n": block_n,
-        "block_k": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "group_m": group_m,
-        "xcd_swizzle": xcd_swizzle,
-        "w_cache_modifier": w_cache_modifier,
-        "split_k": split_k,
+def get_kernel_config_triton(m, n, k, routing_data):
+    """Functional (non-tuned) default triton config; fallback when no tuned JSON
+    entry exists (tuned configs live in configs/moe). Safe for any (block_m, N, K):
+    the 128-wide N and 256-deep K tiles are masked when N/K are smaller."""
+    return {
+        "block_m": routing_data.block_m,
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 1,
+        "group_m": 4,
+        "xcd_swizzle": 8,
+        "w_cache_modifier": None,
+        "split_k": 1,
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": 16,
-        "kpack": 1,
     }
-    return ret
+
+
+def get_kernel_config_gluon(m, n, k, routing_data, force_num_buffers=None):
+    """Functional (non-tuned) default gluon config; fallback when no tuned JSON
+    entry exists (tuned configs live in configs/moe). Safe for any (block_m, N, K):
+    single-buffer, 128-wide N tile, 256-deep K tile (satisfies the stage>=2 BLOCK_K
+    floor). ``force_num_buffers`` pins the pipeline stage."""
+    return {
+        "block_m": routing_data.block_m,
+        "block_n": 128,
+        "block_k": 256,
+        "num_warps": 4,
+        "num_stages": 2,
+        "group_m": 4,
+        "xcd_swizzle": 1,
+        "w_cache_modifier": None,
+        "split_k": 1,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "num_buffers": 1 if force_num_buffers is None else force_num_buffers,
+    }
+
+
+_MOE_A16W4_CONFIG_NAME = "MOE-GEMM-A16W4"
+
+
+@functools.lru_cache(maxsize=256)
+def _load_moe_a16w4_json(variant: str, block_m: int):
+    """Load the configs/moe JSON for a (variant, block_m), falling back to the
+    block_m-agnostic file. Returns the raw dict (two-level N -> K mapping), or None
+    if no file exists (JSON is optional)."""
+    arch = get_arch()
+    base = f"{AITER_TRITON_CONFIGS_PATH}/moe"
+    name = f"{arch}-{_MOE_A16W4_CONFIG_NAME}-{variant}"
+    for fname in (f"{name}-BLOCK_M={block_m}.json", f"{name}.json"):
+        fpath = f"{base}/{fname}"
+        if os.path.exists(fpath):
+            with open(fpath, "r") as fh:
+                return json.load(fh)
+    return None
+
+
+def _leq_lookup(mapping: dict, prefix: str, val: int):
+    """Select an entry from `mapping` by `val` via {prefix}_LEQ_x / {prefix}_GEQ_x
+    keys, falling back to a "default" / "any" catch-all. Returns the matched value,
+    or None."""
+    leq = sorted(
+        int(key.rsplit("_", 1)[1])
+        for key in mapping
+        if key.startswith(prefix + "_LEQ_")
+    )
+    for bound in leq:
+        if val <= bound:
+            return mapping[f"{prefix}_LEQ_{bound}"]
+    geq = sorted(
+        (
+            int(key.rsplit("_", 1)[1])
+            for key in mapping
+            if key.startswith(prefix + "_GEQ_")
+        ),
+        reverse=True,
+    )
+    for bound in geq:
+        if val >= bound:
+            return mapping[f"{prefix}_GEQ_{bound}"]
+    if "default" in mapping:
+        return mapping["default"]
+    if "any" in mapping:
+        return mapping["any"]
+    return None
+
+
+def _moe_a16w4_json_entry(variant: str, block_m: int, n: int, k: int):
+    """Config entry for a (variant, block_m, N, K) via the two-level N -> K lookup,
+    or None if no file/entry matches."""
+    cfg = _load_moe_a16w4_json(variant, block_m)
+    if cfg is None:
+        return None
+    sub = _leq_lookup(cfg, "N", n)
+    if not isinstance(sub, dict):
+        return None
+    entry = _leq_lookup(sub, "K", k)
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _auto_default(block_m):
+    """Functional default for the `auto` variant (no JSON): gfx1250 runs gluon,
+    single-buffer. Non-gfx1250 / swizzled scales are forced to triton earlier."""
+    return {"backend": "gluon", "num_buffers": 1}
+
+
+def _get_config(routing_data, m, n, k, config=None, swizzle_mx_scale=None):
+    """Resolve the full a16w4 MoE launch config (backend + stage + tiling).
+
+    Backend/stage come from `config` if pinned, else the ``auto`` variant picks
+    them per shape. Tiling comes from the variant JSON if present, else the
+    functional default; tiling keys in `config` overlay on top.
+
+    Returns ``(config_dict, is_tuned)``; ``config_dict`` always has ``"backend"``
+    and (for gluon) ``"num_buffers"``.
+    """
+    config = dict(config) if config else {}
+    block_m = routing_data.block_m
+    backend = config.get("backend")
+    num_buffers = config.get("num_buffers")
+    pinned_gluon = backend == "gluon"
+
+    arch = get_arch()
+    # Correctness: the gluon a16w4 kernel is gfx1250-only and supports only
+    # compact (non-swizzled) e8m0 scales.
+    if swizzle_mx_scale is not None:
+        if pinned_gluon and arch == "gfx1250":
+            raise ValueError(
+                "backend='gluon' cannot honor swizzled MX scales "
+                f"(swizzle_mx_scale={swizzle_mx_scale!r}): the Gluon a16w4 kernel "
+                "supports only compact e8m0 scales. Use backend='triton'."
+            )
+        backend = "triton"
+    if arch != "gfx1250":
+        backend = "triton"
+
+    is_tuned = False
+    # Resolve backend and/or gluon stage from `auto` when either is unpinned, so
+    # backend="gluon" (no stage) still gets the tuned per-shape stage.
+    if backend is None or (backend == "gluon" and num_buffers is None):
+        auto = _moe_a16w4_json_entry("auto", block_m, n, k)
+        if auto is not None:
+            is_tuned = True
+        else:
+            auto = _auto_default(block_m)
+        if backend is None:
+            backend = auto["backend"]
+        if backend == "gluon" and num_buffers is None:
+            num_buffers = auto.get("num_buffers")
+
+    # Tiling for the chosen variant: JSON if present, else functional default.
+    if backend == "gluon":
+        if num_buffers is None:
+            num_buffers = 1
+        entry = _moe_a16w4_json_entry(f"gluon-num-stage-{num_buffers}", block_m, n, k)
+        if entry is not None:
+            entry["block_m"] = block_m
+            entry.setdefault("num_buffers", num_buffers)
+            params = entry
+            is_tuned = True
+        else:
+            params = get_kernel_config_gluon(
+                m, n, k, routing_data, force_num_buffers=num_buffers
+            )
+    else:
+        entry = _moe_a16w4_json_entry("triton", block_m, n, k)
+        if entry is not None:
+            entry["block_m"] = block_m
+            params = entry
+            is_tuned = True
+        else:
+            params = get_kernel_config_triton(m, n, k, routing_data)
+
+    params["backend"] = backend
+
+    # Overlay caller-supplied tiling keys (everything except the control key).
+    for key, val in config.items():
+        if key != "backend":
+            params[key] = val
+
+    return params, is_tuned
 
 
 # -----------------------------------------------------------------------------
@@ -143,11 +284,20 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    config: Optional[dict] = None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
+
+    Args:
+        config (Optional[dict]): Kernel selection + tuning parameters. May pin
+            ``"backend"`` ("triton"/"gluon"), ``"num_buffers"`` (gluon stage
+            1/2/3), and tiling keys (block_n, block_k, num_warps, etc.). When
+            backend/stage is unpinned, the ``auto`` config resolves it per shape;
+            ``block_m`` always comes from ``routing_data``. See
+            :func:`_get_config`.
     """
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
@@ -163,23 +313,24 @@ def moe_gemm_a16w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
 
-    # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data)
+    # resolve the launch config (backend + stage + tiling); see _get_config.
+    config, _is_tuned = _get_config(
+        routing_data, M, N, K, config=config, swizzle_mx_scale=swizzle_mx_scale
+    )
+    # _get_config always sets block_m from routing_data; keep them in lockstep.
+    assert block_m == config["block_m"], (block_m, config["block_m"])
+    use_gluon = config["backend"] == "gluon"
+    # swiglu runs in the split-k reduction when split_k>1 (matmul writes both
+    # halves), otherwise it folds into the matmul itself.
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
-        reduction_n_matmul = 1
         apply_swiglu_reduction = True
-        reduction_n_reduction = 2
-    elif apply_swiglu:
-        apply_swiglu_matmul = True
-        reduction_n_matmul = 2
-        apply_swiglu_reduction = False
-        reduction_n_reduction = 1
     else:
-        apply_swiglu_matmul = False
-        reduction_n_matmul = 1
+        apply_swiglu_matmul = apply_swiglu
         apply_swiglu_reduction = False
-        reduction_n_reduction = 1
+    # swiglu halves N (factor-2 reduction) in whichever stage applies it.
+    reduction_n_matmul = 2 if apply_swiglu_matmul else 1
+    reduction_n_reduction = 2 if apply_swiglu_reduction else 1
 
     # allocate output memory
     y, y_final = allocate_output(
@@ -191,75 +342,141 @@ def moe_gemm_a16w4(
         routing_data,
         gather_indx,
         scatter_indx,
-        config["block_m"],
+        block_m,
         config["split_k"],
     )
     stride_bias = None if bias is None else bias.stride(0)
 
-    # moe metadata
+    # moe metadata. The kernel unconditionally loads hist / token_offs_raw /
+    # block_pid_map, so expt_data is required (not optional).
     expt_data = routing_data.expt_data
-    expt_hist = None if expt_data is None else expt_data.hist
-    expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
-    expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
-    expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+    assert expt_data is not None, "routing_data.expt_data is required"
+    expt_hist = expt_data.hist
+    expt_hist_sum = expt_data.token_offs_pad[-1]
+    expt_token_offs_raw = expt_data.token_offs_raw
+    expt_block_pid_map = expt_data.block_pid_map
 
     # spmd grid
-    grid_m = routing_data.n_blocks(M, config["block_m"])
+    grid_m = routing_data.n_blocks(M, block_m)
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    _moe_gemm_a16w4[(grid,)](
-        y,
-        y.stride(0),
-        y.stride(1),
-        y.stride(2),
-        x,
-        x.stride(0),
-        x.stride(1),
-        w,
-        w.stride(0),
-        w.stride(1),
-        w.stride(2),
-        w_scales,
-        w_scales.stride(0),
-        w_scales.stride(1),
-        w_scales.stride(2),
-        bias,
-        stride_bias,
-        gammas,
-        N,
-        K,
-        gather_indx,
-        expt_hist,
-        expt_token_offs_raw,
-        expt_hist_sum,
-        expt_block_pid_map,
-        grid_m,
-        grid_n,
-        apply_swiglu_matmul,
-        alpha,
-        limit,
-        reduction_n_matmul,
-        swiglu_add_residual,
-        routing_data.n_expts_act,
-        config["block_m"],
-        config["block_n"],
-        config["block_k"],
-        config["group_m"],
-        XCD_SWIZZLE=config["xcd_swizzle"],
-        SWIZZLE_MX_SCALE=swizzle_mx_scale,
-        SPLIT_K=config["split_k"],
-        EVEN_K=K % config["block_k"] == 0,
-        MASK_K_LIMIT=K % config["block_k"],
-        W_CACHE_MODIFIER=config["w_cache_modifier"],
-        num_warps=config["num_warps"],
-        num_stages=config["num_stages"],
-        UPCAST_INDICES=should_upcast_indices(x, w, y),
-        waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        kpack=config["kpack"],
-    )
+    if use_gluon:
+        w_scales_kernel = w_scales.transpose(1, 2)
+        # Each pipeline stage is a separate named kernel; pick by buffer count so
+        # profiles attribute time to the pipeline that actually ran.
+        num_buffers = max(
+            1, min(config["num_buffers"], triton.cdiv(K, config["block_k"]))
+        )
+        if num_buffers == 1:
+            gluon_kernel = _moe_gemm_a16w4_gluon_stage1
+        elif num_buffers == 2:
+            gluon_kernel = _moe_gemm_a16w4_gluon_stage2
+        else:
+            gluon_kernel = _moe_gemm_a16w4_gluon_stage3
+        gluon_kernel[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales_kernel,
+            w_scales_kernel.stride(0),
+            w_scales_kernel.stride(1),
+            w_scales_kernel.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            x.shape[-2],
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            block_m,
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=num_buffers,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        )
+    else:
+        _moe_gemm_a16w4_triton[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            block_m,
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            SPLIT_K=config["split_k"],
+            EVEN_K=K % config["block_k"] == 0,
+            MASK_K_LIMIT=K % config["block_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+        )
 
     # Build grouped reduction inputs in a uniform way
     group_indx = (
