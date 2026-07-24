@@ -93,7 +93,9 @@ def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         o = tl.maximum(o, 0.0)
         o = o * scale_weight[None, :].T
 
-        mask = context_idx + tl.arange(0, ChunkK) <= context_length - pid_next_n
+        mask = (
+            context_idx + tl.arange(0, ChunkK) <= context_length - next_n + pid_next_n
+        )
         o = tl.where(mask[None, :], o, float("-inf"))
 
         tl.store(
@@ -188,7 +190,9 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
         o = tl.maximum(o, 0.0)
         o = o * scale_weight[None, :].T
 
-        mask = context_idx + tl.arange(0, ChunkK) <= context_length - pid_next_n
+        mask = (
+            context_idx + tl.arange(0, ChunkK) <= context_length - next_n + pid_next_n
+        )
         o = tl.where(mask[None, :], o, float("-inf"))
 
         logits = tl.reduce(o, axis=0, combine_fn=_sum_combine)
