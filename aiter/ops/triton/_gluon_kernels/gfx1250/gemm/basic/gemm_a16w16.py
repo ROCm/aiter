@@ -498,7 +498,7 @@ def _gemm_a16w16_compute_bound_kernel(
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
     # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
-    for _ in gl.static_range(NUM_BUFFERS):
+    for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
@@ -532,7 +532,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # Register pre-load prologue: wait for tile 0 then read it into cur_a/cur_b.
     # After TDM prologue there are (NUM_BUFFERS-1)*2 ops in-flight; waiting for
     # (NUM_BUFFERS-2)*2 lets exactly one tile (tile 0) complete.
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     if LAYOUT[0] == "T":
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -592,7 +592,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
     # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
     # compute_idx+1 has landed in LDS.
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     load_idx += 1
 
@@ -627,7 +627,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # The final K tile is peeled out after this loop so its (possibly partial)
     # TDM load can be bounds-checked with set_bounds; the interior iterations
     # use the fast add_offsets path that leaves the OOB bound untouched.
-    for _ in range(num_k_tiles - NUM_BUFFERS - 2):
+    for _ in range(num_k_tiles - NUM_BUFFERS - 1):
 
         # WMMA for the current tile — uses operands pre-loaded in the
         # *previous* iteration so no ds_read stall before the matrix op.
@@ -663,7 +663,7 @@ def _gemm_a16w16_compute_bound_kernel(
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
         # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
         # compute_idx+1 has landed in LDS.
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
         load_idx += 1
 
@@ -727,7 +727,7 @@ def _gemm_a16w16_compute_bound_kernel(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     load_idx += 1
 
@@ -757,8 +757,8 @@ def _gemm_a16w16_compute_bound_kernel(
 
     # Epilogue: no more TDM loads; drain the remaining NUM_BUFFERS-1 tiles.
     # The first NUM_BUFFERS-2 iterations still use the pre-load / WMMA pattern.
-    for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+    for i in gl.static_range(NUM_BUFFERS - 2):
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
 
         if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(

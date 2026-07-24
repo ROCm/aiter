@@ -1,0 +1,16 @@
+gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
+gfx1250,256,1,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,2,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,4,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,8,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,16,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,32,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,64,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,128,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,256,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,512,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,1024,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,2048,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,4096,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,8192,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
+gfx1250,256,16384,32320,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0.0,auto,0.0,0.0,0.0
