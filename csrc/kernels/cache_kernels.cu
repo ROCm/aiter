@@ -1772,7 +1772,9 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
     const int pe_dim,                          // 64
     const int block_size,                      //
     const float* k_scale,                         //
-    const float* q_scale
+    const float* q_scale,
+    const int max_position,
+    const bool compute_all_q
 ) {
   const int64_t token_idx = blockIdx.x / num_heads; //num_heads
   const int64_t head_idx = blockIdx.x % num_heads;
@@ -1780,10 +1782,16 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
   const int64_t slot_idx = slot_mapping[token_idx];
   int64_t pos = positions[token_idx];
 
-  // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
+  // compute_all_q == false (non-DCP default): restore the original early-return
+  // so padded / cudagraph tokens (slot_idx < 0) skip Q RoPE + q_out entirely.
+  // compute_all_q == true (DCP): every rank needs all queries after the head
+  // all-gather, so compute Q RoPE unconditionally; only the KV-cache writes
+  // below are guarded by (slot_idx >= 0). Clamp pos defensively: padded tokens
+  // may carry a stale position that would index cos/sin out of bounds.
+  if (!compute_all_q && slot_idx < 0) {
     return;
   }
+  pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
   int64_t cos_sin_cache_offset = pos * 32;
   const scalar_t *cos_ptr = cos_cache + cos_sin_cache_offset;
   const scalar_t *sin_ptr = sin_cache + cos_sin_cache_offset;
@@ -1859,7 +1867,7 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
   }
   float fp32_cos = static_cast<float>(cos);
   float fp32_sin = static_cast<float>(sin);
-  if (head_idx == 0) {
+  if (head_idx == 0 && slot_idx >= 0) {
     auto const* ptr_i               = reinterpret_cast<scalar_t const*>(kv_c + token_idx * kv_c_stride);
 
     // Use opus::make_gmem for kv_c input
@@ -1949,16 +1957,17 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     const int kv_lora_rank, const int pe_dim,                          // 64
     const int block_size,                      //
     const float* k_scale, const float* q_scale,
-    bool is_neox, bool is_nope_first
+    bool is_neox, bool is_nope_first, const int max_position,
+    const bool compute_all_q
 ) {
   if (is_neox) {
-    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, true, true, vec_size>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
-                                                  positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, 
-                                                  q_out_stride_0, q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale);
+    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, true, true, vec_size>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping,
+                                                  positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1,
+                                                  q_out_stride_0, q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale, max_position, compute_all_q);
   } else {
-    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, false, true, vec_size>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, 
-                                                  positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, 
-                                                  q_out_stride_0, q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale);
+    fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl<scalar_t, cache_t, query_t, kv_dt, q_dt, false, true, vec_size>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping,
+                                                  positions, cos_cache, sin_cache,block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1,
+                                                  q_out_stride_0, q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, k_scale, q_scale, max_position, compute_all_q);
   }
 
 }
@@ -2171,14 +2180,21 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         const int kv_c_stride, const int k_pe_stride,
         const int kv_lora_rank, const int pe_dim,
         const int block_size,
-        const float* scale, const float* q_scale
+        const float* scale, const float* q_scale,
+        const int max_position,
+        const bool compute_all_q
     ) {
       const int64_t token_idx = blockIdx.x;
       const int64_t slot_idx = slot_mapping[token_idx];
-      // NOTE: slot_idx can be -1 if the token is padded
-      if (slot_idx < 0) {
+      // compute_all_q == false (non-DCP default): restore the original
+      // early-return so padded / cudagraph tokens (slot_idx < 0) skip Q RoPE +
+      // q_out entirely. compute_all_q == true (DCP): every rank needs all
+      // queries after the head all-gather, so keep Q RoPE unconditional; only
+      // the KV-cache writes are guarded by write_kv.
+      if (!compute_all_q && slot_idx < 0) {
         return;
       }
+      const bool write_kv = (slot_idx >= 0);
       //concat
       const int64_t block_idx = slot_idx / block_size;
       const int64_t block_offset = slot_idx % block_size;
@@ -2235,8 +2251,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       vec_cur = q_buffer_i.template load<vec_size_i>(
           q_head_idx * q_nope_stride_1 + q_vec_dst_idx * vec_size_i);
       
-      // Load and store k vector (only threads < k_num_vecs need to work)
-      if (vec_idx < k_num_vecs)
+      // Load and store k vector (only threads < k_num_vecs need to work).
+      // DCP: KV write only on the owning rank (write_kv).
+      if (write_kv && vec_idx < k_num_vecs)
       {
         k_vec_cur = buffer_i.template load<vec_size_i>(vec_idx * vec_size_i);
         if constexpr (kv_dt == vllm::Fp8KVCacheDataType::kAuto) {
@@ -2247,7 +2264,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         }
       }
       int64_t pos = positions[token_idx];
-
+      // Clamp pos defensively: padded / cudagraph tokens (slot_idx < 0) may
+      // carry a stale position that would index cos/sin caches out of bounds.
+      pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
       int64_t cos_sin_cache_offset = pos * pe_dim / 2;
 
       const scalar_t *cos_ptr = cos_cache + cos_sin_cache_offset;
@@ -2347,9 +2366,9 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
               q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_q_converted, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
           }
       }
-    // apply rotary
+    // apply rotary (k_pe RoPE write into KV cache; DCP: owning rank only)
     const int nk =  embed_dim;
-    if (threadIdx.x < nk)
+    if (write_kv && threadIdx.x < nk)
     {
       if constexpr (is_nope_first)
       {
@@ -2385,24 +2404,25 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         const int kv_lora_rank, const int pe_dim,
         const int block_size,
         const float* scale, const float* q_scale,
-        bool is_neox, bool is_nope_first
+        bool is_neox, bool is_nope_first, const int max_position,
+        const bool compute_all_q
     ) {
       if (is_neox && is_nope_first) {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions,
                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0,
-                                           q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale);
+                                           q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale, max_position, compute_all_q);
       } else if (is_neox && !is_nope_first) {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
-                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0, 
-                                            q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, true, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions,
+                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0,
+                                            q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale, max_position, compute_all_q);
       } else if (!is_neox && is_nope_first) {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
-                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0, 
-                                            q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, true>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions,
+                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0,
+                                            q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale, max_position, compute_all_q);
       } else {
-        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions, 
-                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0, 
-                                            q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale);
+        fuse_qk_rope_concat_and_cache_mla_kernel_opt<scalar_t,cache_t,query_t, kv_dt, q_dt, false, false>(q_nope, q_pe, kv_c, k_pe, kv_cache, q_out, slot_mapping, positions,
+                                            cos_cache, sin_cache, block_stride, entry_stride, q_nope_stride_0, q_nope_stride_1, q_pe_stride_0, q_pe_stride_1, q_out_stride_0,
+                                            q_out_stride_1, num_heads, kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size, scale, q_scale, max_position, compute_all_q);
       }
     }
 
@@ -3530,7 +3550,7 @@ void reshape_and_cache_flash(
          kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,                             \
          reinterpret_cast<const float*>(k_scale.data_ptr()),                                     \
          reinterpret_cast<const float*>(q_scale.data_ptr()),                                     \
-         is_neox, is_nope_first);
+         is_neox, is_nope_first, max_position, compute_all_q);
 #define CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
  aiter::fuse_qk_rope_concat_and_cache_mla_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE>      \
        <<<grid, block, 0, stream>>>(                                                             \
@@ -3550,7 +3570,7 @@ void reshape_and_cache_flash(
          kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,                             \
          reinterpret_cast<const float*>(k_scale.data_ptr()),                                     \
          reinterpret_cast<const float*>(q_scale.data_ptr()),                                     \
-         is_neox, is_nope_first);
+         is_neox, is_nope_first, max_position, compute_all_q);
 #define CALL_PREFILL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_rope_concat_and_cache_mla_kernel_prefill<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE>      \
                <<<grid, block, 0, stream>>>(                                                             \
@@ -4147,7 +4167,8 @@ void fused_qk_rope_concat_and_cache_mla(
     aiter_tensor_t& positions, // [num_tokens]
     aiter_tensor_t &cos_cache, // [max_position, rot_dim//2]
     aiter_tensor_t &sin_cache, // [max_position, rot_dim//2]
-    bool is_neox, bool is_nope_first
+    bool is_neox, bool is_nope_first,
+    bool compute_all_q
 ) {
   int num_tokens = slot_mapping.size(0);
   int kv_lora_rank = kv_c.size(-1);
@@ -4159,6 +4180,9 @@ void fused_qk_rope_concat_and_cache_mla(
   int num_blocks = (num_tokens + block_size - 1) / block_size;
   int num_actual_tokens = slot_mapping.size(0);
   int num_slots = slot_mapping.size(0);
+  // Upper bound for the defensive pos clamp inside the decode kernels (padded /
+  // cudagraph tokens with slot_idx < 0 may carry a stale position).
+  const int max_position = cos_cache.size(0);
 
   AITER_CHECK(q_nope.dim() == q_pe.dim());
   AITER_CHECK(q_nope.size(1) == q_pe.size(1));

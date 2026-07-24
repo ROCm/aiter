@@ -130,7 +130,10 @@ void fused_qk_rope_concat_and_cache_mla(
     aiter_tensor_t& cos_cache, // [max_positions, pe_dim//2]
     aiter_tensor_t& sin_cache, // [max_positions, pe_dim//2]
     bool is_neox,
-    bool is_nope_first);
+    bool is_nope_first,
+    // compute_all_q: false (default, non-DCP) restores slot<0 early-return;
+    // true (DCP) forces Q RoPE for every token (needed after head all-gather).
+    bool compute_all_q = false);
 
 // DeepSeek V3.1 MLA: fused QK RoPE(pe) + static FP8 quant + segmented paged KV
 // cache write (no RMSNorm). kv_cache is flat [num_blocks, page_size*kv_lora +
