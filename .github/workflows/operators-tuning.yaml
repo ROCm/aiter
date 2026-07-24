@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout aiter repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Sync submodules
         run: |
@@ -104,7 +104,7 @@ jobs:
 
       - name: Upload tuned CSVs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tuned-csvs
           path: aiter/configs/*.csv
