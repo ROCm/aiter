@@ -136,8 +136,8 @@ def call_metadata(inputs, outs, dtype, kvtype):
         uni_seqlen_qo=UNI_SEQLEN_QO,
         fast_mode=True,
         max_split_per_batch=MAX_SPLIT_PER_BATCH,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
     )
 
 
