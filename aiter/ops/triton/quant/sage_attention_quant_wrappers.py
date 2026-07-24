@@ -7,6 +7,7 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
+    sage_quant_v_fp4_colmajor_kernel,
     sage_quant_kernel,
     _rot_k_only_kernel,
     _rot_q_kernel,
@@ -194,6 +195,125 @@ def sage_quant_mxfp4(
     k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
 
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+
+
+_F4F4_V_KPERM_CACHE = {}
+
+
+def _f4f4_v_kperm(device):
+    """Cached int32 [64] 'meas' kv-column permutation for the f4f4 col-major V pack
+    (col c holds kv-token kperm[c]). Built once per device so it is not recreated per
+    call (and stays out of any CUDA-graph capture region)."""
+    kp = _F4F4_V_KPERM_CACHE.get(device)
+    if kp is None:
+        s = torch.arange(64, device=device)
+        j = s % 32
+        pi = 4 * (j // 8) + 16 * ((j // 4) % 2) + (j % 4)
+        tau64 = 32 * (s // 32) + pi
+        kperm = torch.empty(64, dtype=torch.long, device=device)
+        kperm[tau64] = s  # kperm[col] = tau64^{-1}(col)
+        kp = kperm.to(torch.int32).contiguous()
+        _F4F4_V_KPERM_CACHE[device] = kp
+    return kp
+
+
+def sage_quant_f4f4(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    USE_RNE=False,
+    R=None,
+    BLOCK_R=32,
+):
+    """f4f4 quantizer: fp4 Q/K (mxfp4, hadamard-rotated) + per-channel fp4 (E2M1) V in
+    the kernel's col-major LDS operand layout. The Q/K path is identical to
+    ``sage_quant_mxfp4``; V is packed to fp4 (uint8, 8x1024 B col-major blocks per
+    128-kv tile) with an f32 per-channel descale instead of fp8. In-tree (no dependency
+    on the research host packer). FP8_TYPE/FP8_MAX are accepted for signature parity with
+    ``sage_quant_mxfp4`` but unused (V is fp4, not fp8).
+
+    Returns (q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s), where
+    v_fp4_view is a strided [b, sk, h_kv, 128] uint8 view over a [b, h_kv, nT*8192]+64 B
+    backing buffer (seq stride 64). flash_attn_mxfp4_func consumes it directly -- do NOT
+    call .contiguous() on it (that would drop the col-major LDS layout -> garbage). The
+    kernel's V loads are bounds-checked (num_records = kv_len*64), so the last-token
+    strided window is safe; the +64 B slack only keeps the torch view in storage bounds.
+    """
+    if layout == "bshd":
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = v.shape
+        v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, d] (strided view; kernel reads strides)
+    elif layout == "bhsd":
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = v.shape
+        v_tok = v  # [b, h_kv, sk, d]
+    else:
+        raise ValueError(f"Unknown tensor layout: {layout}")
+
+    tile = 128
+    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
+    assert (
+        kv_len % tile == 0
+    ), f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
+    nT = kv_len // tile
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    # Q/K: identical to sage_quant_mxfp4 (hadamard rotation + smoothing -> mxfp4).
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+
+    # V: per-channel fp4 (E2M1) col-major LDS pack. descale = per-channel amax over kv / 6
+    # (E2M1 max), computed in torch like the fp8 sage_quant_v path (scale-outside).
+    amax = v_tok.abs().amax(dim=-2).to(torch.float32)  # [b, h_kv, d]
+    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
+    kperm = _f4f4_v_kperm(v.device)
+    packed = torch.empty((b, h_kv, nT * 8192), dtype=torch.uint8, device=v.device)
+    grid = (b * h_kv * nT * 8,)
+    sage_quant_v_fp4_colmajor_kernel[grid](
+        v_tok,
+        packed,
+        v_descale,
+        kperm,
+        v_tok.stride(0),
+        v_tok.stride(1),
+        v_tok.stride(2),
+        v_tok.stride(3),
+        packed.stride(0),
+        packed.stride(1),
+        v_descale.stride(0),
+        v_descale.stride(1),
+        h_kv,
+        nT,
+        kv_len,
+    )
+    # +64 B slack so the strided view's last-token window (seq stride 64 < 128) stays in
+    # storage bounds (kernel reads are separately bounds-checked by num_records).
+    buf = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
+    v_fp4_view = torch.as_strided(
+        buf,
+        (b, kv_len, h_kv, 128),
+        (h_kv * kv_len * 64, 64, kv_len * 64, 1),
+    )
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
 
 
 def sage_quant(

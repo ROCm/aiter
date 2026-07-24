@@ -172,6 +172,83 @@ def sage_quant_v_kernel(
 
 
 @triton.jit
+def _e2m1_code(y):
+    """E2M1 (fp4) nearest encode, ties toward lower magnitude (== numpy argmin
+    first-min): idx = #{grid midpoints strictly below |y|}; sign bit = 8. The grid is
+    {0,.5,1,1.5,2,3,4,6} so the midpoints are {.25,.75,1.25,1.75,2.5,3.5,5.0}."""
+    mag = tl.abs(y)
+    idx = (mag > 0.25).to(tl.int32)
+    idx += (mag > 0.75).to(tl.int32)
+    idx += (mag > 1.25).to(tl.int32)
+    idx += (mag > 1.75).to(tl.int32)
+    idx += (mag > 2.5).to(tl.int32)
+    idx += (mag > 3.5).to(tl.int32)
+    idx += (mag > 5.0).to(tl.int32)
+    sign = (y < 0.0).to(tl.int32) * 8
+    return idx | sign
+
+
+@triton.jit
+def sage_quant_v_fp4_colmajor_kernel(
+    v_ptr,  # V [b, h_kv, S, D] (any strides -- a permuted view is fine, no copy needed)
+    out_ptr,  # uint8 [b, h_kv, nT*8192] col-major fp4 operand blocks
+    desc_ptr,  # fp32 [b, h_kv, D]  per-channel descale = amax_over_S / 6
+    kperm_ptr,  # int32 [64]  'meas' kv-col permutation (col kk holds token kperm[kk])
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_db,
+    stride_dh,
+    h_kv,
+    nT,
+    S,
+):
+    """Pack per-channel fp4 (E2M1) V into the f4f4 kernel's col-major LDS operand layout:
+    per 128-kv tile, 8 blocks of 1024 B (u = 2*n + k; n = head-dim 32-block 0..3, k = kv
+    64-half 0..1); each block is 64 kv-cols x 16 nibble-bytes (even chan -> low nibble, odd
+    chan -> high nibble). One program packs one 1024 B block. Cosine-equivalent to the numpy
+    packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral)."""
+    pid = tl.program_id(0)
+    u = pid % 8
+    t = (pid // 8) % nT
+    bh = pid // (8 * nT)
+    bb = bh // h_kv
+    hh = bh % h_kv
+    n = u // 2  # head-dim 32-block
+    k = u % 2  # kv 64-half
+
+    kk = tl.arange(0, 64)
+    tok_in_half = tl.load(kperm_ptr + kk)  # [64]
+    token = t * 128 + k * 64 + tok_in_half  # [64] absolute kv token in S
+    jj = tl.arange(0, 16)
+    chan_lo = n * 32 + 2 * jj  # [16] even channels -> low nibble
+    chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
+
+    vbase = v_ptr + bb * stride_vb + hh * stride_vh
+    dbase = desc_ptr + bb * stride_db + hh * stride_dh
+    row = token[:, None] * stride_vs  # [64,1]
+
+    v_lo = tl.load(vbase + row + chan_lo[None, :] * stride_vd).to(tl.float32)
+    v_hi = tl.load(vbase + row + chan_hi[None, :] * stride_vd).to(tl.float32)
+    d_lo = tl.load(dbase + chan_lo)  # [16]
+    d_hi = tl.load(dbase + chan_hi)
+
+    y_lo = v_lo / d_lo[None, :]
+    y_hi = v_hi / d_hi[None, :]
+
+    code_lo = _e2m1_code(y_lo)
+    code_hi = _e2m1_code(y_hi)
+    byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
+
+    obase = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192 + u * 1024
+    ooff = kk[:, None] * 16 + jj[None, :]
+    tl.store(obase + ooff, byte)
+
+
+@triton.jit
 def _rotate_quantize_q_kernel(
     Q,
     Q_q,
