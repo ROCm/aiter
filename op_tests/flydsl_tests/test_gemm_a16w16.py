@@ -204,15 +204,15 @@ def test_gemm_a16_w16_split_k(M, N, K, tm, tn, tk, mw, nw, nb, sk):
     torch.cuda.empty_cache()
     x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
 
-    common = dict(
-        dtype=torch.float32,
-        tile_m=tm,
-        tile_n=tn,
-        tile_k=tk,
-        m_warp=mw,
-        n_warp=nw,
-        num_buffers=nb,
-    )
+    common = {
+        "dtype": torch.float32,
+        "tile_m": tm,
+        "tile_n": tn,
+        "tile_k": tk,
+        "m_warp": mw,
+        "n_warp": nw,
+        "num_buffers": nb,
+    }
     out_single = gemm_a16w16(x, w, split_k=1, **common).clone()
     out_split = gemm_a16w16(x, w, split_k=sk, **common).clone()
 
@@ -227,15 +227,15 @@ def test_gemm_a16_w16_split_k_bf16(M, N, K, tm, tn, tk, mw, nw, nb, sk):
     x = (x.float() * 0.1).to(torch.bfloat16)
     w = (w.float() * 0.1).to(torch.bfloat16)
 
-    common = dict(
-        dtype=torch.bfloat16,
-        tile_m=tm,
-        tile_n=tn,
-        tile_k=tk,
-        m_warp=mw,
-        n_warp=nw,
-        num_buffers=nb,
-    )
+    common = {
+        "dtype": torch.bfloat16,
+        "tile_m": tm,
+        "tile_n": tn,
+        "tile_k": tk,
+        "m_warp": mw,
+        "n_warp": nw,
+        "num_buffers": nb,
+    }
     out_single = gemm_a16w16(x, w, split_k=1, **common).clone()
     out_split = gemm_a16w16(x, w, split_k=sk, **common).clone()
 
@@ -250,17 +250,17 @@ def test_gemm_a16_w16_split_k_output_buffer_zeroed(sk):
     x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
     y = torch.empty((M, N), dtype=torch.float32, device="cuda")
 
-    common = dict(
-        dtype=torch.float32,
-        y=y,
-        tile_m=64,
-        tile_n=64,
-        tile_k=128,
-        m_warp=2,
-        n_warp=2,
-        num_buffers=2,
-        split_k=sk,
-    )
+    common = {
+        "dtype": torch.float32,
+        "y": y,
+        "tile_m": 64,
+        "tile_n": 64,
+        "tile_k": 128,
+        "m_warp": 2,
+        "n_warp": 2,
+        "num_buffers": 2,
+        "split_k": sk,
+    }
     out1 = gemm_a16w16(x, w, **common).clone()
     out2 = gemm_a16w16(x, w, **common).clone()  # reuse y -> must re-zero, not 2x
 

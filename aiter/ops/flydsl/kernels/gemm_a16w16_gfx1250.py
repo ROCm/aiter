@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
@@ -11,6 +12,7 @@ from flydsl.expr import (
     buffer_ops,
     const_expr,
     gpu,
+    idx2crd,
     range_constexpr,
     rocdl,
     tdm_ops,
@@ -20,8 +22,6 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from flydsl.expr import idx2crd
-from typing import Optional
 
 # WMMA 16×16×32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
@@ -103,20 +103,20 @@ def compile_gemm_a16w16(
     m_warp: int = 2,
     n_warp: int = 4,
     in_dtype: str = "fp16",
-    out_dtype: str = None,
+    out_dtype: str | None = None,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 2,
-    activation: Optional[str] = None,
+    activation: str | None = None,
     add_bias: bool = False,
     physical_mk: bool = True,  # True=M-major (row-major X), False=K-major (col-major X)
     physical_kn: bool = False,  # False=N-major (row-major W), True=K-major (transposed W)
-    loop_carried_load_percent: Optional[int] = None,
+    loop_carried_load_percent: int | None = None,
     kernarg_preload: bool = False,
     use_manual_barrier: bool = False,
     split_k: int = 1,
-    sched_strategy: Optional[str] = None,
-    barrier_signal_wait_latency: Optional[int] = None,
+    sched_strategy: str | None = None,
+    barrier_signal_wait_latency: int | None = None,
     main_loop_unroll: bool = False,
     variant: str = "bandwidth_bound",
 ):
@@ -1041,7 +1041,7 @@ def compile_gemm_a16w16(
             if main_loop_iters > 0
             else min(num_buffers - 1, num_k_tiles)
         )
-        drain_base = main_loop_iters if main_loop_iters > 0 else 0
+        drain_base = max(0, main_loop_iters)
 
         def _drain_wait_for(tile_idx):
             # Wait for compile-time drain tile tile_idx to land.
@@ -1197,24 +1197,24 @@ def compile_gemm_a16w16(
 def gemm_a16w16(
     x: torch.Tensor,
     w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     dtype: torch.dtype = torch.float16,
-    y: Optional[torch.Tensor] = None,
-    activation: Optional[str] = None,
+    y: torch.Tensor | None = None,
+    activation: str | None = None,
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 32,
     m_warp: int = 2,
     n_warp: int = 4,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 2,
     kernarg_preload: bool = False,
-    loop_carried_load_percent: Optional[int] = None,
+    loop_carried_load_percent: int | None = None,
     use_manual_barrier: bool = False,
     split_k: int = 1,
-    sched_strategy: Optional[str] = None,
-    barrier_signal_wait_latency: Optional[int] = None,
+    sched_strategy: str | None = None,
+    barrier_signal_wait_latency: int | None = None,
     main_loop_unroll: bool = False,
     variant: str = "bandwidth_bound",
 ):
