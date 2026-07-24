@@ -60,7 +60,7 @@ def _patch_flaky_hip_device_count():
         _t = torch.zeros(1, device="cuda")
         torch.cuda.synchronize()
         del _t
-    except Exception:
+    except Exception:  # noqa: BLE001
         return
     ngpu = 1
     try:
@@ -68,7 +68,7 @@ def _patch_flaky_hip_device_count():
         import subprocess
 
         out = subprocess.run(
-            ["rocminfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            ["rocminfo"], capture_output=True, text=True, check=False
         ).stdout
         ngpu = max(
             1,
@@ -76,7 +76,7 @@ def _patch_flaky_hip_device_count():
                 "GPU" in d and "Device Type" in d for d in re.split(r"Agent\s*\d+", out)
             ),
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         ngpu = 1
     torch.cuda.device_count = lambda: ngpu  # type: ignore[assignment]
 
@@ -267,7 +267,7 @@ def _gfx1250_fuse_kids_for_tile(M, N, K, cu_num, bm, bn, bk):
     valid_sk.sort(key=lambda sk: (_gfx1250_occ_cost(base_wg * sk, cu_num), sk))
     sk_sel = sorted(set(valid_sk[:GFX1250_FUSE_TOP_SPLITK]))
     nc_valid = [nc for nc in range(1, 6) if ntn % nc == 0]  # exact N-fill, <=5
-    nc_sel = sorted(set([1, max(nc_valid)])) if nc_valid else [1]
+    nc_sel = sorted({1, max(nc_valid)}) if nc_valid else [1]
     out = []
     for nc in nc_sel:
         for sk in sk_sel:
@@ -614,9 +614,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         if _ceil_div(N, k_inst.B_N) % n_cluster != 0:
             return True
         k_steps_tot = _ceil_div(K, k_inst.B_K)
-        if split_k > k_steps_tot:
-            return True
-        return False
+        return split_k > k_steps_tot
 
     if k_inst.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
         # gfx1250 WMMA kernel: ragged M/N ARE supported -- the main kernel
@@ -1486,7 +1484,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         # probe when torch enumeration is broken. TEMPORARY.
         try:
             return super().get_cu_num()
-        except Exception:
+        except Exception:  # noqa: BLE001
             from aiter.jit.utils.chip_info import get_cu_num as _cu
 
             return _cu()

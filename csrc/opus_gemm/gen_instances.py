@@ -885,7 +885,7 @@ void
             # the legacy VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
             if reduce_arch == "gfx1250":
                 reduce_vec, reduce_block = 8, 128
-                reduce_split_ks = tuple(range(0, 17))  # 0 (runtime) + 1..16 (unrolled)
+                reduce_split_ks = tuple(range(17))  # 0 (runtime) + 1..16 (unrolled)
                 reduce_d_ws = "__bf16"
             else:
                 reduce_vec, reduce_block = 16, 64
@@ -983,7 +983,7 @@ def get_tune_dict(tune_dict_csv):
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 cu_num = torch.cuda.get_device_properties(gpu).multi_processor_count
-        except Exception:
+        except Exception:  # noqa: BLE001
             # torch device enumeration is broken on some ROCm nightlies
             # (device_count()==0 / "Invalid device id"); use rocminfo instead.
             cu_num = None
@@ -992,7 +992,7 @@ def get_tune_dict(tune_dict_csv):
                 from aiter.jit.utils.chip_info import get_cu_num as _rocminfo_cu_num
 
                 cu_num = _rocminfo_cu_num()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 cu_num = None
         if cu_num is not None:
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()

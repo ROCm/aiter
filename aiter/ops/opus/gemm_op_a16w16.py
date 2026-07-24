@@ -39,7 +39,6 @@ Python surface is deliberately per-dtype: a16w16 here, a8w8 in its own
 module when that lands.
 """
 
-import functools
 import logging
 
 import torch
@@ -164,7 +163,6 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
         )
 
 
-@functools.lru_cache(maxsize=32)
 def _get_opus_workspace(device: torch.device, ws_elems: int) -> torch.Tensor:
     """Cached workspace allocation for opus split-K.
 
@@ -228,7 +226,7 @@ def opus_gemm_a16w16_tune(
     # externally (torch.empty) and passed to the C++ launcher.
     workspace = None
     if 20000 <= kernelId < 30000:
-        batch, M, N = Y.shape
+        _batch, M, N = Y.shape
         _, _, K = XQ.shape
         # Workspace must be large enough for any kid's tile padding.
         # Use the LARGEST tile dimensions (B_M=128, B_N=512) to compute

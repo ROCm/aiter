@@ -30,8 +30,8 @@ from aiter.ops.opus import gemm_a16w16_opus
 from aiter.test_common import checkAllclose, run_perftest
 
 try:
-    from aiter.ops.opus import opus_gemm_workspace_init  # noqa: E402
-except Exception:
+    from aiter.ops.opus import opus_gemm_workspace_init
+except Exception:  # noqa: BLE001
     opus_gemm_workspace_init = None
 
 
@@ -238,7 +238,7 @@ def test_opus_shapes_graph(
             )
             perf_rows.append((M, us, csv_us, ratio))
             passed += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
 
