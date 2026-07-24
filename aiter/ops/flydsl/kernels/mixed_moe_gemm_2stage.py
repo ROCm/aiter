@@ -1,44 +1,45 @@
 """MoE GEMM stage1/stage2 kernel builders (FLIR MFMA, mxfp4/mxfp8)."""
 
-from typing import Optional
+import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
-
-from flydsl.expr import range_constexpr
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
-
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
 from flydsl._mlir import ir
-from flydsl.expr.typing import T
-
-from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
-from flydsl.expr.gpu import lds_space as _lds_space
-from flydsl._mlir.extras import types as _mT
-from flydsl._mlir.dialects import llvm, scf, memref
+from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
-
-from .mfma_preshuffle_pipeline import (
-    _buffer_load_vec,
-    buffer_copy_gmem16_dwordx4,
-    lds_store_16b_xor16,
-    lds_store_8b_xor16,
-    lds_store_4b_xor16,
-    make_preshuffle_b_layout,
-    make_preshuffle_scale_layout,
-    tile_chunk_coord_i32,
-    swizzle_xor16,
+from flydsl._mlir.extras import types as _mT
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
 )
-from .mfma_epilogues import c_shuffle_epilog, default_epilog
-from .layout_utils import crd2idx, idx2crd, get as layout_get
-
-import functools
+from flydsl.expr.gpu import lds_space as _lds_space
+from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.moe_common import (
     GateMode,
+)
+
+from .layout_utils import crd2idx, idx2crd
+from .layout_utils import get as layout_get
+from .mfma_epilogues import c_shuffle_epilog, default_epilog
+from .mfma_preshuffle_pipeline import (
+    _buffer_load_vec,
+    buffer_copy_gmem16_dwordx4,
+    lds_store_4b_xor16,
+    lds_store_8b_xor16,
+    lds_store_16b_xor16,
+    make_preshuffle_b_layout,
+    make_preshuffle_scale_layout,
+    swizzle_xor16,
+    tile_chunk_coord_i32,
 )
 
 
@@ -2296,7 +2297,7 @@ def compile_mixed_moe_gemm1(
                 sk_n_offset = [0]
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused, row_byte_base = row_ctx
+                    _fused, row_byte_base = row_ctx
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
@@ -2934,7 +2935,7 @@ def compile_mixed_moe_gemm2(
     inter_dim_pad: int = 0,
     persist_m: int = 4,
     sort_block_m: int = 0,
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
@@ -4638,7 +4639,7 @@ def compile_mixed_moe_gemm2(
                     return llvm.inttoptr(ptr_ty, i64_raw)
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused, row_byte_base, row_byte_off_i32 = row_ctx
+                    _fused, row_byte_base, row_byte_off_i32 = row_ctx
                     if const_expr(need_fp8_out):
                         # frag is vector<e_vec x f32>; e_vec==8 == one opus
                         # 8-col MXFP8 group. Quantize to e4m3 + one e8m0 byte.

@@ -76,13 +76,13 @@ def _job_key(job: dict) -> tuple:
 
 def parse_csv(csv_path: str):
     """Parse an fp4 tuned CSV into unique mxmoe-port compile jobs (one per stage)."""
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
         parse_flydsl_v2_gemm2_kernel,
     )
-    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
 
     jobs = []
     seen = set()
@@ -350,7 +350,7 @@ def compile_one_config(**job):
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  stage{stage}  {shape_str}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  stage{stage}  {shape_str}: {e}")
 
     return result

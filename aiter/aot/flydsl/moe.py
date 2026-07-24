@@ -27,7 +27,6 @@ import csv
 import os
 import sys
 import time
-from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -38,7 +37,6 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
@@ -52,6 +50,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_kernel_params,
     runtime_swiglu_limit,
 )
+from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -214,7 +213,7 @@ def _precompile_to_cache(
     # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
     # production-variant ``_persist_async_w4_cumul3`` does), causing
     # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -933,7 +932,7 @@ def compile_one_config(
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result

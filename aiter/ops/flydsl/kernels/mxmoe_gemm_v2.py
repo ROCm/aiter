@@ -11,21 +11,21 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
 
+from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
+from .mxfp4_gemm_common import _gep1 as gep1
+from .mxfp4_gemm_common import _global_base_ptr1 as global_base_ptr1
+from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from .mxfp4_gemm_common import (
-    kStages,
-    kBS_stride_k0_dw,
     flat_buffer_view,
     global_typed_ptr,
+    kBS_stride_k0_dw,
+    kStages,
     lds_dma_atom_128,
     lds_dma_dst,
+    lds_swizzle_mask_f8,
     lds_typed_ptr,
     lds_vec_load,
-    lds_swizzle_mask_f8,
 )
-from .mxfp4_gemm_common import _global_base_ptr1 as global_base_ptr1
-from .mxfp4_gemm_common import _gep1 as gep1
-from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
-from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 
 
 def bq_view(
