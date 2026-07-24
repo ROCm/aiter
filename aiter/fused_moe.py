@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 
@@ -858,9 +858,9 @@ def fused_moe_1stage(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: torch.Tensor | None = None,
-    M: int = None,
+    M: int | None = None,
     device=None,
-    doweight_stage1: bool = None,
+    doweight_stage1: bool | None = None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
