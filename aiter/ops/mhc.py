@@ -20,8 +20,25 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    is_fn_pack_bf16: int = 0,
+    is_fn_pack_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
 ) -> None: ...
+
+
+@compile_ops("module_mhc")
+def mhc_pre_convert_fn(
+    fn_packed: Tensor,  # (hc_mult3, hc_hidden_size) int32 out
+    fn: Tensor,  # (hc_mult3, hc_hidden_size) fp32 in
+) -> None: ...
+
+
+def mhc_pre_convert_fn_ref(fn: torch.Tensor) -> torch.Tensor:
+    """Torch equivalent of the HIP ``mhc_pre_convert_fn`` kernel: pack fp32 fn into
+    int32 dwords (hi = bf16(fn) in [31:16], lo = bf16(fn - fp32(hi)) in [15:0])."""
+    hi = fn.to(torch.bfloat16)
+    lo = (fn - hi.to(torch.float32)).to(torch.bfloat16)
+    hi_bits = hi.view(torch.int16).to(torch.int32) & 0xFFFF
+    lo_bits = lo.view(torch.int16).to(torch.int32) & 0xFFFF
+    return ((hi_bits << 16) | lo_bits).to(torch.int32).contiguous()
 
 
 @compile_ops("module_mhc")
@@ -174,44 +191,57 @@ def _mhc_fused_config_gfx942_80(m, hidden_size, num_cu):
 
 
 def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
-    tile_k = 32 if hidden_size % 32 == 0 else 64
-    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
-    if not valid:
-        return 1, 16, 32, tile_k
+    # Re-tuned on gfx1250/256 for the bf16-packed GEMM path (is_fn_pack_bf16=1,
+    # wave32 bf16 WMMA) under the relaxed split_k constraint: prefetch now needs only
+    # >=1 k-tile per split (was *2), so split_k can go deeper. Measured per (m, hidden)
+    # with fn pre-packed to int32 (mhc_pre_convert_fn); see mhc_fused_post_pre_tuning.md.
+    #
+    # Unlike gfx950 (where tile_m=64 spills and loses), on the gfx1250 bf16 wave32 path
+    # tile_m=64 is the fastest at large m; tile_k=64 wins only at m~=1024,hidden>=7168.
+    # The optima are jagged in m (no clean analytic rule), so this is a measured lookup.
+    tile_n = 32  # tile_n=16 never wins
 
-    tile_n = 32
-    # Re-tuned on gfx1250/256 (TDM residual load): fn-reuse (tile_m=32) wins from
-    # m=512 up; m<=256 is launch-bound and stays on tile_m=16.
-    tile_m = 16 if m <= 256 else 32
-
-    # (m upper bound, target split_k) measured per (m, hidden) then merged; the
-    # target is snapped to a legal divisor below so it stays valid for any hidden.
-    # Mid/large m follows blocks_m*split_k ~= 4*cu (~128*cu/m); small m is
-    # launch-bound (high split_k, config barely matters); very large m goes deeper.
+    # (m upper bound, (target_split_k, tile_m, tile_k)); target_split_k is the REAL
+    # split_k (== gemm_out_sqrsum.size(0)), snapped to a legal divisor for the actual
+    # hidden_size below. Small m is launch-bound (deep split fills the device); the
+    # large-m tile_m=64 path is a ~2-wave fill (split_k ~= 32768/m). tile_k=64 wins only
+    # at m~=1024, hidden>=7168. Picked by a round-robin shootout (interleaved candidates,
+    # min over rounds) because back-to-back timing drifts thermally on this kernel.
     if hidden_size >= 7168:
         table = [
-            (128, 32),
-            (256, 32),
-            (512, 32),
-            (1024, 32),
-            (2048, 16),
-            (4096, 8),
-            (8192, 14),
-            (1 << 30, 7),
+            (128, (112, 16, 32)),
+            (256, (56, 16, 32)),
+            (512, (28, 32, 32)),
+            (1024, (16, 32, 64)),
+            (2048, (7, 32, 32)),
+            (4096, (8, 64, 32)),
+            (8192, (4, 64, 32)),
+            (1 << 30, (2, 64, 32)),
         ]
     else:
         table = [
-            (128, 64),
-            (256, 32),
-            (512, 32),
-            (1024, 32),
-            (2048, 16),
-            (4096, 8),
-            (8192, 8),
-            (1 << 30, 8),
+            (128, (64, 32, 32)),
+            (256, (64, 32, 32)),
+            (512, (32, 32, 32)),
+            (1024, (16, 32, 32)),
+            (2048, (4, 16, 32)),
+            (4096, (4, 64, 32)),
+            (8192, (2, 64, 32)),
+            (1 << 30, (4, 32, 32)),
         ]
-    target = next(t for ub, t in table if m <= ub)
-    splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target)), -s))
+    target_sk, tile_m, tile_k = next(cfg for ub, cfg in table if m <= ub)
+
+    # tile_k must divide hidden_size; fall back to the other legal tile_k if not
+    # (and drop the un-instantiated tile_m=64 + tile_k=64 combo down to tile_m=16).
+    if hidden_size % tile_k != 0:
+        tile_k = 32 if tile_k == 64 else 64
+        if tile_m == 64 and tile_k == 64:
+            tile_m = 16
+
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu, prefetch_stages=1)
+    if not valid:
+        return 1, 16, tile_n, tile_k
+    splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target_sk)), -s))
     return splitk, tile_m, tile_n, tile_k
 
 
@@ -296,6 +326,7 @@ def mhc_pre_fake(
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    large_m_splitk: bool = False,
     is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
@@ -322,7 +353,7 @@ def mhc_pre(
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_fn_pack_bf16: int = 0,
+    is_fn_pack_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -342,6 +373,7 @@ def mhc_pre(
     )
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
+    # is_fn_pack_bf16=1: fn is the pre-packed int32 tensor (bf16 hi/lo MFMA path).
     mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k, is_fn_pack_bf16)
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)

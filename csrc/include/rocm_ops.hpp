@@ -2275,6 +2275,11 @@ namespace py = pybind11;
           py::arg("fn"),                        \
           py::arg("tile_k") = 128,              \
           py::arg("is_fn_pack_bf16") = 0);      \
+    m.def("mhc_pre_convert_fn",                 \
+          &aiter::mhc_pre_convert_fn,           \
+          "mhc_pre_convert_fn",                 \
+          py::arg("fn_packed"),                 \
+          py::arg("fn"));                       \
     m.def("mhc_pre_big_fuse",                   \
           &aiter::mhc_pre_big_fuse,             \
           "mhc_pre_big_fuse",                   \
