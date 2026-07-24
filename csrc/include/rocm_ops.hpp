@@ -2265,6 +2265,20 @@ namespace py = pybind11;
           py::arg("epsilon"),                        \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
+#define GEMMA_RMSNORM_QUANT_PYBIND                             \
+    m.def("gemma_rmsnorm_fp8_group_quant",                     \
+          &aiter::gemma_rmsnorm_fp8_group_quant,               \
+          py::arg("out"),                                      \
+          py::arg("scale"),                                    \
+          py::arg("x"),                                        \
+          py::arg("weight"),                                   \
+          py::arg("epsilon"),                                  \
+          py::arg("group_size"),                               \
+          py::arg("transpose_scale") = false,                  \
+          py::arg("residual") = py::none(),                    \
+          py::arg("out_normed") = py::none(),                  \
+          "Fused Gemma RMSNorm + FP8 Group Quantization");
+
 #define MHC_PYBIND                              \
     m.def("mhc_pre_gemm_sqrsum",                \
           &aiter::mhc_pre_gemm_sqrsum,          \
