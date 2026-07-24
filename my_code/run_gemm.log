@@ -1,749 +1,749 @@
-[aiter WARNING] 2026-07-24 09:31:49.714 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/jit/core.py:588 - check_numa_custom_op
+[aiter WARNING] 2026-07-24 10:34:21.892 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/jit/core.py:588 - check_numa_custom_op
 WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
-[aiter INFO] 2026-07-24 09:31:49.716 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/jit/core.py:611 - get_module_custom_op
+[aiter INFO] 2026-07-24 10:34:21.894 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/jit/core.py:611 - get_module_custom_op
 import [module_aiter_core] under /data/yanguahe/code/wk_sp1/aiter/aiter/jit/module_aiter_core.so
-[aiter INFO] 2026-07-24 09:31:53.536 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/op_tests/test_flydsl_grouped_gemm_gfx1250.py:730 - set_data_format
+[aiter INFO] 2026-07-24 10:34:25.738 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/op_tests/test_flydsl_grouped_gemm_gfx1250.py:730 - set_data_format
 grouped GEMM data format: a8w4
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:31:53.771 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/jit/core.py:611 - get_module_custom_op
+[aiter INFO] 2026-07-24 10:34:25.952 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/jit/core.py:611 - get_module_custom_op
 import [module_moe_asm] under /data/yanguahe/code/wk_sp1/aiter/aiter/jit/module_moe_asm.so
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/moe_route
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/moe_route/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/moe_route/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/moe_route/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/moe_route/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/moe_route/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/moe_route/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/moe_route/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/moe_route/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/moe_route/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/moe_route/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/moe_route/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/moe_route/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/moe_route/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/moe_route/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/moe_route/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/moe_route/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/moe_route/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/moe_route/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/moe_route/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/moe_route/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/moe_route/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/moe_route/21_final_isa.s
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/moe_contiguous_psum_remap
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/moe_contiguous_psum_remap/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/moe_contiguous_psum_remap/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/moe_contiguous_psum_remap/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/moe_contiguous_psum_remap/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/moe_contiguous_psum_remap/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/moe_contiguous_psum_remap/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/moe_contiguous_psum_remap/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/moe_contiguous_psum_remap/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/moe_contiguous_psum_remap/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/moe_contiguous_psum_remap/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/moe_contiguous_psum_remap/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/moe_contiguous_psum_remap/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/moe_contiguous_psum_remap/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/moe_contiguous_psum_remap/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/moe_contiguous_psum_remap/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/moe_contiguous_psum_remap/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/moe_contiguous_psum_remap/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/moe_contiguous_psum_remap/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/moe_contiguous_psum_remap/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/moe_contiguous_psum_remap/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/moe_contiguous_psum_remap/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/moe_contiguous_psum_remap/21_final_isa.s
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_route/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_contiguous_psum_remap/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS/21_final_isa.s
 [lds] gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1: A=4352 B=32768 SA=128 SB=2048 per_buf(unpadded)=39296 PITCH(512-aligned)=39424 x num_buffers=2 | C_STORE=8192 -> ARENA=78848 B (77.00 KiB)
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/21_final_isa.s
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all/21_final_isa.s
 [lds] gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1: A=2304 B=32768 SA=64 SB=2048 per_buf(unpadded)=37184 PITCH(512-aligned)=37376 x num_buffers=2 | C_STORE=16384 -> ARENA=74752 B (73.00 KiB)
-[aiter INFO] 2026-07-24 09:31:59.416 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5433.070480823517 us/iter from cuda.Event
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16
+[flydsl.compile] dump 00_origin -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/17_convert_func_to_llvm.mlir
+[aiter INFO] 2026-07-24 10:34:31.613 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5086.837589740753 us/iter from cuda.Event
 /opt/venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
   _warn_once(
-[W724 09:31:59.887145801 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {64, 66, 98, 5, 423, 268, 269, 14, 398, 16, 63, 61, 276, 29, 62, 31}
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.5639999999999645
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 649.0100000000001
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2090.325
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.805000000000007
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 592.8849999999993
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.6450000000004366
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 112.16699999999992
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 0.8400000000000318
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 72.7470000000003
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 5.726999999999975
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.371999999999957
-[aiter INFO] 2026-07-24 09:31:59.495 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 7.930999999999926
-[aiter INFO] 2026-07-24 09:31:59.496 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1627.7930000000001
-[aiter INFO] 2026-07-24 09:31:59.496 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.76400000000001
-[aiter INFO] 2026-07-24 09:31:59.496 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 48.27099999999996
-[aiter INFO] 2026-07-24 09:31:59.496 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 105.39699999999993
-[aiter INFO] 2026-07-24 09:31:59.553 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
-                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             45.1              6.4        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            127.5              3.6        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            188.7             13.5        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            388.7             27.8        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            518.8             74.1        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            775.9            110.8        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,829.4            547.1        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,413.8            630.5        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,524.3          1,646.3        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,813.9          2,116.3        CUDA            2
-10                                                                                  hipDeviceSynchronize  1.0           56.1              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0          409.1              0.0              0.0         CPU         4688
-12                                                                                           aten::copy_ 15.0          437.0              0.0              0.0         CPU         4688
-13                                                                                     aiter::fused_moe_  7.0       35,921.2              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,260.5          5,232.3              NaN         NaN          NaN
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1/21_final_isa.s
-[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16
-[flydsl.compile] dump 00_origin -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/00_origin.mlir
-[flydsl.compile] dump 01_fly_rewrite_func_signature -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/01_fly_rewrite_func_signature.mlir
-[flydsl.compile] dump 02_fly_canonicalize -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/02_fly_canonicalize.mlir
-[flydsl.compile] dump 03_fly_layout_lowering -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/03_fly_layout_lowering.mlir
-[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/04_fly_int_swizzle_simplify.mlir
-[flydsl.compile] dump 05_canonicalize -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/05_canonicalize.mlir
-[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/06_fly_convert_atom_call_to_ssa_form.mlir
-[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/07_fly_promote_regmem_to_vectorssa.mlir
-[flydsl.compile] dump 08_convert_fly_to_rocdl -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/08_convert_fly_to_rocdl.mlir
-[flydsl.compile] dump 09_canonicalize -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/09_canonicalize.mlir
-[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
-[flydsl.compile] dump 11_rocdl_attach_target -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/11_rocdl_attach_target.mlir
-[flydsl.compile] dump 12_convert_scf_to_cf -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/12_convert_scf_to_cf.mlir
-[flydsl.compile] dump 13_convert_cf_to_llvm -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/13_convert_cf_to_llvm.mlir
-[flydsl.compile] dump 14_gpu_to_llvm -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/14_gpu_to_llvm.mlir
-[flydsl.compile] dump 15_convert_vector_to_llvm -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/15_convert_vector_to_llvm.mlir
-[flydsl.compile] dump 16_convert_arith_to_llvm -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/16_convert_arith_to_llvm.mlir
-[flydsl.compile] dump 17_convert_func_to_llvm -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/17_convert_func_to_llvm.mlir
-[flydsl.compile] dump 18_reconcile_unrealized_casts -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/18_reconcile_unrealized_casts.mlir
-[flydsl.compile] dump 19_gpu_module_to_binary -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/19_gpu_module_to_binary.mlir
-[flydsl.compile] dump 20_llvm_ir -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/20_llvm_ir.ll
-[flydsl.compile] dump 21_final_isa -> /root/.flydsl/debug/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/21_final_isa.s
-[sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5232.30 (graph=True)
-
-===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:01.441 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5684.676826000214 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:01.521 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {32, 64, 99, 5, 70, 11, 429, 430, 16, 274, 61, 275, 278, 29, 62, 63}
-[aiter INFO] 2026-07-24 09:32:01.521 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 107.48000000000002
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2.643000000000029
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2116.4840000000004
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 5.567000000000007
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 648.7289999999999
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.9250000000000114
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.0049999999992
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 583.3509999999997
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 7.3700000000000045
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+[W724 10:34:31.084461432 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 66, 98, 5, 261, 262, 14, 270, 16, 50, 63, 53, 376, 380, 29, 31}
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.562999999999988
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 623.451
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2042.574
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.1240000000000236
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
 abnormal data: 3.2840000000001055
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.772000000000048
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 100.46900000000005
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1740.9229999999998
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 5.766999999999939
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 48.351
-[aiter INFO] 2026-07-24 09:32:01.522 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.972999999999956
-[aiter INFO] 2026-07-24 09:32:01.578 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 100.18899999999985
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 6.4080000000000155
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1554.6440000000002
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.206999999999994
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 6.24899999999991
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 7.850000000000023
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.63200000000006
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.363999999999578
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 537.6030000000001
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.3640000000000327
+[aiter INFO] 2026-07-24 10:34:31.695 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 66.13700000000006
+[aiter INFO] 2026-07-24 10:34:31.755 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             42.5              6.1        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            331.9             23.7        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            361.1             10.3        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            403.9             28.9        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            542.3             77.5        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            873.4            124.8        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,292.1            613.2        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          5,074.0            724.9        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         13,194.6          1,884.9        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         16,650.7          2,378.7        CUDA            2
-10                                                                                           aten::copy_ 15.0          452.3              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0          721.6              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       40,669.6              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,977.6          5,966.6              NaN         NaN          NaN
+0                                                                                              moe_route  7.0            0.0             41.4              5.9        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            135.9              9.7        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            176.5              5.0        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            355.3             25.4        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            473.2             67.6        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            726.0            103.7        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,873.7            553.4        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,334.4            619.2        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,436.0          1,633.7        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,566.0          2,080.9        CUDA            2
+10                                                                                  hipDeviceSynchronize  1.0            3.3              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0          339.3              0.0              0.0         CPU         5339
+12                                                                                           aten::copy_ 15.0          403.9              0.0              0.0         CPU         5339
+13                                                                                     aiter::fused_moe_  7.0       35,450.7              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,171.0          5,159.8              NaN         NaN          NaN
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /data/yanguahe/code/wk_sp1/aiter/my_code/flydsl_dump/moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16/21_final_isa.s
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5966.64 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5159.78 (graph=True)
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:03.167 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5988.5265827178955 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:03.398 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {5, 71, 72, 328, 455, 11, 301, 302, 63, 61, 468, 23, 124, 29, 62, 31}
-[aiter INFO] 2026-07-24 09:32:03.398 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.208000000000027
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 53.680000000000064
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 728.208
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1914.6629999999996
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 55.88299999999981
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.125
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.245000000000346
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 116.9340000000002
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 63.97399999999993
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 47.549999999999955
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 623.6109999999999
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 5.247000000000014
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2320.2690000000002
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.045000000000016
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 52.396999999999935
-[aiter INFO] 2026-07-24 09:32:03.399 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 113.92899999999997
-[aiter INFO] 2026-07-24 09:32:03.454 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:33.572 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5335.464715957642 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:33.647 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 66, 98, 263, 42, 13, 14, 16, 370, 61, 250, 251, 380, 29, 62, 63}
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.76299999999992
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 574.979
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1959.3700000000001
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1513.2219999999998
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 63.214000000000055
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 111.68600000000004
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 14.300000000000011
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.166999999999973
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 53.27900000000045
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 7.491000000000099
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.723000000000411
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 155.75199999999995
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 582.4300000000003
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.56200000000001
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.75199999999995
+[aiter INFO] 2026-07-24 10:34:33.648 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.611999999999966
+[aiter INFO] 2026-07-24 10:34:33.705 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             33.1              4.7        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            429.7             30.7        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            447.1             12.8        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            501.5             35.8        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            615.3             87.9        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            913.2            130.5        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,502.9            643.3        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          5,328.3            761.2        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         13,762.1          1,966.0        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         17,116.0          2,445.1        CUDA            2
-10                                                                                           aten::copy_ 15.0          553.9              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0        1,062.7              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       42,270.8              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        6,269.6          6,235.6              NaN         NaN          NaN
+0                                                                                              moe_route  7.0            0.0            275.8             39.4        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            498.1             35.6        CUDA            2
+2                                                                              moe_contiguous_psum_remap  7.0            0.0            555.6             79.4        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            576.6             41.2        CUDA            2
+4                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            929.7            132.8        CUDA            2
+5              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0          1,418.9             40.5        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,864.6            552.1        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,288.0            612.6        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         10,576.2          1,510.9        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         13,745.1          1,963.6        CUDA            2
+10                                                                                           aten::copy_ 15.0          625.4              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0        2,054.2              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       34,234.9              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,273.5          5,246.9              NaN         NaN          NaN
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 6235.58 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5246.93 (graph=True)
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:05.034 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 6116.983413696289 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {64, 289, 70, 454, 447, 13, 14, 111, 16, 303, 63, 61, 278, 29, 62, 31}
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1.6020000000000891
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 121.38000000000011
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 692.955
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 653.3360000000002
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+[aiter INFO] 2026-07-24 10:34:35.212 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5371.643364429474 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:35.473 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 66, 99, 5, 261, 392, 11, 269, 16, 63, 276, 405, 60, 29, 62, 31}
+[aiter INFO] 2026-07-24 10:34:35.473 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.4429999999999836
+[aiter INFO] 2026-07-24 10:34:35.473 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 604.583
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2047.3409999999997
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.524000000000001
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.641999999999825
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
 abnormal data: 55.48199999999997
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.604999999999961
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.084000000000003
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2246.238
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 7.129000000000019
-[aiter INFO] 2026-07-24 09:32:05.114 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1770.2060000000001
-[aiter INFO] 2026-07-24 09:32:05.115 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 11.335999999999899
-[aiter INFO] 2026-07-24 09:32:05.115 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 9.572999999999979
-[aiter INFO] 2026-07-24 09:32:05.115 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 59.36799999999994
-[aiter INFO] 2026-07-24 09:32:05.115 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.88900000000001
-[aiter INFO] 2026-07-24 09:32:05.115 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 48.07099999999991
-[aiter INFO] 2026-07-24 09:32:05.115 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 112.60699999999997
-[aiter INFO] 2026-07-24 09:32:05.169 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.765000000000043
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 156.55299999999988
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 7.329999999999984
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.29099999999994
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1658.279
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 609.5910000000003
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.252000000000066
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 6.048000000000002
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.51200000000006
+[aiter INFO] 2026-07-24 10:34:35.474 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 104.95600000000002
+[aiter INFO] 2026-07-24 10:34:35.530 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             95.1             13.6        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            285.5             20.4        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            378.3             27.0        CUDA            2
-3                                                                              moe_contiguous_psum_remap  7.0            0.0            517.5             73.9        CUDA            2
-4              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            540.3             15.4        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            842.6            120.4        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,313.1            616.2        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,942.7            706.1        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         13,021.6          1,860.2        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         16,267.6          2,323.9        CUDA            2
-10                                                                                           aten::copy_ 15.0          426.4              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0          963.5              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       40,000.2              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,912.9          5,886.3              NaN         NaN          NaN
+0                                                                                              moe_route  7.0            0.0             31.2              4.5        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            197.9             14.1        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            261.7              7.5        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            400.5             28.6        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            537.7             76.8        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            769.0            109.9        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,007.0            572.4        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,531.7            647.4        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,035.3          1,719.3        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         15,224.0          2,174.9        CUDA            2
+10                                                                                           aten::copy_ 15.0          449.1              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0          591.3              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       37,135.8              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,453.7          5,428.0              NaN         NaN          NaN
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5886.32 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5428.00 (graph=True)
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:06.771 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 6164.369344711304 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {448, 289, 68, 37, 71, 72, 13, 14, 111, 303, 61, 276, 28, 29, 62, 447}
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 615.8800000000001
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 156.11299999999983
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 60.52999999999997
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 104.79599999999994
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 12.978000000000065
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 698.203
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 53.559000000000026
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 105.19600000000003
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2173.33
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1714.042
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 60.370000000000005
-[aiter INFO] 2026-07-24 09:32:06.847 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 107.48000000000002
-[aiter INFO] 2026-07-24 09:32:06.848 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 19.387999999999977
-[aiter INFO] 2026-07-24 09:32:06.848 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 55.160999999999945
-[aiter INFO] 2026-07-24 09:32:06.848 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 51.43599999999992
-[aiter INFO] 2026-07-24 09:32:06.848 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 50.074000000000524
-[aiter INFO] 2026-07-24 09:32:06.903 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:37.039 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5552.974760532379 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 66, 99, 419, 5, 423, 42, 11, 268, 270, 16, 61, 276, 29, 62, 63}
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1.8419999999999845
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 613.8770000000001
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2135.7929999999997
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 54.84100000000035
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.125
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 595.049
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 105.71699999999998
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.6440000000000055
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.5239999999998872
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 106.47800000000007
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 6.1679999999999495
+[aiter INFO] 2026-07-24 10:34:37.114 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.251999999999953
+[aiter INFO] 2026-07-24 10:34:37.115 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1637.888
+[aiter INFO] 2026-07-24 10:34:37.115 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 6.168999999999983
+[aiter INFO] 2026-07-24 10:34:37.115 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.351
+[aiter INFO] 2026-07-24 10:34:37.115 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.29200000000003
+[aiter INFO] 2026-07-24 10:34:37.171 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             89.6             12.8        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            346.7             24.8        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            457.5             32.7        CUDA            2
-3                                                                              moe_contiguous_psum_remap  7.0            0.0            497.0             71.0        CUDA            2
-4              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            643.2             18.4        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            831.2            118.7        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,060.8            580.1        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,442.6            634.7        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,458.7          1,637.0        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,625.9          2,089.4        CUDA            2
-10                                                                                           aten::copy_ 15.0          508.9              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0        1,381.3              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       36,005.8              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,413.7          5,350.5              NaN         NaN          NaN
+0                                                                                              moe_route  7.0            0.0             41.8              6.0        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0             83.3              6.0        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            268.4              7.7        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            395.7             28.3        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            510.0             72.9        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            707.0            101.0        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,976.1            568.0        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,317.6            616.8        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,273.7          1,610.5        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,558.3          2,079.8        CUDA            2
+10                                                                                           aten::fill_ 55.0          430.1              0.0              0.0         CPU         5339
+11                                                                                           aten::copy_ 15.0          444.1              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       35,384.7              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,179.8          5,161.7              NaN         NaN          NaN
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5350.45 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5161.74 (graph=True)
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:08.509 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5348.45894575119 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {64, 66, 99, 5, 11, 268, 269, 271, 63, 52, 21, 57, 379, 380, 29, 31}
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2.842999999999961
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 598.895
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2009.525
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.964999999999975
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.3240000000000123
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.2039999999997235
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 91.25599999999986
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1469.196
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 9.173000000000002
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.731999999999971
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.088000000000022
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 16.823999999999955
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2.5230000000001382
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 503.95300000000043
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.3279999999999745
-[aiter INFO] 2026-07-24 09:32:08.585 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 62.93399999999997
-[aiter INFO] 2026-07-24 09:32:08.640 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:38.682 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5687.776267528534 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {32, 64, 66, 98, 261, 262, 393, 10, 12, 271, 16, 381, 52, 58, 29, 63}
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 66.65800000000002
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.4829999999999472
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 600.4169999999999
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2038.1670000000001
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.28099999999995
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 150.98499999999967
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 547.0170000000007
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.244999999999948
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.562999999999988
+[aiter INFO] 2026-07-24 10:34:38.770 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1581.524
+[aiter INFO] 2026-07-24 10:34:38.771 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.567000000000007
+[aiter INFO] 2026-07-24 10:34:38.771 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.44200000000001
+[aiter INFO] 2026-07-24 10:34:38.771 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.371999999999957
+[aiter INFO] 2026-07-24 10:34:38.771 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 17.465000000000032
+[aiter INFO] 2026-07-24 10:34:38.771 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.807999999999993
+[aiter INFO] 2026-07-24 10:34:38.771 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.131000000000085
+[aiter INFO] 2026-07-24 10:34:38.857 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
 0                                                                                              moe_route  7.0            0.0             40.8              5.8        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            171.9              4.9        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            283.9             20.3        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            388.9             27.8        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            488.3             69.8        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            909.1            129.9        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,075.4            582.2        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,573.8            653.4        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,384.2          1,769.2        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         15,452.7          2,207.5        CUDA            2
-10                                                                                           aten::copy_ 15.0          405.8              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0          483.1              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       37,924.4              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,544.8          5,538.4              NaN         NaN          NaN
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            108.5              7.7        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            121.9              3.5        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            369.4             26.4        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            520.3             74.3        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            762.5            108.9        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,791.7            541.7        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,259.9            608.6        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,259.9          1,608.6        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,391.0          2,055.9        CUDA            2
+10                                                                                           aten::fill_ 55.0          360.0              0.0              0.0         CPU         5339
+11                                                                                           aten::copy_ 15.0          386.8              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       35,026.0              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,110.4          5,089.4              NaN         NaN          NaN
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5538.44 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5089.39 (graph=True)
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:10.203 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5817.365229129791 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:10.279 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {32, 64, 71, 72, 423, 10, 426, 14, 111, 274, 61, 275, 278, 27, 29, 62}
-[aiter INFO] 2026-07-24 09:32:10.279 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 108.08000000000004
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 60.610000000000014
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.972000000000094
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 667.357
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.4439999999995052
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 53.15899999999999
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 554.9489999999996
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 51.03499999999997
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2054.312
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 19.467999999999847
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 59.00800000000004
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 151.42599999999993
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1610.3670000000006
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 56.80400000000003
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 13.979999999999905
-[aiter INFO] 2026-07-24 09:32:10.280 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 48.11099999999999
-[aiter INFO] 2026-07-24 09:32:10.336 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:40.379 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5591.3620591163635 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {68, 37, 422, 71, 72, 423, 13, 14, 112, 61, 275, 21, 276, 279, 29, 62}
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 60.528999999999996
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 104.91599999999994
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.6829999999999927
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.230999999999995
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 708.819
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 555.4299999999994
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 68.101
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.846000000000004
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2088.0820000000003
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 25.998000000000047
+[aiter INFO] 2026-07-24 10:34:40.458 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.4839999999999236
+[aiter INFO] 2026-07-24 10:34:40.459 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.331999999999994
+[aiter INFO] 2026-07-24 10:34:40.459 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 126.06700000000001
+[aiter INFO] 2026-07-24 10:34:40.459 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1573.7930000000001
+[aiter INFO] 2026-07-24 10:34:40.459 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 0.8400000000000318
+[aiter INFO] 2026-07-24 10:34:40.459 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.672000000000025
+[aiter INFO] 2026-07-24 10:34:40.516 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             38.7              5.5        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            244.1             17.4        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            401.3             11.5        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            451.7             32.3        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            452.6             64.7        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            727.7            104.0        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,945.3            563.6        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,264.5            609.2        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,149.3          1,592.8        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,393.0          2,056.1        CUDA            2
-10                                                                                           aten::copy_ 15.0          499.8              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0          803.0              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       34,971.1              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,182.0          5,152.6              NaN         NaN          NaN
+0                                                                                              moe_route  7.0            0.0            152.8             21.8        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            359.0             25.6        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            447.5             32.0        CUDA            2
+3                                                                              moe_contiguous_psum_remap  7.0            0.0            535.4             76.5        CUDA            2
+4                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            870.3            124.3        CUDA            2
+5              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            877.6             25.1        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,168.1            595.4        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,555.2            650.7        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,053.6          1,721.9        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         15,336.0          2,190.9        CUDA            2
+10                                                                                           aten::copy_ 15.0          496.2              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0        1,357.2              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       37,671.5              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,646.4          5,622.2              NaN         NaN          NaN
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5152.61 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5622.22 (graph=True)
 
 ===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:11.923 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5686.965107917786 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:11.999 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {64, 66, 99, 5, 392, 393, 11, 268, 269, 16, 273, 63, 52, 57, 29, 31}
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+[aiter INFO] 2026-07-24 10:34:42.054 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5276.671290397644 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:42.132 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 66, 99, 5, 11, 268, 269, 397, 400, 17, 63, 273, 53, 58, 29, 31}
+[aiter INFO] 2026-07-24 10:34:42.132 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
 abnormal data: 2.643000000000029
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 596.971
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2050.866
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.725999999999999
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.4039999999995416
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 532.9160000000002
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.4839999999999804
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2.842999999999847
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 97.94599999999991
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.768999999999949
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1590.7380000000003
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 7.850999999999999
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.331000000000017
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 18.145999999999958
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 5.927999999999997
-[aiter INFO] 2026-07-24 09:32:12.000 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 64.81599999999992
-[aiter INFO] 2026-07-24 09:32:12.056 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
-                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             38.7              5.5        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0             80.6              5.8        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            174.4              5.0        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            399.3             28.5        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            476.8             68.1        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            739.9            105.7        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,048.4            578.3        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,468.2            638.3        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,088.4          1,726.9        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         15,234.4          2,176.3        CUDA            2
-10                                                                                           aten::fill_ 55.0          281.2              0.0              0.0         CPU         4688
-11                                                                                           aten::copy_ 15.0          417.4              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       37,094.8              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,399.1          5,392.7              NaN         NaN          NaN
-[sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5392.73 (graph=True)
-
-===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:13.626 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5847.5053906440735 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {64, 33, 290, 99, 5, 69, 14, 16, 274, 61, 277, 440, 441, 29, 62, 63}
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2.842999999999961
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 108.3610000000001
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1800.8120000000004
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2195.242
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 55.36200000000002
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 647.006
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 0.8799999999999955
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.051000000000045
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 60.8100000000004
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.932000000000016
-[aiter INFO] 2026-07-24 09:32:13.706 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 134.35999999999967
-[aiter INFO] 2026-07-24 09:32:13.707 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.8439999999991414
-[aiter INFO] 2026-07-24 09:32:13.707 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 611.393
-[aiter INFO] 2026-07-24 09:32:13.707 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.248000000000047
-[aiter INFO] 2026-07-24 09:32:13.707 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 48.271999999999935
-[aiter INFO] 2026-07-24 09:32:13.707 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 10.495000000000005
-[aiter INFO] 2026-07-24 09:32:13.763 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
-                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             84.8             12.1        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            365.6             26.1        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            447.8             32.0        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            490.1             14.0        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            561.9             80.3        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            886.2            126.6        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,209.2            601.3        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,915.8            702.3        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,800.7          1,828.7        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         16,005.6          2,286.5        CUDA            2
-10                                                                                           aten::copy_ 15.0          496.1              0.0              0.0         CPU         4688
-11                                                                                           aten::fill_ 55.0          940.7              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       39,464.3              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,843.0          5,824.0              NaN         NaN          NaN
-[sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5823.96 (graph=True)
-
-===== tokens=4096 =====
-[aiter INFO] 2026-07-24 09:32:15.338 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
-avg: 5563.370585441589 us/iter from cuda.Event
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
-abnormal data indices: {64, 66, 99, 5, 392, 393, 11, 268, 269, 16, 63, 51, 276, 54, 29, 31}
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2.40300000000002
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 610.5920000000001
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 2067.05
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 4.925999999999988
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.3239999999996144
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 541.3290000000006
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 3.6850000000000023
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+[aiter INFO] 2026-07-24 10:34:42.132 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 614.7189999999999
+[aiter INFO] 2026-07-24 10:34:42.132 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2075.103
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 6.408999999999992
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.363999999999976
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
 abnormal data: 3.3640000000000327
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 124.82600000000002
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.2479999999999905
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 60.40899999999999
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 8.211000000000013
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 1550.6779999999999
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 48.39199999999994
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 6.968999999999937
-[aiter INFO] 2026-07-24 09:32:15.413 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
-abnormal data: 66.01700000000005
-[aiter INFO] 2026-07-24 09:32:15.469 - MainProcess:4688 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 99.26699999999983
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.6849999999994907
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 574.9790000000003
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.1270000000000095
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.411000000000058
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1676.7069999999994
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 7.571000000000026
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.44200000000001
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.847999999999956
+[aiter INFO] 2026-07-24 10:34:42.133 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 68.14100000000008
+[aiter INFO] 2026-07-24 10:34:42.189 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
                                                                                                     name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
-0                                                                                              moe_route  7.0            0.0             41.0              5.9        CUDA            2
-1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0             95.6              6.8        CUDA            2
-2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            170.6              4.9        CUDA            2
-3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            399.2             28.5        CUDA            2
-4                                                                              moe_contiguous_psum_remap  7.0            0.0            463.8             66.3        CUDA            2
-5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            697.0             99.6        CUDA            2
-6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,860.0            551.4        CUDA            2
-7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,307.2            615.3        CUDA            2
-8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,559.3          1,651.3        CUDA            2
-9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,737.1          2,105.3        CUDA            2
-10                                                                                           aten::fill_ 55.0          346.4              0.0              0.0         CPU         4688
-11                                                                                           aten::copy_ 15.0          447.6              0.0              0.0         CPU         4688
-12                                                                                     aiter::fused_moe_  7.0       35,665.4              0.0              0.0         CPU         4688
-[avg us/iter]                                                                                        NaN  NaN        5,208.5          5,190.1              NaN         NaN          NaN
+0                                                                                              moe_route  7.0            0.0             42.8              6.1        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            259.8             18.6        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            336.8              9.6        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            392.6             28.0        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            533.0             76.1        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            843.4            120.5        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,187.2            598.2        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,864.8            695.0        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,739.5          1,819.9        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         15,866.6          2,266.7        CUDA            2
+10                                                                                           aten::copy_ 15.0          448.0              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0          623.9              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       39,077.3              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,735.6          5,723.8              NaN         NaN          NaN
 [sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
-[bench a8w4 gugu silu] fused_moe end-to-end us = 5190.12 (graph=True)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5723.78 (graph=True)
+
+===== tokens=4096 =====
+[aiter INFO] 2026-07-24 10:34:43.732 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5618.75307559967 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 66, 99, 5, 261, 262, 11, 270, 16, 63, 381, 52, 58, 379, 29, 31}
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.883000000000038
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 628.1379999999999
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2034.762
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.3240000000000123
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.76299999999992
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 99.9079999999999
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.4839999999999804
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1610.9680000000003
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.206999999999994
+[aiter INFO] 2026-07-24 10:34:43.806 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.130999999999972
+[aiter INFO] 2026-07-24 10:34:43.807 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 600.6170000000002
+[aiter INFO] 2026-07-24 10:34:43.807 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 8.010999999999967
+[aiter INFO] 2026-07-24 10:34:43.807 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 18.146000000000072
+[aiter INFO] 2026-07-24 10:34:43.807 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 3.5649999999996
+[aiter INFO] 2026-07-24 10:34:43.807 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 5.968000000000075
+[aiter INFO] 2026-07-24 10:34:43.807 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 67.46000000000004
+[aiter INFO] 2026-07-24 10:34:43.863 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0                                                                                              moe_route  7.0            0.0             92.2             13.2        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            223.9             16.0        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            339.1              9.7        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            396.4             28.3        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            516.1             73.7        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            702.4            100.3        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,890.7            555.8        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,403.8            629.1        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,532.1          1,647.4        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,717.6          2,102.5        CUDA            2
+10                                                                                           aten::copy_ 15.0          414.5              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0          589.8              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       35,855.0              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,265.6          5,259.2              NaN         NaN          NaN
+[sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5259.20 (graph=True)
+
+===== tokens=4096 =====
+[aiter INFO] 2026-07-24 10:34:45.438 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5907.284319400787 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {33, 69, 9, 329, 14, 463, 124, 81, 82, 51, 83, 305, 340, 470, 28, 61}
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 53.55899999999997
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 101.47099999999989
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 110.92500000000001
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 210.27300000000014
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 118.69600000000003
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 104.1939999999995
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2321.6310000000003
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 29.442999999999984
+[aiter INFO] 2026-07-24 10:34:45.524 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.286000000000058
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 151.06499999999994
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 725.9650000000001
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.76299999999992
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1749.375
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 645.8850000000002
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 106.87900000000002
+[aiter INFO] 2026-07-24 10:34:45.525 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 59.96900000000005
+[aiter INFO] 2026-07-24 10:34:45.581 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0                                                                                              moe_route  7.0            0.0            435.2             62.2        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0            761.5             54.4        CUDA            2
+2                                                                              moe_contiguous_psum_remap  7.0            0.0            821.2            117.3        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            929.2             66.4        CUDA            2
+4                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0          1,174.3            167.8        CUDA            2
+5              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0          2,064.2             59.0        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          4,749.1            678.4        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          5,176.6            739.5        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         12,652.7          1,807.5        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         16,109.0          2,301.3        CUDA            2
+10                                                                                           aten::copy_ 15.0        1,030.6              0.0              0.0         CPU         5339
+11                                                                                           aten::fill_ 55.0        3,191.7              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       41,118.0              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        6,477.2          6,410.4              NaN         NaN          NaN
+[sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 6410.42 (graph=True)
+
+===== tokens=4096 =====
+[aiter INFO] 2026-07-24 10:34:47.146 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:90 - wrapper
+avg: 5861.090540885925 us/iter from cuda.Event
+[aiter INFO] 2026-07-24 10:34:47.221 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:319 - post_process_data
+abnormal data indices: {64, 99, 36, 5, 70, 422, 423, 11, 274, 61, 20, 275, 278, 29, 62, 63}
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2.7630000000000337
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 2154.742
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 105.63700000000006
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.6860000000000355
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 638.434
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 55.16100000000006
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 591.7640000000001
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.204999999999984
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 4.326000000000022
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 24.15599999999995
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 59.72799999999995
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 127.83000000000038
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 1618.2600000000002
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 52.156999999999925
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 48.43100000000004
+[aiter INFO] 2026-07-24 10:34:47.222 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:321 - post_process_data
+abnormal data: 9.773000000000025
+[aiter INFO] 2026-07-24 10:34:47.279 - MainProcess:5339 - /data/yanguahe/code/wk_sp1/aiter/aiter/test_common.py:404 - get_trace_perf
+                                                                                                    name  cnt  host_time_sum  device_time_sum  device_time_avg device_type device_index
+0                                                                                              moe_route  7.0            0.0             41.8              6.0        CUDA            2
+1              void at::native::vectorized_elementwise_kernel<16, at::native::FillFunctor<unsigned ch... 14.0            0.0             92.2              6.6        CUDA            2
+2              void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std::a... 35.0            0.0            174.8              5.0        CUDA            2
+3              void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cud... 14.0            0.0            400.9             28.6        CUDA            2
+4                                                                              moe_contiguous_psum_remap  7.0            0.0            521.3             74.5        CUDA            2
+5                                                        moe_fused_quant_preshuffle_fd768_r1_fp8_pk8_all  7.0            0.0            726.4            103.8        CUDA            2
+6                                                          moe_gather_reduce_bf16_d7168_tk6_sk1_v4_wbf16  7.0            0.0          3,888.5            555.5        CUDA            2
+7                                       moe_fused_quant_preshuffle_routeks_fd7168_r1_fp8_pk8_srctk6_noKS  7.0            0.0          4,423.2            631.9        CUDA            2
+8                         gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_afp8_outbf16_noact_bias1_qout0_qrep1_v1  7.0            0.0         11,625.9          1,660.8        CUDA            2
+9                          gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1  7.0            0.0         14,889.5          2,127.1        CUDA            2
+10                                                                                           aten::fill_ 55.0          395.4              0.0              0.0         CPU         5339
+11                                                                                           aten::copy_ 15.0          449.4              0.0              0.0         CPU         5339
+12                                                                                     aiter::fused_moe_  7.0       36,116.6              0.0              0.0         CPU         5339
+[avg us/iter]                                                                                        NaN  NaN        5,280.2          5,254.9              NaN         NaN          NaN
+[sanity a8w4 gugu silu] graph: logits_diff=4.1258e-06 rel_l2=2.8725e-03 (gate<0.01, ref_norm=7.8872e+06)
+[bench a8w4 gugu silu] fused_moe end-to-end us = 5254.94 (graph=True)
 
 [precision summary]
 | data_format   | layout   | act   | init   |   experts |   tokens |   topk |   model_dim |   inter_dim |   logits_diff |     rel_l2 | pass   |      us | gemm1_us   | gemm2_us   |
 |:--------------|:---------|:------|:-------|----------:|---------:|-------:|------------:|------------:|--------------:|-----------:|:-------|--------:|:-----------|:-----------|
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5232.3  |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5966.64 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 6235.58 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5886.32 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5350.45 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5538.44 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5152.61 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5392.73 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5823.96 |            |            |
-| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5190.12 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5159.78 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5246.93 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5428    |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5161.74 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5089.39 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5622.22 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5723.78 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5259.2  |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 6410.42 |            |            |
+| a8w4          | gugu     | silu  | random |       384 |     4096 |      6 |        7168 |         768 |    4.1258e-06 | 0.00287254 | True   | 5254.94 |            |            |
