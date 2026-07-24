@@ -127,23 +127,11 @@ class Harness:
         return self.page_id_first_over_4g() + 16
 
 
-HARNESS = Harness(dtypes.bf16, dtypes.bf16, 64, 1)
-
-# Module-level names for bench_mla_ckv.py and similar imports.
-NHEAD = HARNESS.nhead
-USE_FP8 = HARNESS.use_fp8
-BYTES_PER_PAGE = HARNESS.bytes_per_page
-PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
-DECODE_QLEN = HARNESS.decode_qlen
-
-
-def _sync_module_aliases() -> None:
-    global NHEAD, USE_FP8, BYTES_PER_PAGE, PAGE_ID_FIRST_OVER_4G, DECODE_QLEN
-    NHEAD = HARNESS.nhead
-    USE_FP8 = HARNESS.use_fp8
-    BYTES_PER_PAGE = HARNESS.bytes_per_page
-    PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
-    DECODE_QLEN = HARNESS.decode_qlen
+PRESETS: dict[str, tuple[torch.dtype, torch.dtype, int]] = {
+    "qh16_fp8": (dtypes.fp8, dtypes.fp8, 16),
+    "qh64_bf16": (dtypes.bf16, dtypes.bf16, 64),
+}
+DEFAULT_PRESET = "qh16_fp8"
 
 
 def apply_config(
@@ -161,18 +149,33 @@ def apply_config(
     _sync_module_aliases()
 
 
-def apply_preset(name: str) -> None:
-    presets = {
-        "qh64_bf16": (dtypes.bf16, dtypes.bf16, 64),
-        "qh16_fp8": (dtypes.fp8, dtypes.fp8, 16),
-    }
-    if name not in presets:
-        raise ValueError(f"unknown preset {name}")
-    q, kv, n = presets[name]
-    apply_config(q, kv, n)
+def apply_preset(name: str, decode_qlen: int = DECODE_QLEN) -> None:
+    if name not in PRESETS:
+        raise ValueError(f"unknown preset {name!r}, choose from {list(PRESETS)}")
+    q, kv, n = PRESETS[name]
+    apply_config(q, kv, n, decode_qlen)
 
 
 _apply_preset = apply_preset  # legacy alias
+
+
+_q0, _kv0, _n0 = PRESETS[DEFAULT_PRESET]
+HARNESS = Harness(_q0, _kv0, _n0, DECODE_QLEN)
+
+# Module-level names for bench_mla_ckv.py and similar imports.
+NHEAD = HARNESS.nhead
+USE_FP8 = HARNESS.use_fp8
+BYTES_PER_PAGE = HARNESS.bytes_per_page
+PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
+
+
+def _sync_module_aliases() -> None:
+    global NHEAD, USE_FP8, BYTES_PER_PAGE, PAGE_ID_FIRST_OVER_4G, DECODE_QLEN
+    NHEAD = HARNESS.nhead
+    USE_FP8 = HARNESS.use_fp8
+    BYTES_PER_PAGE = HARNESS.bytes_per_page
+    PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
+    DECODE_QLEN = HARNESS.decode_qlen
 
 
 def _point_cases_for(h: Harness) -> list[PointCase]:
@@ -584,11 +587,12 @@ def _main():
         choices=["boundary", "over4g", "pa_window", "mega", "page16m", "all"],
         default="all",
     )
+    _dq, _dkv, _dn = PRESETS[DEFAULT_PRESET]
     p.add_argument(
         "-d",
         "--dtype",
         type=dtypes.str2Dtype,
-        default=dtypes.bf16,
+        default=_dq,
         choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
         metavar="{bf16, fp8}",
         help="Q dtype (same as test_mla.py -d)",
@@ -597,7 +601,7 @@ def _main():
         "-kvd",
         "--kv_dtype",
         type=dtypes.str2Dtype,
-        default=dtypes.bf16,
+        default=_dkv,
         choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
         metavar="{bf16, fp8}",
         help="KV dtype (same as test_mla.py -kvd)",
@@ -606,14 +610,19 @@ def _main():
         "-n",
         "--nhead",
         type=dtypes.str2tuple,
-        default="64,1",
-        help="nhead and decode_qlen (MTP+1), same as test_mla.py -n. e.g. -n 16,1 or -n 16,4",
+        default=f"{_dn},1",
+        help="nhead and decode_qlen (MTP+1), same as test_mla.py -n",
     )
     p.add_argument("--ctx", type=int, default=0)
     p.add_argument("--page-base", type=int, default=0)
     p.add_argument("--num-kv-splits", type=int, default=1)
     p.add_argument("--cases", type=str, default="")
-    p.add_argument("--ps", choices=["ps", "nps", "both"], default="both")
+    p.add_argument(
+        "--ps",
+        choices=["ps", "nps", "both"],
+        default="ps",
+        help="persistent kernel variant (default: ps, matches PR #4341 large page_id fix)",
+    )
     p.add_argument("--lse", choices=["on", "off", "both"], default="both")
     p.add_argument(
         "--aiter-root",
@@ -621,7 +630,12 @@ def _main():
         default="",
         help="Aiter repo root (default: parent of op_tests; used to read mla_asm.csv)",
     )
-    p.add_argument("--skip-mega", action="store_true")
+    p.add_argument(
+        "--skip-mega",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="skip sequential_mega_over4g (default: skip; golden ref needs ~8GiB extra)",
+    )
     p.add_argument("--mega-ctx", type=int, default=0)
     args = p.parse_args()
 
