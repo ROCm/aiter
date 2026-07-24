@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from . import dtypes
 from .mx_types import (
     MX_DEFAULT_ROUND_MODE,
     MxDtypeInt,
     MxScaleRoundModeInt,
+)
+
+FLOAT4_E2M1_MAX = 6.0
+FLOAT4_E2M1_MAX_RECIPROCAL = 1.0 / FLOAT4_E2M1_MAX
+_E2M1_TO_FLOAT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
 )
 
 
@@ -50,6 +56,193 @@ def mxfp4_to_f32(x):
     ]
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device=x.device)
     return mxfp4_in_f32[x.long()]
+
+
+def break_fp4_bytes(a, dtype):
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    assert a.dtype == torch.uint8
+    m, n = a.shape
+    a_flat = a.flatten()
+    high = (a_flat & 0xF0) >> 4
+    low = a_flat & 0x0F
+    combined = torch.stack((low, high), dim=1).flatten()
+    signs = (combined & 0x08).to(torch.bool)
+    abs_vals = (combined & 0x07).to(torch.long)
+
+    kE2M1 = _E2M1_TO_FLOAT.to(device=a.device)
+    values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
+    return values.reshape(m, n * 2).to(dtype=dtype)
+
+
+def dequantize_nvfp4(
+    tensor_fp4: torch.Tensor,
+    tensor_sf: torch.Tensor,
+    global_scale: torch.Tensor,
+    dtype: torch.dtype,
+    block_size: int = 16,
+):
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """Dequantize an NVFP4 tensor back to ``dtype``.
+
+    Supports 2D ``[m, packed_k]`` and 3D ``[batch, m, packed_k]`` inputs.
+    """
+    assert tensor_fp4.dtype == torch.uint8
+
+    is_3d = tensor_fp4.ndim == 3
+    if is_3d:
+        dim0, m, packed_k = tensor_fp4.shape
+        tensor_fp4 = tensor_fp4.reshape(-1, packed_k)
+        tensor_sf = tensor_sf.reshape(-1, tensor_sf.shape[-1])
+        global_scale = global_scale[:, None, None]
+    else:
+        m, packed_k = tensor_fp4.shape
+
+    k = packed_k * 2
+    tensor_f32 = break_fp4_bytes(tensor_fp4, torch.float32)
+    tensor_f32 = tensor_f32.reshape(-1, k // block_size, block_size)
+    tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
+
+    if is_3d:
+        tensor_sf = tensor_sf.reshape(dim0, m, k // block_size)
+    tensor_sf_dtype = tensor_sf.to(torch.float32) * global_scale
+
+    if is_3d:
+        tensor_f32 = tensor_f32.reshape(dim0, m, -1, block_size)
+
+    out = tensor_f32 * tensor_sf_dtype.unsqueeze(-1)
+    out = out.reshape(*out.shape[:-2], -1)
+
+    return out.to(dtype)
+
+
+def get_reciprocal(x):
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    if isinstance(x, torch.Tensor):
+        return 1.0 / (x + (x == 0) * 1e8)
+    if isinstance(x, (float, int)):
+        return 0.0 if x == 0 else 1.0 / x
+    raise TypeError("Input must be a float, int, or a torch.Tensor.")
+
+
+def cast_to_fp4(x):
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    sign = torch.sign(x)
+    x = torch.abs(x)
+    x[(x >= 0.0) & (x <= 0.25)] = 0.0
+    x[(x > 0.25) & (x < 0.75)] = 0.5
+    x[(x >= 0.75) & (x <= 1.25)] = 1.0
+    x[(x > 1.25) & (x < 1.75)] = 1.5
+    x[(x >= 1.75) & (x <= 2.5)] = 2.0
+    x[(x > 2.5) & (x < 3.5)] = 3.0
+    x[(x >= 3.5) & (x <= 5.0)] = 4.0
+    x[x > 5.0] = 6.0
+    return x * sign
+
+
+def ref_nvfp4_quant(x, global_scale, block_size):
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    assert global_scale.dtype == torch.float32
+    assert x.ndim == 2
+    m, n = x.shape
+    x = torch.reshape(x, (m, n // block_size, block_size))
+    vec_max = torch.max(torch.abs(x), dim=-1, keepdim=True)[0].to(torch.float32)
+    scale = global_scale * (vec_max * FLOAT4_E2M1_MAX_RECIPROCAL)
+    scale = torch.clamp(scale, max=448, min=-448)
+    scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
+    output_scale = get_reciprocal(scale * get_reciprocal(global_scale))
+
+    scaled_x = x.to(torch.float32) * output_scale
+    clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(m, n)
+    return cast_to_fp4(clipped_x), scale.squeeze(-1)
+
+
+def shuffle_nvfp4_weight_for_flydsl(weight: torch.Tensor) -> torch.Tensor:
+    """Preshuffle packed NVFP4 [E, N, K//2] for FlyDSL kpack_bytes=8 layout."""
+    expert, n_out, packed_k = weight.shape
+    if n_out % 16 != 0 or packed_k % 32 != 0:
+        raise ValueError(
+            f"NVFP4 FlyDSL weight requires N%16==0 and packed_K%32==0, "
+            f"got shape={tuple(weight.shape)}"
+        )
+    flattened = weight.view(expert * n_out, packed_k)
+    shuffled = flattened.view(expert * n_out // 16, 16, packed_k // 32, 4, 8)
+    shuffled = shuffled.permute(0, 2, 3, 1, 4).contiguous()
+    return shuffled.view_as(weight)
+
+
+def _quantize_nvfp4_weight_for_moe(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize BF16/FP32 MoE weights to packed NVFP4 plus per-block scales.
+
+    Args:
+        weight: Unpacked weight shaped ``[experts, n_out, k]``. ``k`` must be
+            divisible by 16.
+
+    Returns:
+        ``(packed_weight, block_scales, global_scale)`` where ``packed_weight``
+        is ``uint8`` with two FP4 values per byte and ``block_scales`` is
+        ``uint8`` storage for ``float8_e4m3fn`` scales shaped
+        ``[experts, n_out, k // 16]``. For tests and tuning references,
+        ``block_scales.dequantized_weight`` is populated with the BF16/FP16
+        QDQ weight.
+    """
+
+    def _pack_fp4_to_uint8(fp4_f32: torch.Tensor) -> torch.Tensor:
+        e2m1_encode = {
+            0.0: 0,
+            0.5: 1,
+            1.0: 2,
+            1.5: 3,
+            2.0: 4,
+            3.0: 5,
+            4.0: 6,
+            6.0: 7,
+        }
+        sign = (fp4_f32 < 0).to(torch.uint8) << 3
+        magnitude = torch.abs(fp4_f32)
+        code = torch.zeros_like(magnitude, dtype=torch.uint8)
+        for value, bits in e2m1_encode.items():
+            code[magnitude == value] = bits
+        nibbles = sign | code
+        low = nibbles[..., 0::2]
+        high = nibbles[..., 1::2]
+        return low | (high << 4)
+
+    expert, _, k = weight.shape
+    if k % 16 != 0:
+        raise ValueError(f"NVFP4 MoE weight K must be divisible by 16, got K={k}")
+
+    global_scale = torch.ones((expert,), dtype=torch.float32, device=weight.device)
+    packed_per_expert = []
+    scales_per_expert = []
+    for expert_idx in range(expert):
+        fp4_f32, block_scales_f32 = ref_nvfp4_quant(
+            weight[expert_idx].float(),
+            global_scale[expert_idx : expert_idx + 1],
+            block_size=16,
+        )
+        packed_per_expert.append(_pack_fp4_to_uint8(fp4_f32))
+        scales_per_expert.append(
+            block_scales_f32.to(torch.float8_e4m3fn).view(torch.uint8)
+        )
+
+    packed_weight = torch.stack(packed_per_expert, dim=0).contiguous()
+    block_scales = torch.stack(scales_per_expert, dim=0).contiguous()
+    dequantized_weight = dequantize_nvfp4(
+        packed_weight,
+        block_scales,
+        global_scale,
+        weight.dtype,
+        block_size=16,
+    )
+    block_scales.dequantized_weight = dequantized_weight.contiguous()
+    return packed_weight, block_scales, global_scale
 
 
 # ---------------------------------------------------------------------------

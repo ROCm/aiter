@@ -543,6 +543,7 @@ def _precompile_to_cache(
                     w1.view(-1),
                     flat_a_scale,
                     flat_w_scale,
+                    torch.empty(0, device=dev),
                     sorted_token_ids,
                     sorted_expert_ids,
                     sw_arg,
@@ -716,6 +717,7 @@ def _precompile_to_cache(
                     w2,
                     flat_a_scale,
                     flat_w_scale,
+                    torch.empty(0, device=dev),
                     sorted_token_ids,
                     sorted_expert_ids,
                     sw_arg,
@@ -784,7 +786,6 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
     row/token dims are dynamic, so dummy buffers suffice.
     """
     import torch
-
     from aiter.ops.flydsl.moe_kernels import (
         _get_compiled_silu_fused,
         _get_compiled_swiglu,
