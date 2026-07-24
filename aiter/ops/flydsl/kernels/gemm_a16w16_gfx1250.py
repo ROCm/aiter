@@ -1130,13 +1130,16 @@ def compile_gemm_a16w16(
 
         # Set waves_per_eu
         for op in ctx.gpu_module_body.operations:
-            if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                if effective_waves_per_eu is not None:
-                    _wpe = int(effective_waves_per_eu)
-                    if _wpe >= 1:
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            ir.IntegerType.get_signless(32), _wpe
-                        )
+            if (
+                hasattr(op, "attributes")
+                and op.OPERATION_NAME == "gpu.func"
+                and effective_waves_per_eu is not None
+            ):
+                _wpe = int(effective_waves_per_eu)
+                if _wpe >= 1:
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        ir.IntegerType.get_signless(32), _wpe
+                    )
 
         # Flat work-group size hint.
         flat_wg_attr = ir.StringAttr.get(f"{block_threads},{block_threads}")
