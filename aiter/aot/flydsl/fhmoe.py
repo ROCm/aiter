@@ -8,15 +8,10 @@
 from __future__ import annotations
 
 import csv
-import re
 from dataclasses import dataclass
 from typing import Any
 
 from aiter.aot.flydsl.common import cu_num_to_arch, job_identity
-
-
-def _without_xcd(kernel_name: str) -> str:
-    return re.sub(r"_xcd\d+", "", kernel_name)
 
 
 def _normalized_enum(value: str) -> str:
@@ -46,9 +41,7 @@ def _row_job_keys(row: dict[str, str]) -> set[tuple[Any, ...]]:
     stage1_name = row.get("kernelName1", "").strip()
     stage1_params = get_flydsl_kernel_params(stage1_name)
     stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
-    stage1_fuse_quant = (
-        stage1_out_dtype if stage1_out_dtype in ("fp4", "fp8") else None
-    )
+    stage1_fuse_quant = stage1_out_dtype if stage1_out_dtype in ("fp4", "fp8") else None
     prefix = (
         int(row["token"]),
         int(row["model_dim"]),
@@ -108,8 +101,6 @@ def extend_fhmoe_jobs(
             continue
         fhmoe_job = {
             **job,
-            "kernel_name": _without_xcd(job["kernel_name"]),
-            "xcd_swizzle": 0,
             "shared_expert_id": job["experts"] - 1,
         }
         key = job_identity(fhmoe_job)
@@ -234,7 +225,6 @@ class _FHMoEAOTBackend:
     def compile_stage1(self, **kwargs):
         from aiter.ops.flydsl.fhmoe import compile_flydsl_fhmoe_stage1
 
-        kwargs.pop("xcd_swizzle", None)
         return compile_flydsl_fhmoe_stage1(
             **kwargs,
             shared_expert_id=self.shared_expert_id,
@@ -243,7 +233,6 @@ class _FHMoEAOTBackend:
     def compile_stage2(self, **kwargs):
         from aiter.ops.flydsl.fhmoe import compile_flydsl_fhmoe_stage2
 
-        kwargs.pop("xcd_swizzle", None)
         return compile_flydsl_fhmoe_stage2(
             **kwargs,
             shared_expert_id=self.shared_expert_id,
