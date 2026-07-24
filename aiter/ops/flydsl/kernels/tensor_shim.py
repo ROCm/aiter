@@ -2,19 +2,17 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-
-import torch
-import numpy as np
-import flydsl.compiler as flyc
-from itertools import product
 from abc import ABC, abstractmethod
+from itertools import product
 
+import flydsl.compiler as flyc
+import numpy as np
+import torch
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl._mlir import ir
+from flydsl.expr import arith, buffer_ops, ptrtoint, range_constexpr, vector
 from flydsl.expr.typing import T
-
-from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -50,11 +48,20 @@ def _run_compiled(exe, *args):
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
     """
     cf = getattr(exe, "_cf", None)
-    if cf is None:
+    if cf is not None:
+        cf(*args)
+        return
+    try:
         cf = flyc.compile(exe, *args)
         exe._cf = cf
-    else:
-        cf(*args)
+    except Exception:
+        # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
+        try:
+            while ir.Context.current is not None:
+                ir.Context.current.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        raise
 
 
 def _to_raw(v):
@@ -87,18 +94,14 @@ def get_dtype_in_kernel(dtype: str):
 def get_dtype_vec_size(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 8
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 8
 
 
 def get_dtype_bytes(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 2
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 2
 
 

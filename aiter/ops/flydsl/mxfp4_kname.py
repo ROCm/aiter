@@ -16,6 +16,11 @@ _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
+_FLYDSL_V2_GEMM2_RE = re.compile(
+    r"^flydsl(?:v2_moe2|_moe2_layout)_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
+    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
+    r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
+)
 
 
 def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
@@ -85,3 +90,21 @@ def _is_mxfp4_kname(kname) -> bool:
     # CSV tune files leave kernelName empty for 1-stage configs; pandas loads
     # those cells as float('nan'), and bool(nan) is True, so guard on str type.
     return isinstance(kname, str) and kname.startswith("flydsl_mxmoe_g")
+
+
+def parse_flydsl_v2_gemm2_kernel(name):
+    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
+    if not m:
+        return None
+    return {
+        "a_dtype": m.group("a"),
+        "b_dtype": m.group("b"),
+        "out_dtype": m.group("out"),
+        "tile_m": int(m.group("tm")),
+        "tile_n": int(m.group("tn")),
+        "tile_k": int(m.group("tk")),
+        "epilog": m.group("epilog"),
+        "persist": bool(m.group("persist")),
+        "use_nt": bool(m.group("nt")),
+        "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
+    }

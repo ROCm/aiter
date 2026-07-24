@@ -26,10 +26,29 @@ DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
+# V2 GEMM2 enables fp8 route-out by default; the legacy MoE AOT path keeps its
+# own default behavior in moe.py.
+_STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:
     """Dedup key == the runtime FlyDSL cache key."""
+    if job.get("v2_stage2"):
+        return (
+            2,
+            "layout",
+            job["BM"],
+            job["use_nt"],
+            job["epilog"],
+            job["D_INTER"],
+            job["N_OUT"],
+            job["topk"] if job["epilog"] == "reduce" else 1,
+            job["SBM"],
+            job["persist"],
+            job["cu_num"] if job["persist"] else 0,
+            job["has_pad"],
+            job["out_dtype"],
+        )
     if job["stage"] == 1:
         return (
             1,
@@ -57,12 +76,13 @@ def _job_key(job: dict) -> tuple:
 
 def parse_csv(csv_path: str):
     """Parse an fp4 tuned CSV into unique mxmoe-port compile jobs (one per stage)."""
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
+        parse_flydsl_v2_gemm2_kernel,
     )
-    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
 
     jobs = []
     seen = set()
@@ -104,7 +124,40 @@ def parse_csv(csv_path: str):
                 )
 
             kn2 = (row.get("kernelName2") or "").strip()
-            if _is_mxfp4_kname(kn2):
+            v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
+            if v2_g2 is not None:
+                bm = v2_g2["tile_m"]
+                inter_dim_pad = d_inter - inter_dim
+                model_dim_pad = 0
+                out_dtype = (
+                    "fp8"
+                    if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
+                    else "bf16"
+                )
+                _add(
+                    {
+                        "stage": 2,
+                        "v2_stage2": True,
+                        "kernel_name": kn2,
+                        "BM": bm,
+                        "use_nt": v2_g2["use_nt"],
+                        "NE": expert,
+                        "N_OUT": model_dim,
+                        "epilog": v2_g2["epilog"],
+                        "D_INTER": d_inter,
+                        "D_INTER_REAL": d_inter_real,
+                        "topk": topk,
+                        "SBM": v2_g2["sort_block_m"] or bm,
+                        "persist": v2_g2["persist"],
+                        "cu_num": int(row.get("cu_num", "0") or "0"),
+                        "a_dtype": v2_g2["a_dtype"],
+                        "inter_dim_pad": inter_dim_pad,
+                        "model_dim_pad": model_dim_pad,
+                        "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
+                        "out_dtype": out_dtype,
+                    }
+                )
+            elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 if p2["mxfp4out"] and not _MXFP4_INTERMEDIATE:
                     continue
@@ -199,11 +252,87 @@ def _compile_stage2(job):
     )
 
 
+def _compile_v2_stage2(job):
+    import torch
+
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    d = _dummy()
+    max_sorted = job["BM"]
+    if job["persist"]:
+        max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
+    is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
+    out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
+    if job["epilog"] == "reduce":
+        if is_fp8_route_out:
+            target = torch.empty(
+                (
+                    job["BM"] * job["topk"],
+                    job["N_OUT"] + job["N_OUT"] // 8,
+                ),
+                dtype=torch.uint8,
+                device="cpu",
+            )
+        else:
+            target = torch.empty(
+                (job["BM"], job["topk"], job["N_OUT"]),
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+    else:
+        target = out
+    mxfp4_moe_gemm2(
+        inter_sorted_quant=d,
+        inter_sorted_shuffled_scale=d,
+        w2_u8=d,
+        w2_scale_u8=d,
+        sorted_expert_ids=d,
+        cumsum_tensor=d,
+        sorted_token_ids=d,
+        sorted_weights=d,
+        out=target,
+        M_logical=job["BM"],
+        max_sorted=max_sorted,
+        NE=job["NE"],
+        D_HIDDEN=job["N_OUT"],
+        D_INTER=job["D_INTER"],
+        topk=job["topk"],
+        BM=job["BM"],
+        use_nt=job["use_nt"],
+        a_dtype=job["a_dtype"],
+        epilog=job["epilog"],
+        SBM=job["SBM"],
+        persist=job["persist"],
+        cu_num=job["cu_num"],
+        n_sorted_padded=max_sorted,
+        inter_dim_pad=job["inter_dim_pad"],
+        model_dim_pad=job["model_dim_pad"],
+        out_dtype=job["out_dtype"],
+        stream=0,
+    )
+    if job["epilog"] == "reduce":
+        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+        _run_moe_reduction(
+            target,
+            out,
+            job["BM"],
+            job["topk"],
+            job["N_OUT"],
+            expert_mask=None,
+            topk_ids=None,
+            stream=0,
+            is_fp8=is_fp8_route_out,
+        )
+
+
 def compile_one_config(**job):
     stage = job["stage"]
     shape_str = (
         f"{job['kernel_name']} NE={job['NE']} D_INTER={job['D_INTER']} BM={job['BM']}"
     )
+    if job.get("v2_stage2"):
+        shape_str += f" out_dtype={job['out_dtype']}"
     result = {"kernel_name": job["kernel_name"], "stage": stage, "compile_time": None}
 
     t0 = time.time()
@@ -214,12 +343,14 @@ def compile_one_config(**job):
         with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
             if stage == 1:
                 _compile_stage1(job)
+            elif job.get("v2_stage2"):
+                _compile_v2_stage2(job)
             else:
                 _compile_stage2(job)
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  stage{stage}  {shape_str}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  stage{stage}  {shape_str}: {e}")
 
     return result

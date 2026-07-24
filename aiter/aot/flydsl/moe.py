@@ -27,7 +27,6 @@ import csv
 import os
 import sys
 import time
-from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -51,6 +50,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_kernel_params,
     runtime_swiglu_limit,
 )
+from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -105,12 +105,19 @@ def parse_csv(csv_path: str):
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
             stage1_name = row.get("kernelName1", "").strip()
+            stage2_name = row.get("kernelName2", "").strip()
             stage1_params = (
                 get_flydsl_kernel_params(stage1_name)
                 if stage1_name.startswith("flydsl_")
                 else None
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
+            stage1_v2_output_layout = stage2_name.startswith("flydsl_moe2_layout_")
+            stage2_v2_params = (
+                parse_flydsl_v2_gemm2_kernel(stage2_name)
+                if stage1_v2_output_layout
+                else None
+            )
 
             # cktile_ stage1 runs a FlyDSL post-activation epilogue (silu ->
             # silu_and_mul_fq, swiglu -> swiglu_and_mul) that the flydsl_-only loop
@@ -138,6 +145,8 @@ def parse_csv(csv_path: str):
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
                 if not name or not name.startswith("flydsl_"):
+                    continue
+                if name.startswith("flydsl_moe2_layout_"):
                     continue
 
                 params = get_flydsl_kernel_params(name)
@@ -168,8 +177,11 @@ def parse_csv(csv_path: str):
                             if stage1_out_dtype in ("fp4", "fp8")
                             else None
                         )
-
                     full_job = {**job, **params}
+                    if params["stage"] == 1 and stage1_v2_output_layout:
+                        full_job["v2_output_layout"] = True
+                        if stage2_v2_params is not None:
+                            full_job["out_dtype"] = stage2_v2_params["a_dtype"]
                     key = job_identity(full_job)
                     if key in seen:
                         continue
@@ -201,7 +213,7 @@ def _precompile_to_cache(
     # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
     # production-variant ``_persist_async_w4_cumul3`` does), causing
     # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -216,6 +228,7 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -412,6 +425,7 @@ def _precompile_to_cache(
             _gui_sk = gate_mode == "interleave" and _is_splitk
             _gui_sk_fused = _gui_sk and _fuse_any_quant
             _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
+            _v2_output_layout = _fuse_any_quant and not _is_splitk and v2_output_layout
             _gemm_out_torch_dtype = (
                 torch.bfloat16 if _gemm_out_dtype == "bf16" else torch.float16
             )
@@ -441,23 +455,46 @@ def _precompile_to_cache(
                 )
             else:
                 tmp_out = None
-                out = (
-                    torch.empty(
-                        (tokens, topk, inter_dim // 2), device=dev, dtype=torch.uint8
+                if _v2_output_layout:
+                    _sorted_rows = max(
+                        sorted_token_ids.shape[0],
+                        sorted_expert_ids.shape[0] * tile_m,
                     )
-                    if _need_fp4
-                    else (
+                    out = (
                         torch.empty(
-                            (tokens, topk, inter_dim), device=dev, dtype=torch.uint8
-                        )
-                        if _need_fp8
-                        else torch.empty(
-                            (tokens, topk, inter_dim),
+                            (_sorted_rows, inter_dim // 2),
                             device=dev,
-                            dtype=_gemm_out_torch_dtype,
+                            dtype=torch.uint8,
+                        )
+                        if _need_fp4
+                        else torch.empty(
+                            (_sorted_rows, inter_dim),
+                            device=dev,
+                            dtype=torch.uint8,
                         )
                     )
-                )
+                else:
+                    out = (
+                        torch.empty(
+                            (tokens, topk, inter_dim // 2),
+                            device=dev,
+                            dtype=torch.uint8,
+                        )
+                        if _need_fp4
+                        else (
+                            torch.empty(
+                                (tokens, topk, inter_dim),
+                                device=dev,
+                                dtype=torch.uint8,
+                            )
+                            if _need_fp8
+                            else torch.empty(
+                                (tokens, topk, inter_dim),
+                                device=dev,
+                                dtype=_gemm_out_torch_dtype,
+                            )
+                        )
+                    )
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
@@ -576,6 +613,7 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 k_wave=k_wave,
+                v2_output_layout=_v2_output_layout,
             )
             _run_compiled(exe, args)
 
@@ -894,7 +932,7 @@ def compile_one_config(
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result
