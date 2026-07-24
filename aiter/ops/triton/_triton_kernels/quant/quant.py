@@ -52,6 +52,47 @@ def _dynamic_per_tensor_quant_fp8_i8_kernel(
 
 
 @triton.jit
+def _fused_dynamic_per_tensor_quant_fp8_i8_kernel(
+    qx_ptr,
+    x_in_ptr,
+    scale_out_ptr,
+    N: int,
+    DTYPE_MAX: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Single-workgroup fused amax + quantize for the small/decode regime.
+    # One program walks the whole (flattened, contiguous) tensor in a grid-stride
+    # loop, so the global scale is known without a cross-block reduction -> a
+    # single kernel launch instead of the atomic-max amax pass + separate quant
+    # pass. Byte-identical to _dynamic_per_tensor_quant_fp8_i8_kernel +
+    # _static_per_tensor_quant_fp8_i8_kernel: same scale (max commutes with
+    # / DTYPE_MAX), same 1 / scale, no clamp (dynamic scaling guarantees
+    # |x| / scale <= DTYPE_MAX).
+    offs = tl.arange(0, BLOCK)
+
+    amax = tl.zeros([BLOCK], dtype=tl.float32)
+    i = 0
+    while i < N:
+        idx = i + offs
+        mask = idx < N
+        x = tl.load(x_in_ptr + idx, mask=mask, other=0.0, cache_modifier=".cg")
+        amax = tl.maximum(amax, tl.abs(x.to(tl.float32)))
+        i += BLOCK
+    scale = tl.max(amax, axis=0) / DTYPE_MAX
+    tl.store(scale_out_ptr, scale)
+    scale_recip = 1 / scale
+
+    i = 0
+    while i < N:
+        idx = i + offs
+        mask = idx < N
+        x = tl.load(x_in_ptr + idx, mask=mask, other=0.0, cache_modifier=".cg")
+        qx = (x.to(tl.float32) * scale_recip).to(qx_ptr.dtype.element_ty)
+        tl.store(qx_ptr + idx, qx, mask=mask, cache_modifier=".cs")
+        i += BLOCK
+
+
+@triton.jit
 def _dynamic_per_token_quant_fp8_i8_kernel(
     qx_ptr,
     scale_out_ptr,
