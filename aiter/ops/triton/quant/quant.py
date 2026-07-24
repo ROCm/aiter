@@ -158,7 +158,9 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor,
+    scaling_mode: str = "even",
+    use_hw_cvt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -168,6 +170,14 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        use_hw_cvt: On the plain Triton dispatch path, use the native gfx950
+            hardware conversion instruction v_cvt_scalef32_pk_fp4_bf16 instead
+            of the manual bit-manipulation fallback. Requires x to be bf16
+            (auto-disabled otherwise). Ignored on the Gluon dispatch paths:
+            the gfx950 Gluon kernel always uses the hw instruction (and is
+            only selected when x is bf16 -- non-bf16 input on gfx950 falls
+            through to the plain Triton path instead); the gfx1250 Gluon
+            kernel has no hw-cvt path at all.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -176,6 +186,8 @@ def dynamic_mxfp4_quant(
     M, N = x.shape
 
     assert (N // 2) % 2 == 0
+    if use_hw_cvt and x.dtype != torch.bfloat16:
+        use_hw_cvt = False
 
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -190,8 +202,8 @@ def dynamic_mxfp4_quant(
     if M <= 32:
         NUM_ITER = 1
         BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 32
-        NUM_WARPS = 1
+        BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+        NUM_WARPS = 4
         NUM_STAGES = 1
     else:
         NUM_ITER = 4
@@ -202,17 +214,17 @@ def dynamic_mxfp4_quant(
 
         if N <= 16384:
             BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 128
+            BLOCK_SIZE_N = 256
 
     # for small N values
     if N <= 1024:
         NUM_ITER = 1
         NUM_STAGES = 1
         NUM_WARPS = 4
-        BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
+        BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
         # BLOCK_SIZE_N needs to be multiple of 32
         BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(8, triton.next_power_of_2(M))
+        BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
@@ -220,7 +232,10 @@ def dynamic_mxfp4_quant(
     )
     even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-    if arch_info.get_arch() in ("gfx950"):
+    # The gfx950 Gluon kernel dropped its sw (manual bit-manipulation)
+    # fallback and always uses the hw-cvt instruction, which only supports
+    # bf16 -- non-bf16 input falls through to the plain Triton path below.
+    if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16:
         gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
             x,
             x_fp4,
@@ -241,7 +256,7 @@ def dynamic_mxfp4_quant(
             waves_per_eu=0,
         )
 
-    elif arch_info.get_arch() in ("gfx1250"):
+    elif arch_info.get_arch() == "gfx1250":
         gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
             x,
             x_fp4,
@@ -278,6 +293,7 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             NUM_STAGES=NUM_STAGES,
+            USE_HW_CVT=use_hw_cvt,
             num_warps=NUM_WARPS,
             waves_per_eu=0,
         )
