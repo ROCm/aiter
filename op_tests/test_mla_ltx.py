@@ -18,9 +18,9 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import pytest
 import torch
@@ -348,14 +348,14 @@ def _build_persistent_metadata(
         dtype_q=dtype,
         dtype_kv=dtype,
     )
-    return dict(
-        work_meta_data=wmd,
-        work_indptr=wi,
-        work_info_set=wis,
-        reduce_indptr=ri,
-        reduce_final_map=rfm,
-        reduce_partial_map=rpm,
-    )
+    return {
+        "work_meta_data": wmd,
+        "work_indptr": wi,
+        "work_info_set": wis,
+        "reduce_indptr": ri,
+        "reduce_final_map": rfm,
+        "reduce_partial_map": rpm,
+    }
 
 
 # --- decode: golden vs ASM ---
@@ -397,12 +397,12 @@ def mla_decode_asm(
     out = torch.empty((qlen, HARNESS.nhead, V_HEAD_DIM), dtype=torch.bfloat16).fill_(-1)
     kv_view = kv_buffer.view(num_pages, PAGE_SIZE, NHEAD_KV, QK_HEAD_DIM)
     q_asm = q.to(dtypes.fp8) if HARNESS.q_dtype == dtypes.fp8 else q
-    kw = dict(
-        page_size=PAGE_SIZE,
-        nhead_kv=NHEAD_KV,
-        sm_scale=sm,
-        return_lse=return_lse,
-    )
+    kw = {
+        "page_size": PAGE_SIZE,
+        "nhead_kv": NHEAD_KV,
+        "sm_scale": sm,
+        "return_lse": return_lse,
+    }
     if HARNESS.use_fp8:
         kw["q_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
         kw["kv_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
