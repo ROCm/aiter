@@ -1,0 +1,268 @@
+name: FFM Aiter UT
+
+run-name: FFM aiter UT on ${{ inputs.runner || 'aiter-1gpu-runner' }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - "aiter/ops/triton/**"
+      - "op_tests/triton_tests/**"
+      - ".github/workflows/ffm-bringup.yaml"
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Self-hosted MI350 runner label to use for the FFM UT.
+        required: true
+        default: aiter-1gpu-runner
+        type: string
+      docker_image:
+        description: FFM image to pull and test.
+        required: true
+        default: rocm/ffm-dev:latest
+        type: string
+      test_ref:
+        description: Git branch containing the reduced FFM Triton test suite.
+        required: true
+        default: shared/reduced_tests_for_FFM_CI
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'aiter-1gpu-runner' }}
+  cancel-in-progress: true
+
+env:
+  FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
+  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
+  FFM_TEST: op_tests/triton_tests
+  FFM_SHARD_COUNT: 32
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for Checks workflow
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  ffm-aiter-ut:
+    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }}) / Shard ${{ matrix.shard }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    needs: [check-signal]
+    runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Load reduced FFM Triton test suite
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
+          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
+          echo "FFM test source commit: ${ffm_test_source_commit}"
+          rm -rf "${FFM_TEST}"
+          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
+          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
+          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+          if [ "${test_count}" -eq 0 ]; then
+            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+            exit 1
+          fi
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "::error::Missing DOCKER_PASSWORD secret required to pull ${FFM_IMAGE}"
+            exit 1
+          fi
+          DOCKER_USER="${DOCKERHUB_USERNAME:-rocmshared}"
+          for attempt in 1 2 3; do
+            if echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USER}" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "::error::Docker login failed after 3 attempts"
+          exit 1
+
+      - name: Pull FFM image
+        run: |
+          set -euo pipefail
+          docker pull "${FFM_IMAGE}"
+
+      - name: Run sharded FFM Triton tests
+        run: |
+          set -euo pipefail
+
+          DEVICE_FLAG="--device /dev/dri"
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG="$(cat /etc/podinfo/gha-render-devices)"
+          fi
+
+          GROUP_FLAGS=""
+          for group in video render; do
+            gid="$(getent group "${group}" | cut -d: -f3 || true)"
+            if [ -n "${gid}" ]; then
+              GROUP_FLAGS="${GROUP_FLAGS} --group-add ${gid}"
+            fi
+          done
+
+          docker run --rm -i \
+            --device /dev/kfd ${DEVICE_FLAG} \
+            ${GROUP_FLAGS} \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --shm-size=16gb \
+            -e FFM_TEST="${FFM_TEST}" \
+            -e FFM_SHARD_INDEX="${{ matrix.shard }}" \
+            -e FFM_SHARD_COUNT="${FFM_SHARD_COUNT}" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${FFM_IMAGE}" \
+            bash -l -s <<'FFM_DOCKER_SCRIPT'
+              set -euo pipefail
+              source /ffm/ffmlite_env.sh
+              cd /workspace
+              git config --global --add safe.directory /workspace
+
+              echo "==== Runtime context ===="
+              echo "pwd: $(pwd)"
+              echo "aiter checkout: $(git rev-parse HEAD)"
+              echo "FFM_TEST=${FFM_TEST}"
+              echo "FFM_SHARD_INDEX=${FFM_SHARD_INDEX}"
+              echo "FFM_SHARD_COUNT=${FFM_SHARD_COUNT}"
+              echo "PATH=${PATH}"
+              echo "PYTHONPATH=${PYTHONPATH:-}"
+
+              export ENABLE_CK=0
+              export AITER_TRITON_ONLY=0
+              export AITER_USE_SYSTEM_TRITON=1
+              export PIP_BREAK_SYSTEM_PACKAGES=1
+              echo "ENABLE_CK=${ENABLE_CK}"
+              echo "AITER_TRITON_ONLY=${AITER_TRITON_ONLY}"
+              echo "AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}"
+
+              echo "==== Python packages before reinstall ===="
+              python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
+
+              echo "==== Reinstall mounted aiter checkout ===="
+              python3 -m pip uninstall -y amd-aiter aiter || true
+              python3 -m pip install --break-system-packages --no-build-isolation -e .
+
+              echo "==== Python packages after reinstall ===="
+              python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
+              python3 -m pip uninstall -y pylama || true
+
+              echo "==== Build FFM Triton shard ===="
+              printf "%s\n" \
+                "op_tests/triton_tests/conv/test_causal_conv1d.py" \
+                "op_tests/triton_tests/attention/test_mha_with_pe.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_a8w8_blockscale.py" \
+                "op_tests/triton_tests/moe/test_moe_gemm_int8_smoothquant.py" \
+                "op_tests/triton_tests/attention/test_unified_attention.py" \
+                "op_tests/triton_tests/attention/test_pa_decode.py" \
+                "op_tests/triton_tests/moe/test_moe_gemm_a8w8_blockscale.py" \
+                "op_tests/triton_tests/fusions/test_fused_kv_cache.py" \
+                "op_tests/triton_tests/moe/test_moe.py" \
+                "op_tests/triton_tests/attention/test_pa_prefill.py" \
+                "op_tests/triton_tests/rope/test_fused_qkv_split_qk_rope.py" \
+                "op_tests/triton_tests/test_pa_decode_gluon.py" \
+                "op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_a16w16.py" \
+                "op_tests/triton_tests/rope/test_rope.py" \
+                "op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_mul_add.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py" \
+                "op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16_fused.py" \
+                "op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16.py" \
+                "op_tests/triton_tests/gemm/batched/test_batched_gemm_afp4wfp4.py" \
+                "op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py" \
+                "op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_split_cat.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_afp8wfp8.py" \
+                "op_tests/triton_tests/fusions/test_mhc.py" \
+                "op_tests/triton_tests/moe/test_moe_routing.py" \
+                "op_tests/triton_tests/moe/test_moe_routing_sigmoid_top1_fused.py" \
+                > ffm_excluded_files.list
+
+              printf "%s\n" \
+                "op_tests/triton_tests/attention/test_mha_v3.py" \
+                "op_tests/triton_tests/test_pa_decode_gluon.py" \
+                "op_tests/triton_tests/conv/test_causal_conv1d.py" \
+                "op_tests/triton_tests/attention/test_mha_fp8.py" \
+                "op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py" \
+                > ffm_node_sharded_files.all
+              grep -Fxv -f ffm_excluded_files.list ffm_node_sharded_files.all > ffm_node_sharded_files.list || true
+
+              ./.github/scripts/split_tests.sh --shards "${FFM_SHARD_COUNT}" --test-type triton
+              tr " " "\n" < "triton_shard_${FFM_SHARD_INDEX}.list" \
+                | sed "/^$/d" \
+                | grep -Fxv -f ffm_excluded_files.list \
+                | grep -Fxv -f ffm_node_sharded_files.list \
+                > ffm_shard_items.list || true
+
+              while IFS= read -r file; do
+                if [ ! -f "${file}" ]; then
+                  echo "Node-sharded file not present in reduced suite, skipping: ${file}"
+                  continue
+                fi
+                echo "Collecting node-sharded file: ${file}"
+                if ! python3 -m pytest --collect-only -q "${file}" > ffm_collect_one_file.txt 2>&1; then
+                  cat ffm_collect_one_file.txt
+                  echo "::error::Failed to collect ${file}"
+                  exit 1
+                fi
+                awk \
+                  -v prefix="${file}::" \
+                  -v shard="${FFM_SHARD_INDEX}" \
+                  -v shards="${FFM_SHARD_COUNT}" \
+                  'index($0, prefix) == 1 { n++; if (((n - 1) % shards) == shard) print }' \
+                  ffm_collect_one_file.txt >> ffm_shard_items.list
+              done < ffm_node_sharded_files.list
+
+              awk 'NF && !seen[$0]++' ffm_shard_items.list > ffm_shard_items.dedup
+              mv ffm_shard_items.dedup ffm_shard_items.list
+              shard_count="$(wc -l < ffm_shard_items.list | tr -d " ")"
+              echo "Selected ${shard_count} FFM Triton item(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+              if [ "${shard_count}" -eq 0 ]; then
+                echo "No FFM Triton items selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}; exiting successfully."
+                exit 0
+              fi
+              cat ffm_shard_items.list
+              mapfile -t FFM_TEST_ITEMS < ffm_shard_items.list
+
+              echo "==== Run sharded FFM Triton tests ===="
+              python3 -m pytest -v --maxfail=1 --tb=short --durations=50 "${FFM_TEST_ITEMS[@]}"
+          FFM_DOCKER_SCRIPT
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logout 2>/dev/null || true
+          docker rmi "${FFM_IMAGE}" 2>/dev/null || true
