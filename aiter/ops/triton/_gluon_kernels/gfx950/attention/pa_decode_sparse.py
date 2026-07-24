@@ -923,7 +923,7 @@ def _pa_decode_sparse_reduce(
     neg_inf = float("-inf")
     m_final = gl.full([BLOCK_M], neg_inf, gl.float32, layout=row_l)
     # pass 1: global max over splits
-    for s in range(0, NUM_SPLITS):
+    for s in range(NUM_SPLITS):
         base = query_idx * pm_stride0 + s * pm_stride_s
         m_s = gl.amd.cdna4.buffer_load(
             ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf
@@ -938,7 +938,7 @@ def _pa_decode_sparse_reduce(
     # pass 2: weighted sums
     l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=BLK)
-    for s in range(0, NUM_SPLITS):
+    for s in range(NUM_SPLITS):
         base = query_idx * pm_stride0 + s * pm_stride_s
         m_s = gl.amd.cdna4.buffer_load(
             ptr=part_m_ptr + base, offsets=h, mask=head_mask, other=neg_inf
