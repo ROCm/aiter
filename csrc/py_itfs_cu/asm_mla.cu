@@ -668,8 +668,9 @@ void mla_decode_stage1_asm_fwd(
     int cp_rank,                          //   round-robin CP rank id
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
+    int is_causal,                        //   causal masking flag
     hipStream_t stream)
-{    
+{
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -852,7 +853,7 @@ void mla_decode_stage1_asm_fwd(
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int causal = 0;
+    int causal = is_causal ? 1 : 0;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
