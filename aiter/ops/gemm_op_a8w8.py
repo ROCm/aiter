@@ -82,6 +82,22 @@ def gemm_a8w8_ck(
 ) -> torch.Tensor: ...
 
 
+@compile_ops(
+    "module_gemm_a8w8_cktile",
+    fc_name="gemm_a8w8_cktile",
+    gen_fake=gen_gemm_a8w8_ck_fake_tensors,
+)
+def gemm_a8w8_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
 def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -627,7 +643,6 @@ def gemm_a8w8_CK(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
-
     q_dtype_w = WQ.dtype if WQ.dtype in [dtypes.fp8, dtypes.i8] else dtypes.i8
     ck_config = get_GEMM_config_with_quant_type(
         m, n, k, q_dtype_w, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
@@ -639,7 +654,17 @@ def gemm_a8w8_CK(
             splitK = 0
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     try:
-        return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+        if ck_config is None:
+            gemm_fn = gemm_a8w8_cktile if get_gfx() == "gfx950" else gemm_a8w8_ck
+        else:
+            libtype = ck_config.get("libtype", "ck")
+            if libtype == "ck":
+                gemm_fn = gemm_a8w8_ck
+            elif libtype == "cktile":
+                gemm_fn = gemm_a8w8_cktile
+            else:
+                raise RuntimeError(f"Unknown libtype: {libtype}")
+        return gemm_fn(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
     except RuntimeError as e:
         raise RuntimeError(
             f"gemm_a8w8_CK failed for shape M={m}, N={n}, K={k}, "
@@ -1009,6 +1034,22 @@ def gen_gemm_a8w8_tune_fake_tensors(
     gen_fake=gen_gemm_a8w8_tune_fake_tensors,
 )
 def gemm_a8w8_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a8w8_cktile_tune",
+    fc_name="gemm_a8w8_cktile_tune",
+    gen_fake=gen_gemm_a8w8_tune_fake_tensors,
+)
+def gemm_a8w8_cktile_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
