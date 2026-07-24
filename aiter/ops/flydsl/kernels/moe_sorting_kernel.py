@@ -180,9 +180,7 @@ def _lds_store_raw(raw_ptr, val, idx):
 
 
 _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
-_dummy_local_tokens_cache = (
-    {}
-)  # device -> torch.Tensor(1, dtype=i32); dummy placeholder when has_local_tokens=False
+_dummy_local_tokens_cache = {}  # device -> torch.Tensor(1, dtype=i32); dummy placeholder when has_local_tokens=False
 
 
 # ---------------------------------------------------------------------------
