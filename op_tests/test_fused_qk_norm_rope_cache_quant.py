@@ -2874,7 +2874,10 @@ def test_pts_quant_shuffle_block_layout_parity(
     eps=1e-6,
     use_shuffle_layout=True,
 ):
-    """Parity: the pts write must give identical KV cache for the original [2, num_blocks, ...] and new [num_blocks, 2, ...] (unbind(1)) paged layouts, for both use_shuffle_layout=True and False (both honor the cache's per-block stride)."""
+    """Parity: the pts write must give an identical KV cache across paged layouts
+    that differ only in block/token/head strides -- [2, num_blocks, ...],
+    [num_blocks, 2, ...] (unbind(1)), and the packed
+    [num_blocks, num_heads_kv, block_size, 2*head_size] (non-shuffle only)."""
     cache_dtype = cache_dtype or dtype  # None => auto (cache dtype == qkv dtype)
     x = (
         16 // torch.empty(0, dtype=cache_dtype).element_size()
@@ -2904,22 +2907,42 @@ def test_pts_quant_shuffle_block_layout_parity(
     per_tensor_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     per_tensor_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
-    def run(blocks_first: bool):
-        # blocks_first=True: new [num_blocks,2,...] (K=cache[:,0], stride 2x); False: original [2,num_blocks,...] (K=cache[0], contiguous).
-        if blocks_first:
-            kv = torch.zeros(
-                (num_blocks, 2, block_size, num_heads_kv, head_size),
-                dtype=cache_dtype,
-                device="cuda",
-            )
-            k_cache, v_cache = kv[:, 0], kv[:, 1]
-        else:
+    def run(layout: str):
+        # Three physically distinct paged KV layouts that must all write the same
+        # logical [num_blocks, block_size, num_heads_kv, head_size] K/V cache. The
+        # kernel is stride-aware in block/token/head; only the innermost head_size
+        # dim must stay contiguous (stride 1).
+        if layout == "kv_first":
+            # original [2, num_blocks, ...]: K=cache[0], per-block contiguous.
             kv = torch.zeros(
                 (2, num_blocks, block_size, num_heads_kv, head_size),
                 dtype=cache_dtype,
                 device="cuda",
             )
             k_cache, v_cache = kv[0], kv[1]
+        elif layout == "blocks_first":
+            # [num_blocks, 2, ...]: K=cache[:,0], K/V interleaved per block (block stride 2x).
+            kv = torch.zeros(
+                (num_blocks, 2, block_size, num_heads_kv, head_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+            k_cache, v_cache = kv[:, 0], kv[:, 1]
+        elif layout == "packed_headdim":
+            # [num_blocks, num_heads_kv, block_size, 2*head_size]: K/V packed along
+            # the innermost dim (K=[...,:D], V=[...,D:]) with head/token order
+            # transposed vs the others. permute(0,2,1,3) ->
+            # [num_blocks, block_size, num_heads_kv, head_size] so the kernel's
+            # (block, token, head) stride reads line up; head_size stays contiguous.
+            kv = torch.zeros(
+                (num_blocks, num_heads_kv, block_size, 2 * head_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+            k_cache = kv[..., :head_size].permute(0, 2, 1, 3)
+            v_cache = kv[..., head_size:].permute(0, 2, 1, 3)
+        else:
+            raise ValueError(f"unknown layout {layout!r}")
         q_out = torch.empty(
             (num_tokens, num_heads_q, head_size), dtype=dtype, device="cuda"
         )
@@ -2958,8 +2981,20 @@ def test_pts_quant_shuffle_block_layout_parity(
         )
         return q_out, k_cache, v_cache
 
-    q_orig, k_orig, v_orig = run(blocks_first=False)  # [2, num_blocks, ...]
-    q_new, k_new, v_new = run(blocks_first=True)  # [num_blocks, 2, ...]
+    # Reference layout + the variants under test; every layout must produce a
+    # bit-identical logical K/V cache (only block/token/head strides differ).
+    q_ref, k_ref, v_ref = run("kv_first")  # [2, num_blocks, ...]
+    variants = {
+        "blocks_first": run("blocks_first"),  # [num_blocks, 2, ...]
+    }
+    # Packed [num_blocks, Hkv, block_size, 2*head_size]: head_size contiguous in the
+    # innermost dim (K=[...,:D], V=[...,D:]). Non-shuffle only -- the x-shuffle repacks
+    # head_size non-contiguously and honors only the block stride, so a contiguous-head
+    # packed layout can't be represented under it.
+    if not use_shuffle_layout:
+        variants["packed_headdim"] = run(
+            "packed_headdim"
+        )  # [num_blocks, Hkv, block_size, 2*D]
 
     tag = (
         f"block_layout_parity qkv={dtype}, cache={cache_dtype}, tokens={num_tokens}, "
@@ -2967,16 +3002,25 @@ def test_pts_quant_shuffle_block_layout_parity(
         f"block_size={block_size}, blocks={num_blocks}, neox={is_neox_style}, "
         f"shuffle={use_shuffle_layout}"
     )
-    # Only the block stride differs -> must match exactly; checkAllclose logs but doesn't raise, so assert on its ratio.
-    for name, a, b in (
-        ("q_out", q_orig, q_new),
-        ("k_cache", k_orig, k_new),
-        ("v_cache", v_orig, v_new),
-    ):
-        err = checkAllclose(
-            a.float(), b.float(), rtol=0, atol=0, printLog=False, msg=f"{name} {tag}"
-        )
-        assert err == 0, f"{name} [2,B] vs [B,2] parity MISMATCH (err={err}): {tag}"
+    # Only block/token/head strides differ -> must match exactly; checkAllclose
+    # logs but doesn't raise, so assert on its returned ratio.
+    for layout, (q_v, k_v, v_v) in variants.items():
+        for name, a, b in (
+            ("q_out", q_ref, q_v),
+            ("k_cache", k_ref, k_v),
+            ("v_cache", v_ref, v_v),
+        ):
+            err = checkAllclose(
+                a.float(),
+                b.float(),
+                rtol=0,
+                atol=0,
+                printLog=False,
+                msg=f"{name} kv_first vs {layout} {tag}",
+            )
+            assert (
+                err == 0
+            ), f"{name} kv_first vs {layout} parity MISMATCH (err={err}): {tag}"
     print(f"[PASS] {tag}", flush=True)
     return {
         "qkv_dtype": str(dtype),
@@ -3376,7 +3420,9 @@ if __name__ == "__main__":
     df_md = df.to_markdown(index=False)
     aiter.logger.info("partial_rotary_pts_quant summary (markdown):\n%s", df_md)
 
-    # Stride-aware shuffle parity: original [2, num_blocks, ...] vs new [num_blocks, 2, ...] paged layout must give identical KV cache.
+    # Stride-aware shuffle parity: [2, num_blocks, ...], [num_blocks, 2, ...] and
+    # packed [num_blocks, Hkv, block_size, 2*head_size] paged layouts must all
+    # give an identical KV cache.
     fp8 = get_dtype_fp8()
     df = []
     for is_neox_style in args.is_neox_styles:

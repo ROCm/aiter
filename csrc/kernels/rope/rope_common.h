@@ -7789,7 +7789,11 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           int rotary_dim           = 0,
                                           int64_t k_block_stride   = 0,
                                           int64_t v_block_stride   = 0,
-                                          bool gemma_norm          = false)
+                                          bool gemma_norm          = false,
+                                          int64_t k_token_stride   = 0,
+                                          int64_t k_head_stride    = 0,
+                                          int64_t v_token_stride   = 0,
+                                          int64_t v_head_stride    = 0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -8007,15 +8011,18 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             }
             else
             {
-                // block_size == 0 => non-paged cache (flat [num_slots, num_heads_k, HEAD_SIZE]):
-                // index directly by slot. Otherwise the cache is paged and K/V are interleaved
-                // per block, so index with the cache's real per-block stride (k_block_stride):
-                // offset = block_id*block_stride + block_offset*slot_size + head*HEAD_SIZE + elem
+                // Non-paged (block_size==0) indexes by slot; paged offset =
+                // block*block_stride + slot*tok + head*head + elem.
                 const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
+                // Each stride 0 => contiguous fallback (num_heads*HEAD_SIZE,
+                // HEAD_SIZE); non-zero writes a strided view (e.g. #44455) in place.
+                const int64_t tok_stride  = (k_token_stride != 0) ? k_token_stride : slot_size;
+                const int64_t head_stride = (k_head_stride != 0) ? k_head_stride
+                                                                  : static_cast<int64_t>(HEAD_SIZE);
                 int64_t offset;
                 if(block_size == 0)
                 {
-                    offset = slot_id * slot_size + head_id_k * HEAD_SIZE + access_id_in_head;
+                    offset = slot_id * tok_stride + head_id_k * head_stride + access_id_in_head;
                 }
                 else
                 {
@@ -8024,8 +8031,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                     const int64_t block_stride = (k_block_stride != 0)
                                                      ? k_block_stride
                                                      : static_cast<int64_t>(block_size) * slot_size;
-                    offset = block_id * block_stride + block_offset * slot_size +
-                             head_id_k * HEAD_SIZE + access_id_in_head;
+                    offset = block_id * block_stride + block_offset * tok_stride +
+                             head_id_k * head_stride + access_id_in_head;
                 }
                 out_kv_vec.store(k_cache + offset);
             }
@@ -8061,13 +8068,16 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
-            // Same scheme as the K path above, for the V cache.
-            // block_size == 0 => non-paged cache, index directly by slot.
+            // Same stride-aware scheme as K (block/token/head; 0 => contiguous
+            // fallback, non-zero writes a strided view such as the #44455 packed).
             const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            const int64_t tok_stride  = (v_token_stride != 0) ? v_token_stride : slot_size;
+            const int64_t head_stride = (v_head_stride != 0) ? v_head_stride
+                                                             : static_cast<int64_t>(HEAD_SIZE);
             int64_t offset;
             if(block_size == 0)
             {
-                offset = slot_id * slot_size + head_id_v * HEAD_SIZE + access_id_in_head;
+                offset = slot_id * tok_stride + head_id_v * head_stride + access_id_in_head;
             }
             else
             {
@@ -8076,8 +8086,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 const int64_t block_stride = (v_block_stride != 0)
                                                  ? v_block_stride
                                                  : static_cast<int64_t>(block_size) * slot_size;
-                offset                     = block_id * block_stride + block_offset * slot_size +
-                         head_id_v * HEAD_SIZE + access_id_in_head;
+                offset = block_id * block_stride + block_offset * tok_stride +
+                         head_id_v * head_stride + access_id_in_head;
             }
             out_kv_vec.store(v_cache + offset);
         }
@@ -8091,8 +8101,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
     }
 }
 
-// mrope-3D launcher: intentionally relies on the default-0 (contiguous) block stride
-// in fused_mrope_rms_kv_kernel; the stride-aware path is the pts launcher below.
+// mrope-3D launcher: relies on default-0 (contiguous) strides; the fully
+// stride-aware path is the pts launcher (fused_rope_rms_set_kv) below.
 template <typename T, int M, typename KVT>
 void fused_mrope_rms_set_kv(const T* qkv,
                             const T* q_w,
@@ -8259,7 +8269,11 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t x                = 0,
                            int64_t rotary_dim       = 0,
                            int64_t k_block_stride   = 0,
-                           int64_t v_block_stride   = 0)
+                           int64_t v_block_stride   = 0,
+                           int64_t k_token_stride   = 0,
+                           int64_t k_head_stride    = 0,
+                           int64_t v_token_stride   = 0,
+                           int64_t v_head_stride    = 0)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int THREAD_BLOCK_SIZE = 256;
@@ -8300,7 +8314,12 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         x,                   \
                                                         (int)rotary_dim,     \
                                                         k_block_stride,      \
-                                                        v_block_stride);     \
+                                                        v_block_stride,      \
+                                                        /*gemma_norm=*/false,\
+                                                        k_token_stride,      \
+                                                        k_head_stride,       \
+                                                        v_token_stride,      \
+                                                        v_head_stride);      \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -8332,7 +8351,12 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         x,                   \
                                                         (int)rotary_dim,     \
                                                         k_block_stride,      \
-                                                        v_block_stride);     \
+                                                        v_block_stride,      \
+                                                        /*gemma_norm=*/false,\
+                                                        k_token_stride,      \
+                                                        k_head_stride,       \
+                                                        v_token_stride,      \
+                                                        v_head_stride);      \
     }
 
     switch(head_size)
