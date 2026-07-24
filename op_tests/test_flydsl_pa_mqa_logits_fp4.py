@@ -366,7 +366,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     num_iters=20,
     num_warmup=3,
     num_warps=4,
-    parallel_unit_num=512,
+    parallel_unit_num=None,
     head_dim=DEFAULT_HEAD_DIM,
     bench=True,
 ):
@@ -465,12 +465,16 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
 
     # The persistent-grid schedule has S = parallel_unit_num // next_n batch
     # slots; if batch_size exceeds S the surplus batches are silently dropped
-    # (their out stays -inf -> NaN cosine). Grow the grid so every (batch,
-    # next_n) gets at least one slot.
-    parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
+    # (their out stays -inf -> NaN cosine). For an explicit value grow the grid
+    # so every (batch, next_n) gets at least one slot; when None, let the
+    # scheduler auto-derive a cudagraph-safe grid (= batch*next_n*ceil(t_max/
+    # block_k)), which already satisfies both constraints.
+    if parallel_unit_num is not None:
+        parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
     safe, cta_info, total_ctas = compute_varctx_schedule(
         context_lens, block_k, parallel_unit_num, t_max, next_n=next_n
     )
+    parallel_unit_num = total_ctas
     print(
         f"  schedule: parallel_unit={parallel_unit_num} num_warps={num_warps} "
         f"safe_chunks_per_cta={safe}  total_ctas={total_ctas}  "
@@ -666,8 +670,9 @@ def main():
     parser.add_argument(
         "--parallel_unit_num",
         type=int,
-        default=512,
-        help="target CTA count for host schedule (default 512)",
+        default=None,
+        help="target CTA count for host schedule "
+        "(default: auto = batch*next_n*ceil(max_seq_len/block_k))",
     )
     parser.add_argument(
         "--next_n",

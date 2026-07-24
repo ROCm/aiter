@@ -120,11 +120,14 @@ def compute_varctx_schedule(
     next_n=1,
     cta_info_out=None,
 ):
+    B = context_lens.shape[0]
+    if parallel_unit_num is None:
+        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
+        parallel_unit_num = B * next_n * chunks_per_seq
     P = parallel_unit_num
     if P % next_n != 0:
         raise ValueError(f"parallel_unit_num={P} must be a multiple of next_n={next_n}")
     S = P // next_n
-    B = context_lens.shape[0]
     if S < B:
         raise ValueError(
             f"compute_varctx_schedule: parallel_unit_num//next_n={S} < batches={B} "
@@ -674,13 +677,20 @@ def flydsl_pa_mqa_logits_fp4(
     block_k: int = 256,
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: int = 512,
+    parallel_unit_num: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
     cta_info: Optional[torch.Tensor] = None,
     total_ctas: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Decode/varctx FP4 paged MQA logits (gfx950)."""
+    """Decode/varctx FP4 paged MQA logits (gfx950).
+
+    ``parallel_unit_num`` is the persistent-grid CTA count; when ``None`` it is
+    auto-derived (cudagraph-safe, no device→host sync) as
+    ``batch * next_n * ceil(max_seq_len / block_k)``, which is a multiple of
+    ``next_n`` and ``>= batch*next_n`` by construction. Pass a smaller explicit
+    value to trade parallelism for fewer no-op CTAs.
+    """
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]

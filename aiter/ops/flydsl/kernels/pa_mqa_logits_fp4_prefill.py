@@ -737,3 +737,128 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         stream,
     )
     return out
+
+
+@triton.jit
+def _varqlen_windows_kernel(
+    cu_ptr,  # [B+1] int32, prefix-sum of per-batch qlen
+    ctx_ptr,  # [B] int32, per-batch KV length
+    row_to_batch_ptr,  # [total_q] int32 (out)
+    local_starts_ptr,  # [total_q] int32 (out)
+    local_ends_ptr,  # [total_q] int32 (out)
+    total_q,
+    B,
+    BLOCK: tl.constexpr,
+):
+    """Fused build of ragged-row metadata for per-batch variable qlen (MTP)."""
+    pid = tl.program_id(0)
+    r = pid * BLOCK + tl.arange(0, BLOCK)
+    rmask = r < total_q
+
+    lo = tl.zeros([BLOCK], tl.int32)
+    hi = tl.full([BLOCK], B, tl.int32)
+    for _ in tl.static_range(32):
+        mid = (lo + hi) // 2
+        cu_mid = tl.load(
+            cu_ptr + 1 + tl.minimum(mid, B - 1), mask=(mid < B), other=2147483647
+        )
+        go_right = cu_mid <= r
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+    b = tl.minimum(lo, B - 1)
+
+    cu_b = tl.load(cu_ptr + b, mask=rmask, other=0)
+    cu_b1 = tl.load(cu_ptr + b + 1, mask=rmask, other=0)
+    ctx_b = tl.load(ctx_ptr + b, mask=rmask, other=0)
+    n = r - cu_b
+    qlen = cu_b1 - cu_b
+    le = tl.maximum(ctx_b - qlen + n + 1, 0)
+
+    tl.store(row_to_batch_ptr + r, b, mask=rmask)
+    tl.store(local_starts_ptr + r, tl.zeros([BLOCK], tl.int32), mask=rmask)
+    tl.store(local_ends_ptr + r, le, mask=rmask)
+
+
+def compute_varqlen_windows(cu_seq_q, context_lens, total_q):
+    """Build ragged-row metadata for per-batch variable query length (MTP)."""
+    dev = cu_seq_q.device
+    cu = cu_seq_q.to(torch.int32).contiguous()
+    ctx = context_lens.to(torch.int32).contiguous()
+    B = ctx.shape[0]
+    row_to_batch = torch.empty(total_q, dtype=torch.int32, device=dev)
+    local_starts = torch.empty(total_q, dtype=torch.int32, device=dev)
+    local_ends = torch.empty(total_q, dtype=torch.int32, device=dev)
+    if total_q > 0:
+        BLOCK = 256
+        grid = (triton.cdiv(total_q, BLOCK),)
+        _varqlen_windows_kernel[grid](
+            cu,
+            ctx,
+            row_to_batch,
+            local_starts,
+            local_ends,
+            total_q,
+            B,
+            BLOCK=BLOCK,
+        )
+    return row_to_batch, local_starts, local_ends
+
+
+def flydsl_pa_mqa_logits_fp4_varqlen(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    max_seq_len: int,
+    *,
+    cu_seq_q: Optional[torch.Tensor] = None,
+    context_lens: Optional[torch.Tensor] = None,
+    windows: Optional[tuple] = None,
+    weight_scale: float = 1.0,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    parallel_unit_num: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    cta_info: Optional[torch.Tensor] = None,
+    n_ctas: Optional[int] = None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    """Variable-qlen (per-batch MTP) FP4 paged MQA logits (gfx950)."""
+    total_q = q_fp4.shape[0]
+    if windows is None:
+        if cu_seq_q is None or context_lens is None:
+            raise ValueError(
+                "flydsl_pa_mqa_logits_fp4_varqlen: pass windows=(row_to_batch, "
+                "local_starts, local_ends) built once via "
+                "compute_varqlen_windows, or both cu_seq_q and context_lens "
+                "to build them here."
+            )
+        windows = compute_varqlen_windows(cu_seq_q, context_lens, total_q)
+    row_to_batch, local_starts, local_ends = windows
+    if parallel_unit_num is None:
+        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
+        parallel_unit_num = total_q * chunks_per_seq
+    return flydsl_pa_mqa_logits_fp4_prefill(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_to_batch,
+        local_starts,
+        local_ends,
+        max_seq_len,
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        num_warps=num_warps,
+        parallel_unit_num=parallel_unit_num,
+        out=out,
+        cta_info=cta_info,
+        n_ctas=n_ctas,
+        stream=stream,
+    )
