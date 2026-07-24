@@ -24,11 +24,8 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 @gluon.jit
 def _cache_load(ptr, off, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
-    # gfx950 buffer_load carries a 32-bit offset (2 GB cap); a cache past that gathers
-    # via 64-bit gl.load instead. Valid slots always land in-bounds (full tiles are
-    # peeled and slot-checked), so no extra masking is needed. ".cg" streams the KV
-    # gather past L1 (each token is read once) -- hardcoded at the call site (not wired
-    # as a constexpr arg) so it also lowers on older gluon (triton 3.6).
+    # gfx950 buffer_load carries a 32-bit offset (2 GB cap), a cache past that gathers
+    # via 64-bit gl.load instead. 
     if USE_BUFFER_LOAD:
         return gl.amd.cdna4.buffer_load(
             ptr=ptr, offsets=off.to(gl.int32), mask=mask, other=other, cache=".cg"
