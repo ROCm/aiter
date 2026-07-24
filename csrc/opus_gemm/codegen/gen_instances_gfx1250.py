@@ -70,7 +70,7 @@ def splitk_reduce_extra_device_instantiations():
         "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS=bf16\n"
     )
     for has_oob in ("true", "false"):
-        for sk in range(0, 17):
+        for sk in range(17):
             out += (
                 f"template __global__ void splitk_reduce_kernel_gfx1250<8, 128, __bf16, true,  float,  {has_oob}, {sk}, __bf16>(\n"
                 "    const void*, __bf16*, int, int, int, int, int, int,\n"
@@ -431,7 +431,7 @@ def gen_splitk_fuse_instance(
     # it groups N-tile peers (cluster.y, A-multicast), so expose it as n_cluster.
     n_cluster = getattr(k, "fuse_m_cluster", 1)
     ws_dtype = getattr(k, "fuse_ws_dtype", "bf16_t")
-    ws_ctype, ws_bytes_elem = _FUSE_WS_CTYPE[ws_dtype]
+    ws_ctype, _ws_bytes_elem = _FUSE_WS_CTYPE[ws_dtype]
 
     # Traits: 11-arg form (default cluster dims; the fuse kernel drives its own
     # __cluster_dims__(SplitK, MClusterWg, 1) and only uses the traits for tile

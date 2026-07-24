@@ -13,10 +13,11 @@ Usage:
 import argparse
 import os
 import sys
+
 import torch
 
 # Skip on unsupported arch via the same probe opus uses at import time.
-from aiter.ops.opus._arch import _detect_arch  # noqa: E402
+from aiter.ops.opus._arch import _detect_arch
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 if not _arch_ok:
@@ -25,12 +26,12 @@ if not _arch_ok:
     )
     sys.exit(0)
 
-from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
-from aiter.ops.opus import gemm_a16w16_opus  # noqa: E402
+from aiter.ops.opus import gemm_a16w16_opus
+from aiter.test_common import checkAllclose, run_perftest
 
 try:
-    from aiter.ops.opus import opus_gemm_workspace_init  # noqa: E402
-except Exception:
+    from aiter.ops.opus import opus_gemm_workspace_init
+except Exception:  # noqa: BLE001
     opus_gemm_workspace_init = None
 
 
@@ -237,7 +238,7 @@ def test_opus_shapes_graph(
             )
             perf_rows.append((M, us, csv_us, ratio))
             passed += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
 
@@ -278,7 +279,7 @@ def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
             tflops = 2.0 * batch * M * N * K / us / 1e6
             print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
             passed += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
     print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")

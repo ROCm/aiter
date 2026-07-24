@@ -9,24 +9,25 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
+
+# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
+# and ARCH_MAP_REGISTRY at import time.
+from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
+from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from codegen.common import (
     _A16W16_TAGS,
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
+)
+from codegen.common import (
     kid_arch as _kid_arch_common,
 )
-
-# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
-# and ARCH_MAP_REGISTRY at import time.
-from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
-from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
-from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from opus_gemm_common import (
     HEURISTIC_DEFAULT_KIDS,
     OpusGemmInstance,
-    heuristic_kids_for_arch,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -37,6 +38,7 @@ from opus_gemm_common import (
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    heuristic_kids_for_arch,
     kernels_list,
 )
 
@@ -709,7 +711,7 @@ void
         }
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
-            for mnk, k in kernels_dict.items():
+            for k in kernels_dict.values():
                 if k.kernel_tag in A16W16_TUNE_TAGS:
                     if k.kernel_tag in GFX1250_SPLITK_TAGS:
                         f.write(MANIFEST_NOSCALE_6ARG_WS.format(kernel_name=k.name))
@@ -883,7 +885,7 @@ void
             # the legacy VEC=16/BLOCK=64 fp32-workspace 6-param instantiations.
             if reduce_arch == "gfx1250":
                 reduce_vec, reduce_block = 8, 128
-                reduce_split_ks = tuple(range(0, 17))  # 0 (runtime) + 1..16 (unrolled)
+                reduce_split_ks = tuple(range(17))  # 0 (runtime) + 1..16 (unrolled)
                 reduce_d_ws = "__bf16"
             else:
                 reduce_vec, reduce_block = 16, 64
@@ -932,7 +934,7 @@ void
         self._host_instantiations = []
         self._device_instantiations = []
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         # Emit one fused HOST TU + N device TUs (one per kid, dtype) + one dedicated splitk_reduce.device.cu.
@@ -981,7 +983,7 @@ def get_tune_dict(tune_dict_csv):
             if torch.cuda.is_available():
                 gpu = torch.cuda.current_device()
                 cu_num = torch.cuda.get_device_properties(gpu).multi_processor_count
-        except Exception:
+        except Exception:  # noqa: BLE001
             # torch device enumeration is broken on some ROCm nightlies
             # (device_count()==0 / "Invalid device id"); use rocminfo instead.
             cu_num = None
@@ -990,7 +992,7 @@ def get_tune_dict(tune_dict_csv):
                 from aiter.jit.utils.chip_info import get_cu_num as _rocminfo_cu_num
 
                 cu_num = _rocminfo_cu_num()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 cu_num = None
         if cu_num is not None:
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
@@ -1182,7 +1184,7 @@ if __name__ == "__main__":
             from aiter.jit.utils.chip_info import get_gfx_runtime
 
             target_arches = {get_gfx_runtime().lower()}
-        except Exception:
+        except Exception:  # noqa: BLE001
             target_arches = None
 
     if target_arches is not None:

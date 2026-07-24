@@ -39,9 +39,7 @@ Python surface is deliberately per-dtype: a16w16 here, a8w8 in its own
 module when that lands.
 """
 
-import functools
 import logging
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -58,7 +56,7 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor:
@@ -81,8 +79,8 @@ def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    workspace: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
@@ -165,7 +163,6 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
         )
 
 
-@functools.lru_cache(maxsize=32)
 def _get_opus_workspace(device: torch.device, ws_elems: int) -> torch.Tensor:
     """Cached workspace allocation for opus split-K.
 
@@ -229,7 +226,7 @@ def opus_gemm_a16w16_tune(
     # externally (torch.empty) and passed to the C++ launcher.
     workspace = None
     if 20000 <= kernelId < 30000:
-        batch, M, N = Y.shape
+        _batch, M, N = Y.shape
         _, _, K = XQ.shape
         # Workspace must be large enough for any kid's tile padding.
         # Use the LARGEST tile dimensions (B_M=128, B_N=512) to compute
@@ -281,10 +278,10 @@ def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return Y
 
@@ -299,10 +296,10 @@ def _opus_gemm_bf16_dispatch(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor: ...
 
 
@@ -477,12 +474,12 @@ def _finalize_output(Y: Tensor, reshape_out_to_2d: bool) -> Tensor:
 def gemm_a16w16_opus(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
     *,
-    kernelId: Optional[int] = None,
-    splitK: Optional[int] = None,
-    out: Optional[Tensor] = None,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: Tensor | None = None,
 ) -> Tensor:
     """Shape-driven opus a16w16 GEMM.
 
@@ -522,7 +519,7 @@ def gemm_a16w16_opus(
     -------
     Tensor with shape [M, N] when A was 2D, [batch, M, N] when A was 3D.
     """
-    XQ, WQ, Y, M, N, K, batch, reshape_out_to_2d = _validate_and_reshape(
+    XQ, WQ, Y, M, N, K, _batch, reshape_out_to_2d = _validate_and_reshape(
         A, B, bias, dtype, out
     )
 
@@ -601,10 +598,10 @@ def opus_gemm_workspace_release_all() -> None: ...
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
+    "is_splitk_kid",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
     "opus_gemm_workspace_release",
     "opus_gemm_workspace_release_all",
-    "is_splitk_kid",
 ]

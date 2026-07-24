@@ -37,9 +37,9 @@ def _make_unsupported_arch_stub(name: str):
 
 
 if _arch_ok:
-    from .gemm_op_a16w16 import (  # noqa: E402
-        opus_gemm_a16w16_tune,
+    from .gemm_op_a16w16 import (
         gemm_a16w16_opus,
+        opus_gemm_a16w16_tune,
         opus_gemm_workspace_init,
         opus_gemm_workspace_release,
         opus_gemm_workspace_release_all,
@@ -70,9 +70,9 @@ else:
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
-    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "gemm_a16w16_opus",
+    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
     "opus_gemm_workspace_release",
     "opus_gemm_workspace_release_all",
