@@ -9,6 +9,8 @@ and BLOCK_H heads per CTA. Same grid as the decode kernel. No split-K:
 prefill fills the GPU via the token dimension.
 """
 
+from typing import Optional
+
 import torch
 import triton
 
@@ -33,6 +35,7 @@ def pa_prefill_sparse(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    has_invalid: Optional[bool] = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
@@ -68,6 +71,9 @@ def pa_prefill_sparse(
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
 
     T, H, D = q.shape
+    if has_invalid is None:
+        avg_prefix_len = kv_indices_prefix.numel() / max(T, 1)
+        has_invalid = not (0 < avg_prefix_len <= 16)
     _LOGGER.info(
         f"PA_PREFILL_SPARSE T={T} H={H} D={D} "
         f"prefix_indices={kv_indices_prefix.shape[0]} "
@@ -80,16 +86,27 @@ def pa_prefill_sparse(
     assert kv_indices_extend.dtype == torch.int32 and kv_indices_extend.is_contiguous()
     assert kv_indptr_extend.dtype == torch.int32 and kv_indptr_extend.is_contiguous()
 
-    block_h = max(triton.next_power_of_2(min(H, 16)), 16)
-    block_d = triton.next_power_of_2(D)
-    assert block_d == D
-    block_k = 16
-
     total_prefix_pages = unified_kv.shape[0]
     total_extend_tokens = kv.shape[0]
-
     USE_EXP2 = True
+    block_d = triton.next_power_of_2(D)
+    assert block_d == D
 
+    if H >= 64:
+        block_h = 64
+        block_k = 16
+        num_warps = 4
+        waves_per_eu = 1
+    elif H >= 32:
+        block_h = 32
+        block_k = 16
+        num_warps = 4
+        waves_per_eu = 1
+    else:
+        block_h = max(triton.next_power_of_2(min(H, 16)), 16)
+        block_k = 16
+        num_warps = 1
+        waves_per_eu = 1
     grid = (T, triton.cdiv(H, block_h))
 
     gluon_pa_prefill_sparse[grid](
@@ -120,7 +137,9 @@ def pa_prefill_sparse(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        HAS_INVALID=has_invalid,
         USE_EXP2=USE_EXP2,
-        num_warps=1,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
     return out

@@ -272,6 +272,7 @@ def test_pa_prefill_sparse_vs_reference(T, H, D, prefix_len, extend_len, sentine
         e_indptr,
         sink,
         scale,
+        has_invalid=sentinels,
     )
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)

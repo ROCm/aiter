@@ -125,13 +125,31 @@ def pa_decode_sparse(
     out = torch.empty_like(q)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
-    # kv_indices = kv_indices.to(torch.int32).contiguous()
-    # kv_indptr = kv_indptr.to(torch.int32).contiguous()
+
+    use_gluon = DEVICE_ARCH == "gfx1250"
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
         # If H is too large to fit a single tile, halve until it does.
-        block_h = triton.next_power_of_2(min(H, 16))
+        if use_gluon:
+            if H >= 128:
+                block_h = 128
+            elif H >= 64:
+                if T >= 2048:
+                    block_h = 64
+                elif T >= 32:
+                    block_h = 32
+                else:
+                    block_h = 16
+            elif H >= 32:
+                if T >= 256:
+                    block_h = 32
+                else:
+                    block_h = 16
+            else:
+                block_h = triton.next_power_of_2(H)
+        else:
+            block_h = triton.next_power_of_2(min(H, 16))
     else:
         block_h = triton.next_power_of_2(block_h)
     block_h = max(block_h, 16)  # AMD MFMA min tile
@@ -141,21 +159,32 @@ def pa_decode_sparse(
     block_d = triton.next_power_of_2(D)
     assert block_d == D
 
-    use_gluon = DEVICE_ARCH == "gfx1250"
-
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
     # arches use the synchronous slot path, where 32 exposes memory latency.
     if use_gluon:
         block_k = 16
-        attn_num_warps = 1
-        max_num_wg = 1024
+        waves_per_eu = 1
+        if block_h == 128:
+            block_k = 32
+            attn_num_warps = 8
+            max_num_wg = 256
+            waves_per_eu = 2
+        elif block_h == 64:
+            attn_num_warps = 4
+            max_num_wg = 256
+        elif block_h == 32:
+            attn_num_warps = 2
+            max_num_wg = 512
+        else:
+            attn_num_warps = 1
+            max_num_wg = 1024
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
         max_num_wg = 256
+        waves_per_eu = 1
     num_stages = 2
-    waves_per_eu = 1
     # gluon reduce with BLOCK_H=1 keeps KV_SPLITS and BLOCK_H entirely
     # in-thread; a single warp suffices and avoids shared-memory layout
     # mismatches between 2D (m/l) and 3D (acc) loads.
