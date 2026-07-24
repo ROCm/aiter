@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
 import traceback
@@ -21,11 +22,20 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.build_targets import _parse_gpu_archs_env
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
 _TILE_K = 256
+
+
+def _target_gfx_archs() -> set[str] | None:
+    """Requested build archs from GPU_ARCHS, or None when unset/native."""
+    gfx_env = os.getenv("GPU_ARCHS")
+    if not gfx_env or gfx_env.strip().lower() == "native":
+        return None
+    return set(_parse_gpu_archs_env(gfx_env))
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -124,6 +134,7 @@ def _scheduler_variants(row, base_job):
 def parse_csv(csv_path: str):
     jobs = []
     seen = set()
+    target_archs = _target_gfx_archs()
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             if not row:
@@ -133,6 +144,10 @@ def parse_csv(csv_path: str):
                 row.get(col) is None or str(row.get(col)).strip() == ""
                 for col in ("model_dim", "inter_dim", "expert", "token")
             ):
+                continue
+            # Skip rows whose target arch is not in the requested GPU_ARCHS
+            row_gfx = (row.get("gfx") or "").strip()
+            if target_archs is not None and row_gfx and row_gfx not in target_archs:
                 continue
             n_warp = int(row.get("n_warp") or 4)
             token_num = int(row["token"])
