@@ -37,7 +37,7 @@ def run_torch(x, weight, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm(b, m, n, k, dtype, layout):
+def test_gemm(b, m, n, k, dtype, layout, backend=None):
     weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.bf16)
     # Input (x) and output (y) layout, both logically [b, m, k] / [b, m, n]:
     #   mbn: transposed views of contiguous [m, b, *] tensors (physically
@@ -60,7 +60,7 @@ def test_gemm(b, m, n, k, dtype, layout):
 
     gemm_funcs = {
         # triton path mirrors the model call (preallocated transposed YQ)
-        "triton": lambda: batched_gemm_bf16_triton(x, weight, YQ=y),
+        "triton": lambda: batched_gemm_bf16_triton(x, weight, YQ=y, backend=backend),
         "torch_einsum": lambda: torch.einsum(
             "sgd,grd->sgr" if layout == "mbn" else "sgd,grd->gsr", o_sgd, weight
         ),
@@ -164,14 +164,26 @@ def main():
         bmn = plain contiguous [b, m, n].
         e.g.: -l mbn""",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon", "auto"],
+        default="auto",
+        help="""Kernel backend for the triton path.
+        triton = vanilla Triton kernels (all archs),
+        gluon  = gfx1250-optimized Triton kernels,
+        auto   = gluon on gfx1250, triton otherwise (default).
+        e.g.: --backend gluon""",
+    )
     args = parser.parse_args()
 
+    backend = None if args.backend == "auto" else args.backend
     for dtype in args.dtype:
         df = []
         for layout, b, (m, n, k) in itertools.product(
             args.layout, args.batch, args.mnk
         ):
-            ret = test_gemm(b, m, n, k, dtype, layout)
+            ret = test_gemm(b, m, n, k, dtype, layout, backend=backend)
             df.append(ret)
         df = pd.DataFrame(df)
         aiter.logger.info(
