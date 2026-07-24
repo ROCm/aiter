@@ -10,8 +10,6 @@ import re
 import torch
 from torch import Tensor
 
-from aiter import dtypes
-
 _compile_blockscale_gemm = None
 _run_compiled = None
 _fx = None
@@ -38,6 +36,9 @@ def _lazy_import():
 
 
 def _require_e8m0_scale(scale: Tensor, shape: tuple[int, int], name: str) -> Tensor:
+
+    from aiter.utility import dtypes
+
     if tuple(scale.shape) != shape:
         raise RuntimeError(
             f"[FlyDSL gfx1250 blockscale] {name} must have shape {shape}, "

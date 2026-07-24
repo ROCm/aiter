@@ -8,17 +8,18 @@ import sys
 # Add parent directory to path to ensure we use local aiter module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from einops import rearrange
+from einops import repeat as eirp
+
+import aiter
 from aiter import dtypes
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
-from einops import rearrange
-from einops import repeat as eirp
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
@@ -106,7 +107,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
             w_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
         )
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
+    a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
     gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
