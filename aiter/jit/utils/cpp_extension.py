@@ -29,10 +29,16 @@ from setuptools.command.build_ext import build_ext
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
-LIB_EXT = ".so"
-EXEC_EXT = ""
-CLIB_PREFIX = "lib"
-CLIB_EXT = ".so"
+if IS_WINDOWS:
+    LIB_EXT = ".pyd"
+    EXEC_EXT = ".exe"
+    CLIB_PREFIX = ""
+    CLIB_EXT = ".dll"
+else:
+    LIB_EXT = ".so"
+    EXEC_EXT = ""
+    CLIB_PREFIX = "lib"
+    CLIB_EXT = ".so"
 SHARED_FLAG = "-shared"
 
 SUBPROCESS_DECODE_ARGS = ()
@@ -86,7 +92,40 @@ def executable_path(executable: str) -> str:
     return os.path.realpath(path)
 
 
+def _get_hip_version_from_file() -> Optional[str]:
+    """Read HIP version from .hipVersion shipped with the TheRock SDK.
+
+    Used as a fallback when hipconfig.exe is unavailable (e.g. in
+    build-isolated environments where rocm_sdk_core is not installed).
+    """
+    try:
+        import sysconfig as _sc_hv
+
+        _platlib = _sc_hv.get_paths()["platlib"]
+        _hip_ver_file = os.path.join(_platlib, "_rocm_sdk_devel", "bin", ".hipVersion")
+        if os.path.isfile(_hip_ver_file):
+            with open(_hip_ver_file) as _f:
+                _major = _minor = None
+                for _line in _f:
+                    if _line.startswith("HIP_VERSION_MAJOR="):
+                        _major = _line.split("=", 1)[1].strip()
+                    elif _line.startswith("HIP_VERSION_MINOR="):
+                        _minor = _line.split("=", 1)[1].strip()
+                if _major and _minor:
+                    return f"{_major}.{_minor}"
+    except Exception:
+        pass
+    return None
+
+
 def get_hip_version():
+    if IS_WINDOWS:
+        # In build-isolated environments rocm_sdk_core may be absent and
+        # hipconfig.exe unavailable. Try reading .hipVersion from the SDK
+        # first; if not found, fall through to the hipconfig path below.
+        ver = _get_hip_version_from_file()
+        if ver is not None:
+            return ver
     try:
         hipconfig = executable_path("hipconfig")
         output = subprocess.check_output([hipconfig, "--version"], text=True)
@@ -293,11 +332,14 @@ COMMON_NVCC_FLAGS = [
 ]
 
 COMMON_HIP_FLAGS = [
-    "-fPIC",
     "-D__HIP_PLATFORM_AMD__=1",
     "-DUSE_ROCM=1",
     "-DHIPBLAS_V2",
 ]
+
+# -fPIC is rejected by clang on the x86_64-pc-windows-msvc target.
+if not IS_WINDOWS:
+    COMMON_HIP_FLAGS.append("-fPIC")
 
 COMMON_HIPCC_FLAGS = [
     "-DCUDA_HAS_FP16=1",
@@ -321,6 +363,12 @@ PLAT_TO_VCVARS = {
 
 
 def get_cxx_compiler():
+    # On Windows prefer CXX env var, then hipcc; fall back to the original default.
+    if IS_WINDOWS:
+        cxx = os.environ.get("CXX")
+        if cxx:
+            return cxx
+        return executable_path("hipcc")
     return os.environ.get("CXX", "c++")
 
 
@@ -331,6 +379,10 @@ def _is_binary_build() -> bool:
 
 
 def _accepted_compilers_for_platform() -> List[str]:
+    # Windows HIP build uses AMD's clang++ or hipcc wrappers.
+    if IS_WINDOWS:
+        return ["clang++.exe", "hipcc.exe", "hipcc.bat"]
+
     # gnu-c++ and gnu-cc are the conda gcc compilers
     return ["g++", "gcc", "gnu-c++", "gnu-cc", "clang++", "clang"]
 
@@ -432,6 +484,11 @@ def get_compiler_abi_compatibility_and_version(
             )
         )
         return (False, Version("0.0.0"))
+
+    # clang++.exe (TheRock SDK) is pre-validated; the GCC version check below
+    # is Linux-only and would leave `version`/`minimum_required_version` undefined.
+    if IS_WINDOWS:
+        return (True, Version("0.0.0"))
 
     try:
         if IS_LINUX:
@@ -1475,16 +1532,22 @@ def verify_ninja_availability():
 
 
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
-    extra_ldflags.append("-mcmodel=large")
-    extra_ldflags.append("-ffunction-sections")
-    extra_ldflags.append("-fdata-sections ")
-    extra_ldflags.append("-Wl,--gc-sections")
-    extra_ldflags.append("-Wl,--cref")
+    if IS_WINDOWS:
+        # Link Python import lib explicitly; Linux finds it automatically at runtime.
+        py_libs_dir = os.path.join(sys.base_prefix, "libs").replace("\\", "/")
+        extra_ldflags.append(f"-L{py_libs_dir}")
+    else:
+        extra_ldflags.append("-mcmodel=large")
+        extra_ldflags.append("-ffunction-sections")
+        extra_ldflags.append("-fdata-sections ")
+        extra_ldflags.append("-Wl,--gc-sections")
+        extra_ldflags.append("-Wl,--cref")
+
     if not torch_exclude:
         import torch
 
         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
-        TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
+        TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib").replace(os.sep, "/")
         extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
         extra_ldflags.append("-lc10")
         if with_cuda:
@@ -1496,14 +1559,15 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
         if not is_standalone:
             extra_ldflags.append("-ltorch_python")
 
-        if is_standalone:
+        if is_standalone and not IS_WINDOWS:
             extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
 
     if with_cuda and IS_HIP_EXTENSION:
         if verbose:
             print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
-        extra_ldflags.append(f'-L{_join_rocm_home("lib")}')
+        _rocm_lib = _join_rocm_home("lib").replace(os.sep, "/")
+        extra_ldflags.append(f"-L{_rocm_lib}")
         extra_ldflags.append("-lamdhip64")
     return extra_ldflags
 
@@ -1521,11 +1585,13 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
     if not _archs:
         import torch
 
-        archFlags = torch._C._cuda_getArchFlags()
-        if archFlags:
-            archs = archFlags.split()
+        if IS_WINDOWS:
+            from chip_info import _detect_native
+
+            archs = _detect_native()
         else:
-            archs = []
+            archFlags = torch._C._cuda_getArchFlags()
+            archs = archFlags.split() if archFlags else []
     else:
         archs = _archs.replace(" ", ";").split(";")
     flags = [f"--offload-arch={arch}" for arch in archs]
@@ -1669,7 +1735,11 @@ def _write_ninja_file_to_build_library(
     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
     # installations where default `get_path` points to non-existing `/Library/Python/M.m/include` folder
     if is_python_module:
-        python_include_path = sysconfig.get_path("include", scheme="posix_prefix")
+        # posix_prefix gives wrong path on Windows (e.g. include/python3.13).
+        if IS_WINDOWS:
+            python_include_path = sysconfig.get_path("include")
+        else:
+            python_include_path = sysconfig.get_path("include", scheme="posix_prefix")
         if python_include_path is not None:
             system_includes.append(python_include_path)
 
@@ -1684,10 +1754,20 @@ def _write_ninja_file_to_build_library(
         # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
     # Windows does not understand `-isystem` and quotes flags later.
-    common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
-    common_cflags += [f"-isystem {shlex.quote(include)}" for include in system_includes]
+    def _format_include_path(p):
+        if IS_WINDOWS:
+            # Windows does not use shell quoting; double-quote only when the path
+            # contains spaces, otherwise leave it bare.
+            return f'"{p}"' if " " in p else p
+        return shlex.quote(p)
 
-    cflags = common_cflags + ["-fPIC", "-std=c++20"] + extra_cflags
+    common_cflags += [f"-I{_format_include_path(include)}" for include in user_includes]
+    common_cflags += [
+        f"-isystem {_format_include_path(include)}" for include in system_includes
+    ]
+
+    _fpic = [] if IS_WINDOWS else ["-fPIC"]
+    cflags = common_cflags + _fpic + ["-std=c++20"] + extra_cflags
 
     if with_cuda and IS_HIP_EXTENSION:
         cuda_flags = ["-DWITH_HIP"] + cflags + COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS
@@ -1725,6 +1805,19 @@ def _write_ninja_file_to_build_library(
         with_cuda=with_cuda,
         extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
     )
+
+
+def _ninja_escape(p: str) -> str:
+    """Escape a path for use in a ninja build file.
+
+    On Windows, drive letter colons (e.g. C:) conflict with ninja's build
+    rule separator and must be written as C$:. Backslashes are also
+    normalised to forward slashes.
+    """
+    if IS_WINDOWS:
+        p = p.replace("\\", "/")
+        p = re.sub(r"^([A-Za-z]):/", lambda m: m.group(1) + "$:/", p)
+    return p.replace(" ", "$ ")
 
 
 def _write_ninja_file(
@@ -1786,7 +1879,7 @@ def _write_ninja_file(
     config = ["ninja_required_version = 1.3"]
     config.append(f"cxx = {compiler}")
     if with_cuda or cuda_dlink_post_cflags:
-        nvcc = _join_rocm_home("bin", "hipcc")
+        nvcc = executable_path("hipcc")
         config.append(f"nvcc = {nvcc}")
 
     if IS_HIP_EXTENSION:
@@ -1851,8 +1944,8 @@ def _write_ninja_file(
             _resolve_per_source_flags(source_file) if is_cuda_source else None
         )
 
-        source_file_q = source_file.replace(" ", "$ ")
-        object_file_q = object_file.replace(" ", "$ ")
+        source_file_q = _ninja_escape(source_file)
+        object_file_q = _ninja_escape(object_file)
         build.append(f"build {object_file_q}: {rule} {source_file_q}")
         if per_source_flags:
             # Append to the rule-level $cuda_post_cflags rather than
@@ -1880,7 +1973,10 @@ def _write_ninja_file(
             "  command = $cxx @$out.rsp $ldflags -o $out\n  rspfile = $out.rsp\n  rspfile_content = $in"
         )
 
-        link = [f'build {library_target}: link {" ".join(objects)}']
+        # Escape paths for ninja (drive-letter colon and spaces).
+        _link_target = _ninja_escape(library_target)
+        _link_inputs = " ".join(_ninja_escape(o) for o in objects)
+        link = [f"build {_link_target}: link {_link_inputs}"]
 
         default = [f"default {library_target}"]
     else:
