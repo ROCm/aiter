@@ -332,13 +332,6 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
         )
-        self.parser.add_argument(
-            "--opus-a8w4-inter-dim-pad",
-            type=int,
-            default=None,
-            help="Opus A8W4 stage2 tuner override for runtime inter_dim_pad. "
-            "If omitted, Opus tunes real inter_dim (pad=0).",
-        )
 
     @staticmethod
     def weight_quant(
@@ -742,24 +735,40 @@ class FmoeTuner(TunerCommon):
             opus_moe_stage2_a8w4_decode_fwd,
             opus_moe_stage2_reduce_token_slot_route_output_fwd,
         )
+        from aiter.ops.opus.moe_stage2_a8w4_meta import (
+            OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT,
+            opus_a8w4_shape_family,
+            opus_a8w4_shape_family_for_shape,
+        )
 
-        inter_dim_pad = int(kparams.get("inter_dim_pad", 0))
-        effective_inter_dim = int(a2_qt.shape[-1]) - inter_dim_pad
-        if inter_dim_pad < 0 or effective_inter_dim <= 0:
-            raise ValueError(
-                "invalid Opus A8W4 stage2 inter_dim_pad/effective_inter_dim: "
-                f"logical_inter_dim={a2_qt.shape[-1]}, "
-                f"inter_dim_pad={inter_dim_pad}, "
-                f"effective_inter_dim={effective_inter_dim}"
+        shape_family = opus_a8w4_shape_family(
+            kparams.get("shape_family", OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name)
+        )
+        if shape_family is None:
+            shape_family = opus_a8w4_shape_family_for_shape(
+                model_dim=w2_qt.shape[1],
+                inter_dim=a2_qt.shape[-1],
+                expert=w2_qt.shape[0],
+                topk=topk,
+                block_n=kparams.get("kernel_block_n"),
             )
-        block_n = int(kparams.get("kernel_block_n"))
-        if block_n <= 0 or w2_qt.shape[1] % block_n != 0:
+        if shape_family is None:
             raise ValueError(
-                "unsupported Opus A8W4 stage2 block_n: "
-                f"model_dim={w2_qt.shape[1]}, logical_inter_dim={a2_qt.shape[-1]}, "
-                f"expert={w2_qt.shape[0]}, topk={topk}, "
-                f"block_n={kparams.get('kernel_block_n')}, "
-                f"inter_dim_pad={inter_dim_pad}, effective_inter_dim={effective_inter_dim}"
+                "unsupported Opus A8W4 shape family: "
+                f"shape_family={kparams.get('shape_family')}"
+            )
+        if not shape_family.matches(
+            model_dim=w2_qt.shape[1],
+            inter_dim=a2_qt.shape[-1],
+            expert=w2_qt.shape[0],
+            topk=topk,
+            block_n=kparams.get("kernel_block_n"),
+        ):
+            raise ValueError(
+                "Opus A8W4 stage2 candidate does not match shape family "
+                f"{shape_family.name}: model_dim={w2_qt.shape[1]}, "
+                f"inter_dim={a2_qt.shape[-1]}, expert={w2_qt.shape[0]}, "
+                f"topk={topk}, block_n={kparams.get('kernel_block_n')}"
             )
         kid = kparams["kid"]
         kbm = kparams["kernel_block_m"]
@@ -767,9 +776,9 @@ class FmoeTuner(TunerCommon):
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
         # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
-        # For padded inter dims, opus receives the physical logical-K tensors
-        # plus runtime inter_dim_pad, while the torch ref slices the same tensors
-        # to effective K. Verified cosine ~3e-4.
+        # The family inter pad was zeroed on the raw weight BEFORE shuffling
+        # (generate_data_2stages), so opus and the torch ref both use the
+        # family's effective inter dim. Verified cosine ~3e-4.
         w2_use = w2_qt
         w2_scale_opus = w2_scale
         if kparams["route_out"]:
@@ -784,7 +793,7 @@ class FmoeTuner(TunerCommon):
                 num_valid_ids,
                 block_m=kbm,
                 kernel_id=kid,
-                inter_dim_pad=inter_dim_pad,
+                inter_dim_pad=shape_family.inter_dim_pad,
                 return_per_slot=True,
             )
             if route_out.dtype == torch.uint8:  # MXFP8 route_out
@@ -810,7 +819,7 @@ class FmoeTuner(TunerCommon):
             out=moe_buf,
             block_m=kbm,
             kernel_id=kid,
-            inter_dim_pad=inter_dim_pad,
+            inter_dim_pad=shape_family.inter_dim_pad,
         )
 
     @staticmethod
@@ -1689,21 +1698,26 @@ class FmoeTuner(TunerCommon):
     def run_torch_moe_stage2_opus_eff(*args, **kwargs):
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
             OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
+            opus_a8w4_shape_family_for_shape,
         )
 
         # Opus A8W4 ref slices padded inter dim before deferring to
-        # run_torch_moe_stage2, matching runtime effective-K dispatch.
-        inter_dim_pad = kwargs.pop("inter_dim_pad", 0)
-        inter_dim_pad = 0 if inter_dim_pad is None else int(inter_dim_pad)
+        # run_torch_moe_stage2, matching the decode shape family and kernel layout.
         a2_qt, w1_qt, w2_qt, *rest = args
-        eff = int(a2_qt.shape[-1]) - inter_dim_pad
-        if inter_dim_pad < 0 or eff <= 0:
+        shape_family = opus_a8w4_shape_family_for_shape(
+            model_dim=w2_qt.shape[1],
+            inter_dim=a2_qt.shape[-1],
+            expert=w2_qt.shape[0],
+            topk=a2_qt.shape[1],
+        )
+        if shape_family is None:
             raise ValueError(
-                "invalid Opus A8W4 stage2 reference inter_dim_pad/effective_inter_dim: "
-                f"logical_inter_dim={a2_qt.shape[-1]}, "
-                f"inter_dim_pad={inter_dim_pad}, effective_inter_dim={eff}"
+                "unsupported Opus A8W4 shape for reference: "
+                f"model_dim={w2_qt.shape[1]}, inter_dim={a2_qt.shape[-1]}, "
+                f"expert={w2_qt.shape[0]}, topk={a2_qt.shape[1]}"
             )
         kernel_contract = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+        eff = shape_family.effective_inter_dim
         a2_qt = a2_qt[..., :eff].contiguous()
         w2_qt = w2_qt[..., : eff // kernel_contract.fp4_values_per_byte].contiguous()
         # rest = [topk_weights, topk_ids, a2_scale, w2_scale, ...]; w2_scale is rest[3]
@@ -1919,6 +1933,9 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        w1_bias=None,
+        w2_bias=None,
+        swiglu_limit=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -1931,7 +1948,9 @@ class FmoeTuner(TunerCommon):
             quant_type=quant_type,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
+            w1_bias=w1_bias,
             doweight=doweight_stage1,
+            swiglu_limit=swiglu_limit,
         )
         AQDType = hidden_states.dtype
 
@@ -1969,6 +1988,7 @@ class FmoeTuner(TunerCommon):
             quant_type=quant_type,
             a2_scale=a2_scale,
             w2_scale=w2_scale,
+            w2_bias=w2_bias,
             doweight=not doweight_stage1,
         )
         return ref2
@@ -3165,17 +3185,11 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def gen_opus_2stages_task(
-        self,
-        info,
-        blockMs,
-        *,
-        inter_dim_pad=None,
-    ):
+    def gen_opus_2stages_task(self, info, blockMs):
         # opus a8w4 stage2 candidates. Stage2-only:
         # the tuner pairs each opus kid with the best stage1 and keeps the
         # lowest-us combo. opus takes the a16w4 MFMA shuffle (w2_qt_shffle_ck /
-        # w2_scale_aiter, same as ck) and dispatches by runtime effective
+        # w2_scale_aiter, same as ck) and computes the family's effective
         # inter dim, so its ref is run_torch_moe_stage2_opus_eff. Inputs verified
         # cosine ~3e-4; raw=0.94 and shuffle-without-slice=0.14 are wrong.
         tasks_opus = []
@@ -3197,32 +3211,30 @@ class FmoeTuner(TunerCommon):
         ) = info
 
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
             get_opus_a8w4_stage2_kernels,
+            opus_a8w4_shape_family_for_shape,
         )
 
-        inter_dim_pad = 0 if inter_dim_pad is None else int(inter_dim_pad)
-        effective_inter_dim = int(inter_dim) - inter_dim_pad
-        k_step_packed = (
-            OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.bk_logical
-            // OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.fp4_values_per_byte
+        shape_family = opus_a8w4_shape_family_for_shape(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            expert=expert,
+            topk=topk,
         )
         # gfx950 + a8w4 (fp8 act / fp4 weight / per_1x32) + g1u1 + supported
-        # effective-K. Kids are filtered by their block_n below.
+        # shape family. Kids are filtered by their bound shape family below.
         if not (
             gfx == "gfx950"
             and use_g1u1
             and q_type == QuantType.per_1x32
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp4x2
-            and model_dim > 0
-            and 0 <= inter_dim_pad < inter_dim
-            and effective_inter_dim % k_step_packed == 0
+            and shape_family is not None
         ):
             return tasks_opus
 
         # fp8-activation stage2 ref (shape-level, shared by all opus kids): torch
-        # stage2 on the bf16 stage1 output, sliced by opus_eff to match runtime effective-K.
+        # stage2 on the bf16 stage1 output, sliced by opus_eff to match the family.
         s2_ref_args = (
             [
                 "ref1_bf16",
@@ -3254,15 +3266,21 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             if blockM not in (16, 32, 64, 128):
                 continue
-            for kname, kparams in get_opus_a8w4_stage2_kernels(token=token).items():
+            for kname, kparams in get_opus_a8w4_stage2_kernels(
+                shape_family=shape_family.name,
+                token=token,
+            ).items():
                 # tuner blockM is the moe_sorting block_m; valid only when it
                 # equals the kid's SORT_BLOCK_M.
                 if kparams["sort_block_m"] != blockM:
                     continue
-                kparams = dict(kparams)
-                kparams["inter_dim_pad"] = inter_dim_pad
-                block_n = int(kparams.get("kernel_block_n"))
-                if block_n <= 0 or model_dim % block_n != 0:
+                if not shape_family.matches(
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    expert=expert,
+                    topk=topk,
+                    block_n=kparams.get("kernel_block_n"),
+                ):
                     continue
                 gen_args = (
                     token,
@@ -3291,7 +3309,7 @@ class FmoeTuner(TunerCommon):
                         {},
                         FmoeTuner.run_torch_moe_stage2_opus_eff,
                         s2_ref_args,
-                        {"inter_dim_pad": inter_dim_pad},
+                        {},
                         None,
                         0.01,
                         0.01,
@@ -3557,19 +3575,29 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
-            # fused_moe overrides the activation quant dtype at runtime for
-            # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
-            # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
-            # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
-            # kernel actually runs a4w4. Mirror that here so the reference and the
-            # kernel weight layout match (else outputs are uncorrelated).
-            # Source of truth: aiter/fused_moe.py q_dtype_a selection.
-            eff_q_dtype_a = q_dtype_a
+            # a16w4/a8w4/mxfp8 shuffle their weights into the gate-up interleaved
+            # (guinterleave) layout via shuffle_weight_a16w4, which the kernel only
+            # reads correctly under gate_mode=INTERLEAVE. fused_moe defaults to
+            # SEPARATED, so run_config must request INTERLEAVE for these paths
+            # (else the kernel misreads gate/up channels and the output is
+            # uncorrelated with the natural-layout reference). Mirrors
+            # op_tests/test_moe_2stage.py::_effective_gate_mode.
+            if q_type == QuantType.per_1x32 and (
+                (q_dtype_a in [dtypes.fp8, dtypes.bf16] and q_dtype_w == dtypes.fp4x2)
+                or (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
+            ):
+                gate_mode = "interleave"
+            else:
+                gate_mode = "separated"
+            # a16w4 / a8w4 (fp4 weight) configs were tuned with the fp8 (a8w4)
+            # kernel picker forced on. Below the default AITER_BF16_FP8_MOE_BOUND
+            # (256) fused_moe's per_1x32 picker selects the bf16/a16w4 path, which
+            # for Silu has no kernel and dispatch-crashes ("Unsupported kernel
+            # config for moe heuristic dispatch") -> the tuned fp8 kernel is never
+            # reached. Force the bound to 0 so the lookup matches how these shapes
+            # were tuned. Mirrors op_tests/test_moe_2stage.py and test_moe_ep.py.
             if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
-                if act_type == ActivationType.Swiglu:
-                    eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
-                else:
-                    eff_q_dtype_a = dtypes.fp4x2
+                os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
@@ -3609,6 +3637,39 @@ class FmoeTuner(TunerCommon):
                 w2 = torch.randn(
                     (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
                 )
+                # Swiglu MXFP4 (a16w4 / a8w4) runs the gpt-oss Swiglu path, which
+                # folds an extra +1 into the linear/up branch via the kernel's
+                # bias support (see fused_moe.swiglu / _needs_swiglu_bias_support).
+                # The torch reference's swiglu() always applies that +1, so the
+                # kernel must run its bias path too -- which only happens when a
+                # bias is supplied. Build a random expert bias and feed it to BOTH
+                # the kernel and the reference so the +1 (and bias) match. Mirrors
+                # op_tests/test_moe_2stage.py. Silu (no +1) and mxfp8/a4w4/a16wi4
+                # run without bias (their tuned kernels take the no-bias path, so
+                # adding a reference-only bias would create a spurious mismatch).
+                use_bias = (
+                    q_type == QuantType.per_1x32
+                    and act_type == ActivationType.Swiglu
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and q_dtype_w == dtypes.fp4x2
+                )
+                if use_bias:
+                    n1 = inter_dim * 2 if use_g1u1 else inter_dim
+                    exp_bias1 = torch.clamp(
+                        torch.randn((expert, n1), dtype=dtype, device="cuda"),
+                        -1.0,
+                        1.0,
+                    )
+                    exp_bias2 = torch.clamp(
+                        torch.randn((expert, model_dim), dtype=dtype, device="cuda"),
+                        -1.0,
+                        1.0,
+                    )
+                    bias1_aiter = exp_bias1.to(dtypes.fp32)
+                    bias2_aiter = exp_bias2.to(dtypes.fp32)
+                else:
+                    exp_bias1 = exp_bias2 = None
+                    bias1_aiter = bias2_aiter = None
                 w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
                 w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
                 if q_dtype_w is not dtypes.fp4x2:
@@ -3739,30 +3800,25 @@ class FmoeTuner(TunerCommon):
                 elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                     a1_qt = hidden.to(dtypes.bf16)
                     a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
-                    and q_dtype_w == dtypes.fp4x2
+                elif q_type == QuantType.per_1x32 and (
+                    (
+                        q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                        and q_dtype_w == dtypes.fp4x2
+                    )
+                    or (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
                 ):
-                    # a16w4 (bf16 activation): reference runs activation in bf16.
-                    a1_qt = hidden.to(dtype)
-                    a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp8
-                    and q_dtype_w == dtypes.fp8
-                ):
-                    # mxfp8 (a8w8): kernel quantizes the activation internally; the
-                    # reference runs activation in bf16 (mirror test_moe_2stage).
+                    # a16w4 / a8w4 / mxfp8: the kernel quantizes the activation
+                    # internally; the torch reference keeps the activation in bf16
+                    # (higher precision) and lets logits_diff absorb the kernel's
+                    # quant error. Mirrors op_tests/test_moe_2stage.py.
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
                 else:
-                    # Use the *effective* activation dtype (what fused_moe runs),
-                    # not the config's nominal q_dtype_a. For Silu+SEPARATED fp4
-                    # weights this is fp4x2 (a4w4), so the reference quantizes the
-                    # activation to fp4 to match the kernel.
+                    # a4w4 (and other per_128x128/per_Token paths): quantize the
+                    # reference activation with the config's nominal q_dtype_a,
+                    # matching op_tests/test_moe_2stage.py.
                     torch_quant = aiter.get_torch_quant(q_type)
-                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
+                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
 
                 out, us = run_perftest(
                     fused_moe,
@@ -3777,6 +3833,9 @@ class FmoeTuner(TunerCommon):
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
+                    gate_mode=gate_mode,
+                    bias1=bias1_aiter,
+                    bias2=bias2_aiter,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
@@ -3801,6 +3860,8 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    w1_bias=exp_bias1,
+                    w2_bias=exp_bias2,
                 )
                 if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     diag = tensor_compare_diagnostics(ref, out)
@@ -3833,7 +3894,7 @@ class FmoeTuner(TunerCommon):
                         status = (
                             f"mismatch:err_ratio={err_ratio:.6g}"
                             f"(>{allowed_err_ratio_desc}),"
-                            f"logits_diff={logits_diff:.6g}(>{diag})"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol}); {diag}"
                         )
                 results.append(
                     {
@@ -3979,13 +4040,7 @@ class FmoeTuner(TunerCommon):
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
-                tasks_ck.extend(
-                    self.gen_opus_2stages_task(
-                        info,
-                        blockMs,
-                        inter_dim_pad=args.opus_a8w4_inter_dim_pad,
-                    )
-                )
+                tasks_ck.extend(self.gen_opus_2stages_task(info, blockMs))
             if _want("asm"):
                 task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
