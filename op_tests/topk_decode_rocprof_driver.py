@@ -116,7 +116,7 @@ def run_cell(
     env = os.environ.copy()
     env.update(KERNEL_ENV.get(kernel, {}))
     print(f"\n\n{' '.join(cmd)}\n\n")
-    log = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    log = subprocess.run(cmd, check=False, capture_output=True, text=True, env=env)
     csvs = glob.glob(str(out_file) + "*kernel_trace.csv")
     if not csvs:
         return (
@@ -149,7 +149,10 @@ def run_cell(
     if include_zero and KERNEL_ZERO_MATCH.get(kernel) is not None:
         zpat = KERNEL_ZERO_MATCH[kernel]
         fills = sorted(
-            (int(r["Start_Timestamp"]), int(r["End_Timestamp"]) - int(r["Start_Timestamp"]))
+            (
+                int(r["Start_Timestamp"]),
+                int(r["End_Timestamp"]) - int(r["Start_Timestamp"]),
+            )
             for r in rows
             if zpat.search(r["Kernel_Name"])
         )
@@ -171,7 +174,7 @@ def run_cell(
             per_call[ci] += zsum
             prev_end = ce
         zero_note = f"+zero({n_zero}/{len(per_call)})"
-        
+
     # ``min`` is robust to noisy co-tenant GPU contention (sharing CUs only ever
     # inflates a kernel's measured duration), while ``median`` is the default.
     reduce_fn = min if stat == "min" else statistics.median
