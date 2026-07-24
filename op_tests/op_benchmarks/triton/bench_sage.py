@@ -42,6 +42,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
     sage_quant_mxfp4,
+    sage_quant_f4f4,
     sage_quant_mxfp6,
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
@@ -1192,7 +1193,6 @@ def make_kernel_runner(
         # V-fp4 experiments). Baseline + the v_cvt_pk_u8 exp keep mxfp4's fp8 V; V-fp4 is a later step.
         if args.kernel == "aiter_f4f4":
             os.environ["AITER_FMHA_F4F4"] = "1"
-            os.environ.setdefault("AITER_MXFP4_V", "0")  # f4f4 kernel is PLAIN per-channel fp4-V (no E8M0)
         else:
             os.environ.pop("AITER_FMHA_F4F4", None)
         # Drive flash_attn_mxfp4_func with mxfp4 inputs from sage_quant_mxfp4 (the
@@ -1220,8 +1220,12 @@ def make_kernel_runner(
         # consumes a pre-scaled Q and must NOT re-apply the scale (doing so
         # double-scales the softmax). Pin the fold scale to the same softmax_scale
         # used by the reference and pass it through explicitly.
+        # f4f4 packs V as in-tree per-channel fp4 (sage_quant_f4f4, no external dep);
+        # mxfp4 keeps fp8 V (sage_quant_mxfp4). Q/K path is identical for both.
+        _quant_fn = sage_quant_f4f4 if args.kernel == "aiter_f4f4" else sage_quant_mxfp4
+
         def _quantize_mxfp4():
-            return sage_quant_mxfp4(
+            return _quant_fn(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1247,18 +1251,12 @@ def make_kernel_runner(
             else None
         )
 
-        # f4f4: keep mxfp4's fp4 Q/K but re-pack V as per-channel fp4 (E2M1) like f6f4, so the
-        # PV MMA is fp4 V x fp8 P. The fwd_hd128_f4f4.co (redirected via AITER_FMHA_F4F4) reads V via
-        # ds_read_b64_tr_b4 + a per-channel V descale in the epilogue.
-        _f4f4_vpacker = (
-            _build_fp4_v_packer(q_bshd.device) if args.kernel == "aiter_f4f4" else None
-        )
-
+        # f4f4: sage_quant_f4f4 already emits the per-channel fp4 (E2M1) V in the kernel's
+        # col-major LDS layout (fwd_hd128_f4f4.co, redirected via AITER_FMHA_F4F4), so no
+        # separate V re-pack is needed here (was the external _build_fp4_v_packer).
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
             if _fp4_kcoal_packer is not None:
                 k_fp4 = _fp4_kcoal_packer(k_fp4)
-            if _f4f4_vpacker is not None:
-                v_fp8, v_descale = _f4f4_vpacker(v_bshd)  # replace fp8 V with per-channel fp4 V
             return flash_attn_mxfp4_func(
                 q_fp4,
                 k_fp4,
