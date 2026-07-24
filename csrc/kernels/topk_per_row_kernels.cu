@@ -11,6 +11,7 @@
 #include <hipcub/util_type.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -1423,6 +1424,154 @@ __device__ void last_filter(T const* in_buf,
     }
 }
 
+/**
+ * Deterministic final tie filter for the one-block decode path.
+ *
+ * The preceding radix passes have already selected the exact FP32 score at the
+ * kth boundary.  ``last_filter`` above used an atomic counter for values equal
+ * to that score, so independent launches could keep different members of a
+ * large exact-score tie.  GLM's replicated sparse indexer requires every TP
+ * rank to keep the same logical token positions.
+ *
+ * Keep all strictly-better scores with the normal fast path.  For the
+ * ambiguous exact-score boundary, scan logical row positions in increasing
+ * order in block-sized tiles and use a block prefix sum to assign positions.
+ * Hence the selected boundary members (and their output order) are exactly
+ * the smallest token ids.  This is the second component of the lexicographic
+ * ordering ``(score descending, token_id ascending)``.
+ *
+ * It is intentionally used only when ``counter->len > counter->k``: unique
+ * thresholds and ties that fully fit retain the original single-pass cost.
+ */
+template <typename T,
+          typename IdxT,
+          int BitsPerPass,
+          int BlockSize,
+          bool WRITE_TOPK_VALUES>
+__device__ void last_filter_ties_by_token_id_oneblock(
+    T const* in,
+    T* out,
+    IdxT* out_idx,
+    IdxT current_len,
+    IdxT k,
+    Counter<T, IdxT>* counter,
+    bool const select_min,
+    int const pass,
+    typename hipcub::BlockScan<IdxT, BlockSize>::TempStorage& tie_scan_storage)
+{
+    using BlockScan = hipcub::BlockScan<IdxT, BlockSize>;
+
+    const auto kth_value_bits    = counter->kth_value_bits;
+    const int start_bit          = calc_start_bit<T, BitsPerPass>(pass);
+    const IdxT num_ties_to_keep  = counter->k;
+    IdxT* p_out_cnt              = &counter->out_cnt;
+    IdxT* p_ties_written         = &counter->out_back_cnt;
+
+    // First preserve the existing fast vectorized filtering for all scores
+    // strictly better than the exact kth score.  These are unambiguous.
+    vectorized_process(threadIdx.x, blockDim.x, in, current_len,
+        [&](T value, IdxT idx) {
+            const auto bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
+            if(bits < kth_value_bits)
+            {
+                const IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
+                if(WRITE_TOPK_VALUES) { out[pos] = value; }
+                out_idx[pos] = idx;
+            }
+        });
+
+    __syncthreads();
+    if(threadIdx.x == 0) { *p_ties_written = 0; }
+    __syncthreads();
+
+    // Each tile is visited in logical-token order.  BlockScan assigns a
+    // deterministic rank to every tied item in that tile; the accumulated
+    // rank selects the first ``num_ties_to_keep`` token ids globally.
+    for(IdxT tile_start = 0; tile_start < current_len; tile_start += BlockSize)
+    {
+        const IdxT idx = tile_start + static_cast<IdxT>(threadIdx.x);
+        T value{};
+        IdxT is_tie = 0;
+        if(idx < current_len)
+        {
+            value = in[idx];
+            const auto bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
+            is_tie = bits == kth_value_bits ? 1 : 0;
+        }
+
+        IdxT tile_rank = 0;
+        IdxT tile_count = 0;
+        BlockScan(tie_scan_storage).ExclusiveSum(is_tie, tile_rank, tile_count);
+
+        const IdxT tie_rank = *p_ties_written + tile_rank;
+        if(is_tie && tie_rank < num_ties_to_keep)
+        {
+            const IdxT pos = k - num_ties_to_keep + tie_rank;
+            if(WRITE_TOPK_VALUES) { out[pos] = value; }
+            out_idx[pos] = idx;
+        }
+
+        __syncthreads();
+        if(threadIdx.x == 0) { *p_ties_written += tile_count; }
+        __syncthreads();
+        if(*p_ties_written >= num_ties_to_keep) { break; }
+    }
+}
+
+/**
+ * Canonicalise the selected decode top-k order after membership selection.
+ *
+ * The radix selector deliberately uses atomics to write strictly-better
+ * candidates.  That preserves the selected set but not its output order, and
+ * independent TP ranks can therefore feed the same KV set to sparse MLA in a
+ * different permutation.  Sort the final K=2048 entries by the full
+ * lexicographic key ``(score descending, token_id ascending)``.  ``twiddle``
+ * already maps a larger floating-point score to a smaller ordered key for the
+ * largest-top-k path, so an ascending 64-bit radix sort gives the required
+ * ordering without a comparison sort.
+ */
+template <typename T,
+          typename IdxT,
+          int BlockSize,
+          int ItemsPerThread,
+          bool WRITE_TOPK_VALUES>
+__device__ void sort_selected_topk_by_score_and_token_id_oneblock(
+    T const* in,
+    T* out,
+    IdxT* out_idx,
+    bool const select_min,
+    typename hipcub::BlockRadixSort<uint64_t,
+                                    BlockSize,
+                                    ItemsPerThread,
+                                    IdxT>::TempStorage& sort_storage)
+{
+    using TopKSort = hipcub::BlockRadixSort<uint64_t, BlockSize, ItemsPerThread, IdxT>;
+    uint64_t keys[ItemsPerThread];
+    IdxT indices[ItemsPerThread];
+
+#pragma unroll
+    for(int item = 0; item < ItemsPerThread; ++item)
+    {
+        const int pos = item * BlockSize + threadIdx.x;
+        const IdxT idx = out_idx[pos];
+        const uint64_t score_key = static_cast<uint64_t>(twiddle_in(in[idx], select_min));
+        // The low word is the logical token id, so ascending radix order
+        // deterministically resolves exact score ties.
+        keys[item] = (score_key << 32) | static_cast<uint32_t>(idx);
+        indices[item] = idx;
+    }
+
+    TopKSort(sort_storage).SortBlockedToStriped(keys, indices);
+
+#pragma unroll
+    for(int item = 0; item < ItemsPerThread; ++item)
+    {
+        const int pos = item * BlockSize + threadIdx.x;
+        out_idx[pos] = indices[item];
+        if(WRITE_TOPK_VALUES) { out[pos] = in[indices[item]]; }
+    }
+}
+
 // Multi-block last_filter launched as a separate kernel.
 template <typename T,
           typename IdxT,
@@ -1943,7 +2092,8 @@ template <typename T,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false,
-          Phase phase>
+          Phase phase,
+          bool deterministic_ties_by_token_id = false>
 __global__ void radix_topk_one_block_kernel(T const* in,
                                             IdxT const* in_idx,
                                             const int64_t len,
@@ -1957,8 +2107,24 @@ __global__ void radix_topk_one_block_kernel(T const* in,
                                             const int next_n)
 {
     constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
+    using TieBlockScan = hipcub::BlockScan<IdxT, BlockSize>;
+    // GLM decode uses K=2048 with a 1024-thread block.  Two selected items
+    // per thread permit a single block radix sort of the final output.
+    static constexpr int kTopKItemsPerThread = 2;
+    using TopKSort = hipcub::BlockRadixSort<uint64_t,
+                                             BlockSize,
+                                             kTopKItemsPerThread,
+                                             IdxT>;
+    // The histogram is only needed while selecting the FP32 score threshold.
+    // Reuse its LDS allocation for the deterministic tie scan and final sort.
+    __shared__ union
+    {
+        IdxT histogram[num_buckets];
+        typename TieBlockScan::TempStorage tie_scan;
+        typename TopKSort::TempStorage topk_sort;
+    } shared_storage;
     __shared__ Counter<T, IdxT> counter;
-    __shared__ IdxT histogram[num_buckets];
+    IdxT* histogram = shared_storage.histogram;
 
     const int64_t batch_id = blockIdx.x;
 
@@ -2051,8 +2217,39 @@ __global__ void radix_topk_one_block_kernel(T const* in,
 
         if(pass == num_passes - 1)
         {
-            last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, prioritize_smaller_indice>(
-                in, in_idx, out, out_idx, row_len, k, &counter, select_min, pass, false);
+            if constexpr(deterministic_ties_by_token_id)
+            {
+                // Decode supplies no index indirection: the row offset is the
+                // logical token id.  An exact-score boundary is ambiguous only
+                // when more tied values exist than remaining top-k slots.
+                if(in_idx == nullptr && counter.len > counter.k)
+                {
+                    last_filter_ties_by_token_id_oneblock<T,
+                                                           IdxT,
+                                                           BitsPerPass,
+                                                           BlockSize,
+                                                           WRITE_TOPK_VALUES>(
+                        in,
+                        out,
+                        out_idx,
+                        row_len,
+                        k,
+                        &counter,
+                        select_min,
+                        pass,
+                        shared_storage.tie_scan);
+                }
+                else
+                {
+                    last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, prioritize_smaller_indice>(
+                        in, in_idx, out, out_idx, row_len, k, &counter, select_min, pass, false);
+                }
+            }
+            else
+            {
+                last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, prioritize_smaller_indice>(
+                    in, in_idx, out, out_idx, row_len, k, &counter, select_min, pass, false);
+            }
             break;
         }
         else if(counter.len == counter.k)
@@ -2060,6 +2257,23 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
                 in, in_idx, out, out_idx, row_len, k, &counter, select_min, pass);
             break;
+        }
+    }
+
+    if constexpr(deterministic_ties_by_token_id)
+    {
+        // The native decode API fixes K at 2048.  Keep the generic kernel
+        // usable for other callers by retaining its original order there.
+        if(k == BlockSize * kTopKItemsPerThread)
+        {
+            __syncthreads();
+            sort_selected_topk_by_score_and_token_id_oneblock<T,
+                                                                IdxT,
+                                                                BlockSize,
+                                                                kTopKItemsPerThread,
+                                                                WRITE_TOPK_VALUES>(
+                in, out, out_idx, select_min, shared_storage.topk_sort);
+            __syncthreads();
         }
     }
 
@@ -2252,7 +2466,8 @@ template <typename T,
           int BitsPerPass,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
-          Phase phase = Phase::Prefill>
+          Phase phase = Phase::Prefill,
+          bool deterministic_ties_by_token_id = false>
 void standalone_stable_radix_topk_one_block_(void* buf,
                                              size_t& buf_size,
                                              T const* in,
@@ -2288,7 +2503,14 @@ void standalone_stable_radix_topk_one_block_(void* buf,
         bufs                                = static_cast<decltype(bufs)>(aligned_pointers[0]);
     }
 
-    radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>
+    radix_topk_one_block_kernel<T,
+                                IdxT,
+                                BitsPerPass,
+                                BlockSize,
+                                WRITE_TOPK_VALUES,
+                                false,
+                                phase,
+                                deterministic_ties_by_token_id>
         <<<batch_size, BlockSize, 0, stream>>>(
             in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
 }
@@ -2308,18 +2530,30 @@ inline bool topk_oneblock_use_large_bpp()
 
 // Thin wrapper dispatching to the correct BPP at runtime.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
-          Phase phase = Phase::Prefill>
+          Phase phase = Phase::Prefill, bool deterministic_ties_by_token_id = false>
 inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, IdxT const* in_idx,
                                     int batch_size, int64_t len, IdxT* rowStarts, IdxT* rowEnds,
                                     IdxT k, T* out, IdxT* out_idx, bool select_min,
                                     hipStream_t stream, bool sorted = false, int next_n = 0)
 {
     if (topk_oneblock_use_large_bpp()) {
-        standalone_stable_radix_topk_one_block_<T, IdxT, 12, BlockSize, WRITE_TOPK_VALUES, phase>(
+        standalone_stable_radix_topk_one_block_<T,
+                                                IdxT,
+                                                12,
+                                                BlockSize,
+                                                WRITE_TOPK_VALUES,
+                                                phase,
+                                                deterministic_ties_by_token_id>(
             buf, buf_size, in, in_idx, batch_size, len, rowStarts, rowEnds,
             k, out, out_idx, select_min, stream, sorted, next_n);
     } else {
-        standalone_stable_radix_topk_one_block_<T, IdxT, 11, BlockSize, WRITE_TOPK_VALUES, phase>(
+        standalone_stable_radix_topk_one_block_<T,
+                                                IdxT,
+                                                11,
+                                                BlockSize,
+                                                WRITE_TOPK_VALUES,
+                                                phase,
+                                                deterministic_ties_by_token_id>(
             buf, buf_size, in, in_idx, batch_size, len, rowStarts, rowEnds,
             k, out, out_idx, select_min, stream, sorted, next_n);
     }
@@ -2518,6 +2752,124 @@ void radix_topk_dispatch(void* buf,
     }
 }
 
+// The radix selection paths above guarantee the selected set but do not define
+// a total order for equal fp32 keys.  Sparse MLA consumes the returned order in
+// low-precision reductions, so a different equal-key permutation on TP ranks
+// is observable. Canonicalise the GLM prefill shape in one GPU block per row.
+// We intentionally use logical-token-id order for the already-selected set:
+// sparse MLA is set-based, while a shared deterministic traversal order keeps
+// its low-precision reductions replica-identical. This also puts equal-score
+// tokens in ascending token-id order without re-sorting the full context.
+template <int kTopK>
+__global__ __launch_bounds__(256) void canonicalize_prefill_topk_kernel(
+    const float* __restrict__ logits,
+    const int stride0,
+    int* __restrict__ indices,
+    float* __restrict__ values,
+    const int* __restrict__ row_starts,
+    const int* __restrict__ row_ends)
+{
+    static_assert((kTopK & (kTopK - 1)) == 0, "radix sort needs power-of-two k");
+    constexpr int kThreads = 256;
+    constexpr int kItemsPerThread = kTopK / kThreads;
+    using BlockRadixSort = hipcub::BlockRadixSort<uint32_t, kThreads, kItemsPerThread>;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ typename BlockRadixSort::TempStorage radix_storage;
+    __shared__ int row_can_be_sorted;
+
+    const int row_start = row_starts[row];
+    const int row_end = row_ends[row];
+    const int valid_count = max(0, min(kTopK, row_end - row_start));
+
+    if(tid == 0)
+    {
+        row_can_be_sorted = 1;
+    }
+    __syncthreads();
+
+    // A causal prefill contains early rows whose valid key range is shorter
+    // than kTopK. The native selector intentionally leaves that tail
+    // unspecified because sparse MLA consumes only min(kTopK, row_length)
+    // entries. Pad that tail with UINT_MAX and never write it back.
+    uint32_t keys[kItemsPerThread];
+#pragma unroll
+    for(int item = 0; item < kItemsPerThread; ++item)
+    {
+        // BlockRadixSort::Sort uses blocked thread-item layout.
+        const int pos = tid * kItemsPerThread + item;
+        if(pos < valid_count)
+        {
+            const int logical_id = indices[row * kTopK + pos];
+            if(logical_id < row_start || logical_id >= row_end)
+            {
+                atomicExch(&row_can_be_sorted, 0);
+            }
+            else
+            {
+                keys[item] = static_cast<uint32_t>(logical_id);
+            }
+        }
+        else
+        {
+            keys[item] = std::numeric_limits<uint32_t>::max();
+        }
+    }
+    __syncthreads();
+
+    if(!row_can_be_sorted)
+    {
+        return;
+    }
+
+    // hipCUB radix sort has a small, fixed number of digit passes. It replaces
+    // the prior 66-barrier bitonic network and keeps full long-prefill batches
+    // practical while remaining entirely on the GPU.
+    BlockRadixSort(radix_storage).Sort(keys);
+
+#pragma unroll
+    for(int item = 0; item < kItemsPerThread; ++item)
+    {
+        const int pos = tid * kItemsPerThread + item;
+        if(pos < valid_count)
+        {
+            const int logical_id = static_cast<int>(keys[item]);
+            indices[row * kTopK + pos] = logical_id;
+            if(values != nullptr)
+            {
+                values[row * kTopK + pos] = logits[row * stride0 + logical_id];
+            }
+        }
+    }
+}
+
+inline void canonicalize_prefill_topk(const float* logits,
+                                      int stride0,
+                                      int* indices,
+                                      float* values,
+                                      const int* row_starts,
+                                      const int* row_ends,
+                                      int batch,
+                                      int k,
+                                      hipStream_t stream)
+{
+    // GLM sparse MLA and the shipped ASM prefill top-k both use k=2048. Keep
+    // other public top-k callers on their prior behaviour instead of silently
+    // imposing a launch shape they did not request.
+    // Full-context prefill can contain tens of thousands of rows. Canonical
+    // ordering is principally needed for the small prefix-cache suffix that
+    // feeds sparse MLA; cap the native post-sort here rather than moving the
+    // policy up to ATOM. Override for broader validation if desired.
+    const char* max_rows_env = std::getenv("AITER_CANONICAL_PREFILL_TOPK_MAX_ROWS");
+    const int max_rows = max_rows_env == nullptr ? 32 : std::atoi(max_rows_env);
+    if(k == 2048 && (max_rows <= 0 || batch <= max_rows))
+    {
+        canonicalize_prefill_topk_kernel<2048><<<batch, 256, 0, stream>>>(
+            logits, stride0, indices, values, row_starts, row_ends);
+    }
+}
+
 // Prefill entry: dispatches to mb or ob based on batch size and seq_len.
 // `workspace` (optional): a caller-provided, zero-initialized persistent buffer
 // for the mb path (see get_topk_mb_workspace in topk.py). When given, the host
@@ -2584,14 +2936,24 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
         torch::Tensor workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
         void* ws_ptr            = static_cast<void*>(workspace.data_ptr<uint8_t>());
         if (write_vals) {
-            aiter::ob::dispatch_topk_oneblock<float, int, 1024, true, aiter::ob::Phase::Prefill>(
+            aiter::ob::dispatch_topk_oneblock<float,
+                                              int,
+                                              1024,
+                                              true,
+                                              aiter::ob::Phase::Prefill,
+                                              true>(
                 ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
                 batch, stride0,
                 row_starts_ptr, row_ends_ptr,
                 kTopK, values_ptr, indices_ptr,
                 select_min, stream, /*sorted=*/true);
         } else {
-            aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Prefill>(
+            aiter::ob::dispatch_topk_oneblock<float,
+                                              int,
+                                              1024,
+                                              false,
+                                              aiter::ob::Phase::Prefill,
+                                              true>(
                 ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
                 batch, stride0,
                 row_starts_ptr, row_ends_ptr,
@@ -2599,6 +2961,10 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                 select_min, stream, /*sorted=*/true);
         }
     }
+
+    canonicalize_prefill_topk(
+        logits_ptr, static_cast<int>(stride0), indices_ptr, values_ptr,
+        row_starts_ptr, row_ends_ptr, batch, kTopK, stream);
 }
 
 // Decode entry: always uses the one-block kernel.
@@ -2644,7 +3010,12 @@ void top_k_per_row_decode(const torch::Tensor& logits,
     const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
     torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
     void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
-    aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
+    aiter::ob::dispatch_topk_oneblock<float,
+                                      int,
+                                      1024,
+                                      false,
+                                      aiter::ob::Phase::Decode,
+                                      true>(
         ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
         batch, stride0,
         /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
