@@ -110,18 +110,9 @@ __device__ void moe_fused_gate_impl(void* input,
     }
     extern __shared__ char shared_mem[];
     char* ptr = (char*)(((size_t)shared_mem + 255) & ~255);
+    (void)ptr;
 
-    // float *scores = reinterpret_cast<float *>(ptr + tidx / params.THREADS_PER_ROW *
-    // params.THREADS_PER_ROW * params.VPT * sizeof(float)); ptr += WARP_SIZE * params.VPT *
-    // sizeof(float);
-
-    float* scores =
-        reinterpret_cast<float*>(ptr + tidx / params.THREADS_PER_ROW * topk * sizeof(float));
-    ptr += params.ROWS_PER_WARP * topk * sizeof(float);
-
-    int* topk_indices =
-        reinterpret_cast<int*>(ptr + tidx / params.THREADS_PER_ROW * topk * sizeof(int));
-    // ptr += params.ROWS_PER_WARP * topk * sizeof(int);
+    float local_scores[MAX_VPT];
 
     // Calculate topk_excluding_share_expert_fusion from topk
     int64_t topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
@@ -187,19 +178,13 @@ __device__ void moe_fused_gate_impl(void* input,
 
     // __syncthreads();
 
-////////////////////// Sigmoid //////////////////////
+////////////////////// Sigmoid + Add Bias //////////////////////
 #pragma unroll
     for(int ii = 0; ii < params.VPT; ++ii)
     {
-        row_chunk[ii] = ::isnan(row_chunk[ii]) ? 0.0f : (1.0f / (1.0f + expf(-row_chunk[ii])));
-    }
-    // __syncthreads();
-
-////////////////////// Add Bias //////////////////////
-#pragma unroll
-    for(int ii = 0; ii < params.VPT; ++ii)
-    {
-        bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
+        float x = row_chunk[ii];
+        row_chunk[ii] = ::isnan(x) ? 0.0f : (1.0f / (1.0f + __expf(-x)));
+        bias_chunk[ii] += row_chunk[ii];
     }
 
     // local argmax
@@ -257,16 +242,11 @@ __device__ void moe_fused_gate_impl(void* input,
         const kvp result_kvp = multithread_reduce(thread_kvp, arg_min, params.THREADS_PER_ROW);
         expert               = result_kvp.key;
 
-        // clear the max value in the thread
-        if(k_idx < params.THREADS_PER_ROW - topk_group)
+        int const thread_to_clear_in_group = expert / params.VPT;
+        if(thread_group_idx == thread_to_clear_in_group)
         {
-            int const thread_to_clear_in_group = expert / params.VPT;
-
-            if(thread_group_idx == thread_to_clear_in_group)
-            {
-                bias_chunk[0] = FLT_MAX;
-                max_val       = FLT_MAX;
-            }
+            bias_chunk[0] = FLT_MAX;
+            max_val       = FLT_MAX;
         }
     }
 
@@ -328,42 +308,21 @@ __device__ void moe_fused_gate_impl(void* input,
 
         int thread_to_clear_in_group = expert / params.VPT;
         int64_t idx                  = out_stride * thread_row + k_idx;
+        int expert_to_clear_in_thread = expert % params.VPT;
+        int src_lane = tidx - thread_group_idx + thread_to_clear_in_group;
+        float score_val = __shfl(row_chunk[expert_to_clear_in_thread], src_lane);
 
         if(thread_group_idx == thread_to_clear_in_group)
         {
-            int expert_to_clear_in_thread = expert % params.VPT;
-            // topk_indices[k_idx] = expert;
-
-#pragma unroll
-            for(int ii = 0; ii < params.VPT; ++ii)
-            {
-                if(ii == expert_to_clear_in_thread)
-                {
-                    bias_chunk[ii] = -FLT_MAX; // clear the max value in the thread
-                    // output_ptr[idx] = row_chunk[ii];
-                    scores[k_idx] = row_chunk[ii];
-                }
-            }
-            // output_ptr[idx] = row_chunk[k_idx];
-            // expert_mask &= ~(1u << expert_to_clear_in_thread);
-            // output_ptr[idx] = scale;  // store output
-
-            //// clear the max value in the thread
-            // bias_chunk[expert_to_clear_in_thread] = -FLT_MAX;
-            //// store output
-            // output_ptr[idx] = row_chunk[expert_to_clear_in_thread];
+            bias_chunk[expert_to_clear_in_thread] = -FLT_MAX;
             indices_ptr[idx] = static_cast<int32_t>(expert);
         }
-        __syncthreads();
 
-        // accumulate sum for all elements
         if(thread_group_idx == 0)
         {
-            // output_sum += output_ptr[idx];
-            output_sum += scores[k_idx];
+            local_scores[k_idx] = score_val;
+            output_sum += score_val;
         }
-
-        // __syncthreads();
     }
 
     if(thread_group_idx == 0 && num_fused_shared_experts > 0)
@@ -389,16 +348,16 @@ __device__ void moe_fused_gate_impl(void* input,
             }
         }
     }
-    __syncthreads();
 
     ////////////////////// Rescale Output //////////////////////
     if(thread_group_idx == 0)
     {
+        float rcp_sum = 1.0f / output_sum;
 #pragma unroll
-        for(int ii = 0; ii < topk; ++ii)
+        for(int ii = 0; ii < topk_excluding_share_expert_fusion; ++ii)
         {
             int64_t const idx = out_stride * thread_row + ii;
-            output_ptr[idx]   = scores[ii] / output_sum;
+            output_ptr[idx]   = local_scores[ii] * rcp_sum;
         }
     }
 }
@@ -558,7 +517,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     int64_t num_blocks    = (num_warps + WARPS_PER_CTA - 1) / WARPS_PER_CTA;
     int ROWS_PER_WARP     = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
     size_t shared_mem_size =
-        ((topk * sizeof(float) + topk * sizeof(int)) * ROWS_PER_WARP + 255) & ~255;
+        256;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
