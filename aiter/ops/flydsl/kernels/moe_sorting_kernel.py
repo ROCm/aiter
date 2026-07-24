@@ -770,8 +770,9 @@ def _compile_moe_sorting_oneshot(
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = moe_sorting_oneshot_kernel(
             topk_ids_tensor,
             topk_weights_tensor,
@@ -1021,8 +1022,9 @@ def _compile_moe_sorting_multiphase(
         workspace: fx.Tensor,
         i32_total_elems: fx.Int32,
         n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = clear_workspace_kernel(workspace, i32_total_elems)
         launcher.launch(grid=(n_grid, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
 
@@ -1085,8 +1087,9 @@ def _compile_moe_sorting_multiphase(
         i32_mesh_stride: fx.Int32,
         i32_niters: fx.Int32,
         n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p0_scatter_kernel(
             topk_ids,
             workspace,
@@ -1231,8 +1234,9 @@ def _compile_moe_sorting_multiphase(
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p1_count_kernel(
             workspace,
             expert_mask_tensor,
@@ -1436,8 +1440,9 @@ def _compile_moe_sorting_multiphase(
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p0v2_kernel(
             topk_ids,
             workspace,
@@ -1704,8 +1709,9 @@ def _compile_moe_sorting_multiphase(
         i32_mesh_size: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p23_kernel(
             workspace,
             topk_weights_tensor,
@@ -1740,8 +1746,9 @@ def _compile_moe_sorting_multiphase(
         i32_mesh_size: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid_p23: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         l1 = p0v2_kernel(
             topk_ids,
             workspace,
@@ -1791,8 +1798,9 @@ def _compile_moe_sorting_multiphase(
         n_grid_k1: fx.Int32,
         n_grid_k2: fx.Int32,
         n_grid_p23: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         l1 = clear_workspace_kernel(workspace, i32_ws_total)
         l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
 
