@@ -9,6 +9,81 @@
 #include <c10/util/Half.h>
 #include <hip/hip_bf16.h>
 
+#if !ENABLE_CK
+// ---------------------------------------------------------------------------
+// Minimal ck_tile:: bridge for the shim build (ENABLE_CK==0).
+//
+// A handful of kernels (e.g. fused_qk_norm_rope_cache_quant.cu and
+// rope/rope_common.h) still spell their scalar dtypes and conversions with the
+// ck_tile:: names. Rather than pulling in the whole Composable Kernel core, we
+// alias those names onto the already-included, arch-tested opus dtypes and
+// route type_convert / numeric through opus::cast / opus::numeric_limits.
+//
+// This header is included right after opus/opus.hpp and before the kernels that
+// need it, so opus:: symbols are visible here. It is guarded by !ENABLE_CK so it
+// never collides with the real ck_tile core when CK is enabled.
+//
+// Every observed call site converts *through* fp32 (IT -> float -> T), which is
+// exactly the set of scalar casts opus defines (X <-> fp32), so no direct
+// non-fp32 pair is ever required.
+namespace ck_tile {
+
+using fp32_t = float;
+using fp16_t = opus::fp16_t;
+using bf16_t = opus::bf16_t;
+using fp8_t  = opus::fp8_t;
+using bf8_t  = opus::bf8_t;
+
+// __device__ only: opus scalar fp8 casts are device-only intrinsics, and every
+// call site in the shim build is inside device/global kernels.
+template <typename D, typename S>
+__device__ inline D type_convert(const S& x)
+{
+    using DD = opus::remove_cvref_t<D>;
+    using SS = opus::remove_cvref_t<S>;
+    if constexpr(std::is_same_v<DD, SS>)
+    {
+        return x;
+    }
+    else if constexpr(opus::is_dtype_v<DD> && opus::is_dtype_v<SS>)
+    {
+        // opus scalar cast is defined for every X <-> fp32 pair; route any
+        // other (non-fp32) pair through fp32 to stay within that set.
+        if constexpr(std::is_same_v<DD, fp32_t> || std::is_same_v<SS, fp32_t>)
+        {
+            return static_cast<D>(opus::cast<DD>(x));
+        }
+        else
+        {
+            return static_cast<D>(opus::cast<DD>(opus::cast<fp32_t>(x)));
+        }
+    }
+    else
+    {
+        return static_cast<D>(x);
+    }
+}
+
+template <typename T>
+struct numeric
+{
+    __host__ __device__ static constexpr T max()
+    {
+        return opus::numeric_limits<opus::remove_cvref_t<T>>::max();
+    }
+    __host__ __device__ static constexpr T min()
+    {
+        return opus::numeric_limits<opus::remove_cvref_t<T>>::min();
+    }
+    __host__ __device__ static constexpr T lowest()
+    {
+        return opus::numeric_limits<opus::remove_cvref_t<T>>::lowest();
+    }
+};
+
+} // namespace ck_tile
+#endif // !ENABLE_CK
+
 namespace aiter {
 using namespace opus;
 #define RT 0
