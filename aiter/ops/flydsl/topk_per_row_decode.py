@@ -72,18 +72,18 @@ def _multi_processor_count(arch: str | None = None) -> int:
 
 @functools.cache
 def _environ_kernel_config() -> dict:
-    cfg = dict(
-        scan_stages=_env_int("FLYDSL_TOPK_SCAN_STAGES"),
-        tiered_short_max=_env_int("FLYDSL_TOPK_TIERED_SHORT_MAX"),
-        tiered_mid_cap=_env_int("FLYDSL_TOPK_TIERED_MID_CAP"),
-        tiered_mid_max=_env_int("FLYDSL_TOPK_TIERED_MID_MAX"),
-        tiered_long_cap=_env_int("FLYDSL_TOPK_TIERED_LONG_CAP"),
-        bits_per_pass=_env_int("FLYDSL_TOPK_TIERED_BPP"),
+    cfg = {
+        "scan_stages": _env_int("FLYDSL_TOPK_SCAN_STAGES"),
+        "tiered_short_max": _env_int("FLYDSL_TOPK_TIERED_SHORT_MAX"),
+        "tiered_mid_cap": _env_int("FLYDSL_TOPK_TIERED_MID_CAP"),
+        "tiered_mid_max": _env_int("FLYDSL_TOPK_TIERED_MID_MAX"),
+        "tiered_long_cap": _env_int("FLYDSL_TOPK_TIERED_LONG_CAP"),
+        "bits_per_pass": _env_int("FLYDSL_TOPK_TIERED_BPP"),
         # 0/1 override for the non-finite mask (default on); set 0 to disable.
-        mask_non_finite=_env_int("FLYDSL_TOPK_TIERED_MASK_NONFINITE"),
+        "mask_non_finite": _env_int("FLYDSL_TOPK_TIERED_MASK_NONFINITE"),
         # Force a single tier for every row (auto/short/mid/long)
-        tier_mode=os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE"),
-    )
+        "tier_mode": os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE"),
+    }
     return {k: v for k, v in cfg.items() if v is not None}
 
 
@@ -239,19 +239,19 @@ def _default_kernel_config(
     # Env FLYDSL_TOPK_TIERED_ES (0/1) overrides; gfx942 frozen (0).
     es_on = _env_int("FLYDSL_TOPK_TIERED_ES", 1 if arch == "gfx950" else 0)
 
-    return dict(
-        blocks_per_row=blocks_per_row,
-        bits_per_pass=bits_per_pass,
-        scan_stages=_TIERED_SCAN_STAGES,
-        tiered_short_max=tiered_short_max,
-        tiered_mid_cap=tiered_mid_cap_default,
-        tiered_mid_max=tiered_mid_max,
-        tiered_long_cap=tiered_long_cap_default,
-        mask_non_finite=True,
-        tier_mode="auto",
-        row_proportional_parts=bool(rpp_on),
-        early_stop=bool(es_on) and num_rows <= 1,
-    )
+    return {
+        "blocks_per_row": blocks_per_row,
+        "bits_per_pass": bits_per_pass,
+        "scan_stages": _TIERED_SCAN_STAGES,
+        "tiered_short_max": tiered_short_max,
+        "tiered_mid_cap": tiered_mid_cap_default,
+        "tiered_mid_max": tiered_mid_max,
+        "tiered_long_cap": tiered_long_cap_default,
+        "mask_non_finite": True,
+        "tier_mode": "auto",
+        "row_proportional_parts": bool(rpp_on),
+        "early_stop": bool(es_on) and num_rows <= 1,
+    }
 
 
 def _kernel_config(num_rows: int, max_model_len: int) -> dict:
