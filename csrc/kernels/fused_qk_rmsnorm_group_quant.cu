@@ -20,6 +20,7 @@ template <typename DTYPE_I,
           int ReduceThreadSize,
           bool ADD_RESIDUAL,
           bool OUTPUT_UNQUANT,
+          bool OUTPUT_UNQUANT_FP32,
           bool GEMMA_NORM = false,
           bool NO_QUANT = false,
           bool PER_TOKEN_QUANT = false,
@@ -28,6 +29,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     DTYPE_O* __restrict__ q_out_quantized,
     void* __restrict__ q_out_scale,
     DTYPE_I* __restrict__ q_out_unquantized,
+    float* __restrict__ q_out_unquantized_fp32,
     DTYPE_I* __restrict__ k_out,
     DTYPE_I* __restrict__ q_res_out,
     const DTYPE_I* __restrict__ q,
@@ -47,6 +49,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     int q_out_scale_row_stride,
     int q_out_scale_col_stride,
     int q_out_u_stride,
+    int q_out_u_fp32_stride,
     int k_out_stride,
     int q_res_out_stride,
     int group_size)
@@ -55,6 +58,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     auto* out1_q = q_out_quantized;
     auto* out1_scale = q_out_scale;
     auto* out1_unquant = q_out_unquantized;
+    auto* out1_unquant_fp32 = q_out_unquantized_fp32;
     auto* out2 = k_out;
     auto* out_res1 = q_res_out;
     const auto* inp1 = q;
@@ -73,6 +77,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     const int out1_scale_row_stride = q_out_scale_row_stride;
     const int out1_scale_col_stride = q_out_scale_col_stride;
     const int out1_unquant_stride = q_out_u_stride;
+    const int out1_unquant_fp32_stride = q_out_u_fp32_stride;
     const int out2_stride = k_out_stride;
     const int out_res1_stride = q_res_out_stride;
 
@@ -241,6 +246,23 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                              interleave_size,
                              num_load_inst,
                              DTYPE_I>(out_u_buffer, thread_data_f, row_offset);
+            }
+        }
+        if constexpr(OUTPUT_UNQUANT_FP32)
+        {
+            if(row_active)
+            {
+                auto out_u_fp32_ptr =
+                    out1_unquant_fp32 + idx * static_cast<int64_t>(out1_unquant_fp32_stride);
+                auto out_u_fp32_buffer = opus::make_gmem<float>(out_u_fp32_ptr, n * sizeof(float));
+                store_vector<float,
+                             float,
+                             thread_data_size,
+                             RT,
+                             interleave,
+                             interleave_size,
+                             num_load_inst,
+                             float>(out_u_fp32_buffer, thread_data_f, row_offset);
             }
         }
 
@@ -421,7 +443,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     }
 }
 
-#define FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, PER_TOKEN_QUANT_V, interleave) \
+#define FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V, PER_TOKEN_QUANT_V, interleave) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(inp1.dtype(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                             \
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;                                                                 \
         using DTYPE_OO = DTYPE_O;                                                                                                 \
@@ -434,6 +456,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                          ReduceThreadSize,                                                                        \
                                          ADD_RESIDUAL,                                                                            \
                                          OUTPUT_UNQUANT,                                                                          \
+                                         OUTPUT_UNQUANT_FP32,                                                                     \
                                          GEMMA_NORM_V,                                                                            \
                                          NO_QUANT_V,                                                                              \
                                          PER_TOKEN_QUANT_V,                                                                       \
@@ -441,6 +464,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             reinterpret_cast<DTYPE_OO*>(out1_quantized.data_ptr()),                                                              \
             out1_scale.data_ptr(),                                                                                                \
             reinterpret_cast<DTYPE_I*>(out1_unquantized.data_ptr()),                                                             \
+            reinterpret_cast<float*>(out1_unquantized_fp32.data_ptr()),                                                          \
             reinterpret_cast<DTYPE_I*>(out2.data_ptr()),                                                                          \
             reinterpret_cast<DTYPE_I*>(out_res1.data_ptr()),                                                                      \
             reinterpret_cast<const DTYPE_I*>(inp1.data_ptr()),                                                                    \
@@ -460,18 +484,19 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             out1_scale_row_stride,                                                                                                \
             out1_scale_col_stride,                                                                                                \
             out1_u_stride,                                                                                                        \
+            out1_u_fp32_stride,                                                                                                   \
             out2_stride,                                                                                                          \
             out_res1_stride,                                                                                                      \
             group_size);                                                                                                          \
     });
 
-#define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, interleave) \
-    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, interleave)
+#define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V, interleave) \
+    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V, false, interleave)
 
-#define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
-    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false)
+#define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V) \
+    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V, false)
 
-#define FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
+#define FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V) \
     do                                                                                                          \
     {                                                                                                           \
         if(quant_is_fp8)                                                                                        \
@@ -482,6 +507,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                                ReduceThreadSize,                                                \
                                                ADD_RESIDUAL,                                                    \
                                                OUTPUT_UNQUANT,                                                  \
+                                               OUTPUT_UNQUANT_FP32,                                             \
                                                GEMMA_NORM_V,                                                    \
                                                NO_QUANT_V);                                                     \
         }                                                                                                       \
@@ -493,94 +519,140 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                                ReduceThreadSize,                                                \
                                                ADD_RESIDUAL,                                                    \
                                                OUTPUT_UNQUANT,                                                  \
+                                               OUTPUT_UNQUANT_FP32,                                             \
                                                GEMMA_NORM_V,                                                    \
                                                NO_QUANT_V);                                                     \
         }                                                                                                       \
     } while(0)
 
-#define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
-    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
+#define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V) \
+    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V)
 
-#define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
-    FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
+#define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V) \
+    FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, NO_QUANT_V)
 
-#define FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
-    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false, true, true)
+#define FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V) \
+    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, OUTPUT_UNQUANT_FP32, GEMMA_NORM_V, false, true, true)
 
-#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, RTS)                                       \
-    do                                                                                         \
-    {                                                                                          \
-        if(no_quant)                                                                            \
-        {                                                                                      \
-            /* No-quant mode: OUTPUT_UNQUANT is always true; only branch on residual×gemma. */\
-            if(has_residual)                                                                    \
-            {                                                                                  \
-                if(gemma_norm) { MACRO(BS, TDS, RTS, true,  true, true,  true); }              \
-                else           { MACRO(BS, TDS, RTS, true,  true, false, true); }              \
-            }                                                                                  \
-            else                                                                               \
-            {                                                                                  \
-                if(gemma_norm) { MACRO(BS, TDS, RTS, false, true, true,  true); }              \
-                else           { MACRO(BS, TDS, RTS, false, true, false, true); }              \
-            }                                                                                  \
-        }                                                                                      \
-        else if(has_residual)                                                                   \
-        {                                                                                      \
-            if(output_unquantized_inp1)                                                         \
-            {                                                                                  \
-                if(gemma_norm) { MACRO(BS, TDS, RTS, true, true, true,  false); }              \
-                else           { MACRO(BS, TDS, RTS, true, true, false, false); }              \
-            }                                                                                  \
-            else                                                                               \
-            {                                                                                  \
-                if(gemma_norm) { MACRO(BS, TDS, RTS, true, false, true,  false); }             \
-                else           { MACRO(BS, TDS, RTS, true, false, false, false); }             \
-            }                                                                                  \
-        }                                                                                      \
-        else                                                                                   \
-        {                                                                                      \
-            if(output_unquantized_inp1)                                                         \
-            {                                                                                  \
-                if(gemma_norm) { MACRO(BS, TDS, RTS, false, true, true,  false); }             \
-                else           { MACRO(BS, TDS, RTS, false, true, false, false); }             \
-            }                                                                                  \
-            else                                                                               \
-            {                                                                                  \
-                if(gemma_norm) { MACRO(BS, TDS, RTS, false, false, true,  false); }            \
-                else           { MACRO(BS, TDS, RTS, false, false, false, false); }            \
-            }                                                                                  \
-        }                                                                                      \
+#define CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, ADD_RESIDUAL_V, OUTPUT_UNQUANT_V, OUTPUT_UNQUANT_FP32_V, NO_QUANT_V) \
+    do                                                                                                                     \
+    {                                                                                                                      \
+        if(gemma_norm) { MACRO(BS, TDS, RTS, ADD_RESIDUAL_V, OUTPUT_UNQUANT_V, OUTPUT_UNQUANT_FP32_V, true,  NO_QUANT_V); }\
+        else           { MACRO(BS, TDS, RTS, ADD_RESIDUAL_V, OUTPUT_UNQUANT_V, OUTPUT_UNQUANT_FP32_V, false, NO_QUANT_V); }\
     } while(0)
 
-#define DISPATCH_RESIDUAL_UNQUANT_PER_TOKEN_(MACRO, BS, TDS)                               \
-    do                                                                                       \
-    {                                                                                        \
-        if(has_residual)                                                                     \
-        {                                                                                    \
-            if(output_unquantized_inp1)                                                      \
-            {                                                                                \
-                if(gemma_norm) { MACRO(BS, TDS, true, true, true); }                         \
-                else           { MACRO(BS, TDS, true, true, false); }                        \
-            }                                                                                \
-            else                                                                             \
-            {                                                                                \
-                if(gemma_norm) { MACRO(BS, TDS, true, false, true); }                        \
-                else           { MACRO(BS, TDS, true, false, false); }                       \
-            }                                                                                \
-        }                                                                                    \
-        else                                                                                 \
-        {                                                                                    \
-            if(output_unquantized_inp1)                                                      \
-            {                                                                                \
-                if(gemma_norm) { MACRO(BS, TDS, false, true, true); }                        \
-                else           { MACRO(BS, TDS, false, true, false); }                       \
-            }                                                                                \
-            else                                                                             \
-            {                                                                                \
-                if(gemma_norm) { MACRO(BS, TDS, false, false, true); }                       \
-                else           { MACRO(BS, TDS, false, false, false); }                      \
-            }                                                                                \
-        }                                                                                    \
+#define CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, ADD_RESIDUAL_V, OUTPUT_UNQUANT_V, OUTPUT_UNQUANT_FP32_V) \
+    do                                                                                                      \
+    {                                                                                                       \
+        if(gemma_norm) { MACRO(BS, TDS, ADD_RESIDUAL_V, OUTPUT_UNQUANT_V, OUTPUT_UNQUANT_FP32_V, true); }   \
+        else           { MACRO(BS, TDS, ADD_RESIDUAL_V, OUTPUT_UNQUANT_V, OUTPUT_UNQUANT_FP32_V, false); }  \
+    } while(0)
+
+#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, RTS)                                      \
+    do                                                                                        \
+    {                                                                                         \
+        if(no_quant)                                                                           \
+        {                                                                                     \
+            if(has_residual)                                                                   \
+            {                                                                                 \
+                if(output_unquantized_inp1_fp32)                                               \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, true, true, true,  true);     \
+                }                                                                             \
+                else                                                                          \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, true, true, false, true);     \
+                }                                                                             \
+            }                                                                                 \
+            else                                                                              \
+            {                                                                                 \
+                if(output_unquantized_inp1_fp32)                                               \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, false, true, true,  true);    \
+                }                                                                             \
+                else                                                                          \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, false, true, false, true);    \
+                }                                                                             \
+            }                                                                                 \
+        }                                                                                     \
+        else if(has_residual)                                                                  \
+        {                                                                                     \
+            if(output_unquantized_inp1)                                                        \
+            {                                                                                 \
+                if(output_unquantized_inp1_fp32)                                               \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, true, true, true,  false);    \
+                }                                                                             \
+                else                                                                          \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, true, true, false, false);    \
+                }                                                                             \
+            }                                                                                 \
+            else                                                                              \
+            {                                                                                 \
+                CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, true, false, false, false);       \
+            }                                                                                 \
+        }                                                                                     \
+        else                                                                                  \
+        {                                                                                     \
+            if(output_unquantized_inp1)                                                        \
+            {                                                                                 \
+                if(output_unquantized_inp1_fp32)                                               \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, false, true, true,  false);   \
+                }                                                                             \
+                else                                                                          \
+                {                                                                             \
+                    CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, false, true, false, false);   \
+                }                                                                             \
+            }                                                                                 \
+            else                                                                              \
+            {                                                                                 \
+                CALL_GROUP_WITH_GEMMA_(MACRO, BS, TDS, RTS, false, false, false, false);      \
+            }                                                                                 \
+        }                                                                                     \
+    } while(0)
+
+#define DISPATCH_RESIDUAL_UNQUANT_PER_TOKEN_(MACRO, BS, TDS)                                 \
+    do                                                                                        \
+    {                                                                                         \
+        if(has_residual)                                                                       \
+        {                                                                                     \
+            if(output_unquantized_inp1)                                                        \
+            {                                                                                 \
+                if(output_unquantized_inp1_fp32)                                               \
+                {                                                                             \
+                    CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, true, true, true);             \
+                }                                                                             \
+                else                                                                          \
+                {                                                                             \
+                    CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, true, true, false);            \
+                }                                                                             \
+            }                                                                                 \
+            else                                                                              \
+            {                                                                                 \
+                CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, true, false, false);               \
+            }                                                                                 \
+        }                                                                                     \
+        else                                                                                  \
+        {                                                                                     \
+            if(output_unquantized_inp1)                                                        \
+            {                                                                                 \
+                if(output_unquantized_inp1_fp32)                                               \
+                {                                                                             \
+                    CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, false, true, true);            \
+                }                                                                             \
+                else                                                                          \
+                {                                                                             \
+                    CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, false, true, false);           \
+                }                                                                             \
+            }                                                                                 \
+            else                                                                              \
+            {                                                                                 \
+                CALL_PER_TOKEN_WITH_GEMMA_(MACRO, BS, TDS, false, false, false);              \
+            }                                                                                 \
+        }                                                                                     \
     } while(0)
 
 #define DISPATCH_REDUCE_THREAD_SIZE_(MACRO, BS, TDS)                                              \
@@ -605,6 +677,7 @@ void fused_qk_rmsnorm_group_quant(
     std::optional<aiter_tensor_t> q_weight_opt,
     std::optional<double> q_epsilon_opt,
     std::optional<aiter_tensor_t> q_out_unquantized_opt,
+    std::optional<aiter_tensor_t> q_out_unquantized_fp32_opt,
     std::optional<aiter_tensor_t> k_out_opt,
     std::optional<aiter_tensor_t> q_res_out_opt,
     std::optional<aiter_tensor_t> k,
@@ -653,6 +726,7 @@ void fused_qk_rmsnorm_group_quant(
     auto& inp1_weight = q_weight;
     const float inp1_epsilon = static_cast<float>(q_epsilon);
     const auto& out1_unquantized_opt = q_out_unquantized_opt;
+    const auto& out1_unquantized_fp32_opt = q_out_unquantized_fp32_opt;
     const auto& out2_opt = k_out_opt;
     const auto& out_res1_opt = q_res_out_opt;
     const auto& inp2 = k;
@@ -829,6 +903,10 @@ void fused_qk_rmsnorm_group_quant(
     bool has_second_input = inp2.has_value();
     bool has_residual = res1.has_value();
     bool output_unquantized_inp1 = out1_unquantized_opt.has_value();
+    bool output_unquantized_inp1_fp32 = out1_unquantized_fp32_opt.has_value();
+    AITER_CHECK(!output_unquantized_inp1_fp32 || output_unquantized_inp1,
+                __func__,
+                " q_out_unquantized_fp32 requires q_out_unquantized to also be provided");
 
     aiter_tensor_t out1_unquantized =
         output_unquantized_inp1 ? out1_unquantized_opt.value() : dummy;
@@ -844,10 +922,30 @@ void fused_qk_rmsnorm_group_quant(
                     __func__,
                     " q_out_unquantized shape mismatch with q");
     }
+    aiter_tensor_t out1_unquantized_fp32 =
+        output_unquantized_inp1_fp32 ? out1_unquantized_fp32_opt.value() : dummy;
+    if(output_unquantized_inp1_fp32)
+    {
+        AITER_CHECK(out1_unquantized_fp32.is_gpu(),
+                    __func__,
+                    " q_out_unquantized_fp32 must be on CUDA/HIP device");
+        AITER_CHECK(out1_unquantized_fp32.dim() == 2,
+                    __func__,
+                    " q_out_unquantized_fp32 must be a 2D tensor");
+        check_2d_last_dim_contiguous(out1_unquantized_fp32, "q_out_unquantized_fp32");
+        AITER_CHECK(out1_unquantized_fp32.dtype() == AITER_DTYPE_fp32,
+                    __func__,
+                    " q_out_unquantized_fp32 dtype must be float32");
+        AITER_CHECK(out1_unquantized_fp32.size(0) == m && out1_unquantized_fp32.size(1) == n1,
+                    __func__,
+                    " q_out_unquantized_fp32 shape mismatch with q");
+    }
 
     int inp1_stride = inp1.stride(0);
     int out1_q_stride = no_quant ? 0 : out1_quantized.stride(0);
     int out1_u_stride = output_unquantized_inp1 ? out1_unquantized.stride(0) : 0;
+    int out1_u_fp32_stride =
+        output_unquantized_inp1_fp32 ? out1_unquantized_fp32.stride(0) : 0;
 
     aiter_tensor_t out_res1 = dummy;
     int out_res1_stride = 0;
@@ -1079,6 +1177,7 @@ void fused_qk_rmsnorm_per_token_quant(
                                  q_weight,
                                  q_epsilon,
                                  q_out_unquantized_opt,
+                                 std::nullopt,
                                  k_out_opt,
                                  q_res_out_opt,
                                  k,

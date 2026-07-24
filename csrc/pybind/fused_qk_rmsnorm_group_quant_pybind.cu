@@ -16,6 +16,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_weight")                 = std::nullopt,
           py::arg("q_epsilon")                = std::nullopt,
           py::arg("q_out_unquantized")        = std::nullopt,
+          py::arg("q_out_unquantized_fp32")   = std::nullopt,
           py::arg("k_out")                    = std::nullopt,
           py::arg("q_res_out")                = std::nullopt,
           py::arg("k")                        = std::nullopt,
