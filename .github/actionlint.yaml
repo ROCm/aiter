@@ -4,6 +4,7 @@ self-hosted-runner:
     - aiter-8gpu-runner
     - aiter-di-ci-spur-login
     - aiter-di-ci-spur-login-vllm
+    - aiter-di-ci-spur-login-sglang
     - aiter-gfx1100
     - build-only-aiter
     - linux-aiter-do-mi350x-1
