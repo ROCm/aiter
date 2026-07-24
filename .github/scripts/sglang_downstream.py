@@ -106,6 +106,38 @@ TESTS = [
         "comment": "Standalone performance job is too long for PR validation.",
         "run_on_schedule": True,
     },
+    {
+        # GLM-5 MXFP4 (InferenceX MI355X frontier model) SGLang accuracy gate.
+        # MXFP4 is the AITER-critical MoE kernel path, so this is the most
+        # relevant GLM gate for AITER regressions. Uses SGLang's registered eval
+        # on amd/aiter-ci (test_glm5_mxfp4_eval_mi35x.py -> suite
+        # nightly-amd-8-gpu-mi35x-glm5-mxfp4): amd/GLM-5-MXFP4, TP=8, gsm8k
+        # threshold 0.90 (enforced inside the test).
+        # The test reads GLM5_MXFP4_MODEL_PATH, so model_path_env wires the
+        # /models cache automatically (no source patch needed); it falls back to
+        # the HF ~90GB download if the model is not staged on /models.
+        # GLM-5.1 specifics need either the 355GB GLM-5.1-FP8 staged on /models,
+        # or the GLM-5.1-MXFP4 TP=2 test landing on amd/aiter-ci (then move this
+        # gate to TP2 on do-mi350x-2, off the saturated 8-GPU pool).
+        "runner": "linux-aiter-do-mi350x-8",
+        "label": "MI35X",
+        "model": "GLM-5-MXFP4",
+        "model_id": "amd/GLM-5-MXFP4",
+        "model_path_env": "GLM5_MXFP4_MODEL_PATH",
+        "test_type": "Accuracy",
+        "timeout_minutes": 130,
+        "extra_exec_args": "",
+        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5-mxfp4 --nightly --timeout-per-file 5400",
+        # Disabled pending model staging. Verified failure mode: amd/GLM-5-MXFP4
+        # is NOT on the runner /models cache, so the test falls back to a ~90GB HF
+        # download that does not finish inside the 90-min job timeout (server never
+        # reaches ready; scheduler watchdog timeouts; "Fail. Time elapsed:
+        # 5405s"). NOT a DSA hang or AITER bug. Flip both to True once
+        # amd/GLM-5-MXFP4 is staged on /models (same place DeepSeek-R1-MXFP4 etc.
+        # live) so the gate resolves via GLM5_MXFP4_MODEL_PATH and runs fast.
+        "run_on_pr": False,
+        "run_on_schedule": False,
+    },
 ]
 
 
