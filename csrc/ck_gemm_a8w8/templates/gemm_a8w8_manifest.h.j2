@@ -1,0 +1,23 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#include <cstdlib>
+
+#include <torch/extension.h>
+{% for kernel_name in kernel_names %}
+template <typename ABDataType, typename DDataType, typename EDataType>
+torch::Tensor
+{{ kernel_name }}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    std::optional<torch::Tensor> bias,
+    int KBatch);
+{% endfor %}
+
+#endif // USE_ROCM
