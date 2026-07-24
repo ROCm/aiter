@@ -11,7 +11,10 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
                          int num_expert_group,
                          int topk_group,
                          bool renormalize,
-                         const float routed_scaling_factor = 1.);
+                         const float routed_scaling_factor = 1.,
+                         int num_fused_shared_experts = 0,
+                         const float fused_shared_experts_scaling_factor = 1.,
+                         int shared_expert_base = -1);
 
 void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                   torch::Tensor& topk_weights,  // [num_tokens, topk]
@@ -20,7 +23,10 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                   int topk_grp,
                   bool need_renorm,
                   bool is_softmax                   = true,
-                  const float routed_scaling_factor = 1.);
+                  const float routed_scaling_factor = 1.,
+                  int num_fused_shared_experts = 0,
+                  const float fused_shared_experts_scaling_factor = 1.,
+                  int shared_expert_base = -1);
 
 std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                        at::Tensor& bias,

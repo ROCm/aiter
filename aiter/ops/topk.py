@@ -85,6 +85,9 @@ def biased_grouped_topk_hip(
     topk_grp: int,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,
+    num_fused_shared_experts: int = 0,
+    fused_shared_experts_scaling_factor: float = 1.0,
+    shared_expert_base: int = -1,
 ) -> None: ...
 
 
@@ -98,6 +101,9 @@ def grouped_topk(
     need_renorm: bool,
     is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,
+    num_fused_shared_experts: int = 0,
+    fused_shared_experts_scaling_factor: float = 1.0,
+    shared_expert_base: int = -1,
 ) -> None: ...
 
 
@@ -144,11 +150,18 @@ def biased_grouped_topk(
     topk_group: int,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
+    num_fused_shared_experts: int = 0,
+    fused_shared_experts_scaling_factor: float = 1.0,
+    shared_expert_base: int = -1,
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
+    if (
+        num_fused_shared_experts > 0
+        or token_num <= cu_num * 212
+        or num_experts // num_expert_group > 32
+    ):
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -158,6 +171,9 @@ def biased_grouped_topk(
             topk_group,
             need_renorm,
             routed_scaling_factor,
+            num_fused_shared_experts,
+            fused_shared_experts_scaling_factor,
+            shared_expert_base,
         )
     else:
         topk = topk_ids.shape[1]
