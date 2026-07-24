@@ -61,6 +61,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
@@ -125,6 +126,33 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
     }
 
 
+_BMM_RE = re.compile(
+    r"^flydsl_blockscale_bpreshuffle_bmm_"
+    r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
+    r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
+    r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
+    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
+)
+
+
+def _parse_bmm_kernel_name(name: str) -> Optional[Dict]:
+    m = _BMM_RE.fullmatch(name)
+    if m is None:
+        return None
+    return {
+        "kind": "bmm",
+        "tile_m": int(m.group("tile_m")),
+        "tile_n": int(m.group("tile_n")),
+        "tile_k": int(m.group("tile_k")),
+        "m_warp": int(m.group("m_warp")),
+        "n_warp": int(m.group("n_warp")),
+        "num_buffers": int(m.group("num_buffers")),
+        "split_k": int(m.group("split_k")),
+        "cluster_m": int(m.group("cluster_m")),
+        "cluster_n": int(m.group("cluster_n")),
+    }
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
@@ -142,8 +170,15 @@ def parse_csv(csv_path: str):
             n = int(row["N"])
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
+            gfx = row.get("gfx", "").strip()
+            batch = int(row.get("B", "1") or "1")
 
-            if kernel_name.startswith("flydsl_bpreshuflle_"):
+            if kernel_name.startswith("flydsl_blockscale_bpreshuffle_bmm_"):
+                params = _parse_bmm_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["batch"] = batch
+            elif kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_gemm"):
                 params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
@@ -165,6 +200,7 @@ def parse_csv(csv_path: str):
                 "n": n,
                 "k": k,
                 "cu_num": cu_num,
+                "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
                 **params,
             }
@@ -357,14 +393,92 @@ def _compile_preshuffle_to_cache(
     )
 
 
+def _compile_bmm_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    batch: int = 1,
+    layout_mbn: int = 1,
+    out_is_f16: int = 0,
+    split_k: int = 1,
+    cluster_m: int = 1,
+    cluster_n: int = 1,
+    **kwargs,
+):
+    del kwargs, split_k, cluster_m, cluster_n
+
+    import torch
+
+    from aiter.ops.flydsl.kernels.a8w8_bmm_bpreshuffle_gfx1250 import (
+        launch_gemm_a8w8_tdm,
+    )
+
+    dev = torch.device("cpu")
+    out_dtype = torch.float16 if out_is_f16 else torch.bfloat16
+    scale_k = k // 128
+    scale_n = n // 128
+
+    # Shapes/layouts mirror the runtime data contract (BMN vs MBN); values are
+    # irrelevant under FakeTensorMode -- only shape/stride/dtype drive compilation.
+    if layout_mbn:
+        a = torch.empty((m, batch, k), device=dev, dtype=torch.uint8).view(m * batch, k)
+        sa = torch.empty((m, batch, scale_k), device=dev, dtype=torch.uint8)
+        c = torch.empty((m, batch, n), device=dev, dtype=out_dtype)
+    else:
+        a = torch.empty((batch, m, k), device=dev, dtype=torch.uint8).view(batch * m, k)
+        sa = torch.empty((batch, m, scale_k), device=dev, dtype=torch.uint8)
+        c = torch.empty((batch, m, n), device=dev, dtype=out_dtype)
+    b = torch.empty((batch, n, k), device=dev, dtype=torch.uint8).view(batch * n, k)
+    sb = torch.empty((batch, scale_n, scale_k), device=dev, dtype=torch.uint8)
+    stream = fx.Stream(0)
+
+    _compile_executable_to_cache(
+        launch_gemm_a8w8_tdm,
+        c,
+        # arg_a / arg_b are fx.Pointer in the kernel -> wrap as PointerJitArg
+        # (handles FakeTensor by producing a null ptr under FakeTensorMode).
+        _ptr_view_safe(a),
+        _ptr_view_safe(b),
+        sa,
+        sb,
+        m,
+        stream,
+        n,
+        k,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        batch,
+        layout_mbn,
+        num_buffers,
+    )
+
+
 def compile_one_config(
     kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    gfx = kwargs.get("gfx", "").strip()
+    if gfx:
+        aot_arch = gfx
+    else:
+        aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    batch = int(kwargs.get("batch", 1))
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
+    if kind == "bmm":
+        shape_str = f"{kernel_name}  B={batch} M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
         "kind": kind,
@@ -385,6 +499,10 @@ def compile_one_config(
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "bmm":
+                bmm_kwargs = dict(kwargs)
+                bmm_kwargs.pop("batch", None)
+                _compile_bmm_to_cache(m=m, n=n, k=k, batch=batch, **bmm_kwargs)
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
@@ -426,6 +544,7 @@ def main():
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+    bmm_jobs = [j for j in all_jobs if j["kind"] == "bmm"]
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
@@ -434,6 +553,7 @@ def main():
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  BMM jobs:         {len(bmm_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
     print("  Compile arch:     (from cu_num)")
     print(f"  Cache dir:        {cache_dir}")
@@ -442,10 +562,10 @@ def main():
 
     total_t0 = time.time()
 
-    # HGEMM and preshuffle kernels are independent compiles, so they share
-    # one pool for maximum fan-out instead of two serial passes.
-    print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle) ---")
-    results = run_jobs_parallel(compile_one_config, hgemm_jobs + preshuffle_jobs)
+    print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle + bmm) ---")
+    results = run_jobs_parallel(
+        compile_one_config, hgemm_jobs + preshuffle_jobs + bmm_jobs
+    )
 
     total_elapsed = time.time() - total_t0
 

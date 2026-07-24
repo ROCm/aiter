@@ -68,7 +68,7 @@ def mp_lock(
             return ret
         # Could not acquire: another process holds the lock. Wait for it.
         # wait() returns True if the holder released normally (work done),
-        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
         if baton.wait():
             if WaitFunc is not None:
@@ -120,6 +120,11 @@ AITER_CONFIG_GROUPED_FMOE = os.getenv(
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM = os.getenv(
+    "AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_bmm.csv",
 )
 
 AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
@@ -189,6 +194,14 @@ class AITER_CONFIG(object):
             "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
             AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
             "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM",
+            AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM,
+            "a8w8_blockscale_bpreshuffle_tuned_bmm",
         )
 
     @property
