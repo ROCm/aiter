@@ -143,6 +143,7 @@ def generate_data(
     num_blocks=32768,
     block_size=32,
     head_size=64,
+    v_head_size=None,
     num_heads=(16, 2),
     sliding_window=None,
     q_dtype=torch.bfloat16,
@@ -161,6 +162,8 @@ def generate_data(
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
+    if v_head_size is None:
+        v_head_size = head_size
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
     if sliding_window is not None and sliding_window > 0:
@@ -203,7 +206,14 @@ def generate_data(
         dtype=torch.float32,
         device=device,
     )
-    value_cache = torch.randn_like(key_cache)
+    value_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        v_head_size,
+        dtype=torch.float32,
+        device=device,
+    )
     if kv_dtype == torch.uint8:
         # NVFP4 KV cache: kernel consumes packed+shuffled cache, reference uses e4m3.
         key_cache_orig = key_cache.to(e4m3_dtype)
@@ -236,7 +246,7 @@ def generate_data(
     sinks = torch.randn(num_query_heads, dtype=torch.float32, device=device)
 
     output = torch.empty(
-        sum(query_lens), num_query_heads, head_size, dtype=out_dtype, device=device
+        sum(query_lens), num_query_heads, v_head_size, dtype=out_dtype, device=device
     )
 
     # ---- descales / output scale ----
@@ -305,6 +315,7 @@ def ref_paged_attn(
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
+    v_head_size = value_cache.shape[-1]
     outputs: list[torch.Tensor] = []
     start_idx = 0
     query = query.to(torch.float32)
@@ -327,7 +338,7 @@ def ref_paged_attn(
 
         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
         k = k[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+        v = value_cache[block_indices].view(-1, num_kv_heads, v_head_size)
         v = v[:kv_len]
 
         if q.shape[1] != k.shape[1]:
@@ -706,3 +717,115 @@ def test_triton_unified_attn(
         torch.testing.assert_close(
             output, ref_output, atol=atol, rtol=rtol
         ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(256, 256)],
+        [(1, 137), (5, 1024), (1, 19)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
+@pytest.mark.parametrize(
+    "head_size, v_head_size",
+    [
+        # MiMo decode: qk head wider than the value head
+        (192, 128),
+        # symmetric, must stay identical to the single-mask path
+        (128, 128),
+        # value head wider than qk, the reverse ordering
+        (128, 192),
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+@torch.inference_mode()
+def test_triton_unified_attn_asym_head(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    v_head_size: int,
+    block_size: int,
+) -> None:
+    torch.manual_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        block_size=block_size,
+        head_size=head_size,
+        v_head_size=v_head_size,
+        num_heads=num_heads,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sinks,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg=f"unified_attn asym head qk={head_size} v={v_head_size}",
+        )
+        <= tol_err_ratio
+    )
