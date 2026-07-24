@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: I001, RUF100
 
 import torch
 import os
@@ -116,6 +117,7 @@ else:
     from .ops.topk import *  # noqa: F403,E402
     from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402
     from .ops.mha import *  # noqa: F403,E402
+    from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *  # noqa: F403,E402
     from .ops.trans_ragged_layout import *  # noqa: F403,E402
     from .ops.sample import *  # noqa: F403,E402
