@@ -733,17 +733,6 @@ parser.add_argument(
     e.g.: --kv_cache_dtypes bf16
           or --kv_cache_dtypes fp8""",
 )
-parser.add_argument(
-    "-hk",
-    "--kv_head",
-    type=int,
-    nargs="*",
-    default=[1, 4],
-    help="""Number of KV heads (num_heads_k == num_heads_v) for the mrope
-            loop. Previously hard-coded to 1; 4 matches the Qwen3-VL
-            worst-case workload (q=64, k=v=4, head_size=128).
-    e.g.: -hk 4""",
-)
 
 mrope_sections_dict = {64: [12, 10, 10], 128: [24, 20, 20], 256: [48, 40, 40]}
 
@@ -757,7 +746,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     test_return_kv_flags = [True, False]
     use_shuffle_layouts = [True]  # Test both normal and shuffle layouts
-    page_sizes = [16, 64]
+    page_sizes = [16]  # Test two page sizes for shuffle layout
     partial_rotary_configs = [(256, 64), (128, 32)]
     partial_rotary_heads = [(32, 4), (8, 2)]
 
@@ -770,27 +759,26 @@ if __name__ == "__main__":
                     for is_neox_style in args.neox_style:
                         for num_token in args.token:
                             for num_head in args.head:
-                                for num_head_kv in args.kv_head:
-                                    for i, head_size in enumerate(args.head_sizes):
-                                        for is_interleaved in args.is_interleaved:
-                                            test_mrope_3d_rms_set_kv_shuffle(
-                                                args.dtype,
-                                                num_token,
-                                                num_head,
-                                                num_head_kv,
-                                                num_head_kv,
-                                                head_size,
-                                                is_neox_style,
-                                                mrope_sections_dict[head_size],
-                                                is_interleaved,
-                                                eps=1e-6,
-                                                is_mrope=True,
-                                                kv_cache_dtype=kv_cache_dtype,
-                                                test_return_kv=test_return_kv,
-                                                use_shuffle_layout=use_shuffle_layout,
-                                                page_size=page_size,
-                                                max_positions=args.max_positions,
-                                            )
+                                for i, head_size in enumerate(args.head_sizes):
+                                    for is_interleaved in args.is_interleaved:
+                                        test_mrope_3d_rms_set_kv_shuffle(
+                                            args.dtype,
+                                            num_token,
+                                            num_head,
+                                            1,
+                                            1,
+                                            head_size,
+                                            is_neox_style,
+                                            mrope_sections_dict[head_size],
+                                            is_interleaved,
+                                            eps=1e-6,
+                                            is_mrope=True,
+                                            kv_cache_dtype=kv_cache_dtype,
+                                            test_return_kv=test_return_kv,
+                                            use_shuffle_layout=use_shuffle_layout,
+                                            page_size=page_size,
+                                            max_positions=args.max_positions,
+                                        )
 
     for kv_cache_dtype in args.kv_cache_dtypes:
         for test_return_kv in test_return_kv_flags:

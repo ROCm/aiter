@@ -41,7 +41,7 @@ if is_flydsl_available():
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
-    from .kernels.qk_norm_mrope_cache_quant_shuffle import (
+    from .kernels.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle import (
         flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
     )
     from .kernels.pa_mqa_logits_fp4 import (
