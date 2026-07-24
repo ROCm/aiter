@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import math
 import os
 import re
 import statistics
@@ -344,7 +345,7 @@ def main() -> None:
             cells = []
             for kernel in args.kernels:
                 v, s = results[(kernel, k, L)][0], results[(kernel, k, L)][1]
-                cells.append("na" if v != v else f"{v:.2f}±{s:.2f}")
+                cells.append("na" if math.isnan(v) else f"{v:.2f}±{s:.2f}")
             print(f"| {k} | {args.num_rows} | {L} | " + " | ".join(cells) + " |")
 
 
