@@ -19,8 +19,6 @@ Variant:
                       VGPRs in lane16 layout.
 """
 
-from typing import Optional
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -176,7 +174,7 @@ def compile_gemm_a8w8_blockscale(
     scale_block_k: int = 128,
     scale_block_n: int = 128,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 0,
     out_dtype: str = "bf16",
     variant: str = "compute_bound",
