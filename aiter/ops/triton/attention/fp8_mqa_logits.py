@@ -77,6 +77,84 @@ def _gfx942_tile_fits_lds(
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
+# Runtime autotune for the gfx942 non-gluon indexer tile. Candidates are
+# pre-pruned by a KV-tile LDS estimate at occupancy=1, then each is tried
+# under a guarded probe/benchmark: any tile that fails to compile (e.g. an
+# older Triton that spills Q/scores to LDS and overflows 64KB) is skipped,
+# never fatal, and we fall back through smaller tiles down to (64,1) -- the
+# config #3257 validated as crash-safe for the DSv4 indexer on MI300X.
+# Among the tiles that compile we keep the fastest, cached per (head_size,
+# seq_len bucket). Replaces the static occupancy=2 gate: no hard-coded tile
+# -- long prefill keeps (128,2); short/occupancy-bound shapes pick a smaller
+# tile when it actually benchmarks faster.
+_GFX942_MQA_TILE_CANDS = [(128, 2), (128, 1), (64, 2), (64, 1)]
+_gfx942_mqa_tile_cache = {}
+
+
+def _mqa_seq_bucket(seq_len: int) -> int:
+    for b in (1024, 4096, 16384, 65536):
+        if seq_len <= b:
+            return b
+    return 1 << 20
+
+
+def _probe_ok(launch, bk, ns) -> bool:
+    # Compile + run once; catches an LDS-overflow JIT abort (e.g. an older
+    # Triton that spills Q/scores to LDS) so a too-big tile is rejected, not fatal.
+    try:
+        launch(bk, ns)
+        return True
+    except Exception:
+        return False
+
+
+def _autotune_gfx942_mqa_tile(head_size: int, seq_len: int, launch):
+    key = (head_size, _mqa_seq_bucket(seq_len))
+    cached = _gfx942_mqa_tile_cache.get(key)
+    if cached is not None:
+        return cached
+    # Pre-prune by the KV-tile LDS estimate at occupancy=1 (single-workgroup
+    # upper bound); the guarded probe/bench below is what actually guarantees
+    # the chosen tile compiles.
+    cands = [
+        (bk, ns)
+        for (bk, ns) in _GFX942_MQA_TILE_CANDS
+        if _gfx942_tile_fits_lds(bk, head_size, ns, occupancy=1)
+    ]
+    if not cands:
+        cands = [(64, 1)]
+    try:
+        from triton.testing import do_bench
+    except Exception:
+        do_bench = None
+
+    best = None
+    if do_bench is not None:
+        best_t = float("inf")
+        for bk, ns in cands:
+            try:
+                t = do_bench(lambda bk=bk, ns=ns: launch(bk, ns), warmup=3, rep=8)
+            except Exception:
+                continue  # won't compile/fit on this Triton -> skip (never fatal)
+            if t < best_t:
+                best_t, best = t, (bk, ns)
+    else:
+        # No benchmarking: probe-compile in preference order, take the first
+        # tile that actually runs (keeps fast (128,2) when it compiles).
+        for bk, ns in cands:
+            if _probe_ok(launch, bk, ns):
+                best = (bk, ns)
+                break
+
+    if best is None:
+        # Every candidate failed to compile (e.g. an old Triton on a large
+        # head_size). Fall back to the smallest tile -- the (64, 1) config
+        # #3257 validated as crash-safe for the DSv4 indexer on MI300X.
+        best = (64, 1)
+    _gfx942_mqa_tile_cache[key] = best
+    return best
+
+
 def fp8_mqa_logits(
     Q,
     KV,
@@ -132,18 +210,6 @@ def fp8_mqa_logits(
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
     if not use_gluon:
-        # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
-        # the default (128, 2) tile would not fit two co-resident workgroups
-        # on a CU; keep the default tile otherwise.
-        if arch == "gfx942" and not _gfx942_tile_fits_lds(
-            block_kv=128, head_size=head_size, num_stages=2, occupancy=2
-        ):
-            block_kv = 64
-            num_stages = 1
-        else:
-            block_kv = 128
-            num_stages = 2
-
         # heuristic for MFMA instruction shape
         matrix_instr_nonkdim = 32
         if seq_len <= 1024:
@@ -165,33 +231,44 @@ def fp8_mqa_logits(
         if scale_mul != 1.0:
             kv_scales = kv_scales.to(torch.float32) * scale_mul
 
-        _fp8_mqa_logits_kernel[(seq_len,)](
-            Q_ptr=Q,
-            KV_ptr=KV,
-            kv_scales_ptr=kv_scales,
-            weights_ptr=weights,
-            cu_start_ptr=cu_starts,
-            cu_end_ptr=cu_ends,
-            logits_ptr=logits,
-            seq_len=seq_len,
-            seq_len_kv=seq_len_kv,
-            NUM_HEADS=num_heads,
-            HEAD_SIZE=head_size,
-            stride_q_s=stride_q_s,
-            stride_q_h=stride_q_h,
-            stride_q_d=stride_q_d,
-            stride_kv_s=stride_kv_s,
-            stride_kv_d=stride_kv_d,
-            stride_w_s=stride_w_s,
-            stride_w_h=stride_w_h,
-            stride_logits_s=stride_logits_s,
-            stride_logits_k=stride_logits_k,
-            BLOCK_KV=block_kv,
-            num_warps=4,
-            num_stages=num_stages,
-            waves_per_eu=2,
-            matrix_instr_nonkdim=matrix_instr_nonkdim,
-        )
+        def _launch(block_kv, num_stages):
+            _fp8_mqa_logits_kernel[(seq_len,)](
+                Q_ptr=Q,
+                KV_ptr=KV,
+                kv_scales_ptr=kv_scales,
+                weights_ptr=weights,
+                cu_start_ptr=cu_starts,
+                cu_end_ptr=cu_ends,
+                logits_ptr=logits,
+                seq_len=seq_len,
+                seq_len_kv=seq_len_kv,
+                NUM_HEADS=num_heads,
+                HEAD_SIZE=head_size,
+                stride_q_s=stride_q_s,
+                stride_q_h=stride_q_h,
+                stride_q_d=stride_q_d,
+                stride_kv_s=stride_kv_s,
+                stride_kv_d=stride_kv_d,
+                stride_w_s=stride_w_s,
+                stride_w_h=stride_w_h,
+                stride_logits_s=stride_logits_s,
+                stride_logits_k=stride_logits_k,
+                BLOCK_KV=block_kv,
+                num_warps=4,
+                num_stages=num_stages,
+                waves_per_eu=2,
+                matrix_instr_nonkdim=matrix_instr_nonkdim,
+            )
+
+        # Runtime-autotuned tile on gfx942: pre-pruned by the occupancy=1 LDS
+        # estimate, then guarded-probed so a too-big tile is skipped (never fatal).
+        if arch == "gfx942":
+            block_kv, num_stages = _autotune_gfx942_mqa_tile(
+                head_size, seq_len, _launch
+            )
+        else:
+            block_kv, num_stages = 128, 2
+        _launch(block_kv, num_stages)
     else:
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
