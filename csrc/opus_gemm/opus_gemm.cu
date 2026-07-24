@@ -67,7 +67,8 @@ OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
 #endif
 }
 
-// a16w16 arch routers: switch on opus_get_gfx_arch() to per-arch dispatch.
+// a16w16 arch routers (gfx950/gfx942 only; gfx1250 uses its own dispatch with workspace).
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
 template <typename CDataType>
 OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, bool has_bias = false)
 {
@@ -81,19 +82,14 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, boo
     case OpusGfxArch::Gfx942:
       return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch, has_bias);
 #endif
-#ifdef OPUS_BUILD_HAS_GFX1250
-    case OpusGfxArch::Gfx1250:
-      return opus_dispatch_a16w16_gfx1250<CDataType>(M, N, K, batch, has_bias);
-#endif
     default:
     {
       const auto &info = opus_get_arch_info();
       AITER_CHECK(false,
-                  "opus_gemm: a16w16 dispatch is only implemented for gfx950 today; "
+                  "opus_gemm: a16w16 dispatch via this path is only implemented for "
+                  "gfx950/gfx942; gfx1250 uses a separate dispatch with workspace. "
                   "current device ", info.dev,
-                  " has gcnArchName='", info.name,
-                  "'. Other archs (gfx940 / gfx942 / gfx1100 / ...) will be added "
-                  "as more pipelines land.");
+                  " has gcnArchName='", info.name, "'");
     }
   }
 }
@@ -112,21 +108,18 @@ opus_a16w16_tune_dispatch(int id)
     case OpusGfxArch::Gfx942:
       return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
 #endif
-#ifdef OPUS_BUILD_HAS_GFX1250
-    case OpusGfxArch::Gfx1250:
-      return opus_a16w16_tune_dispatch_gfx1250<CDataType>(id);
-#endif
     default:
     {
       const auto &info = opus_get_arch_info();
       AITER_CHECK(false,
-                  "opus_gemm_a16w16_tune: dispatch is only implemented for gfx950 today; "
+                  "opus_gemm_a16w16_tune: dispatch is only implemented for gfx950/gfx942 "
+                  "via this path; gfx1250 uses a separate dispatch with workspace. "
                   "current device ", info.dev,
-                  " has gcnArchName='", info.name,
-                  "'. Other archs will be added as more pipelines land.");
+                  " has gcnArchName='", info.name, "'");
     }
   }
 }
+#endif // OPUS_BUILD_HAS_GFX950 || OPUS_BUILD_HAS_GFX942
 
 // ── opus_gemm() — top-level a16w16 / a8w8 entry ─────────────────────────────
 
@@ -189,17 +182,51 @@ void opus_gemm(
     // Tuned-lookup-then-heuristic dispatch. splitK=0 = "launcher decides".
     int batch = XQ.size(0);
     const bool has_bias = bias.has_value();
-    if (Y.dtype() == AITER_DTYPE_bf16)
+#ifdef OPUS_BUILD_HAS_GFX1250
+    if (opus_get_gfx_arch() == OpusGfxArch::Gfx1250)
     {
-      opus_dispatch_a16w16<bf16_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
-    }
-    else if (Y.dtype() == AITER_DTYPE_fp32)
-    {
-      opus_dispatch_a16w16<fp32_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
+      // gfx1250: all kids are split-K and need a workspace. The heuristic
+      // dispatch returns a 6-arg function pointer (with workspace). We allocate
+      // a temporary workspace here for the auto/heuristic path. For the tuned
+      // path, Python allocates via torch.empty.
+      auto fn = opus_dispatch_a16w16_gfx1250<fp32_t>(M, N, K, batch, has_bias);
+      int padded_M = ((M + 63) / 64) * 64;
+      int padded_N = ((N + 63) / 64) * 64;
+      size_t ws_elems = (size_t)16 * padded_M * padded_N;
+      size_t ws_bytes = ws_elems * sizeof(bf16_t);
+      void* ws_ptr = nullptr;
+      HIP_CALL(hipMalloc(&ws_ptr, ws_bytes));
+      aiter_tensor_t ws_tensor{};
+      ws_tensor.ptr = ws_ptr;
+      ws_tensor.numel_ = ws_elems;
+      ws_tensor.ndim = 1;
+      ws_tensor.shape[0] = (int64_t)ws_elems;
+      ws_tensor.strides[0] = 1;
+      ws_tensor.dtype_ = AITER_DTYPE_bf16;
+      ws_tensor.device_id = 0;
+      fn(XQ, WQ, Y, ws_tensor, bias, 0);
+      HIP_CALL(hipDeviceSynchronize());
+      HIP_CALL(hipFree(ws_ptr));
     }
     else
+#endif
     {
-      AITER_CHECK(false, "opus_gemm a16w16: unsupported output dtype, expected bf16 or fp32");
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
+      if (Y.dtype() == AITER_DTYPE_bf16)
+      {
+        opus_dispatch_a16w16<bf16_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
+      }
+      else if (Y.dtype() == AITER_DTYPE_fp32)
+      {
+        opus_dispatch_a16w16<fp32_t>(M, N, K, batch, has_bias)(XQ, WQ, Y, bias, 0);
+      }
+      else
+      {
+        AITER_CHECK(false, "opus_gemm a16w16: unsupported output dtype, expected bf16 or fp32");
+      }
+#else
+      AITER_CHECK(false, "opus_gemm: no a16w16 dispatch available for this arch");
+#endif
     }
   }
   else
@@ -215,9 +242,13 @@ static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
 static constexpr int OPUS_GFX942_KID_OFFSET = 10000;
 static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
-// gfx1250 cluster/TDM split-K (fp32 workspace + reduce) kids: [20000, 21000).
+// gfx1250 split-K kids: [20000, 20100) plain cluster/TDM (fp32 workspace +
+// reduce), [20100, 21000) clusterlaunch multicast ws, [21000, 30000) FUSED
+// single-kernel in-cluster reduce (no reduce kernel; the fuse family sweeps
+// tile x split_k x n_cluster x ws so it spans a wide band). All use the
+// <fp32_t> lookup ABI and fold bias; the split-K band spans [20000, 30000).
 static constexpr int OPUS_GFX1250_SPLITK_KID_MIN = 20000;
-static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 21000;
+static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 30000;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
@@ -296,6 +327,7 @@ void opus_gemm_a16w16_tune(
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
     std::optional<aiter_tensor_t> bias,
+    std::optional<aiter_tensor_t> workspace,
     int kernelId,
     int splitK)
 {
@@ -324,15 +356,40 @@ void opus_gemm_a16w16_tune(
                   || Y.dtype() == AITER_DTYPE_fp32,
                   "opus_gemm_a16w16_tune splitk kid requires bf16 or fp32 Y "
                   "(reduce kernel writes the correct dtype)");
-      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#ifdef OPUS_BUILD_HAS_GFX1250
+      if (opus_kid_is_gfx1250_splitk(kernelId))
+      {
+        AITER_CHECK(workspace.has_value(),
+                    "gfx1250 split-K kids require a workspace tensor "
+                    "(allocated via torch.empty on the Python side)");
+        auto& ws = workspace.value();
+        opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kernelId)(XQ, WQ, Y, ws, bias, splitK);
+      }
+      else
+#endif
+      {
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
+        opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#else
+        AITER_CHECK(false, "opus_gemm_a16w16_tune: non-gfx1250 splitk dispatch unavailable");
+#endif
+      }
     }
     else if (Y.dtype() == AITER_DTYPE_bf16)
     {
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
       opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#else
+      AITER_CHECK(false, "opus_gemm_a16w16_tune: non-splitk bf16 dispatch unavailable for this arch");
+#endif
     }
     else if (Y.dtype() == AITER_DTYPE_fp32)
     {
+#if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
       opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
+#else
+      AITER_CHECK(false, "opus_gemm_a16w16_tune: non-splitk fp32 dispatch unavailable for this arch");
+#endif
     }
     else
     {
@@ -394,6 +451,11 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_tune(
 // must pre-register the handle via opus_gemm_workspace_init(), otherwise the
 // lookup throws (cleaner than the prior SIGABRT). The framework calls
 // opus_gemm_workspace_init() once per TBO stream eagerly before capture.
+//
+// Teardown: entries are held for the process lifetime unless explicitly freed
+// via opus_gemm_workspace_release() (current stream) or
+// opus_gemm_workspace_release_all() (all streams). Both run in eager mode and
+// synchronize before freeing.
 namespace {
 struct SplitkWsRegistry {
   std::mutex mu;
@@ -423,11 +485,23 @@ opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t s, bool allow_create)
               "expected gemm) before HIP graph capture.");
   auto* owner = new SplitkWsRegistry::Owner{};
   opus_splitk_ws_handle* h = nullptr;
+#ifdef OPUS_BUILD_HAS_GFX950
+  // gfx950 launchers feed the host handle STRAIGHT to the kernel, which
+  // dereferences ptr/bytes on the device -- so it must be device-visible
+  // pinned/coherent host memory.
   HIP_CALL(hipHostMalloc(reinterpret_cast<void**>(&h),
                          sizeof(opus_splitk_ws_handle),
                          hipHostMallocCoherent));
   h->ptr   = nullptr;
   h->bytes = 0;
+#else
+  // gfx942/gfx1250 read a device mirror (opus_splitk_ws_sync_to_device); the
+  // device never dereferences this host handle. So plain host memory suffices
+  // and we avoid pinned/coherent allocations entirely -- the OS reclaims plain
+  // host memory at process exit with no dependency on HIP's pinned-memory
+  // teardown (which can wedge fragile drivers and hang a subsequent process).
+  h = new opus_splitk_ws_handle{nullptr, 0};
+#endif
   owner->host   = h;
   owner->device = nullptr;
   R.map[s]      = owner;
@@ -482,6 +556,75 @@ void opus_gemm_workspace_init()
               "opus_gemm_workspace_init must be called in eager mode "
               "(not inside HIP graph capture).");
   (void)opus_splitk_ws_get(s, /*allow_create=*/true);
+}
+
+// Free everything a single Owner holds: the GPU workspace data buffer (owned via
+// the host handle's `ptr`), the host coherent handle itself, and the device
+// mirror. Caller must hold the registry mutex and must have synchronized any
+// in-flight work that could still reference the buffer.
+static void opus_splitk_ws_free_owner_locked(SplitkWsRegistry::Owner* owner)
+{
+  if (owner == nullptr) return;
+  if (owner->host != nullptr)
+  {
+    if (owner->host->ptr != nullptr)
+    {
+      HIP_CALL(hipFree(owner->host->ptr));
+      owner->host->ptr   = nullptr;
+      owner->host->bytes = 0;
+    }
+#ifdef OPUS_BUILD_HAS_GFX950
+    HIP_CALL(hipHostFree(owner->host));  // paired with hipHostMalloc above
+#else
+    delete owner->host;  // paired with plain `new` for the gfx942/gfx1250 path
+#endif
+    owner->host = nullptr;
+  }
+  if (owner->device != nullptr)
+  {
+    HIP_CALL(hipFree(owner->device));
+    owner->device = nullptr;
+  }
+  delete owner;
+}
+
+// Release the splitk workspace (buffer + handles + registry entry) for the
+// CURRENT stream. Safe to call when the stream was never registered (no-op).
+// Must run in eager mode; frees are stream-capture-illegal.
+void opus_gemm_workspace_release()
+{
+  hipStream_t s = aiter::getCurrentHIPStream();
+  hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+  HIP_CALL(hipStreamIsCapturing(s, &cap));
+  AITER_CHECK(cap == hipStreamCaptureStatusNone,
+              "opus_gemm_workspace_release must be called in eager mode "
+              "(not inside HIP graph capture).");
+  // Drain the stream so no in-flight kernel references the buffer being freed.
+  HIP_CALL(hipStreamSynchronize(s));
+  auto& R = splitk_ws_registry();
+  std::lock_guard<std::mutex> g(R.mu);
+  auto it = R.map.find(s);
+  if (it == R.map.end()) return;
+  opus_splitk_ws_free_owner_locked(it->second);
+  R.map.erase(it);
+}
+
+// Release the splitk workspace for ALL registered streams and clear the
+// registry. Intended for explicit teardown (e.g. before a framework tears down
+// its stream pool). Must run in eager mode.
+void opus_gemm_workspace_release_all()
+{
+  auto& R = splitk_ws_registry();
+  std::lock_guard<std::mutex> g(R.mu);
+  if (R.map.empty()) return;
+  // Drain all device work before freeing any buffer (buffers belong to many
+  // streams; a single device sync covers them all).
+  HIP_CALL(hipDeviceSynchronize());
+  for (auto& kv : R.map)
+  {
+    opus_splitk_ws_free_owner_locked(kv.second);
+  }
+  R.map.clear();
 }
 
 #endif // !__HIP_DEVICE_COMPILE__

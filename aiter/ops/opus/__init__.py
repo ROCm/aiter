@@ -41,6 +41,8 @@ if _arch_ok:
         opus_gemm_a16w16_tune,
         gemm_a16w16_opus,
         opus_gemm_workspace_init,
+        opus_gemm_workspace_release,
+        opus_gemm_workspace_release_all,
     )
 
     def opus_gemm_a8w8_blockscale_bpreshuffle_tune(*args, **kwargs):
@@ -59,6 +61,12 @@ else:
         "opus_gemm_a8w8_blockscale_bpreshuffle_tune"
     )
     opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")
+    opus_gemm_workspace_release = _make_unsupported_arch_stub(
+        "opus_gemm_workspace_release"
+    )
+    opus_gemm_workspace_release_all = _make_unsupported_arch_stub(
+        "opus_gemm_workspace_release_all"
+    )
 
 
 __all__ = [
@@ -66,4 +74,6 @@ __all__ = [
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "gemm_a16w16_opus",
     "opus_gemm_workspace_init",
+    "opus_gemm_workspace_release",
+    "opus_gemm_workspace_release_all",
 ]

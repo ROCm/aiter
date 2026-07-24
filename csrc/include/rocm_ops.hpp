@@ -294,9 +294,10 @@ namespace py = pybind11;
           py::arg("XQ"),                      \
           py::arg("WQ"),                      \
           py::arg("Y"),                       \
-          py::arg("bias")     = std::nullopt, \
-          py::arg("kernelId") = 0,            \
-          py::arg("splitK")   = 0);
+          py::arg("bias")      = std::nullopt, \
+          py::arg("workspace") = std::nullopt, \
+          py::arg("kernelId")  = 0,            \
+          py::arg("splitK")    = 0);
 
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
@@ -316,6 +317,18 @@ namespace py = pybind11;
           "CUDA stream. Call once per stream eagerly (outside HIP "  \
           "graph capture) before capturing graphs that include "     \
           "opus_gemm splitk kernels under TBO.");
+
+#define OPUS_GEMM_WORKSPACE_RELEASE_PYBIND                             \
+    m.def("opus_gemm_workspace_release",                              \
+          &opus_gemm_workspace_release,                               \
+          "Free the splitk workspace (buffer + handles + registry "  \
+          "entry) for the current CUDA stream. Eager mode only; "    \
+          "no-op if the stream was never registered.");               \
+    m.def("opus_gemm_workspace_release_all",                          \
+          &opus_gemm_workspace_release_all,                           \
+          "Free the splitk workspace for all registered streams and " \
+          "clear the registry. Eager mode only. Use for explicit "   \
+          "teardown before a framework reclaims its stream pool.");
 
 #define OPUS_MOE_PYBIND                                                            \
     m.def("opus_moe_stage2_a8w4_decode_fwd",                                        \
