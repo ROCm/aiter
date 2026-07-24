@@ -6,6 +6,7 @@ Usage:
   pytest -xvs op_tests/test_mla_v4_nm.py
 """
 
+import functools
 import os
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import sys
 import numpy as np
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
@@ -46,6 +49,602 @@ needs_gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or not _on_gfx950(),
     reason="v4 nm shader is shipped only for gfx950; requires GPU",
 )
+
+
+# ===========================================================================
+# Vendored BF16 Triton decode reference.
+#
+# Verbatim copy of the split-K sparse paged-decode kernels from ATOM
+# (atom/model_ops/v4_kernels/paged_decode.py) so this test is fully
+# self-contained — no cross-repo import. Used purely as an independent
+# cross-check for the bf16 math path (split-K Triton vs this file's pure-torch
+# golden). The only local change vs the source is `_cu_count`, which queries
+# the CU count via torch (dropping ATOM's aiter device-info import).
+#
+# Contract (from the source docstring):
+#   q:          [T, H, D] bf16/fp16
+#   unified_kv: [total_pages, D] (page_size=1), same dtype as q
+#   kv_indices: [total_indices] int32, per-token slot lists, flat
+#   kv_indptr:  [T+1] int32, prefix sum of per-token kv_len
+#   attn_sink:  [H] fp32, per-head softmax-denom bias, folded as a virtual K
+# Numerics: online-softmax in log2 domain (exp2, qk_scale = softmax_scale*LOG2E).
+# ===========================================================================
+_TRITON_LOG2E = 1.4426950408889634  # log2(e); folds nat-log sink into log2 domain
+_TRITON_MAX_KV_SPLITS = 64  # hard cap on kv_splits (see _kv_splits_heuristic)
+# GROUP_SIZE for the vendored kernels' (unused) fp8 dequant path. Kept only so
+# the constexpr launch args match the source; the bf16 path never reads scales.
+_FP8_GROUP_SIZE = 64
+
+
+@functools.lru_cache(maxsize=1)
+def _cu_count() -> int:
+    """Compute-unit count of the active GPU (queried once, cached)."""
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+def _kernel_config(block_h: int):
+    """Pick (BLOCK_K, num_warps, num_stages) without autotune. Depends only on
+    block_h (a function of H) so it's CUDAGraph-capture stable."""
+    block_k = 16
+    num_warps = 4 if block_h <= 32 else 8
+    num_stages = 2
+    return block_k, num_warps, num_stages
+
+
+def _prev_pow2(n: int) -> int:
+    """Largest power of two <= n. For n < 1 returns 1."""
+    if n < 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
+def _kv_splits_heuristic(
+    T: int,
+    H: int,
+    block_h: int,
+    num_cu=None,
+    target_wg_per_cu: float = 2.0,
+    max_kv_splits: int = _TRITON_MAX_KV_SPLITS,
+) -> int:
+    """Pick KV_SPLITS to fill the GPU. Depends only on capture-time scalars
+    (T, H, block_h) — never reads tensor values/shapes."""
+    if num_cu is None:
+        num_cu = _cu_count()
+    target_wg = max(1, int(target_wg_per_cu * num_cu))
+    head_blocks = max(1, (H + block_h - 1) // block_h)
+    base_ctas = max(1, T * head_blocks)
+    if base_ctas >= target_wg:
+        return 1
+    splits_to_fill = max(1, target_wg // base_ctas)
+    return _prev_pow2(min(splits_to_fill, max_kv_splits))
+
+
+@triton.jit
+def _paged_decode_fused_kernel(
+    q_ptr,  # [N, H, D]
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    kv_indices_ptr,  # [total_indices] int32
+    kv_indptr_ptr,  # [N+1] int32
+    attn_sink_ptr,  # [H]
+    out_ptr,  # [N, H, D]
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_n,
+    kv_stride_d,
+    ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    qk_scale,  # = softmax_scale * LOG2E
+    log2e,  # = LOG2E, to lift natural-log sink into log2 domain
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    QUANT_KV: tl.constexpr,  # True -> dequant fp8 KV via kv_scales
+    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
+    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE (constexpr; D % GROUP_SIZE == 0)
+):
+    """Single-pass online-softmax with sink folded inline (kv_splits == 1)."""
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    if QUANT_KV:
+        g_idx_per_d = d_offs // GROUP_SIZE
+    for j in tl.range(0, num_tiles, num_stages=3):
+        k_start = j * BLOCK_K
+        k_pos = k_start + k_offs
+        valid = k_pos < kv_len
+        slot = tl.load(
+            kv_indices_ptr + kv_start + k_pos,
+            mask=valid,
+            other=0,
+        )
+
+        kv_raw = tl.load(
+            unified_kv_ptr
+            + slot[:, None] * kv_stride_n
+            + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        if QUANT_KV:
+            scales_full = tl.load(
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(q.dtype)
+            kv = kv_raw.to(q.dtype) * scales_full
+        else:
+            kv = kv_raw
+
+        scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+        l_i = l_new
+
+    # Fold attn_sink as a virtual K of weight 1 (natural-log bias -> log2 domain).
+    sink_raw = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
+        tl.float32
+    )
+    sink = sink_raw * log2e
+    m_final = tl.maximum(m_i, sink)
+    alpha_kv = tl.exp2(m_i - m_final)
+    alpha_sink = tl.exp2(sink - m_final)
+    l_final = l_i * alpha_kv + alpha_sink
+
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(
+        l_final[:, None] > 0.0, (acc * alpha_kv[:, None]) / denom[:, None], 0.0
+    )
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+@triton.jit
+def _paged_decode_split_kernel(
+    q_ptr,  # [N, H, D]
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
+    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    kv_indices_ptr,  # [total_indices] int32
+    kv_indptr_ptr,  # [N+1] int32
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    kv_stride_n,
+    kv_stride_d,
+    ks_stride_n,  # row stride of kv_scales (groups are contiguous, stride=1)
+    mp_stride_t,
+    mp_stride_k,
+    mp_stride_h,
+    lp_stride_t,
+    lp_stride_k,
+    lp_stride_h,
+    ap_stride_t,
+    ap_stride_k,
+    ap_stride_h,
+    ap_stride_d,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    qk_scale,  # = softmax_scale * LOG2E
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    QUANT_KV: tl.constexpr,  # True -> dequant fp8 KV via kv_scales
+    GROUP_SIZE: tl.constexpr,  # scale block width along D (e.g. 64)
+    NUM_GROUPS: tl.constexpr,  # D // GROUP_SIZE
+):
+    """3D split-K + exp2-softmax. Emits pre-sink (m, l, acc) fp32 partials."""
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+
+    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+        return
+    num_tiles = tl.cdiv(kv_len, BLOCK_K)
+    tile_start = pid_k * tiles_per_segment
+    tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    k_offs = tl.arange(0, BLOCK_K)
+    if QUANT_KV:
+        g_idx_per_d = d_offs // GROUP_SIZE
+    for j in tl.range(tile_start, tile_end, num_stages=3):
+        k_start = j * BLOCK_K
+        k_pos = k_start + k_offs
+        valid = k_pos < kv_len
+        slot = tl.load(
+            kv_indices_ptr + kv_start + k_pos,
+            mask=valid,
+            other=0,
+        )
+
+        kv_raw = tl.load(
+            unified_kv_ptr
+            + slot[:, None] * kv_stride_n
+            + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        if QUANT_KV:
+            scales_full = tl.load(
+                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(q.dtype)
+            kv = kv_raw.to(q.dtype) * scales_full
+        else:
+            kv = kv_raw
+
+        scores = tl.dot(q, tl.trans(kv)) * qk_scale
+        scores = tl.where(valid[None, :], scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+        l_i = l_new
+
+    m_base = t * mp_stride_t + pid_k * mp_stride_k
+    tl.store(m_partial_ptr + m_base + h_offs * mp_stride_h, m_i, mask=h_mask)
+    l_base = t * lp_stride_t + pid_k * lp_stride_k
+    tl.store(l_partial_ptr + l_base + h_offs * lp_stride_h, l_i, mask=h_mask)
+    a_base = t * ap_stride_t + pid_k * ap_stride_k
+    tl.store(
+        acc_partial_ptr
+        + a_base
+        + h_offs[:, None] * ap_stride_h
+        + d_offs[None, :] * ap_stride_d,
+        acc,
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+@triton.jit
+def _paged_decode_reduce_kernel(
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
+    attn_sink_ptr,  # [H]
+    kv_indptr_ptr,  # [N+1] int32
+    out_ptr,  # [N, H, D]
+    mp_stride_t,
+    mp_stride_k,
+    mp_stride_h,
+    lp_stride_t,
+    lp_stride_k,
+    lp_stride_h,
+    ap_stride_t,
+    ap_stride_k,
+    ap_stride_h,
+    ap_stride_d,
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    log2e,  # = LOG2E, used to convert natural-log sink -> log2 domain
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """2D-tile reduce: combine KV_SPLITS partials, fold attn_sink, write out.
+    Grid: (T, H, ceil(D / D_CHUNK))."""
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    dc = tl.program_id(2)
+
+    d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
+    k_offs = tl.arange(0, KV_SPLITS)
+    d_mask = d_offs < D
+
+    neg_large = -3.4028234663852886e38
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    kv_len = kv_end - kv_start
+    if kv_len == 0:
+        out_off = t * out_stride_t + h * out_stride_h + d_offs * out_stride_d
+        tl.store(
+            out_ptr + out_off,
+            tl.zeros([D_CHUNK], dtype=out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+        return
+    tiles_per_segment = tl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
+    act_num_segments = tl.cdiv(kv_len, tl.maximum(tiles_per_segment, 1) * BLOCK_K)
+    segm_mask = k_offs < act_num_segments
+
+    m_p = tl.load(
+        m_partial_ptr + t * mp_stride_t + k_offs * mp_stride_k + h * mp_stride_h,
+        mask=segm_mask,
+        other=neg_large,
+    )
+    l_p = tl.load(
+        l_partial_ptr + t * lp_stride_t + k_offs * lp_stride_k + h * lp_stride_h,
+        mask=segm_mask,
+        other=0.0,
+    )
+    a_p = tl.load(
+        acc_partial_ptr
+        + t * ap_stride_t
+        + k_offs[:, None] * ap_stride_k
+        + h * ap_stride_h
+        + d_offs[None, :] * ap_stride_d,
+        mask=segm_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    m_max = tl.max(m_p, axis=0)
+    alpha_split = tl.exp2(m_p - m_max)
+    l_combined = tl.sum(l_p * alpha_split, axis=0)
+    acc_combined = tl.sum(a_p * alpha_split[:, None], axis=0)
+
+    sink_raw = tl.load(attn_sink_ptr + h).to(tl.float32)
+    sink = sink_raw * log2e
+    m_final = tl.maximum(m_max, sink)
+    alpha_kv = tl.exp2(m_max - m_final)
+    alpha_sink = tl.exp2(sink - m_final)
+    l_final = l_combined * alpha_kv + alpha_sink
+
+    denom = tl.maximum(l_final, 1.0e-30)
+    acc_final = acc_combined * alpha_kv
+    out = tl.where(l_final > 0.0, acc_final / denom, 0.0)
+
+    tl.store(
+        out_ptr + t * out_stride_t + h * out_stride_h + d_offs * out_stride_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=d_mask,
+    )
+
+
+def _sparse_attn_v4_paged_decode_triton(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    block_h: int = None,
+    kv_splits: int = None,
+    block_k: int = None,
+) -> torch.Tensor:
+    """V4 sparse decode Triton implementation: split-K with FUSED fast path,
+    exp2 softmax. bf16/fp16 KV only (the vendored fp8 dequant path is present
+    in the kernels but unused here — kv_scales is never supplied)."""
+    if not q.is_cuda:
+        raise RuntimeError("Triton sparse_attn_v4_paged_decode requires CUDA/HIP")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(f"expects fp16/bf16 q, got {q.dtype}")
+    if unified_kv.dtype != q.dtype:
+        raise RuntimeError(
+            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+        )
+
+    T, H, D = q.shape
+    out = torch.empty_like(q)
+
+    if block_h is None:
+        block_h = triton.next_power_of_2(min(H, 64))
+    else:
+        block_h = triton.next_power_of_2(block_h)
+    block_h = max(block_h, 16)  # AMD MFMA min tile
+
+    n_head_blocks = (H + block_h - 1) // block_h
+    h_padded = n_head_blocks * block_h
+    block_d = triton.next_power_of_2(D)
+
+    if kv_splits is None:
+        kv_splits = _kv_splits_heuristic(T, H, block_h)
+
+    qk_scale = float(softmax_scale) * _TRITON_LOG2E
+    _bk, num_warps, num_stages = _kernel_config(block_h)
+    if block_k is None:
+        block_k = _bk
+
+    # bf16 path: supply a 1-element dummy fp32 kv_scales so the launch signature
+    # stays uniform (QUANT_KV=False elides the dequant code at compile time).
+    kv_scales_arg = q.new_empty(1, dtype=torch.float32)
+    ks_stride_n_arg = 1
+    num_groups_arg = 1
+
+    if kv_splits == 1:
+        grid_fused = (T, n_head_blocks)
+        _paged_decode_fused_kernel[grid_fused](
+            q,
+            unified_kv,
+            kv_scales_arg,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            ks_stride_n_arg,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            qk_scale,
+            _TRITON_LOG2E,
+            H,
+            D,
+            BLOCK_H=block_h,
+            BLOCK_D=block_d,
+            BLOCK_K=block_k,
+            QUANT_KV=False,
+            GROUP_SIZE=_FP8_GROUP_SIZE,
+            NUM_GROUPS=num_groups_arg,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return out
+
+    m_partial = torch.empty(
+        (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+    )
+    l_partial = torch.empty_like(m_partial)
+    acc_partial = torch.empty(
+        (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+    )
+
+    grid_split = (T, n_head_blocks, kv_splits)
+    _paged_decode_split_kernel[grid_split](
+        q,
+        unified_kv,
+        kv_scales_arg,
+        kv_indices,
+        kv_indptr,
+        m_partial,
+        l_partial,
+        acc_partial,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        unified_kv.stride(0),
+        unified_kv.stride(1),
+        ks_stride_n_arg,
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
+        H,
+        D,
+        kv_splits,
+        qk_scale,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        QUANT_KV=False,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        NUM_GROUPS=num_groups_arg,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    base_grid_t_h = T * H
+    target_reduce_wg = 2 * _cu_count()
+    if base_grid_t_h >= target_reduce_wg:
+        d_chunk = block_d
+    else:
+        d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
+        d_chunks_needed = min(d_chunks_needed, block_d // 32)
+        d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
+    grid_reduce = (T, H, (D + d_chunk - 1) // d_chunk)
+    _paged_decode_reduce_kernel[grid_reduce](
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        kv_indptr,
+        out,
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        _TRITON_LOG2E,
+        H,
+        D,
+        kv_splits,
+        BLOCK_D=block_d,
+        D_CHUNK=d_chunk,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -120,13 +719,6 @@ def _build_inputs(
         0, batch * pages_per_seq, dtype=torch.int32, device=device
     )
 
-    kv_last_page_lens = torch.full(
-        (batch,),
-        kv_seq_lens % PAGE_SIZE,
-        dtype=torch.int32,
-        device=device,
-    )
-
     split_indptr = (
         torch.arange(0, batch + 1, dtype=torch.int32, device=device) * num_kv_splits
     )
@@ -163,7 +755,6 @@ def _build_inputs(
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
         split_indptr=split_indptr,
         max_seqlen_q=q_seq_logical,
         sink=sink,
@@ -291,12 +882,19 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
             f"want {want} (0x{want:08x})"
         )
 
-    # Sanity: pointer slots (0..6, 13, 14, 16, 17, 18) must be non-NULL.
+    # Sanity: pointer slots (0..5, 13, 14, 16, 17, 18) must be non-NULL.
     # Slot 18 (ptr_sink) is REQUIRED non-NULL — caller must allocate even
     # when they want "no sink" math (-inf works, but the buffer must exist).
-    for slot_idx in (0, 1, 2, 3, 4, 5, 6, 13, 14, 16, 17, 18):
+    # Slot 6 (ptr_LTL / kv_last_page_lens) is INTENTIONALLY NULL: the param was
+    # removed from the v4 nm ABI (page_size=1 -> kv_seq_len comes from the
+    # token-level kv_indptr). The host hard-sets it to nullptr; the kernel never
+    # loads through it. See the null-check below.
+    for slot_idx in (0, 1, 2, 3, 4, 5, 13, 14, 16, 17, 18):
         ptr = int.from_bytes(slot(slot_idx)[:8], "little")
         assert ptr != 0, f"slot {slot_idx} pointer is NULL"
+    assert (
+        int.from_bytes(slot(6)[:8], "little") == 0
+    ), "slot 6 (ptr_LTL / kv_last_page_lens) must be NULL — removed from v4 nm ABI"
 
     # Slots 19/20 are the valid_split-count export scratch. gfx950 now WIRES
     # them (valid-split-exporting kernels): slot 19 = valid_split_count buffer
@@ -505,13 +1103,72 @@ def _torch_attn_decode_fp8_dequant_ref(
     )
 
 
+def _triton_attn_decode_bf16(
+    q_bf16,  # [total_q, num_heads, D=512] bf16
+    kv_bf16,  # [num_page, page_size=1, num_kv_heads=1, D=512] bf16
+    qo_indptr,  # [batch+1]  q rows per sequence (cumulative)
+    kv_indptr,  # [batch+1]  pages per sequence (cumulative; page_size=1)
+    kv_page_indices,  # [total_pages_used]
+    sm_scale,
+    attn_sink,  # [num_heads] fp32
+):
+    """BF16 Triton reference via the sibling ATOM split-K decode kernel
+    (`_sparse_attn_v4_paged_decode_triton`).
+
+    Layout bridge: aiter's decode shares ONE kv span across all q tokens of a
+    sequence (qo_indptr maps batch->q rows, kv_indptr maps batch->pages). The
+    ATOM kernel is sparse — its kv_indptr/kv_indices are indexed PER query
+    token. So we fan each batch's page span out to every one of its q tokens.
+
+    Relies on the _build_bf16_inputs convention (page_size=1,
+    kv_last_page_lens==1): a batch's token count == its page count == the full
+    span, so there is no partial last page to trim.
+
+    Returns out [total_q, num_heads, D] bf16 (V dim == head dim for MLA).
+    """
+    total_q, num_heads, d = q_bf16.shape
+    device = q_bf16.device
+
+    # [num_page, 1, 1, D] -> [num_page, D]: ATOM wants a flat per-page pool.
+    unified_kv = kv_bf16.reshape(-1, d).contiguous()
+
+    qo = qo_indptr.cpu().tolist()
+    kvp = kv_indptr.cpu().tolist()
+    batch = len(qo) - 1
+
+    tok_indptr = [0]
+    tok_index_chunks = []
+    for b in range(batch):
+        qs, qe = qo[b], qo[b + 1]
+        ps, pe = kvp[b], kvp[b + 1]
+        span = kv_page_indices[ps:pe]  # this batch's page ids
+        n = pe - ps
+        for _ in range(qe - qs):  # every q token in the batch sees the full span
+            tok_index_chunks.append(span)
+            tok_indptr.append(tok_indptr[-1] + n)
+
+    if tok_index_chunks:
+        kv_indices_tok = torch.cat(tok_index_chunks).to(torch.int32)
+    else:
+        kv_indices_tok = torch.zeros(0, dtype=torch.int32, device=device)
+    kv_indptr_tok = torch.tensor(tok_indptr, dtype=torch.int32, device=device)
+
+    return _sparse_attn_v4_paged_decode_triton(
+        q_bf16,
+        unified_kv,
+        kv_indices_tok,
+        kv_indptr_tok,
+        attn_sink,
+        float(sm_scale),
+    )
+
+
 def _asm_attn_decode_bf16(
     q_bf16,  # [total_q, num_heads=16, D=512] bf16
     kv_bf16,  # [num_page, page_size=1, num_kv_heads=1, D=512] bf16
     qo_indptr,
     kv_indptr,
     kv_page_indices,
-    kv_last_page_lens,
     max_seqlen_q,
     sm_scale,
 ):
@@ -566,7 +1223,6 @@ def _asm_attn_decode_bf16(
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
         split_indptr=split_indptr,
         max_seqlen_q=max_seqlen_q,
         sink=sink,
@@ -890,6 +1546,25 @@ def _run_one_point(
         num_rotate_args=1,
     )
 
+    # ---- timed call (1b): BF16 triton decode ----
+    # The vendored ATOM split-K triton kernel, fed the SAME bf16 q/kv (no FP8
+    # quant). Timed so the summary can report triton vs asm throughput side by
+    # side. Runs BEFORE the asm calls so nothing executes between the asm write
+    # to logits_buf and the out_asm read below. Consumes inputs["q_bf16"] etc.
+    out_triton, us_triton = run_perftest(
+        _triton_attn_decode_bf16,
+        inputs["q_bf16"],
+        inputs["kv_bf16"],
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        sm_scale,
+        inputs["sink"],
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=1,
+    )
+
     # ---- timed call (2a): asm kernel ONLY (no stage2 merge) ----
     # Times the v4 nm decoder kernel in isolation so the perf number isolates
     # kernel work from the cross-split merge cost. For num_kv_splits=1 this
@@ -930,7 +1605,6 @@ def _run_one_point(
         qo_indptr=inputs["qo_indptr"],
         kv_indptr=inputs["kv_indptr"],
         kv_page_indices=inputs["kv_page_indices"],
-        kv_last_page_lens=inputs["kv_last_page_lens"],
         split_indptr=split_indptr,
         max_seqlen_q=inputs["max_seqlen_q"],
         sink=inputs["sink"],
@@ -944,18 +1618,41 @@ def _run_one_point(
         num_rotate_args=1,
     )
 
-    # Resolve the asm output to compare against. Three cases, all reading the
-    # buffer the wrapper actually populated (the 2b call above):
+    # Resolve the asm output to compare against. Three cases, all reading a
+    # NORMALIZED final attention result (not a raw pre-softmax-divide partial):
     #   out_16_nosplit=1   -> kernel writes packed-BF16 into the logits region;
     #                         the wrapper unpacks it into output_buf (see
     #                         mla_decode_fwd_v4_nm). Read output_buf directly.
-    #   single-pass (fp32) -> kernel writes one FP32 partial to logits[:, 0],
-    #                         no stage2; cast it to BF16.
-    #   multi-pass         -> stage2 merge wrote merged BF16 to output_buf.
+    #   single-pass (fp32) -> logits_buf[:, 0] is the UN-normalized numerator
+    #                         (no stage2 merge runs for one split, so the softmax
+    #                         denominator is never applied — reading it raw is 2x
+    #                         off vs the refs). Do one extra, untimed wrapper call
+    #                         on the zero-copy out_16_nosplit=1 path, which writes
+    #                         the normalized BF16 output into a fresh buffer.
+    #   multi-pass         -> stage2 merge wrote merged (normalized) BF16 to
+    #                         output_buf.
     if out_16_nosplit != 0:
         out_asm = output_buf  # wrapper unpacked packed-BF16 here
     elif num_kv_splits == 1:
-        out_asm = logits_buf[:, 0].to(dtypes.bf16)  # [total_q, num_heads, dv]
+        out_asm = torch.empty_like(output_buf)
+        aiter.mla.mla_decode_fwd_v4_nm(
+            q=q_packed,
+            qrope=q_rope.contiguous(),
+            kv_buffer=kv_packed,
+            kvrope=kv_rope.contiguous(),
+            output=out_asm,
+            qo_indptr=inputs["qo_indptr"],
+            kv_indptr=inputs["kv_indptr"],
+            kv_page_indices=inputs["kv_page_indices"],
+            split_indptr=split_indptr,
+            max_seqlen_q=inputs["max_seqlen_q"],
+            sink=inputs["sink"],
+            sm_scale=sm_scale,
+            out_16_nosplit=1,  # normalized zero-copy final output
+            num_kv_splits=1,
+            logits=logits_buf,
+            attn_lse=lse_buf,
+        )
     else:
         out_asm = output_buf  # already [total_q, num_heads, dv] BF16
 
@@ -967,7 +1664,8 @@ def _run_one_point(
     #   [fp8_ref vs asm]    = kernel math error (quant-independent)
     print(
         f"\n[v4 nm accuracy] batch={batch} kv_seq_lens={kv_seq_lens} "
-        f"q_seq_logical={q_seq_logical} num_kv_splits={num_kv_splits} seed={seed}"
+        f"q_seq_logical={q_seq_logical} gqa_ratio={gqa_ratio} "
+        f"attn_sink={attn_sink} num_kv_splits={num_kv_splits} seed={seed}"
     )
     # Per-element check at checkAllclose's default 1% tolerance (rtol=atol=1e-2).
     # checkAllclose prints pass/warning/failed with the offending-element ratio +
@@ -988,6 +1686,16 @@ def _run_one_point(
         tol_err_ratio=0.02,
         msg="mla_v4_nm [fp8_dequant_ref vs asm]",
     )
+    # triton vs asm: triton runs on bf16 q/kv (~golden), asm carries the FP8
+    # quant noise, so this spans the full golden-vs-asm gap — same 3e-2 headroom.
+    checkAllclose(
+        out_triton.float(),
+        out_asm.float(),
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg="mla_v4_nm [triton_bf16 vs asm]",
+    )
 
     # ---- perf: fp8_ref vs asm ----
     # We report two asm timings:
@@ -1000,13 +1708,19 @@ def _run_one_point(
     us_asm = us_asm_kernel  # used by the caller in the summary
     merge_us = us_asm_total - us_asm_kernel
     speedup = us_ref / us_asm if us_asm > 0 else float("inf")
+    triton_speedup = us_triton / us_asm if us_asm > 0 else float("inf")
     print(
         f"[v4 nm perf]     iters={num_iters}: "
         f"asm_k={us_asm_kernel:.2f} us ({flops / us_asm_kernel / 1e6:.2f} TFLOPS) "
         f"merge={merge_us:.2f} us  total={us_asm_total:.2f} us, "
         f"fp8_ref={us_ref:.2f} us, speedup(kernel)={speedup:.1f}x"
     )
-    return us_asm, us_ref
+    print(
+        f"[v4 nm perf]     triton={us_triton:.2f} us "
+        f"({flops / us_triton / 1e6:.2f} TFLOPS), "
+        f"asm_k vs triton = {triton_speedup:.2f}x"
+    )
+    return us_asm, us_ref, us_triton, us_asm_total
 
 
 @needs_gfx950
@@ -1093,7 +1807,6 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
         split_indptr=None,
         max_seqlen_q=1,
         sink=sink,
@@ -1118,6 +1831,73 @@ def _run_varlen_point(kv_lens, gqa_ratio=128, seed=0, attn_sink=True):
         atol=3e-2,
         tol_err_ratio=0.02,
         msg=f"mla_v4_nm varlen [fp8_dequant_ref vs asm] kv_lens={kv_lens}",
+    )
+
+
+@needs_gfx950
+@pytest.mark.parametrize("attn_sink", [True, False])
+@pytest.mark.parametrize(
+    "batch,kv_seq_lens,q_seq_logical",
+    [(2, 64, 1), (4, 128, 1), (1, 256, 1)],
+)
+def test_v4_nm_triton_vs_golden(batch, kv_seq_lens, q_seq_logical, attn_sink):
+    """Cross-check the sibling ATOM BF16 Triton decode against this file's
+    pure-torch BF16 golden.
+
+    Both consume the SAME bf16 q/kv (no FP8 quant), so they should agree
+    tightly — this isolates 'Triton kernel math' from the FP8 quant noise the
+    asm accuracy test has to tolerate. Exercises both the sink and no-sink
+    (per-head -inf) softmax paths.
+    """
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=q_seq_logical,
+        seed=0,
+        attn_sink=attn_sink,
+    )
+    sm_scale = 1.0 / (_QUANT_D**0.5)  # matches the kernel's 1/sqrt(512)
+
+    out_golden, _ = _torch_attn_decode_bf16_golden(
+        inputs["q_bf16"],
+        inputs["kv_bf16"],
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        sm_scale,
+        attn_sink=inputs["sink"],
+    )
+
+    out_triton = _triton_attn_decode_bf16(
+        inputs["q_bf16"],
+        inputs["kv_bf16"],
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        sm_scale,
+        inputs["sink"],
+    )
+
+    print(
+        f"\n[v4 nm triton] batch={batch} kv_seq_lens={kv_seq_lens} "
+        f"q_seq_logical={q_seq_logical} sink={attn_sink}"
+    )
+    # checkAllclose does NOT raise (returns the mismatch fraction, 0 on a clean
+    # pass), so assert to actually gate on bf16-vs-bf16 agreement.
+    err = checkAllclose(
+        out_golden.float(),
+        out_triton.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        tol_err_ratio=0.02,
+        msg=f"mla_v4_nm [golden_bf16 vs triton_bf16] "
+        f"batch={batch} kv={kv_seq_lens} sink={attn_sink}",
+    )
+    assert (err or 0) < 0.02, (
+        f"triton bf16 decode disagrees with the torch golden: batch={batch} "
+        f"kv_seq_lens={kv_seq_lens} sink={attn_sink} mismatch={float(err):.3%} "
+        f"(>=2%)."
     )
 
 
@@ -1214,7 +1994,6 @@ def test_v4_nm_ragged_short_seq_no_corrupt():
             qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
             kv_page_indices=kv_page_indices,
-            kv_last_page_lens=kv_last_page_lens,
             split_indptr=None,
             max_seqlen_q=1,
             sink=sink,
@@ -1315,7 +2094,6 @@ def _run_cudagraph_bucket_point(
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr,
         kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
         split_indptr=None,
         max_seqlen_q=1,
         sink=sink,
@@ -1469,7 +2247,6 @@ def asm_sparse_attn_v4_paged_decode(
             ), f"asm v4 nm wrapper requires kv_indptr constant per group-of-4 (batch {b}, offset {j})"
 
     kv_page_indices = kv_indices.to(torch.int32).contiguous()
-    kv_last_page_lens = torch.ones(batch, dtype=torch.int32, device=device)
 
     # unified_kv [P, D] -> [P, page_size=1, num_kv_heads=1, D]
     kv_bf16 = unified_kv.view(-1, 1, 1, _QUANT_D)
@@ -1480,7 +2257,6 @@ def asm_sparse_attn_v4_paged_decode(
         qo_indptr=qo_indptr,
         kv_indptr=kv_indptr_per_seq,
         kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
         max_seqlen_q=4,
         sm_scale=softmax_scale,
     )
@@ -1626,7 +2402,6 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
         qo_indptr=bf["qo_indptr"],
         kv_indptr=bf["kv_indptr"],
         kv_page_indices=bf["kv_page_indices"],
-        kv_last_page_lens=bf["kv_last_page_lens"],
         max_seqlen_q=bf["max_seqlen_q"],
         sink=sink,
     )
@@ -1817,7 +2592,6 @@ def _oob_worker_main(gqa=128, q_seq_logical=1):
         qo_indptr=inp["qo_indptr"],
         kv_indptr=inp["kv_indptr"],
         kv_page_indices=inp["kv_page_indices"],
-        kv_last_page_lens=inp["kv_last_page_lens"],
         split_indptr=None,
         max_seqlen_q=q_seq_logical,
         sink=inp["sink"],
@@ -1984,7 +2758,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split-kv",
         type=int,
-        default=1,
+        default=None,
     )
     parser.add_argument(
         "--gqa-ratio",
@@ -2025,7 +2799,7 @@ if __name__ == "__main__":
             f"\n========== batch={batch} kv_seq_lens={kv_seq_lens} "
             f"q_seq_logical={q_seq_logical} =========="
         )
-        us_asm, us_ref = _run_one_point(
+        us_asm, us_ref, us_triton, us_asm_total = _run_one_point(
             batch=batch,
             kv_seq_lens=kv_seq_lens,
             q_seq_logical=q_seq_logical,
@@ -2037,12 +2811,31 @@ if __name__ == "__main__":
             attn_sink=args.attn_sink,
             out_16_nosplit=args.out_16_nosplit,
         )
-        perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))
+        perf_rows.append(
+            (
+                batch,
+                kv_seq_lens,
+                q_seq_logical,
+                args.gqa_ratio,
+                args.attn_sink,
+                us_asm,
+                us_ref,
+                us_triton,
+                us_asm_total,
+            )
+        )
 
-    print("\n[v4 nm perf summary] (us; speedup = fp8_ref / asm_kernel)")
+    print("\n[v4 nm perf summary] (us; speedup = other / asm_tot, end-to-end)")
+    print("  asm_k = kernel only; asm_tot = kernel + stage2 merge (end-to-end)")
+    print("  triton/torch are end-to-end, so speedup uses asm_tot for a fair compare")
     print(
-        f"  {'batch':>6} {'kv_seq':>8} {'q_seq':>6} "
-        f"{'asm_k us':>10} {'fp8_ref us':>12} {'speedup':>9}"
+        f"  {'batch':>6} {'kv_seq':>8} {'q_seq':>6} {'gqa':>5} {'sink':>6} "
+        f"{'asm_k us':>10} {'asm_tot us':>11} {'triton us':>10} {'torch us':>10} "
+        f"{'triton/asm':>11} {'torch/asm':>10}"
     )
-    for b, k, q, ua, ur in perf_rows:
-        print(f"  {b:>6d} {k:>8d} {q:>6d} {ua:>10.2f} {ur:>12.2f} {ur / ua:>8.1f}x")
+    for b, k, q, g, s, ua, ur, ut, uat in perf_rows:
+        print(
+            f"  {b:>6d} {k:>8d} {q:>6d} {g:>5d} {str(s):>6} "
+            f"{ua:>10.2f} {uat:>11.2f} {ut:>10.2f} "
+            f"{ur:>10.2f} {ut / uat:>10.1f}x {ur / uat:>9.1f}x"
+        )
