@@ -3769,6 +3769,463 @@ def test_batch_prefill_sink(
     )
 
 
+# ===========================================================================
+# ASM qkptph/vph FP8 causal paged batch-prefill kernel (module
+# module_mha_batch_prefill_asm). Self-contained: builds paged inputs in the
+# exact layout the asm launcher consumes (packed-Q via cu_seqlens, vec_k_col_v
+# K, column-major V, per-token-head q/k descales, per-head v descale, optional
+# p_scale, SGLang 1D page table) and validates against an fp32 reference whose
+# math mirrors scripts/f8_fmha_prefill/fwd_fp8.cpp (poc_kl).
+# ===========================================================================
+from aiter.ops.mha_batch_prefill_asm import mha_batch_prefill_asm  # noqa: E402
+
+_ASM_FP8 = dtypes.fp8
+_ASM_FP8_MAX = float(torch.finfo(_ASM_FP8).max)
+_ASM_PAGE = int(os.environ.get("ASM_PAGE", "16"))
+_ASM_VECX = 16  # FP8 128-bit vector width; equals page size
+
+
+def _asm_quant_per_row(x):
+    """Per-(row) symmetric fp8 quant over the last dim. Returns (fp8, descale)."""
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+    descale = (amax / _ASM_FP8_MAX).to(torch.float32)
+    xq = (x / descale).to(_ASM_FP8)
+    return xq, descale.squeeze(-1)
+
+
+def _asm_reference(qf8, kf8, vf8, q_desc, k_desc, v_desc, p_scale, scale, gqa):
+    """fp32 reference for one batch element. Shapes:
+    qf8 [sq,hq,d], kf8/vf8 [sk,hk,d], q_desc [sq,hq], k_desc [sk,hk],
+    v_desc [hk], p_scale [hq] or None. Returns out [sq,hq,d] fp32.
+    """
+    sq, hq, d = qf8.shape
+    sk, hk, _ = kf8.shape
+    qd = qf8.float() * q_desc[..., None]  # [sq,hq,d]
+    kd = kf8.float() * k_desc[..., None]  # [sk,hk,d]
+    vd = vf8.float() * v_desc[None, :, None]  # [sk,hk,d]
+    out = torch.empty(sq, hq, d, dtype=torch.float32, device=qf8.device)
+    # Bottom-right causal mask (sq==sk here): key k visible to query q if k<=q.
+    qidx = torch.arange(sq, device=qf8.device)[:, None]
+    kidx = torch.arange(sk, device=qf8.device)[None, :]
+    mask = kidx > (qidx + (sk - sq))
+    for h in range(hq):
+        hk_i = h // gqa
+        scores = (qd[:, h] @ kd[:, hk_i].transpose(0, 1)) * scale  # [sq,sk]
+        scores = scores.masked_fill(mask, float("-inf"))
+        m = scores.amax(dim=-1, keepdim=True)
+        p = torch.exp(scores - m)
+        if p_scale is not None:
+            p = p * p_scale[h]
+        denom = p.sum(dim=-1, keepdim=True).clamp(min=1e-20)
+        p_deq = p.to(_ASM_FP8).float()  # P quantized to fp8 for PV
+        acc = p_deq @ vd[:, hk_i]  # [sq,d]
+        out[:, h] = acc / denom
+    return out
+
+
+def _asm_pack_paged_kv(kf8_list, vf8_list, kdesc_list, num_heads_k, head_dim):
+    """Scatter per-batch BHSD-style fp8 K/V (and K-descale) into paged pools with
+    an identity LTD. Returns dict of tensors the launcher consumes."""
+    dev = kf8_list[0].device
+    page, x = _ASM_PAGE, _ASM_VECX
+    ppb = [(kf8.shape[0] + page - 1) // page for kf8 in kf8_list]
+    num_pages = sum(ppb)
+    kv_indptr = torch.tensor(
+        [0, *list(itertools.accumulate(ppb))], dtype=torch.int32, device=dev
+    )
+    kv_page_indices = torch.arange(
+        num_pages, dtype=torch.int32, device=dev
+    )  # identity LTD
+    seqlens_kvcache = torch.tensor(
+        [kf8.shape[0] for kf8 in kf8_list], dtype=torch.int32, device=dev
+    )
+
+    k_pool = torch.zeros(
+        num_pages, num_heads_k, head_dim // x, page, x, dtype=_ASM_FP8, device=dev
+    )
+    v_pool = torch.zeros(
+        num_pages, num_heads_k, head_dim, page, dtype=_ASM_FP8, device=dev
+    )
+    kdesc_pool = torch.zeros(
+        num_pages, page, num_heads_k, dtype=torch.float32, device=dev
+    )
+
+    for b, (kf8, vf8, kdesc) in enumerate(zip(kf8_list, vf8_list, kdesc_list)):
+        sk = kf8.shape[0]
+        base = kv_indptr[b].item()
+        for t in range(sk):
+            phys = base + t // page  # identity LTD
+            row = t % page
+            # K: [phys, hk, d//x, row, d%x]
+            kt = kf8[t].view(num_heads_k, head_dim // x, x)  # [hk, d/x, x]
+            k_pool[phys, :, :, row, :] = kt
+            # V: [phys, hk, d, row]
+            v_pool[phys, :, :, row] = vf8[t]  # [hk, d]
+            # K-descale: [phys, row, hk]
+            kdesc_pool[phys, row, :] = kdesc[t]
+    return dict(
+        k_pool=k_pool,
+        v_pool=v_pool,
+        kdesc_pool=kdesc_pool,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        seqlens_kvcache=seqlens_kvcache,
+        num_pages=num_pages,
+    )
+
+
+def _asm_pack_paged_kv_alllayers(
+    kf8_list, vf8_list, kdesc_list, num_heads_k, head_dim, num_layers, layer_idx, seed=0
+):
+    """Pack per-batch fp8 K/V into the vLLM "all-layers-per-block" combined KV
+    cache (vllm-project/vllm#27742) and return strided K/V views for ONE layer.
+
+    The backing buffer is C-contiguous as
+        (num_blocks, num_kv_heads, num_layers, 2, page * head_dim)
+    so all layers (and both K and V) of a block sit contiguously. The inner
+    page*head_dim chunk keeps the kernel's existing swizzle: K as
+    [head_dim/x, page, x], V (col-major) as [head_dim, page]. The per-layer view
+    handed to the launcher then matches the issue's 5D shape/stride (with only
+    the innermost (page, head_dim) reinterpreted as the kernel swizzle):
+        K view: (num_pages, hk, head_dim/x, page, x)
+        V view: (num_pages, hk, head_dim, page)
+        block stride = num_kv_heads*num_layers*2*page*head_dim   (== view.stride(0))
+        head  stride = num_layers*2*page*head_dim                (== view.stride(1))
+        K/V split    = page*head_dim                             (V base = K base + this)
+        layer base   = layer_idx * 2*page*head_dim
+
+    All non-target layers are filled with random fp8 so a correct run proves the
+    kernel addresses the cache purely via stride(0)/stride(1) and the K/V base
+    pointers (no contiguity assumption).
+    """
+    dev = kf8_list[0].device
+    page, x = _ASM_PAGE, _ASM_VECX
+    ppb = [(kf8.shape[0] + page - 1) // page for kf8 in kf8_list]
+    num_pages = sum(ppb)
+    kv_indptr = torch.tensor(
+        [0, *list(itertools.accumulate(ppb))], dtype=torch.int32, device=dev
+    )
+    kv_page_indices = torch.arange(num_pages, dtype=torch.int32, device=dev)
+    seqlens_kvcache = torch.tensor(
+        [kf8.shape[0] for kf8 in kf8_list], dtype=torch.int32, device=dev
+    )
+
+    inner = page * head_dim  # fp8 elements per (block,head,layer,kv) tile
+    kv_stride = inner
+    layer_stride = 2 * inner
+    head_stride = num_layers * layer_stride
+    block_stride = num_heads_k * head_stride
+    total = num_pages * block_stride
+
+    # Random fp8 noise everywhere; the target layer's tiles are overwritten below.
+    gen = torch.Generator(device=dev).manual_seed(1234 + seed)
+    buf = (torch.rand(total, generator=gen, device=dev) * 2 - 1).to(_ASM_FP8)
+
+    k_pool = torch.as_strided(
+        buf,
+        (num_pages, num_heads_k, head_dim // x, page, x),
+        (block_stride, head_stride, page * x, x, 1),
+        storage_offset=layer_idx * layer_stride,  # kv index 0 (K)
+    )
+    v_pool = torch.as_strided(
+        buf,
+        (num_pages, num_heads_k, head_dim, page),
+        (block_stride, head_stride, page, 1),
+        storage_offset=layer_idx * layer_stride + kv_stride,  # kv index 1 (V)
+    )
+
+    kdesc_pool = torch.zeros(
+        num_pages, page, num_heads_k, dtype=torch.float32, device=dev
+    )
+
+    for b, (kf8, vf8, kdesc) in enumerate(zip(kf8_list, vf8_list, kdesc_list)):
+        sk = kf8.shape[0]
+        base = kv_indptr[b].item()
+        for t in range(sk):
+            phys = base + t // page  # identity LTD
+            row = t % page
+            kt = kf8[t].view(num_heads_k, head_dim // x, x)  # [hk, d/x, x]
+            k_pool[phys, :, :, row, :] = kt
+            v_pool[phys, :, :, row] = vf8[t]  # [hk, d]
+            kdesc_pool[phys, row, :] = kdesc[t]
+    return dict(
+        k_pool=k_pool,
+        v_pool=v_pool,
+        kdesc_pool=kdesc_pool,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        seqlens_kvcache=seqlens_kvcache,
+        num_pages=num_pages,
+        buf=buf,
+    )
+
+
+def run_batch_prefill_asm(
+    seqlens,
+    num_qo_heads=8,
+    num_kv_heads=1,
+    head_dim=128,
+    use_p_scale=True,
+    seed=0,
+    bench=False,
+    warmup=10,
+    iters=50,
+    combined_kv=False,
+    num_kv_layers=4,
+    kv_layer_idx=2,
+    adversarial=False,
+    adv_amp=120.0,
+    adv_qbias=1.5,
+    assert_nrms=True,
+):
+    """Drive mha_batch_prefill_asm for the given per-batch seqlens (prefill:
+    qo_len==kv_len per batch) and validate against the fp32 reference. When
+    bench=True, also time the kernel and report latency + TFLOPS.
+
+    adversarial=True stresses the VFA freeze-max seeding: it plants a single
+    dominant key in a LATE KV tile (beyond the 512-key, 2-tile freeze-max seed),
+    aligned with a query bias, so that key's logit is the true row max for every
+    query that can see it -- but the frozen seed (first 2 tiles) never sampled it.
+    On an exact kernel this is harmless; on freeze-max the frozen P for that key
+    saturates fp8 (e4m3fnuz max 240) and the dominant contribution is lost."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    batch = len(seqlens)
+    gqa = num_qo_heads // num_kv_heads
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q_packed, qdesc_packed, out_ref_packed = [], [], []
+    kf8_list, vf8_list, kdesc_list = [], [], []
+    v_desc = (torch.rand(num_kv_heads, device=dev) * 0.5 + 0.5).to(torch.float32)
+    p_scale = (
+        (torch.rand(num_qo_heads, device=dev) * 0.5 + 0.75).to(torch.float32)
+        if use_p_scale
+        else None
+    )
+    adv_dir = None
+    if adversarial:
+        adv_dir = torch.randn(head_dim, device=dev)
+        adv_dir = adv_dir / adv_dir.norm()
+
+    for s in seqlens:
+        q = torch.randn(s, num_qo_heads, head_dim, device=dev)
+        k = torch.randn(s, num_kv_heads, head_dim, device=dev)
+        v = torch.randn(s, num_kv_heads, head_dim, device=dev)
+        if adversarial:
+            # Bias every query along adv_dir, then plant one dominant aligned key
+            # in a late tile (past the first 512 keys = 2 freeze-max seed tiles).
+            q = q + adv_qbias * adv_dir
+            pos = 512 + (s - 512) // 2 if s > 640 else s - 1
+            if os.environ.get("ADV_POS"):
+                pos = int(os.environ["ADV_POS"])
+            k[pos] = k[pos] + adv_amp * adv_dir
+        qf8, qdesc = _asm_quant_per_row(q)  # [s,hq,d],[s,hq]
+        kf8, kdesc = _asm_quant_per_row(k)  # [s,hk,d],[s,hk]
+        # V descale is per-kv-head only (launcher v_descale [hk]).
+        vf8 = (v / v_desc[None, :, None]).to(_ASM_FP8)
+        q_packed.append(qf8)
+        qdesc_packed.append(qdesc)
+        kf8_list.append(kf8)
+        vf8_list.append(vf8)
+        kdesc_list.append(kdesc)
+        out_ref_packed.append(
+            _asm_reference(qf8, kf8, vf8, qdesc, kdesc, v_desc, p_scale, scale, gqa)
+        )
+
+    q_packed = torch.cat(q_packed, dim=0).contiguous()  # [total_q,hq,d]
+    qdesc_packed = torch.cat(qdesc_packed, dim=0).contiguous()  # [total_q,hq]
+    out_ref = torch.cat(out_ref_packed, dim=0)  # [total_q,hq,d]
+    cu_seqlens_q = torch.tensor(
+        [0, *list(itertools.accumulate(seqlens))], dtype=torch.int32, device=dev
+    )
+    if combined_kv:
+        paged = _asm_pack_paged_kv_alllayers(
+            kf8_list,
+            vf8_list,
+            kdesc_list,
+            num_kv_heads,
+            head_dim,
+            num_kv_layers,
+            kv_layer_idx,
+            seed=seed,
+        )
+    else:
+        paged = _asm_pack_paged_kv(
+            kf8_list, vf8_list, kdesc_list, num_kv_heads, head_dim
+        )
+
+    out = torch.empty_like(q_packed, dtype=torch.bfloat16)
+
+    def _launch():
+        mha_batch_prefill_asm(
+            q_packed,
+            paged["k_pool"],
+            paged["v_pool"],
+            cu_seqlens_q,
+            paged["kv_indptr"],
+            paged["kv_page_indices"],
+            paged["seqlens_kvcache"],
+            out,
+            qdesc_packed,
+            paged["kdesc_pool"],
+            v_desc,
+            batch,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            head_dim,
+            _ASM_PAGE,
+            paged["num_pages"],
+            max(seqlens),
+            scale,
+            p_scale=p_scale,
+        )
+
+    _launch()
+
+    out_f = out.float()
+    diff = out_f - out_ref
+    if os.environ.get("ROW_DIAG"):
+        # per-query-row NRMS: diff is [total_q, hq, d]; reduce over hq,d
+        rn = (diff.pow(2).sum(dim=(1, 2)) / out_ref.pow(2).sum(dim=(1, 2)).clamp(min=1e-20)).sqrt()
+        pos = 512 + (seqlens[0] - 512) // 2 if seqlens[0] > 640 else seqlens[0] - 1
+        if os.environ.get("ADV_POS"):
+            pos = int(os.environ["ADV_POS"])
+        top = torch.topk(rn, 12)
+        print(f"    [ROW_DIAG] dominant key pos={pos}; worst rows (idx:nrms):")
+        print("      " + " ".join(f"{int(i)}:{float(v):.3f}" for v, i in zip(top.values, top.indices)))
+        print(f"    [ROW_DIAG] rows<pos mean={rn[:pos].mean():.4f}  rows>=pos mean={rn[pos:].mean():.4f}")
+        w = int(top.indices[0])
+        of = out_f[w].reshape(-1); orf = out_ref[w].reshape(-1)
+        print(f"    [ROW_DIAG] worst row {w}: |out|={of.norm():.3f} |ref|={orf.norm():.3f} "
+              f"dot={torch.dot(of, orf).item():.3f} out[:4]={[round(x,3) for x in of[:4].tolist()]} "
+              f"ref[:4]={[round(x,3) for x in orf[:4].tolist()]}")
+    nrms = (diff.pow(2).sum() / out_ref.pow(2).sum().clamp(min=1e-20)).sqrt().item()
+    max_abs = diff.abs().max().item()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        out_f.reshape(-1), out_ref.reshape(-1), dim=0, eps=1e-20
+    ).item()
+
+    latency_ms = None
+    tflops = None
+    if bench:
+        for _ in range(warmup):
+            _launch()
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            _launch()
+        end.record()
+        torch.cuda.synchronize()
+        latency_ms = start.elapsed_time(end) / iters
+        # Causal FLOPs: per batch sum_q (q+1) score pairs * 2*(d_qk+d_v) (QK + PV).
+        score_pairs = sum(s * (s + 1) / 2 for s in seqlens)
+        flops = num_qo_heads * score_pairs * (head_dim + head_dim) * 2.0
+        tflops = flops / (latency_ms * 1e-3) / 1e12
+
+    msg = (
+        f"[asm] seqlens={seqlens} hq={num_qo_heads} hk={num_kv_heads} "
+        f"p_scale={use_p_scale} NRMS={nrms:.4e} cos={cos_sim:.6f} max_abs={max_abs:.4e}"
+    )
+    if bench:
+        msg += f" | latency={latency_ms:.4f} ms  {tflops:.1f} TFLOPS"
+    print(msg)
+    if assert_nrms:
+        assert nrms < 0.06, f"asm kernel vs reference NRMS too high: {nrms:.4e}"
+    return dict(
+        nrms=nrms,
+        cos_sim=cos_sim,
+        max_abs=max_abs,
+        latency_ms=latency_ms,
+        tflops=tflops,
+    )
+
+
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize("seqlen", [256, 512])
+def test_batch_prefill_asm_batched(seqlen, use_p_scale):
+    # Batched / b=1 path (varlen kernel with a single [0, S] segment).
+    run_batch_prefill_asm([seqlen], use_p_scale=use_p_scale, seed=11)
+
+
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize("seqlens", [[256, 512], [512, 256, 384]])
+def test_batch_prefill_asm_varlen(seqlens, use_p_scale):
+    # Varlen: distinct per-batch sequence lengths.
+    run_batch_prefill_asm(seqlens, use_p_scale=use_p_scale, seed=23)
+
+
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        [272],  # b=1: one full 256-row Q tile + a 16-row partial tail
+        [257],  # b=1: single-row tail
+        [1000],  # b=1: 3 full tiles + a 232-row tail
+        [272, 257],  # varlen, every batch unaligned
+        [512, 300, 384],  # mixed aligned / unaligned (300, 384 not % 256)
+    ],
+)
+def test_batch_prefill_asm_qseqlen_unaligned_256(seqlens, use_p_scale):
+    """Regression for the FP8 paged qkptph/vph causal asm kernel (ts_qo=256) when a
+    per-batch Q sequence length is NOT a multiple of the 256-row Q tile. The partial
+    last tile must clamp the packed q_descale ([total_q, nheads]) and Q-row reads so
+    no out-of-bounds global access occurs for the padding rows of that tile."""
+    assert any(s % 256 != 0 for s in seqlens), "test must exercise an unaligned seqlen"
+    run_batch_prefill_asm(seqlens, use_p_scale=use_p_scale, seed=29)
+
+
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize(
+    "num_kv_layers,kv_layer_idx", [(1, 0), (4, 0), (4, 2), (4, 3), (8, 5)]
+)
+@pytest.mark.parametrize("seqlens", [[512], [256, 384]])
+def test_batch_prefill_asm_combined_kv(seqlens, num_kv_layers, kv_layer_idx, use_p_scale):
+    """vLLM "all-layers-per-block" combined KV cache (vllm-project/vllm#27742).
+
+    The kernel must read a SINGLE layer's strided K/V views out of a backing
+    buffer that interleaves all layers and both K/V per block:
+        (num_blocks, num_kv_heads, num_layers, 2, page*head_dim)
+    The other layers are random noise, so a passing NRMS proves the kernel
+    addresses KV purely via the per-layer view's stride(0)/stride(1) and K/V
+    base pointers, with the inner swizzle preserved."""
+    run_batch_prefill_asm(
+        seqlens,
+        use_p_scale=use_p_scale,
+        seed=37,
+        combined_kv=True,
+        num_kv_layers=num_kv_layers,
+        kv_layer_idx=kv_layer_idx,
+    )
+
+
+# Perf sweep: b=1 latency/TFLOPS at increasing context, reporting NRMS + runtime.
+# Opt-in (it is a benchmark, not a correctness gate) via AITER_ASM_PERF=1.
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.skipif(
+    os.environ.get("AITER_ASM_PERF") != "1",
+    reason="perf sweep; set AITER_ASM_PERF=1 to run",
+)
+@pytest.mark.parametrize("seqlen", [512, 1024, 2048, 4096, 8192, 16384, 27507, 32768])
+def test_batch_prefill_asm_perf(seqlen):
+    run_batch_prefill_asm([seqlen], use_p_scale=True, seed=31, bench=True)
+
+
 # CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
 # above only executes the non-sink scenarios. Add a small representative sweep
 # of the StreamLLM sink scenarios here so they actually exercise in CI.
@@ -3796,3 +4253,14 @@ if __name__ == "__main__":
             dtype=dtype,
             seed=42,
         )
+
+    # ASM qkptph/vph FP8 causal paged kernel (gfx942 only).
+    if get_gpu_arch() == "gfx942":
+        if os.environ.get("AITER_ASM_PERF") == "1":
+            # Perf sweep: b=1 latency/TFLOPS (+ NRMS) at increasing context.
+            for s in (512, 1024, 2048, 4096, 8192, 16384, 32768):
+                run_batch_prefill_asm([s], use_p_scale=True, seed=31, bench=True)
+        else:
+            for sl in ([512], [256, 512], [512, 256, 384]):
+                for ps in (False, True):
+                    run_batch_prefill_asm(sl, use_p_scale=ps, seed=7)
