@@ -3,8 +3,8 @@
 
 from typing import Optional, Tuple
 
-import triton
 import torch
+import triton
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
     gluon_dynamic_mxfp4_quant_kernel_gfx1250,
 )
