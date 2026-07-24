@@ -249,7 +249,7 @@ def gemm2_body_v2(
     kbs_per_expert_dw = (
         N_OUT_rt // fx.Int32(32)
     ) * kBS_stride_n0_dw  # (N_OUT//16//2)*stride
-    num_n_blocks = N_OUT_rt // fx.Int32(256)
+    num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
     K_TILES_MAX = INTER_MAX // BK
 
