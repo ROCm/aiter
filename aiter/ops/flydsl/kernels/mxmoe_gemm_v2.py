@@ -774,9 +774,7 @@ def atomic_bf16_epilog(
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
     store_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(2), BFloat16)
-    atomic_bf16x2 = fx.make_copy_atom(
-        fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16
-    )
+    atomic_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
     store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(2), Int32)
     store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(2), Int8)
 
@@ -852,7 +850,7 @@ def atomic_bf16_epilog(
             for rg in range_constexpr((BN + route_group_n - 1) // route_group_n):
                 col_lane8 = rg * route_group_n + n_lane * fx.Int32(route_vec)
 
-                def store_route_group():
+                def store_route_group(col_lane8):
                     col_g0 = n_block_idx * BN + col_lane8
                     vals = []
                     for q in range_constexpr(route_vec):
@@ -861,9 +859,7 @@ def atomic_bf16_epilog(
                             # bf16 LDS already has routing weight baked in at write time.
                             vals.append(fx.Float32(lds_base_bf16[idx_q]))
                         else:
-                            vals.append(
-                                fx.Float32(lds_base_fptr[idx_q]) * weight[mr]
-                            )
+                            vals.append(fx.Float32(lds_base_fptr[idx_q]) * weight[mr])
                     local_max = fabs_f32(vals[0])
                     for q in range_constexpr(1, route_vec):
                         local_max = local_max.maximumf(fabs_f32(vals[q]))
@@ -872,9 +868,7 @@ def atomic_bf16_epilog(
                     e8m0 = ax_e - fx.Int32(7)
                     e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
                     e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
-                    block_scale = fx.Float32(
-                        _raw(e8m0 << fx.Int32(23)).bitcast(T.f32)
-                    )
+                    block_scale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
                     bs_raw = _raw(block_scale)
                     pk_ty = T.vec(2, T.i16)
                     packed_lo = _raw(Vec.filled([2], 0, fx.Int16))
@@ -905,17 +899,15 @@ def atomic_bf16_epilog(
                         + fx.Int64(col_g0 // fx.Int32(route_vec))
                     )
                     scale_frag = fx.make_rmem_tensor(1, Int8)
-                    scale_frag.store(
-                        Vec.from_elements([e8m0.to(Int8)], Int8)
-                    )
+                    scale_frag.store(Vec.from_elements([e8m0.to(Int8)], Int8))
                     fx.copy(store_i8, scale_frag, out_i8[None, scale_off])
 
                 @flyc.jit
-                def store_route_group_if_valid():
+                def store_route_group_if_valid(col_lane8):
                     if col_lane8 < fx.Int32(BN):
-                        store_route_group()
+                        store_route_group(col_lane8)
 
-                store_route_group_if_valid()
+                store_route_group_if_valid(col_lane8)
         else:
             for s in range_constexpr(BN // store_group_n):
                 # adjacent ee=0,1 contiguous -> one 2-wide load.
@@ -955,8 +947,8 @@ def atomic_bf16_epilog(
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
 
         @flyc.jit
-        def store_if_valid():
+        def store_if_valid(token_id, mr):
             if token_id < i32_M:
                 store_one_mr(mr)
 
-        store_if_valid()
+        store_if_valid(token_id, mr)
