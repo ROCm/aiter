@@ -25,7 +25,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 @gluon.jit
 def _cache_load(ptr, off, USE_BUFFER_LOAD: gl.constexpr, mask=None, other=None):
     # gfx950 buffer_load carries a 32-bit offset (2 GB cap), a cache past that gathers
-    # via 64-bit gl.load instead. 
+    # via 64-bit gl.load instead.
     if USE_BUFFER_LOAD:
         return gl.amd.cdna4.buffer_load(
             ptr=ptr, offsets=off.to(gl.int32), mask=mask, other=other, cache=".cg"
