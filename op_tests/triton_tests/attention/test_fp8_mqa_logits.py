@@ -149,3 +149,55 @@ def test_fp8_mqa_logits(
     if ref_neginf_mask.all():
         return  # nothing left to compare
     assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.parametrize("context_len", [128, 1024])
+@torch.inference_mode()
+def test_fp8_paged_mqa_logits_page_size_one(context_len: int) -> None:
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+    if get_gfx() != "gfx1201":
+        pytest.skip("regression covers the gfx1201 paged-MQA route")
+    fp8_dtype = get_fp8_e4m3_dtype()
+    assert fp8_dtype == torch.float8_e4m3fn
+
+    torch.manual_seed(7)
+    heads, head_dim = 64, 128
+    q = torch.randn(1, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(context_len, 1, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(1, heads, device="cuda", dtype=torch.float32)
+    fp8_max = torch.finfo(fp8_dtype).max
+    q_fp8 = q.to(fp8_dtype)
+    kv_scale = kv.abs().float().amax(dim=-1, keepdim=True).clamp_min(1e-4) / fp8_max
+    kv_fp8 = (kv.float() / kv_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+    packed_kv = torch.empty(context_len, 132, device="cuda", dtype=torch.uint8)
+    packed_kv[:, :head_dim] = kv_fp8.view(torch.uint8).reshape(context_len, head_dim)
+    packed_kv[:, head_dim:] = kv_scale.reshape(context_len, 1).view(torch.uint8)
+    packed_kv = packed_kv.view(context_len, 1, 1, head_dim + 4)
+
+    context_lens = torch.tensor([context_len], device="cuda", dtype=torch.int32)
+    block_table = torch.arange(context_len, device="cuda", dtype=torch.int32).view(
+        1, -1
+    )
+    logits = torch.empty(1, context_len, device="cuda", dtype=torch.float32)
+    deepgemm_fp8_paged_mqa_logits(
+        q_fp8,
+        packed_kv,
+        weights,
+        logits,
+        context_lens,
+        block_table,
+        context_len,
+        Preshuffle=False,
+        KVBlockSize=1,
+    )
+
+    q_dequant = q_fp8.float()[0, 0]
+    kv_dequant = kv_fp8.float()[:, 0, 0] * kv_scale.float()[:, 0, 0]
+    reference = (torch.relu(q_dequant @ kv_dequant.T) * weights[0, :, None]).sum(dim=0)
+    torch.testing.assert_close(logits[0], reference, atol=1e-3, rtol=1e-3)
