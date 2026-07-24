@@ -45,12 +45,10 @@ HBM-traffic benefit. See ``op_tests/flydsl-best-practices.md`` S6.
 
 import math
 from functools import lru_cache
-from typing import List, Optional
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
@@ -115,7 +113,7 @@ def _build_q_kernel(
     num_heads_k: int,
     num_heads_v: int,
     head_size: int,
-    mrope_section: List[int],
+    mrope_section: list[int],
     eps: float,
     is_interleaved: bool,
     gemma_norm: bool,
@@ -268,7 +266,7 @@ def _build_q_kernel(
         token_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         k = kernel(
             qkv,
@@ -300,7 +298,7 @@ def _build_kv_kernel(
     num_heads_q: int,
     num_heads_kv: int,  # num_heads_k == num_heads_v (validated by caller)
     head_size: int,
-    mrope_section: List[int],
+    mrope_section: list[int],
     eps: float,
     block_size: int,
     x: int,
@@ -362,17 +360,11 @@ def _build_kv_kernel(
         positions_stride_1: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
-        layout_tx_wave_lane = fx.make_layout(
-            (WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1)
-        )
+        layout_tx_wave_lane = fx.make_layout((WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1))
         layout_stage = fx.make_layout((block_size, D), stride=(D, 1))
-        layout_k_runs = fx.make_layout(
-            (D // x, block_size), stride=(block_size, 1)
-        )
+        layout_k_runs = fx.make_layout((D // x, block_size), stride=(block_size, 1))
         layout_v_runs = fx.make_layout((block_size // x, D), stride=(D, 1))
-        layout_stage_runs = fx.make_layout(
-            (block_size, D // x, x), stride=(D, x, 1)
-        )
+        layout_stage_runs = fx.make_layout((block_size, D // x, x), stride=(D, x, 1))
         layout_run = fx.make_layout(x, stride=1)
         layout_k_cache = fx.make_layout(
             (H_KV, D // x, block_size, x),
@@ -490,12 +482,10 @@ def _build_kv_kernel(
                         k0 = fx.Float32(0.0)
                         k1 = fx.Float32(0.0)
                         if col < HALF:
-                            k0 = fx.BFloat16(
-                                qkv_t[tok, H_Q + head, col]
-                            ).to(fx.Float32)
-                            k1 = fx.BFloat16(
-                                qkv_t[tok, H_Q + head, col + HALF]
-                            ).to(fx.Float32)
+                            k0 = fx.BFloat16(qkv_t[tok, H_Q + head, col]).to(fx.Float32)
+                            k1 = fx.BFloat16(qkv_t[tok, H_Q + head, col + HALF]).to(
+                                fx.Float32
+                            )
                             sumsq_local = sumsq_local + k0 * k0 + k1 * k1
                         k0s.append(k0)
                         k1s.append(k1)
@@ -544,9 +534,9 @@ def _build_kv_kernel(
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         if col < HALF:
-                            v0 = fx.BFloat16(
-                                qkv_t[tok, H_Q + H_KV + head, col]
-                            ).to(fx.Float32)
+                            v0 = fx.BFloat16(qkv_t[tok, H_Q + H_KV + head, col]).to(
+                                fx.Float32
+                            )
                             v1 = fx.BFloat16(
                                 qkv_t[tok, H_Q + H_KV + head, col + HALF]
                             ).to(fx.Float32)
@@ -635,9 +625,7 @@ def _build_kv_kernel(
                     chunk_k = fx.get(coord_k_run, 0)
                     block_off = fx.get(coord_k_run, 1)
                     src_k = fx.slice(k_lds_runs, (block_off, chunk_k, None))
-                    dst_k = fx.slice(
-                        k_cache_block, (head, chunk_k, block_off, None)
-                    )
+                    dst_k = fx.slice(k_cache_block, (head, chunk_k, block_off, None))
                     reg_k = fx.make_rmem_tensor(layout_run, CACHE_FX_TYPE)
                     fx.copy_atom_call(copy_128b, src_k, reg_k)
                     vec_k = fx.memref_load_vec(reg_k)
@@ -650,17 +638,12 @@ def _build_kv_kernel(
                     coord_v_run = fx.idx2crd(fx.Int32(r), layout_v_runs)
                     tile = fx.get(coord_v_run, 0)
                     d = fx.get(coord_v_run, 1)
-                    vals = [
-                        v_lds_view[tile * x + j, d]
-                        for j in range_constexpr(x)
-                    ]
+                    vals = [v_lds_view[tile * x + j, d] for j in range_constexpr(x)]
                     if const_expr(cache_is_fp8):
                         vec_x = vector.from_elements(T.vec(x, T.i8), vals)
                     else:
                         vec_x = vector.from_elements(T.vec(x, T.bf16), vals)
-                    dst_v = fx.slice(
-                        v_cache_block, (head, tile, d, None)
-                    )
+                    dst_v = fx.slice(v_cache_block, (head, tile, d, None))
                     fx.ptr_store(vec_x, fx.get_iter(dst_v))
         else:
             # Generic HIP-compatible scatter for arbitrary/decode mappings.
@@ -690,12 +673,12 @@ def _build_kv_kernel(
                             v_cache_block = (v_cache + v_block_base).view(
                                 layout_v_cache
                             )
-                            k_cache_block[head, d // x, block_off, d % x] = (
-                                k_lds_view[token_local, d]
+                            k_cache_block[head, d // x, block_off, d % x] = k_lds_view[
+                                token_local, d
+                            ]
+                            v_cache_block[head, block_off // x, d, block_off % x] = (
+                                v_lds_view[token_local, d]
                             )
-                            v_cache_block[
-                                head, block_off // x, d, block_off % x
-                            ] = v_lds_view[token_local, d]
 
     @flyc.jit
     def launch(
@@ -715,7 +698,7 @@ def _build_kv_kernel(
         page_block_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         k = kernel(
             qkv,
@@ -812,7 +795,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     num_heads_v: int,
     head_size: int,
     is_neox_style: bool,
-    mrope_section_: List[int],
+    mrope_section_: list[int],
     is_interleaved: bool,
     eps: float,
     q_out: torch.Tensor,
@@ -821,15 +804,15 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     slot_mapping: torch.Tensor,
     per_tensor_k_scale: torch.Tensor,
     per_tensor_v_scale: torch.Tensor,
-    k_out: Optional[torch.Tensor],
-    v_out: Optional[torch.Tensor],
+    k_out: torch.Tensor | None,
+    v_out: torch.Tensor | None,
     return_kv: bool,
     use_shuffle_layout: bool,
     block_size: int,
     x: int,
     rotary_dim: int = 0,
     gemma_norm: bool = False,
-    stream: Optional[torch.cuda.Stream] = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """FlyDSL drop-in for ``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``.
 
@@ -934,9 +917,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     cache_is_fp8 = k_cache.dtype in fp8_dtypes
     cache_is_bf16 = k_cache.dtype == torch.bfloat16
     if not cache_is_fp8 and not cache_is_bf16:
-        raise TypeError(
-            "k_cache/v_cache must be a 1-byte FP8 dtype or torch.bfloat16"
-        )
+        raise TypeError("k_cache/v_cache must be a 1-byte FP8 dtype or torch.bfloat16")
     expected_x = _RUN_BYTES // k_cache.element_size()
     if x != expected_x:
         raise ValueError(
@@ -950,9 +931,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             "KV-cache-write kernel."
         )
     if head_size not in (64, 128, 256):
-        raise ValueError(
-            f"head_size ({head_size}) must be one of 64, 128, or 256"
-        )
+        raise ValueError(f"head_size ({head_size}) must be one of 64, 128, or 256")
     if len(mrope_section_) != 3:
         raise ValueError(
             f"mrope_section_ must have exactly 3 entries (3D-mrope), got "
@@ -984,17 +963,24 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     if positions.dtype != torch.int64:
         raise TypeError(f"positions must be int64, got {positions.dtype}")
     if positions.shape != (3, num_tokens):
-        raise ValueError(f"positions shape {tuple(positions.shape)} != (3, {num_tokens})")
+        raise ValueError(
+            f"positions shape {tuple(positions.shape)} != (3, {num_tokens})"
+        )
     if slot_mapping.dtype != torch.int64:
         raise TypeError(f"slot_mapping must be int64, got {slot_mapping.dtype}")
     if slot_mapping.shape != (num_tokens,):
         raise ValueError(
             f"slot_mapping shape {tuple(slot_mapping.shape)} != ({num_tokens},)"
         )
-    if per_tensor_k_scale.dtype != torch.float32 or per_tensor_v_scale.dtype != torch.float32:
+    if (
+        per_tensor_k_scale.dtype != torch.float32
+        or per_tensor_v_scale.dtype != torch.float32
+    ):
         raise TypeError("per_tensor_k_scale/per_tensor_v_scale must be float32")
     if per_tensor_k_scale.numel() != 1 or per_tensor_v_scale.numel() != 1:
-        raise ValueError("per_tensor_k_scale/per_tensor_v_scale must contain one element")
+        raise ValueError(
+            "per_tensor_k_scale/per_tensor_v_scale must contain one element"
+        )
     if return_kv and (k_out is None or v_out is None):
         raise ValueError("return_kv=True requires k_out and v_out to be provided")
 
@@ -1008,8 +994,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         expected_qkv_shape = (num_tokens, total_heads * D)
     else:
         raise ValueError(
-            "qkv must be 2-D [T, (H_q+H_k+H_v)*D] or "
-            "3-D [T, H_q+H_k+H_v, D]"
+            "qkv must be 2-D [T, (H_q+H_k+H_v)*D] or 3-D [T, H_q+H_k+H_v, D]"
         )
     if tuple(qkv.shape) != expected_qkv_shape:
         raise ValueError(
@@ -1027,9 +1012,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     if not cos_sin.is_contiguous():
         raise ValueError("cos_sin must be contiguous")
     if q_out.dtype != torch.bfloat16 or q_out.numel() != num_tokens * H_Q * D:
-        raise ValueError(
-            f"q_out must be bf16 with {num_tokens * H_Q * D} elements"
-        )
+        raise ValueError(f"q_out must be bf16 with {num_tokens * H_Q * D} elements")
     if not q_out.is_contiguous():
         raise ValueError("q_out must be contiguous")
     if not k_cache.is_contiguous() or not v_cache.is_contiguous():
@@ -1128,9 +1111,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     k_out_arg = k_out if return_kv else k_cache.new_empty(1)
     v_out_arg = v_out if return_kv else v_cache.new_empty(1)
     for page_block_offset in range(0, num_page_blocks, _MAX_GRID_Y):
-        chunk_page_blocks = min(
-            _MAX_GRID_Y, num_page_blocks - page_block_offset
-        )
+        chunk_page_blocks = min(_MAX_GRID_Y, num_page_blocks - page_block_offset)
         _run_compiled(
             kv_launch,
             _ptr(qkv_flat),

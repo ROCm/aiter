@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -20,13 +19,12 @@ from aiter.test_common import checkAllclose, run_perftest
 from aiter.utility import dtypes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_fused_qk_norm_mrope_cache_quant import (  # noqa: E402
+from test_fused_qk_norm_mrope_cache_quant import (
     apply_interleaved_rope,
     apply_rotary_emb_torch,
     gemma_rms_norm_forward,
     rms_norm_forward,
 )
-
 
 EPS = 1e-6
 MAX_POSITIONS = 4096
@@ -49,9 +47,7 @@ def _v_head_stride(head_size: int, page_size: int, x: int) -> int:
     return (page_size // x) * head_size * x
 
 
-def _v_per_block(
-    head_size: int, page_size: int, x: int, num_kv_heads: int
-) -> int:
+def _v_per_block(head_size: int, page_size: int, x: int, num_kv_heads: int) -> int:
     return num_kv_heads * _v_head_stride(head_size, page_size, x)
 
 
@@ -86,11 +82,7 @@ def _scatter_shuffle_cache(
             + head * _k_head_stride(head_size, page_size)
             + block_offset * x
         )
-        dst = (
-            base[:, None]
-            + k_chunk[None, :] * (page_size * x)
-            + k_in_x[None, :]
-        )
+        dst = base[:, None] + k_chunk[None, :] * (page_size * x) + k_in_x[None, :]
         k_flat[dst.reshape(-1)] = k[:, head, :].reshape(-1)
 
     v_flat = v_cache.view(-1)
@@ -133,9 +125,7 @@ def torch_ref(
     num_tokens = qkv.shape[0]
     q_size = num_q_heads * head_size
     kv_size = num_kv_heads * head_size
-    q, k, v = qkv.view(num_tokens, -1).split(
-        [q_size, kv_size, kv_size], dim=-1
-    )
+    q, k, v = qkv.view(num_tokens, -1).split([q_size, kv_size, kv_size], dim=-1)
 
     norm = gemma_rms_norm_forward if gemma_norm else rms_norm_forward
     q = norm(q.view(num_tokens, num_q_heads, head_size), qw, EPS)
@@ -171,9 +161,7 @@ def torch_ref(
 
     k_cache = initial_k_cache.clone()
     v_cache = initial_v_cache.clone()
-    _scatter_shuffle_cache(
-        k_quant, v_quant, k_cache, v_cache, slots, page_size, x
-    )
+    _scatter_shuffle_cache(k_quant, v_quant, k_cache, v_cache, slots, page_size, x)
 
     k_out = initial_k_out.clone() if initial_k_out is not None else None
     v_out = initial_v_out.clone() if initial_v_out is not None else None
@@ -218,9 +206,7 @@ def run_case(
     qw = torch.randn(head_size, dtype=torch.bfloat16, device=device)
     kw = torch.randn(head_size, dtype=torch.bfloat16, device=device)
     cos_sin = (
-        torch.randn(
-            MAX_POSITIONS, head_size, dtype=torch.bfloat16, device=device
-        )
+        torch.randn(MAX_POSITIONS, head_size, dtype=torch.bfloat16, device=device)
         * 0.25
     )
     positions_storage = torch.randint(
@@ -242,12 +228,12 @@ def run_case(
             slots[0] = -1
 
     cache_shape = (num_blocks, page_size, num_kv_heads, head_size)
-    initial_k_cache = torch.randn(
-        cache_shape, dtype=torch.bfloat16, device=device
-    ).to(cache_dtype)
-    initial_v_cache = torch.randn(
-        cache_shape, dtype=torch.bfloat16, device=device
-    ).to(cache_dtype)
+    initial_k_cache = torch.randn(cache_shape, dtype=torch.bfloat16, device=device).to(
+        cache_dtype
+    )
+    initial_v_cache = torch.randn(cache_shape, dtype=torch.bfloat16, device=device).to(
+        cache_dtype
+    )
     initial_k_out = (
         torch.randn(
             num_tokens,
@@ -423,6 +409,7 @@ def run_case(
         f"speedup={production_us / flydsl_us:.2f}x"
     )
 
+
 def _str_to_bool(value: str) -> bool:
     value = value.lower()
     if value in {"true", "1", "yes"}:
@@ -454,9 +441,7 @@ def main() -> None:
     parser.add_argument(
         "--page-sizes", type=int, nargs="+", choices=[16, 64], default=[64]
     )
-    parser.add_argument(
-        "--interleaved", type=_str_to_bool, nargs="+", default=[True]
-    )
+    parser.add_argument("--interleaved", type=_str_to_bool, nargs="+", default=[True])
     parser.add_argument(
         "--slot-patterns",
         nargs="+",
@@ -466,12 +451,8 @@ def main() -> None:
     parser.add_argument(
         "--strided-positions", type=_str_to_bool, nargs="+", default=[False]
     )
-    parser.add_argument(
-        "--gemma-norm", type=_str_to_bool, nargs="+", default=[False]
-    )
-    parser.add_argument(
-        "--return-kv", type=_str_to_bool, nargs="+", default=[False]
-    )
+    parser.add_argument("--gemma-norm", type=_str_to_bool, nargs="+", default=[False])
+    parser.add_argument("--return-kv", type=_str_to_bool, nargs="+", default=[False])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--iters", type=int, default=1)

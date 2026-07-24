@@ -3,6 +3,7 @@
 import argparse
 
 import torch
+
 import aiter
 from aiter.ops.flydsl import flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 from aiter.utility import dtypes
@@ -30,9 +31,7 @@ def build_inputs(m: int, seed: int, slot_pattern: str):
             raise ValueError("m exceeds the allocated cache capacity")
         slot_map = torch.arange(m, dtype=torch.int64, device="cuda")
     else:
-        slot_map = torch.randint(
-            0, 22988 * 64, (m,), dtype=torch.int64, device="cuda"
-        )
+        slot_map = torch.randint(0, 22988 * 64, (m,), dtype=torch.int64, device="cuda")
     per_tensor_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     per_tensor_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
@@ -61,8 +60,12 @@ def allocate_outputs(inputs, return_kv: bool):
     kv_dtype = inputs["kv_dtype"]
 
     return {
-        "k_out": torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda") if return_kv else None,
-        "v_out": torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda") if return_kv else None,
+        "k_out": torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda")
+        if return_kv
+        else None,
+        "v_out": torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda")
+        if return_kv
+        else None,
     }
 
 
@@ -99,6 +102,7 @@ def run_once(inputs, outputs, return_kv: bool):
         128,
         False,
     )
+
 
 def run_once_flydsl(inputs, outputs, return_kv: bool):
     m = inputs["qkv"].shape[0]
@@ -182,11 +186,15 @@ def parse_args():
         default="aligned",
         help="Aligned exercises the coalesced path; random exercises scatter fallback.",
     )
-    parser.add_argument("--return-kv", action="store_true", help="Enable return_kv path")
+    parser.add_argument(
+        "--return-kv", action="store_true", help="Enable return_kv path"
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     benchmark("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", run_once, args)
-    benchmark("flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", run_once_flydsl, args)
+    benchmark(
+        "flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", run_once_flydsl, args
+    )
