@@ -60,12 +60,12 @@ def allocate_outputs(inputs, return_kv: bool):
     kv_dtype = inputs["kv_dtype"]
 
     return {
-        "k_out": torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda")
-        if return_kv
-        else None,
-        "v_out": torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda")
-        if return_kv
-        else None,
+        "k_out": (
+            torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda") if return_kv else None
+        ),
+        "v_out": (
+            torch.empty(m, 4, 128, dtype=kv_dtype, device="cuda") if return_kv else None
+        ),
     }
 
 
