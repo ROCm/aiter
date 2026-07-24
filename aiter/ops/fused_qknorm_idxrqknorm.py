@@ -87,6 +87,9 @@ def fused_qknorm_idxrqknorm(
         and isinstance(kv_cache_dtype, str)
         and kv_cache_dtype.startswith("fp8")
     )
+    use_per_token_kv_scale = (
+        use_fp8_kv_cache and kv_cache_dtype != "fp8_e4m3_unit"
+    )
     if use_fp8_kv_cache:
         if index_slot_mapping is None:
             index_slot_mapping = slot_mapping
@@ -98,8 +101,12 @@ def fused_qknorm_idxrqknorm(
         assert q_out is not None
         assert index_q_out is not None
         assert index_slot_mapping is not None
-        assert k_scale is not None
-        assert v_scale is not None
+        if use_per_token_kv_scale:
+            assert k_scale is not None
+            assert v_scale is not None
+        else:
+            assert k_scale is None
+            assert v_scale is None
 
     _fused_qknorm_idxrqknorm_hip(
         qkv,

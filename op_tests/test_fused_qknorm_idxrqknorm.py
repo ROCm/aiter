@@ -541,10 +541,13 @@ def run_fused_qknorm_idxrqknorm(
 
     use_asm_layout = mode.startswith("asm_layout")
     use_uint8_kv_cache = mode.endswith("_uint8")
+    use_unit_scale_kv_cache = mode == "fp8_kv_cache_unit"
     kv_cache_dtype = None
     if use_fp8_kv_cache:
         kv_cache_dtype = torch.uint8 if use_uint8_kv_cache else dtypes.fp8
-    use_fp8_index_cache = use_fp8_kv_cache or mode == "asm_layout_fp8_index"
+    use_fp8_index_cache = (
+        use_fp8_kv_cache and not use_unit_scale_kv_cache
+    ) or mode == "asm_layout_fp8_index"
     q_out, index_q_out, kv_cache, index_cache = make_insert_outputs(
         case,
         kv_cache_dtype=kv_cache_dtype,
@@ -572,13 +575,15 @@ def run_fused_qknorm_idxrqknorm(
     use_pertoken = "pertoken" in mode
     kv_cache_dtype_arg = "auto"
     if use_fp8_kv_cache:
-        if use_pertoken:
+        if use_unit_scale_kv_cache:
+            # SGLang MiniMax-M3 contract: direct BF16 -> FP8 cast, no scale buffer.
+            kv_cache_dtype_arg = "fp8_e4m3_unit"
+        elif use_pertoken:
             # Per-token dynamic quant: k_scale/v_scale are OUTPUT tensors the op fills.
             k_scale, v_scale = make_pertoken_scales(case, asm_layout=use_asm_layout)
+            kv_cache_dtype_arg = "fp8_e4m3"
         else:
-            k_scale = torch.tensor(0.75, dtype=torch.float32, device="cuda")
-            v_scale = torch.tensor(1.25, dtype=torch.float32, device="cuda")
-        kv_cache_dtype_arg = "fp8_e4m3"
+            raise AssertionError(f"unknown fp8 kv-cache contract for mode={mode}")
     index_cache_dtype_arg = "fp8" if use_fp8_index_cache else "auto"
 
     aiter.fused_qknorm_idxrqknorm(
@@ -633,7 +638,10 @@ def test_fused_qknorm_idxrqknorm(
     use_fp8_kv_cache = mode.startswith("fp8_kv_cache") or (
         mode.startswith("asm_layout_fp8") and mode != "asm_layout_fp8_index"
     )
-    use_fp8_index_cache = use_fp8_kv_cache or mode == "asm_layout_fp8_index"
+    use_unit_scale_kv_cache = mode == "fp8_kv_cache_unit"
+    use_fp8_index_cache = (
+        use_fp8_kv_cache and not use_unit_scale_kv_cache
+    ) or mode == "asm_layout_fp8_index"
     if use_fp8_kv_cache and fp8_cache_dtype() is None:
         aiter.logger.info("Skip fp8_kv_cache: torch FP8 dtype is unavailable")
         return {
@@ -801,7 +809,10 @@ def test_fused_qknorm_idxrqknorm(
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
-            if use_fp8_kv_cache:
+            if use_unit_scale_kv_cache:
+                k_ref = fp8_unit_scale_ref(refs["k"])
+                v_ref = fp8_unit_scale_ref(refs["v"])
+            elif use_fp8_kv_cache:
                 k_ref = fp8_cache_ref(refs["k"], k_scale)
                 v_ref = fp8_cache_ref(refs["v"], v_scale)
             else:
@@ -844,7 +855,11 @@ DEFAULT_CASES = [
     ("asm_layout", "fp16", 19, 16, 96, 4),
     ("asm_layout", "bf16", 13, 16, 64, 0),
     ("asm_layout_fp8_index", "bf16", 17, 16, 64, 4),
-    # fp8 path is per-token dynamic quant only (no per-tensor static scale).
+    # SGLang contract: page-1 NHD, unit-scale main FP8, BF16 index cache.
+    ("fp8_kv_cache_unit", "bf16", 1, 1, 64, 1),
+    ("fp8_kv_cache_unit", "bf16", 16, 1, 64, 1),
+    ("fp8_kv_cache_unit", "bf16", 64, 1, 64, 1),
+    # ATOM contract: per-token main FP8 scales and FP8 index cache.
     ("fp8_kv_cache_pertoken", "bf16", 17, 16, 64, 4),
     ("fp8_kv_cache_pertoken_uint8", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "bf16", 17, 16, 64, 4),
@@ -859,6 +874,7 @@ l_mode = [
     "inplace",
     "asm_layout",
     "asm_layout_fp8_index",
+    "fp8_kv_cache_unit",
     "fp8_kv_cache_pertoken",
     "fp8_kv_cache_pertoken_uint8",
     "asm_layout_fp8_pertoken",
