@@ -86,7 +86,20 @@ def select_2d_config(
 
     # base prefill, for short cases
     if not all_decode:
-        num_stages_2d, num_warps = 1, 2
+        if head_size >= 512 and not arch.is_rdna:
+            num_warps, num_stages_2d = 4, 2
+            TILE_SIZE = 16
+        elif head_size >= 256 and not arch.is_rdna:
+            num_warps, num_stages_2d = 2, 2
+            TILE_SIZE = 32
+        else:
+            # large prefill config
+            if max_seqlen_q >= 256:
+                BLOCK_M = 64 if arch.is_rdna else 128
+                num_stages_2d, num_warps = 1, 4
+            else:
+                num_stages_2d, num_warps = 1, 2
+
     # pure decode config
     else:
         # to not have masking when loading KV
@@ -94,12 +107,10 @@ def select_2d_config(
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
-            num_stages_2d, num_warps = 3, 2
-
-    # large prefill config
-    if max_seqlen_q >= 256:
-        BLOCK_M = 64 if arch.is_rdna else 128
-        num_stages_2d, num_warps = 1, 4
+            if head_size >= 512:
+                num_stages_2d, num_warps = 1, 4
+            else:
+                num_stages_2d, num_warps = 3, 2
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
@@ -136,6 +147,7 @@ def select_3d_config(
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
     SLIDING_WINDOW: int = None,
 ):
+    arch = get_arch()
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
     assert kv_cache_dtype in (
@@ -188,6 +200,9 @@ def select_3d_config(
         #     attn_warps = max(attn_warps, 1)
         #     attn_warps = min(attn_warps, 4)
     else:
+        if head_size >= 512 and not arch.is_rdna:
+            attn_warps, attn_stages = 4, 1
+
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = target_num_prgms * occ
 
@@ -195,12 +210,13 @@ def select_3d_config(
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
+        if head_size >= 512 and not arch.is_rdna:
+            MIN_SEGMENTS = min(16, MAX_SEGMENTS)
         if num_segments == 0:
             num_segments = math.ceil(target_num_prgms / num_2d_prgms)
             num_segments = min(num_segments, MAX_SEGMENTS)
-            num_segments = triton.next_power_of_2(num_segments)
-            num_segments = min(num_segments, 128)
             num_segments = max(num_segments, MIN_SEGMENTS)
+            num_segments = triton.next_power_of_2(num_segments)
 
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
@@ -268,6 +284,9 @@ def use_2d_kernel(
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
         return (sliding_window > 0) or (not all_decode)
+
+    if head_size >= 512 and not get_arch().is_rdna and not all_decode:
+        return True
 
     return (
         (sliding_window > 0)
