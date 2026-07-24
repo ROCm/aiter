@@ -143,7 +143,7 @@ def launch_gemm_a8w4_tdm(
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
     ):
-        rocdl.disable_xdl_arb_stall()
+        # rocdl.disable_xdl_arb_stall()
 
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
