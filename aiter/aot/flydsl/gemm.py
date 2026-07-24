@@ -48,6 +48,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
+    KERNEL_FAMILY_HGEMM_FIXED_TILE,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
 )
@@ -276,20 +277,36 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
-    # optional bias and split-K sync tensors.
-    launch_bias = bias if has_bias else b
-    _compile_executable_to_cache(
-        exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(launch_bias),
-        m,
-        _ptr_view_safe(semaphore),
-        _ptr_view_safe(signal),
-        stream,
-    )
+    if kernel_family == KERNEL_FAMILY_HGEMM_FIXED_TILE:
+        # fixed_tile kernels have no bias slot.
+        if has_bias:
+            raise ValueError(
+                f"kernel_family={kernel_family!r} does not support bias, "
+                "but has_bias=True"
+            )
+        _compile_executable_to_cache(
+            exe,
+            _ptr_view_safe(out),
+            _ptr_view_safe(a),
+            _ptr_view_safe(b),
+            m,
+            _ptr_view_safe(semaphore),
+            _ptr_view_safe(signal),
+            stream,
+        )
+    else:
+        launch_bias = bias if has_bias else b
+        _compile_executable_to_cache(
+            exe,
+            _ptr_view_safe(out),
+            _ptr_view_safe(a),
+            _ptr_view_safe(b),
+            _ptr_view_safe(launch_bias),
+            m,
+            _ptr_view_safe(semaphore),
+            _ptr_view_safe(signal),
+            stream,
+        )
 
 
 def _compile_preshuffle_to_cache(
