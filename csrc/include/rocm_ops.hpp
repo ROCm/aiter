@@ -31,6 +31,7 @@ namespace py = pybind11;
         .value("Silu", ActivationType::Silu)                                                \
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
+        .value("GeluTanh", ActivationType::GeluTanh)                                        \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
