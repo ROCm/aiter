@@ -8,8 +8,8 @@ import logging
 import multiprocessing
 import os
 import re
-import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,6 +30,7 @@ from cpp_extension import (  # noqa: E402
     get_hip_version,
 )
 from file_baton import FileBaton  # noqa: E402
+from blob_gen import windows_blob_gen_argv  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -954,9 +955,20 @@ def build_module(
             if blob_gen_cmd:
                 blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
-                if AITER_LOG_MORE:
-                    logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
+                if sys.platform == "win32":
+                    blob_gen_argv = windows_blob_gen_argv(PY, blob_gen_cmd, blob_dir)
+                    if AITER_LOG_MORE:
+                        logger.info(
+                            f"exec_blob ---> {subprocess.list2cmdline(blob_gen_argv)}"
+                        )
+                    subprocess.run(blob_gen_argv, check=True)
+                else:
+                    blob_gen_shell_cmd = (
+                        f"{PY} {blob_gen_cmd.format(blob_dir)}"
+                    )
+                    if AITER_LOG_MORE:
+                        logger.info(f"exec_blob ---> {blob_gen_shell_cmd}")
+                    os.system(blob_gen_shell_cmd)
                 sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 

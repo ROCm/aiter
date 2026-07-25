@@ -12,6 +12,7 @@ JIT_UTILS = os.path.join(REPO_ROOT, "aiter", "jit", "utils")
 sys.path.insert(0, JIT_UTILS)
 
 from build_targets import get_build_targets_env  # noqa: E402
+from blob_gen import windows_blob_gen_argv  # noqa: E402
 from mha_recipes import _ck_targets_flag_for_arch  # noqa: E402
 
 
@@ -43,6 +44,58 @@ class TestWindowsRDNACKTargets(unittest.TestCase):
     def test_cdna_keeps_ck_generator_defaults(self):
         self.assertEqual(_ck_targets_flag_for_arch("gfx942"), "")
         self.assertEqual(_ck_targets_flag_for_arch("gfx950"), "")
+
+    def test_blob_generator_paths_with_spaces_are_single_arguments(self):
+        argv = windows_blob_gen_argv(
+            r"C:\Program Files\Python\python.exe",
+            (
+                r"C:\Work Tree\aiter\3rdparty\composable_kernel"
+                r"\example\ck_tile\01_fmha\generate.py "
+                '-d fwd --receipt 100 --filter " @ " --output_dir {}'
+            ),
+            r"C:\Work Tree\build\blob",
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                r"C:\Program Files\Python\python.exe",
+                (
+                    r"C:\Work Tree\aiter\3rdparty\composable_kernel"
+                    r"\example\ck_tile\01_fmha\generate.py"
+                ),
+                "-d",
+                "fwd",
+                "--receipt",
+                "100",
+                "--filter",
+                " @ ",
+                "--output_dir",
+                r"C:\Work Tree\build\blob",
+            ],
+        )
+
+    def test_blob_generator_equals_path_with_spaces(self):
+        argv = windows_blob_gen_argv(
+            r"C:\Python\python.exe",
+            (
+                r"C:\Work Tree\gen.py --working_path {} "
+                r"--compiled_kids_sidecar=C:\Work Tree\compiled.json"
+            ),
+            r"C:\Work Tree\blob",
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                r"C:\Python\python.exe",
+                r"C:\Work Tree\gen.py",
+                "--working_path",
+                r"C:\Work Tree\blob",
+                "--compiled_kids_sidecar",
+                r"C:\Work Tree\compiled.json",
+            ],
+        )
 
 
 if __name__ == "__main__":
