@@ -72,8 +72,8 @@ def test_kimi_k3_biased_grouped_topk_row_strided(num_tokens: int):
 
 
 @pytest.mark.skipif(torch.version.hip is None, reason="ROCm/HIP is required")
-def test_row_strided_input_falls_back_from_opt_sort():
-    """The opt-sort shape uses the generic kernel when rows are strided."""
+def test_opt_sort_accepts_row_strided_input():
+    """The opt-sort kernel accepts row-strided inputs."""
     torch.manual_seed(1)
     num_tokens = 4
     num_experts = 256

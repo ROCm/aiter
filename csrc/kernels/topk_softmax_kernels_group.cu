@@ -626,6 +626,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                              const DTYPE_I* __restrict__ correction_bias, // [num_expert]
                              float* __restrict__ topk_weights,            // [num_tokens, topk]
                              int* __restrict__ topk_ids,                  // [num_tokens, topk]
+                             const size_t stride_gating,
                              const size_t stride_tk,
                              const int num_experts,
                              const int topk,
@@ -683,7 +684,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     f32vec gating;
     if constexpr(!isSoftmax)
     {
-        auto const* input_ptr = gating_output + token_idx * num_experts;
+        auto const* input_ptr = gating_output + token_idx * stride_gating;
         // for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         int e = threadIdx.x;
         {
@@ -721,7 +722,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {
             int e = threadIdx.x + i_ * blockDim.x;
 
-            float gating = gating_output[token_idx * num_experts + e];
+            float gating = gating_output[token_idx * stride_gating + e];
             // scores[e] = gating;
             scores_[i_] = gating;
             if(gating > max_val)
@@ -1215,6 +1216,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                                correction_bias.data_ptr<scalar_t>(),              \
                                topk_weights.data_ptr<float>(),                    \
                                topk_ids.data_ptr<int>(),                          \
+                               stride_gating,                                     \
                                stride_tk,                                         \
                                num_experts,                                       \
                                topk,                                              \
@@ -1249,8 +1251,7 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
-                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64) &&
-                        (stride_gating == static_cast<size_t>(num_experts));
+                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
