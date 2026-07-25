@@ -13,9 +13,10 @@ On gfx950 (CDNA4) DeepSeek-V4 sparse-MLA decode has a dedicated gluon
 implementation (bottom of this module): ``pa_decode_sparse`` routes all formats
 to the merged ``_pa_decode_sparse_gfx950_gluon`` driver -- packed fp8_ds_mla /
 bf16 block cache (3D; optional SWA+top-k two-loop via ``extra_*``) and the
-uniform fp8 / bf16 pool (2D). The vLLM DSv4 backend's packed entry is kept as a
-thin shim (``_rocm_sparse_attn_decode_ragged_triton``).
+uniform fp8 / bf16 pool (2D).
 """
+
+import math
 
 import torch
 import triton
@@ -25,6 +26,12 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
+    _pa_decode_sparse as _pa_decode_sparse_gfx950,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
+    _pa_decode_sparse_reduce as _pa_decode_sparse_reduce_gfx950,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
@@ -387,14 +394,29 @@ def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.int32).contiguous()
 
 
-def _decode_num_splits(num_queries, heads_blocks, avg_len=0.0, block_k=64):
-    base = max(1, num_queries * heads_blocks)
+def _decode_num_splits(
+    num_queries, heads_blocks, avg_main=0.0, avg_extra=0.0, block_k=64
+):
+    """Pick the split-K count by minimizing a cost model of the decode work:
+
+        cost(s) = waves(s) * iters(s)  +  GAMMA * s  +  DELTA * fill(s)
+        s = # splits
+    Tuned on gfx950 for DSv4 decode (H=16, D=512, BLOCK_K=64); split count is
+    capped at 16.
+    """
     cu = max(1, get_num_sms())
-    mu = 0.04
+    base = max(1, num_queries * heads_blocks)
+    GAMMA, DELTA, FILL_CU = 0.32, 2.0, 0.75
+    thr = FILL_CU * cu
     best_splits, best_cost = 1, None
     for splits in range(1, 17):
+        m_it = math.ceil(math.ceil(avg_main / splits) / block_k) if avg_main > 0 else 0
+        e_it = (
+            math.ceil(math.ceil(avg_extra / splits) / block_k) if avg_extra > 0 else 0
+        )
         waves = (base * splits + cu - 1) // cu
-        cost = waves * (1.0 / splits + mu)
+        fill = max(0.0, 1.0 - base * splits / thr) / splits
+        cost = waves * (m_it + e_it) + GAMMA * splits + DELTA * fill
         if best_cost is None or cost < best_cost - 1e-9:
             best_splits, best_cost = splits, cost
     return best_splits
@@ -436,10 +458,6 @@ def _pa_decode_sparse_gfx950_gluon(
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
-    from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-        _pa_decode_sparse,
-        _pa_decode_sparse_reduce,
-    )
 
     # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
     # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
@@ -481,7 +499,8 @@ def _pa_decode_sparse_gfx950_gluon(
         nope_dim = head_dim
         main_num_rows = extra_num_rows = cache.shape[0]
         cache_bytes = cache.nelement() * cache.element_size()
-        avg_len = indices.numel() / max(1, num_queries)
+        avg_main = indices.numel() / max(1, num_queries)  # one segment; no extra
+        avg_extra = 0.0
     else:
         # packed fp8_ds_mla [nb, block, 584] (embedded scale) or bf16 block cache.
         UNIFORM = False
@@ -507,7 +526,8 @@ def _pa_decode_sparse_gfx950_gluon(
             cache.nelement() * cache.element_size(),
             extra_cache.nelement() * extra_cache.element_size(),
         )
-        avg_len = (indices.numel() + extra_indices.numel()) / max(1, num_queries)
+        avg_main = indices.numel() / max(1, num_queries)
+        avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
     use_buffer_load = cache_bytes <= MAX_BYTES
     HEAD_ALIGNED = num_heads % BLOCK_M == 0
@@ -517,10 +537,9 @@ def _pa_decode_sparse_gfx950_gluon(
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
-        num_splits = _decode_num_splits(num_queries, heads_blocks, avg_len, BLOCK_K)
-        # Cap at the tile count: extra splits just fragment short token lists into
-        # sub-tile masked chunks (matters for tiny top-k / small merged ctx).
-        num_splits = min(num_splits, max(1, int((avg_len + BLOCK_K - 1) // BLOCK_K)))
+        num_splits = _decode_num_splits(
+            num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
+        )
 
     if num_splits > 1:
         part_m = torch.empty(
@@ -543,7 +562,7 @@ def _pa_decode_sparse_gfx950_gluon(
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
     grid = (num_queries, num_splits, heads_blocks)
-    _pa_decode_sparse[grid](
+    _pa_decode_sparse_gfx950[grid](
         q,
         cache,
         main_bf16,
@@ -601,7 +620,7 @@ def _pa_decode_sparse_gfx950_gluon(
         return part_acc, part_m, part_l
 
     rgrid = (num_queries, heads_blocks)
-    _pa_decode_sparse_reduce[rgrid](
+    _pa_decode_sparse_reduce_gfx950[rgrid](
         part_m,
         part_l,
         part_acc,
