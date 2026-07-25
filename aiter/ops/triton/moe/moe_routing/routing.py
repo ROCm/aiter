@@ -93,7 +93,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     hist = hist[:n_expts_tot]
     assert hist.dtype == torch.int32
     # scratchpad
-    if n_gates <= 65536:
+    if n_gates <= 65536 - 1:  # save one token id for OOB checks
         combined_indx = torch.empty(n_gates * 2, dtype=torch.uint16, device=device)
     else:
         combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
@@ -232,7 +232,7 @@ def log2_power_of_two(x):
 
 
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    BLOCK = 128
+    BLOCK = triton.next_power_of_2(n_expts_tot)
     cdiv = triton.cdiv
     block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:
